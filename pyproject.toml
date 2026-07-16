@@ -1,0 +1,187 @@
+[project]
+name = "langchaint"
+version = "0.2.0"
+description = "It ain't langchain."
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.13.4",
+]
+
+[project.optional-dependencies]
+# One extra per backend: the langchaint.anthropic / langchaint.openai subpackages
+# import their SDK at module top, so an application installs only the backends it uses.
+anthropic = ["anthropic>=0.116.0"]
+openai = ["openai>=2.45.0"]
+all = ["anthropic>=0.116.0", "openai>=2.45.0"]
+# The langchaint.tracing subpackage imports only opentelemetry-api (trace, Tracer,
+# Status, StatusCode); a production app installs the api and wires its own SDK,
+# matching OTel's api/sdk split. Deliberately not folded into all, which stays
+# backends-only: an app that wants both SDKs but no tracing must not pull OTel.
+otel = ["opentelemetry-api>=1.30.0"]
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "langchaint[all]",
+    "langchaint[otel]",
+    # opentelemetry-sdk is needed only by the tracing tests' in-memory exporter
+    # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper
+    # itself imports only opentelemetry-api.
+    "opentelemetry-sdk>=1.30.0",
+    "pytest>=9.0.2",
+    "pyrefly>=1.2.0.dev2",
+    "ruff>=0.15.20",
+    "typos>=1.48.0",
+]
+
+[tool.pyrefly]
+preset = "strict"
+# project-includes bounds type checking to exactly these trees (leaving the developer
+# tooling under scripts/ out); search-path is the separate import-resolution knob, "src"
+# being the langchaint import root.
+project-includes = ["src", "tests"]
+# src is the langchaint import root; the repo root is added so cross-module test
+# imports (tests.test_bound_llm reused by tests.test_tracing) resolve the same way
+# pytest resolves them at runtime.
+search-path = ["src", "."]
+
+# Enabled above strict: redundant-cast enforces the "no cast" smell's
+# stale half (every finding is a deletable cast), and deprecated flags
+# stdlib/library deprecations before an upgrade breaks them.
+# explicit-any stays off: the remaining Any sites are deliberate
+# existential typing (overload implementations, SDK stream generics,
+# the heterogeneous Tool collection), and suppressions on deliberate
+# Any would only add noise. When pyrefly 1.2.0 lands, also enable
+# implicit-any-variable (inference gaps that silently make a variable
+# Any): the tree is clean for it since Tool.validate_and_run owns the
+# typed validate-then-call pair, but 1.1.1 rejects the rule name.
+[tool.pyrefly.errors]
+redundant-cast = "error"
+deprecated = "error"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 99
+format.preview = true
+
+lint.preview = true
+lint.explicit-preview-rules = true
+lint.select = [
+    "ANN",
+    "BLE",
+    "FBT",
+    "PERF",
+    "A",
+    "B",
+    "INP",
+    "PIE",
+    "PT",
+    "RET",
+    "RSE",
+    "SLF",
+    "SIM",
+    "SLOT",
+    "TID",
+    "TC",
+    "ARG",
+    "LOG",
+    "G",
+    "PTH",
+    "FLY",
+    "I",
+    "N",
+    "F",
+    "PL",
+    "UP",
+    "FURB",
+    "RUF",
+    "TRY",
+    "W505",  # doc-line-too-long, capped by pycodestyle.max-doc-length below
+    # Docstrings, selected as exact codes with no pydocstyle convention.
+    # The dropped google convention was an ignore-overlay whose removals
+    # the code satisfies anyway, and it ignored D401, which then needed an
+    # exact-code select to win over the convention. Deliberately absent:
+    # D203 and D213, which conflict with D211 and D212; D405-D414 and
+    # D416, which enforce underlined rst/numpy section headers instead of
+    # the Args:/Raises:/Yields: prose sections used here; and the preview
+    # rules D420 (incorrect-section-order) and D421
+    # (property-docstring-starts-with-verb), not opted into: D421 flags a
+    # verb-first property docstring, which the imperative mood used
+    # everywhere here (D401) would otherwise produce.
+    "D100",  # undocumented-public-module
+    "D101",  # undocumented-public-class
+    "D102",  # undocumented-public-method
+    "D103",  # undocumented-public-function
+    "D104",  # undocumented-public-package
+    "D105",  # undocumented-magic-method
+    "D106",  # undocumented-public-nested-class
+    "D107",  # undocumented-public-init
+    "D200",  # unnecessary-multiline-docstring
+    "D201",  # blank-line-before-function
+    "D202",  # blank-line-after-function
+    "D204",  # incorrect-blank-line-after-class
+    "D205",  # missing-blank-line-after-summary
+    "D206",  # docstring-tab-indentation
+    "D207",  # under-indentation
+    "D208",  # over-indentation
+    "D209",  # new-line-after-last-paragraph
+    "D210",  # surrounding-whitespace
+    "D211",  # blank-line-before-class
+    "D212",  # multi-line-summary-first-line
+    "D214",  # overindented-section
+    "D215",  # overindented-section-underline
+    "D300",  # triple-single-quotes
+    "D301",  # escape-sequence-in-docstring
+    "D400",  # missing-trailing-period
+    "D401",  # non-imperative-mood
+    "D402",  # signature-in-docstring
+    "D403",  # first-word-uncapitalized
+    "D404",  # docstring-starts-with-this
+    "D415",  # missing-terminal-punctuation
+    "D417",  # undocumented-param
+    "D418",  # overload-with-docstring
+    "D419",  # empty-docstring
+    # Preview docstring features
+    "DOC202",  # docstring documents a return that does not exist
+    "DOC402",  # missing "Yields" in docstring
+    "DOC403",  # docstring documents a yield that does not exist
+    # DOC501 (raised exception missing) and DOC502 (documents an exception not
+    # raised) are deliberately absent. Both resolve a raise only for the literal
+    # `raise SomeError(...)` / `raise SomeError` shapes; they cannot see through
+    # `raise type(exc)(...)` (re-raising the same leaf class enriched) or
+    # `raise Class.factory(...)` (they read the last attribute, `factory`, as the
+    # exception name), both of which this package uses. Under them a correctly
+    # documented raise reports as extraneous and a real raise reports as missing,
+    # so documenting raises is a CLAUDE.md convention (see "Document what a
+    # function raises") checked in review instead.
+]
+lint.ignore = [
+    "ANN401",
+    "SIM105",
+    "PLR2004",
+    "TRY003",
+]
+
+# Docstrings and comments break lines at sentence boundaries, not at a column
+# width; a sentence longer than this cap breaks at a clause boundary. Code
+# stays at line-length 99 via the formatter; E501 is deliberately unselected.
+lint.pycodestyle.max-doc-length = 120
+lint.flake8-tidy-imports.ban-relative-imports = "all"
+lint.pylint.max-args = 7
+
+# The tests exercise private helpers and attributes directly (Provider._request,
+# BoundLLM._bound_provider); those accesses are the unit under test, so SLF001
+# (private-member-access) cannot be satisfied without exposing internals.
+lint.per-file-ignores."tests/*" = ["SLF001"]
+
+# The examples are standalone scripts run by path (python examples/01_basics.py),
+# deliberately not an importable package, so INP001 (implicit-namespace-package,
+# which would demand an examples/__init__.py) does not apply.
+lint.per-file-ignores."examples/*" = ["INP001"]
+
+[tool.typos.default.extend-words]

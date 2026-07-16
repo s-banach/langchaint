@@ -249,7 +249,6 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     ]
     reasoning_trace = assistant_message.turn[0]
     assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.provider_name == "openai_responses"
     assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
     assert assistant_message.text == "hey"
     assert assistant_message.tool_calls == (
@@ -300,24 +299,20 @@ def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder(
         "encrypted_content": "enc-1",
         "field_newer_than_sdk": "x",
     }
-    assistant_message = AssistantMessage(
-        turn=(ReasoningTrace(provider_name="openai_responses", reasoning=reasoning),)
-    )
+    assistant_message = AssistantMessage(turn=(ReasoningTrace(reasoning=reasoning),))
     assert _assistant_items(assistant_message) == [reasoning]
 
 
-def test_foreign_reasoning_is_dropped_without_error() -> None:
-    """An anthropic-tagged trace emits nothing here, so cross-provider replay degrades instead of erroring."""
+def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
+    """An anthropic-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
+    reasoning: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
     assistant_message = AssistantMessage(
-        turn=(
-            ReasoningTrace(
-                provider_name="anthropic_messages",
-                reasoning={"type": "thinking", "thinking": "t", "signature": "s"},
-            ),
-            TextPart(text="hi"),
-        )
+        turn=(ReasoningTrace(reasoning=reasoning), TextPart(text="hi"))
     )
-    assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hi"}]
+    assert _assistant_items(assistant_message) == [
+        reasoning,
+        {"role": "assistant", "content": "hi"},
+    ]
 
 
 def test_provider_result_normalizes_a_response_with_usage() -> None:

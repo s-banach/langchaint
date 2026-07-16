@@ -161,17 +161,14 @@ def _tool_result_content(
     return [_part_block(part) for part in content]
 
 
-def _is_native_reasoning_trace(reasoning_trace: ReasoningTrace) -> bool:
-    """Whether this adapter produced the trace and can re-feed it; a foreign trace is dropped on consume."""
-    return reasoning_trace.provider_name == AnthropicMessagesProvider.name
-
-
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
     """Convert one AssistantMessage to wire blocks in turn order.
 
-    A native ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
-    because the API rejects a tool-use continuation whose latest thinking block was modified;
-    a foreign trace is dropped so a conversation replayed through another provider degrades instead of erroring.
+    A ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    because the API rejects a tool-use continuation whose latest thinking block was modified.
+    A trace another provider produced goes to the wire the same way and the API rejects its
+    unknown type key, so a conversation replayed through the wrong provider fails loudly;
+    switching providers means first rebuilding concluded assistant turns without their traces.
     An empty TextPart is skipped because the API rejects empty text blocks.
 
     Raises:
@@ -191,9 +188,11 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
                     input=json.loads(element.args_json),
                 )
             )
-        elif _is_native_reasoning_trace(element):
-            # The dict is this adapter's own SDK block's model_dump, so its shape is the wire
-            # param's by construction; reconstructing it field by field would risk the exact
+        elif isinstance(element, ReasoningTrace):
+            # The dict is the producing SDK block's model_dump; when this adapter produced it,
+            # its shape is the wire param's by construction, and when another provider did,
+            # the API rejects the unknown type key (the loud failure the docstring states).
+            # Reconstructing it field by field would risk the exact
             # byte-level change the API rejects. The shallow copy keeps the wire path
             # (which mutates blocks to place cache breakpoints) from ever writing into the
             # frozen message's stored payload.
@@ -310,10 +309,7 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
             )
         elif block.type in ("thinking", "redacted_thinking"):
             turn.append(
-                ReasoningTrace(
-                    provider_name=AnthropicMessagesProvider.name,
-                    reasoning=block.model_dump(mode="python", exclude_none=True),
-                )
+                ReasoningTrace(reasoning=block.model_dump(mode="python", exclude_none=True))
             )
     return AssistantMessage(turn=tuple(turn))
 

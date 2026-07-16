@@ -248,7 +248,6 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     ]
     reasoning_trace = assistant_message.turn[0]
     assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.provider_name == "anthropic_messages"
     assert reasoning_trace.reasoning == {
         "type": "thinking",
         "thinking": "check first",
@@ -293,21 +292,20 @@ def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder(
         "signature": "s",
         "field_newer_than_sdk": "x",
     }
-    assistant_message = AssistantMessage(
-        turn=(ReasoningTrace(provider_name="anthropic_messages", reasoning=reasoning),)
-    )
+    assistant_message = AssistantMessage(turn=(ReasoningTrace(reasoning=reasoning),))
     assert _assistant_content_blocks(assistant_message) == [reasoning]
 
 
-def test_foreign_reasoning_is_dropped_without_error() -> None:
-    """An openai-tagged trace emits nothing here, so cross-provider replay degrades instead of erroring."""
+def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
+    """An openai-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
+    reasoning = {"type": "reasoning", "id": "rs_1"}
     assistant_message = AssistantMessage(
-        turn=(
-            ReasoningTrace(provider_name="openai_responses", reasoning={"type": "reasoning", "id": "rs_1"}),
-            TextPart(text="hi"),
-        )
+        turn=(ReasoningTrace(reasoning=reasoning), TextPart(text="hi"))
     )
-    assert _assistant_content_blocks(assistant_message) == [{"type": "text", "text": "hi"}]
+    assert _assistant_content_blocks(assistant_message) == [
+        reasoning,
+        {"type": "text", "text": "hi"},
+    ]
 
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:

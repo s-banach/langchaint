@@ -29,8 +29,7 @@ def test_conversation_round_trips_through_json_preserving_types() -> None:
         AssistantMessage(
             turn=(
                 ReasoningTrace(
-                    provider_name="anthropic_messages",
-                    reasoning={"type": "thinking", "thinking": "check first", "signature": "sig"},
+                    reasoning={"type": "thinking", "thinking": "check first", "signature": "sig"}
                 ),
                 TextPart(text="Checking."),
                 ToolCall(id="c1", name="probe", args_json='{"step": 1}'),
@@ -70,7 +69,7 @@ def test_turn_elements_validate_by_field_match() -> None:
     message = AssistantMessage.model_validate({
         "role": "assistant",
         "turn": [
-            {"provider_name": "openai_responses", "reasoning": {"type": "reasoning", "id": "rs_1"}},
+            {"reasoning": {"type": "reasoning", "id": "rs_1"}},
             {"text": "hi"},
             {"id": "c1", "name": "probe", "args_json": "{}"},
         ],

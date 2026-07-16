@@ -85,17 +85,17 @@ class ReasoningTrace(BaseModel):
     """One reasoning element the model produced, round-tripped verbatim.
 
     The core never inspects reasoning: reasoning is the producing SDK item's
-    model_dump(mode="python", exclude_none=True), and the producing adapter re-feeds that dict
+    model_dump(mode="python", exclude_none=True), and the consuming adapter re-feeds that dict
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
     thinking block; OpenAI re-reads encrypted_content).
-    provider_name is the producing adapter's Provider.name and names the only adapter that can
-    re-feed this trace; a foreign adapter drops it.
+    Only the producing provider can accept the dict: replaying it through another provider is a
+    malformed request that provider rejects, so switching providers means first rebuilding
+    concluded assistant turns without their traces.
     The dict field makes this model unhashable, unlike its frozen siblings; messages are never hashed.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    provider_name: str
     reasoning: Mapping[str, object]
 
 

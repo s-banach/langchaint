@@ -32,7 +32,7 @@ Mapping decisions:
 - The bound system prompt travels as the `instructions` parameter, not as an input item.
 - An AssistantMessage re-feeds its turn elements in emission order,
   which the API requires for replay under store=False:
-  a kept ReasoningTrace is its reasoning item re-sent unchanged, a ToolCall one `function_call` item,
+  a ReasoningTrace is its reasoning item re-sent unchanged, a ToolCall one `function_call` item,
   and a maximal run of adjacent TextParts one assistant message item;
   ToolMessage becomes a `function_call_output` item keyed by call_id.
   The API has no is_error flag, so the error text in output is the only error signal.
@@ -188,11 +188,6 @@ def _function_call_output(content: str | tuple[Part, ...]) -> str | ResponseFunc
     return output_content
 
 
-def _is_native_reasoning_trace(reasoning_trace: ReasoningTrace) -> bool:
-    """Whether this adapter produced the trace and can re-feed it; a foreign trace is dropped on consume."""
-    return reasoning_trace.provider_name == OpenAIResponsesProvider.name
-
-
 def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
     """Convert one AssistantMessage to its input items in turn order.
 
@@ -201,9 +196,11 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
     each ToolCall becomes a function_call item keyed by call_id,
     which the paired ToolMessage's function_call_output references.
-    A native ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
-    so encrypted_content replays byte-identical;
-    a foreign trace is dropped so a conversation replayed through another provider degrades instead of erroring.
+    A ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    so encrypted_content replays byte-identical.
+    A trace another provider produced goes to the wire the same way and the API rejects its
+    unknown type key, so a conversation replayed through the wrong provider fails loudly;
+    switching providers means first rebuilding concluded assistant turns without their traces.
     """
     items: list[ResponseInputItemParam] = []
     pending_texts: list[str] = []
@@ -227,10 +224,12 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
                 "arguments": element.args_json,
             }
             items.append(function_call_item)
-        elif _is_native_reasoning_trace(element):
+        elif isinstance(element, ReasoningTrace):
             flush_text_run()
-            # The dict is this adapter's own SDK item's model_dump, so its shape is the wire
-            # param's by construction; reconstructing it field by field would risk changing the
+            # The dict is the producing SDK item's model_dump; when this adapter produced it,
+            # its shape is the wire param's by construction, and when another provider did,
+            # the API rejects the unknown type key (the loud failure the docstring states).
+            # Reconstructing it field by field would risk changing the
             # payload the API re-reads. The shallow copy keeps the wire path from ever aliasing
             # the frozen message's stored payload into a mutable request structure.
             items.append(cast("ResponseReasoningItemParam", dict(element.reasoning)))
@@ -324,10 +323,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     for item in response.output:
         if item.type == "reasoning":
             turn.append(
-                ReasoningTrace(
-                    provider_name=OpenAIResponsesProvider.name,
-                    reasoning=item.model_dump(mode="python", exclude_none=True),
-                )
+                ReasoningTrace(reasoning=item.model_dump(mode="python", exclude_none=True))
             )
         elif item.type == "function_call":
             turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))

@@ -22,10 +22,12 @@ from langchaint.messages import (
     Message,
     MessageContent,
     Part,
+    ReasoningTrace,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
+    TurnElement,
     UserMessage,
 )
 from langchaint.provider import (
@@ -70,6 +72,7 @@ __all__ = [
     "PricingTable",
     "RateLimiter",
     "ReasoningEffort",
+    "ReasoningTrace",
     "RefusalError",
     "Response",
     "RetriesExhaustedError",
@@ -88,6 +91,7 @@ __all__ = [
     "ToolOutput",
     "ToolOutputExplicit",
     "TransientError",
+    "TurnElement",
     "Usage",
     "UserMessage",
     "to_row",

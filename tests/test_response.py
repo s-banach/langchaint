@@ -19,6 +19,7 @@ from langchaint import (
     RefusalError,
     Response,
     RetriesExhaustedError,
+    TextPart,
     TransientError,
     Usage,
     to_row,
@@ -68,7 +69,7 @@ def _response[OutputT](
         elapsed_seconds=1.5,
         raw=_Raw(),
         stop_reason="end_turn",
-        assistant_message=AssistantMessage(content=str(output)),
+        assistant_message=AssistantMessage(turn=(TextPart(text=str(output)),)),
     )
 
 

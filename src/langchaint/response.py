@@ -31,9 +31,10 @@ class Response[OutputT]:
     output is the assistant text, or the SDK-parsed response_format instance.
     attempt_records holds one AttemptRecord per request sent, in order;
     every record but the last failed and the last succeeded, and attempts is derived from the records.
-    assistant_message is the adapter-built turn exactly as the provider produced it (text part structure preserved),
+    assistant_message is the adapter-built turn exactly as the provider produced it,
+    the whole ordered turn (reasoning, text, and tool calls in emission order),
     held by reference for appending to a conversation.
-    Rebuilding it from output and tool_calls is lossy (it collapses multi-part text to one string)
+    Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
     and is the rewrap this field exists to prevent.
     raw is the SDK's own response model, held by reference (no dump, no copy; call raw.model_dump() for a dict);
     on streams it comes from the SDK-assembled final message.

@@ -28,6 +28,7 @@ from langchaint import (
     RetriesExhaustedError,
     StreamItem,
     StreamProtocolError,
+    TextPart,
     ToolCall,
     TransientError,
     Usage,
@@ -90,7 +91,7 @@ def _success_result(content: str) -> ProviderResult[str]:
     """Build a successful text ProviderResult carrying the given content."""
     return ProviderResult(
         output=content,
-        assistant_message=AssistantMessage(content=content),
+        assistant_message=AssistantMessage(turn=(TextPart(text=content),)),
         usage=_USAGE,
         cost_in_usd=0.0,
         stop_reason="end_turn",
@@ -124,7 +125,7 @@ class _FakeStream(ProviderStream[str]):
         """Return the assembled result the SDK would produce."""
         return ProviderResult(
             output="ab",
-            assistant_message=AssistantMessage(content="ab"),
+            assistant_message=AssistantMessage(turn=(TextPart(text="ab"),)),
             usage=_USAGE,
             cost_in_usd=0.001,
             stop_reason="end_turn",

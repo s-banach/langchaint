@@ -46,6 +46,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     PricingTable,
+    ReasoningTrace,
     RefusalError,
     SpecificTool,
     StreamItem,
@@ -57,8 +58,10 @@ from langchaint import (
 from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.openai import OpenAIResponsesProvider
 from langchaint.openai.responses_provider import (
+    _assistant_items,
     _assistant_message_from,
     _BoundOpenAIStructured,
+    _BoundOpenAIText,
     _cost_in_usd,
     _normalized_stop_reason,
     _normalized_usage,
@@ -90,6 +93,13 @@ _FUNCTION_CALL_OUTPUT_ITEM = {
     "call_id": "call1",
     "name": "lookup",
     "arguments": '{"q": 1}',
+}
+
+_REASONING_OUTPUT_ITEM: dict[str, object] = {
+    "type": "reasoning",
+    "id": "rs_1",
+    "summary": [],
+    "encrypted_content": "enc-1",
 }
 
 
@@ -221,6 +231,95 @@ def test_assistant_message_collects_text_and_tool_calls() -> None:
     )
 
 
+def test_reasoning_round_trips_verbatim_in_position() -> None:
+    """A reasoning item round-trips verbatim and in its original position.
+
+    Produce yields one ReasoningTrace where the reasoning item sat.
+    Consume re-emits the stored dict unchanged, in the same position, with one input item per modeled output item.
+    """
+    response = _response(
+        usage=None,
+        output=[_REASONING_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM],
+    )
+    assistant_message = _assistant_message_from(response)
+    assert [type(element) for element in assistant_message.turn] == [
+        ReasoningTrace,
+        TextPart,
+        ToolCall,
+    ]
+    reasoning_trace = assistant_message.turn[0]
+    assert isinstance(reasoning_trace, ReasoningTrace)
+    assert reasoning_trace.provider_name == "openai_responses"
+    assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
+    assert assistant_message.text == "hey"
+    assert assistant_message.tool_calls == (
+        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    )
+    items = _assistant_items(assistant_message)
+    assert len(items) == len(response.output)
+    assert items[0] == reasoning_trace.reasoning
+    assert items[1] == {"role": "assistant", "content": "hey"}
+    assert items[2] == {
+        "type": "function_call",
+        "call_id": "call1",
+        "name": "lookup",
+        "arguments": '{"q": 1}',
+    }
+
+
+def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
+    """A message item with two text parts yields two adjacent TextParts.
+
+    On consume, the maximal adjacent run re-joins into one assistant message item.
+    """
+    two_part_message: dict[str, object] = {
+        "type": "message",
+        "id": "m1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {"type": "output_text", "text": "he", "annotations": []},
+            {"type": "output_text", "text": "y", "annotations": []},
+        ],
+    }
+    assistant_message = _assistant_message_from(_response(usage=None, output=[two_part_message]))
+    assert assistant_message.turn == (TextPart(text="he"), TextPart(text="y"))
+    assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
+
+
+def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder() -> None:
+    """A stored dict carrying a field newer than the installed SDK param re-emits unchanged.
+
+    A consume step that reshaped the dict to the pinned param keys would corrupt the payload
+    the API re-reads across an SDK upgrade.
+    """
+    reasoning: dict[str, object] = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "enc-1",
+        "field_newer_than_sdk": "x",
+    }
+    assistant_message = AssistantMessage(
+        turn=(ReasoningTrace(provider_name="openai_responses", reasoning=reasoning),)
+    )
+    assert _assistant_items(assistant_message) == [reasoning]
+
+
+def test_foreign_reasoning_is_dropped_without_error() -> None:
+    """An anthropic-tagged trace emits nothing here, so cross-provider replay degrades instead of erroring."""
+    assistant_message = AssistantMessage(
+        turn=(
+            ReasoningTrace(
+                provider_name="anthropic_messages",
+                reasoning={"type": "thinking", "thinking": "t", "signature": "s"},
+            ),
+            TextPart(text="hi"),
+        )
+    )
+    assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hi"}]
+
+
 def test_provider_result_normalizes_a_response_with_usage() -> None:
     """A response with usage yields the normalized partition, cost, and stop reason.
 
@@ -248,8 +347,10 @@ def test_wire_input_converts_each_message_kind() -> None:
     wire = _wire_input([
         UserMessage(content="q"),
         AssistantMessage(
-            content="thinking",
-            tool_calls=(ToolCall(id="call1", name="lookup", args_json="{}"),),
+            turn=(
+                TextPart(text="thinking"),
+                ToolCall(id="call1", name="lookup", args_json="{}"),
+            ),
         ),
         ToolMessage(tool_call_id="call1", content="r"),
     ])
@@ -503,6 +604,25 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
     asyncio.run(scenario())
 
 
+def test_stream_final_turn_carries_reasoning() -> None:
+    """final()'s assistant turn includes the ReasoningTrace from the terminal response's output."""
+
+    async def scenario() -> None:
+        adapter_stream = _stream([
+            _completed_event(
+                _response(usage=None, output=[_REASONING_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM]), 1
+            ),
+        ])
+        async for _item in adapter_stream.items():
+            pass
+        result = await adapter_stream.final()
+        reasoning_trace = result.assistant_message.turn[0]
+        assert isinstance(reasoning_trace, ReasoningTrace)
+        assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
+
+    asyncio.run(scenario())
+
+
 def test_stream_failed_terminal_is_terminal() -> None:
     """A failed terminal is terminal: no StreamProtocolError, and final() reports other."""
 
@@ -627,6 +747,54 @@ def test_structured_bind_raises_truncation_on_a_max_output_tokens_incomplete() -
         )
     assert raised.value.stop_reason == "max_tokens"
     assert raised.value.cost_in_usd > 0.0
+
+
+def test_every_request_carries_the_reasoning_include(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create, parse, and stream (text and structured) all send include=["reasoning.encrypted_content"].
+
+    The offline round-trip tests cannot catch a dropped include:
+    the API populates encrypted_content only when asked,
+    so without this parameter every replayed reasoning item would be silently empty.
+    """
+    provider = _provider()
+    request = provider._request(_binding(automatic_prompt_caching=True))
+    includes: list[object] = []
+
+    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
+        includes.append(request_kwargs["include"])
+        return _response(usage=None)
+
+    async def fake_parse(**request_kwargs: object) -> ParsedResponse[_StructuredReport]:
+        includes.append(request_kwargs["include"])
+        return _parsed_response(_StructuredReport(city="Nairobi", celsius=25))
+
+    class _FakeStreamManager:
+        async def __aenter__(self) -> _FakeSDKStream:
+            return _FakeSDKStream([])
+
+    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
+        includes.append(request_kwargs["include"])
+        return _FakeStreamManager()
+
+    monkeypatch.setattr(provider.client.responses, "create", fake_create)
+    monkeypatch.setattr(provider.client.responses, "parse", fake_parse)
+    monkeypatch.setattr(provider.client.responses, "stream", fake_stream)
+    text_bound = _BoundOpenAIText(adapter=provider, request=request)
+    structured_bound = _BoundOpenAIStructured(
+        adapter=provider, request=request, response_format=_StructuredReport
+    )
+
+    async def scenario() -> None:
+        conversation = [UserMessage(content="q")]
+        await text_bound.send(conversation)
+        await text_bound.open_stream(conversation)
+        await structured_bound.send(conversation)
+        await structured_bound.open_stream(conversation)
+
+    asyncio.run(scenario())
+    assert includes == [["reasoning.encrypted_content"]] * 4
 
 
 def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:

@@ -24,10 +24,16 @@ Verified against openai 2.45.0:
 - The API stores responses server-side for later retrieval by default;
   the adapter always sends `store=False` because conversation state is the caller's conversation argument,
   and a stored copy would be an unused side effect.
+- The adapter sends `include=["reasoning.encrypted_content"]` on every request,
+  so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`;
+  `store=False` alone leaves `encrypted_content` None and the replayed reasoning would be empty.
 
 Mapping decisions:
 - The bound system prompt travels as the `instructions` parameter, not as an input item.
-- An AssistantMessage becomes an assistant message item plus one `function_call` item per tool call;
+- An AssistantMessage re-feeds its turn elements in emission order,
+  which the API requires for replay under store=False:
+  a kept ReasoningTrace is its reasoning item re-sent unchanged, a ToolCall one `function_call` item,
+  and a maximal run of adjacent TextParts one assistant message item;
   ToolMessage becomes a `function_call_output` item keyed by call_id.
   The API has no is_error flag, so the error text in output is the only error signal.
 - ImagePart becomes an `input_image` item with a data: URI and `detail="auto"`.
@@ -42,7 +48,7 @@ Mapping decisions:
 import base64
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, override
+from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 import openai
 from openai import AsyncBedrockOpenAI, AsyncOpenAI, Omit, omit
@@ -51,6 +57,7 @@ from openai.types.responses import (
     EasyInputMessageParam,
     FunctionToolParam,
     ResponseFunctionToolCallParam,
+    ResponseIncludable,
     ResponseInputMessageContentListParam,
     ResponseUsage,
     ToolChoiceFunctionParam,
@@ -68,6 +75,9 @@ from openai.types.responses.response_input_param import (
 from openai.types.shared_params.reasoning import Reasoning
 from pydantic import BaseModel
 
+if TYPE_CHECKING:
+    from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
+
 from langchaint.exceptions import (
     ExceededMaxCompletionTokensError,
     RefusalError,
@@ -79,10 +89,12 @@ from langchaint.messages import (
     ImagePart,
     Message,
     Part,
+    ReasoningTrace,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
+    TurnElement,
     UserMessage,
 )
 from langchaint.provider import (
@@ -113,6 +125,9 @@ class _OpenAIRequest:
     (never **kwargs) keeps the SDK's overload resolution intact.
     instructions is the bound system prompt; the API takes it as a parameter, not an input item.
     tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
+    include is always ["reasoning.encrypted_content"]:
+    the adapter re-feeds the whole conversation every turn, so every response's reasoning items
+    must carry the payload a later request replays.
     """
 
     model: str
@@ -123,6 +138,7 @@ class _OpenAIRequest:
     tool_choice: _WireToolChoice | Omit
     parallel_tool_calls: bool | Omit
     prompt_cache_options: PromptCacheOptions | Omit
+    include: list[ResponseIncludable]
 
 
 def _image_data_uri(image_part: ImagePart) -> str:
@@ -172,23 +188,53 @@ def _function_call_output(content: str | tuple[Part, ...]) -> str | ResponseFunc
     return output_content
 
 
-def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
-    """Convert one AssistantMessage to its input items.
+def _is_native_reasoning_trace(reasoning_trace: ReasoningTrace) -> bool:
+    """Whether this adapter produced the trace and can re-feed it; a foreign trace is dropped on consume."""
+    return reasoning_trace.provider_name == OpenAIResponsesProvider.name
 
-    The text becomes an assistant message item; each tool call becomes a function_call item keyed by call_id,
+
+def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
+    """Convert one AssistantMessage to its input items in turn order.
+
+    The API requires the original item order for replay under store=False.
+    A maximal run of adjacent TextParts becomes one assistant message item whose content joins their texts
+    (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
+    each ToolCall becomes a function_call item keyed by call_id,
     which the paired ToolMessage's function_call_output references.
+    A native ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    so encrypted_content replays byte-identical;
+    a foreign trace is dropped so a conversation replayed through another provider degrades instead of erroring.
     """
     items: list[ResponseInputItemParam] = []
-    if assistant_message.text:
-        items.append({"role": "assistant", "content": assistant_message.text})
-    for tool_call in assistant_message.tool_calls:
-        function_call_item: ResponseFunctionToolCallParam = {
-            "type": "function_call",
-            "call_id": tool_call.id,
-            "name": tool_call.name,
-            "arguments": tool_call.args_json,
-        }
-        items.append(function_call_item)
+    pending_texts: list[str] = []
+
+    def flush_text_run() -> None:
+        """Emit the buffered adjacent TextParts as one assistant message item."""
+        if pending_texts:
+            items.append({"role": "assistant", "content": "".join(pending_texts)})
+            pending_texts.clear()
+
+    for element in assistant_message.turn:
+        if isinstance(element, TextPart):
+            if element.text:
+                pending_texts.append(element.text)
+        elif isinstance(element, ToolCall):
+            flush_text_run()
+            function_call_item: ResponseFunctionToolCallParam = {
+                "type": "function_call",
+                "call_id": element.id,
+                "name": element.name,
+                "arguments": element.args_json,
+            }
+            items.append(function_call_item)
+        elif _is_native_reasoning_trace(element):
+            flush_text_run()
+            # The dict is this adapter's own SDK item's model_dump, so its shape is the wire
+            # param's by construction; reconstructing it field by field would risk changing the
+            # payload the API re-reads. The shallow copy keeps the wire path from ever aliasing
+            # the frozen message's stored payload into a mutable request structure.
+            items.append(cast("ResponseReasoningItemParam", dict(element.reasoning)))
+    flush_text_run()
     return items
 
 
@@ -267,17 +313,31 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
 
 
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
-    """Build the package assistant turn from the output items.
+    """Build the package assistant turn from the output items, item order preserved.
 
-    output_text concatenates the message items' text parts; output items other than messages and function calls
-    (reasoning, built-in tool calls) are dropped.
+    A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay;
+    a message item becomes one TextPart per output_text content part it holds, in their order
+    (a refusal content part is not a TextPart and is not captured);
+    built-in tool call items are dropped (built-in tools are out of scope).
     """
-    tool_calls = tuple(
-        ToolCall(id=item.call_id, name=item.name, args_json=item.arguments)
-        for item in response.output
-        if item.type == "function_call"
-    )
-    return AssistantMessage(content=response.output_text, tool_calls=tool_calls)
+    turn: list[TurnElement] = []
+    for item in response.output:
+        if item.type == "reasoning":
+            turn.append(
+                ReasoningTrace(
+                    provider_name=OpenAIResponsesProvider.name,
+                    reasoning=item.model_dump(mode="python", exclude_none=True),
+                )
+            )
+        elif item.type == "function_call":
+            turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
+        elif item.type == "message":
+            turn.extend(
+                TextPart(text=content_part.text)
+                for content_part in item.content
+                if content_part.type == "output_text"
+            )
+    return AssistantMessage(turn=tuple(turn))
 
 
 def _normalized_usage(usage: ResponseUsage) -> Usage:
@@ -389,6 +449,7 @@ class OpenAIResponsesProvider(Provider):
             prompt_cache_options=(
                 omit if binding.automatic_prompt_caching else PromptCacheOptions(mode="explicit")
             ),
+            include=["reasoning.encrypted_content"],
         )
 
     @override
@@ -528,6 +589,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            include=self._request.include,
             store=False,
             input=_wire_input(conversation),
         )
@@ -549,6 +611,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            include=self._request.include,
             store=False,
             input=_wire_input(conversation),
         )
@@ -632,6 +695,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            include=self._request.include,
             store=False,
             input=_wire_input(conversation),
             text_format=self._response_format,
@@ -654,6 +718,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            include=self._request.include,
             store=False,
             input=_wire_input(conversation),
             text_format=self._response_format,

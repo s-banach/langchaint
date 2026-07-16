@@ -27,7 +27,7 @@ import base64
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, override
+from typing import Any, Literal, cast, override
 
 import anthropic
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, Omit, omit
@@ -38,7 +38,9 @@ from anthropic.types import (
     MessageParam,
     OutputConfigParam,
     ParsedMessage,
+    RedactedThinkingBlockParam,
     TextBlockParam,
+    ThinkingBlockParam,
     ToolChoiceParam,
     ToolParam,
     ToolResultBlockParam,
@@ -57,10 +59,12 @@ from langchaint.messages import (
     AssistantMessage,
     Message,
     Part,
+    ReasoningTrace,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
+    TurnElement,
     UserMessage,
 )
 from langchaint.provider import (
@@ -80,7 +84,12 @@ from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
 type _ContentBlockParam = (
-    TextBlockParam | ImageBlockParam | ToolUseBlockParam | ToolResultBlockParam
+    TextBlockParam
+    | ImageBlockParam
+    | ToolUseBlockParam
+    | ToolResultBlockParam
+    | ThinkingBlockParam
+    | RedactedThinkingBlockParam
 )
 
 type _AnthropicImageMediaType = Literal["image/gif", "image/jpeg", "image/png", "image/webp"]
@@ -152,29 +161,45 @@ def _tool_result_content(
     return [_part_block(part) for part in content]
 
 
+def _is_native_reasoning_trace(reasoning_trace: ReasoningTrace) -> bool:
+    """Whether this adapter produced the trace and can re-feed it; a foreign trace is dropped on consume."""
+    return reasoning_trace.provider_name == AnthropicMessagesProvider.name
+
+
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
-    """Convert one AssistantMessage to wire blocks, text before tool calls.
+    """Convert one AssistantMessage to wire blocks in turn order.
+
+    A native ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    because the API rejects a tool-use continuation whose latest thinking block was modified;
+    a foreign trace is dropped so a conversation replayed through another provider degrades instead of erroring.
+    An empty TextPart is skipped because the API rejects empty text blocks.
 
     Raises:
         json.JSONDecodeError: a tool_call.args_json is not valid JSON.
     """
     blocks: list[_ContentBlockParam] = []
-    if isinstance(assistant_message.content, str):
-        if assistant_message.content:
-            blocks.append({"type": "text", "text": assistant_message.content})
-    else:
-        blocks.extend(
-            TextBlockParam(type="text", text=part.text) for part in assistant_message.content
-        )
-    blocks.extend(
-        ToolUseBlockParam(
-            type="tool_use",
-            id=tool_call.id,
-            name=tool_call.name,
-            input=json.loads(tool_call.args_json),
-        )
-        for tool_call in assistant_message.tool_calls
-    )
+    for element in assistant_message.turn:
+        if isinstance(element, TextPart):
+            if element.text:
+                blocks.append(TextBlockParam(type="text", text=element.text))
+        elif isinstance(element, ToolCall):
+            blocks.append(
+                ToolUseBlockParam(
+                    type="tool_use",
+                    id=element.id,
+                    name=element.name,
+                    input=json.loads(element.args_json),
+                )
+            )
+        elif _is_native_reasoning_trace(element):
+            # The dict is this adapter's own SDK block's model_dump, so its shape is the wire
+            # param's by construction; reconstructing it field by field would risk the exact
+            # byte-level change the API rejects. The shallow copy keeps the wire path
+            # (which mutates blocks to place cache breakpoints) from ever writing into the
+            # frozen message's stored payload.
+            blocks.append(
+                cast("ThinkingBlockParam | RedactedThinkingBlockParam", dict(element.reasoning))
+            )
     return blocks
 
 
@@ -185,6 +210,8 @@ def _wire_messages(
 
     With automatic_prompt_caching, places the per-request cache breakpoint on the last content block,
     so the cached span grows with the conversation.
+    A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
+    so that request writes none.
 
     Raises:
         AbortBatchError: an image part's media_type is outside the API's set (from _part_block).
@@ -217,7 +244,9 @@ def _wire_messages(
     if automatic_prompt_caching and wire:
         last_blocks = wire[-1][1]
         if last_blocks:
-            last_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+            last_block = last_blocks[-1]
+            if last_block["type"] != "thinking" and last_block["type"] != "redacted_thinking":
+                last_block["cache_control"] = {"type": "ephemeral"}
     return [MessageParam(role=role, content=blocks) for role, blocks in wire]
 
 
@@ -266,19 +295,27 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
 
 
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
-    """Build the package assistant turn from the SDK message.
+    """Build the package assistant turn from the SDK message, block order preserved.
 
-    Blocks other than text and tool_use (thinking, server tool results) are dropped.
+    A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
+    model_dump for verbatim replay; server tool blocks are dropped (built-in tools are out of scope).
     """
-    text_parts = tuple(
-        TextPart(text=block.text) for block in message.content if block.type == "text"
-    )
-    tool_calls = tuple(
-        ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
-        for block in message.content
-        if block.type == "tool_use"
-    )
-    return AssistantMessage(content=text_parts, tool_calls=tool_calls)
+    turn: list[TurnElement] = []
+    for block in message.content:
+        if block.type == "text":
+            turn.append(TextPart(text=block.text))
+        elif block.type == "tool_use":
+            turn.append(
+                ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
+            )
+        elif block.type in ("thinking", "redacted_thinking"):
+            turn.append(
+                ReasoningTrace(
+                    provider_name=AnthropicMessagesProvider.name,
+                    reasoning=block.model_dump(mode="python", exclude_none=True),
+                )
+            )
+    return AssistantMessage(turn=tuple(turn))
 
 
 def _normalized_usage(usage: anthropic.types.Usage) -> Usage:

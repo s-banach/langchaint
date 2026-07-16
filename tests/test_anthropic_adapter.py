@@ -32,6 +32,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     PricingTable,
+    ReasoningTrace,
     RefusalError,
     SpecificTool,
     StreamItem,
@@ -45,6 +46,8 @@ from langchaint import (
 from langchaint.anthropic import AnthropicMessagesProvider
 from langchaint.anthropic.messages_provider import (
     _AnthropicStream,
+    _assistant_content_blocks,
+    _assistant_message_from,
     _BoundAnthropicStructured,
     _cost_in_usd,
     _normalized_stop_reason,
@@ -213,13 +216,109 @@ def test_provider_result_extracts_text_and_tool_use() -> None:
     assert result.raw is message
 
 
+def _message_with_content(content: list[at.ContentBlock]) -> at.Message:
+    """Build an SDK message carrying the given content blocks."""
+    return at.Message(
+        id="msg_1",
+        content=content,
+        model="claude-sonnet-5",
+        role="assistant",
+        stop_reason="tool_use",
+        type="message",
+        usage=at.Usage(input_tokens=1, output_tokens=1),
+    )
+
+
+def test_reasoning_round_trips_verbatim_in_position() -> None:
+    """A thinking block round-trips verbatim and in its original position.
+
+    Produce yields one ReasoningTrace where the thinking block sat.
+    Consume re-emits the stored dict unchanged, in the same position, with one wire block per modeled block.
+    """
+    message = _message_with_content([
+        at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
+        at.TextBlock(type="text", text="hello"),
+        at.ToolUseBlock(type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}),
+    ])
+    assistant_message = _assistant_message_from(message)
+    assert [type(element) for element in assistant_message.turn] == [
+        ReasoningTrace,
+        TextPart,
+        ToolCall,
+    ]
+    reasoning_trace = assistant_message.turn[0]
+    assert isinstance(reasoning_trace, ReasoningTrace)
+    assert reasoning_trace.provider_name == "anthropic_messages"
+    assert reasoning_trace.reasoning == {
+        "type": "thinking",
+        "thinking": "check first",
+        "signature": "sig-1",
+    }
+    assert assistant_message.text == "hello"
+    assert assistant_message.tool_calls == (
+        ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
+    )
+    blocks = _assistant_content_blocks(assistant_message)
+    assert len(blocks) == len(message.content)
+    assert blocks[0] == reasoning_trace.reasoning
+    assert blocks[1] == {"type": "text", "text": "hello"}
+    assert blocks[2] == {
+        "type": "tool_use",
+        "id": "tu_1",
+        "name": "get_weather",
+        "input": {"city": "Nairobi"},
+    }
+
+
+def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
+    """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire."""
+    message = _message_with_content([
+        at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes")
+    ])
+    assistant_message = _assistant_message_from(message)
+    assert _assistant_content_blocks(assistant_message) == [
+        {"type": "redacted_thinking", "data": "opaque-bytes"}
+    ]
+
+
+def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder() -> None:
+    """A stored dict carrying a field newer than the installed SDK param re-emits unchanged.
+
+    A consume step that reshaped the dict to the pinned param keys would modify the thinking block
+    across an SDK upgrade, which the API rejects on a tool-use continuation.
+    """
+    reasoning = {
+        "type": "thinking",
+        "thinking": "t",
+        "signature": "s",
+        "field_newer_than_sdk": "x",
+    }
+    assistant_message = AssistantMessage(
+        turn=(ReasoningTrace(provider_name="anthropic_messages", reasoning=reasoning),)
+    )
+    assert _assistant_content_blocks(assistant_message) == [reasoning]
+
+
+def test_foreign_reasoning_is_dropped_without_error() -> None:
+    """An openai-tagged trace emits nothing here, so cross-provider replay degrades instead of erroring."""
+    assistant_message = AssistantMessage(
+        turn=(
+            ReasoningTrace(provider_name="openai_responses", reasoning={"type": "reasoning", "id": "rs_1"}),
+            TextPart(text="hi"),
+        )
+    )
+    assert _assistant_content_blocks(assistant_message) == [{"type": "text", "text": "hi"}]
+
+
 def test_wire_messages_groups_consecutive_tool_results() -> None:
     """Consecutive ToolMessages collapse into one user message of tool_result blocks."""
     conversation = [
         UserMessage(content="hi"),
         AssistantMessage(
-            content="checking",
-            tool_calls=(ToolCall(id="tu_1", name="t", args_json='{"a": 1}'),),
+            turn=(
+                TextPart(text="checking"),
+                ToolCall(id="tu_1", name="t", args_json='{"a": 1}'),
+            ),
         ),
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
@@ -242,6 +341,26 @@ def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
     tool_results = _content_blocks(wire[0])
     assert tool_results[-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in tool_results[0]
+
+
+def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
+    """A conversation ending on a thinking block writes no breakpoint that request.
+
+    The thinking wire params carry no cache_control key, so the marker has nowhere valid to go.
+    """
+    conversation = [
+        AssistantMessage(
+            turn=(
+                TextPart(text="t"),
+                ReasoningTrace(
+                    provider_name="anthropic_messages",
+                    reasoning={"type": "thinking", "thinking": "x", "signature": "s"},
+                ),
+            )
+        )
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=True)
+    assert all("cache_control" not in block for block in _content_blocks(wire[0]))
 
 
 def test_wire_messages_writes_no_breakpoint_when_caching_disabled() -> None:
@@ -415,12 +534,18 @@ class _FakeSDKMessageStream(AsyncMessageStream[None]):
     def current_message_snapshot(self) -> ParsedMessage[None]:
         return self._message_snapshot
 
+    @override
+    async def get_final_message(self) -> ParsedMessage[None]:
+        return self._message_snapshot
 
-def _message_snapshot(stop_reason: at.StopReason | None) -> ParsedMessage[None]:
+
+def _message_snapshot(
+    stop_reason: at.StopReason | None, content: list[at.ContentBlock] | None = None
+) -> ParsedMessage[None]:
     """Build the accumulated message the SDK stream would hold after draining."""
     message = at.Message(
         id="msg_1",
-        content=[],
+        content=content if content is not None else [],
         model="claude-sonnet-4-5",
         role="assistant",
         stop_reason=stop_reason,
@@ -493,6 +618,32 @@ def test_stream_yields_bare_text_and_one_complete_tool_call() -> None:
         "y",
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
     ]
+
+
+def test_stream_final_turn_carries_reasoning() -> None:
+    """final()'s assistant turn includes the thinking block from the SDK-assembled message."""
+
+    async def scenario() -> None:
+        snapshot = _message_snapshot(
+            "end_turn",
+            content=[
+                at.ThinkingBlock(type="thinking", thinking="check", signature="sig-1"),
+                at.TextBlock(type="text", text="hey"),
+            ],
+        )
+        adapter_stream = _anthropic_stream([], snapshot)
+        async for _item in adapter_stream.items():
+            pass
+        result = await adapter_stream.final()
+        reasoning_trace = result.assistant_message.turn[0]
+        assert isinstance(reasoning_trace, ReasoningTrace)
+        assert reasoning_trace.reasoning == {
+            "type": "thinking",
+            "thinking": "check",
+            "signature": "sig-1",
+        }
+
+    asyncio.run(scenario())
 
 
 def test_stream_without_stop_reason_raises() -> None:

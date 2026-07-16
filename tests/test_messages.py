@@ -12,6 +12,7 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     Message,
+    ReasoningTrace,
     TextPart,
     ToolCall,
     ToolMessage,
@@ -26,33 +27,73 @@ def test_conversation_round_trips_through_json_preserving_types() -> None:
     conversation: tuple[Message, ...] = (
         UserMessage(content=(TextPart(text="look"), ImagePart(data=b"png", media_type="image/png"))),
         AssistantMessage(
-            content="Checking.",
-            tool_calls=(ToolCall(id="c1", name="probe", args_json='{"step": 1}'),),
+            turn=(
+                ReasoningTrace(
+                    provider_name="anthropic_messages",
+                    reasoning={"type": "thinking", "thinking": "check first", "signature": "sig"},
+                ),
+                TextPart(text="Checking."),
+                ToolCall(id="c1", name="probe", args_json='{"step": 1}'),
+            ),
         ),
         ToolMessage(tool_call_id="c1", content="probe 1: ok"),
         ToolMessage(tool_call_id="c1", content="boom", is_error=True),
-        AssistantMessage(content="Done."),
+        AssistantMessage(turn=(TextPart(text="Done."),)),
     )
     restored = _CONVERSATION_ADAPTER.validate_json(_CONVERSATION_ADAPTER.dump_json(conversation))
     assert restored == conversation
     assert [type(message) for message in restored] == [type(message) for message in conversation]
+    restored_assistant = restored[1]
+    assert isinstance(restored_assistant, AssistantMessage)
+    assert [type(element) for element in restored_assistant.turn] == [
+        ReasoningTrace,
+        TextPart,
+        ToolCall,
+    ]
 
 
 def test_validation_selects_the_member_from_the_role_tag() -> None:
-    """A payload whose fields alone are ambiguous validates to the type its role names.
-
-    content-only dicts satisfy both UserMessage and AssistantMessage; only the tag decides.
-    """
+    """The role tag selects the message type, not which member's fields happen to match."""
     user = _CONVERSATION_ADAPTER.validate_python([{"role": "user", "content": "hi"}])[0]
     assert type(user) is UserMessage
-    assistant = _CONVERSATION_ADAPTER.validate_python([{"role": "assistant", "content": "hi"}])[0]
+    assistant = _CONVERSATION_ADAPTER.validate_python(
+        [{"role": "assistant", "turn": [{"text": "hi"}]}]
+    )[0]
     assert type(assistant) is AssistantMessage
+
+
+def test_turn_elements_validate_by_field_match() -> None:
+    """TurnElement has no discriminator: the three members' disjoint field sets select the type.
+
+    A persisted turn whose dicts re-validate to the wrong member would silently corrupt replay.
+    """
+    message = AssistantMessage.model_validate({
+        "role": "assistant",
+        "turn": [
+            {"provider_name": "openai_responses", "reasoning": {"type": "reasoning", "id": "rs_1"}},
+            {"text": "hi"},
+            {"id": "c1", "name": "probe", "args_json": "{}"},
+        ],
+    })
+    assert [type(element) for element in message.turn] == [ReasoningTrace, TextPart, ToolCall]
 
 
 def test_validation_without_a_role_tag_is_rejected() -> None:
     """A message payload missing role fails validation, proving the discriminator is engaged."""
     with pytest.raises(ValidationError):
         _CONVERSATION_ADAPTER.validate_python([{"content": "hi"}])
+
+
+def test_positional_construction_and_string_turn_coercion() -> None:
+    """UserMessage and AssistantMessage take their one argument positionally.
+
+    A bare string turn coerces to one TextPart on every construction path.
+    """
+    assert UserMessage("Hello") == UserMessage(content="Hello")
+    assistant = AssistantMessage("hey")
+    assert assistant.turn == (TextPart(text="hey"),)
+    assert assistant == AssistantMessage(turn=(TextPart(text="hey"),))
+    assert AssistantMessage.model_validate({"role": "assistant", "turn": "hey"}) == assistant
 
 
 def test_tool_message_content_accepts_parts_and_coerces_a_list_to_a_tuple() -> None:

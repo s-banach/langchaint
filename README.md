@@ -14,9 +14,10 @@ There are no per-call parameter overrides; changing parameters is `rebind(...)`,
 `rebind` carries the same overload, so `rebind(response_format=Model)` switches the output type to `BoundLLM[Model]`, `rebind(response_format=None)` switches it back to `BoundLLM[str]`, and leaving it out keeps the current type.
 Every generate and stream method takes a conversation of `Message`s; a bare `str` is accepted as shorthand for a conversation of one `UserMessage` holding that text.
 
-**The catalog is one function per backend returning a ready LLM.**
+**The catalog is a constructor function per backend returning a ready LLM (anthropic adds a second for Bedrock).**
 `from langchaint.openai import openai_model` then `openai_model("gpt-5.6-terra")`, and `from langchaint.anthropic import anthropic_model` then `anthropic_model("claude-sonnet-5")`, take the provider's own model identifier (a `Literal`, so typos fail the type check), look up the public prices, construct the adapter, and wrap it in an `LLM`.
-`client=None` constructs the native SDK client from environment credentials; Bedrock is passing a Bedrock client instead.
+`client=None` constructs the native first-party SDK client from environment credentials.
+Anthropic Bedrock is a second sibling constructor, `anthropic_bedrock_model(model, aws_region=...)`: it names the same catalog model and reads the model's Bedrock surface (which of two SDK client classes) and wire model id from a table, so the application names neither the client class nor the Bedrock id.
 Constructing an adapter directly covers models outside the catalog.
 
 **The SDKs are optional dependencies, one extra per backend.**
@@ -30,7 +31,8 @@ OTel tracing follows the same pattern: `langchaint.tracing` imports only opentel
 Adapters store a `with_options(max_retries=0)` copy of the client, so the SDK never retries beneath the package's retry loop.
 OpenAI support is the Responses API only: every supported OpenAI model speaks it, so there is no Chat Completions adapter.
 The adapter always sends `store=False` because conversation state is the caller's conversation argument.
-Bedrock support is the SDKs' bundled clients (`AsyncAnthropicBedrock`, `AsyncBedrockOpenAI`) passed as `client`; there is no Converse adapter.
+Anthropic Bedrock is two distinct SDK surfaces, the legacy `InvokeModel` client `AsyncAnthropicBedrock` and the Messages-API client `AsyncAnthropicBedrockMantle`, and the catalog models split across them, so `anthropic_bedrock_model` reads the client class and wire model id per model from `ANTHROPIC_BEDROCK`.
+OpenAI on Bedrock is the bundled `AsyncBedrockOpenAI` passed as `client`; there is no Converse adapter.
 Requests travel as typed frozen dataclasses whose optional fields are `X | Omit`, passed to the SDK as explicit keywords: no `**kwargs`, no hand-written wire TypedDicts, and the SDK overloads resolve without casts.
 
 **Anthropic prompt caching is placed by the adapter.**

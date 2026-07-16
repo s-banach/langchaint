@@ -9,13 +9,13 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncIterator, Sequence
-from typing import override
+from typing import get_args, override
 
 import anthropic
 import anthropic.types as at
 import httpx
 import pytest
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from anthropic.lib.streaming import (
     AsyncMessageStream,
     ParsedContentBlockStopEvent,
@@ -26,6 +26,7 @@ from anthropic.types.parsed_message import ParsedTextBlock
 from pydantic import BaseModel
 
 from langchaint import (
+    LLM,
     AbortBatchError,
     AssistantMessage,
     ExceededMaxCompletionTokensError,
@@ -43,7 +44,13 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.anthropic import AnthropicMessagesProvider
+from langchaint.anthropic import (
+    ANTHROPIC_BEDROCK,
+    ANTHROPIC_PRICING,
+    AnthropicMessagesProvider,
+    AnthropicModelName,
+    anthropic_bedrock_model,
+)
 from langchaint.anthropic.messages_provider import (
     _AnthropicStream,
     _assistant_content_blocks,
@@ -765,3 +772,76 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
 def test_adapter_pins_sdk_retries_off() -> None:
     """The stored client copy carries max_retries=0 so only the package retries."""
     assert _provider().client.max_retries == 0
+
+
+def _anthropic_provider_of(llm: LLM) -> AnthropicMessagesProvider:
+    """Narrow an LLM's provider to the concrete adapter so tests read its client/model/pricing."""
+    provider = llm.provider
+    assert isinstance(provider, AnthropicMessagesProvider)
+    return provider
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_wire_model", "expected_client_class"),
+    [
+        ("claude-fable-5", "anthropic.claude-fable-5", AsyncAnthropicBedrockMantle),
+        ("claude-opus-4-8", "anthropic.claude-opus-4-8", AsyncAnthropicBedrockMantle),
+        ("claude-haiku-4-5-20251001", "anthropic.claude-haiku-4-5", AsyncAnthropicBedrockMantle),
+        ("claude-opus-4-6", "us.anthropic.claude-opus-4-6-v1", AsyncAnthropicBedrock),
+        ("claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6", AsyncAnthropicBedrock),
+    ],
+)
+def test_bedrock_model_routes_wire_id_and_client_class(
+    model: AnthropicModelName,
+    expected_wire_model: str,
+    expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
+) -> None:
+    """Each catalog model reaches its surface's client class with the surface's wire id, retries pinned off."""
+    provider = _anthropic_provider_of(anthropic_bedrock_model(model, aws_region="us-east-1"))
+    assert provider.model == expected_wire_model
+    assert isinstance(provider.client, expected_client_class)
+    assert provider.client.max_retries == 0
+
+
+def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
+    """The Bedrock default pricing is the same PricingTable object anthropic_model uses, not a copy."""
+    provider = _anthropic_provider_of(anthropic_bedrock_model("claude-opus-4-6", aws_region="us-east-1"))
+    assert provider.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
+
+
+def test_bedrock_model_uses_a_matching_supplied_client_with_the_routing_wire_id() -> None:
+    """A supplied client whose class serves the surface passes through, retries pinned off, wire id applied."""
+    provider = _anthropic_provider_of(
+        anthropic_bedrock_model(
+            "claude-opus-4-8", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
+        )
+    )
+    assert isinstance(provider.client, AsyncAnthropicBedrockMantle)
+    assert provider.model == "anthropic.claude-opus-4-8"
+    assert provider.client.max_retries == 0
+    # aws_region survives with_options; the supplied client's distinctive region proves it is the one
+    # used, not a default rebuilt from the constructor's own aws_region (which is None here).
+    assert provider.client.aws_region == "eu-west-1"
+
+
+def test_bedrock_model_rejects_a_client_whose_surface_does_not_serve_the_model() -> None:
+    """A legacy client for a mantle-only model fails at construction, naming the model and required class."""
+    legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
+    with pytest.raises(ValueError, match="claude-sonnet-5") as excinfo:
+        anthropic_bedrock_model("claude-sonnet-5", client=legacy_client)
+    assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
+
+
+def test_bedrock_table_is_total_over_the_catalog() -> None:
+    """Every AnthropicModelName has a routing entry, so a new catalog model must add one."""
+    assert set(ANTHROPIC_BEDROCK) == set(get_args(AnthropicModelName.__value__))
+
+
+def test_adapter_accepts_a_mantle_client() -> None:
+    """AnthropicMessagesProvider takes an AsyncAnthropicBedrockMantle and pins its retries off."""
+    client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
+    provider = AnthropicMessagesProvider(
+        client=client, model="anthropic.claude-opus-4-8", pricing=_PRICING
+    )
+    assert isinstance(provider.client, AsyncAnthropicBedrockMantle)
+    assert provider.client.max_retries == 0

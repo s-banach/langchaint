@@ -30,7 +30,13 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast, override
 
 import anthropic
-from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, Omit, omit
+from anthropic import (
+    AsyncAnthropic,
+    AsyncAnthropicBedrock,
+    AsyncAnthropicBedrockMantle,
+    Omit,
+    omit,
+)
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
     Base64ImageSourceParam,
@@ -376,8 +382,10 @@ def _provider_result[OutputT](
 
 
 class AnthropicMessagesProvider(Provider):
-    """Adapter over an AsyncAnthropic or AsyncAnthropicBedrock client.
+    """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
+    The three clients expose the same messages.create/parse/stream methods and with_options,
+    so the adapter logic is identical across the first-party API and both Bedrock surfaces.
     default_max_completion_tokens fills the API-required max_tokens
     when the binding's inference_params leave max_completion_tokens None.
     """
@@ -387,7 +395,7 @@ class AnthropicMessagesProvider(Provider):
     def __init__(
         self,
         *,
-        client: AsyncAnthropic | AsyncAnthropicBedrock,
+        client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
         model: str,
         pricing: PricingTable,
         default_max_completion_tokens: int = 4096,

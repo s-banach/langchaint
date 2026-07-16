@@ -112,7 +112,8 @@ def openai_model(
     client None constructs AsyncOpenAI(), which reads OPENAI_API_KEY from the environment.
     pricing None selects OPENAI_PRICING[model].
     rate_limiter None means the RateLimiter defaults;
-    pass one shared instance across models on the same account to share its budget.
+    pass one shared instance across models on the same account to share its budget,
+    built in the same event loop as the LLMs, since one instance serves one loop.
     """
     return LLM(
         OpenAIResponsesProvider(

@@ -109,6 +109,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
+from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.provider import (
     Binding,
     BoundProvider,
@@ -393,19 +394,45 @@ def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
     )
 
 
-def _cost_in_usd(usage: ResponseUsage, pricing: PricingTable) -> float:
-    """Price the raw counts.
+def cost_breakdown(usage_raw: ResponseUsage, pricing: PricingTable) -> CostBreakdown:
+    """Exact per-category cost of one response, computed from its raw SDK usage.
 
-    Cache reads and cache writes bill at their own rates and the remainder of `usage.input_tokens` at the input rate.
+    The arithmetic is the same price() call that produced the stored Usage.cost_in_usd
+    for the same response, so total_cost_in_usd equals it.
+    OpenAI has one cache-write tier, priced at cache_write_usd_per_million_tokens,
+    so input_tokens_cache_write_1h is always 0 and price's missing-1h-rate ValueError cannot fire here.
+    """
+    return price(counts=_priceable_counts(usage_raw), pricing=pricing)
+
+
+def _priceable_counts(usage: ResponseUsage) -> PriceableCounts:
+    """Split the raw counters into pricing categories.
+
+    usage.input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
+    so the uncached count is the remainder after subtracting them.
+    OpenAI has no 1-hour write tier: every write lands in the base input_tokens_cache_write slot
+    and input_tokens_cache_write_1h is always 0.
     """
     details = usage.input_tokens_details
-    input_tokens_cache_none = usage.input_tokens - details.cached_tokens - details.cache_write_tokens
-    return (
-        input_tokens_cache_none * pricing.input_cache_none_usd_per_million_tokens
-        + details.cached_tokens * pricing.cache_read_usd_per_million_tokens
-        + details.cache_write_tokens * pricing.cache_write_usd_per_million_tokens
-        + usage.output_tokens * pricing.output_usd_per_million_tokens
-    ) / 1_000_000
+    return PriceableCounts(
+        input_tokens_cache_none=(
+            usage.input_tokens - details.cached_tokens - details.cache_write_tokens
+        ),
+        input_tokens_cache_read=details.cached_tokens,
+        input_tokens_cache_write=details.cache_write_tokens,
+        input_tokens_cache_write_1h=0,
+        output_tokens=usage.output_tokens,
+    )
+
+
+def _cost_in_usd(usage: ResponseUsage, pricing: PricingTable) -> float:
+    """Price the raw counts through the same price() call cost_breakdown uses.
+
+    Sharing the one arithmetic path keeps the stored Usage.cost_in_usd and a reported breakdown
+    from disagreeing. _priceable_counts always fills input_tokens_cache_write_1h with 0,
+    so price's missing-1h-rate ValueError cannot fire and no translation to a batch error is needed.
+    """
+    return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
 
 
 def _provider_result[OutputT](

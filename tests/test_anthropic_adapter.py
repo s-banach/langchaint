@@ -50,6 +50,8 @@ from langchaint.anthropic import (
     AnthropicMessagesProvider,
     AnthropicModelName,
     anthropic_bedrock_model,
+    anthropic_model,
+    cost_breakdown,
 )
 from langchaint.anthropic.messages_provider import (
     _AnthropicStream,
@@ -195,6 +197,77 @@ def test_cost_raises_abort_when_one_hour_writes_lack_a_rate() -> None:
     with pytest.raises(AbortBatchError) as raised:
         _cost_in_usd(usage, _PRICING_NO_1H)
     assert raised.value.usage_raw is usage
+
+
+def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
+    """Each category cost is its own product, and the total equals the stored Usage.cost_in_usd."""
+    usage = _usage_with_cache_split()
+    breakdown = cost_breakdown(usage, _PRICING)
+    assert breakdown.counts.input_tokens_cache_none == 100
+    assert breakdown.counts.input_tokens_cache_read == 200
+    assert breakdown.counts.input_tokens_cache_write == 10
+    assert breakdown.counts.input_tokens_cache_write_1h == 20
+    assert breakdown.counts.output_tokens == 50
+    assert breakdown.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
+    assert breakdown.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
+    assert breakdown.input_tokens_cache_write_cost_in_usd == 10 * 3.75 / 1e6
+    assert breakdown.input_tokens_cache_write_1h_cost_in_usd == 20 * 6.0 / 1e6
+    assert breakdown.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
+    assert breakdown.total_cost_in_usd == _normalized_usage(usage, _PRICING).cost_in_usd
+
+
+def test_cost_breakdown_raises_value_error_when_one_hour_writes_lack_a_rate() -> None:
+    """The public reporting call surfaces the plain ValueError; AbortBatchError is generation-only."""
+    with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
+        cost_breakdown(_usage_with_cache_split(), _PRICING_NO_1H)
+
+
+def test_one_hour_ttl_requires_the_one_hour_rate_at_construction() -> None:
+    """cache_ttl "1h" with a table missing the 1h rate fails at model construction, naming the model."""
+    with pytest.raises(ValueError, match="claude-sonnet-5"):
+        anthropic_model(
+            "claude-sonnet-5",
+            client=AsyncAnthropic(api_key="test"),
+            cache_ttl="1h",
+            pricing=_PRICING_NO_1H,
+        )
+    with pytest.raises(ValueError, match="claude-sonnet-5"):
+        anthropic_bedrock_model(
+            "claude-sonnet-5", aws_region="us-east-1", cache_ttl="1h", pricing=_PRICING_NO_1H
+        )
+    with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
+        AnthropicMessagesProvider(
+            client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING_NO_1H, cache_ttl="1h"
+        )
+
+
+def test_one_hour_ttl_constructs_with_a_one_hour_rate() -> None:
+    """The default ANTHROPIC_PRICING carries the 1h rate, and "5m" never needs it."""
+    assert (
+        _anthropic_provider_of(
+            anthropic_model(
+                "claude-sonnet-5", client=AsyncAnthropic(api_key="test"), cache_ttl="1h"
+            )
+        ).cache_ttl
+        == "1h"
+    )
+    assert (
+        _anthropic_provider_of(
+            anthropic_bedrock_model("claude-sonnet-5", aws_region="us-east-1", cache_ttl="1h")
+        ).cache_ttl
+        == "1h"
+    )
+    assert (
+        _anthropic_provider_of(
+            anthropic_model(
+                "claude-sonnet-5",
+                client=AsyncAnthropic(api_key="test"),
+                cache_ttl="5m",
+                pricing=_PRICING_NO_1H,
+            )
+        ).cache_ttl
+        == "5m"
+    )
 
 
 @pytest.mark.parametrize(

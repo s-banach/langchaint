@@ -9,6 +9,8 @@ client None constructs the native SDK client, which reads credentials from the e
 Bedrock routing is passing an AsyncBedrockOpenAI client instead.
 pricing None selects the model's public prices from OPENAI_PRICING.
 Pass your own PricingTable to override, for example when your account bills at a custom rate.
+cost_breakdown(usage_raw, pricing) reports the exact per-category cost of one response from its raw
+SDK usage, through the same arithmetic that produced the stored Usage.cost_in_usd.
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://developers.openai.com/api/docs/pricing.
@@ -31,7 +33,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.llm import LLM
-from langchaint.openai.responses_provider import OpenAIResponsesProvider
+from langchaint.openai.responses_provider import OpenAIResponsesProvider, cost_breakdown
 from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
@@ -129,5 +131,6 @@ __all__ = [
     "OPENAI_PRICING",
     "OpenAIModelName",
     "OpenAIResponsesProvider",
+    "cost_breakdown",
     "openai_model",
 ]

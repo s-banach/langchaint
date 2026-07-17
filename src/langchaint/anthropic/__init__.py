@@ -14,6 +14,8 @@ Pass your own PricingTable to override, for example when your account bills at a
 For a custom httpx.AsyncClient (loaded certs, a proxy), anthropic_model takes client=AsyncAnthropic(
 http_client=...) since its single client class makes that lossless, while anthropic_bedrock_model takes
 http_client= directly so it can still pick the model's Bedrock client class for you.
+cost_breakdown(usage_raw, pricing) reports the exact per-category cost of one response from its raw
+SDK usage, through the same arithmetic that produced the stored Usage.cost_in_usd.
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://platform.claude.com/docs/en/about-claude/pricing.
@@ -36,7 +38,11 @@ except ModuleNotFoundError as exc:
         "langchaint's anthropic backend requires the anthropic package; install langchaint[anthropic]."
     ) from exc
 
-from langchaint.anthropic.messages_provider import AnthropicMessagesProvider, CacheTtl
+from langchaint.anthropic.messages_provider import (
+    AnthropicMessagesProvider,
+    CacheTtl,
+    cost_breakdown,
+)
 from langchaint.llm import LLM
 from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
@@ -160,6 +166,11 @@ def anthropic_model(
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
+
+    Raises:
+        ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
+            (from AnthropicMessagesProvider.__init__; every ANTHROPIC_PRICING entry carries the
+            rate, so only a custom pricing can trip this).
     """
     return LLM(
         AnthropicMessagesProvider(
@@ -207,7 +218,10 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
 
     Raises:
         ValueError: both client and http_client are provided,
-            or client is provided but its class does not serve model's Bedrock surface.
+            or client is provided but its class does not serve model's Bedrock surface,
+            or cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
+            (from AnthropicMessagesProvider.__init__; every ANTHROPIC_PRICING entry carries the
+            rate, so only a custom pricing can trip this).
     """
     routing = ANTHROPIC_BEDROCK[model]
     if client is None:
@@ -244,4 +258,5 @@ __all__ = [
     "CacheTtl",
     "anthropic_bedrock_model",
     "anthropic_model",
+    "cost_breakdown",
 ]

@@ -89,6 +89,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
+from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.provider import (
     Binding,
     BoundProvider,
@@ -445,37 +446,58 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
     )
 
 
-def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
-    """Price the raw counts.
+def cost_breakdown(usage_raw: anthropic.types.Usage, pricing: PricingTable) -> CostBreakdown:
+    """Exact per-category cost of one response, computed from its raw SDK usage.
 
-    5-minute and 1-hour cache writes bill at different rates, split by usage.cache_creation.
+    The raw usage is consumed (not the neutral Usage) because only it keeps the 5-minute / 1-hour
+    cache-write split the two rates need, and the arithmetic is the same price() call that produced
+    the stored Usage.cost_in_usd for the same response, so total_cost_in_usd equals it.
 
     Raises:
-        AbortBatchError:
-            the response reports 1-hour cache writes but the PricingTable has no cache_write_1h_usd_per_million_tokens.
+        ValueError: usage_raw reports 1-hour cache writes but pricing has no
+            cache_write_1h_usd_per_million_tokens (propagated from price;
+            a standalone reporting call has no batch, so this is never AbortBatchError).
     """
-    cache_write_5m_tokens = usage.cache_creation_input_tokens or 0
-    cache_write_1h_tokens = 0
+    return price(counts=_priceable_counts(usage_raw), pricing=pricing)
+
+
+def _priceable_counts(usage: anthropic.types.Usage) -> PriceableCounts:
+    """Split the raw counters into pricing categories, keeping the two cache-write tiers apart.
+
+    usage.cache_creation splits writes into 5-minute and 1-hour tokens; when it is absent,
+    cache_creation_input_tokens bills entirely at the base cache_write_usd_per_million_tokens rate.
+    usage.input_tokens excludes cache reads and writes (verified against anthropic 0.116.0),
+    so it is exactly the uncached count.
+    """
+    input_tokens_cache_write = usage.cache_creation_input_tokens or 0
+    input_tokens_cache_write_1h = 0
     if usage.cache_creation is not None:
-        cache_write_5m_tokens = usage.cache_creation.ephemeral_5m_input_tokens
-        cache_write_1h_tokens = usage.cache_creation.ephemeral_1h_input_tokens
-    cost_in_usd = (
-        usage.input_tokens * pricing.input_cache_none_usd_per_million_tokens
-        + (usage.cache_read_input_tokens or 0) * pricing.cache_read_usd_per_million_tokens
-        + cache_write_5m_tokens * pricing.cache_write_usd_per_million_tokens
-        + usage.output_tokens * pricing.output_usd_per_million_tokens
-    ) / 1_000_000
-    if cache_write_1h_tokens:
-        if pricing.cache_write_1h_usd_per_million_tokens is None:
-            raise AbortBatchError(
-                "the response reports 1-hour cache writes but the PricingTable "
-                "has no cache_write_1h_usd_per_million_tokens",
-                usage_raw=usage,
-            )
-        cost_in_usd += (
-            cache_write_1h_tokens * pricing.cache_write_1h_usd_per_million_tokens / 1_000_000
-        )
-    return cost_in_usd
+        input_tokens_cache_write = usage.cache_creation.ephemeral_5m_input_tokens
+        input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
+    return PriceableCounts(
+        input_tokens_cache_none=usage.input_tokens,
+        input_tokens_cache_read=usage.cache_read_input_tokens or 0,
+        input_tokens_cache_write=input_tokens_cache_write,
+        input_tokens_cache_write_1h=input_tokens_cache_write_1h,
+        output_tokens=usage.output_tokens,
+    )
+
+
+def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
+    """Price the raw counts for the generation path, where a batch exists.
+
+    Shares price() and _priceable_counts with the public cost_breakdown,
+    so the stored Usage.cost_in_usd and a reported breakdown cannot disagree.
+
+    Raises:
+        AbortBatchError: the response reports 1-hour cache writes but the PricingTable has no
+            cache_write_1h_usd_per_million_tokens. A pricing-table defect dooms every sibling
+            sharing it, so it aborts the batch, carrying the billed 200's raw usage as evidence.
+    """
+    try:
+        return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
+    except ValueError as exc:
+        raise AbortBatchError(str(exc), usage_raw=usage) from exc
 
 
 def _provider_result[OutputT](
@@ -532,7 +554,18 @@ class AnthropicMessagesProvider(Provider):
         "1h" holds entries across longer gaps and writes bill 2x
         (priced by the PricingTable's cache_write_1h_usd_per_million_tokens).
         A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request.
+
+        Raises:
+            ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens.
+                Every 1-hour marker this adapter would write produces 1-hour cache writes the table
+                cannot price, so the first cached response would abort its batch; failing here turns
+                that mid-batch abort into an immediate config error before any request is sent.
         """
+        if cache_ttl == "1h" and pricing.cache_write_1h_usd_per_million_tokens is None:
+            raise ValueError(
+                f"cache_ttl='1h' for model {model!r} requires a PricingTable with "
+                f"cache_write_1h_usd_per_million_tokens, which prices the 2x 1-hour cache writes"
+            )
         super().__init__(model=model, pricing=pricing)
         # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
         # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).

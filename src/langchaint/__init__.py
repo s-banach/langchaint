@@ -31,6 +31,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
+from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.provider import (
     PricingTable,
     SpecificTool,
@@ -60,6 +61,7 @@ __all__ = [
     "AssistantMessage",
     "AttemptRecord",
     "BoundLLM",
+    "CostBreakdown",
     "DispatchExceptionGroup",
     "DispatchHandled",
     "DispatchInvalidToolArgs",
@@ -73,6 +75,7 @@ __all__ = [
     "Message",
     "MessageContent",
     "Part",
+    "PriceableCounts",
     "PricingTable",
     "RateLimiter",
     "RawSchemaTool",
@@ -99,5 +102,6 @@ __all__ = [
     "TurnElement",
     "Usage",
     "UserMessage",
+    "price",
     "to_row",
 ]

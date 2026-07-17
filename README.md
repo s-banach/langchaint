@@ -49,6 +49,8 @@ Every marker's TTL is the adapter's `cache_ttl` (`"5m"` default, `"1h"` for entr
 The counters are validated non-negative, which is what guards the openai path, where `input_tokens_cache_none` is derived by subtraction from the provider's all-inclusive `input_tokens`.
 `Usage` also carries `cost_in_usd`, computed inside the adapter from raw provider counts against a `PricingTable`: it is stored, never derived from the counters, because providers split counters the normalized `Usage` collapses (anthropic bills 5-minute and 1-hour cache writes at different rates, and an adapter that sees 1-hour writes without `cache_write_1h_usd_per_million_tokens` raises `AbortBatchError` rather than misbill). Cost riding inside `Usage` means the two are born together and one `sum()` folds both; total across several results with `Usage.sum_of(...)`.
 Provider-specific detail the partition drops (the 5m/1h write split, `server_tool_use`, `service_tier`) stays readable on `usage_raw`, the raw SDK usage object carried by reference beside every `Usage`.
+For a per-category cost split, each backend has `cost_breakdown(usage_raw, pricing)` (`langchaint.anthropic.cost_breakdown` / `langchaint.openai.cost_breakdown`): it extracts the counts from the raw SDK usage (only there does the 5m/1h write split survive) and prices them through the same neutral `price` call that produced the stored `cost_in_usd`, so the returned `CostBreakdown`'s `total_cost_in_usd` equals it.
+`CostBreakdown` carries one cost per category, the derived `input_tokens_cost_in_usd` and `total_cost_in_usd`, and the priced `counts`, from which an application computes its own caching counterfactual against whatever baseline it chooses; cache writes bill above the uncached rate (1.25x at 5 minutes, 2x at 1 hour), so savings are negative on the turn that writes the cache and land on later read turns, meaning any savings number is only meaningful aggregated over a conversation.
 
 **Success is a `Response`, failure is a `GenerationError`.**
 A generate that succeeds returns a frozen `Response[OutputT]` with every field present; one that ends terminally raises (or, in a batch, returns) a `GenerationError`.
@@ -111,6 +113,7 @@ Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, o
     src/langchaint/
         messages.py          message and part models, StopReason
         usage.py             Usage counters
+        pricing.py           PriceableCounts, CostBreakdown, price
         inference_params.py  InferenceParams
         exceptions.py        error vocabulary: TransientError,
                              AbortBatchError, AttemptRecord,
@@ -125,13 +128,14 @@ Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, o
         llm.py               LLM, BoundLLM, the retry loop
         anthropic/           the anthropic backend (needs the anthropic
                              SDK): __init__ has anthropic_model,
-                             ANTHROPIC_PRICING, AnthropicModelName;
-                             messages_provider.py has the adapter
-                             AnthropicMessagesProvider
+                             ANTHROPIC_PRICING, AnthropicModelName,
+                             cost_breakdown; messages_provider.py has
+                             the adapter AnthropicMessagesProvider
         openai/              the openai backend (needs the openai SDK):
                              __init__ has openai_model, OPENAI_PRICING,
-                             OpenAIModelName; responses_provider.py has
-                             the adapter OpenAIResponsesProvider
+                             OpenAIModelName, cost_breakdown;
+                             responses_provider.py has the adapter
+                             OpenAIResponsesProvider
         tracing/             OTel span tracing (needs opentelemetry-api,
                              install langchaint[otel]): __init__ has
                              TracedLLM, TracedBoundLLM, TracedStreamHandle

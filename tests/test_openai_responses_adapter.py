@@ -56,7 +56,7 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.exceptions import StreamProtocolError, TransientError
-from langchaint.openai import OpenAIResponsesProvider
+from langchaint.openai import OpenAIResponsesProvider, cost_breakdown
 from langchaint.openai.responses_provider import (
     _assistant_items,
     _assistant_message_from,
@@ -187,6 +187,23 @@ def test_cost_prices_each_cache_tier_and_the_remainder() -> None:
     cost = _cost_in_usd(_usage_with_cache(), _PRICING)
     expected = (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
     assert abs(cost - expected) < 1e-12
+
+
+def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
+    """Each category cost is its own product, the 1h slot is 0, and the total equals the stored cost."""
+    usage = _usage_with_cache()
+    breakdown = cost_breakdown(usage, _PRICING)
+    assert breakdown.counts.input_tokens_cache_none == 300
+    assert breakdown.counts.input_tokens_cache_read == 600
+    assert breakdown.counts.input_tokens_cache_write == 100
+    assert breakdown.counts.input_tokens_cache_write_1h == 0
+    assert breakdown.counts.output_tokens == 40
+    assert breakdown.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
+    assert breakdown.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
+    assert breakdown.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
+    assert breakdown.input_tokens_cache_write_1h_cost_in_usd == 0.0
+    assert breakdown.output_tokens_cost_in_usd == 40 * 10.0 / 1e6
+    assert breakdown.total_cost_in_usd == _normalized_usage(usage, _PRICING).cost_in_usd
 
 
 def test_stop_reason_is_tool_use_with_a_function_call_item() -> None:

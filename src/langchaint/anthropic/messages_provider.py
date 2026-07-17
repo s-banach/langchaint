@@ -152,6 +152,7 @@ class _AnthropicRequest:
 
     model: str
     max_tokens: int
+    temperature: float | Omit
     system: list[TextBlockParam] | Omit
     tools: list[ToolParam] | Omit
     tool_choice: ToolChoiceParam | Omit
@@ -589,6 +590,11 @@ class AnthropicMessagesProvider(Provider):
             max_tokens=(
                 max_tokens if max_tokens is not None else self.default_max_completion_tokens
             ),
+            temperature=(
+                binding.inference_params.temperature
+                if binding.inference_params.temperature is not None
+                else omit
+            ),
             system=system,
             tools=tools,
             tool_choice=tool_choice,
@@ -706,6 +712,7 @@ class _BoundAnthropicText(BoundProvider[str]):
         message = await self._adapter.client.messages.create(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
+            temperature=self._request.temperature,
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -729,6 +736,7 @@ class _BoundAnthropicText(BoundProvider[str]):
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
+            temperature=self._request.temperature,
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -802,6 +810,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
         message = await self._adapter.client.messages.parse(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
+            temperature=self._request.temperature,
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -826,6 +835,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
+            temperature=self._request.temperature,
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,

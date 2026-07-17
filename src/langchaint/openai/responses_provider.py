@@ -150,6 +150,7 @@ class _OpenAIRequest:
     which the instructions string cannot), and a str or absent system_prompt leaves it empty."""
 
     max_output_tokens: int | Omit
+    temperature: float | Omit
     reasoning: Reasoning | Omit
     tools: list[FunctionToolParam] | Omit
     tool_choice: _WireToolChoice | Omit
@@ -489,6 +490,11 @@ class OpenAIResponsesProvider(Provider):
                 if binding.inference_params.max_completion_tokens is not None
                 else omit
             ),
+            temperature=(
+                binding.inference_params.temperature
+                if binding.inference_params.temperature is not None
+                else omit
+            ),
             reasoning=(
                 Reasoning(effort=binding.inference_params.reasoning_effort)
                 if binding.inference_params.reasoning_effort is not None
@@ -635,6 +641,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
+            temperature=self._request.temperature,
             reasoning=self._request.reasoning,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -657,6 +664,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
+            temperature=self._request.temperature,
             reasoning=self._request.reasoning,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -741,6 +749,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
+            temperature=self._request.temperature,
             reasoning=self._request.reasoning,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
@@ -764,6 +773,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
+            temperature=self._request.temperature,
             reasoning=self._request.reasoning,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,

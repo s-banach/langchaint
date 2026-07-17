@@ -477,6 +477,23 @@ def test_request_omits_tool_sentinels_without_tools() -> None:
     assert request.output_config == {"effort": "high"}
 
 
+def test_request_maps_temperature_and_omits_it_when_unset() -> None:
+    """A bound temperature lands on the request; None leaves the omit sentinel."""
+    unset = _provider()._request(
+        _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
+    )
+    assert isinstance(unset.temperature, anthropic.Omit)
+    binding = Binding(
+        system_prompt=None,
+        tool_schemas=(),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        inference_params=InferenceParams(temperature=0.2),
+        automatic_prompt_caching=False,
+    )
+    assert _provider()._request(binding).temperature == 0.2
+
+
 def test_request_marks_the_system_block_only_when_caching() -> None:
     """The system block carries a breakpoint under caching and none without it."""
     cached = _provider()._request(

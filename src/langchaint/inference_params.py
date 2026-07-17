@@ -1,6 +1,6 @@
 """Inference parameters.
 
-Exactly two fields.
+Exactly three fields.
 The escape hatch for unmapped provider parameters is subclassing the adapter, never a passthrough dict.
 Replacement is whole-object: a rebind(inference_params=...) replaces the bound InferenceParams,
 so no field-wise merge rules exist to learn;
@@ -27,3 +27,4 @@ class InferenceParams:
 
     max_completion_tokens: int | None = None
     reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = None

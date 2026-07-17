@@ -436,6 +436,21 @@ def test_request_requests_explicit_mode_when_caching_disabled() -> None:
     assert request.prompt_cache_options == {"mode": "explicit"}
 
 
+def test_request_maps_temperature_and_omits_it_when_unset() -> None:
+    """A bound temperature lands on the request; None leaves the omit sentinel."""
+    unset = _provider()._request(_binding(automatic_prompt_caching=True))
+    assert isinstance(unset.temperature, openai.Omit)
+    binding = Binding(
+        system_prompt=None,
+        tool_schemas=(),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        inference_params=InferenceParams(temperature=0.2),
+        automatic_prompt_caching=True,
+    )
+    assert _provider()._request(binding).temperature == 0.2
+
+
 def test_request_omits_tool_fields_without_tools() -> None:
     """No tools leaves tools, tool_choice, and parallel_tool_calls at the omit sentinel."""
     request = _provider()._request(_binding(automatic_prompt_caching=True))

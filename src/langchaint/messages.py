@@ -103,6 +103,14 @@ class ReasoningTrace(BaseModel):
     Only the producing provider can accept the dict: replaying it through another provider is a
     malformed request that provider rejects, so switching providers means first rebuilding
     concluded assistant turns without their traces.
+    Full reasoning history is the default and the conversation is the only control surface:
+    trimming is the application's job, done the same way, by rebuilding concluded assistant turns without their traces;
+    a turn whose tool calls still await results must keep its reasoning,
+    and there is no bind-time on/off parameter because it would be redundant with editing the conversation.
+    Beyond replay correctness, keeping traces matters for quality
+    (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
+    and for prompt caching:
+    reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
     The dict field makes this model unhashable, unlike its frozen siblings; messages are never hashed.
     """
 

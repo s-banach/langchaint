@@ -1,6 +1,11 @@
 """langchaint: a provider-neutral LLM client.
 
 Adapters wrap the official anthropic/openai SDK clients; generation happens only through LLM.bind(...) -> BoundLLM.
+__all__ re-exports only the SDK-free application surface.
+The backend constructors, pricing tables, adapters, and cost_breakdown extractors stay in their subpackages:
+re-exporting them here would force import langchaint through both SDKs.
+The adapter-author contract stays in langchaint.provider.
+Internal helpers (Admission, SequenceNotStr, ToolSchema, DispatchableTool) are importable but off __all__.
 """
 
 from langchaint.exceptions import (

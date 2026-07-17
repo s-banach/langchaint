@@ -9,6 +9,11 @@ args_schema rides through to the provider unchanged, and it validates only that 
 deferring field-level rules to the tool's owner (the MCP server re-validates its own inputs).
 Both return str or a Sequence[Part] (text and images the model then sees), or a ToolOutputExplicit carrying that
 content plus is_error and app_data.
+A tool function returns data and nothing that steers control flow:
+stop, route, escalate, and needs-approval are decisions the application makes in its own loop between turns,
+reading app_data or is_error.
+The application owns that loop and langchaint ships no library-owned agent loop,
+so a control-flow return channel (a goto or an engine-state update smuggled through a tool's return value) is forbidden.
 No signature introspection and no docstring scraping: name, description, and schema are explicit,
 so what the provider sees is exactly what the code states.
 """

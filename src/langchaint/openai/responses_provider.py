@@ -21,6 +21,8 @@ Verified against openai 2.45.0:
   the provider's implicit caching is left in place and nothing is sent.
   The adapter sends it regardless of model (it keeps no model-version table),
   so binding False with a pre-gpt-5.6 model may be rejected by the API.
+  `prompt_cache_options.ttl` takes "30m" as its only value,
+  so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
 - A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
   under either binding value: implicit mode writes up to the latest three explicit breakpoints,
   explicit mode up to the latest four, and older marks are read-only for matching,
@@ -266,8 +268,9 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
         elif isinstance(element, ReasoningTrace):
             flush_text_run()
             # The dict is the producing SDK item's model_dump; when this adapter produced it,
-            # its shape is the wire param's by construction, and when another provider did,
-            # the API rejects the unknown type key (the loud failure the docstring states).
+            # its shape is the wire param's by construction, so the cast holds. A trace another
+            # provider produced is not this shape; it is passed through unchanged, never dropped
+            # or neutralized here (trimming is the app's job), and left to the API.
             # Reconstructing it field by field would risk changing the
             # payload the API re-reads. The shallow copy keeps the wire path from ever aliasing
             # the frozen message's stored payload into a mutable request structure.

@@ -523,6 +523,7 @@ class BoundLLM[OutputT]:
         A first item ending in a GenerationError still admits the rest:
         a rejected 200 (a refusal, a truncation) wrote the prefix on the provider side,
         and after a transport failure the rest simply run against a cold cache; there is no second warmer.
+        There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
         An AbortBatchError from the first item raises before any sibling starts.
         """
         _reject_bare_str_batch(conversations)

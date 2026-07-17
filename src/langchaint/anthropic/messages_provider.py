@@ -14,14 +14,14 @@ Reasoning replay, verified by docs and live runs because it is request-time beha
 the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
 It filters prior turns' thinking blocks itself, so re-emitting every ReasoningTrace unconditionally is safe.
 It rejects consecutive thinking blocks re-sent out of their emission order, which turn order preserves.
-It rejects thinking re-fed on a request whose binding enables no reasoning;
-the adapter surfaces that provider error rather than silencing it.
 
 Cache breakpoints: with automatic_prompt_caching bound True,
 the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
 or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,
 so the cached span grows with the conversation.
 Bound False, the adapter writes no marker of its own.
+The adapter never sends the API's top-level automatic cache_control request parameter:
+it is unavailable on Bedrock, which this adapter also serves.
 A part with cache_breakpoint True adds a marker under either binding: on the part's own text or image block
 in a user message, and on the enclosing tool_result block for the last part of a ToolMessage
 (the API documents cache_control on the tool_result block itself; a marked part that is not
@@ -264,10 +264,11 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
             )
         elif isinstance(element, ReasoningTrace):
             # The dict is the producing SDK block's model_dump; when this adapter produced it,
-            # its shape is the wire param's by construction, and when another provider did,
-            # the API rejects the unknown type key (the loud failure the docstring states).
+            # its shape is the wire param's by construction, so the cast holds. A trace another
+            # provider produced is not this shape; it is passed through unchanged, never dropped
+            # or neutralized here (trimming is the app's job), and left to the API.
             # Reconstructing it field by field would risk the exact
-            # byte-level change the API rejects. The shallow copy keeps the wire path
+            # byte-level change replay cannot tolerate. The shallow copy keeps the wire path
             # (which mutates blocks to place cache breakpoints) from ever writing into the
             # frozen message's stored payload.
             blocks.append(
@@ -567,7 +568,10 @@ class AnthropicMessagesProvider(Provider):
         automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
         "1h" holds entries across longer gaps and writes bill 2x
         (priced by the PricingTable's cache_write_1h_usd_per_million_tokens).
-        A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request.
+        A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request:
+        mixing is allowed but requires the 1h markers before the 5m markers.
+        That ordering rule is docs-only, not SDK-introspectable, stated under "Mixing different TTLs" at
+        https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
 
         Raises:
             ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens.

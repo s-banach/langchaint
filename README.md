@@ -89,6 +89,7 @@ Tool content is model-facing, so it is exactly `MessageContent` (`str | Sequence
 A function may instead return a `ToolOutputExplicit` wrapping that content plus `is_error` and `app_data` (the app-facing channel, which does carry a typed `BaseModel` or `Mapping` the model never sees).
 `Tool.validate_and_run` validates raw call JSON against `args_model` and runs the function; it lives on `Tool` because there the args type parameter is concrete, so the validated arguments reach the function fully typed.
 `Tool.dispatch` returns `DispatchHandled[AppDataT] | DispatchInvalidToolArgs`, so on the handled outcome a caller that dispatched a known tool reads `app_data` back at its concrete type with no `isinstance`.
+For a tool whose schema is a raw JSON schema and not a pydantic model (an MCP tool discovered at run time), `RawSchemaTool` carries the JSON schema as `args_schema` (sent to the provider unchanged) and a function taking the parsed arguments as a `dict[str, object]` (the type dispatch builds; a `Mapping[str, object]` annotation is also accepted by contravariance); it validates only that the arguments are a JSON object and leaves every field-level rule to the tool's owner (the MCP server re-validates its own inputs), so wrapping an MCP tool needs no hand-written pydantic model per tool. `Tool` and `RawSchemaTool` share the `DispatchableTool` protocol (a `name`, a `schema()`, a `dispatch()`), so one `ToolManager` holds a mix of the two.
 `ToolManager` serializes the tools provider-neutrally, resolves the called name, and returns each outcome as a `DispatchOutcome`, a three-arm union over a heterogeneous tool set (where `app_data` erases to `BaseModel | Mapping[str, object] | None`): `DispatchHandled` carries the model-facing `ToolMessage` the caller appends to the conversation, paired with the function's `app_data` (data the model never sees); `DispatchInvalidToolArgs` carries a default `is_error` `ToolMessage` plus the pydantic `ValidationError` as a required field, so a caller that authors its own reply reads `validation_error.errors()` with no narrowing crutch; `DispatchUnknownTool` carries a default `is_error` `ToolMessage` naming the held tools plus the off-list `called_name`.
 Every arm carries `tool_message`, so a caller that only appends the reply reads `result.tool_message` with no `match`.
 An off-list tool name becomes a `DispatchUnknownTool` outcome rather than a raise, just like argument JSON the model got wrong becomes a `DispatchInvalidToolArgs` outcome: both are model data the model can correct (a provider can emit a name outside the sent schemas, and a rebind can strand an earlier turn's `tool_call`).
@@ -113,7 +114,7 @@ Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, o
                              GenerationError and its leaves
         response.py          Response[OutputT], to_row
         rate_limiter.py      RateLimiter
-        tools.py             Tool, ToolSchema, ToolManager
+        tools.py             Tool, RawSchemaTool, ToolSchema, ToolManager
         provider.py          Binding, ToolChoice, PricingTable,
                              StreamItem, ProviderResult,
                              ProviderStream, BoundProvider, Provider

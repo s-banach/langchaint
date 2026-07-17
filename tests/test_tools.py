@@ -19,6 +19,7 @@ from langchaint import (
     ImagePart,
     InvalidToolArgsError,
     Part,
+    RawSchemaTool,
     TextPart,
     Tool,
     ToolCall,
@@ -26,6 +27,13 @@ from langchaint import (
     ToolOutputExplicit,
 )
 from langchaint.tools import render_invalid_tool_args, render_unknown_tool
+
+_WEATHER_SCHEMA: Mapping[str, object] = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+    "additionalProperties": False,
+}
 
 
 class _EchoArgs(BaseModel):
@@ -480,3 +488,145 @@ def test_duplicate_tool_names_are_rejected() -> None:
     """Two tools sharing a name raise ValueError at construction."""
     with pytest.raises(ValueError, match="duplicate tool name"):
         ToolManager([_echo_tool(), _echo_tool()])
+
+
+async def _weather_function(args: dict[str, object]) -> str:
+    """Read the parsed city argument and report it, with no pydantic model in sight.
+
+    Annotated dict[str, object], the declared parameter type of RawSchemaTool.function and the typical user form.
+    """
+    return f"sunny in {args['city']}"
+
+
+def _weather_tool() -> RawSchemaTool:
+    """Build a RawSchemaTool from a raw JSON schema, the shape an MCP tool arrives in."""
+    return RawSchemaTool(
+        name="weather",
+        description="Report the weather.",
+        args_schema=_WEATHER_SCHEMA,
+        function=_weather_function,
+    )
+
+
+def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> None:
+    """RawSchemaTool.schema carries the args_schema by identity, not a model_json_schema derivation.
+
+    A pydantic tool derives its schema; a RawSchemaTool already holds the JSON schema the provider wants, so the wire
+    schema must be the exact object passed in (an MCP inputSchema), byte-for-byte, with no reshaping.
+    """
+    schema = _weather_tool().schema()
+    assert schema.name == "weather"
+    assert schema.description == "Report the weather."
+    assert schema.args_schema is _WEATHER_SCHEMA
+
+
+def test_schema_tool_dispatch_passes_the_parsed_mapping_to_the_function() -> None:
+    """A valid call reaches the function as the parsed arguments mapping and comes back a DispatchHandled."""
+    call = ToolCall(id="call1", name="weather", args_json='{"city": "Oslo"}')
+    result = asyncio.run(_weather_tool().dispatch(call))
+    assert isinstance(result, DispatchHandled)
+    assert result.tool_message.content == "sunny in Oslo"
+    assert result.tool_message.is_error is False
+    assert result.app_data is None
+
+
+def test_schema_tool_dispatch_does_no_field_level_validation() -> None:
+    """An argument outside the schema still runs: field rules are the tool owner's, not RawSchemaTool's.
+
+    The JSON is a well-formed object, so the only local check passes; the schema requires city and forbids extras,
+    yet dispatch runs the function unchanged, proving RawSchemaTool defers field validation to the server.
+    """
+    call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo", "city": "Bergen"}')
+    result = asyncio.run(_weather_tool().dispatch(call))
+    assert isinstance(result, DispatchHandled)
+    assert result.tool_message.content == "sunny in Bergen"
+
+
+def test_schema_tool_dispatch_returns_invalid_args_for_non_object_json() -> None:
+    """A non-object args_json is the one thing RawSchemaTool rejects locally: a DispatchInvalidToolArgs, no raise.
+
+    A scalar JSON payload cannot be a tool's arguments, so it comes back as the invalid-args arm holding a live
+    ValidationError, symmetric with the pydantic tool, so the loop and the model can recover.
+    """
+    call = ToolCall(id="call1", name="weather", args_json="5")
+    result = asyncio.run(_weather_tool().dispatch(call))
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.is_error is True
+    assert "invalid arguments for weather" in result.tool_message.content
+    assert result.validation_error.error_count() >= 1
+
+
+def test_schema_tool_dispatch_returns_invalid_args_for_malformed_json() -> None:
+    """Malformed args_json is rejected the same way: a DispatchInvalidToolArgs, not a propagating decode error."""
+    call = ToolCall(id="call1", name="weather", args_json='{"city": ')
+    result = asyncio.run(_weather_tool().dispatch(call))
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.is_error is True
+
+
+def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
+    """A RawSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel."""
+    raw_result = {"forecast": ["sunny"], "source": "mcp"}
+
+    async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
+        """Return model-visible content plus the raw MCP result the model never sees.
+
+        Annotated Mapping[str, object]: accepted against the dict[str, object] parameter by contravariance,
+        pinning that the wider annotation keeps typechecking.
+        """
+        return ToolOutputExplicit(content=f"weather for {args['city']}", app_data=raw_result)
+
+    tool: RawSchemaTool[Mapping[str, object]] = RawSchemaTool(
+        name="weather",
+        description="Report the weather via MCP.",
+        args_schema=_WEATHER_SCHEMA,
+        function=_mcp_function,
+    )
+    call = ToolCall(id="call1", name="weather", args_json='{"city": "Oslo"}')
+    result = asyncio.run(tool.dispatch(call))
+    assert isinstance(result, DispatchHandled)
+    assert result.tool_message.content == "weather for Oslo"
+    assert result.app_data is raw_result
+
+
+def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
+    """One ToolManager routes to a pydantic Tool and a RawSchemaTool side by side.
+
+    schemas() emits both wire schemas and dispatch reaches each tool, proving DispatchableTool lets the manager hold
+    the two forms together without either being a special case.
+    """
+    manager = ToolManager([_echo_tool(), _weather_tool()])
+    names = {schema.name for schema in manager.schemas()}
+    assert names == {"echo", "weather"}
+
+    echo_result = asyncio.run(manager.dispatch(ToolCall(id="c1", name="echo", args_json='{"text": "hi"}')))
+    weather_result = asyncio.run(manager.dispatch(ToolCall(id="c2", name="weather", args_json='{"city": "Oslo"}')))
+    assert isinstance(echo_result, DispatchHandled)
+    assert isinstance(weather_result, DispatchHandled)
+    assert echo_result.tool_message.content == "hi"
+    assert weather_result.tool_message.content == "sunny in Oslo"
+
+
+def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> None:
+    """RawSchemaTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
+
+    Dispatching the RawSchemaTool directly (not via the manager) keeps its own app_data type, so the local annotation
+    raw: Mapping[str, object] | None typechecks with no isinstance.
+    This is the RawSchemaTool analogue of the Tool.dispatch test.
+    """
+
+    async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
+        """Return content plus a mapping app_data."""
+        return ToolOutputExplicit(content=f"weather for {args['city']}", app_data={"source": "mcp"})
+
+    tool: RawSchemaTool[Mapping[str, object]] = RawSchemaTool(
+        name="weather",
+        description="Report the weather via MCP.",
+        args_schema=_WEATHER_SCHEMA,
+        function=_mcp_function,
+    )
+    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}')))
+    assert isinstance(result, DispatchHandled)
+    raw: Mapping[str, object] | None = result.app_data
+    assert raw is not None
+    assert raw["source"] == "mcp"

@@ -1,7 +1,7 @@
 # langchaint
 
 Provider-neutral async LLM client over the official provider SDKs (anthropic >= 0.116.0, openai >= 2.45.0).
-Prototype: nothing is stable, everything can be rewritten.
+Alpha: the API is unstable and may change without notice.
 
 ## Design
 

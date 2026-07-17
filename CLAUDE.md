@@ -1,6 +1,6 @@
 # langchaint
 
-A provider-neutral LLM client library. Prototype: nothing is stable, everything can be rewritten.
+A provider-neutral LLM client library. Alpha: the API is unstable and may change without notice.
 
 ## Docstrings and comments
 

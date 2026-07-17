@@ -80,7 +80,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
         """Drive one generate_one to success and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider(echo=True)), tracer=tracer)
-        response = await traced.bind().generate_one("hi")
+        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert response.output == "hi"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
@@ -118,7 +118,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
         with pytest.raises(RefusalError):
-            await traced.bind().generate_one("hi")
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -144,7 +144,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
         with pytest.raises(ExceededMaxCompletionTokensError):
-            await traced.bind().generate_one("hi")
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -165,7 +165,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
             LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)), tracer=tracer
         )
         with pytest.raises(RetriesExhaustedError):
-            await traced.bind().generate_one("hi")
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -187,7 +187,7 @@ def test_generate_one_abort_records_the_exception_and_ends_the_span() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
         with pytest.raises(AbortBatchError):
-            await traced.bind().generate_one("hi")
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         # An abort carries no shared-field attributes; it is recorded as an exception event instead.
@@ -205,7 +205,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
         provider = _FakeProvider(failures=[TransientError("boom")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
-        response = await traced.bind().generate_one("hi")
+        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert response.attempts == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
@@ -232,7 +232,7 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=rate_limiter), tracer=tracer)
-        results = await traced.bind().generate_many([
+        results = await traced.bind(automatic_prompt_caching=True).generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
             [UserMessage(content="c")],
@@ -277,7 +277,7 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
             await LLM(
                 _provider(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)
             )
-            .bind()
+            .bind(automatic_prompt_caching=True)
             .generate_many(conversations)
         )
         tracer, _exporter = _in_memory_tracer()
@@ -285,7 +285,7 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
             LLM(_provider(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)),
             tracer=tracer,
         )
-        wrapped = await traced.bind().generate_many(conversations)
+        wrapped = await traced.bind(automatic_prompt_caching=True).generate_many(conversations)
         plain_rows = [to_row(result) for result in plain]
         wrapped_rows = [to_row(result) for result in wrapped]
         assert [sorted(row) for row in plain_rows] == [sorted(row) for row in wrapped_rows]
@@ -307,7 +307,7 @@ def test_generate_many_abort_marks_the_batch_span_error() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=rate_limiter), tracer=tracer)
         with pytest.raises(AbortBatchError):
-            await traced.bind().generate_many([
+            await traced.bind(automatic_prompt_caching=True).generate_many([
                 [UserMessage(content="a")],
                 [UserMessage(content="b")],
             ])
@@ -325,7 +325,7 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_token() -
         """Iterate the stream fully, call final(), and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer)
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
         assert "".join(texts) == "ab"
@@ -348,7 +348,7 @@ def test_stream_final_is_idempotent_and_ends_the_span_once() -> None:
         """Call final() twice on one drained stream and count the spans."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer)
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             first = await stream.final()
             second = await stream.final()
         assert first is second
@@ -364,7 +364,7 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
         """Break out after one item and confirm one span ended without error status."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer)
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             async for _item in stream:
                 break
         (span,) = exporter.get_finished_spans()
@@ -380,7 +380,7 @@ def test_stream_never_iterated_emits_no_span() -> None:
         """Enter and leave the context without driving the stream."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer)
-        async with traced.bind().stream_one("hi"):
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
             pass
         assert exporter.get_finished_spans() == ()
 
@@ -392,7 +392,7 @@ def test_stream_failing_mid_iteration_ends_its_span_with_error_status() -> None:
 
     async def _drain(traced: TracedLLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             async for _item in stream:
                 pass
 
@@ -418,7 +418,7 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
         provider = _FakeProvider(stream=_RefusingStream())
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             with pytest.raises(RefusalError):
                 await stream.final()
         (span,) = exporter.get_finished_spans()
@@ -449,7 +449,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider(echo=True)), attribute_format=_mapper, tracer=tracer)
-        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
+        rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(system_prompt="s2")
         assert_type(rebound, TracedBoundLLM[str])
         await rebound.generate_one("hi")
         async with rebound.stream_one("hi") as stream:
@@ -478,7 +478,7 @@ def test_callable_attribute_format_emits_exactly_its_keys() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), attribute_format=_mapper, tracer=tracer)
-        await traced.bind().generate_one("hi")
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes == {"custom.model": "fake-model", "custom.attempts": 1}
 
@@ -500,7 +500,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         # No global SDK provider is configured, so get_tracer yields non-recording spans.
         tracer = trace.get_tracer("no-sdk")
         traced = TracedLLM(LLM(_FakeProvider()), attribute_format=_mapper, tracer=tracer)
-        response = await traced.bind().generate_one("hi")
+        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert response.output == "ok"
         assert calls == []
 
@@ -526,7 +526,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), attribute_format=_mapper, tracer=tracer)
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await traced.bind().generate_one("hi")
+            response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
@@ -558,7 +558,7 @@ def test_generate_many_does_not_invoke_the_mapper() -> None:
             attribute_format=_mapper,
             tracer=tracer,
         )
-        results = await traced.bind().generate_many([
+        results = await traced.bind(automatic_prompt_caching=True).generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
         ])
@@ -591,7 +591,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeProvider()), attribute_format=_mapper, tracer=tracer)
-        async with traced.bind().stream_one("hi") as stream:
+        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             async for _item in stream:
                 pass
             response = await stream.final()
@@ -613,9 +613,9 @@ def test_unknown_attribute_format_string_raises_key_error() -> None:
 def test_bind_output_types_are_mirrored() -> None:
     """The overloads mirror LLM.bind: a model gives TracedBoundLLM[Model], absent gives [str]."""
     traced = TracedLLM(LLM(_FakeProvider()))
-    structured = traced.bind(response_format=_Answer)
+    structured = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(structured, TracedBoundLLM[_Answer])
-    text = traced.bind()
+    text = traced.bind(automatic_prompt_caching=True)
     assert_type(text, TracedBoundLLM[str])
 
 
@@ -636,7 +636,7 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
     traced = TracedLLM(LLM(provider, rate_limiter=rate_limiter))
     assert traced.provider is provider
     assert traced.rate_limiter is rate_limiter
-    bound = traced.bind(response_format=_Answer)
+    bound = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert bound.provider is provider
     assert bound.rate_limiter is rate_limiter
     assert bound.response_format is _Answer
@@ -647,5 +647,24 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
 def test_wrapping_a_stream_creates_a_traced_stream() -> None:
     """The stream_one call returns a TracedStreamHandle, the wrapper that owns the stream span."""
     traced = TracedLLM(LLM(_FakeProvider()))
-    handle = traced.bind().stream_one("hi")
+    handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
     assert isinstance(handle, TracedStreamHandle)
+
+
+def test_generate_many_passes_warm_cache_through() -> None:
+    """warm_cache reaches BoundLLM.generate_many: the warming item never overlaps a sibling."""
+
+    async def scenario() -> None:
+        """Run a three-item batch on a slow fake with a wide slot and read the recorded peak."""
+        provider = _FakeProvider(echo=True, send_seconds=0.01)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter(max_in_flight=8)), tracer=tracer)
+        results = await traced.bind(automatic_prompt_caching=True).generate_many(
+            [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
+        )
+        assert all(isinstance(result, Response) for result in results)
+        assert provider.bound_providers[0].peak_in_flight == 2
+        (span,) = exporter.get_finished_spans()
+        assert span.kind == SpanKind.INTERNAL
+
+    asyncio.run(scenario())

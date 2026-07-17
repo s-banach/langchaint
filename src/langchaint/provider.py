@@ -23,7 +23,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from langchaint.inference_params import InferenceParams
-from langchaint.messages import AssistantMessage, Message, StopReason, ToolCall
+from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
@@ -120,7 +120,17 @@ class Binding:
     per-request data is the conversation argument of the BoundProvider methods, nothing else.
     """
 
-    system_prompt: str | None
+    system_prompt: str | tuple[TextPart, ...] | None
+    """The bound system prompt; None binds none.
+
+    The parts form exists to carry cache_breakpoint marks inside the system prompt:
+    the anthropic adapter renders one system text block per part,
+    and the openai adapter sends the parts as a developer-role input message ahead of the conversation
+    (the SDK documents `instructions` as "a system (or developer) message inserted into the model's context",
+    and only input message parts carry prompt_cache_breakpoint).
+    A plain str renders exactly as before (one anthropic system block; the openai instructions parameter).
+    """
+
     tool_schemas: tuple[ToolSchema, ...]
     tool_choice: ToolChoice
     parallel_tool_calls: bool
@@ -130,9 +140,11 @@ class Binding:
 
     True: the anthropic adapter marks the frozen prefix and each request's last message block as cache breakpoints;
     the openai adapter leaves the provider's implicit caching in place.
-    False disables caching for workloads whose prompts are never reused, so they do not pay for cache writes:
-    the anthropic adapter writes no breakpoints,
-    and the openai adapter requests explicit-mode caching with no breakpoints.
+    False: the anthropic adapter writes no breakpoints of its own,
+    and the openai adapter requests explicit-mode caching with no breakpoints,
+    so a conversation without marked parts caches nothing and pays no cache writes.
+    Under either value, a part with cache_breakpoint True adds a breakpoint at exactly that boundary,
+    so False plus marked parts is the fully user-specified caching configuration.
     On openai, False requires a gpt-5.6 or later model:
     the SDK documents prompt_cache_options as supported only there,
     and the adapter sends it whenever False is bound, so an older model may reject the request.

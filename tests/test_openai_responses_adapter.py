@@ -408,7 +408,11 @@ def _provider() -> OpenAIResponsesProvider:
     )
 
 
-def _binding(*, automatic_prompt_caching: bool, system_prompt: str | None = None) -> Binding:
+def _binding(
+    *,
+    automatic_prompt_caching: bool,
+    system_prompt: str | tuple[TextPart, ...] | None = None,
+) -> Binding:
     """Assemble a toolless binding varying only caching and the system prompt."""
     return Binding(
         system_prompt=system_prompt,
@@ -830,3 +834,101 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
 def test_adapter_pins_sdk_retries_off() -> None:
     """The stored client copy carries max_retries=0 so only the package retries."""
     assert _provider().client.max_retries == 0
+
+
+def test_wire_input_marks_marked_user_and_tool_parts() -> None:
+    """A marked part carries prompt_cache_breakpoint on its wire part; unmarked siblings carry none."""
+    wire = _wire_input([
+        UserMessage(
+            content=(TextPart(text="shared context", cache_breakpoint=True), TextPart(text="question"))
+        ),
+        ToolMessage(
+            tool_call_id="c1",
+            content=(
+                TextPart(text="saw"),
+                ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
+            ),
+        ),
+    ])
+    assert wire == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "shared context",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "input_text", "text": "question"},
+            ],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": [
+                {"type": "input_text", "text": "saw"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{base64.b64encode(b'png').decode('ascii')}",
+                    "detail": "auto",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+            ],
+        },
+    ]
+
+
+def test_wire_input_sends_every_mark_without_a_client_side_cap() -> None:
+    """The server keeps the latest breakpoints itself, so all five marks go to the wire."""
+    wire = _wire_input([
+        UserMessage(
+            content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(5))
+        ),
+    ])
+    assert wire == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": f"m{index}",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }
+                for index in range(5)
+            ],
+        }
+    ]
+
+
+def test_request_system_parts_become_a_developer_input_message() -> None:
+    """A parts system_prompt travels as a developer-role input message; instructions stays unset."""
+    request = _provider()._request(
+        _binding(
+            automatic_prompt_caching=True,
+            system_prompt=(
+                TextPart(text="stable instructions", cache_breakpoint=True),
+                TextPart(text="semi-stable context"),
+            ),
+        )
+    )
+    assert request.instructions is None
+    assert request.input_prefix == [
+        {
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "stable instructions",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "input_text", "text": "semi-stable context"},
+            ],
+        }
+    ]
+
+
+def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> None:
+    """A str system_prompt keeps the instructions mapping and sends no prefix item."""
+    request = _provider()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
+    assert request.instructions == "sys"
+    assert request.input_prefix == []

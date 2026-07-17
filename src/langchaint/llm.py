@@ -27,7 +27,7 @@ from langchaint.exceptions import (
     _extract_transient_errors,
 )
 from langchaint.inference_params import InferenceParams
-from langchaint.messages import Message, UserMessage
+from langchaint.messages import Message, TextPart, UserMessage
 from langchaint.provider import Binding, BoundProvider, Provider, ToolChoice
 from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response
@@ -112,7 +112,7 @@ def _as_conversation(conversation: str | Sequence[Message]) -> Sequence[Message]
 
 def _build_binding(
     *,
-    system_prompt: str | None,
+    system_prompt: str | Sequence[TextPart] | None,
     tool_manager: ToolManager | None,
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
@@ -121,8 +121,18 @@ def _build_binding(
 ) -> Binding:
     """Convert bind arguments to the frozen Binding.
 
-    Tool schema conversion happens here, once per binding.
+    Tool schema conversion happens here, once per binding;
+    a system_prompt given as parts is coerced to the frozen tuple form.
+
+    Raises:
+        ValueError: system_prompt is an empty sequence of parts; pass None to bind no system prompt.
     """
+    if system_prompt is not None and not isinstance(system_prompt, str):
+        if not system_prompt:
+            raise ValueError(
+                "system_prompt is an empty sequence of parts; pass None to bind no system prompt"
+            )
+        system_prompt = tuple(system_prompt)
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=() if tool_manager is None else tool_manager.schemas(),
@@ -169,42 +179,44 @@ class LLM:
     def bind[ModelT: BaseModel](
         self,
         *,
-        system_prompt: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager | None = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
-        automatic_prompt_caching: bool = ...,
+        automatic_prompt_caching: bool,
     ) -> "BoundLLM[ModelT]": ...
     @overload
     def bind(
         self,
         *,
-        system_prompt: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager | None = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
-        automatic_prompt_caching: bool = ...,
+        automatic_prompt_caching: bool,
     ) -> "BoundLLM[str]": ...
     def bind(
         self,
         *,
-        system_prompt: str | None = None,
+        system_prompt: str | Sequence[TextPart] | None = None,
         tool_manager: ToolManager | None = None,
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
-        automatic_prompt_caching: bool = True,
+        automatic_prompt_caching: bool,
     ) -> "BoundLLM[Any]":
         """Freeze the prompt prefix and fix the output type.
 
         response_format=Model gives BoundLLM[Model] whose output is the SDK-parsed instance;
         absent gives BoundLLM[str] whose output is the assistant text.
-        Ad-hoc use is llm.bind().generate_one(...).
+        automatic_prompt_caching has no default: caching changes billing,
+        so the library never chooses a caching configuration for the caller.
+        Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
         """
         binding = _build_binding(
             system_prompt=system_prompt,
@@ -256,7 +268,7 @@ class BoundLLM[OutputT]:
         self,
         *,
         response_format: type[NewModelT],
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -268,7 +280,7 @@ class BoundLLM[OutputT]:
         self,
         *,
         response_format: None,
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -280,7 +292,7 @@ class BoundLLM[OutputT]:
         self,
         *,
         response_format: Unchanged = ...,
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -291,7 +303,7 @@ class BoundLLM[OutputT]:
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
-        system_prompt: str | None | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
         tool_manager: ToolManager | None | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
@@ -489,6 +501,8 @@ class BoundLLM[OutputT]:
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = False,
     ) -> list[Response[OutputT] | GenerationError]:
         """Order-aligned batch: result i belongs to conversations[i].
 
@@ -501,8 +515,28 @@ class BoundLLM[OutputT]:
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.
         An AbortBatchError in any item cancels the in-flight siblings and raises, because the batch is misconfigured.
+
+        warm_cache runs conversations[0] to completion before starting the rest,
+        because a provider cache entry is readable only after the response that writes it begins,
+        so a batch sharing a cached prefix otherwise pays one cold cache write per in-flight item.
+        It costs one item of serial latency and warms unconditionally,
+        whether or not the binding places any cache marker.
+        A first item ending in a GenerationError still admits the rest:
+        a rejected 200 (a refusal, a truncation) wrote the prefix on the provider side,
+        and after a transport failure the rest simply run against a cold cache; there is no second warmer.
+        An AbortBatchError from the first item raises before any sibling starts.
         """
         _reject_bare_str_batch(conversations)
+        # The slices also convert the SequenceNotStr protocol to the Sequence _gather_or_cancel takes.
+        if warm_cache and conversations:
+            first_result = await self._generate_or_failure(conversations[0])
+            return [first_result, *await self._gather_or_cancel(conversations[1:])]
+        return await self._gather_or_cancel(conversations[0:])
+
+    async def _gather_or_cancel(
+        self, conversations: Sequence[str | Sequence[Message]]
+    ) -> list[Response[OutputT] | GenerationError]:
+        """Run the conversations concurrently; on any raise, cancel the in-flight siblings and re-raise."""
         tasks = [
             asyncio.create_task(self._generate_or_failure(conversation))
             for conversation in conversations

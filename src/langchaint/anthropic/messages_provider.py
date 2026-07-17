@@ -14,7 +14,22 @@ Cache breakpoints: with automatic_prompt_caching bound True,
 the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
 or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,
 so the cached span grows with the conversation.
-Bound False, no marker is written and nothing is cached.
+Bound False, the adapter writes no marker of its own.
+A part with cache_breakpoint True adds a marker under either binding: on the part's own text or image block
+in a user message, and on the enclosing tool_result block for the last part of a ToolMessage
+(the API documents cache_control on the tool_result block itself; a marked part that is not
+the message's last would silently move the boundary to the block's end, so it aborts instead).
+A system_prompt bound as parts renders one system block per part, marked parts carrying cache_control,
+so a breakpoint can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
+The API allows at most 4 cache_control markers per request.
+The binding's own markers (marked system parts, the automatic frozen-prefix and last-message markers)
+spend slots first; a binding whose markers alone exceed the limit fails at bind with ValueError.
+The remainder is the per-request budget for marked message parts:
+the latest marks up to that budget are written and older ones left unwritten,
+mirroring openai's documented latest-N rule so a conversation that accrues one mark per turn keeps working.
+Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default,
+so the wire form matches markers written before cache_ttl existed; "1h" writes ttl "1h",
+whose writes bill at the PricingTable's cache_write_1h_usd_per_million_tokens).
 
 Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
@@ -40,6 +55,7 @@ from anthropic import (
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
     Base64ImageSourceParam,
+    CacheControlEphemeralParam,
     ImageBlockParam,
     MessageParam,
     OutputConfigParam,
@@ -108,6 +124,24 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 )
 
 
+_CACHE_MARKER_REQUEST_LIMIT = 4
+"""The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
+
+type CacheTtl = Literal["5m", "1h"]
+"""A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
+
+
+def _cache_control_param(cache_ttl: CacheTtl) -> CacheControlEphemeralParam:
+    """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
+
+    The omission keeps the "5m" wire form byte-identical to a marker written before cache_ttl existed,
+    so upgrading the package alone cannot invalidate a live cache entry.
+    """
+    if cache_ttl == "5m":
+        return {"type": "ephemeral"}
+    return {"type": "ephemeral", "ttl": "1h"}
+
+
 @dataclass(frozen=True, kw_only=True)
 class _AnthropicRequest:
     """The typed request fields one binding precomputes.
@@ -123,6 +157,10 @@ class _AnthropicRequest:
     tool_choice: ToolChoiceParam | Omit
     output_config: OutputConfigParam | Omit
     automatic_prompt_caching: bool
+    cache_ttl: CacheTtl
+    message_mark_budget: int
+    """What the binding's own markers (system marks, the frozen-prefix and last-message markers) leave
+    of the API's 4-marker request limit for per-request marked parts."""
 
 
 def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
@@ -147,11 +185,25 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
     return {"type": "image", "source": image_source}
 
 
-def _user_content_blocks(user_message: UserMessage) -> list[_ContentBlockParam]:
-    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's AbortBatchError."""
+def _user_content_blocks(
+    user_message: UserMessage,
+) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
+    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's AbortBatchError.
+
+    The second element holds the blocks whose part sets cache_breakpoint, in content order;
+    the caller applies the request-wide marker budget, so no marker is written here.
+    """
+    blocks: list[_ContentBlockParam] = []
+    marked: list[TextBlockParam | ImageBlockParam] = []
     if isinstance(user_message.content, str):
-        return [{"type": "text", "text": user_message.content}]
-    return [_part_block(part) for part in user_message.content]
+        blocks.append({"type": "text", "text": user_message.content})
+        return blocks, marked
+    for part in user_message.content:
+        block = _part_block(part)
+        blocks.append(block)
+        if part.cache_breakpoint:
+            marked.append(block)
+    return blocks, marked
 
 
 def _tool_result_content(
@@ -208,8 +260,38 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     return blocks
 
 
+def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
+    """Whether the tool message's last part sets cache_breakpoint, marking the enclosing tool_result block.
+
+    The marker goes on the tool_result block itself, the placement the API documents;
+    for the message's last part that is equivalent, because the block's span ends where that part ends.
+
+    Raises:
+        AbortBatchError: a part other than the message's last sets cache_breakpoint;
+            the enclosing block's marker would silently move the boundary to the block's end,
+            and the same request would abort again.
+    """
+    if isinstance(tool_message.content, str):
+        return False
+    marked_indexes = [
+        index for index, part in enumerate(tool_message.content) if part.cache_breakpoint
+    ]
+    if not marked_indexes:
+        return False
+    if marked_indexes != [len(tool_message.content) - 1]:
+        raise AbortBatchError(
+            "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
+            "the marker goes on the enclosing tool_result block, whose span ends at the last part"
+        )
+    return True
+
+
 def _wire_messages(
-    conversation: Sequence[Message], *, automatic_prompt_caching: bool
+    conversation: Sequence[Message],
+    *,
+    automatic_prompt_caching: bool,
+    cache_ttl: CacheTtl,
+    message_mark_budget: int,
 ) -> list[MessageParam]:
     """Convert a conversation to wire messages.
 
@@ -217,13 +299,20 @@ def _wire_messages(
     so the cached span grows with the conversation.
     A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
     so that request writes none.
+    A part with cache_breakpoint marks its own block in a user message
+    and the enclosing tool_result block in a tool message;
+    the latest marks up to message_mark_budget are written and older ones left unwritten.
+    message_mark_budget is what the binding's markers leave of the request limit,
+    computed once in _request; at 0, every mark goes unwritten.
 
     Raises:
-        AbortBatchError: an image part's media_type is outside the API's set (from _part_block).
+        AbortBatchError: an image part's media_type is outside the API's set (from _part_block),
+            or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking).
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
     wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []
     pending_tool_results: list[_ContentBlockParam] = []
+    marked_blocks: list[TextBlockParam | ImageBlockParam | ToolResultBlockParam] = []
 
     def flush_tool_results() -> None:
         """Group buffered consecutive tool results into one user message."""
@@ -233,25 +322,33 @@ def _wire_messages(
 
     for message in conversation:
         if isinstance(message, ToolMessage):
-            pending_tool_results.append({
+            tool_result_block: ToolResultBlockParam = {
                 "type": "tool_result",
                 "tool_use_id": message.tool_call_id,
                 "content": _tool_result_content(message.content),
                 "is_error": message.is_error,
-            })
+            }
+            if _tool_message_is_marked(message):
+                marked_blocks.append(tool_result_block)
+            pending_tool_results.append(tool_result_block)
         elif isinstance(message, UserMessage):
             flush_tool_results()
-            wire.append(("user", _user_content_blocks(message)))
+            blocks, marked = _user_content_blocks(message)
+            marked_blocks.extend(marked)
+            wire.append(("user", blocks))
         else:
             flush_tool_results()
             wire.append(("assistant", _assistant_content_blocks(message)))
     flush_tool_results()
+    if message_mark_budget > 0:
+        for block in marked_blocks[-message_mark_budget:]:
+            block["cache_control"] = _cache_control_param(cache_ttl)
     if automatic_prompt_caching and wire:
         last_blocks = wire[-1][1]
         if last_blocks:
             last_block = last_blocks[-1]
             if last_block["type"] != "thinking" and last_block["type"] != "redacted_thinking":
-                last_block["cache_control"] = {"type": "ephemeral"}
+                last_block["cache_control"] = _cache_control_param(cache_ttl)
     return [MessageParam(role=role, content=blocks) for role, blocks in wire]
 
 
@@ -272,7 +369,10 @@ def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> 
 
 
 def _wire_tools(
-    tool_schemas: tuple[ToolSchema, ...], *, cache_breakpoint_on_last_tool: bool
+    tool_schemas: tuple[ToolSchema, ...],
+    *,
+    cache_breakpoint_on_last_tool: bool,
+    cache_ttl: CacheTtl,
 ) -> list[ToolParam]:
     """Convert tool schemas to wire tools.
 
@@ -288,7 +388,7 @@ def _wire_tools(
         for tool_schema in tool_schemas
     ]
     if cache_breakpoint_on_last_tool and tools:
-        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        tools[-1]["cache_control"] = _cache_control_param(cache_ttl)
     return tools
 
 
@@ -399,37 +499,87 @@ class AnthropicMessagesProvider(Provider):
         model: str,
         pricing: PricingTable,
         default_max_completion_tokens: int = 4096,
+        cache_ttl: CacheTtl = "5m",
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
         The stored client is a with_options(max_retries=0) copy: the package's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
+        cache_ttl applies uniformly to every cache_control marker this adapter writes,
+        automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
+        "1h" holds entries across longer gaps and writes bill 2x
+        (priced by the PricingTable's cache_write_1h_usd_per_million_tokens).
+        A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request.
         """
         super().__init__(model=model, pricing=pricing)
         self.client = client.with_options(max_retries=0)
         self.default_max_completion_tokens = default_max_completion_tokens
+        self.cache_ttl: CacheTtl = cache_ttl
 
     def _request(self, binding: Binding) -> _AnthropicRequest:
-        """Precompute the typed request fields the binding determines."""
+        """Precompute the typed request fields the binding determines.
+
+        A str system_prompt is one system block; a parts system_prompt is one block per part,
+        each marked part carrying cache_control.
+        automatic_prompt_caching marks the last system block (idempotent when it is already marked)
+        or, with no system prompt, the last tool.
+        The binding's markers spend the API's 4-marker request limit first;
+        message_mark_budget carries the remainder to _wire_messages.
+
+        Raises:
+            ValueError: the binding's markers alone (marked system parts plus the automatic markers)
+                exceed the API's 4-marker request limit; unmark some system parts.
+                Also raised on an empty tuple system_prompt,
+                which bind rejects and only a directly constructed Binding can carry.
+        """
         max_tokens = binding.inference_params.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
+        bind_marker_count = 0
         if binding.system_prompt is not None:
-            system_block: TextBlockParam = {"type": "text", "text": binding.system_prompt}
+            system_blocks: list[TextBlockParam] = []
+            if isinstance(binding.system_prompt, str):
+                system_blocks.append({"type": "text", "text": binding.system_prompt})
+            else:
+                if not binding.system_prompt:
+                    raise ValueError(
+                        "system_prompt is an empty tuple of parts; bind rejects this, "
+                        "so it can only come from a directly constructed Binding"
+                    )
+                for part in binding.system_prompt:
+                    system_block: TextBlockParam = {"type": "text", "text": part.text}
+                    if part.cache_breakpoint:
+                        system_block["cache_control"] = _cache_control_param(self.cache_ttl)
+                    system_blocks.append(system_block)
             if binding.automatic_prompt_caching:
-                system_block["cache_control"] = {"type": "ephemeral"}
-            system = [system_block]
+                system_blocks[-1]["cache_control"] = _cache_control_param(self.cache_ttl)
+            bind_marker_count = sum(1 for block in system_blocks if "cache_control" in block)
+            system = system_blocks
         tools: list[ToolParam] | Omit = omit
         tool_choice: ToolChoiceParam | Omit = omit
         if binding.tool_schemas:
+            cache_breakpoint_on_last_tool = (
+                binding.automatic_prompt_caching and binding.system_prompt is None
+            )
             tools = _wire_tools(
                 binding.tool_schemas,
-                cache_breakpoint_on_last_tool=(
-                    binding.automatic_prompt_caching and binding.system_prompt is None
-                ),
+                cache_breakpoint_on_last_tool=cache_breakpoint_on_last_tool,
+                cache_ttl=self.cache_ttl,
             )
+            if cache_breakpoint_on_last_tool:
+                bind_marker_count += 1
             tool_choice = _wire_tool_choice(
                 binding.tool_choice, parallel_tool_calls=binding.parallel_tool_calls
+            )
+        last_message_marker_count = 1 if binding.automatic_prompt_caching else 0
+        message_mark_budget = (
+            _CACHE_MARKER_REQUEST_LIMIT - bind_marker_count - last_message_marker_count
+        )
+        if message_mark_budget < 0:
+            raise ValueError(
+                f"the binding writes {bind_marker_count + last_message_marker_count} cache markers, "
+                f"over the API's limit of {_CACHE_MARKER_REQUEST_LIMIT} per request; "
+                f"unmark some system parts"
             )
         output_config: OutputConfigParam | Omit = omit
         if binding.inference_params.reasoning_effort is not None:
@@ -444,6 +594,8 @@ class AnthropicMessagesProvider(Provider):
             tool_choice=tool_choice,
             output_config=output_config,
             automatic_prompt_caching=binding.automatic_prompt_caching,
+            cache_ttl=self.cache_ttl,
+            message_mark_budget=message_mark_budget,
         )
 
     @override
@@ -559,7 +711,10 @@ class _BoundAnthropicText(BoundProvider[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             messages=_wire_messages(
-                conversation, automatic_prompt_caching=self._request.automatic_prompt_caching
+                conversation,
+                automatic_prompt_caching=self._request.automatic_prompt_caching,
+                cache_ttl=self._request.cache_ttl,
+                message_mark_budget=self._request.message_mark_budget,
             ),
         )
         return _provider_result(
@@ -579,7 +734,10 @@ class _BoundAnthropicText(BoundProvider[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             messages=_wire_messages(
-                conversation, automatic_prompt_caching=self._request.automatic_prompt_caching
+                conversation,
+                automatic_prompt_caching=self._request.automatic_prompt_caching,
+                cache_ttl=self._request.cache_ttl,
+                message_mark_budget=self._request.message_mark_budget,
             ),
         )
         sdk_stream = await manager.__aenter__()
@@ -649,7 +807,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             messages=_wire_messages(
-                conversation, automatic_prompt_caching=self._request.automatic_prompt_caching
+                conversation,
+                automatic_prompt_caching=self._request.automatic_prompt_caching,
+                cache_ttl=self._request.cache_ttl,
+                message_mark_budget=self._request.message_mark_budget,
             ),
             output_format=self._response_format,
         )
@@ -670,7 +831,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             messages=_wire_messages(
-                conversation, automatic_prompt_caching=self._request.automatic_prompt_caching
+                conversation,
+                automatic_prompt_caching=self._request.automatic_prompt_caching,
+                cache_ttl=self._request.cache_ttl,
+                message_mark_budget=self._request.message_mark_budget,
             ),
             output_format=self._response_format,
         )

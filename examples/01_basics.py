@@ -22,9 +22,11 @@ async def plain_text() -> None:
     Swapping providers is one import: anthropic_model("claude-sonnet-5") returns an LLM with the same surface.
     bind() with no response_format returns BoundLLM[str], so response.output is the assistant text.
     A bare str is shorthand for a conversation of one user turn holding that text.
+    automatic_prompt_caching is required on every bind with no default, because caching changes billing;
+    these one-shot prompts reuse no prefix, so False. 02_tool_loop.py shows the case where True pays.
     """
     llm = openai_model("gpt-5.6-terra")
-    assistant = llm.bind(system_prompt="You are a terse assistant.")
+    assistant = llm.bind(system_prompt="You are a terse assistant.", automatic_prompt_caching=False)
     response = await assistant.generate_one("Name three primary colors.")
     print(response.output)
     print(f"{response.cost_in_usd:.6f} USD, {response.usage.output_tokens} output tokens")
@@ -48,6 +50,7 @@ async def structured_output() -> None:
     classifier = llm.bind(
         system_prompt="Classify the sentiment of the user's message.",
         response_format=Sentiment,
+        automatic_prompt_caching=False,
     )
     response = await classifier.generate_one("This is the best day I have had in months.")
     sentiment = response.output
@@ -64,6 +67,7 @@ async def rebind_to_change_a_parameter() -> None:
     base = llm.bind(
         system_prompt="Answer in one sentence.",
         inference_params=InferenceParams(max_completion_tokens=256),
+        automatic_prompt_caching=False,
     )
     longer = base.rebind(inference_params=InferenceParams(max_completion_tokens=2048))
     response = await longer.generate_one("Explain how a suspension bridge carries load.")
@@ -78,7 +82,10 @@ async def batch_to_rows() -> None:
     Concurrency is bounded by the shared RateLimiter's max_in_flight (see 05_rate_limiting_and_errors.py).
     """
     llm = openai_model("gpt-5.6-terra")
-    summarizer = llm.bind(system_prompt="Summarize in five words.")
+    summarizer = llm.bind(
+        system_prompt="Summarize in five words.",
+        automatic_prompt_caching=False,
+    )
     documents = [
         "The quarterly report shows revenue up twelve percent on strong subscription growth.",
         "Heavy rain closed three mountain passes and stranded weekend hikers overnight.",

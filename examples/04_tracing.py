@@ -43,7 +43,7 @@ async def traced_generate() -> None:
     the paid result is never discarded by a telemetry bug.
     """
     traced = TracedLLM(openai_model("gpt-5.6-terra"))
-    assistant = traced.bind(system_prompt="Answer in one sentence.")
+    assistant = traced.bind(system_prompt="Answer in one sentence.", automatic_prompt_caching=False)
     response = await assistant.generate_one("What is the capital of Japan?")
     print(response.output)
     # Streaming is traced too: traced_bound.stream_one(...) returns a TracedStreamHandle that records

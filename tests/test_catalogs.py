@@ -83,3 +83,13 @@ def test_rate_limiter_lands_on_the_llm() -> None:
     defaulted = openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="offline"))
     assert isinstance(defaulted.rate_limiter, RateLimiter)
     assert defaulted.rate_limiter is not rate_limiter
+
+def test_cache_ttl_lands_on_the_adapter() -> None:
+    """A caller-supplied cache_ttl reaches the adapter; the default is "5m"."""
+    llm = anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="offline"), cache_ttl="1h")
+    provider = llm.provider
+    assert isinstance(provider, AnthropicMessagesProvider)
+    assert provider.cache_ttl == "1h"
+    defaulted = anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="offline"))
+    assert isinstance(defaulted.provider, AnthropicMessagesProvider)
+    assert defaulted.provider.cache_ttl == "5m"

@@ -1,6 +1,7 @@
 """Inference parameters.
 
-Exactly two fields; the escape hatch for unmapped provider knobs is subclassing the adapter, never a passthrough dict.
+Exactly two fields.
+The escape hatch for unmapped provider parameters is subclassing the adapter, never a passthrough dict.
 Replacement is whole-object: a rebind(inference_params=...) replaces the bound InferenceParams,
 so no field-wise merge rules exist to learn;
 partial change is spelled dataclasses.replace(bound_llm.binding.inference_params, ...) at the call site.

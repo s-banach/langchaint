@@ -99,12 +99,15 @@ async def basic_run() -> None:
     """Wire a ToolManager into the binding and run the loop with no approval gate.
 
     The same ToolManager instance goes into bind (so its schemas are sent) and into the loop (so calls dispatch to it).
+    automatic_prompt_caching=True because the loop re-sends the growing conversation every turn,
+    so each turn re-reads the cached prefix the previous turn wrote.
     """
     tool_manager = ToolManager([weather_tool])
     llm = openai_model("gpt-5.6-terra")
     bound = llm.bind(
         system_prompt="Use tools to answer questions about the weather.",
         tool_manager=tool_manager,
+        automatic_prompt_caching=True,
     )
     answer = await run_agent(bound, tool_manager, "What is the weather in Oslo?")
     print(answer)
@@ -119,7 +122,7 @@ async def reading_dispatch_outcomes() -> None:
     DispatchUnknownTool carries the off-list called_name.
     """
     tool_manager = ToolManager([weather_tool])
-    bound = openai_model("gpt-5.6-terra").bind(tool_manager=tool_manager)
+    bound = openai_model("gpt-5.6-terra").bind(tool_manager=tool_manager, automatic_prompt_caching=False)
     conversation: list[Message] = [UserMessage(content="What is the weather in Oslo?")]
     response = await bound.generate_one(conversation)
     conversation.append(response.assistant_message)
@@ -183,6 +186,7 @@ async def approval_run() -> None:
     bound = openai_model("gpt-5.6-terra").bind(
         system_prompt="Use tools to help the user.",
         tool_manager=tool_manager,
+        automatic_prompt_caching=True,
     )
     answer = await run_agent(bound, tool_manager, "Transfer 50 USD to account A-1.", approve=require_approval)
     print(answer)

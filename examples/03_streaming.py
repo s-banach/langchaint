@@ -23,7 +23,10 @@ async def stream_text() -> None:
 
     Nothing starts until the first item is requested; the async with block guarantees the connection closes.
     """
-    bound = openai_model("gpt-5.6-terra").bind(system_prompt="Answer in a short paragraph.")
+    bound = openai_model("gpt-5.6-terra").bind(
+        system_prompt="Answer in a short paragraph.",
+        automatic_prompt_caching=False,
+    )
     handle = bound.stream_one("Describe the water cycle.")
     async with handle:
         async for item in handle:
@@ -93,6 +96,7 @@ async def main() -> None:
     bound = openai_model("gpt-5.6-terra").bind(
         system_prompt="Use tools to answer questions about the weather.",
         tool_manager=tool_manager,
+        automatic_prompt_caching=True,
     )
     answer = await stream_agent(bound, tool_manager, "What is the weather in Oslo?")
     print(f"\nfinal answer: {answer}")

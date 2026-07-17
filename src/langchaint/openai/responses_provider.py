@@ -21,6 +21,11 @@ Verified against openai 2.45.0:
   the provider's implicit caching is left in place and nothing is sent.
   The adapter sends it regardless of model (it keeps no model-version table),
   so binding False with a pre-gpt-5.6 model may be rejected by the API.
+- A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
+  under either binding value: implicit mode writes up to the latest three explicit breakpoints,
+  explicit mode up to the latest four, and older marks are read-only for matching,
+  so the adapter sends every mark and caps nothing.
+  With automatic_prompt_caching False, marked parts are what re-enables caching at exactly those boundaries.
 - The API stores responses server-side for later retrieval by default;
   the adapter always sends `store=False` because conversation state is the caller's conversation argument,
   and a stored copy would be an unused side effect.
@@ -29,7 +34,10 @@ Verified against openai 2.45.0:
   `store=False` alone leaves `encrypted_content` None and the replayed reasoning would be empty.
 
 Mapping decisions:
-- The bound system prompt travels as the `instructions` parameter, not as an input item.
+- A str system_prompt travels as the `instructions` parameter, not as an input item;
+  a parts system_prompt travels as a developer-role input message first in every request's input,
+  the message the SDK documents `instructions` as inserting, because only input message parts
+  carry prompt_cache_breakpoint.
 - An AssistantMessage re-feeds its turn elements in emission order,
   which the API requires for replay under store=False:
   a ReasoningTrace is its reasoning item re-sent unchanged, a ToolCall one `function_call` item,
@@ -58,7 +66,11 @@ from openai.types.responses import (
     FunctionToolParam,
     ResponseFunctionToolCallParam,
     ResponseIncludable,
+    ResponseInputImageContentParam,
+    ResponseInputImageParam,
     ResponseInputMessageContentListParam,
+    ResponseInputTextContentParam,
+    ResponseInputTextParam,
     ResponseUsage,
     ToolChoiceFunctionParam,
 )
@@ -123,7 +135,7 @@ class _OpenAIRequest:
 
     Fields set to the SDK's omit sentinel leave the provider default in place; passing them as explicit keywords
     (never **kwargs) keeps the SDK's overload resolution intact.
-    instructions is the bound system prompt; the API takes it as a parameter, not an input item.
+    instructions is the bound str system prompt; a parts system prompt travels in input_prefix instead.
     tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
     include is always ["reasoning.encrypted_content"]:
     the adapter re-feeds the whole conversation every turn, so every response's reasoning items
@@ -132,6 +144,11 @@ class _OpenAIRequest:
 
     model: str
     instructions: str | None
+    input_prefix: list[ResponseInputItemParam]
+    """Items sent ahead of the conversation every request: a system_prompt bound as parts becomes
+    one developer-role input message here (its parts carry prompt_cache_breakpoint marks,
+    which the instructions string cannot), and a str or absent system_prompt leaves it empty."""
+
     max_output_tokens: int | Omit
     reasoning: Reasoning | Omit
     tools: list[FunctionToolParam] | Omit
@@ -148,19 +165,30 @@ def _image_data_uri(image_part: ImagePart) -> str:
 
 
 def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
-    """Convert one UserMessage to a user message item."""
+    """Convert one UserMessage to a user message item.
+
+    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part;
+    the API writes up to the latest four breakpoints per request (three in implicit mode)
+    and treats older ones as read-only, so every mark is sent and no client-side cap applies.
+    """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
     parts: ResponseInputMessageContentListParam = []
     for part in user_message.content:
         if isinstance(part, TextPart):
-            parts.append({"type": "input_text", "text": part.text})
+            wire_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
+            if part.cache_breakpoint:
+                wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            parts.append(wire_text)
         else:
-            parts.append({
+            wire_image: ResponseInputImageParam = {
                 "type": "input_image",
                 "image_url": _image_data_uri(part),
                 "detail": "auto",
-            })
+            }
+            if part.cache_breakpoint:
+                wire_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            parts.append(wire_image)
     return {"role": "user", "content": parts}
 
 
@@ -172,19 +200,27 @@ def _function_call_output(content: str | tuple[Part, ...]) -> str | ResponseFunc
     A bare string passes through; a sequence of parts becomes that structured content list.
     The image content param is a distinct wire type from the user-message input_image param,
     so this builds its own dict rather than reusing _user_item's list, sharing only the data: URI encoding.
+    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part,
+    under the same latest-N server rule _user_item's docstring states.
     """
     if isinstance(content, str):
         return content
     output_content: ResponseFunctionCallOutputItemListParam = []
     for part in content:
         if isinstance(part, TextPart):
-            output_content.append({"type": "input_text", "text": part.text})
+            output_text: ResponseInputTextContentParam = {"type": "input_text", "text": part.text}
+            if part.cache_breakpoint:
+                output_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            output_content.append(output_text)
         else:
-            output_content.append({
+            output_image: ResponseInputImageContentParam = {
                 "type": "input_image",
                 "image_url": _image_data_uri(part),
                 "detail": "auto",
-            })
+            }
+            if part.cache_breakpoint:
+                output_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
+            output_content.append(output_image)
     return output_content
 
 
@@ -418,7 +454,25 @@ class OpenAIResponsesProvider(Provider):
         self.client = client.with_options(max_retries=0)
 
     def _request(self, binding: Binding) -> _OpenAIRequest:
-        """Precompute the typed request fields the binding determines."""
+        """Precompute the typed request fields the binding determines.
+
+        A str system_prompt travels as the instructions parameter,
+        which the SDK documents as "a system (or developer) message inserted into the model's context".
+        A parts system_prompt travels as that message itself, a developer-role input message
+        first in every request's input, because only input message parts carry prompt_cache_breakpoint.
+        """
+        instructions: str | None = None
+        input_prefix: list[ResponseInputItemParam] = []
+        if isinstance(binding.system_prompt, str):
+            instructions = binding.system_prompt
+        elif binding.system_prompt is not None:
+            system_parts: ResponseInputMessageContentListParam = []
+            for part in binding.system_prompt:
+                system_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
+                if part.cache_breakpoint:
+                    system_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                system_parts.append(system_text)
+            input_prefix.append({"role": "developer", "content": system_parts})
         tools: list[FunctionToolParam] | Omit = omit
         tool_choice: _WireToolChoice | Omit = omit
         parallel_tool_calls: bool | Omit = omit
@@ -428,7 +482,8 @@ class OpenAIResponsesProvider(Provider):
             parallel_tool_calls = binding.parallel_tool_calls
         return _OpenAIRequest(
             model=self.model,
-            instructions=binding.system_prompt,
+            instructions=instructions,
+            input_prefix=input_prefix,
             max_output_tokens=(
                 binding.inference_params.max_completion_tokens
                 if binding.inference_params.max_completion_tokens is not None
@@ -587,7 +642,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             prompt_cache_options=self._request.prompt_cache_options,
             include=self._request.include,
             store=False,
-            input=_wire_input(conversation),
+            input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
         return _provider_result(
             response=response,
@@ -609,7 +664,7 @@ class _BoundOpenAIText(BoundProvider[str]):
             prompt_cache_options=self._request.prompt_cache_options,
             include=self._request.include,
             store=False,
-            input=_wire_input(conversation),
+            input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
         sdk_stream = await manager.__aenter__()
         return _OpenAIStream(
@@ -693,7 +748,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             prompt_cache_options=self._request.prompt_cache_options,
             include=self._request.include,
             store=False,
-            input=_wire_input(conversation),
+            input=[*self._request.input_prefix, *_wire_input(conversation)],
             text_format=self._response_format,
         )
         return _provider_result(
@@ -716,7 +771,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             prompt_cache_options=self._request.prompt_cache_options,
             include=self._request.include,
             store=False,
-            input=_wire_input(conversation),
+            input=[*self._request.input_prefix, *_wire_input(conversation)],
             text_format=self._response_format,
         )
         sdk_stream = await manager.__aenter__()

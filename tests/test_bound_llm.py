@@ -322,7 +322,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
     async def scenario() -> None:
         """Drive one generate_one through a single transient failure."""
         provider = _FakeProvider(failures=[TransientError("boom")])
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(system_prompt="s")
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(system_prompt="s", automatic_prompt_caching=True)
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert response.output == "ok"
         assert response.attempts == 2
@@ -352,7 +352,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
     async def scenario() -> None:
         """Drive one generate_one to exhaustion under a two-attempt budget."""
         provider = _FakeProvider(failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind(automatic_prompt_caching=True)
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
         failure = exhausted.value
@@ -379,7 +379,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
         """Recover from one failure under a visible 0.05s backoff."""
         provider = _FakeProvider(failures=[TransientError("boom")])
         rate_limiter = RateLimiter(max_attempts=2, backoff_base_seconds=0.05)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         failed, succeeded = response.attempt_records
         assert failed.elapsed_seconds < 0.05
@@ -398,7 +398,7 @@ def test_abort_batch_error_raises_immediately_without_retry() -> None:
     async def scenario() -> None:
         """Drive one generate_one whose send raises AbortBatchError."""
         provider = _FakeProvider(failures=[AbortBatchError("nope")])
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         with pytest.raises(AbortBatchError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert provider.bound_providers[0].send_count == 1
@@ -418,7 +418,7 @@ def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
                 )
             ]
         )
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         with pytest.raises(RefusalError) as refused:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert provider.bound_providers[0].send_count == 1
@@ -446,7 +446,7 @@ def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
                 )
             ]
         )
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         with pytest.raises(ExceededMaxCompletionTokensError) as truncated:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert provider.bound_providers[0].send_count == 1
@@ -466,7 +466,7 @@ def test_unrecognized_error_classified_transient_is_retried() -> None:
         provider = _FakeProvider(
             failures=[ValueError("x1"), ValueError("x2")], classify_result="transient"
         )
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert response.output == "ok"
         assert response.attempts == 3
@@ -480,7 +480,7 @@ def test_unrecognized_error_classified_abort_raises() -> None:
     async def scenario() -> None:
         """Drive one generate_one whose send raises a classify-abort exception."""
         provider = _FakeProvider(failures=[ValueError("boom")], classify_result="abort")
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         with pytest.raises(AbortBatchError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert provider.bound_providers[0].send_count == 1
@@ -491,7 +491,7 @@ def test_unrecognized_error_classified_abort_raises() -> None:
 def test_rebind_unchanged_keeps_binding_equal_and_still_rebuilds() -> None:
     """An all-unchanged rebind keeps the binding equal but still builds a new bound provider."""
     provider = _FakeProvider()
-    bound_llm = LLM(provider).bind(system_prompt="s")
+    bound_llm = LLM(provider).bind(system_prompt="s", automatic_prompt_caching=True)
     same = bound_llm.rebind()
     assert same.binding == bound_llm.binding
     assert same._bound_provider is not bound_llm._bound_provider
@@ -501,7 +501,7 @@ def test_rebind_unchanged_keeps_binding_equal_and_still_rebuilds() -> None:
 def test_rebind_changed_field_creates_new_binding_and_bound_provider() -> None:
     """Changing a field produces a new Binding and a freshly bound provider."""
     provider = _FakeProvider()
-    bound_llm = LLM(provider).bind(system_prompt="s")
+    bound_llm = LLM(provider).bind(system_prompt="s", automatic_prompt_caching=True)
     changed = bound_llm.rebind(system_prompt="s2")
     assert changed.binding != bound_llm.binding
     assert changed.binding.system_prompt == "s2"
@@ -518,7 +518,7 @@ class _Answer(BaseModel):
 def test_rebind_to_a_response_format_rebinds_even_when_the_binding_is_unchanged() -> None:
     """response_format is not part of Binding, so a rebind that only changes it must still re-bind."""
     provider = _FakeProvider()
-    bound_llm = LLM(provider).bind(system_prompt="s")
+    bound_llm = LLM(provider).bind(system_prompt="s", automatic_prompt_caching=True)
     structured = bound_llm.rebind(response_format=_Answer)
     assert_type(structured, BoundLLM[_Answer])
     assert provider.structured_bind_count == 1
@@ -529,7 +529,7 @@ def test_rebind_to_a_response_format_rebinds_even_when_the_binding_is_unchanged(
 def test_rebind_leaving_response_format_out_keeps_the_content_type_and_rebuilds() -> None:
     """Omitting response_format keeps BoundLLM[str] and rebuilds through bind_text."""
     provider = _FakeProvider()
-    bound_llm = LLM(provider).bind(system_prompt="s")
+    bound_llm = LLM(provider).bind(system_prompt="s", automatic_prompt_caching=True)
     same = bound_llm.rebind()
     assert_type(same, BoundLLM[str])
     assert provider.structured_bind_count == 0
@@ -539,7 +539,7 @@ def test_rebind_leaving_response_format_out_keeps_the_content_type_and_rebuilds(
 def test_rebind_response_format_none_switches_structured_back_to_text() -> None:
     """From a structured binding, response_format=None returns BoundLLM[str] via bind_text."""
     provider = _FakeProvider()
-    structured = LLM(provider).bind(system_prompt="s", response_format=_Answer)
+    structured = LLM(provider).bind(system_prompt="s", response_format=_Answer, automatic_prompt_caching=True)
     assert len(provider.bound_providers) == 0
     text = structured.rebind(response_format=None)
     assert_type(text, BoundLLM[str])
@@ -550,7 +550,7 @@ def test_rebind_response_format_none_switches_structured_back_to_text() -> None:
 def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_structured() -> None:
     """A prefix change with response_format left out rebuilds from the stored model type."""
     provider = _FakeProvider()
-    structured = LLM(provider).bind(system_prompt="s", response_format=_Answer)
+    structured = LLM(provider).bind(system_prompt="s", response_format=_Answer, automatic_prompt_caching=True)
     assert provider.structured_bind_count == 1
     rebound = structured.rebind(system_prompt="s2")
     assert_type(rebound, BoundLLM[_Answer])
@@ -561,8 +561,8 @@ def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_str
 def test_response_format_is_a_public_field_bind_and_rebind_carry_it() -> None:
     """response_format is public inspectable state that bind sets and rebind carries and switches."""
     provider = _FakeProvider()
-    assert LLM(provider).bind().response_format is None
-    structured = LLM(provider).bind(response_format=_Answer)
+    assert LLM(provider).bind(automatic_prompt_caching=True).response_format is None
+    structured = LLM(provider).bind(response_format=_Answer, automatic_prompt_caching=True)
     assert structured.response_format is _Answer
     assert structured.rebind(system_prompt="s2").response_format is _Answer
     assert structured.rebind(response_format=None).response_format is None
@@ -591,7 +591,7 @@ def test_generate_many_aligns_results_with_inputs() -> None:
     async def scenario() -> None:
         """Run a two-item batch whose fake echoes each conversation's first turn."""
         provider = _FakeProvider(echo=True)
-        bound_llm = LLM(provider).bind()
+        bound_llm = LLM(provider).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content="a")], [UserMessage(content="b")]]
         )
@@ -606,7 +606,7 @@ def test_generate_many_returns_exhaustion_as_a_failure_row() -> None:
     async def scenario() -> None:
         """Run a two-item batch whose every send fails transiently under a two-attempt budget."""
         provider = _FakeProvider(failures=[TransientError("x")] * 4)
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content="a")], [UserMessage(content="b")]]
         )
@@ -630,7 +630,7 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
         """
         provider = _FakeProvider(echo=True, failures=[TransientError("x")])
         rate_limiter = _fast_rate_limiter(max_attempts=1, max_in_flight=1)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content="a")], [UserMessage(content="b")], [UserMessage(content="c")]]
         )
@@ -658,7 +658,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
             ],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content="a")], [UserMessage(content="b")]]
         )
@@ -679,11 +679,84 @@ def test_generate_many_aborts_the_whole_batch_and_cancels_siblings() -> None:
         """Serialize a two-item batch (max_in_flight=1) whose first send aborts."""
         provider = _FakeProvider(echo=True, failures=[AbortBatchError("misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         with pytest.raises(AbortBatchError):
             await bound_llm.generate_many(
                 [[UserMessage(content="a")], [UserMessage(content="b")]]
             )
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_together() -> None:
+    """warm_cache completes conversations[0] before any sibling starts; the rest run at normal concurrency."""
+
+    async def scenario() -> None:
+        """Run an identical three-item batch on two fresh slow fakes and compare the recorded peaks.
+
+        Warmed, the first send overlaps nothing and the remaining two overlap each other, so the peak is 2;
+        the unwarmed control reaches 3, proving warm_cache alone changed the ordering.
+        A fresh provider per run keeps the two peaks independent readings.
+        """
+        conversations = [[UserMessage(content=str(index))] for index in range(3)]
+        warmed_provider = _FakeProvider(echo=True, send_seconds=0.01)
+        warmed_bound_llm = LLM(warmed_provider, rate_limiter=_fast_rate_limiter(max_in_flight=8)).bind(automatic_prompt_caching=True)
+        warmed = await warmed_bound_llm.generate_many(conversations, warm_cache=True)
+        assert _batch_outputs(warmed) == ["0", "1", "2"]
+        assert warmed_provider.bound_providers[0].peak_in_flight == 2
+        control_provider = _FakeProvider(echo=True, send_seconds=0.01)
+        control_bound_llm = LLM(control_provider, rate_limiter=_fast_rate_limiter(max_in_flight=8)).bind(automatic_prompt_caching=True)
+        control = await control_bound_llm.generate_many(conversations)
+        assert _batch_outputs(control) == ["0", "1", "2"]
+        assert control_provider.bound_providers[0].peak_in_flight == 3
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
+    """A first item ending in a GenerationError stays in its slot and the siblings still run."""
+
+    async def scenario() -> None:
+        """Fail the deterministic first send under a one-attempt budget; the other two succeed."""
+        provider = _FakeProvider(echo=True, failures=[TransientError("x")])
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=1)).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many(
+            [[UserMessage(content="a")], [UserMessage(content="b")], [UserMessage(content="c")]],
+            warm_cache=True,
+        )
+        first, second, third = results
+        assert isinstance(first, RetriesExhaustedError)
+        assert isinstance(second, Response)
+        assert second.output == "b"
+        assert isinstance(third, Response)
+        assert third.output == "c"
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_warm_cache_abort_on_the_first_item_starts_no_sibling() -> None:
+    """An AbortBatchError from the warming item raises before any sibling sends."""
+
+    async def scenario() -> None:
+        """Abort the deterministic first send and count the sends that happened."""
+        provider = _FakeProvider(echo=True, failures=[AbortBatchError("misconfigured")])
+        bound_llm = LLM(provider).bind(automatic_prompt_caching=True)
+        with pytest.raises(AbortBatchError):
+            await bound_llm.generate_many(
+                [[UserMessage(content="a")], [UserMessage(content="b")]], warm_cache=True
+            )
+        assert provider.bound_providers[0].send_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
+    """An empty batch under warm_cache returns [] instead of indexing a first item."""
+
+    async def scenario() -> None:
+        """Run the empty batch."""
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
+        assert await bound_llm.generate_many([], warm_cache=True) == []
 
     asyncio.run(scenario())
 
@@ -698,7 +771,7 @@ def test_bare_str_is_shorthand_for_one_user_message() -> None:
         so an echoed value proves the coercion built a real UserMessage.
         """
         provider = _FakeProvider(echo=True)
-        bound_llm = LLM(provider).bind()
+        bound_llm = LLM(provider).bind(automatic_prompt_caching=True)
         response = await bound_llm.generate_one("hi")
         assert response.output == "hi"
         results = await bound_llm.generate_many(["a", [UserMessage(content="b")]])
@@ -718,7 +791,7 @@ def test_generate_many_rejects_a_bare_str_batch() -> None:
         if typeshed drift ever makes str satisfy SequenceNotStr and the static rejection lapses.
         """
         provider = _FakeProvider(echo=True)
-        bound_llm = LLM(provider).bind()
+        bound_llm = LLM(provider).bind(automatic_prompt_caching=True)
         with pytest.raises(TypeError, match="bare str"):
             # pyrefly: ignore[bad-argument-type]
             await bound_llm.generate_many("hi")
@@ -732,7 +805,7 @@ def test_stream_one_accepts_a_bare_str() -> None:
 
     async def scenario() -> None:
         """Build a handle from a bare str and check the stored conversation."""
-        bound_llm = LLM(_FakeProvider()).bind()
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one("hi") as handle:
             assert handle._conversation == (UserMessage(content="hi"),)
             response = await handle.final()
@@ -748,7 +821,7 @@ def test_stream_cancelled_mid_iteration_releases_the_slot() -> None:
         """Open a hanging stream, cancel the suspended item pull, then prove the slot is free."""
         provider = _FakeProvider(stream=_HangingStream())
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         consumer = asyncio.create_task(anext(handle))
         await asyncio.sleep(0.01)
@@ -767,7 +840,7 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
 
     async def scenario() -> None:
         """Iterate the stream fully, then read final()."""
-        bound_llm = LLM(_FakeProvider()).bind()
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             texts = [item async for item in handle if isinstance(item, str)]
             response = await handle.final()
@@ -794,7 +867,7 @@ def test_stream_final_refusal_raises_enriched_without_retry() -> None:
     async def scenario() -> None:
         """Drain a stream whose final() refuses, then read the enriched leaf."""
         provider = _FakeProvider(stream=_RefusingStream())
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(RefusalError) as refused:
                 await handle.final()
@@ -816,7 +889,7 @@ def test_stream_retry_populates_attempt_records() -> None:
     async def scenario() -> None:
         """Open a stream whose first open_stream call fails, then drain it."""
         provider = _FakeProvider(open_failures=[TransientError("conn refused")])
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             response = await handle.final()
         assert response.output == "ab"
@@ -840,7 +913,7 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
     async def scenario() -> None:
         """Open a stream under a two-attempt budget whose every open_stream fails transiently."""
         provider = _FakeProvider(open_failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind(automatic_prompt_caching=True)
         with pytest.raises(RetriesExhaustedError) as exhausted:
             async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
                 await handle.final()
@@ -859,7 +932,7 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
 
     async def scenario() -> None:
         """Drain the stream, idle, then call final()."""
-        bound_llm = LLM(_FakeProvider()).bind()
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
@@ -878,7 +951,7 @@ def test_stream_final_is_idempotent() -> None:
 
     async def scenario() -> None:
         """Call final() twice on one drained stream."""
-        bound_llm = LLM(_FakeProvider()).bind()
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             first: Response[str] = await handle.final()
             second: Response[str] = await handle.final()
@@ -892,7 +965,7 @@ def test_stream_yields_items_in_order_with_complete_tool_call() -> None:
 
     async def scenario() -> None:
         """Collect every item the stream yields."""
-        bound_llm = LLM(_FakeProvider()).bind()
+        bound_llm = LLM(_FakeProvider()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             collected_items = [item async for item in handle]
         assert collected_items == ["a", "b", _FAKE_TOOL_CALL]
@@ -906,7 +979,7 @@ def test_stream_closes_on_context_exit() -> None:
     async def scenario() -> None:
         """Open the stream, consume one item, then leave the context."""
         stream = _FakeStream()
-        bound_llm = LLM(_FakeProvider(stream=stream)).bind()
+        bound_llm = LLM(_FakeProvider(stream=stream)).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 break
@@ -924,7 +997,7 @@ def test_server_stated_retry_after_overrides_exponential_backoff() -> None:
             failures=[TransientError("rate limited", retry_after_seconds=0.001)]
         )
         rate_limiter = RateLimiter(max_attempts=2, backoff_base_seconds=30.0)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert response.output == "ok"
         assert response.attempts == 2
@@ -938,7 +1011,7 @@ def test_max_in_flight_bounds_batch_concurrency() -> None:
     async def scenario() -> None:
         """Run the batch on a slow fake and read the recorded peak."""
         provider = _FakeProvider(echo=True, send_seconds=0.01)
-        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_in_flight=2)).bind()
+        bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter(max_in_flight=2)).bind(automatic_prompt_caching=True)
         conversations = [[UserMessage(content=str(index))] for index in range(5)]
         results = await bound_llm.generate_many(conversations)
         assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
@@ -965,7 +1038,7 @@ def test_backoff_sleep_does_not_hold_the_in_flight_slot(
         rate_limiter = RateLimiter(
             max_attempts=2, backoff_base_seconds=0.2, max_in_flight=1
         )
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         first_task = asyncio.create_task(bound_llm.generate_one([UserMessage(content="a")]))
         await asyncio.sleep(0.01)
         second = await bound_llm.generate_one([UserMessage(content="b")])
@@ -985,7 +1058,7 @@ def test_stream_protocol_error_releases_the_slot() -> None:
         """Drive final() into the protocol error without a context manager."""
         stream = _ProtocolErrorStream()
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(_FakeProvider(stream=stream), rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(_FakeProvider(stream=stream), rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
         with pytest.raises(StreamProtocolError):
             await handle.final()
@@ -1002,7 +1075,7 @@ def test_stream_releases_its_slot_when_exhausted() -> None:
     async def scenario() -> None:
         """Drain one stream under max_in_flight=1, then acquire the slot."""
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(_FakeProvider(), rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(_FakeProvider(), rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
@@ -1023,7 +1096,7 @@ def test_rate_limited_attempt_then_success_ends_the_recovery() -> None:
             ]
         )
         rate_limiter = _fast_rate_limiter(max_attempts=2)
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert response.output == "ok"
         assert response.attempts == 2
@@ -1053,7 +1126,7 @@ def test_stream_open_rate_limit_registers_and_recovery_ends_at_open() -> None:
             ]
         )
         rate_limiter = _fast_rate_limiter()
-        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind()
+        bound_llm = LLM(provider, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             await handle._ensure_stream_open()
             # No item has been pulled yet; the open alone must have ended recovery.
@@ -1070,3 +1143,17 @@ def test_stream_open_rate_limit_registers_and_recovery_ends_at_open() -> None:
         assert response.attempts == 2
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
+    """A list of system parts freezes to a tuple on the binding; a str passes through."""
+    parts = [TextPart(text="stable", cache_breakpoint=True), TextPart(text="context")]
+    bound_llm = LLM(_FakeProvider()).bind(system_prompt=parts, automatic_prompt_caching=True)
+    assert bound_llm.binding.system_prompt == tuple(parts)
+    assert isinstance(bound_llm.binding.system_prompt, tuple)
+
+
+def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
+    """Empty parts are a configuration error; None is the way to bind no system prompt."""
+    with pytest.raises(ValueError, match="empty"):
+        LLM(_FakeProvider()).bind(system_prompt=[], automatic_prompt_caching=True)

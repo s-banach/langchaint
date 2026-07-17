@@ -22,7 +22,7 @@ This guide gives the call-for-call map, then explains what replaces the middlewa
 | `RunnableRetry`, per-model `max_retries` | `RateLimiter(max_attempts=...)`, one instance shared across `LLM`s |
 | `InMemoryRateLimiter`, rate-limit middleware | `RateLimiter(max_in_flight=...)`, one shared account budget |
 | `.with_fallbacks([...])` | app-level `try`/`except` over two bindings (see below) |
-| `set_llm_cache(...)` client-side cache | provider prompt caching, on by default via `automatic_prompt_caching` (no client cache) |
+| `set_llm_cache(...)` client-side cache | provider prompt caching via `automatic_prompt_caching`, required on `bind` (no client cache) |
 | callbacks, LangSmith tracing | `langchaint.tracing.TracedLLM` over any OTel exporter (see `04_tracing.py`) |
 | `temperature=`, `top_p=`, `seed=` on the model | not exposed; `InferenceParams` carries only `max_completion_tokens` and `reasoning_effort` |
 | `SystemMessage` in the message list | `system_prompt=` on `bind`, frozen into the binding |

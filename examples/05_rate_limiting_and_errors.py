@@ -23,14 +23,14 @@ async def shared_rate_limiter() -> None:
     """Pass one RateLimiter to two models so they share one account budget.
 
     max_in_flight bounds concurrent requests; it defaults to 8 and self-adjusts throughput along request duration,
-    which is why there is deliberately no requests_per_minute knob that would go stale with the account tier.
+    which is why there is deliberately no requests_per_minute parameter that would go stale with the account tier.
     A 429 from either model trips the shared limiter and pauses admission for both until a request succeeds again.
     """
     limiter = RateLimiter(max_attempts=5, max_in_flight=16)
     openai_llm = openai_model("gpt-5.6-terra", rate_limiter=limiter)
     anthropic_llm = anthropic_model("claude-sonnet-5", rate_limiter=limiter)
     for llm in (openai_llm, anthropic_llm):
-        assistant = llm.bind(system_prompt="Answer in one word.")
+        assistant = llm.bind(system_prompt="Answer in one word.", automatic_prompt_caching=False)
         response = await assistant.generate_one("Name a primary color.")
         print(response.model, response.output)
 
@@ -51,6 +51,7 @@ async def catch_generation_error() -> None:
     classifier = openai_model("gpt-5.6-terra").bind(
         system_prompt="Classify the sentiment as positive or negative.",
         response_format=Sentiment,
+        automatic_prompt_caching=False,
     )
     try:
         response = await classifier.generate_one("This is the best day in months.")
@@ -79,8 +80,14 @@ async def main() -> None:
     """Run every snippet in this file."""
     await shared_rate_limiter()
     await catch_generation_error()
-    primary = openai_model("gpt-5.6-terra").bind(system_prompt="Answer in one sentence.")
-    secondary = anthropic_model("claude-sonnet-5").bind(system_prompt="Answer in one sentence.")
+    primary = openai_model("gpt-5.6-terra").bind(
+        system_prompt="Answer in one sentence.",
+        automatic_prompt_caching=False,
+    )
+    secondary = anthropic_model("claude-sonnet-5").bind(
+        system_prompt="Answer in one sentence.",
+        automatic_prompt_caching=False,
+    )
     response = await generate_with_fallback(primary, secondary, "What is the capital of France?")
     print(response.output)
 

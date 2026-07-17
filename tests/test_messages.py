@@ -114,3 +114,38 @@ def test_tool_message_is_frozen() -> None:
     message = ToolMessage(tool_call_id="c1", content="ok")
     with pytest.raises(ValidationError):
         message.content = "changed"  # pyrefly: ignore[read-only]
+
+
+def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
+    """A marked part survives the JSON round trip; an unmarked part re-validates with the default."""
+    conversation: tuple[Message, ...] = (
+        UserMessage(content=(TextPart(text="shared context", cache_breakpoint=True), TextPart(text="question"))),
+        ToolMessage(
+            tool_call_id="c1",
+            content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),),
+        ),
+    )
+    restored = _CONVERSATION_ADAPTER.validate_json(_CONVERSATION_ADAPTER.dump_json(conversation))
+    assert restored == conversation
+    restored_user = restored[0]
+    assert isinstance(restored_user, UserMessage)
+    assert isinstance(restored_user.content, tuple)
+    assert restored_user.content[0].cache_breakpoint is True
+    assert restored_user.content[1].cache_breakpoint is False
+
+
+def test_assistant_turn_rejects_a_marked_text_part() -> None:
+    """A TextPart with cache_breakpoint in an assistant turn fails validation on every construction path."""
+    marked = TextPart(text="hey", cache_breakpoint=True)
+    with pytest.raises(ValidationError, match="cache_breakpoint"):
+        AssistantMessage(turn=(marked,))
+    with pytest.raises(ValidationError, match="cache_breakpoint"):
+        AssistantMessage.model_validate({
+            "role": "assistant",
+            "turn": [{"text": "hey", "cache_breakpoint": True}],
+        })
+
+
+def test_assistant_turn_still_accepts_unmarked_text() -> None:
+    """The validator rejects only marked parts; the plain turn is untouched."""
+    assert AssistantMessage("hey").text == "hey"

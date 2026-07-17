@@ -3,7 +3,7 @@
 Short, runnable examples of langchaint.
 Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK extra installed and the provider's API key in the environment.
 `langchaint[openai]` and `OPENAI_API_KEY` cover the openai examples.
-`05_rate_limiting_and_errors.py` also builds an anthropic model, so it additionally needs `langchaint[anthropic]` and `ANTHROPIC_API_KEY`.
+`05_rate_limiting_and_errors.py` and `06_prompt_caching.py` also build anthropic models, so they additionally need `langchaint[anthropic]` and `ANTHROPIC_API_KEY`.
 Where a tool's specifics do not matter, the code uses a minimal placeholder tool rather than a realistic one.
 
 | File | Shows |
@@ -13,6 +13,7 @@ Where a tool's specifics do not matter, the code uses a minimal placeholder tool
 | [`03_streaming.py`](03_streaming.py) | `stream_one`, the `str \| ToolCall` iterator, `final()` for usage and cost, and the streaming tool loop |
 | [`04_tracing.py`](04_tracing.py) | OTel telemetry with `TracedLLM` and a span exporter |
 | [`05_rate_limiting_and_errors.py`](05_rate_limiting_and_errors.py) | one shared `RateLimiter` across an openai and an anthropic model, catching a `GenerationError`, and a try/except fallback |
+| [`06_prompt_caching.py`](06_prompt_caching.py) | `cache_breakpoint` marks in the frozen prefix, the anthropic 4-marker budget and `cache_ttl`, openai's implicit/explicit modes, and the marks each provider rejects |
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | the call-for-call API map and what replaces the middleware layer |
 
 Each `.py` file carries the langchaint calls; the LangChain call-for-call map for all of them lives in one place, `MIGRATING_FROM_LANGCHAIN.md`, so start there for the mental model, then read `01_basics.py`.

@@ -328,7 +328,7 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
-    wire = _wire_messages(conversation, automatic_prompt_caching=False)
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
     assert [message["role"] for message in wire] == ["user", "assistant", "user"]
     tool_results = _content_blocks(wire[2])
     assert len(tool_results) == 2
@@ -342,7 +342,7 @@ def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
-    wire = _wire_messages(conversation, automatic_prompt_caching=True)
+    wire = _wire_messages(conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2)
     tool_results = _content_blocks(wire[0])
     assert tool_results[-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in tool_results[0]
@@ -364,7 +364,7 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
             )
         )
     ]
-    wire = _wire_messages(conversation, automatic_prompt_caching=True)
+    wire = _wire_messages(conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2)
     assert all("cache_control" not in block for block in _content_blocks(wire[0]))
 
 
@@ -374,7 +374,7 @@ def test_wire_messages_writes_no_breakpoint_when_caching_disabled() -> None:
         UserMessage(content="hi"),
         ToolMessage(tool_call_id="tu_1", content="r1"),
     ]
-    wire = _wire_messages(conversation, automatic_prompt_caching=False)
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
     assert all(
         "cache_control" not in block
         for message in wire
@@ -393,7 +393,7 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
             content=(TextPart(text="saw"), ImagePart(data=b"png", media_type="image/png")),
         )
     ]
-    wire = _wire_messages(conversation, automatic_prompt_caching=False)
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["content"] == [
         {"type": "text", "text": "saw"},
@@ -416,7 +416,7 @@ def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -
         )
     ]
     with pytest.raises(AbortBatchError):
-        _wire_messages(conversation, automatic_prompt_caching=False)
+        _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
 
 
 def test_wire_tool_choice_required_becomes_any_and_inverts_parallel() -> None:
@@ -451,7 +451,7 @@ def _provider() -> AnthropicMessagesProvider:
 
 def _binding(
     *,
-    system_prompt: str | None,
+    system_prompt: str | tuple[TextPart, ...] | None,
     tool_schemas: tuple[ToolSchema, ...],
     automatic_prompt_caching: bool,
 ) -> Binding:
@@ -809,6 +809,14 @@ def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
     assert provider.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
 
 
+def test_bedrock_model_threads_cache_ttl_to_the_adapter() -> None:
+    """A caller-supplied cache_ttl reaches the adapter through anthropic_bedrock_model."""
+    provider = _anthropic_provider_of(
+        anthropic_bedrock_model("claude-opus-4-6", aws_region="us-east-1", cache_ttl="1h")
+    )
+    assert provider.cache_ttl == "1h"
+
+
 def test_bedrock_model_uses_a_matching_supplied_client_with_the_routing_wire_id() -> None:
     """A supplied client whose class serves the surface passes through, retries pinned off, wire id applied."""
     provider = _anthropic_provider_of(
@@ -845,3 +853,212 @@ def test_adapter_accepts_a_mantle_client() -> None:
     )
     assert isinstance(provider.client, AsyncAnthropicBedrockMantle)
     assert provider.client.max_retries == 0
+
+
+def test_wire_messages_marks_a_marked_user_part() -> None:
+    """A user part with cache_breakpoint carries the marker on its own block; unmarked siblings carry none."""
+    conversation = [
+        UserMessage(content=(TextPart(text="shared context", cache_breakpoint=True), TextPart(text="question"))),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
+    blocks = _content_blocks(wire[0])
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in blocks[1]
+
+
+def test_wire_messages_marks_a_marked_image_part() -> None:
+    """An image part with cache_breakpoint carries the marker on its image block."""
+    conversation = [
+        UserMessage(content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),)),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
+    assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part() -> None:
+    """A marked last part of a ToolMessage marks the enclosing tool_result block, never a nested block."""
+    conversation = [
+        ToolMessage(
+            tool_call_id="tu_1",
+            content=(TextPart(text="a"), TextPart(text="b", cache_breakpoint=True)),
+        )
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
+    tool_result = _content_blocks(wire[0])[0]
+    assert tool_result["cache_control"] == {"type": "ephemeral"}
+    assert tool_result["content"] == [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+
+
+def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
+    """A marked part before the ToolMessage's last aborts instead of silently moving the boundary."""
+    conversation = [
+        ToolMessage(
+            tool_call_id="tu_1",
+            content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
+        )
+    ]
+    with pytest.raises(AbortBatchError, match="last part"):
+        _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
+
+
+def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_caching() -> None:
+    """Five marks spend the 4-marker request budget on the latest four; the oldest goes unwritten."""
+    conversation = [
+        UserMessage(content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(5))),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4)
+    blocks = _content_blocks(wire[0])
+    assert "cache_control" not in blocks[0]
+    assert all(block["cache_control"] == {"type": "ephemeral"} for block in blocks[1:])
+
+
+def test_wire_messages_reserves_two_slots_for_automatic_markers() -> None:
+    """With automatic caching, only the latest two marks are written beside the last-block marker."""
+    conversation = [
+        UserMessage(content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(3))),
+        UserMessage(content="question"),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2)
+    marked_blocks = _content_blocks(wire[0])
+    assert "cache_control" not in marked_blocks[0]
+    assert all(block["cache_control"] == {"type": "ephemeral"} for block in marked_blocks[1:])
+    assert _content_blocks(wire[1])[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
+    """A parts system_prompt is one block per part; marked parts and the automatic last block carry markers."""
+    request = _provider()._request(
+        _binding(
+            system_prompt=(
+                TextPart(text="stable instructions", cache_breakpoint=True),
+                TextPart(text="semi-stable context"),
+            ),
+            tool_schemas=(),
+            automatic_prompt_caching=True,
+        )
+    )
+    assert request.system == [
+        {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "semi-stable context", "cache_control": {"type": "ephemeral"}},
+    ]
+    assert request.message_mark_budget == 1
+
+
+def test_request_system_parts_without_automatic_caching_mark_only_marked_parts() -> None:
+    """Bound False, only the marked system part carries a marker; the budget spends only on it."""
+    request = _provider()._request(
+        _binding(
+            system_prompt=(
+                TextPart(text="stable", cache_breakpoint=True),
+                TextPart(text="volatile"),
+            ),
+            tool_schemas=(),
+            automatic_prompt_caching=False,
+        )
+    )
+    assert request.system == [
+        {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "volatile"},
+    ]
+    assert request.message_mark_budget == 3
+
+
+def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> None:
+    """Four marked system parts plus the automatic markers cannot fit the 4-marker limit."""
+    with pytest.raises(ValueError, match="limit"):
+        _provider()._request(
+            _binding(
+                system_prompt=tuple(
+                    TextPart(text=f"s{index}", cache_breakpoint=True) for index in range(4)
+                ),
+                tool_schemas=(),
+                automatic_prompt_caching=True,
+            )
+        )
+
+
+def test_request_str_system_budget_matches_the_previous_reservation() -> None:
+    """A str system prompt under automatic caching leaves two slots for message marks, as before."""
+    request = _provider()._request(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+    )
+    assert request.message_mark_budget == 2
+    uncached = _provider()._request(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+    )
+    assert uncached.message_mark_budget == 4
+
+
+def test_wire_messages_budget_mixes_user_and_tool_result_marks_across_messages() -> None:
+    """The latest-N budget counts marks across message kinds in conversation order."""
+    conversation = [
+        UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
+        ToolMessage(tool_call_id="tu_1", content=(TextPart(text="mid", cache_breakpoint=True),)),
+        UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=2)
+    assert "cache_control" not in _content_blocks(wire[0])[0]
+    assert _content_blocks(wire[1])[0]["cache_control"] == {"type": "ephemeral"}
+    assert _content_blocks(wire[2])[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automatic_marker() -> None:
+    """An explicit mark on the last block and the automatic last-block marker write one identical marker."""
+    conversation = [
+        UserMessage(content=(TextPart(text="q", cache_breakpoint=True),)),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2)
+    assert _content_blocks(wire[0]) == [
+        {"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+def test_wire_messages_writes_no_marks_at_zero_budget() -> None:
+    """A zero budget leaves every mark unwritten instead of slicing the whole list."""
+    conversation = [
+        UserMessage(content=(TextPart(text="m", cache_breakpoint=True),)),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=0)
+    assert "cache_control" not in _content_blocks(wire[0])[0]
+
+def _provider_1h() -> AnthropicMessagesProvider:
+    """Build an adapter with the 1-hour cache TTL over a keyless client."""
+    return AnthropicMessagesProvider(
+        client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING, cache_ttl="1h"
+    )
+
+
+def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
+    """cache_ttl="1h" puts the explicit ttl key on the automatic system marker and flows into the request."""
+    request = _provider_1h()._request(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+    )
+    assert _block_list(request.system)[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert request.cache_ttl == "1h"
+
+
+def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
+    """cache_ttl="1h" puts the explicit ttl key on the last-tool marker."""
+    request = _provider_1h()._request(
+        _binding(system_prompt=None, tool_schemas=_tool_schemas(), automatic_prompt_caching=True)
+    )
+    assert _block_list(request.tools)[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() -> None:
+    """cache_ttl="1h" puts the explicit ttl key on cache_breakpoint marks and the automatic last-block marker."""
+    conversation = [
+        UserMessage(content=(TextPart(text="context", cache_breakpoint=True),)),
+        UserMessage(content="question"),
+    ]
+    wire = _wire_messages(conversation, automatic_prompt_caching=True, cache_ttl="1h", message_mark_budget=2)
+    assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert _content_blocks(wire[1])[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_request_rejects_an_empty_tuple_system_prompt() -> None:
+    """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
+    with pytest.raises(ValueError, match="empty tuple"):
+        _provider()._request(
+            _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
+        )

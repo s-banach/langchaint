@@ -40,9 +40,9 @@ dev = [
 [tool.pyrefly]
 preset = "strict"
 # project-includes bounds type checking to exactly these trees (leaving the developer
-# tooling under scripts/ out); search-path is the separate import-resolution knob, "src"
+# tooling under scripts/ out); search-path is the separate import-resolution setting, "src"
 # being the langchaint import root.
-project-includes = ["src", "tests"]
+project-includes = ["src", "tests", "examples"]
 # src is the langchaint import root; the repo root is added so cross-module test
 # imports (tests.test_bound_llm reused by tests.test_tracing) resolve the same way
 # pytest resolves them at runtime.

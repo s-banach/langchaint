@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
         "langchaint's anthropic backend requires the anthropic package; install langchaint[anthropic]."
     ) from exc
 
-from langchaint.anthropic.messages_provider import AnthropicMessagesProvider
+from langchaint.anthropic.messages_provider import AnthropicMessagesProvider, CacheTtl
 from langchaint.llm import LLM
 from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
@@ -142,12 +142,16 @@ def anthropic_model(
     client: AsyncAnthropic | AsyncAnthropicBedrock | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
+    cache_ttl: CacheTtl = "5m",
     rate_limiter: RateLimiter | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on the Messages API.
 
     client None constructs AsyncAnthropic(), which reads ANTHROPIC_API_KEY from the environment.
     pricing None selects ANTHROPIC_PRICING[model].
+    cache_ttl applies uniformly to every cache marker the adapter writes:
+    "5m" is the API default; "1h" holds entries across longer gaps and bills writes at 2x instead of 1.25x,
+    paying off when requests reusing the prefix arrive more than five minutes apart.
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
@@ -158,6 +162,7 @@ def anthropic_model(
             model=model,
             pricing=pricing if pricing is not None else ANTHROPIC_PRICING[model],
             default_max_completion_tokens=default_max_completion_tokens,
+            cache_ttl=cache_ttl,
         ),
         rate_limiter=rate_limiter,
     )
@@ -170,6 +175,7 @@ def anthropic_bedrock_model(
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
+    cache_ttl: CacheTtl = "5m",
     rate_limiter: RateLimiter | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on Bedrock.
@@ -182,6 +188,7 @@ def anthropic_bedrock_model(
     pricing None selects ANTHROPIC_PRICING[model], the same table anthropic_model uses:
     the default is Anthropic's first-party list price, an estimate on Bedrock (AWS sets the real rate),
     corrected by passing pricing.
+    cache_ttl has the anthropic_model meaning; Bedrock supports both tiers.
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
@@ -205,6 +212,7 @@ def anthropic_bedrock_model(
             model=routing.wire_model,
             pricing=pricing if pricing is not None else ANTHROPIC_PRICING[model],
             default_max_completion_tokens=default_max_completion_tokens,
+            cache_ttl=cache_ttl,
         ),
         rate_limiter=rate_limiter,
     )
@@ -216,6 +224,7 @@ __all__ = [
     "AnthropicMessagesProvider",
     "AnthropicModelName",
     "BedrockRouting",
+    "CacheTtl",
     "anthropic_bedrock_model",
     "anthropic_model",
 ]

@@ -7,8 +7,12 @@ Prototype: nothing is stable, everything can be rewritten.
 
 **Generation only via binding.**
 `LLM` has no generate methods.
-`LLM.bind(...) -> BoundLLM[OutputT]` freezes everything that determines the cacheable prompt prefix: `system_prompt`, `tool_manager`, `inference_params`, `tool_choice`, `parallel_tool_calls`.
+`LLM.bind(...) -> BoundLLM[OutputT]` freezes everything that determines the cacheable prompt prefix: `system_prompt`, `tool_manager`, `inference_params`, `tool_choice`, `parallel_tool_calls`, `automatic_prompt_caching`.
 `response_format` is frozen too, as the field that fixes the output type.
+`automatic_prompt_caching` has no default: caching changes billing, so every `bind` states it.
+A `TextPart` or `ImagePart` with `cache_breakpoint=True` places a prompt-cache boundary at exactly that part, under either `automatic_prompt_caching` value, so binding `False` and marking parts is the fully user-specified caching configuration.
+`generate_many(conversations, warm_cache=True)` runs the first conversation to completion before admitting the rest, so a batch sharing a cached prefix pays one cache write instead of one per in-flight item; it is opt-in because it costs one item of serial latency.
+`system_prompt` also binds as a sequence of `TextPart`s, so a boundary can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
 There are no per-call parameter overrides; changing parameters is `rebind(...)`, which returns a new `BoundLLM` with the SDK keyword arguments converted again.
 `bind(response_format=Model)` returns `BoundLLM[Model]`; without `response_format` it returns `BoundLLM[str]`, selected by overload.
 `rebind` carries the same overload, so `rebind(response_format=Model)` switches the output type to `BoundLLM[Model]`, `rebind(response_format=None)` switches it back to `BoundLLM[str]`, and leaving it out keeps the current type.
@@ -38,6 +42,7 @@ Requests travel as typed frozen dataclasses whose optional fields are `X | Omit`
 **Anthropic prompt caching is placed by the adapter.**
 A bind-time `cache_control` marker goes on the system block (or the last tool when there is no system prompt), and a per-request marker goes on the last block of the last message, so the breakpoint follows a growing conversation.
 Placement is manual because `messages.parse` lacks the top-level `cache_control` parameter; manual placement keeps create/parse/stream uniform.
+Every marker's TTL is the adapter's `cache_ttl` (`"5m"` default, `"1h"` for entries that must survive longer gaps at 2x write cost), a keyword of `anthropic_model` and `anthropic_bedrock_model`.
 
 **Usage counters partition, cost is the adapter's job.**
 `Usage` stores `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and `output_tokens`; the three input counters are a disjoint partition and `input_tokens_total` is derived.

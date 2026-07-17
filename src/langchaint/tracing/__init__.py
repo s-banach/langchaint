@@ -53,7 +53,7 @@ from langchaint.llm import (
     SequenceNotStr,
     Unchanged,
 )
-from langchaint.messages import Message
+from langchaint.messages import Message, TextPart
 from langchaint.provider import Binding, Provider, StreamItem, ToolChoice
 from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response
@@ -241,36 +241,36 @@ class TracedLLM:
     def bind[ModelT: BaseModel](
         self,
         *,
-        system_prompt: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager | None = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
-        automatic_prompt_caching: bool = ...,
+        automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[ModelT]": ...
     @overload
     def bind(
         self,
         *,
-        system_prompt: str | None = ...,
+        system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager | None = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
-        automatic_prompt_caching: bool = ...,
+        automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[str]": ...
     def bind(
         self,
         *,
-        system_prompt: str | None = None,
+        system_prompt: str | Sequence[TextPart] | None = None,
         tool_manager: ToolManager | None = None,
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
-        automatic_prompt_caching: bool = True,
+        automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
@@ -348,7 +348,7 @@ class TracedBoundLLM[OutputT]:
         self,
         *,
         response_format: type[NewModelT],
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -360,7 +360,7 @@ class TracedBoundLLM[OutputT]:
         self,
         *,
         response_format: None,
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -372,7 +372,7 @@ class TracedBoundLLM[OutputT]:
         self,
         *,
         response_format: Unchanged = ...,
-        system_prompt: str | None | Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -383,7 +383,7 @@ class TracedBoundLLM[OutputT]:
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
-        system_prompt: str | None | Unchanged = UNCHANGED,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
         tool_manager: ToolManager | None | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
@@ -446,8 +446,13 @@ class TracedBoundLLM[OutputT]:
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = False,
     ) -> list[Response[OutputT] | GenerationError]:
         """Order-aligned batch under one INTERNAL span; per-item detail lives in the returned rows.
+
+        warm_cache passes through to BoundLLM.generate_many, which documents it;
+        the span brackets the warming first item and the rest alike.
 
         Delegates to BoundLLM.generate_many rather than re-gathering into per-item child spans:
         generate_many is a bulk convenience (dataset passes, evals),
@@ -472,7 +477,7 @@ class TracedBoundLLM[OutputT]:
         span = self._tracer.start_span(self._span_name, kind=SpanKind.INTERNAL)
         try:
             try:
-                results = await self._bound_llm.generate_many(conversations)
+                results = await self._bound_llm.generate_many(conversations, warm_cache=warm_cache)
             except Exception as exc:
                 _record_other_exception(span, exc)
                 raise

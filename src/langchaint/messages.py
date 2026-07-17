@@ -10,24 +10,36 @@ because providers place it in different request locations.
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 
 class TextPart(BaseModel):
-    """One text span of a message's content."""
+    """One text span of a message's content.
+
+    cache_breakpoint True marks the exact end of a reusable prompt prefix:
+    everything from the start of the request through this part is the span the provider may cache.
+    The adapters map it to anthropic's block-level cache_control and openai's part-level prompt_cache_breakpoint.
+    Each provider writes at most its per-request budget of breakpoints (4 on both) and keeps the latest,
+    so a conversation that accrues one mark per turn keeps working as it grows.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     text: str
+    cache_breakpoint: bool = False
 
 
 class ImagePart(BaseModel):
-    """media_type is an IANA media type such as "image/png"."""
+    """media_type is an IANA media type such as "image/png".
+
+    cache_breakpoint has the same meaning as on TextPart: the reusable prompt prefix ends at this part.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     data: bytes
     media_type: str
+    cache_breakpoint: bool = False
 
 
 type Part = TextPart | ImagePart
@@ -127,13 +139,34 @@ class AssistantMessage(BaseModel):
     A bare string turn is one TextPart, for hand-written turns such as few-shot examples.
 
     Raises:
-        pydantic.ValidationError: turn is neither a str nor a sequence of TurnElements.
+        pydantic.ValidationError: turn is neither a str nor a sequence of TurnElements,
+            or a TextPart in the turn sets cache_breakpoint
+            (openai has no breakpoint on assistant replay text,
+            so a marked assistant part would be a provider-divergent runtime failure;
+            mark the following user or tool message instead).
     """
 
     model_config = ConfigDict(frozen=True)
 
     turn: Annotated[tuple[TurnElement, ...], BeforeValidator(_text_only_turn)]
     role: Literal["assistant"] = "assistant"
+
+    @model_validator(mode="after")
+    def _reject_cache_breakpoint(self) -> "AssistantMessage":
+        """Reject a turn whose TextPart sets cache_breakpoint; the class docstring states why.
+
+        Raises:
+            ValueError: a TextPart in the turn sets cache_breakpoint; pydantic surfaces it as a ValidationError.
+        """
+        if any(
+            isinstance(element, TextPart) and element.cache_breakpoint for element in self.turn
+        ):
+            raise ValueError(
+                "cache_breakpoint is not supported on assistant turn text: "
+                "openai has no breakpoint on assistant replay text; "
+                "mark the following user or tool message instead"
+            )
+        return self
 
     def __init__(
         self, turn: str | Sequence[TurnElement], role: Literal["assistant"] = "assistant"

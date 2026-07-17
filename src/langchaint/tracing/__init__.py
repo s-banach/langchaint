@@ -22,6 +22,8 @@ The wrapper imports only opentelemetry-api, so a production app installs the api
 Every GenAI semantic-convention attribute key is verified against the pinned revision, never asserted from memory:
 opentelemetry-semantic-conventions 0.64b0.
 The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT).
+The pinned revision defines no reasoning message part;
+reasoning appears only as the counter gen_ai.usage.reasoning.output_tokens.
 A convention change is a deliberate edit to this module.
 """
 

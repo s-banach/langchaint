@@ -803,8 +803,8 @@ def test_every_request_carries_the_reasoning_include(
     """create, parse, and stream (text and structured) all send include=["reasoning.encrypted_content"].
 
     The offline round-trip tests cannot catch a dropped include:
-    the API populates encrypted_content only when asked,
-    so without this parameter every replayed reasoning item would be silently empty.
+    the SDK documents include as what populates encrypted_content,
+    so without this parameter every replayed reasoning item could be silently empty.
     """
     provider = _provider()
     request = provider._request(_binding(automatic_prompt_caching=True))

@@ -30,8 +30,9 @@ Verified against openai 2.45.0:
   the adapter always sends `store=False` because conversation state is the caller's conversation argument,
   and a stored copy would be an unused side effect.
 - The adapter sends `include=["reasoning.encrypted_content"]` on every request,
-  so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`;
-  `store=False` alone leaves `encrypted_content` None and the replayed reasoning would be empty.
+  so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`.
+  The SDK documents `include` as what populates `encrypted_content`;
+  a live run on 2026-07-17 saw it populated without the flag, undocumented behavior the adapter does not rely on.
 
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;

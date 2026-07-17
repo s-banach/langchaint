@@ -10,6 +10,13 @@ Verified against anthropic 0.116.0:
 - `Usage.cache_creation` splits cache writes into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`,
   which bill at different rates.
 
+Reasoning replay, verified by docs and live runs because it is request-time behavior SDK introspection cannot show:
+the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
+It filters prior turns' thinking blocks itself, so re-emitting every ReasoningTrace unconditionally is safe.
+It rejects consecutive thinking blocks re-sent out of their emission order, which turn order preserves.
+It rejects thinking re-fed on a request whose binding enables no reasoning;
+the adapter surfaces that provider error rather than silencing it.
+
 Cache breakpoints: with automatic_prompt_caching bound True,
 the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
 or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,

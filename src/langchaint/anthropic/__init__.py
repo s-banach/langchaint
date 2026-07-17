@@ -9,6 +9,8 @@ client None constructs the native first-party SDK client, which reads credential
 anthropic_bedrock_model is the Bedrock sibling: it names the same catalog model and reads the model's
 Bedrock surface (which of two client classes) and its wire model id from ANTHROPIC_BEDROCK,
 so the application names neither the client class nor the Bedrock id.
+Both Bedrock client classes construct offline from aws_region alone (anthropic 0.116.0),
+so building a model object needs no AWS credentials.
 pricing None selects the model's public prices from ANTHROPIC_PRICING, shared by both constructors.
 Pass your own PricingTable to override, for example when your account bills at a custom rate.
 For a custom httpx.AsyncClient (loaded certs, a proxy), anthropic_model takes client=AsyncAnthropic(

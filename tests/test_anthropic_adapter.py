@@ -536,14 +536,14 @@ class _FakeSDKMessageStream(AsyncMessageStream[None]):
 
     def __init__(
         self,
-        replay_events: Sequence[ParsedMessageStreamEvent[None]],
+        replay_events: Sequence[ParsedMessageStreamEvent],
         message_snapshot: ParsedMessage[None],
     ) -> None:
         self._replay_events = list(replay_events)
         self._message_snapshot = message_snapshot
 
     @override
-    async def __aiter__(self) -> AsyncIterator[ParsedMessageStreamEvent[None]]:
+    async def __aiter__(self) -> AsyncIterator[ParsedMessageStreamEvent]:
         for replay_event in self._replay_events:
             yield replay_event
 
@@ -578,7 +578,7 @@ def _message_snapshot(
 
 
 def _anthropic_stream(
-    replay_events: Sequence[ParsedMessageStreamEvent[None]],
+    replay_events: Sequence[ParsedMessageStreamEvent],
     message_snapshot: ParsedMessage[None],
 ) -> _AnthropicStream[str]:
     """Build a text-content adapter stream over replayed events."""

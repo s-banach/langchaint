@@ -8,13 +8,26 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each job runs the full gate; the pair of axes covers the supported boundary.
+        # Bump the Python entries when a new release becomes supported.
+        include:
+          # Newest resolvable dependencies on the floor and the current Python.
+          - { python-version: "3.13", resolution: highest }
+          - { python-version: "3.14", resolution: highest }
+          # Floor dependencies (each direct dep at its pyproject lower bound) on the floor Python, the most conservative supported combination.
+          - { python-version: "3.13", resolution: lowest-direct }
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
       # scripts/CI.sh runs pyrefly, ruff, and pytest through `uv run`, which syncs the locked dev dependency group first.
-      # The check configuration lives in that committed script, not in this workflow.
+      # UV_RESOLUTION steers that resolution per matrix entry; with uv.lock gitignored, every job resolves fresh, so the check configuration stays in the committed script.
       - run: bash scripts/CI.sh
+        env:
+          UV_RESOLUTION: ${{ matrix.resolution }}

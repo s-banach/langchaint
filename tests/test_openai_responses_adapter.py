@@ -466,11 +466,11 @@ class _FakeSDKStream(AsyncResponseStream[None]):
     the base __init__ is deliberately not called, so the untouched base machinery stays unusable.
     """
 
-    def __init__(self, replay_events: Sequence[ResponseStreamEvent[None]]) -> None:
+    def __init__(self, replay_events: Sequence[ResponseStreamEvent]) -> None:
         self._replay_events = list(replay_events)
 
     @override
-    async def __aiter__(self) -> AsyncIterator[ResponseStreamEvent[None]]:
+    async def __aiter__(self) -> AsyncIterator[ResponseStreamEvent]:
         for replay_event in self._replay_events:
             yield replay_event
 
@@ -479,7 +479,7 @@ class _FakeSDKStream(AsyncResponseStream[None]):
         return
 
 
-def _stream(replay_events: Sequence[ResponseStreamEvent[None]]) -> _OpenAIStream[str]:
+def _stream(replay_events: Sequence[ResponseStreamEvent]) -> _OpenAIStream[str]:
     """Build a text-content adapter stream over replayed events."""
     return _OpenAIStream(
         sdk_stream=_FakeSDKStream(replay_events),
@@ -488,7 +488,7 @@ def _stream(replay_events: Sequence[ResponseStreamEvent[None]]) -> _OpenAIStream
     )
 
 
-def _collected_items(replay_events: Sequence[ResponseStreamEvent[None]]) -> list[StreamItem]:
+def _collected_items(replay_events: Sequence[ResponseStreamEvent]) -> list[StreamItem]:
     """Drain the translated items into a list."""
 
     async def scenario() -> list[StreamItem]:

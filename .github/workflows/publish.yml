@@ -1,0 +1,27 @@
+name: Publish to PyPI
+
+# Publishes on a published GitHub Release.
+# Authentication is PyPI Trusted Publishing (OIDC): no API token is stored anywhere.
+# Before the first run, register a pending publisher on https://pypi.org/manage/account/publishing/ with owner s-banach, repo langchaint, workflow publish.yml, and no environment (the job below declares none).
+# No approval gate is deliberate: a published Release publishes to PyPI immediately, chosen for a solo maintainer where cutting the Release is already the deliberate act, so a GitHub environment with a required reviewer would only gate a release against its own author.
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # id-token lets uv mint the short-lived OIDC token PyPI trusts.
+      id-token: write
+      # Naming any permission sets every unnamed one to none, so actions/checkout needs contents spelled out or its checkout 403s.
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv build
+      # No token: uv detects the GitHub Actions OIDC environment and uses Trusted Publishing (the default --trusted-publishing automatic).
+      - run: uv publish

@@ -507,6 +507,11 @@ class AnthropicMessagesProvider(Provider):
         The stored client is a with_options(max_retries=0) copy: the package's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
+        The copy re-feeds client._client (the caller's httpx.AsyncClient) explicitly:
+        the two Bedrock client classes override copy() without the "http_client or self._client" reuse the
+        base AsyncAnthropic.copy has (anthropic 0.116.0), so a plain with_options rebuilds a fresh default
+        transport and drops a custom transport (loaded certs, proxy). Passing it back keeps it; the value is
+        the SDK client's own httpx client, re-entering the same SDK's copy, so the private read is known-true.
         cache_ttl applies uniformly to every cache_control marker this adapter writes,
         automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
         "1h" holds entries across longer gaps and writes bill 2x
@@ -514,7 +519,9 @@ class AnthropicMessagesProvider(Provider):
         A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request.
         """
         super().__init__(model=model, pricing=pricing)
-        self.client = client.with_options(max_retries=0)
+        # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
+        # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
+        self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
         self.default_max_completion_tokens = default_max_completion_tokens
         self.cache_ttl: CacheTtl = cache_ttl
 

@@ -11,6 +11,9 @@ Bedrock surface (which of two client classes) and its wire model id from ANTHROP
 so the application names neither the client class nor the Bedrock id.
 pricing None selects the model's public prices from ANTHROPIC_PRICING, shared by both constructors.
 Pass your own PricingTable to override, for example when your account bills at a custom rate.
+For a custom httpx.AsyncClient (loaded certs, a proxy), anthropic_model takes client=AsyncAnthropic(
+http_client=...) since its single client class makes that lossless, while anthropic_bedrock_model takes
+http_client= directly so it can still pick the model's Bedrock client class for you.
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://platform.claude.com/docs/en/about-claude/pricing.
@@ -21,6 +24,8 @@ Rates derive from the base input price: cache read 0.1x, 5-minute cache write 1.
 
 from dataclasses import dataclass
 from typing import Literal
+
+import httpx
 
 try:
     from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
@@ -168,11 +173,12 @@ def anthropic_model(
     )
 
 
-def anthropic_bedrock_model(
+def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_client to the standard set)
     model: AnthropicModelName,
     *,
     aws_region: str | None = None,
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
+    http_client: httpx.AsyncClient | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTtl = "5m",
@@ -185,6 +191,12 @@ def anthropic_bedrock_model(
     client None constructs the surface's client class with aws_region
     (None resolves the region from the AWS credential chain).
     Pass client to supply your own; it must match the model's surface.
+    http_client passes a custom httpx.AsyncClient (loaded certs, a proxy) to the surface's client class,
+    keeping the class-routing convenience that passing a whole client would forgo;
+    it is only for the default-client path, so passing both client and http_client raises
+    (a passed client already owns its transport). Unlike anthropic_model and openai_model, whose single
+    client class makes client=AsyncAnthropic(http_client=...) lossless, the Bedrock constructor picks one of
+    two client classes from the model, so it takes http_client to spare the application naming that class.
     pricing None selects ANTHROPIC_PRICING[model], the same table anthropic_model uses:
     the default is Anthropic's first-party list price, an estimate on Bedrock (AWS sets the real rate),
     corrected by passing pricing.
@@ -194,12 +206,17 @@ def anthropic_bedrock_model(
     built in the same event loop as the LLMs, since one instance serves one loop.
 
     Raises:
-        ValueError: client is provided but its class does not serve model's Bedrock surface.
+        ValueError: both client and http_client are provided,
+            or client is provided but its class does not serve model's Bedrock surface.
     """
     routing = ANTHROPIC_BEDROCK[model]
     if client is None:
-        client = _BEDROCK_CLIENT_CLASS[routing.surface](aws_region=aws_region)
+        client = _BEDROCK_CLIENT_CLASS[routing.surface](aws_region=aws_region, http_client=http_client)
     else:
+        if http_client is not None:
+            raise ValueError(
+                "Pass at most one of client= or http_client=; a passed client already owns its transport."
+            )
         required_class = _BEDROCK_CLIENT_CLASS[routing.surface]
         if not isinstance(client, required_class):
             raise ValueError(

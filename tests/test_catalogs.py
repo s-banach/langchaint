@@ -5,8 +5,9 @@ what tests can catch is a catalog function wiring the wrong model identifier, th
 or losing an override, a copy-paste error that would type-check and ship silently.
 """
 
+import httpx
 import pytest
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, AsyncAnthropicBedrockMantle
 from openai import AsyncOpenAI
 
 from langchaint import PricingTable, RateLimiter
@@ -14,6 +15,7 @@ from langchaint.anthropic import (
     ANTHROPIC_PRICING,
     AnthropicMessagesProvider,
     AnthropicModelName,
+    anthropic_bedrock_model,
     anthropic_model,
 )
 from langchaint.openai import (
@@ -52,6 +54,33 @@ def test_adapter_client_never_retries_beneath_the_package() -> None:
     assert isinstance(provider, AnthropicMessagesProvider)
     assert provider.client.max_retries == 0
     assert provider.client.api_key == client.api_key
+
+
+# One model per Bedrock surface: claude-opus-4-8 routes to "mantle", claude-opus-4-6 to "legacy".
+# The transport-drop bug lives in each surface's own copy() override, so both surfaces are exercised.
+@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-4-6"])
+def test_bedrock_http_client_survives_the_retry_suppression_copy(model: AnthropicModelName) -> None:
+    """A custom httpx client passed to anthropic_bedrock_model reaches the stored adapter client.
+
+    The two Bedrock client classes override copy() without reusing the existing transport (anthropic
+    0.116.0), so a plain with_options(max_retries=0) drops it; the adapter re-feeds it, so a caller's
+    loaded certs reach the wire. This asserts the injected client survives that copy, not a fresh default.
+    """
+    http_client = httpx.AsyncClient()
+    llm = anthropic_bedrock_model(model, aws_region="us-east-1", http_client=http_client)
+    provider = llm.provider
+    assert isinstance(provider, AnthropicMessagesProvider)
+    assert provider.client.max_retries == 0
+    assert provider.client._client is http_client
+
+
+def test_bedrock_rejects_client_and_http_client_together() -> None:
+    """Passing both client and http_client raises: a passed client already owns its transport."""
+    client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
+    with pytest.raises(ValueError, match="at most one"):
+        anthropic_bedrock_model(
+            "claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
+        )
 
 
 def test_pricing_override_replaces_the_default() -> None:

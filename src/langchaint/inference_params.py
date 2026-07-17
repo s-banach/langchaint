@@ -10,10 +10,13 @@ partial change is spelled dataclasses.replace(bound_llm.binding.inference_params
 from dataclasses import dataclass
 from typing import Literal
 
-type ReasoningEffort = Literal["low", "medium", "high"]
+type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 """Reasoning effort tiers,
-a common subset of both providers' vocabularies (verified against anthropic 0.116.0 / openai 2.45.0):
-the anthropic adapter sends the value as output_config.effort, the openai adapter as reasoning_effort.
+the union of both providers' vocabularies (verified against anthropic 0.116.0 / openai 2.45.0:
+openai accepts all seven, anthropic "low" through "max").
+Each adapter passes the value through as given (anthropic as output_config.effort with adaptive thinking,
+openai as reasoning_effort); a value or model the provider rejects surfaces as the provider's own error,
+per the provider-side-rules design rule, because the valid model-times-value combinations are too many to mirror.
 """
 
 

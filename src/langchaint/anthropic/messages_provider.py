@@ -42,7 +42,12 @@ Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
   consecutive tool results group into one user message because the API requires alternating roles.
 - `stop_reason` maps end_turn/tool_use/max_tokens/refusal to themselves and every other value to "other".
-- `reasoning_effort` maps to `output_config.effort`.
+- `reasoning_effort` maps to `output_config.effort` plus `thinking={"type": "adaptive"}`:
+  effort steers reasoning depth only under adaptive thinking (request-time behavior SDK introspection cannot show),
+  so the adapter sends the pair together and never one alone.
+  The value passes through as given, wider than the SDK's effort literal
+  (ReasoningEffort is the union of both providers' vocabularies, and openai's "none"/"minimal" are outside it),
+  and a model or value the API rejects surfaces as the provider's own error.
 """
 
 import base64
@@ -70,6 +75,7 @@ from anthropic.types import (
     RedactedThinkingBlockParam,
     TextBlockParam,
     ThinkingBlockParam,
+    ThinkingConfigParam,
     ToolChoiceParam,
     ToolParam,
     ToolResultBlockParam,
@@ -165,6 +171,7 @@ class _AnthropicRequest:
     tools: list[ToolParam] | Omit
     tool_choice: ToolChoiceParam | Omit
     output_config: OutputConfigParam | Omit
+    thinking: ThinkingConfigParam | Omit
     automatic_prompt_caching: bool
     cache_ttl: CacheTtl
     message_mark_budget: int
@@ -645,8 +652,14 @@ class AnthropicMessagesProvider(Provider):
                 f"unmark some system parts"
             )
         output_config: OutputConfigParam | Omit = omit
+        thinking: ThinkingConfigParam | Omit = omit
         if binding.inference_params.reasoning_effort is not None:
-            output_config = {"effort": binding.inference_params.reasoning_effort}
+            # cast: deliberate pass-through of the union ReasoningEffort vocabulary, wider than the
+            # SDK's effort literal; a value the API rejects surfaces as the provider's own error.
+            output_config = cast(
+                "OutputConfigParam", {"effort": binding.inference_params.reasoning_effort}
+            )
+            thinking = {"type": "adaptive"}
         return _AnthropicRequest(
             model=self.model,
             max_tokens=(
@@ -661,6 +674,7 @@ class AnthropicMessagesProvider(Provider):
             tools=tools,
             tool_choice=tool_choice,
             output_config=output_config,
+            thinking=thinking,
             automatic_prompt_caching=binding.automatic_prompt_caching,
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
@@ -779,6 +793,7 @@ class _BoundAnthropicText(BoundProvider[str]):
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
+            thinking=self._request.thinking,
             messages=_wire_messages(
                 conversation,
                 automatic_prompt_caching=self._request.automatic_prompt_caching,
@@ -803,6 +818,7 @@ class _BoundAnthropicText(BoundProvider[str]):
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
+            thinking=self._request.thinking,
             messages=_wire_messages(
                 conversation,
                 automatic_prompt_caching=self._request.automatic_prompt_caching,
@@ -878,6 +894,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
+            thinking=self._request.thinking,
             messages=_wire_messages(
                 conversation,
                 automatic_prompt_caching=self._request.automatic_prompt_caching,
@@ -903,6 +920,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
+            thinking=self._request.thinking,
             messages=_wire_messages(
                 conversation,
                 automatic_prompt_caching=self._request.automatic_prompt_caching,

@@ -565,6 +565,37 @@ def test_request_omits_tool_sentinels_without_tools() -> None:
     assert isinstance(request.tools, anthropic.Omit)
     assert isinstance(request.tool_choice, anthropic.Omit)
     assert request.output_config == {"effort": "high"}
+    assert request.thinking == {"type": "adaptive"}
+
+
+def test_request_passes_widened_reasoning_effort_through() -> None:
+    """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
+    binding = Binding(
+        system_prompt=None,
+        tool_schemas=(),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        inference_params=InferenceParams(reasoning_effort="minimal"),
+        automatic_prompt_caching=False,
+    )
+    request = _provider()._request(binding)
+    assert request.output_config == {"effort": "minimal"}
+    assert request.thinking == {"type": "adaptive"}
+
+
+def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> None:
+    """A None reasoning_effort leaves both output_config and thinking at the omit sentinel."""
+    binding = Binding(
+        system_prompt=None,
+        tool_schemas=(),
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        inference_params=InferenceParams(),
+        automatic_prompt_caching=False,
+    )
+    request = _provider()._request(binding)
+    assert isinstance(request.output_config, anthropic.Omit)
+    assert isinstance(request.thinking, anthropic.Omit)
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:

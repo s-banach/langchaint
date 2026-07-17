@@ -13,8 +13,10 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from langchaint import (
+    DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
+    DispatchOutcome,
     DispatchUnknownTool,
     ImagePart,
     InvalidToolArgsError,
@@ -630,3 +632,264 @@ def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> 
     raw: Mapping[str, object] | None = result.app_data
     assert raw is not None
     assert raw["source"] == "mcp"
+
+
+def _raiser_tool() -> Tool[_EchoArgs]:
+    """Build a tool whose function raises immediately, the user-code defect of the dispatch_many tests."""
+
+    async def _raiser_function(args: _EchoArgs) -> str:
+        """Fail with an ordinary user-code exception naming the call's text.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError(f"broke on {args.text}")
+
+    return Tool(
+        name="raiser",
+        description="Raises an ordinary exception.",
+        args_model=_EchoArgs,
+        function=_raiser_function,
+    )
+
+
+def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
+    """dispatch_many starts every call before any finishes, and orders outcomes by call position.
+
+    The first call's function blocks on an event only the second call's function sets:
+    sequential dispatch would never set it, so finishing inside the wait_for timeout proves concurrency,
+    and the first outcome still belongs to the first call although it completed last.
+    """
+
+    async def _run() -> tuple[DispatchOutcome, ...]:
+        gate = asyncio.Event()
+
+        async def _waiter_function(args: _EchoArgs) -> str:
+            """Block until the sibling call opens the gate, then echo."""
+            await gate.wait()
+            return f"waited {args.text}"
+
+        async def _setter_function(args: _EchoArgs) -> str:
+            """Open the gate the sibling call blocks on, then echo."""
+            gate.set()
+            return f"set {args.text}"
+
+        manager = ToolManager([
+            Tool(name="waiter", description="Waits.", args_model=_EchoArgs, function=_waiter_function),
+            Tool(name="setter", description="Sets.", args_model=_EchoArgs, function=_setter_function),
+        ])
+        tool_calls = [
+            ToolCall(id="c1", name="waiter", args_json='{"text": "a"}'),
+            ToolCall(id="c2", name="setter", args_json='{"text": "b"}'),
+        ]
+        return await asyncio.wait_for(manager.dispatch_many(tool_calls), timeout=5)
+
+    outcomes = asyncio.run(_run())
+    assert [outcome.tool_message.tool_call_id for outcome in outcomes] == ["c1", "c2"]
+    assert [outcome.tool_message.content for outcome in outcomes] == ["waited a", "set b"]
+
+
+def test_dispatch_many_returns_every_arm_in_call_order() -> None:
+    """A handled call, bad args, and an off-list name land as their outcome arms, in call order, no raise."""
+    tool_calls = [
+        ToolCall(id="c1", name="echo", args_json='{"text": "hi"}'),
+        ToolCall(id="c2", name="echo", args_json='{"wrong": "key"}'),
+        ToolCall(id="c3", name="missing", args_json="{}"),
+    ]
+    outcomes = asyncio.run(ToolManager([_echo_tool()]).dispatch_many(tool_calls))
+    assert [type(outcome) for outcome in outcomes] == [
+        DispatchHandled,
+        DispatchInvalidToolArgs,
+        DispatchUnknownTool,
+    ]
+    assert [outcome.tool_message.tool_call_id for outcome in outcomes] == ["c1", "c2", "c3"]
+
+
+def test_dispatch_many_of_no_calls_returns_empty() -> None:
+    """An empty tool_calls returns an empty outcome tuple."""
+    assert asyncio.run(ToolManager([_echo_tool()]).dispatch_many([])) == ()
+
+
+def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
+    """A raising function does not interrupt a sibling: the settled sibling's outcome and app_data survive.
+
+    The raiser fails immediately while the sibling yields to the event loop twice before returning,
+    so an implementation that raised on the first failure (or cancelled siblings, as a TaskGroup would)
+    would leave completed_outcomes without the sibling.
+    The sibling's app_data is the user story: a record of money the completed call spent
+    must reach the application although the batch raised.
+    """
+    receipt = _Receipt(record_id="rec-7")
+
+    async def _spender_function(args: _EchoArgs) -> ToolOutputExplicit[_Receipt]:
+        """Yield twice so the sibling defect fires first, then return content plus the receipt."""
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return ToolOutputExplicit(content=f"charged {args.text}", app_data=receipt)
+
+    spender = Tool(
+        name="spender",
+        description="Spends money, then reports.",
+        args_model=_EchoArgs,
+        function=_spender_function,
+    )
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="spender", args_json='{"text": "b"}'),
+    ]
+    manager = ToolManager([_raiser_tool(), spender])
+    with pytest.raises(DispatchExceptionGroup) as caught:
+        asyncio.run(manager.dispatch_many(tool_calls))
+    group = caught.value
+    assert [str(error) for error in group.exceptions] == ["broke on a"]
+    assert len(group.completed_outcomes) == 1
+    outcome = group.completed_outcomes[0]
+    assert isinstance(outcome, DispatchHandled)
+    assert outcome.tool_message.tool_call_id == "c2"
+    assert outcome.tool_message.content == "charged b"
+    assert outcome.app_data is receipt
+
+
+def test_dispatch_many_collects_every_defect_in_call_order() -> None:
+    """Two raising functions land together in exceptions, ordered by call position, siblings settled."""
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
+        ToolCall(id="c3", name="raiser", args_json='{"text": "b"}'),
+    ]
+    manager = ToolManager([_raiser_tool(), _echo_tool()])
+    with pytest.raises(DispatchExceptionGroup) as caught:
+        asyncio.run(manager.dispatch_many(tool_calls))
+    group = caught.value
+    assert [str(error) for error in group.exceptions] == ["broke on a", "broke on b"]
+    assert [outcome.tool_message.tool_call_id for outcome in group.completed_outcomes] == ["c2"]
+
+
+def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes() -> None:
+    """except* catches the group, and the derived subgroup still carries completed_outcomes.
+
+    except* builds the caught subgroup through derive; a derive that fell back to the base ExceptionGroup
+    would drop completed_outcomes, so the subgroup's field is asserted against the settled call.
+    """
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
+    ]
+    manager = ToolManager([_raiser_tool(), _echo_tool()])
+    subgroups: list[ExceptionGroup[RuntimeError]] = []
+    try:
+        asyncio.run(manager.dispatch_many(tool_calls))
+    except* RuntimeError as subgroup:
+        subgroups.append(subgroup)
+    assert len(subgroups) == 1
+    caught = subgroups[0]
+    assert isinstance(caught, DispatchExceptionGroup)
+    assert [outcome.tool_message.tool_call_id for outcome in caught.completed_outcomes] == ["c2"]
+
+
+def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
+    """A CancelledError a sibling function produces on its own re-raises bare, never grouped.
+
+    ExceptionGroup rejects a BaseException that is not an Exception, so an implementation that fed
+    the gathered results to DispatchExceptionGroup unchecked would raise TypeError here instead,
+    and grouping the CancelledError would swallow cancellation.
+    """
+
+    async def _self_cancelling_function(args: _EchoArgs) -> str:
+        """Produce a CancelledError without anyone cancelling the enclosing task.
+
+        Raises:
+            asyncio.CancelledError: always.
+        """
+        raise asyncio.CancelledError(args.text)
+
+    manager = ToolManager([
+        Tool(
+            name="self_cancel",
+            description="Produces a CancelledError.",
+            args_model=_EchoArgs,
+            function=_self_cancelling_function,
+        ),
+        _echo_tool(),
+    ])
+    tool_calls = [
+        ToolCall(id="c1", name="self_cancel", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
+    ]
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.dispatch_many(tool_calls))
+
+
+def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
+    """Defects co-occurring with a sibling's CancelledError chain as its __cause__, not vanish.
+
+    Cancellation wins the raise, but the sibling defect and the settled sibling's outcome
+    ride on the chained DispatchExceptionGroup, so neither is lost to the winning re-raise.
+    """
+
+    async def _self_cancelling_function(args: _EchoArgs) -> str:
+        """Produce a CancelledError without anyone cancelling the enclosing task.
+
+        Raises:
+            asyncio.CancelledError: always.
+        """
+        raise asyncio.CancelledError(args.text)
+
+    manager = ToolManager([
+        Tool(
+            name="self_cancel",
+            description="Produces a CancelledError.",
+            args_model=_EchoArgs,
+            function=_self_cancelling_function,
+        ),
+        _raiser_tool(),
+        _echo_tool(),
+    ])
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="self_cancel", args_json='{"text": "b"}'),
+        ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
+    ]
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(manager.dispatch_many(tool_calls))
+    cause = caught.value.__cause__
+    assert isinstance(cause, DispatchExceptionGroup)
+    assert [str(error) for error in cause.exceptions] == ["broke on a"]
+    assert [outcome.tool_message.tool_call_id for outcome in cause.completed_outcomes] == ["c3"]
+
+
+def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
+    """Cancelling the enclosing task cancels the in-flight dispatches and re-raises only after they unwind.
+
+    Both functions hang on never-set events with a finally recording the unwind;
+    when the awaited dispatch_many task re-raises CancelledError, both finally blocks must already have run,
+    which a bare gather (which cancels its children without awaiting them) would fail.
+    Nothing lands in a DispatchExceptionGroup: cancellation propagates bare.
+    """
+    unwound: list[str] = []
+
+    async def _hanging_function(args: _EchoArgs) -> str:
+        """Hang until cancelled, recording the unwind in finally."""
+        try:
+            await asyncio.Event().wait()
+        finally:
+            unwound.append(args.text)
+        return "unreachable"
+
+    async def _run() -> None:
+        manager = ToolManager([
+            Tool(name="hang", description="Hangs.", args_model=_EchoArgs, function=_hanging_function)
+        ])
+        tool_calls = [
+            ToolCall(id="c1", name="hang", args_json='{"text": "a"}'),
+            ToolCall(id="c2", name="hang", args_json='{"text": "b"}'),
+        ]
+        dispatch_task = asyncio.ensure_future(manager.dispatch_many(tool_calls))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        dispatch_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch_task
+        assert sorted(unwound) == ["a", "b"]
+
+    asyncio.run(_run())

@@ -15,16 +15,25 @@ RetriesExhaustedError, RefusalError, and ExceededMaxCompletionTokensError.
 Classification of raw SDK exceptions into these lives in the provider adapter (Provider.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
 so the adapter detects them where it reads the response and raises the matching leaf directly.
+
+DispatchExceptionGroup sits outside both axes: it belongs to the tool layer, not the generate loop.
+ToolManager.dispatch_many raises it after every sibling dispatch settled,
+grouping the tool-function defects and carrying the settled calls' outcomes.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Self, override
+from typing import TYPE_CHECKING, Self, override
 
 from pydantic import ValidationError
 
 from langchaint.messages import StopReason
 from langchaint.usage import Usage
+
+if TYPE_CHECKING:
+    # Type-only: tools.py imports this module at runtime, so importing the dispatch
+    # outcome types here at runtime would be a cycle. The annotations below quote them.
+    from langchaint.tools import DispatchOutcome
 
 
 class TransientError(Exception):
@@ -319,6 +328,67 @@ class InvalidToolArgsError(Exception):
     def __str__(self) -> str:
         """Render the held ValidationError as its own multi-line string."""
         return str(self.validation_error)
+
+
+class DispatchExceptionGroup(ExceptionGroup[Exception]):
+    """One or more tool functions raised during ToolManager.dispatch_many.
+
+    Raised only after every sibling dispatch settled, so it carries what the batch still produced:
+    completed_outcomes holds the settled calls' outcomes ordered by tool_calls position,
+    each naming its call via tool_message.tool_call_id,
+    so app_data a completed sibling produced (a billing record for money the tool spent) survives the raise,
+    the same principle as GenerationError preserving a rejected 200's billing on attempt_records.
+    The grouped exceptions are user-code defects, dispatch's exceptions-propagate rule extended to a batch,
+    ordered by tool_calls position; the ExceptionGroup base keeps every traceback in the report
+    and supports except* handling.
+    A CancelledError is never a member: ExceptionGroup rejects a BaseException that is not an Exception,
+    and dispatch_many re-raises cancellation bare to keep its semantics.
+    When defects co-occur with such a bare re-raise, this group still carries them,
+    chained as the re-raised exception's __cause__ instead of being the raise itself.
+    """
+
+    completed_outcomes: "tuple[DispatchOutcome, ...]"
+
+    def __new__(
+        cls,
+        message: str,
+        exceptions: Sequence[Exception],
+        *,
+        completed_outcomes: "tuple[DispatchOutcome, ...]",
+    ) -> Self:
+        """Pass message and exceptions to the base __new__, which takes nothing else; __init__ stores the keyword."""
+        group = super().__new__(cls, message, exceptions)
+        group.completed_outcomes = completed_outcomes
+        return group
+
+    def __init__(
+        self,
+        message: str,
+        exceptions: Sequence[Exception],
+        *,
+        completed_outcomes: "tuple[DispatchOutcome, ...]",
+    ) -> None:
+        """Store completed_outcomes and set args on the base.
+
+        BaseException.__init__ takes only positional args, so without this override the keyword
+        the constructor call carries would TypeError there.
+        """
+        super().__init__(message, exceptions)
+        self.completed_outcomes = completed_outcomes
+
+    @override
+    # pyrefly: ignore[bad-override]  # typeshed types derive as generic per call
+    # ([_ExceptionT](Sequence[_ExceptionT], /) -> ExceptionGroup[_ExceptionT]), which no concrete
+    # subclass override can satisfy; this is the override pattern PEP 654 itself documents.
+    def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
+        """Rebuild a subgroup carrying the same completed_outcomes.
+
+        except* and split call this; without the override they would build a plain ExceptionGroup
+        and the subgroup would silently lose completed_outcomes.
+        """
+        return DispatchExceptionGroup(
+            self.message, excs, completed_outcomes=self.completed_outcomes
+        )
 
 
 class StreamProtocolError(Exception):

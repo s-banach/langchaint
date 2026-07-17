@@ -13,13 +13,14 @@ No signature introspection and no docstring scraping: name, description, and sch
 so what the provider sees is exactly what the code states.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from langchaint.exceptions import InvalidToolArgsError
+from langchaint.exceptions import DispatchExceptionGroup, InvalidToolArgsError
 from langchaint.messages import MessageContent, ToolCall, ToolMessage
 
 
@@ -400,3 +401,69 @@ class ToolManager:
             )
             return DispatchUnknownTool(tool_message=tool_message, called_name=call.name)
         return await tool.dispatch(call)
+
+    async def dispatch_many(self, tool_calls: Sequence[ToolCall]) -> tuple[DispatchOutcome, ...]:
+        """Dispatch every call concurrently and return the outcomes ordered by tool_calls position.
+
+        The concurrent counterpart of dispatch for the several tool calls of one assistant turn:
+        every call starts at once, and each outcome sits at its call's index regardless of completion order.
+        A function exception (a user-code defect, as on dispatch) does not interrupt the siblings:
+        every call settles first, then the defects raise together as one DispatchExceptionGroup
+        whose completed_outcomes carries the settled calls' outcomes,
+        so app_data a completed sibling produced (a billing record for money the tool spent) survives the raise.
+        Cancellation is never grouped: cancelling the enclosing task cancels the sibling dispatches
+        and re-raises the CancelledError only after they finish unwinding,
+        and a CancelledError (or any other non-Exception BaseException) a sibling produces re-raises bare,
+        both because ExceptionGroup rejects such members and because grouping one would swallow cancellation.
+        Defects co-occurring with such a bare re-raise still surface: they chain as its __cause__,
+        a DispatchExceptionGroup carrying them and completed_outcomes as usual.
+
+        Raises:
+            DispatchExceptionGroup: one or more tool functions raised;
+                its exceptions holds the defects and completed_outcomes the settled calls' outcomes,
+                both ordered by tool_calls position.
+            asyncio.CancelledError: the enclosing task was cancelled;
+                re-raised after the sibling dispatches finish unwinding.
+            BaseException: a sibling produced a non-Exception BaseException
+                (its own CancelledError, typically); re-raised bare after every sibling settled,
+                with any sibling defects chained as its __cause__ in a DispatchExceptionGroup.
+                When several siblings produce such BaseExceptions, only the first by tool_calls position surfaces:
+                a second CancelledError duplicates the first's only fact (the batch was abandoned),
+                and a KeyboardInterrupt or SystemExit tears down the event loop before this function can observe it.
+        """
+        tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for tool_call in tool_calls]
+        try:
+            results: list[DispatchOutcome | BaseException] = await asyncio.gather(
+                *tasks, return_exceptions=True
+            )
+        except asyncio.CancelledError:
+            # gather already cancelled the sibling tasks but does not wait for them;
+            # settle them so no tool task is still unwinding after this raise.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        completed_outcomes: list[DispatchOutcome] = []
+        raised_exceptions: list[Exception] = []
+        base_exceptions: list[BaseException] = []
+        for result in results:
+            if isinstance(result, Exception):
+                raised_exceptions.append(result)
+            elif isinstance(result, BaseException):
+                base_exceptions.append(result)
+            else:
+                completed_outcomes.append(result)
+        if raised_exceptions:
+            group = DispatchExceptionGroup(
+                f"{len(raised_exceptions)} of {len(tool_calls)} tool calls raised during dispatch_many",
+                raised_exceptions,
+                completed_outcomes=tuple(completed_outcomes),
+            )
+            if base_exceptions:
+                # Cancellation wins, but the co-occurring defects must not vanish:
+                # they chain as the __cause__ the traceback prints.
+                raise base_exceptions[0] from group
+            raise group
+        if base_exceptions:
+            raise base_exceptions[0]
+        return tuple(completed_outcomes)

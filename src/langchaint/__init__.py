@@ -6,6 +6,7 @@ Adapters wrap the official anthropic/openai SDK clients; generation happens only
 from langchaint.exceptions import (
     AbortBatchError,
     AttemptRecord,
+    DispatchExceptionGroup,
     ExceededMaxCompletionTokensError,
     GenerationError,
     InvalidToolArgsError,
@@ -58,6 +59,7 @@ __all__ = [
     "AssistantMessage",
     "AttemptRecord",
     "BoundLLM",
+    "DispatchExceptionGroup",
     "DispatchHandled",
     "DispatchInvalidToolArgs",
     "DispatchOutcome",

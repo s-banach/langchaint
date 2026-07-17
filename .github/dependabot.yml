@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # GitHub Actions only. The Python dependencies are deliberately unbounded >= floors,
+  # and the CI matrix already tests both the lowest-direct floor and the highest resolution,
+  # so a pip/uv updater bumping the lower bound would shrink the supported range on purpose.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # One grouped PR for all action bumps instead of one per action.
+    groups:
+      actions:
+        patterns:
+          - "*"

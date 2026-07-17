@@ -20,12 +20,16 @@ jobs:
           # Floor dependencies (each direct dep at its pyproject lower bound) on the floor Python, the most conservative supported combination.
           - { python-version: "3.13", resolution: lowest-direct }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
+          # uv.lock is gitignored, so key the cache on the committed dependency source instead of the default uv.lock/requirements glob, which matches nothing here.
+          cache-dependency-glob: "pyproject.toml"
+          # UV_RESOLUTION is not part of setup-uv's cache key, so without a suffix the two 3.13 jobs (highest and lowest-direct) share one key and race to save it; keying the suffix on the resolution gives each its own cache.
+          cache-suffix: ${{ matrix.resolution }}
       # scripts/CI.sh runs pyrefly, ruff, and pytest through `uv run`, which syncs the locked dev dependency group first.
       # UV_RESOLUTION steers that resolution per matrix entry; with uv.lock gitignored, every job resolves fresh, so the check configuration stays in the committed script.
       - run: bash scripts/CI.sh

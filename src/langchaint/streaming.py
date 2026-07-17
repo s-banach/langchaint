@@ -118,7 +118,7 @@ class StreamHandle[OutputT]:
                 ended_at_monotonic_seconds=time.monotonic(),
                 error=wrapped,
                 usage=wrapped.usage,
-                cost_in_usd=wrapped.cost_in_usd,
+                usage_raw=wrapped.usage_raw,
             )
         )
         return self._rate_limiter.register_transient_error(_extract_transient_errors(self._attempt_records))
@@ -284,7 +284,7 @@ class StreamHandle[OutputT]:
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                     error=None,
                     usage=exc.usage,
-                    cost_in_usd=exc.cost_in_usd,
+                    usage_raw=exc.usage_raw,
                 )
             )
             raise type(exc)(
@@ -296,8 +296,6 @@ class StreamHandle[OutputT]:
             ) from exc
         response = Response(
             output=provider_result.output,
-            usage=provider_result.usage,
-            cost_in_usd=provider_result.cost_in_usd,
             model=self._provider.model,
             provider_name=self._provider.name,
             attempt_records=(
@@ -307,7 +305,7 @@ class StreamHandle[OutputT]:
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                     error=None,
                     usage=provider_result.usage,
-                    cost_in_usd=provider_result.cost_in_usd,
+                    usage_raw=provider_result.usage_raw,
                 ),
             ),
             elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,

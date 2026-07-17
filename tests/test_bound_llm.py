@@ -56,7 +56,13 @@ _USAGE = Usage(
     input_tokens_cache_write=0,
     input_tokens_cache_none=1,
     output_tokens=1,
+    output_tokens_reasoning=0,
+    cost_in_usd=0.0,
 )
+_USAGE_BILLED = _USAGE.model_copy(update={"cost_in_usd": 0.25})
+"""The billing a rejected 200 (a refusal or truncation) carries; cost now rides inside Usage."""
+_USAGE_STREAM = _USAGE.model_copy(update={"cost_in_usd": 0.001})
+"""The stream final()'s assembled usage, distinct so a stream cost is visible."""
 
 
 def _fast_rate_limiter(*, max_attempts: int = 3, max_in_flight: int = 8) -> RateLimiter:
@@ -87,13 +93,20 @@ class _FakeRawResponse(BaseModel):
     id: str = "fake-response"
 
 
+class _FakeRawUsage(BaseModel):
+    """Stands in for the SDK usage object a real adapter holds in usage_raw."""
+
+
+_FAKE_RAW_USAGE = _FakeRawUsage()
+
+
 def _success_result(content: str) -> ProviderResult[str]:
     """Build a successful text ProviderResult carrying the given content."""
     return ProviderResult(
         output=content,
         assistant_message=AssistantMessage(turn=(TextPart(text=content),)),
         usage=_USAGE,
-        cost_in_usd=0.0,
+        usage_raw=_FAKE_RAW_USAGE,
         stop_reason="end_turn",
         raw=_FakeRawResponse(),
     )
@@ -126,8 +139,8 @@ class _FakeStream(ProviderStream[str]):
         return ProviderResult(
             output="ab",
             assistant_message=AssistantMessage(turn=(TextPart(text="ab"),)),
-            usage=_USAGE,
-            cost_in_usd=0.001,
+            usage=_USAGE_STREAM,
+            usage_raw=_FAKE_RAW_USAGE,
             stop_reason="end_turn",
             raw=_FakeRawResponse(id="fake-final"),
         )
@@ -153,7 +166,7 @@ class _RefusingStream(_FakeStream):
             RefusalError: always, carrying this attempt's billing.
         """
         raise RefusalError.for_rejected_200(
-            usage=_USAGE, cost_in_usd=0.25, stop_reason="refusal"
+            usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
         )
 
 
@@ -414,7 +427,7 @@ def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
         provider = _FakeProvider(
             failures=[
                 RefusalError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="refusal"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
                 )
             ]
         )
@@ -425,11 +438,11 @@ def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
         failure = refused.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
-        assert failure.cost_in_usd == 0.25
+        assert failure.usage.cost_in_usd == 0.25
         assert failure.usage.output_tokens == _USAGE.output_tokens
         (record,) = failure.attempt_records
         assert record.error is None
-        assert record.cost_in_usd == 0.25
+        assert record.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
 
@@ -442,7 +455,7 @@ def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
         provider = _FakeProvider(
             failures=[
                 ExceededMaxCompletionTokensError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="max_tokens"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
                 )
             ]
         )
@@ -453,7 +466,7 @@ def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
         failure = truncated.value
         assert failure.attempts == 1
         assert failure.stop_reason == "max_tokens"
-        assert failure.cost_in_usd == 0.25
+        assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
 
@@ -653,7 +666,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
             echo=True,
             failures=[
                 RefusalError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="refusal"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
                 )
             ],
         )
@@ -665,7 +678,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
         first, second = results
         assert isinstance(first, RefusalError)
         assert first.stop_reason == "refusal"
-        assert first.cost_in_usd == 0.25
+        assert first.usage.cost_in_usd == 0.25
         assert isinstance(second, Response)
         assert second.output == "b"
 
@@ -874,11 +887,11 @@ def test_stream_final_refusal_raises_enriched_without_retry() -> None:
         failure = refused.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
-        assert failure.cost_in_usd == 0.25
+        assert failure.usage.cost_in_usd == 0.25
         assert failure.usage.output_tokens == _USAGE.output_tokens
         (record,) = failure.attempt_records
         assert record.error is None
-        assert record.cost_in_usd == 0.25
+        assert record.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
 

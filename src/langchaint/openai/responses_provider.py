@@ -123,7 +123,7 @@ from langchaint.provider import (
     retry_after_seconds_from_headers,
 )
 from langchaint.tools import ToolSchema
-from langchaint.usage import Usage
+from langchaint.usage import ZERO_USAGE, Usage
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
@@ -373,11 +373,12 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     return AssistantMessage(turn=tuple(turn))
 
 
-def _normalized_usage(usage: ResponseUsage) -> Usage:
-    """Map the raw counters onto the package's disjoint partition.
+def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
+    """Map the raw counters onto the package's disjoint partition and price them.
 
     input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
-    so it is the provider-reported total and the uncached counter is the remainder.
+    so the uncached counter is the remainder after subtracting them.
+    output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
     """
     details = usage.input_tokens_details
     return Usage(
@@ -387,7 +388,8 @@ def _normalized_usage(usage: ResponseUsage) -> Usage:
             usage.input_tokens - details.cached_tokens - details.cache_write_tokens
         ),
         output_tokens=usage.output_tokens,
-        input_tokens_total_provider_reported=usage.input_tokens,
+        output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
+        cost_in_usd=_cost_in_usd(usage=usage, pricing=pricing),
     )
 
 
@@ -406,28 +408,19 @@ def _cost_in_usd(usage: ResponseUsage, pricing: PricingTable) -> float:
     ) / 1_000_000
 
 
-_ZERO_USAGE = Usage(
-    input_tokens_cache_read=0,
-    input_tokens_cache_write=0,
-    input_tokens_cache_none=0,
-    output_tokens=0,
-)
-
-
 def _provider_result[OutputT](
     response: OpenAIResponse, output: OutputT, pricing: PricingTable
 ) -> ProviderResult[OutputT]:
     """Normalize one completed request around already-extracted output.
 
-    response.usage is typed optional; a response without it normalizes to zero usage and zero cost.
+    response.usage is typed optional; a response without it normalizes to ZERO_USAGE (zero cost) and
+    usage_raw None.
     """
     return ProviderResult(
         output=output,
         assistant_message=_assistant_message_from(response),
-        usage=_normalized_usage(response.usage) if response.usage else _ZERO_USAGE,
-        cost_in_usd=(
-            _cost_in_usd(usage=response.usage, pricing=pricing) if response.usage else 0.0
-        ),
+        usage=_normalized_usage(response.usage, pricing=pricing) if response.usage else ZERO_USAGE,
+        usage_raw=response.usage,
         stop_reason=_normalized_stop_reason(response),
         raw=response,
     )
@@ -699,7 +692,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
     def _parsed_output(self, response: ParsedResponse[ModelT]) -> ModelT:
         """Extract the parsed instance, or raise the error that classifies why the turn produced none.
 
-        Each raised error carries this attempt's billing (usage, cost_in_usd,
+        Each raised error carries this attempt's billing (usage with cost_in_usd, usage_raw,
         stop_reason) so a rejected 200's cost is not lost.
 
         Raises:
@@ -710,16 +703,15 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
                 which a later attempt may fix.
         """
         if response.output_parsed is None:
-            usage = _normalized_usage(response.usage) if response.usage else _ZERO_USAGE
-            cost_in_usd = (
-                _cost_in_usd(usage=response.usage, pricing=self._adapter.pricing)
+            usage = (
+                _normalized_usage(response.usage, pricing=self._adapter.pricing)
                 if response.usage
-                else 0.0
+                else ZERO_USAGE
             )
             stop_reason = _normalized_stop_reason(response)
             if stop_reason == "refusal":
                 raise RefusalError.for_rejected_200(
-                    usage=usage, cost_in_usd=cost_in_usd, stop_reason=stop_reason
+                    usage=usage, usage_raw=response.usage, stop_reason=stop_reason
                 )
             if (
                 response.status == "incomplete"
@@ -727,12 +719,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
                 and response.incomplete_details.reason == "max_output_tokens"
             ):
                 raise ExceededMaxCompletionTokensError.for_rejected_200(
-                    usage=usage, cost_in_usd=cost_in_usd, stop_reason=stop_reason
+                    usage=usage, usage_raw=response.usage, stop_reason=stop_reason
                 )
             raise TransientError(
                 "structured response contained no parsed output",
                 usage=usage,
-                cost_in_usd=cost_in_usd,
+                usage_raw=response.usage,
                 stop_reason=stop_reason,
             )
         return response.output_parsed

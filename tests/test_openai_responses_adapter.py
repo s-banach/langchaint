@@ -137,22 +137,35 @@ def _response(
     })
 
 
-def test_normalized_usage_subtracts_cache_from_input_tokens() -> None:
-    """The uncached counter is input_tokens minus both cache counts; the total is checked."""
-    usage = _normalized_usage(_usage_with_cache())
+def test_normalized_usage_subtracts_cache_from_input_tokens_and_prices() -> None:
+    """The uncached counter is input_tokens minus both cache counts, and the priced cost rides on it."""
+    usage = _normalized_usage(_usage_with_cache(), _PRICING)
     assert usage.input_tokens_cache_read == 600
     assert usage.input_tokens_cache_write == 100
     assert usage.input_tokens_cache_none == 300
-    assert usage.input_tokens_total_provider_reported == 1000
     assert usage.input_tokens_total == 1000
+    assert usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+
+
+def test_normalized_usage_reads_reasoning_tokens() -> None:
+    """output_tokens_reasoning reads the required reasoning_tokens counter."""
+    usage = _normalized_usage(
+        ResponseUsage(
+            input_tokens=10,
+            input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+            output_tokens=20,
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=8),
+            total_tokens=30,
+        ),
+        _PRICING,
+    )
+    assert usage.output_tokens_reasoning == 8
 
 
 def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
     """Cache counters summing past input_tokens raise instead of going negative.
 
-    The partition cross-check alone cannot catch this:
-    the subtraction makes the counters sum to input_tokens by construction,
-    so the guard is the non-negativity constraint on input_tokens_cache_none.
+    The subtraction derives input_tokens_cache_none, so the guard is its non-negativity constraint.
     """
     with pytest.raises(ValidationError):
         _normalized_usage(
@@ -164,7 +177,8 @@ def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
                 output_tokens=40,
                 output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
                 total_tokens=1040,
-            )
+            ),
+            _PRICING,
         )
 
 
@@ -324,7 +338,9 @@ def test_provider_result_normalizes_a_response_with_usage() -> None:
     response = _response(usage=_usage_with_cache())
     result = _provider_result(response=response, output="hey", pricing=_PRICING)
     assert result.output == "hey"
-    assert result.usage.input_tokens_total_provider_reported == 1000
+    assert result.usage.input_tokens_total == 1000
+    assert result.usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+    assert result.usage_raw is response.usage
     assert result.stop_reason == "end_turn"
     assert result.raw is response
 
@@ -334,7 +350,8 @@ def test_provider_result_falls_back_to_zero_usage_without_usage() -> None:
     result = _provider_result(response=_response(usage=None), output="hey", pricing=_PRICING)
     assert result.usage.input_tokens_total == 0
     assert result.usage.output_tokens == 0
-    assert result.cost_in_usd == 0.0
+    assert result.usage.cost_in_usd == 0.0
+    assert result.usage_raw is None
 
 
 def test_wire_input_converts_each_message_kind() -> None:
@@ -594,7 +611,7 @@ def test_stream_incomplete_terminal_still_assembles_final() -> None:
         result = await adapter_stream.final()
         assert result.output == "hey"
         assert result.stop_reason == "max_tokens"
-        assert result.usage.input_tokens_total_provider_reported == 1000
+        assert result.usage.input_tokens_total == 1000
 
     asyncio.run(scenario())
 
@@ -612,8 +629,8 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
         result = await adapter_stream.final()
         assert result.output == "hey"
         assert result.stop_reason == "end_turn"
-        assert result.usage.input_tokens_total_provider_reported == 1000
-        assert result.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+        assert result.usage.input_tokens_total == 1000
+        assert result.usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
 
     asyncio.run(scenario())
 
@@ -745,7 +762,7 @@ def test_structured_bind_raises_refusal_on_a_refusal_block() -> None:
             _parsed_response(None, refuse=True, usage=_usage_with_cache())
         )
     assert raised.value.stop_reason == "refusal"
-    assert raised.value.cost_in_usd > 0.0
+    assert raised.value.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_raises_truncation_on_a_max_output_tokens_incomplete() -> None:
@@ -760,7 +777,7 @@ def test_structured_bind_raises_truncation_on_a_max_output_tokens_incomplete() -
             )
         )
     assert raised.value.stop_reason == "max_tokens"
-    assert raised.value.cost_in_usd > 0.0
+    assert raised.value.usage.cost_in_usd > 0.0
 
 
 def test_every_request_carries_the_reasoning_include(

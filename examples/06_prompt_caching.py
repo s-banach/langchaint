@@ -118,7 +118,10 @@ async def anthropic_one_hour_ttl() -> None:
     assistant = llm.bind(system_prompt=STABLE_INSTRUCTIONS, automatic_prompt_caching=True)
     response = await assistant.generate_one("Do you handle refunds?")
     usage = response.usage
-    print(f"1h write: cache_write={usage.input_tokens_cache_write}, {response.cost_in_usd:.6f} USD")
+    print(
+        f"1h write: cache_write={usage.input_tokens_cache_write}, "
+        f"reasoning={usage.output_tokens_reasoning} tokens, {usage.cost_in_usd:.6f} USD"
+    )
 
 
 async def provider_divergent_marks_are_rejected() -> None:

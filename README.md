@@ -44,22 +44,22 @@ A bind-time `cache_control` marker goes on the system block (or the last tool wh
 Placement is manual because `messages.parse` lacks the top-level `cache_control` parameter; manual placement keeps create/parse/stream uniform.
 Every marker's TTL is the adapter's `cache_ttl` (`"5m"` default, `"1h"` for entries that must survive longer gaps at 2x write cost), a keyword of `anthropic_model` and `anthropic_bedrock_model`.
 
-**Usage counters partition, cost is the adapter's job.**
-`Usage` stores `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and `output_tokens`; the three input counters are a disjoint partition and `input_tokens_total` is derived.
-`input_tokens_total_provider_reported` holds what the provider itself reported: openai's `input_tokens` includes cached and cache-write tokens, so the adapter fills it and a validator cross-checks the partition; anthropic reports no all-inclusive total, so it stays None.
-The counters are validated non-negative, which is what guards the openai path: there the partition is derived by subtraction and sums to the reported total by construction.
-`cost_in_usd` is computed inside the adapter from raw provider counts against a `PricingTable`, because providers split counters the normalized `Usage` collapses: anthropic bills 5-minute and 1-hour cache writes at different rates, and an adapter that sees 1-hour writes without `cache_write_1h_usd_per_million_tokens` raises `AbortBatchError` rather than misbill.
+**Usage counters partition, and it carries the adapter-priced cost.**
+`Usage` stores `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, `output_tokens`, and `output_tokens_reasoning` (the reasoning share of output tokens); the three input counters are a disjoint partition and `input_tokens_total` is derived.
+The counters are validated non-negative, which is what guards the openai path, where `input_tokens_cache_none` is derived by subtraction from the provider's all-inclusive `input_tokens`.
+`Usage` also carries `cost_in_usd`, computed inside the adapter from raw provider counts against a `PricingTable`: it is stored, never derived from the counters, because providers split counters the normalized `Usage` collapses (anthropic bills 5-minute and 1-hour cache writes at different rates, and an adapter that sees 1-hour writes without `cache_write_1h_usd_per_million_tokens` raises `AbortBatchError` rather than misbill). Cost riding inside `Usage` means the two are born together and one `sum()` folds both; total across several results with `Usage.sum_of(...)`.
+Provider-specific detail the partition drops (the 5m/1h write split, `server_tool_use`, `service_tier`) stays readable on `usage_raw`, the raw SDK usage object carried by reference beside every `Usage`.
 
 **Success is a `Response`, failure is a `GenerationError`.**
 A generate that succeeds returns a frozen `Response[OutputT]` with every field present; one that ends terminally raises (or, in a batch, returns) a `GenerationError`.
 Its three leaves are the terminal per-item outcomes: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `ExceededMaxCompletionTokensError` (the structured response hit the token cap before its JSON parsed).
 On the base, `stop_reason` is `StopReason | None`: `"refusal"` or `"max_tokens"` on those two leaves, `None` on `RetriesExhaustedError`, whose attempts never reached a completed turn.
-Both hold `attempt_records`, one `AttemptRecord` per request sent: raw `time.monotonic()` start and end readings bracketing the send only (slot waits and backoff sleeps excluded, so rate limiting is distinguishable from slow requests), the attempt's `TransientError` (None on the attempt that succeeded or a rejected 200), and the attempt's `usage`/`cost_in_usd` (None for a transport failure that billed nothing).
+Both hold `attempt_records`, one `AttemptRecord` per request sent: raw `time.monotonic()` start and end readings bracketing the send only (slot waits and backoff sleeps excluded, so rate limiting is distinguishable from slow requests), the attempt's `TransientError` (None on the attempt that succeeded or a rejected 200), the attempt's `usage` (carrying `cost_in_usd`; `ZERO_USAGE` for a transport failure that billed nothing), and `usage_raw` (the raw SDK usage, None when no wire payload existed).
 On a `Response` every record but the last failed; on a `GenerationError` the records describe the terminal outcome.
 `attempts` is derived from the records on both.
 Both also carry `model`, `provider_name`, and `elapsed_seconds` (first request to completion, waits included, so stored rather than derived), so the module-level `to_row(result)` flattens either to the same scalar keys and a mixed list of successes and failures is one table.
-A `GenerationError` derives `usage`/`cost_in_usd` from its records, so a refusal or truncation reports its real cost while a retry-exhausted item whose attempts billed nothing reports zero; `error_text` carries the failure reason.
-On a `Response`, `usage`, `cost_in_usd` (the successful attempt's own), `stop_reason`, `assistant_message`, and `raw` are always present.
+`usage` is the paid total across every attempt, folded from the records, on both `Response` and `GenerationError`: it is the number to bill on (its `cost_in_usd` is the money the call spent), so a refusal or truncation reports its real cost while a retry-exhausted item whose attempts billed nothing reports zero; `error_text` carries the failure reason.
+On a `Response`, `stop_reason`, `assistant_message`, and `raw` are always present; `usage_successful_attempt` is the single kept answer's own usage (the one matching `output` and `raw.usage`), equal to `usage` unless a billed 200 was retried (an empty structured parse retried as transient), in which case `usage` is larger by the retried attempt's billing.
 `raw` is the SDK's own response model held by reference; it is never dumped to a dict, because dumping deep-copies every response body per request.
 
 **One RateLimiter owns retrying and pacing.**
@@ -79,7 +79,7 @@ Unrecognized exceptions go through `Provider.classify`, which returns `"rate_lim
 **Streaming is a handle.**
 `stream_one` returns a `StreamHandle`: an async iterator of `StreamItem = str | ToolCall`, an idempotent `await handle.final()` returning the assembled `Response`, and an async context manager so abandoning a stream closes the connection.
 Text chunks are the provider SDK's own strings passed through without a wrapper class or copy, and each `ToolCall` is yielded once, complete, when its block closes.
-There are deliberately no tool-call delta items (a consumer cannot act on partial argument JSON, and both SDKs accumulate the arguments and hand over the finished call) and no usage or stop items (usage, `cost_in_usd`, and `stop_reason` live on `final()`'s `Response`, and a bare-`str` stop reason could not share a union with bare-`str` text chunks).
+There are deliberately no tool-call delta items (a consumer cannot act on partial argument JSON, and both SDKs accumulate the arguments and hand over the finished call) and no usage or stop items (`usage` (carrying `cost_in_usd`) and `stop_reason` live on `final()`'s `Response`, and a bare-`str` stop reason could not share a union with bare-`str` text chunks).
 Connection failures before the first yielded item retry under the `RateLimiter`; after the first yielded item nothing retries, because replaying chunks the caller already consumed would duplicate output.
 An open stream holds one `RateLimiter` slot from opening until it closes or exhausts, so long-lived streams count against `max_in_flight`.
 

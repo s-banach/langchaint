@@ -97,6 +97,8 @@ def _gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttrib
     so the whole partition is kept together rather than split across two prefixes).
     gen_ai.response.finish_reasons is the plural array the convention defines;
     it is omitted when stop_reason is None (no completed turn).
+    The usage and cost attributes are the call's paid totals across every attempt (result.usage is that scope),
+    not one request's counts; per-attempt detail stays visible as the langchaint.attempt_failed span events.
     """
     usage = result.usage
     attributes: dict[str, str | bool | int | float | Sequence[str]] = {
@@ -104,8 +106,9 @@ def _gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttrib
         "gen_ai.request.model": result.model,
         "gen_ai.usage.input_tokens": usage.input_tokens_total,
         "gen_ai.usage.output_tokens": usage.output_tokens,
+        "gen_ai.usage.reasoning.output_tokens": usage.output_tokens_reasoning,
         "langchaint.attempts": result.attempts,
-        "langchaint.cost_in_usd": result.cost_in_usd,
+        "langchaint.cost_in_usd": usage.cost_in_usd,
         "langchaint.input_tokens_cache_read": usage.input_tokens_cache_read,
         "langchaint.input_tokens_cache_write": usage.input_tokens_cache_write,
         "langchaint.input_tokens_cache_none": usage.input_tokens_cache_none,

@@ -42,7 +42,7 @@ langchaint ships no loop, so there is nothing to splice into: each hook is plain
 | human-in-the-loop / interrupts | check `call.name` (or a tool's `app_data`) between turns and decide; a declined call is an is_error `ToolMessage` you append (see `run_agent`'s `approve` gate) |
 | summarization / message trimming | edit the `conversation` list you hold before the next turn |
 | structured-output middleware | `bind(response_format=Model)`; a refusal or truncation raises a `GenerationError` leaf you catch |
-| usage / cost tracking | read `response.usage` and `response.cost_in_usd`, or `to_row(result)` for a table |
+| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, equal to `usage` unless a billed 200 was retried. Or `to_row(result)` for a table. |
 
 The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full conversation in scope, not a callback fighting an engine that holds the state.
 

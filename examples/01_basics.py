@@ -29,7 +29,7 @@ async def plain_text() -> None:
     assistant = llm.bind(system_prompt="You are a terse assistant.", automatic_prompt_caching=False)
     response = await assistant.generate_one("Name three primary colors.")
     print(response.output)
-    print(f"{response.cost_in_usd:.6f} USD, {response.usage.output_tokens} output tokens")
+    print(f"{response.usage.cost_in_usd:.6f} USD, {response.usage.output_tokens} output tokens")
 
 
 class Sentiment(BaseModel):

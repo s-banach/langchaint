@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from langchaint.exceptions import AttemptRecord, GenerationError
 from langchaint.messages import AssistantMessage, StopReason, ToolCall
-from langchaint.usage import Usage
+from langchaint.usage import ZERO_USAGE, Usage
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_row emits."""
@@ -40,15 +40,13 @@ class Response[OutputT]:
     on streams it comes from the SDK-assembled final message.
     It is a live, mutable pydantic object shared with the adapter, so despite the frozen dataclass around it,
     treat it read-only and raw.model_copy() before mutating.
-    usage and cost_in_usd are the successful attempt's own, not the total across earlier failed attempts;
-    the paid total stays derivable from attempt_records for a caller that wants it.
+    usage and usage_successful_attempt are two scopes, both folded from attempt_records (see their docstrings):
+    usage is the paid total across every attempt, usage_successful_attempt the single kept answer's own.
     elapsed_seconds spans first request to completion, RateLimiter slot waits and backoff waits included;
     it is stored rather than derived from the records because the records deliberately exclude those waits.
     """
 
     output: OutputT
-    usage: Usage
-    cost_in_usd: float
     model: str
     provider_name: str
     attempt_records: tuple[AttemptRecord, ...]
@@ -76,6 +74,28 @@ class Response[OutputT]:
         return len(self.attempt_records)
 
     @property
+    def usage(self) -> Usage:
+        """The paid total across every attempt of the call, carrying cost_in_usd, the number to bill on.
+
+        A call that retried a billed 200 (an empty structured parse retried as transient) counts every such
+        attempt, so this can exceed the tokens of the single answer in output; usage_successful_attempt is
+        that single answer's own usage. This is the same paid-total scope as GenerationError.usage,
+        so the two mean the same thing. Transport, 5xx, and rate-limit retries bill nothing (ZERO_USAGE),
+        so when every failed attempt was one of those this equals usage_successful_attempt.
+        """
+        return sum((record.usage for record in self.attempt_records), start=ZERO_USAGE)
+
+    @property
+    def usage_successful_attempt(self) -> Usage:
+        """The single kept answer's own usage, the one matching output, assistant_message, and raw.usage.
+
+        The last attempt record is the success (__post_init__ enforces it), so this reads it directly.
+        It equals usage in the common case where no failed attempt billed (every retry was a transport,
+        5xx, or rate-limit failure); it is smaller than usage only when a billed 200 was retried.
+        """
+        return self.attempt_records[-1].usage
+
+    @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """The turn's tool calls, from assistant_message."""
         return self.assistant_message.tool_calls
@@ -85,10 +105,10 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
     """One flat dict of scalars per result, for table building.
 
     A success and a failure fill the same keys, so a mixed list becomes one table:
-    a failure's output is None and its error_text carries the failure reason a success leaves None,
-    while its stop_reason, cost_in_usd, and usage counters come from the terminal outcome
-    (None and zero for a retry-exhausted item whose attempts billed nothing,
-    the real values for a refusal or truncation).
+    a failure's output is None and its error_text carries the failure reason a success leaves None.
+    The cost_in_usd and usage-counter columns are the call's paid totals across every attempt, uniform on
+    success and failure rows (zero for a retry-exhausted item whose attempts billed nothing, the real values
+    for a refusal or truncation, and above the single answer's tokens when a billed 200 was retried).
     Usage counters are hoisted to top-level keys named exactly like the Usage fields;
     model output is flattened to its JSON.
     """
@@ -96,7 +116,6 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         output_cell: str | None = None
         error_text: str | None = result.error_text
         stop_reason: StopReason | None = result.stop_reason
-        cost_in_usd = result.cost_in_usd
         usage = result.usage
     else:
         output = result.output
@@ -105,7 +124,6 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         )
         error_text = None
         stop_reason = result.stop_reason
-        cost_in_usd = result.cost_in_usd
         usage = result.usage
     return {
         "output": output_cell,
@@ -115,10 +133,11 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         "provider_name": result.provider_name,
         "attempts": result.attempts,
         "elapsed_seconds": result.elapsed_seconds,
-        "cost_in_usd": cost_in_usd,
+        "cost_in_usd": usage.cost_in_usd,
         "input_tokens_cache_read": usage.input_tokens_cache_read,
         "input_tokens_cache_write": usage.input_tokens_cache_write,
         "input_tokens_cache_none": usage.input_tokens_cache_none,
         "input_tokens_total": usage.input_tokens_total,
         "output_tokens": usage.output_tokens,
+        "output_tokens_reasoning": usage.output_tokens_reasoning,
     }

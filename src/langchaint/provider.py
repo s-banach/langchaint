@@ -158,7 +158,9 @@ class ProviderResult[OutputT]:
 
     output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
     assistant_message is the full turn including tool calls, for appending to a conversation.
-    cost_in_usd is computed by the adapter from raw provider counts against its PricingTable.
+    usage carries the adapter-priced cost_in_usd, computed from raw provider counts against its PricingTable.
+    usage_raw is the raw SDK usage object usage was normalized from, held by reference (no dump, no copy),
+    None when the response reported no usage; a caller recovers provider-specific counts from it.
     raw is the SDK's own response model, held by reference (no dump, no copy).
     It is a live, mutable pydantic object, so despite the frozen dataclass around it,
     treat it read-only and raw.model_copy() before mutating.
@@ -167,7 +169,7 @@ class ProviderResult[OutputT]:
     output: OutputT
     assistant_message: AssistantMessage
     usage: Usage
-    cost_in_usd: float
+    usage_raw: BaseModel | None
     stop_reason: StopReason
     raw: BaseModel
 

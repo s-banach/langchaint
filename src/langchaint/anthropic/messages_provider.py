@@ -421,18 +421,27 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     return AssistantMessage(turn=tuple(turn))
 
 
-def _normalized_usage(usage: anthropic.types.Usage) -> Usage:
-    """Map the raw counters onto the package's disjoint partition.
+def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Usage:
+    """Map the raw counters onto the package's disjoint partition and price them.
 
     `usage.input_tokens` excludes cache reads and writes (verified against anthropic 0.116.0),
-    so it is exactly the uncached-input counter and no provider-reported all-inclusive total exists.
+    so it is exactly the uncached-input counter.
+    output_tokens_details is optional on the SDK Usage; its thinking_tokens counter is 0 when it is absent.
+
+    Raises:
+        AbortBatchError: propagated from _cost_in_usd when the response reports 1-hour cache writes
+            but the PricingTable has no cache_write_1h_usd_per_million_tokens.
     """
+    output_tokens_details = usage.output_tokens_details
     return Usage(
         input_tokens_cache_read=usage.cache_read_input_tokens or 0,
         input_tokens_cache_write=usage.cache_creation_input_tokens or 0,
         input_tokens_cache_none=usage.input_tokens,
         output_tokens=usage.output_tokens,
-        input_tokens_total_provider_reported=None,
+        output_tokens_reasoning=(
+            output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
+        ),
+        cost_in_usd=_cost_in_usd(usage=usage, pricing=pricing),
     )
 
 
@@ -460,7 +469,8 @@ def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
         if pricing.cache_write_1h_usd_per_million_tokens is None:
             raise AbortBatchError(
                 "the response reports 1-hour cache writes but the PricingTable "
-                "has no cache_write_1h_usd_per_million_tokens"
+                "has no cache_write_1h_usd_per_million_tokens",
+                usage_raw=usage,
             )
         cost_in_usd += (
             cache_write_1h_tokens * pricing.cache_write_1h_usd_per_million_tokens / 1_000_000
@@ -471,12 +481,17 @@ def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
 def _provider_result[OutputT](
     message: anthropic.types.Message, output: OutputT, pricing: PricingTable
 ) -> ProviderResult[OutputT]:
-    """Normalize one completed message around already-extracted output."""
+    """Normalize one completed message around already-extracted output.
+
+    Raises:
+        AbortBatchError: propagated from _normalized_usage when the response reports 1-hour cache writes
+            but the PricingTable has no cache_write_1h_usd_per_million_tokens.
+    """
     return ProviderResult(
         output=output,
         assistant_message=_assistant_message_from(message),
-        usage=_normalized_usage(message.usage),
-        cost_in_usd=_cost_in_usd(usage=message.usage, pricing=pricing),
+        usage=_normalized_usage(message.usage, pricing=pricing),
+        usage_raw=message.usage,
         stop_reason=_normalized_stop_reason(message.stop_reason),
         raw=message,
     )
@@ -780,7 +795,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
     def _parsed_output(self, message: ParsedMessage[ModelT]) -> ModelT:
         """Extract the parsed instance, or raise the error that classifies why the turn produced none.
 
-        Each raised error carries this attempt's billing (usage, cost_in_usd,
+        Each raised error carries this attempt's billing (usage with cost_in_usd, usage_raw,
         stop_reason) so a rejected 200's cost is not lost.
 
         Raises:
@@ -789,24 +804,25 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
                 terminal per-item, not retried.
             TransientError: the turn completed but carried no parsed output for another reason,
                 which a later attempt may fix.
+            AbortBatchError: propagated from _normalized_usage when the response reports 1-hour cache writes
+                but the PricingTable has no cache_write_1h_usd_per_million_tokens.
         """
         parsed_output = message.parsed_output
         if parsed_output is None:
-            usage = _normalized_usage(message.usage)
-            cost_in_usd = _cost_in_usd(usage=message.usage, pricing=self._adapter.pricing)
+            usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
             stop_reason = _normalized_stop_reason(message.stop_reason)
             if message.stop_reason == "refusal":
                 raise RefusalError.for_rejected_200(
-                    usage=usage, cost_in_usd=cost_in_usd, stop_reason=stop_reason
+                    usage=usage, usage_raw=message.usage, stop_reason=stop_reason
                 )
             if message.stop_reason == "max_tokens":
                 raise ExceededMaxCompletionTokensError.for_rejected_200(
-                    usage=usage, cost_in_usd=cost_in_usd, stop_reason=stop_reason
+                    usage=usage, usage_raw=message.usage, stop_reason=stop_reason
                 )
             raise TransientError(
                 "structured response contained no parsed output",
                 usage=usage,
-                cost_in_usd=cost_in_usd,
+                usage_raw=message.usage,
                 stop_reason=stop_reason,
             )
         return parsed_output

@@ -34,7 +34,7 @@ async def stream_text() -> None:
                 print(item, end="", flush=True)
         response = await handle.final()
     print()
-    print(f"{response.usage.output_tokens} output tokens, {response.cost_in_usd:.6f} USD")
+    print(f"{response.usage.output_tokens} output tokens, {response.usage.cost_in_usd:.6f} USD")
 
 
 async def stream_agent(

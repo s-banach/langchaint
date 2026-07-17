@@ -40,7 +40,9 @@ from langchaint.tracing import (
     TracedStreamHandle,
 )
 from tests.test_bound_llm import (
+    _FAKE_RAW_USAGE,
     _USAGE,
+    _USAGE_BILLED,
     _FakeProvider,
     _FakeStream,
     _fast_rate_limiter,
@@ -93,6 +95,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
             "gen_ai.response.finish_reasons": ("end_turn",),
             "gen_ai.usage.input_tokens": _USAGE.input_tokens_total,
             "gen_ai.usage.output_tokens": _USAGE.output_tokens,
+            "gen_ai.usage.reasoning.output_tokens": _USAGE.output_tokens_reasoning,
             "langchaint.attempts": 1,
             "langchaint.cost_in_usd": 0.0,
             "langchaint.input_tokens_cache_read": _USAGE.input_tokens_cache_read,
@@ -111,7 +114,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
         provider = _FakeProvider(
             failures=[
                 RefusalError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="refusal"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
                 )
             ]
         )
@@ -137,7 +140,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
         provider = _FakeProvider(
             failures=[
                 ExceededMaxCompletionTokensError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="max_tokens"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
                 )
             ]
         )
@@ -225,7 +228,7 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
             echo=True,
             failures=[
                 RefusalError.for_rejected_200(
-                    usage=_USAGE, cost_in_usd=0.25, stop_reason="refusal"
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
                 )
             ],
         )

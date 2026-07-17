@@ -137,22 +137,37 @@ def _usage_with_cache_split() -> at.Usage:
     )
 
 
-def test_normalized_usage_partitions_input_counters() -> None:
-    """input_tokens is the uncached counter and no all-inclusive total exists."""
-    usage = _normalized_usage(_usage_with_cache_split())
+def test_normalized_usage_partitions_input_counters_and_prices() -> None:
+    """input_tokens is the uncached counter, and the normalized usage carries the priced cost."""
+    usage = _normalized_usage(_usage_with_cache_split(), _PRICING)
     assert usage.input_tokens_cache_read == 200
     assert usage.input_tokens_cache_write == 30
     assert usage.input_tokens_cache_none == 100
     assert usage.input_tokens_total == 330
-    assert usage.input_tokens_total_provider_reported is None
+    assert usage.cost_in_usd == _cost_in_usd(_usage_with_cache_split(), _PRICING)
 
 
 def test_normalized_usage_treats_none_cache_counts_as_zero() -> None:
     """Absent cache counters normalize to zero, not None."""
-    usage = _normalized_usage(at.Usage(input_tokens=7, output_tokens=3))
+    usage = _normalized_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
     assert usage.input_tokens_cache_read == 0
     assert usage.input_tokens_cache_write == 0
     assert usage.input_tokens_cache_none == 7
+
+
+def test_normalized_usage_reads_reasoning_tokens_and_defaults_to_zero() -> None:
+    """output_tokens_reasoning reads thinking_tokens, and is zero when output_tokens_details is absent."""
+    with_details = _normalized_usage(
+        at.Usage(
+            input_tokens=1,
+            output_tokens=9,
+            output_tokens_details=at.OutputTokensDetails(thinking_tokens=4),
+        ),
+        _PRICING,
+    )
+    assert with_details.output_tokens_reasoning == 4
+    without_details = _normalized_usage(at.Usage(input_tokens=1, output_tokens=9), _PRICING)
+    assert without_details.output_tokens_reasoning == 0
 
 
 def test_cost_splits_five_minute_and_one_hour_cache_writes() -> None:
@@ -175,9 +190,11 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
 
 
 def test_cost_raises_abort_when_one_hour_writes_lack_a_rate() -> None:
-    """A 1-hour write with no cache_write_1h rate is a configuration defect."""
-    with pytest.raises(AbortBatchError):
-        _cost_in_usd(_usage_with_cache_split(), _PRICING_NO_1H)
+    """A 1-hour write with no cache_write_1h rate is a configuration defect; the abort keeps the raw usage."""
+    usage = _usage_with_cache_split()
+    with pytest.raises(AbortBatchError) as raised:
+        _cost_in_usd(usage, _PRICING_NO_1H)
+    assert raised.value.usage_raw is usage
 
 
 @pytest.mark.parametrize(
@@ -731,7 +748,7 @@ def test_structured_bind_raises_transient_without_parsed_output() -> None:
     with pytest.raises(TransientError) as raised:
         _structured_bound()._parsed_output(_parsed_message(None))
     # The rejected 200's billing rides on the transient error so the retry record is not zero.
-    assert raised.value.cost_in_usd is not None
+    assert raised.value.usage.cost_in_usd > 0.0
     assert raised.value.stop_reason == "end_turn"
 
 
@@ -740,7 +757,7 @@ def test_structured_bind_raises_refusal_on_a_refusal_stop_reason() -> None:
     with pytest.raises(RefusalError) as raised:
         _structured_bound()._parsed_output(_parsed_message(None, stop_reason="refusal"))
     assert raised.value.stop_reason == "refusal"
-    assert raised.value.cost_in_usd > 0.0
+    assert raised.value.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_raises_truncation_on_a_max_tokens_stop_reason() -> None:
@@ -748,7 +765,7 @@ def test_structured_bind_raises_truncation_on_a_max_tokens_stop_reason() -> None
     with pytest.raises(ExceededMaxCompletionTokensError) as raised:
         _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
     assert raised.value.stop_reason == "max_tokens"
-    assert raised.value.cost_in_usd > 0.0
+    assert raised.value.usage.cost_in_usd > 0.0
 
 
 def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:

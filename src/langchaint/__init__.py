@@ -51,10 +51,11 @@ from langchaint.tools import (
     ToolOutput,
     ToolOutputExplicit,
 )
-from langchaint.usage import Usage
+from langchaint.usage import ZERO_USAGE, Usage
 
 __all__ = [
     "LLM",
+    "ZERO_USAGE",
     "AbortBatchError",
     "AssistantMessage",
     "AttemptRecord",

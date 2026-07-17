@@ -380,7 +380,8 @@ class BoundLLM[OutputT]:
         Every attempt is timed onto an AttemptRecord whose bracket is the send only,
         excluding the slot wait and the backoff sleep,
         so a slow request is distinguishable from time spent rate limited;
-        a completed attempt's record carries its usage and cost_in_usd, a transport failure's is None.
+        a completed attempt's record carries its usage (with cost_in_usd) and usage_raw,
+        a transport failure's usage is ZERO_USAGE and usage_raw None.
 
         Raises:
             AbortBatchError: the adapter classified an attempt's error as abort.
@@ -407,7 +408,7 @@ class BoundLLM[OutputT]:
                             ended_at_monotonic_seconds=time.monotonic(),
                             error=None,
                             usage=exc.usage,
-                            cost_in_usd=exc.cost_in_usd,
+                            usage_raw=exc.usage_raw,
                         )
                     )
                     raise type(exc)(
@@ -437,13 +438,11 @@ class BoundLLM[OutputT]:
                             ended_at_monotonic_seconds=time.monotonic(),
                             error=None,
                             usage=provider_result.usage,
-                            cost_in_usd=provider_result.cost_in_usd,
+                            usage_raw=provider_result.usage_raw,
                         )
                     )
                     return Response(
                         output=provider_result.output,
-                        usage=provider_result.usage,
-                        cost_in_usd=provider_result.cost_in_usd,
                         model=self.provider.model,
                         provider_name=self.provider.name,
                         attempt_records=tuple(attempt_records),
@@ -458,7 +457,7 @@ class BoundLLM[OutputT]:
                         ended_at_monotonic_seconds=time.monotonic(),
                         error=error,
                         usage=error.usage,
-                        cost_in_usd=error.cost_in_usd,
+                        usage_raw=error.usage_raw,
                     )
                 )
                 delay_seconds = self.rate_limiter.register_transient_error(

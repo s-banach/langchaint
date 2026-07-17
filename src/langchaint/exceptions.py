@@ -25,10 +25,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self, override
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from langchaint.messages import StopReason
-from langchaint.usage import Usage
+from langchaint.usage import ZERO_USAGE, Usage
 
 if TYPE_CHECKING:
     # Type-only: tools.py imports this module at runtime, so importing the dispatch
@@ -46,11 +46,13 @@ class TransientError(Exception):
     is_rate_limit marks errors saying the account or service refuses further requests right now
     (Provider.classify returned "rate_limit");
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
-    usage, cost_in_usd, and stop_reason describe the attempt's billable completion
+    usage (carrying cost_in_usd) and stop_reason describe the attempt's billable completion
     when the failing attempt was a completed 200 the adapter rejected downstream
     (a structured parse that returned no output);
-    they are None for a transport failure (timeout, 5xx, connection or rate-limit error) that billed nothing.
-    The retry loop copies them onto the attempt's AttemptRecord.
+    usage_raw is the raw SDK usage object usage was normalized from, held by reference.
+    A transport failure (timeout, 5xx, connection or rate-limit error) billed nothing, so usage is ZERO_USAGE
+    and usage_raw is None; stop_reason is None too.
+    The retry loop copies usage and usage_raw onto the attempt's AttemptRecord.
     """
 
     def __init__(
@@ -59,8 +61,8 @@ class TransientError(Exception):
         *,
         retry_after_seconds: float | None = None,
         is_rate_limit: bool = False,
-        usage: Usage | None = None,
-        cost_in_usd: float | None = None,
+        usage: Usage = ZERO_USAGE,
+        usage_raw: BaseModel | None = None,
         stop_reason: StopReason | None = None,
     ) -> None:
         """Store the server-stated wait, the rate-limit classification, and any attempt billing."""
@@ -68,7 +70,7 @@ class TransientError(Exception):
         self.retry_after_seconds = retry_after_seconds
         self.is_rate_limit = is_rate_limit
         self.usage = usage
-        self.cost_in_usd = cost_in_usd
+        self.usage_raw = usage_raw
         self.stop_reason = stop_reason
 
 
@@ -81,7 +83,14 @@ class AbortBatchError(Exception):
     Examples: bad credentials, an invalid request, an ImagePart media_type outside the API's set,
     a response with 1-hour cache writes but no cache_write_1h_usd_per_million_tokens, and the classify default.
     Adapters must classify unrecognized exceptions as abort so bugs are not retried silently.
+    usage_raw is the raw SDK usage object when the abort fired after a billed 200
+    (the unpriced-1-hour-write case), None otherwise, so that one payload stays recoverable.
     """
+
+    def __init__(self, message: str, *, usage_raw: BaseModel | None = None) -> None:
+        """Store the raw SDK usage object when the abort followed a billed 200."""
+        super().__init__(message)
+        self.usage_raw = usage_raw
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -100,15 +109,17 @@ class AttemptRecord:
     error is None on the attempt that succeeded and on a completed 200 rejected downstream
     (a refusal or a truncation, which are not transient);
     it holds the TransientError otherwise.
-    usage and cost_in_usd are the attempt's billing: set when the attempt reached a billable 200
-    (a success, or a rejected 200), None for a transport failure that billed nothing.
+    usage is the attempt's billing (with cost_in_usd inside): the reported counts when the attempt reached a
+    billable 200 (a success, or a rejected 200), ZERO_USAGE for a transport failure that billed nothing.
+    usage_raw is the raw SDK usage object usage was normalized from, or None when no wire payload existed
+    (a transport failure, or an openai 200 reporting no usage); it is the "did this attempt reach a 200" signal.
     """
 
     started_at_monotonic_seconds: float
     ended_at_monotonic_seconds: float
     error: TransientError | None
-    usage: Usage | None
-    cost_in_usd: float | None
+    usage: Usage
+    usage_raw: BaseModel | None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -135,29 +146,6 @@ def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
     )
 
 
-def _sum_usage(attempt_records: Sequence[AttemptRecord]) -> Usage:
-    """Sum the billable usage across records; a record that billed nothing adds zero.
-
-    input_tokens_total_provider_reported stays None:
-    the sum spans several requests and no single provider-reported total covers it.
-    """
-    usages = [record.usage for record in attempt_records if record.usage is not None]
-    return Usage(
-        input_tokens_cache_read=sum(usage.input_tokens_cache_read for usage in usages),
-        input_tokens_cache_write=sum(usage.input_tokens_cache_write for usage in usages),
-        input_tokens_cache_none=sum(usage.input_tokens_cache_none for usage in usages),
-        output_tokens=sum(usage.output_tokens for usage in usages),
-    )
-
-
-def _sum_cost_in_usd(attempt_records: Sequence[AttemptRecord]) -> float:
-    """Sum the billed cost across records; a record that billed nothing adds zero."""
-    return sum(
-        (record.cost_in_usd for record in attempt_records if record.cost_in_usd is not None),
-        0.0,
-    )
-
-
 class GenerationError(Exception):
     """A terminal per-item generate result that becomes a to_row failure row.
 
@@ -172,9 +160,12 @@ class GenerationError(Exception):
     attempt_records holds one AttemptRecord per request sent;
     model, provider_name, elapsed_seconds, and stop_reason mirror the fields a success Response carries
     so to_row fills the same row shape from either.
-    usage and cost_in_usd are summed from the records (a refusal or truncation reads its one completed attempt;
+    usage (carrying cost_in_usd) is the paid total summed from the records
+    (a refusal or truncation reads its one completed attempt;
     a retry-exhausted item sums its records, near zero when they were transport failures);
     attempts and error_text are derived from the records too.
+    usage_raw is the raw SDK usage of the one rejected 200 on the partial leaf for_rejected_200 builds,
+    and None on the enriched re-raise, where a caller recovers each attempt's payload from attempt_records.
 
     The adapter that detects a refusal or truncation cannot know the loop's prior attempts or timing, so
     it raises the leaf through for_rejected_200 carrying only the one attempt's billing;
@@ -187,7 +178,7 @@ class GenerationError(Exception):
     elapsed_seconds: float
     stop_reason: StopReason | None
     usage: Usage
-    cost_in_usd: float
+    usage_raw: BaseModel | None
 
     def __init__(
         self,
@@ -198,30 +189,32 @@ class GenerationError(Exception):
         elapsed_seconds: float,
         stop_reason: StopReason | None,
     ) -> None:
-        """Fill the row-shape fields; usage and cost_in_usd are summed from the records."""
+        """Fill the row-shape fields; usage (with cost_in_usd) is the paid total summed from the records."""
         self.attempt_records = attempt_records
         self.model = model
         self.provider_name = provider_name
         self.elapsed_seconds = elapsed_seconds
         self.stop_reason = stop_reason
-        self.usage = _sum_usage(attempt_records)
-        self.cost_in_usd = _sum_cost_in_usd(attempt_records)
+        self.usage = sum((record.usage for record in attempt_records), start=ZERO_USAGE)
+        self.usage_raw = None
         super().__init__(self._summary())
 
     @classmethod
     def for_rejected_200(
-        cls, *, usage: Usage, cost_in_usd: float, stop_reason: StopReason
+        cls, *, usage: Usage, usage_raw: BaseModel | None, stop_reason: StopReason
     ) -> Self:
         """Adapter-side leaf carrying one rejected 200's billing, before the loop fills the row.
 
-        The retry loop catches it, records the attempt from usage and cost_in_usd,
+        usage_raw is the raw SDK usage object, None only when the rejected 200 reported no usage
+        (an openai response whose usage field is None).
+        The retry loop catches it, records the attempt from usage and usage_raw,
         and re-raises the enriched leaf through the normal constructor;
         no caller ever sees this partial object,
         so its row-shape fields (attempt_records, model, provider_name, elapsed_seconds) stay unset.
         """
         error = cls.__new__(cls)
         error.usage = usage
-        error.cost_in_usd = cost_in_usd
+        error.usage_raw = usage_raw
         error.stop_reason = stop_reason
         Exception.__init__(error, cls._summary(error))
         return error

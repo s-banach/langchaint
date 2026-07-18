@@ -76,17 +76,17 @@ Usage, cost, and stop reason are not streamed; they live on the Response from fi
 
 
 @dataclass(frozen=True, kw_only=True)
-class SpecificTool:
+class SpecificToolChoice:
     """Tool choice that forces the model to call the named tool."""
 
     tool_name: str
 
 
-type ToolChoice = Literal["auto", "required", "none"] | SpecificTool
+type ToolChoice = Literal["auto", "required", "none"] | SpecificToolChoice
 """Provider-neutral tool choice.
 
-"auto" lets the model decide, "required" forces some tool call (Anthropic's "any"), SpecificTool forces one named tool,
-and "none" forbids tool calls.
+"auto" lets the model decide, "required" forces some tool call (Anthropic's "any"), and "none" forbids tool calls.
+SpecificToolChoice forces one named tool.
 OpenAI's allowed-tools subset form is deliberately unmapped: the binding already pins the tool list.
 """
 

@@ -18,8 +18,8 @@ from langchaint import (
     AbortBatchError,
     AssistantMessage,
     BoundLLM,
-    ExceededMaxCompletionTokensError,
     GenerationError,
+    MaxCompletionTokensExceededError,
     Message,
     PricingTable,
     RateLimiter,
@@ -448,19 +448,19 @@ def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
 
 
 def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
-    """An ExceededMaxCompletionTokensError from send is enriched and never retried."""
+    """A MaxCompletionTokensExceededError from send is enriched and never retried."""
 
     async def scenario() -> None:
         """Drive one generate_one whose send raises the adapter-side truncation leaf."""
         provider = _FakeProvider(
             failures=[
-                ExceededMaxCompletionTokensError.for_rejected_200(
+                MaxCompletionTokensExceededError.for_rejected_200(
                     usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
                 )
             ]
         )
         bound_llm = LLM(provider, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
-        with pytest.raises(ExceededMaxCompletionTokensError) as truncated:
+        with pytest.raises(MaxCompletionTokensExceededError) as truncated:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert provider.bound_providers[0].send_count == 1
         failure = truncated.value

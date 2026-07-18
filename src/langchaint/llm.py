@@ -387,7 +387,7 @@ class BoundLLM[OutputT]:
             AbortBatchError: the adapter classified an attempt's error as abort.
             RefusalError: the model refused on the structured path;
                 the adapter's leaf is re-raised enriched with the attempt records, on the first attempt without a retry.
-            ExceededMaxCompletionTokensError: the structured response hit the token cap;
+            MaxCompletionTokensExceededError: the structured response hit the token cap;
                 re-raised enriched on the first attempt without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
@@ -478,7 +478,7 @@ class BoundLLM[OutputT]:
 
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Every non-success outcome propagates: RetriesExhaustedError on transient exhaustion,
-        RefusalError or ExceededMaxCompletionTokensError on the structured path,
+        RefusalError or MaxCompletionTokensExceededError on the structured path,
         and AbortBatchError on an abort classification;
         the first three share the GenerationError base a caller can catch at once.
         """

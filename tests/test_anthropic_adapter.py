@@ -29,16 +29,16 @@ from langchaint import (
     LLM,
     AbortBatchError,
     AssistantMessage,
-    ExceededMaxCompletionTokensError,
     ImagePart,
     InferenceParams,
+    MaxCompletionTokensExceededError,
     PricingTable,
+    PydanticTool,
     ReasoningTrace,
     RefusalError,
-    SpecificTool,
+    SpecificToolChoice,
     StreamItem,
     TextPart,
-    Tool,
     ToolCall,
     ToolManager,
     ToolMessage,
@@ -117,7 +117,7 @@ def _tool_schemas() -> tuple[ToolSchema, ...]:
         """Return the city unchanged; never called in these tests."""
         return args.city
 
-    tool = Tool(
+    tool = PydanticTool(
         name="get_weather",
         description="Look up the weather",
         args_model=_EchoArgs,
@@ -519,8 +519,8 @@ def test_wire_tool_choice_required_becomes_any_and_inverts_parallel() -> None:
 
 
 def test_wire_tool_choice_specific_tool_names_the_tool() -> None:
-    """A SpecificTool becomes the named-tool form."""
-    assert _wire_tool_choice(SpecificTool(tool_name="x"), parallel_tool_calls=True) == {
+    """A SpecificToolChoice becomes the named-tool form."""
+    assert _wire_tool_choice(SpecificToolChoice(tool_name="x"), parallel_tool_calls=True) == {
         "type": "tool",
         "name": "x",
         "disable_parallel_tool_use": False,
@@ -866,7 +866,7 @@ def test_structured_bind_raises_refusal_on_a_refusal_stop_reason() -> None:
 
 def test_structured_bind_raises_truncation_on_a_max_tokens_stop_reason() -> None:
     """A max_tokens stop_reason with no parsed output is the terminal truncation leaf."""
-    with pytest.raises(ExceededMaxCompletionTokensError) as raised:
+    with pytest.raises(MaxCompletionTokensExceededError) as raised:
         _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
     assert raised.value.stop_reason == "max_tokens"
     assert raised.value.usage.cost_in_usd > 0.0

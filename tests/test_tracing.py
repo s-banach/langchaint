@@ -22,8 +22,8 @@ from pydantic import BaseModel
 from langchaint import (
     LLM,
     AbortBatchError,
-    ExceededMaxCompletionTokensError,
     GenerationError,
+    MaxCompletionTokensExceededError,
     RefusalError,
     Response,
     RetriesExhaustedError,
@@ -139,14 +139,14 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
         """Drive one generate_one whose send truncates, then inspect the error span."""
         provider = _FakeProvider(
             failures=[
-                ExceededMaxCompletionTokensError.for_rejected_200(
+                MaxCompletionTokensExceededError.for_rejected_200(
                     usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
                 )
             ]
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(provider, rate_limiter=_fast_rate_limiter()), tracer=tracer)
-        with pytest.raises(ExceededMaxCompletionTokensError):
+        with pytest.raises(MaxCompletionTokensExceededError):
             await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR

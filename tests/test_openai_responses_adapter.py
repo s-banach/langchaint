@@ -42,13 +42,13 @@ from pydantic import BaseModel, ValidationError
 
 from langchaint import (
     AssistantMessage,
-    ExceededMaxCompletionTokensError,
     ImagePart,
     InferenceParams,
+    MaxCompletionTokensExceededError,
     PricingTable,
     ReasoningTrace,
     RefusalError,
-    SpecificTool,
+    SpecificToolChoice,
     StreamItem,
     TextPart,
     ToolCall,
@@ -428,11 +428,11 @@ def test_wire_input_has_no_system_item() -> None:
 
 
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
-    """The neutral strings pass through unchanged; SpecificTool becomes the function form."""
+    """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"
     assert _wire_tool_choice("required") == "required"
     assert _wire_tool_choice("none") == "none"
-    assert _wire_tool_choice(SpecificTool(tool_name="x")) == {"type": "function", "name": "x"}
+    assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {"type": "function", "name": "x"}
 
 
 def _provider() -> OpenAIResponsesProvider:
@@ -784,7 +784,7 @@ def test_structured_bind_raises_refusal_on_a_refusal_block() -> None:
 
 def test_structured_bind_raises_truncation_on_a_max_output_tokens_incomplete() -> None:
     """An incomplete response for max_output_tokens is the terminal truncation leaf."""
-    with pytest.raises(ExceededMaxCompletionTokensError) as raised:
+    with pytest.raises(MaxCompletionTokensExceededError) as raised:
         _structured_bound()._parsed_output(
             _parsed_response(
                 None,

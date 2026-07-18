@@ -45,7 +45,7 @@ async def catch_generation_error() -> None:
     """Catch the GenerationError base to handle every terminal per-item outcome at once.
 
     On the structured path a refusal raises RefusalError and a token-cap truncation raises
-    ExceededMaxCompletionTokensError; a spent transient budget raises RetriesExhaustedError on any path.
+    MaxCompletionTokensExceededError; a spent transient budget raises RetriesExhaustedError on any path.
     to_row renders the caught error to the same row shape a Response fills, so a failure logs beside successes.
     """
     classifier = openai_model("gpt-5.6-terra").bind(

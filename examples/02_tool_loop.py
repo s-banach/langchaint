@@ -21,7 +21,7 @@ from langchaint import (
     DispatchInvalidToolArgs,
     DispatchUnknownTool,
     Message,
-    Tool,
+    PydanticTool,
     ToolCall,
     ToolManager,
     ToolMessage,
@@ -48,7 +48,7 @@ async def get_weather(args: WeatherArgs) -> str:
     return f"It is 18C and clear in {args.city}."
 
 
-weather_tool = Tool(
+weather_tool = PydanticTool(
     name="get_weather",
     description="Return the current weather for a city.",
     args_model=WeatherArgs,
@@ -165,7 +165,7 @@ async def transfer_funds(args: TransferArgs) -> ToolOutputExplicit[TransferRecei
     )
 
 
-transfer_tool = Tool(
+transfer_tool = PydanticTool(
     name="transfer_funds",
     description="Transfer money to an account.",
     args_model=TransferArgs,

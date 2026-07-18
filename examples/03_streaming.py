@@ -14,7 +14,7 @@ import asyncio
 
 from pydantic import BaseModel
 
-from langchaint import BoundLLM, Message, Tool, ToolCall, ToolManager, UserMessage
+from langchaint import BoundLLM, Message, PydanticTool, ToolCall, ToolManager, UserMessage
 from langchaint.openai import openai_model
 
 
@@ -80,7 +80,7 @@ async def get_weather(args: CityArgs) -> str:
     return f"It is 18C and clear in {args.city}."
 
 
-weather_tool = Tool(
+weather_tool = PydanticTool(
     name="get_weather",
     description="Return the current weather for a city.",
     args_model=CityArgs,

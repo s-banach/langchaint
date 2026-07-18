@@ -1,15 +1,15 @@
-"""RawSchemaTool argument validation: dispatch validates the arguments against args_schema.
+"""JSONSchemaTool argument validation: dispatch validates the arguments against args_schema.
 
 The schema is the only validation code: dispatch checks that the arguments are a JSON object, then validates
 them against args_schema with jsonschema (a langchaint dependency, like pydantic), so an invalid call becomes
-the same DispatchInvalidToolArgs house message a pydantic Tool's argument failure produces
+the same DispatchInvalidToolArgs house message a PydanticTool's argument failure produces
 and the function only ever sees valid arguments.
 This is the one example that needs no API key: it dispatches constructed ToolCalls, no provider involved.
 """
 
 import asyncio
 
-from langchaint import DispatchInvalidToolArgs, RawSchemaTool, ToolCall
+from langchaint import DispatchInvalidToolArgs, JSONSchemaTool, ToolCall
 
 SEARCH_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -27,7 +27,7 @@ async def run_search(args: dict[str, object]) -> str:
     return f"3 results for {args['query']!r}"
 
 
-search_tool = RawSchemaTool(
+search_tool = JSONSchemaTool(
     name="search",
     description="Search the index.",
     args_schema=SEARCH_SCHEMA,
@@ -39,7 +39,7 @@ async def main() -> None:
     """Dispatch one valid and one invalid ToolCall and print both outcomes.
 
     The invalid call returns the house DispatchInvalidToolArgs: an is_error ToolMessage rendered from
-    jsonschema's own errors, the same arm and format a pydantic Tool's argument failure lands in,
+    jsonschema's own errors, the same arm and format a PydanticTool's argument failure lands in,
     so the app's loop handles both tool forms identically.
     """
     valid = await search_tool.dispatch(ToolCall(id="c1", name="search", args_json='{"query": "tides"}'))

@@ -1,13 +1,13 @@
 """Tools.
 
 A tool comes in two forms, both async callables returning ToolOutput and both dispatched by ToolManager.
-Tool is the pydantic form: its function accepts one validated BaseModel argument, and its args_model is both the
+PydanticTool is the pydantic form: its function accepts one validated BaseModel argument, and its args_model is both the
 schema source (model_json_schema) and the validator of the model-produced argument JSON.
-RawSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JSON schema, not a pydantic model
+JSONSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JSON schema, not a pydantic model
 (an MCP tool discovered at runtime): its function accepts the parsed arguments as a dict[str, object], its
 args_schema rides through to the provider unchanged, and dispatch validates the arguments against args_schema
 with jsonschema (first that they are a JSON object, then the schema's field-level rules), so a schema violation
-renders through the same formatter as a pydantic Tool failure and the function only ever sees valid arguments.
+renders through the same formatter as a PydanticTool failure and the function only ever sees valid arguments.
 Both return str or a Sequence[Part] (text and images the model then sees), or a ToolOutputExplicit carrying that
 content plus is_error and app_data.
 A tool function returns data and nothing that steers control flow:
@@ -78,7 +78,7 @@ class DispatchHandled[AppDataT = None]:
     tool_message.is_error distinguishes them, the same bool the function set.
     tool_message is the ToolMessage the application appends to the conversation and the provider sees.
     app_data is the function's app_data, passed through live so the application reads it back at its concrete type:
-    Tool.dispatch carries the tool's own AppDataT onto this arm,
+    PydanticTool.dispatch carries the tool's own AppDataT onto this arm,
     so a caller that dispatched a known tool reads app_data with no isinstance.
     It is None when the function returned bare content.
     It never reaches the provider: only tool_message enters the conversation the adapters convert.
@@ -154,7 +154,8 @@ type DispatchOutcome = (
 
 The manager dispatches a heterogeneous tool set, so app_data is the widest the channel allows,
 BaseModel | Mapping[str, object] | None (a bare-content function leaves it None, hence the None arm in the parameter).
-A caller that knows the single tool it dispatched keeps the tool's own app_data type by calling Tool.dispatch instead.
+A caller that knows the single tool it dispatched keeps the tool's own app_data type by calling that tool's
+own dispatch instead.
 Every arm carries tool_message, so a consumer that only appends the reply reads result.tool_message with no match.
 A consumer that reads the field-level failure detail matches DispatchInvalidToolArgs;
 one that reads the off-list name matches DispatchUnknownTool.
@@ -166,8 +167,8 @@ class ToolSchema:
     """The provider-neutral description of one tool.
 
     Adapters convert it to their wire shape at bind time.
-    args_schema is the JSON schema of the tool's arguments: a Tool supplies its args_model's model_json_schema output,
-    a RawSchemaTool supplies its raw args_schema unchanged.
+    args_schema is the JSON schema of the tool's arguments: a PydanticTool supplies its args_model's
+    model_json_schema output, a JSONSchemaTool supplies its raw args_schema unchanged.
     """
 
     name: str
@@ -176,7 +177,7 @@ class ToolSchema:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Tool[ArgsT: BaseModel, AppDataT = None]:
+class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     """One callable tool: explicit name, description, args_model, function.
 
     validate_and_run, dispatch, and schema are the only readers of args_model and function:
@@ -184,7 +185,7 @@ class Tool[ArgsT: BaseModel, AppDataT = None]:
     which no outside caller could reproduce (a heterogeneous tool collection erases ArgsT and AppDataT).
     AppDataT is the app_data type the function carries, defaulting to None;
     the checker solves it from the function's ToolOutputExplicit return,
-    so Tool.dispatch returns DispatchHandled[AppDataT]
+    so PydanticTool.dispatch returns DispatchHandled[AppDataT]
     and the caller reads app_data at its concrete type with no isinstance.
     """
 
@@ -226,7 +227,7 @@ class Tool[ArgsT: BaseModel, AppDataT = None]:
         and renders an argument-validation failure with render_invalid_tool_args;
         ToolManager.dispatch delegates here so that assembly exists once.
         The caller must already have matched call.name to this tool, so there is no unknown-tool outcome:
-        a single Tool cannot receive an off-list name.
+        a single PydanticTool cannot receive an off-list name.
         The returned DispatchHandled carries this tool's AppDataT,
         so the caller reads app_data at its concrete type with no isinstance.
         Every function exception propagates: it is a defect in user code.
@@ -241,14 +242,14 @@ class Tool[ArgsT: BaseModel, AppDataT = None]:
 _ARGS_OBJECT = TypeAdapter(dict[str, object])
 """Validates that a tool call's args_json is a JSON object, parsing it to a dict without coercing the values.
 
-RawSchemaTool uses it for the parse step of dispatch: the arguments are a JSON object (not a scalar or malformed JSON),
+JSONSchemaTool uses it for the parse step of dispatch: the arguments are a JSON object (not a scalar or malformed JSON),
 which is the precondition every JSON-schema tool shares and the shape jsonschema then validates field-by-field.
 The `object` value type passes every value through untouched, so no field is silently reshaped.
 """
 
 
 @dataclass(frozen=True, kw_only=True)
-class RawSchemaTool[AppDataT = None]:
+class JSONSchemaTool[AppDataT = None]:
     """One callable tool described by a raw JSON schema instead of a pydantic model.
 
     This is the form for a tool whose schema arrives as a plain JSON schema, not a pydantic BaseModel: the archetype
@@ -261,7 +262,7 @@ class RawSchemaTool[AppDataT = None]:
     dispatch validates call.args_json in two steps: the JSON-object precondition (a malformed or non-object
     args_json becomes a DispatchInvalidToolArgs the model can correct), then jsonschema validation of the parsed
     object against args_schema, so a field-level violation lands in the same DispatchInvalidToolArgs a pydantic
-    Tool produces and the function only ever sees valid arguments.
+    PydanticTool produces and the function only ever sees valid arguments.
     The validator class comes from jsonschema.validators.validator_for, so a $schema key in args_schema selects
     the tool owner's declared draft and a schema without one validates under Draft 2020-12.
     There is deliberately no construction-time check_schema: jsonschema counts only dict as a JSON object,
@@ -271,9 +272,9 @@ class RawSchemaTool[AppDataT = None]:
     A semantic rule the schema cannot express is the function's to enforce, returning a
     ToolOutputExplicit with is_error=True.
     AppDataT is the app_data type the function carries, defaulting to None, solved from the function's
-    ToolOutputExplicit return exactly as on Tool, so RawSchemaTool.dispatch returns DispatchHandled[AppDataT].
-    There is no validate_and_run counterpart here: that seam exists on Tool because the validated arguments reach
-    the caller typed, and a RawSchemaTool caller gains nothing over parsing the JSON itself.
+    ToolOutputExplicit return exactly as on PydanticTool, so JSONSchemaTool.dispatch returns DispatchHandled[AppDataT].
+    There is no validate_and_run counterpart here: that seam exists on PydanticTool because the validated
+    arguments reach the caller typed, and a JSONSchemaTool caller gains nothing over parsing the JSON itself.
     """
 
     name: str
@@ -317,14 +318,14 @@ class RawSchemaTool[AppDataT = None]:
         return _handled_outcome(call, result)
 
 
-class DispatchableTool[AppDataT](Protocol):
+class Tool[AppDataT](Protocol):
     """The interface ToolManager needs from a tool: a name, a schema, and dispatch.
 
-    Both Tool (a pydantic-validated args_model) and RawSchemaTool (a raw JSON schema, arguments validated only as a
-    JSON object) satisfy it structurally, so one ToolManager holds a mix of the two, and an application may add its
-    own tool type by satisfying this interface. AppDataT appears only in dispatch's return, so it is covariant:
-    a DispatchableTool of a concrete app_data type is a DispatchableTool of the manager's wider channel type.
-    name is a read-only property so a frozen-dataclass name field (Tool, RawSchemaTool) satisfies it;
+    Both PydanticTool (arguments validated by its args_model) and JSONSchemaTool (arguments validated against its
+    raw args_schema) satisfy it structurally, so one ToolManager holds a mix of the two, and an application may add
+    its own tool type by satisfying this interface. AppDataT appears only in dispatch's return, so it is covariant:
+    a Tool of a concrete app_data type is a Tool of the manager's wider channel type.
+    name is a read-only property so a frozen-dataclass name field (PydanticTool, JSONSchemaTool) satisfies it;
     a plain attribute would demand a read-write name the frozen tools do not have.
     """
 
@@ -347,7 +348,7 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
 
     A header naming the tool, then one line per failure: the dot-joined path and the message.
     A path segment is stringified before the join; an empty path renders as (root).
-    Shared by the Tool path (pydantic errors mapped through _details_from_pydantic) and the RawSchemaTool path
+    Shared by the PydanticTool path (pydantic errors mapped through _details_from_pydantic) and the JSONSchemaTool path
     (jsonschema errors mapped through _details_from_jsonschema), so the two cannot drift.
 
     Raises:
@@ -406,12 +407,12 @@ def _invalid_args_outcome(
 ) -> DispatchInvalidToolArgs:
     """Build the DispatchInvalidToolArgs for a call whose arguments failed validation.
 
-    Shared by Tool.dispatch and both RawSchemaTool.dispatch failure paths
+    Shared by PydanticTool.dispatch and both JSONSchemaTool.dispatch failure paths
     (a non-object args_json, a jsonschema violation):
     all render the same is_error ToolMessage and carry the neutral details for a caller reading the failure.
     render_invalid_tool_args's ValueError cannot fire from here: every caller passes a non-empty tuple
     (a pydantic ValidationError carries at least one error,
-    and RawSchemaTool.dispatch checks the mapped jsonschema details for emptiness first),
+    and JSONSchemaTool.dispatch checks the mapped jsonschema details for emptiness first),
     so the dispatch methods do not list it.
     """
     tool_message = ToolMessage(
@@ -425,8 +426,9 @@ def _invalid_args_outcome(
 def _handled_outcome[AppDataT](call: ToolCall, result: ToolOutput[AppDataT]) -> DispatchHandled[AppDataT]:
     """Wrap a tool function's result into the DispatchHandled the application appends.
 
-    Shared by Tool.dispatch and RawSchemaTool.dispatch: a ToolOutputExplicit carries its content, is_error, and app_data
-    onto the ToolMessage and the arm; bare content becomes a non-error ToolMessage with no app_data.
+    Shared by PydanticTool.dispatch and JSONSchemaTool.dispatch: a ToolOutputExplicit carries its content,
+    is_error, and app_data onto the ToolMessage and the arm; bare content becomes a non-error ToolMessage
+    with no app_data.
     """
     if isinstance(result, ToolOutputExplicit):
         tool_message = ToolMessage(
@@ -445,12 +447,12 @@ class ToolManager:
     """
 
     def __init__(
-        self, tools: Sequence[DispatchableTool[BaseModel | Mapping[str, object] | None]]
+        self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]
     ) -> None:
         """Index the tools by name.
 
-        Each tool is any DispatchableTool, so a manager holds a mix of Tool and RawSchemaTool (and an application's own
-        tool type) keyed by name.
+        Each element is any Tool implementation, so a manager holds a mix of PydanticTool and JSONSchemaTool
+        (and an application's own tool type) keyed by name.
         The app_data bound BaseModel | Mapping[str, object] | None is the widest the manager surfaces:
         it dispatches a heterogeneous set whose per-call AppDataT is erased,
         so a tool whose function carries any of those app_data types is accepted
@@ -460,7 +462,7 @@ class ToolManager:
         Raises:
             ValueError: two tools share a name.
         """
-        self._tools: dict[str, DispatchableTool[BaseModel | Mapping[str, object] | None]] = {}
+        self._tools: dict[str, Tool[BaseModel | Mapping[str, object] | None]] = {}
         for tool in tools:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")

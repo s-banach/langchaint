@@ -42,7 +42,7 @@ except ModuleNotFoundError as exc:
 
 from langchaint.anthropic.messages_provider import (
     AnthropicMessagesProvider,
-    CacheTtl,
+    CacheTTL,
     cost_breakdown,
 )
 from langchaint.llm import LLM
@@ -155,7 +155,7 @@ def anthropic_model(
     client: AsyncAnthropic | AsyncAnthropicBedrock | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
-    cache_ttl: CacheTtl = "5m",
+    cache_ttl: CacheTTL = "5m",
     rate_limiter: RateLimiter | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on the Messages API.
@@ -194,7 +194,7 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     http_client: httpx.AsyncClient | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
-    cache_ttl: CacheTtl = "5m",
+    cache_ttl: CacheTTL = "5m",
     rate_limiter: RateLimiter | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on Bedrock.
@@ -257,7 +257,7 @@ __all__ = [
     "AnthropicMessagesProvider",
     "AnthropicModelName",
     "BedrockRouting",
-    "CacheTtl",
+    "CacheTTL",
     "anthropic_bedrock_model",
     "anthropic_model",
     "cost_breakdown",

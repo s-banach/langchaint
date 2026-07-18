@@ -18,7 +18,7 @@ from langchaint import (
     ZERO_USAGE,
     AssistantMessage,
     AttemptRecord,
-    ExceededMaxCompletionTokensError,
+    MaxCompletionTokensExceededError,
     RefusalError,
     Response,
     RetriesExhaustedError,
@@ -251,7 +251,7 @@ def test_to_row_refusal_reports_its_billing_and_reason() -> None:
 def test_to_row_truncation_reports_its_billing_and_reason() -> None:
     """A truncation row carries the rejected 200's cost and usage and stop_reason "max_tokens"."""
     row = to_row(
-        ExceededMaxCompletionTokensError(
+        MaxCompletionTokensExceededError(
             attempt_records=(_record(error=None, usage=_USAGE),),
             model="fake-model",
             provider_name="fake",

@@ -10,7 +10,7 @@ Two orthogonal properties decide an error's fate, and this module keeps them sep
 
 TransientError and AbortBatchError are per-attempt / control signals.
 The GenerationError leaves are terminal per-item results a to_row failure row is built from:
-RetriesExhaustedError, RefusalError, and ExceededMaxCompletionTokensError.
+RetriesExhaustedError, RefusalError, and MaxCompletionTokensExceededError.
 
 Classification of raw SDK exceptions into these lives in the provider adapter (Provider.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
@@ -152,7 +152,7 @@ class GenerationError(Exception):
     The base for the three non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
     RefusalError (the model refused on the structured path), and
-    ExceededMaxCompletionTokensError (the structured response hit the token cap before its JSON parsed).
+    MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed).
     generate_one raises any of them;
     generate_many returns each in the slot of the item it belongs to,
     so to_row renders a uniform failure row and siblings keep running.
@@ -282,7 +282,7 @@ class RefusalError(GenerationError):
         return "the model refused to produce structured output"
 
 
-class ExceededMaxCompletionTokensError(GenerationError):
+class MaxCompletionTokensExceededError(GenerationError):
     """The structured response reached max_completion_tokens before its JSON parsed.
 
     Fires only on the structured path; the text path surfaces the cap as a Response with stop_reason "max_tokens".
@@ -302,7 +302,7 @@ class ExceededMaxCompletionTokensError(GenerationError):
 class InvalidToolArgsError(Exception):
     """A tool call's args_json failed validation against the tool's args_model.
 
-    Raised only from Tool.validate_and_run's validation step, never from the function,
+    Raised only from PydanticTool.validate_and_run's validation step, never from the function,
     so catching it cannot swallow a function defect.
     This is model data the model can correct:
     ToolManager.dispatch catches it and returns a DispatchInvalidToolArgs

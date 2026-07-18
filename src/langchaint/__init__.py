@@ -5,16 +5,18 @@ __all__ re-exports only the SDK-free application surface.
 The backend constructors, pricing tables, adapters, and cost_breakdown extractors stay in their subpackages:
 re-exporting them here would force import langchaint through both SDKs.
 The adapter-author contract stays in langchaint.provider.
-Internal helpers (Admission, SequenceNotStr, ToolSchema, DispatchableTool) are importable but off __all__.
+Internal helpers (Admission, SequenceNotStr) are importable but off __all__.
+Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
+schema() returns, are on __all__: both appear in signatures application code writes against.
 """
 
 from langchaint.exceptions import (
     AbortBatchError,
     AttemptRecord,
     DispatchExceptionGroup,
-    ExceededMaxCompletionTokensError,
     GenerationError,
     InvalidToolArgsError,
+    MaxCompletionTokensExceededError,
     RefusalError,
     RetriesExhaustedError,
     StreamProtocolError,
@@ -39,7 +41,7 @@ from langchaint.messages import (
 from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.provider import (
     PricingTable,
-    SpecificTool,
+    SpecificToolChoice,
     StreamItem,
     ToolChoice,
 )
@@ -52,11 +54,13 @@ from langchaint.tools import (
     DispatchOutcome,
     DispatchUnknownTool,
     InvalidToolArgsDetail,
-    RawSchemaTool,
+    JSONSchemaTool,
+    PydanticTool,
     Tool,
     ToolManager,
     ToolOutput,
     ToolOutputExplicit,
+    ToolSchema,
 )
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -73,26 +77,27 @@ __all__ = [
     "DispatchInvalidToolArgs",
     "DispatchOutcome",
     "DispatchUnknownTool",
-    "ExceededMaxCompletionTokensError",
     "GenerationError",
     "ImagePart",
     "InferenceParams",
     "InvalidToolArgsDetail",
     "InvalidToolArgsError",
+    "JSONSchemaTool",
+    "MaxCompletionTokensExceededError",
     "Message",
     "MessageContent",
     "Part",
     "PriceableCounts",
     "PricingTable",
+    "PydanticTool",
     "RateLimiter",
-    "RawSchemaTool",
     "ReasoningEffort",
     "ReasoningTrace",
     "RefusalError",
     "Response",
     "RetriesExhaustedError",
     "RowValue",
-    "SpecificTool",
+    "SpecificToolChoice",
     "StopReason",
     "StreamHandle",
     "StreamItem",
@@ -105,6 +110,7 @@ __all__ = [
     "ToolMessage",
     "ToolOutput",
     "ToolOutputExplicit",
+    "ToolSchema",
     "TransientError",
     "TurnElement",
     "Usage",

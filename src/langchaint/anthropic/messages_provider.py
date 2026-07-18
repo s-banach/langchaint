@@ -84,7 +84,7 @@ from pydantic import BaseModel
 
 from langchaint.exceptions import (
     AbortBatchError,
-    ExceededMaxCompletionTokensError,
+    MaxCompletionTokensExceededError,
     RefusalError,
     StreamProtocolError,
     TransientError,
@@ -110,7 +110,7 @@ from langchaint.provider import (
     Provider,
     ProviderResult,
     ProviderStream,
-    SpecificTool,
+    SpecificToolChoice,
     StreamItem,
     ToolChoice,
     retry_after_seconds_from_headers,
@@ -140,11 +140,11 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
 
-type CacheTtl = Literal["5m", "1h"]
+type CacheTTL = Literal["5m", "1h"]
 """A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
 
 
-def _cache_control_param(cache_ttl: CacheTtl) -> CacheControlEphemeralParam:
+def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
     """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
 
     The "5m" wire form must stay byte-stable across releases,
@@ -172,7 +172,7 @@ class _AnthropicRequest:
     output_config: OutputConfigParam | Omit
     thinking: ThinkingConfigParam | Omit
     automatic_prompt_caching: bool
-    cache_ttl: CacheTtl
+    cache_ttl: CacheTTL
     message_mark_budget: int
     """What the binding's own markers (system marks, the frozen-prefix and last-message markers) leave
     of the API's 4-marker request limit for per-request marked parts."""
@@ -306,7 +306,7 @@ def _wire_messages(
     conversation: Sequence[Message],
     *,
     automatic_prompt_caching: bool,
-    cache_ttl: CacheTtl,
+    cache_ttl: CacheTTL,
     message_mark_budget: int,
 ) -> list[MessageParam]:
     """Convert a conversation to wire messages.
@@ -371,7 +371,7 @@ def _wire_messages(
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
     """Convert the neutral tool choice; neutral "required" is Anthropic "any"."""
     disable_parallel_tool_use = not parallel_tool_calls
-    if isinstance(tool_choice, SpecificTool):
+    if isinstance(tool_choice, SpecificToolChoice):
         return {
             "type": "tool",
             "name": tool_choice.tool_name,
@@ -388,7 +388,7 @@ def _wire_tools(
     tool_schemas: tuple[ToolSchema, ...],
     *,
     cache_breakpoint_on_last_tool: bool,
-    cache_ttl: CacheTtl,
+    cache_ttl: CacheTTL,
 ) -> list[ToolParam]:
     """Convert tool schemas to wire tools.
 
@@ -551,7 +551,7 @@ class AnthropicMessagesProvider(Provider):
         model: str,
         pricing: PricingTable,
         default_max_completion_tokens: int = 4096,
-        cache_ttl: CacheTtl = "5m",
+        cache_ttl: CacheTTL = "5m",
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
@@ -588,7 +588,7 @@ class AnthropicMessagesProvider(Provider):
         # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
         self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
         self.default_max_completion_tokens = default_max_completion_tokens
-        self.cache_ttl: CacheTtl = cache_ttl
+        self.cache_ttl: CacheTTL = cache_ttl
 
     def _request(self, binding: Binding) -> _AnthropicRequest:
         """Precompute the typed request fields the binding determines.
@@ -859,7 +859,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
 
         Raises:
             RefusalError: the model refused (stop_reason "refusal"); terminal per-item, not retried.
-            ExceededMaxCompletionTokensError: the response hit the token cap (stop_reason "max_tokens");
+            MaxCompletionTokensExceededError: the response hit the token cap (stop_reason "max_tokens");
                 terminal per-item, not retried.
             TransientError: the turn completed but carried no parsed output for another reason,
                 which a later attempt may fix.
@@ -875,7 +875,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
                     usage=usage, usage_raw=message.usage, stop_reason=stop_reason
                 )
             if message.stop_reason == "max_tokens":
-                raise ExceededMaxCompletionTokensError.for_rejected_200(
+                raise MaxCompletionTokensExceededError.for_rejected_200(
                     usage=usage, usage_raw=message.usage, stop_reason=stop_reason
                 )
             raise TransientError(

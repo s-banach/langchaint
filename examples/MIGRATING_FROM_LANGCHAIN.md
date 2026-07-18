@@ -12,7 +12,7 @@ This guide gives the call-for-call map, then explains what replaces the middlewa
 | `ChatOpenAI(...)`, `init_chat_model(...)` | `openai_model("gpt-5.6-terra")` (or `anthropic_model("claude-sonnet-5")`), returns an `LLM` |
 | `model.invoke(messages)` | `llm.bind(...).generate_one(conversation)`, returns a `Response` |
 | `model.ainvoke(...)` | `generate_one` is already async; there is no sync API |
-| `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([Tool(...)]))` |
+| `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([PydanticTool(...)]))` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
 | `model.batch([...])`, `model.abatch([...])` | `bound.generate_many([...])`, returns `list[Response \| GenerationError]` |
 | `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)`, iterate `str \| ToolCall`, `await handle.final()` for the `Response` |
@@ -63,7 +63,7 @@ The runnable version, a `try`/`except (GenerationError, AbortBatchError)` over t
 ## Errors: success is a Response, failure is a GenerationError
 
 `generate_one` returns a `Response` on success and raises on a terminal outcome.
-`GenerationError` is the base of the three terminal per-item leaves: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `ExceededMaxCompletionTokensError` (the structured response hit the token cap).
+`GenerationError` is the base of the three terminal per-item leaves: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `MaxCompletionTokensExceededError` (the structured response hit the token cap).
 Catch `GenerationError` to handle all three at once.
 `AbortBatchError` is separate: it means the request is misconfigured (a bad request, an unmapped cache rate), so retrying cannot help, and in a batch it cancels the siblings.
 In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_row` renders successes and failures to the same table.

@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
 
 from langchaint.exceptions import (
-    ExceededMaxCompletionTokensError,
+    MaxCompletionTokensExceededError,
     RefusalError,
     StreamProtocolError,
     TransientError,
@@ -121,7 +121,7 @@ from langchaint.provider import (
     Provider,
     ProviderResult,
     ProviderStream,
-    SpecificTool,
+    SpecificToolChoice,
     StreamItem,
     ToolChoice,
     retry_after_seconds_from_headers,
@@ -300,9 +300,9 @@ def _wire_input(conversation: Sequence[Message]) -> list[ResponseInputItemParam]
 def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
     """Convert the neutral tool choice.
 
-    "auto", "required", and "none" map to the same strings; SpecificTool becomes the named-function form.
+    "auto", "required", and "none" map to the same strings; SpecificToolChoice becomes the named-function form.
     """
-    if isinstance(tool_choice, SpecificTool):
+    if isinstance(tool_choice, SpecificToolChoice):
         return {"type": "function", "name": tool_choice.tool_name}
     return tool_choice
 
@@ -626,7 +626,7 @@ class _OpenAIStream[OutputT](ProviderStream[OutputT]):
         Only response.completed carries a ParsedResponse;
         an incomplete or failed terminal response is re-validated into one whose parsed output is absent,
         so the structured output extractor classifies the empty parse (a RefusalError,
-        an ExceededMaxCompletionTokensError,
+        a MaxCompletionTokensExceededError,
         or a TransientError) while the text extractor returns the partial output_text.
 
         Raises:
@@ -728,7 +728,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
 
         Raises:
             RefusalError: the response carried a ResponseOutputRefusal block; terminal per-item, not retried.
-            ExceededMaxCompletionTokensError: the response was incomplete for max_output_tokens;
+            MaxCompletionTokensExceededError: the response was incomplete for max_output_tokens;
                 terminal per-item, not retried.
             TransientError: the turn completed but carried no parsed output for another reason,
                 which a later attempt may fix.
@@ -749,7 +749,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
                 and response.incomplete_details is not None
                 and response.incomplete_details.reason == "max_output_tokens"
             ):
-                raise ExceededMaxCompletionTokensError.for_rejected_200(
+                raise MaxCompletionTokensExceededError.for_rejected_200(
                     usage=usage, usage_raw=response.usage, stop_reason=stop_reason
                 )
             raise TransientError(
@@ -765,7 +765,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
         """Send one non-streaming request via responses.parse.
 
         Raises:
-            RefusalError, ExceededMaxCompletionTokensError, or TransientError: the parse yielded no instance;
+            RefusalError, MaxCompletionTokensExceededError, or TransientError: the parse yielded no instance;
                 propagated from _parsed_output, which names the condition for each.
         """
         response = await self._adapter.client.responses.parse(

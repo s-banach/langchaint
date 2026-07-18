@@ -1,6 +1,6 @@
-"""Tool.validate_and_run and ToolManager routing.
+"""PydanticTool.validate_and_run and ToolManager routing.
 
-The typed validate-then-call pair lives on Tool; these tests pin the error contract:
+The typed validate-then-call pair lives on PydanticTool; these tests pin the error contract:
 an invalid args_json becomes an is_error ToolMessage and a function returning a
 ToolOutputExplicit(is_error=True) carries that failure with its app_data,
 while every function exception (including a function-internal ValidationError) propagates as a user-code defect.
@@ -23,10 +23,10 @@ from langchaint import (
     ImagePart,
     InvalidToolArgsDetail,
     InvalidToolArgsError,
+    JSONSchemaTool,
     Part,
-    RawSchemaTool,
+    PydanticTool,
     TextPart,
-    Tool,
     ToolCall,
     ToolManager,
     ToolOutputExplicit,
@@ -61,9 +61,9 @@ async def _validation_error_function(args: _EchoArgs) -> str:
     return "unreachable"
 
 
-def _echo_tool() -> Tool[_EchoArgs]:
+def _echo_tool() -> PydanticTool[_EchoArgs]:
     """Build the echo tool."""
-    return Tool(
+    return PydanticTool(
         name="echo",
         description="Echo the text back.",
         args_model=_EchoArgs,
@@ -72,7 +72,7 @@ def _echo_tool() -> Tool[_EchoArgs]:
 
 
 def test_schema_converts_name_description_and_args_schema() -> None:
-    """Tool.schema carries the name, description, and the args JSON schema."""
+    """PydanticTool.schema carries the name, description, and the args JSON schema."""
     schema = _echo_tool().schema()
     assert schema.name == "echo"
     assert schema.description == "Echo the text back."
@@ -194,7 +194,7 @@ def test_dispatch_carries_a_parts_result_into_tool_message_content() -> None:
         """Return content parts built from the validated text instead of a string."""
         return [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
 
-    tool = Tool(
+    tool = PydanticTool(
         name="render",
         description="Return parts.",
         args_model=_EchoArgs,
@@ -228,7 +228,7 @@ def test_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
 
 
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
-    """The Tool path's content and details are exactly the conversion and rendering of the pydantic error.
+    """The PydanticTool path's content and details are exactly the conversion and rendering of the pydantic error.
 
     Catching the InvalidToolArgsError from the same validate_and_run, converting its validation_error
     through _details_from_pydantic, and rendering reproduces both fields, pinning that dispatch passes
@@ -301,7 +301,7 @@ def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
 
 def test_function_validation_error_propagates_as_a_defect() -> None:
     """A ValidationError raised inside the function is not treated as bad args."""
-    tool = Tool(
+    tool = PydanticTool(
         name="broken",
         description="Raises from its own pydantic use.",
         args_model=_EchoArgs,
@@ -321,7 +321,7 @@ def test_dispatch_carries_a_returned_is_error_result() -> None:
             content=f"cannot echo {args.text!r}: try a shorter value", is_error=True
         )
 
-    tool = Tool(
+    tool = PydanticTool(
         name="picky",
         description="Returns an is_error result.",
         args_model=_EchoArgs,
@@ -356,7 +356,7 @@ def test_dispatch_passes_a_pydantic_app_data_through_live() -> None:
         """Return model-visible content plus the app_data the model never sees."""
         return ToolOutputExplicit(content=f"echoed {args.text}", app_data=cites)
 
-    tool = Tool(
+    tool = PydanticTool(
         name="cited",
         description="Returns content plus app_data.",
         args_model=_EchoArgs,
@@ -378,7 +378,7 @@ def test_dispatch_passes_a_mapping_app_data_through_unchanged() -> None:
         """Return content plus a mapping app_data."""
         return ToolOutputExplicit(content=f"echoed {args.text}", app_data=app_data)
 
-    tool = Tool(
+    tool = PydanticTool(
         name="mapping",
         description="Returns a mapping app_data.",
         args_model=_EchoArgs,
@@ -400,7 +400,7 @@ def test_dispatch_carries_app_data_on_the_error_outcome() -> None:
             content=f"declined {args.text}", is_error=True, app_data=receipt
         )
 
-    tool = Tool(
+    tool = PydanticTool(
         name="persist",
         description="Fails after persisting a record.",
         args_model=_EchoArgs,
@@ -422,7 +422,7 @@ def test_dispatch_reads_a_pydantic_app_data_typed_without_revalidation() -> None
             content=f"echoed {args.text}", app_data=_Cites(citations=["doc-1"])
         )
 
-    tool = Tool(
+    tool = PydanticTool(
         name="cited",
         description="Returns content plus app_data.",
         args_model=_EchoArgs,
@@ -436,7 +436,7 @@ def test_dispatch_reads_a_pydantic_app_data_typed_without_revalidation() -> None
 
 
 def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> None:
-    """Tool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
+    """PydanticTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
 
     Dispatching a known single tool keeps its own app_data type, so the local annotation cites:
     _Cites | None typechecks (it would be a pyrefly error if app_data were the
@@ -450,7 +450,7 @@ def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> N
             content=f"echoed {args.text}", app_data=_Cites(citations=["doc-1"])
         )
 
-    tool = Tool(
+    tool = PydanticTool(
         name="cited",
         description="Returns content plus app_data.",
         args_model=_EchoArgs,
@@ -465,9 +465,9 @@ def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> N
 
 
 def test_tool_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
-    """Tool.dispatch is the same validate-then-wrap as the manager: bad args are a DispatchInvalidToolArgs.
+    """PydanticTool.dispatch is the same validate-then-wrap as the manager: bad args are a DispatchInvalidToolArgs.
 
-    The manager delegates to Tool.dispatch, so the argument-validation rendering must live here;
+    The manager delegates to PydanticTool.dispatch, so the argument-validation rendering must live here;
     a bad payload comes back as the invalid-args arm holding the neutral details, not a raise.
     """
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
@@ -489,7 +489,7 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
         """
         raise RuntimeError(f"function broke on {args.text}")
 
-    tool = Tool(
+    tool = PydanticTool(
         name="failing",
         description="Raises an ordinary exception.",
         args_model=_EchoArgs,
@@ -509,14 +509,14 @@ def test_duplicate_tool_names_are_rejected() -> None:
 async def _weather_function(args: dict[str, object]) -> str:
     """Read the parsed city argument and report it, with no pydantic model in sight.
 
-    Annotated dict[str, object], the declared parameter type of RawSchemaTool.function and the typical user form.
+    Annotated dict[str, object], the declared parameter type of JSONSchemaTool.function and the typical user form.
     """
     return f"sunny in {args['city']}"
 
 
-def _weather_tool() -> RawSchemaTool:
-    """Build a RawSchemaTool from a raw JSON schema, the shape an MCP tool arrives in."""
-    return RawSchemaTool(
+def _weather_tool() -> JSONSchemaTool:
+    """Build a JSONSchemaTool from a raw JSON schema, the shape an MCP tool arrives in."""
+    return JSONSchemaTool(
         name="weather",
         description="Report the weather.",
         args_schema=_WEATHER_SCHEMA,
@@ -525,9 +525,9 @@ def _weather_tool() -> RawSchemaTool:
 
 
 def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> None:
-    """RawSchemaTool.schema carries the args_schema by identity, not a model_json_schema derivation.
+    """JSONSchemaTool.schema carries the args_schema by identity, not a model_json_schema derivation.
 
-    A pydantic tool derives its schema; a RawSchemaTool already holds the JSON schema the provider wants, so the wire
+    A pydantic tool derives its schema; a JSONSchemaTool already holds the JSON schema the provider wants, so the wire
     schema must be the exact object passed in (an MCP inputSchema), byte-for-byte, with no reshaping.
     """
     schema = _weather_tool().schema()
@@ -551,7 +551,7 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
 
     The payload violates the schema twice (city missing, town unexpected); details is exactly the
     absolute_path/message mapping of iter_errors and the content is render_invalid_tool_args of it,
-    so the RawSchemaTool failure lands in the same arm through the same formatter as a pydantic Tool failure.
+    so the JSONSchemaTool failure lands in the same arm through the same formatter as a PydanticTool failure.
     Draft202012Validator pins the default draft: _WEATHER_SCHEMA carries no $schema key,
     so dispatch must validate under Draft 2020-12.
     """
@@ -569,7 +569,7 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
 
 
 def test_schema_tool_dispatch_returns_invalid_args_for_non_object_json() -> None:
-    """A non-object args_json is the one thing RawSchemaTool rejects locally: a DispatchInvalidToolArgs, no raise.
+    """A non-object args_json is the one thing JSONSchemaTool rejects locally: a DispatchInvalidToolArgs, no raise.
 
     A scalar JSON payload cannot be a tool's arguments, so it comes back as the invalid-args arm holding the
     neutral details, symmetric with the pydantic tool, so the loop and the model can recover.
@@ -590,15 +590,15 @@ def test_schema_tool_dispatch_returns_invalid_args_for_malformed_json() -> None:
     assert result.tool_message.is_error is True
 
 
-def _recording_weather_tool(calls: list[str]) -> RawSchemaTool:
-    """Build the weather RawSchemaTool with a function recording each run in calls."""
+def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
+    """Build the weather JSONSchemaTool with a function recording each run in calls."""
 
     async def _recording_function(args: dict[str, object]) -> str:
         """Record the run, then report the weather."""
         calls.append("function")
         return f"sunny in {args['city']}"
 
-    return RawSchemaTool(
+    return JSONSchemaTool(
         name="weather",
         description="Report the weather.",
         args_schema=_WEATHER_SCHEMA,
@@ -643,7 +643,7 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
     user-code defect like a function exception, rather than becoming a DispatchInvalidToolArgs that would
     blame the model for arguments it got right.
     """
-    tool = RawSchemaTool(
+    tool = JSONSchemaTool(
         name="bad",
         description="Malformed schema.",
         args_schema={"type": "strng"},
@@ -654,7 +654,7 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
-    """A RawSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel."""
+    """A JSONSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel."""
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
     async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
@@ -665,7 +665,7 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
         """
         return ToolOutputExplicit(content=f"weather for {args['city']}", app_data=raw_result)
 
-    tool: RawSchemaTool[Mapping[str, object]] = RawSchemaTool(
+    tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
         name="weather",
         description="Report the weather via MCP.",
         args_schema=_WEATHER_SCHEMA,
@@ -679,9 +679,9 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
 
 
 def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
-    """One ToolManager routes to a pydantic Tool and a RawSchemaTool side by side.
+    """One ToolManager routes to a PydanticTool and a JSONSchemaTool side by side.
 
-    schemas() emits both wire schemas and dispatch reaches each tool, proving DispatchableTool lets the manager hold
+    schemas() emits both wire schemas and dispatch reaches each tool, proving Tool lets the manager hold
     the two forms together without either being a special case.
     """
     manager = ToolManager([_echo_tool(), _weather_tool()])
@@ -697,18 +697,18 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
 
 
 def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> None:
-    """RawSchemaTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
+    """JSONSchemaTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
 
-    Dispatching the RawSchemaTool directly (not via the manager) keeps its own app_data type, so the local annotation
+    Dispatching the JSONSchemaTool directly (not via the manager) keeps its own app_data type, so the local annotation
     raw: Mapping[str, object] | None typechecks with no isinstance.
-    This is the RawSchemaTool analogue of the Tool.dispatch test.
+    This is the JSONSchemaTool analogue of the PydanticTool.dispatch test.
     """
 
     async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
         """Return content plus a mapping app_data."""
         return ToolOutputExplicit(content=f"weather for {args['city']}", app_data={"source": "mcp"})
 
-    tool: RawSchemaTool[Mapping[str, object]] = RawSchemaTool(
+    tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
         name="weather",
         description="Report the weather via MCP.",
         args_schema=_WEATHER_SCHEMA,
@@ -721,7 +721,7 @@ def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> 
     assert raw["source"] == "mcp"
 
 
-def _raiser_tool() -> Tool[_EchoArgs]:
+def _raiser_tool() -> PydanticTool[_EchoArgs]:
     """Build a tool whose function raises immediately, the user-code defect of the dispatch_many tests."""
 
     async def _raiser_function(args: _EchoArgs) -> str:
@@ -732,7 +732,7 @@ def _raiser_tool() -> Tool[_EchoArgs]:
         """
         raise RuntimeError(f"broke on {args.text}")
 
-    return Tool(
+    return PydanticTool(
         name="raiser",
         description="Raises an ordinary exception.",
         args_model=_EchoArgs,
@@ -762,8 +762,8 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
             return f"set {args.text}"
 
         manager = ToolManager([
-            Tool(name="waiter", description="Waits.", args_model=_EchoArgs, function=_waiter_function),
-            Tool(name="setter", description="Sets.", args_model=_EchoArgs, function=_setter_function),
+            PydanticTool(name="waiter", description="Waits.", args_model=_EchoArgs, function=_waiter_function),
+            PydanticTool(name="setter", description="Sets.", args_model=_EchoArgs, function=_setter_function),
         ])
         tool_calls = [
             ToolCall(id="c1", name="waiter", args_json='{"text": "a"}'),
@@ -814,7 +814,7 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
         await asyncio.sleep(0)
         return ToolOutputExplicit(content=f"charged {args.text}", app_data=receipt)
 
-    spender = Tool(
+    spender = PydanticTool(
         name="spender",
         description="Spends money, then reports.",
         args_model=_EchoArgs,
@@ -891,7 +891,7 @@ def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
         raise asyncio.CancelledError(args.text)
 
     manager = ToolManager([
-        Tool(
+        PydanticTool(
             name="self_cancel",
             description="Produces a CancelledError.",
             args_model=_EchoArgs,
@@ -923,7 +923,7 @@ def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
         raise asyncio.CancelledError(args.text)
 
     manager = ToolManager([
-        Tool(
+        PydanticTool(
             name="self_cancel",
             description="Produces a CancelledError.",
             args_model=_EchoArgs,
@@ -965,7 +965,7 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
 
     async def _run() -> None:
         manager = ToolManager([
-            Tool(name="hang", description="Hangs.", args_model=_EchoArgs, function=_hanging_function)
+            PydanticTool(name="hang", description="Hangs.", args_model=_EchoArgs, function=_hanging_function)
         ])
         tool_calls = [
             ToolCall(id="c1", name="hang", args_json='{"text": "a"}'),

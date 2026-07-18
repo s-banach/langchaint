@@ -262,7 +262,7 @@ class StreamHandle[OutputT]:
             AbortBatchError: draining the stream hit an open or item error the adapter classified as abort.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
             RefusalError: the structured parse found a refusal; enriched with this handle's attempt records.
-            ExceededMaxCompletionTokensError: the structured response hit the token cap; enriched likewise.
+            MaxCompletionTokensExceededError: the structured response hit the token cap; enriched likewise.
             TransientError: the structured parse produced no instance for another reason; not retried,
                 because the stream already yielded items to the caller.
         """

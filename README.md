@@ -54,7 +54,7 @@ For a per-category cost split, each backend has `cost_breakdown(usage_raw, prici
 
 **Success is a `Response`, failure is a `GenerationError`.**
 A generate that succeeds returns a frozen `Response[OutputT]` with every field present; one that ends terminally raises (or, in a batch, returns) a `GenerationError`.
-Its three leaves are the terminal per-item outcomes: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `ExceededMaxCompletionTokensError` (the structured response hit the token cap before its JSON parsed).
+Its three leaves are the terminal per-item outcomes: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `MaxCompletionTokensExceededError` (the structured response hit the token cap before its JSON parsed).
 On the base, `stop_reason` is `StopReason | None`: `"refusal"` or `"max_tokens"` on those two leaves, `None` on `RetriesExhaustedError`, whose attempts never reached a completed turn.
 Both hold `attempt_records`, one `AttemptRecord` per request sent: raw `time.monotonic()` start and end readings bracketing the send only (slot waits and backoff sleeps excluded, so rate limiting is distinguishable from slow requests), the attempt's `TransientError` (None on the attempt that succeeded or a rejected 200), the attempt's `usage` (carrying `cost_in_usd`; `ZERO_USAGE` for a transport failure that billed nothing), and `usage_raw` (the raw SDK usage, None when no wire payload existed).
 On a `Response` every record but the last failed; on a `GenerationError` the records describe the terminal outcome.
@@ -72,10 +72,10 @@ A rate-limit error (`Provider.classify` returning `"rate_limit"`, or any error n
 After the pause, admission stays limited to one probe request at a time until the probe succeeds; other transient errors (timeouts, 5xx) pause nobody, because they say nothing about the account's quota.
 
 **Retry stays in the package, classification in the adapter.**
-Adapters raise `TransientError`, `AbortBatchError`, or a `GenerationError` leaf directly where they know the answer: rate limits and overload (transient), a bad request (abort), and an empty structured parse, which splits three ways (a refusal is `RefusalError`, a token-cap truncation is `ExceededMaxCompletionTokensError`, anything else is `TransientError`).
+Adapters raise `TransientError`, `AbortBatchError`, or a `GenerationError` leaf directly where they know the answer: rate limits and overload (transient), a bad request (abort), and an empty structured parse, which splits three ways (a refusal is `RefusalError`, a token-cap truncation is `MaxCompletionTokensExceededError`, anything else is `TransientError`).
 The retry loop retries only `TransientError`; it honors the rest without asking.
 Unrecognized exceptions go through `Provider.classify`, which returns `"rate_limit"`, `"transient"`, or `"abort"`, and anything it does not recognize is abort.
-`generate_one` raises `RetriesExhaustedError` for transient exhaustion, `RefusalError` or `ExceededMaxCompletionTokensError` on the structured path, and `AbortBatchError` for an abort classification; the first three share the `GenerationError` base a caller can catch at once.
+`generate_one` raises `RetriesExhaustedError` for transient exhaustion, `RefusalError` or `MaxCompletionTokensExceededError` on the structured path, and `AbortBatchError` for an abort classification; the first three share the `GenerationError` base a caller can catch at once.
 `generate_many` returns `list[Response[OutputT] | GenerationError]`, so a terminal per-item failure is a row in its slot rather than a raise, while an `AbortBatchError` still cancels the siblings and raises; results stay order-aligned.
 
 **Streaming is a handle.**
@@ -86,19 +86,19 @@ Connection failures before the first yielded item retry under the `RateLimiter`;
 An open stream holds one `RateLimiter` slot from opening until it closes or exhausts, so long-lived streams count against `max_in_flight`.
 
 **Tools are explicit, dispatch is owned.**
-A `Tool` is an async function taking one pydantic model and returning str or a sequence of content parts (text and images the model then sees), plus an explicit name and description; the args model is the schema source, so there is no signature introspection and no docstring scraping.
+A `PydanticTool` is an async function taking one pydantic model and returning str or a sequence of content parts (text and images the model then sees), plus an explicit name and description; the args model is the schema source, so there is no signature introspection and no docstring scraping.
 Tool content is model-facing, so it is exactly `MessageContent` (`str | Sequence[Part]`, the model-facing message body, aliased in `messages.py`): a function with a typed result serializes it to that form itself.
 A function may instead return a `ToolOutputExplicit` wrapping that content plus `is_error` and `app_data` (the app-facing channel, which does carry a typed `BaseModel` or `Mapping` the model never sees).
-`Tool.validate_and_run` validates raw call JSON against `args_model` and runs the function; it lives on `Tool` because there the args type parameter is concrete, so the validated arguments reach the function fully typed.
-`Tool.dispatch` returns `DispatchHandled[AppDataT] | DispatchInvalidToolArgs`, so on the handled outcome a caller that dispatched a known tool reads `app_data` back at its concrete type with no `isinstance`.
-For a tool whose schema is a raw JSON schema and not a pydantic model (an MCP tool discovered at run time), `RawSchemaTool` carries the JSON schema as `args_schema` (sent to the provider unchanged) and a function taking the parsed arguments as a `dict[str, object]` (the type dispatch builds; a `Mapping[str, object]` annotation is also accepted by contravariance); `dispatch` validates the arguments against `args_schema` with `jsonschema` (first that they are a JSON object, then the schema's field-level rules), so the function only ever sees valid arguments, a `RawSchemaTool` failure renders through the same formatter as a pydantic `Tool` failure, and wrapping an MCP tool needs no hand-written pydantic model or validation code per tool. `Tool` and `RawSchemaTool` share the `DispatchableTool` protocol (a `name`, a `schema()`, a `dispatch()`), so one `ToolManager` holds a mix of the two.
+`PydanticTool.validate_and_run` validates raw call JSON against `args_model` and runs the function; it lives on `PydanticTool` because there the args type parameter is concrete, so the validated arguments reach the function fully typed.
+`PydanticTool.dispatch` returns `DispatchHandled[AppDataT] | DispatchInvalidToolArgs`, so on the handled outcome a caller that dispatched a known tool reads `app_data` back at its concrete type with no `isinstance`.
+For a tool whose schema is a raw JSON schema and not a pydantic model (an MCP tool discovered at run time), `JSONSchemaTool` carries the JSON schema as `args_schema` (sent to the provider unchanged) and a function taking the parsed arguments as a `dict[str, object]` (the type dispatch builds; a `Mapping[str, object]` annotation is also accepted by contravariance); `dispatch` validates the arguments against `args_schema` with `jsonschema` (first that they are a JSON object, then the schema's field-level rules), so the function only ever sees valid arguments, a `JSONSchemaTool` failure renders through the same formatter as a `PydanticTool` failure, and wrapping an MCP tool needs no hand-written pydantic model or validation code per tool. `PydanticTool` and `JSONSchemaTool` share the `Tool` protocol (a `name`, a `schema()`, a `dispatch()`), so one `ToolManager` holds a mix of the two, and an application adds its own tool form by implementing `Tool`.
 `ToolManager` serializes the tools provider-neutrally, resolves the called name, and returns each outcome as a `DispatchOutcome`, a three-arm union over a heterogeneous tool set (where `app_data` erases to `BaseModel | Mapping[str, object] | None`): `DispatchHandled` carries the model-facing `ToolMessage` the caller appends to the conversation, paired with the function's `app_data` (data the model never sees); `DispatchInvalidToolArgs` carries a default `is_error` `ToolMessage` plus the neutral `InvalidToolArgsDetail` tuple as a required `details` field, so a caller that authors its own reply reads the per-failure paths and messages with no narrowing crutch; `DispatchUnknownTool` carries a default `is_error` `ToolMessage` naming the held tools plus the off-list `called_name`.
 Every arm carries `tool_message`, so a caller that only appends the reply reads `result.tool_message` with no `match`.
 An off-list tool name becomes a `DispatchUnknownTool` outcome rather than a raise, just like argument JSON the model got wrong becomes a `DispatchInvalidToolArgs` outcome: both are model data the model can correct (a provider can emit a name outside the sent schemas, and a rebind can strand an earlier turn's `tool_call`).
 `ToolManager.dispatch_many` dispatches one assistant turn's several tool calls concurrently and returns the outcomes in call order.
 A tool function exception is still a defect and still raises, but only after every sibling settles: the raise is a `DispatchExceptionGroup` (an `ExceptionGroup`, so every traceback prints and `except*` works) whose `completed_outcomes` carries the settled calls' outcomes, so `app_data` a completed sibling produced (a billing record for money the tool spent) survives the raise.
 Cancellation propagates bare, never grouped, and only after the cancelled sibling dispatches finish unwinding; defects co-occurring with it chain as its `__cause__` in a `DispatchExceptionGroup`, so they still surface.
-`tool_choice` is the neutral vocabulary `"auto" | "required" | SpecificTool | "none"` (anthropic's `"any"` maps from `"required"`); `parallel_tool_calls: bool` maps to anthropic `disable_parallel_tool_use` and openai `parallel_tool_calls`.
+`tool_choice` is the neutral vocabulary `"auto" | "required" | SpecificToolChoice | "none"` (anthropic's `"any"` maps from `"required"`); `parallel_tool_calls: bool` maps to anthropic `disable_parallel_tool_use` and openai `parallel_tool_calls`.
 
 **The ReAct loop is a recipe, not vendored code.**
 There is no agent class.
@@ -120,7 +120,8 @@ Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, o
                              GenerationError and its leaves
         response.py          Response[OutputT], to_row
         rate_limiter.py      RateLimiter
-        tools.py             Tool, RawSchemaTool, ToolSchema, ToolManager
+        tools.py             Tool, PydanticTool, JSONSchemaTool,
+                             ToolSchema, ToolManager
         provider.py          Binding, ToolChoice, PricingTable,
                              StreamItem, ProviderResult,
                              ProviderStream, BoundProvider, Provider

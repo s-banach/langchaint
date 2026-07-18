@@ -5,8 +5,9 @@ Tool is the pydantic form: its function accepts one validated BaseModel argument
 schema source (model_json_schema) and the validator of the model-produced argument JSON.
 RawSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JSON schema, not a pydantic model
 (an MCP tool discovered at runtime): its function accepts the parsed arguments as a dict[str, object], its
-args_schema rides through to the provider unchanged, and it validates only that the arguments are a JSON object,
-deferring field-level rules to the tool's owner (the MCP server re-validates its own inputs).
+args_schema rides through to the provider unchanged, and dispatch validates the arguments against args_schema
+with jsonschema (first that they are a JSON object, then the schema's field-level rules), so a schema violation
+renders through the same formatter as a pydantic Tool failure and the function only ever sees valid arguments.
 Both return str or a Sequence[Part] (text and images the model then sees), or a ToolOutputExplicit carrying that
 content plus is_error and app_data.
 A tool function returns data and nothing that steers control flow:
@@ -19,10 +20,14 @@ so what the provider sees is exactly what the code states.
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Protocol
 
+import jsonschema.exceptions
+import jsonschema.protocols
+import jsonschema.validators
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.exceptions import DispatchExceptionGroup, InvalidToolArgsError
@@ -87,19 +92,40 @@ class DispatchHandled[AppDataT = None]:
 
 
 @dataclass(frozen=True, kw_only=True)
+class InvalidToolArgsDetail:
+    """One argument-validation failure, provider- and library-neutral.
+
+    One instance is one detail item of the invalid-arguments condition named by InvalidToolArgsError and
+    DispatchInvalidToolArgs: one failure at one path.
+    path segments are str for an object key and int for a list index, matching both pydantic's loc and
+    jsonschema's absolute_path; an empty path means the failure is about the arguments as a whole.
+    message is the reason verbatim from the validator that produced it,
+    so the tool owner's own words reach the model unrewritten.
+    Both producers are in-package boundary conversions (_details_from_pydantic, _details_from_jsonschema),
+    so a consumer reads one vocabulary whichever tool form failed.
+    A frozen dataclass, not pydantic: it is a constructed detail value, not a persisted message-tree node,
+    so serde and validation buy nothing here.
+    """
+
+    path: tuple[str | int, ...]
+    message: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class DispatchInvalidToolArgs:
     """A tool call whose arguments failed validation before any function ran.
 
-    tool_message is a default is_error ToolMessage rendered from validation_error for the model to read and correct;
+    tool_message is a default is_error ToolMessage rendered from details for the model to read and correct;
     the application appends it as-is or authors its own reply.
-    validation_error is the pydantic ValidationError, a required field:
-    matching this arm narrows it,
-    so the application reads validation_error.errors() with no assert, cast, or type ignore.
+    details is the neutral per-failure detail, a required field: matching this arm narrows it,
+    so the application reads it with no assert, cast, or type ignore, and reads no pydantic type.
+    Every dispatch-produced outcome carries at least one detail; construction does not enforce that,
+    the emptiness guard lives in render_invalid_tool_args, which every dispatch path renders through.
     There is no app_data field because no function ran to produce any.
     """
 
     tool_message: ToolMessage
-    validation_error: ValidationError
+    details: tuple[InvalidToolArgsDetail, ...]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -208,16 +234,16 @@ class Tool[ArgsT: BaseModel, AppDataT = None]:
         try:
             result = await self.validate_and_run(call.args_json)
         except InvalidToolArgsError as error:
-            return _invalid_args_outcome(call, error.validation_error)
+            return _invalid_args_outcome(call, _details_from_pydantic(error.validation_error))
         return _handled_outcome(call, result)
 
 
 _ARGS_OBJECT = TypeAdapter(dict[str, object])
 """Validates that a tool call's args_json is a JSON object, parsing it to a dict without coercing the values.
 
-RawSchemaTool uses it for the one local check it does: the arguments are a JSON object (not a scalar or malformed JSON),
-which is the precondition every JSON-schema tool shares. The `object` value type passes every value through
-untouched, so no field is silently reshaped; field-level rules are the tool owner's to enforce.
+RawSchemaTool uses it for the parse step of dispatch: the arguments are a JSON object (not a scalar or malformed JSON),
+which is the precondition every JSON-schema tool shares and the shape jsonschema then validates field-by-field.
+The `object` value type passes every value through untouched, so no field is silently reshaped.
 """
 
 
@@ -232,9 +258,18 @@ class RawSchemaTool[AppDataT = None]:
     actually builds, so a function annotated with either dict[str, object] or Mapping[str, object] is accepted
     (a Callable parameter is contravariant); it does not receive a validated model, because there is no model to
     validate against here.
-    dispatch validates only that the arguments are a JSON object, deferring every field-level rule to the tool's owner,
-    so a malformed or non-object args_json becomes a DispatchInvalidToolArgs the model can correct, while a schema
-    violation the JSON-object check cannot catch surfaces from the tool owner (an MCP is_error result) at run time.
+    dispatch validates call.args_json in two steps: the JSON-object precondition (a malformed or non-object
+    args_json becomes a DispatchInvalidToolArgs the model can correct), then jsonschema validation of the parsed
+    object against args_schema, so a field-level violation lands in the same DispatchInvalidToolArgs a pydantic
+    Tool produces and the function only ever sees valid arguments.
+    The validator class comes from jsonschema.validators.validator_for, so a $schema key in args_schema selects
+    the tool owner's declared draft and a schema without one validates under Draft 2020-12.
+    There is deliberately no construction-time check_schema: jsonschema counts only dict as a JSON object,
+    so the metaschema check false-rejects a non-dict Mapping args_schema that validates correctly;
+    a malformed schema instead raises jsonschema's own exception (jsonschema.exceptions.UnknownType, typically)
+    from dispatch, propagating as a user-code defect like a function exception.
+    A semantic rule the schema cannot express is the function's to enforce, returning a
+    ToolOutputExplicit with is_error=True.
     AppDataT is the app_data type the function carries, defaulting to None, solved from the function's
     ToolOutputExplicit return exactly as on Tool, so RawSchemaTool.dispatch returns DispatchHandled[AppDataT].
     There is no validate_and_run counterpart here: that seam exists on Tool because the validated arguments reach
@@ -246,21 +281,38 @@ class RawSchemaTool[AppDataT = None]:
     args_schema: Mapping[str, object]
     function: Callable[[dict[str, object]], Awaitable[ToolOutput[AppDataT]]]
 
+    @cached_property
+    def _validator(self) -> jsonschema.protocols.Validator:
+        """The jsonschema validator instance for args_schema, built once on first dispatch.
+
+        cached_property stores the instance in __dict__, which the frozen dataclass permits
+        (frozen blocks __setattr__, not direct __dict__ writes).
+        """
+        return jsonschema.validators.validator_for(self.args_schema)(self.args_schema)
+
     def schema(self) -> ToolSchema:
         """Convert to the provider-neutral schema, passing args_schema through unchanged."""
         return ToolSchema(name=self.name, description=self.description, args_schema=self.args_schema)
 
     async def dispatch(self, call: ToolCall) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Parse call.args_json to a dict, run the function on it, and wrap the outcome.
+        """Parse call.args_json to a dict, validate it against args_schema, run the function, and wrap the outcome.
 
-        The only local validation is that the arguments are a JSON object; a field-level rule is the tool owner's.
+        The JSON-object precondition runs first, then jsonschema validation of the parsed object;
+        either failure becomes a DispatchInvalidToolArgs without calling the function.
         The returned DispatchHandled carries this tool's AppDataT, read at its concrete type with no isinstance.
-        Every function exception propagates: it is a defect in user code.
+        Every function exception propagates, and so does any jsonschema exception for a malformed args_schema
+        (jsonschema.exceptions.UnknownType, typically): both are defects in user code.
         """
         try:
             args = _ARGS_OBJECT.validate_json(call.args_json)
         except ValidationError as error:
-            return _invalid_args_outcome(call, error)
+            return _invalid_args_outcome(call, _details_from_pydantic(error))
+        # args came from parsing JSON text, so its values are exactly the JSON types iter_errors's
+        # inline recursive-union annotation wants; object cannot prove that to the checker.
+        # pyrefly: ignore[bad-argument-type]
+        details = _details_from_jsonschema(self._validator.iter_errors(args))
+        if details:
+            return _invalid_args_outcome(call, details)
         result = await self.function(args)
         return _handled_outcome(call, result)
 
@@ -290,23 +342,23 @@ class DispatchableTool[AppDataT](Protocol):
         ...
 
 
-def render_invalid_tool_args(tool_name: str, validation_error: ValidationError) -> str:
+def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDetail]) -> str:
     """Build the model-facing content for an argument-validation failure.
 
-    A header naming the tool, then one line per failure: the dot-joined field path and the pydantic msg.
-    loc segments are str for object keys and int for list indices, so each is stringified before the join;
-    an empty loc renders as (root).
-    Only loc and msg are emitted;
-    the url, ctx, and input fields are dropped at the source so the model reads no type codes,
-    documentation URLs, or echoed input.
+    A header naming the tool, then one line per failure: the dot-joined path and the message.
+    A path segment is stringified before the join; an empty path renders as (root).
+    Shared by the Tool path (pydantic errors mapped through _details_from_pydantic) and the RawSchemaTool path
+    (jsonschema errors mapped through _details_from_jsonschema), so the two cannot drift.
+
+    Raises:
+        ValueError: details is empty; claiming invalid arguments with no listed failure would mislead the model.
     """
+    if not details:
+        raise ValueError(f"render_invalid_tool_args for {tool_name} received no details to render")
     lines = [f"invalid arguments for {tool_name}:"]
-    for error in validation_error.errors(
-        include_url=False, include_context=False, include_input=False
-    ):
-        loc = error["loc"]
-        path = ".".join(str(segment) for segment in loc) if loc else "(root)"
-        lines.append(f"  {path}: {error['msg']}")
+    for detail in details:
+        joined_path = ".".join(str(segment) for segment in detail.path) if detail.path else "(root)"
+        lines.append(f"  {joined_path}: {detail.message}")
     return "\n".join(lines)
 
 
@@ -320,18 +372,54 @@ def render_unknown_tool(called_name: str, held_names: Sequence[str]) -> str:
     return f"unknown tool {called_name!r}; available tools: {held}"
 
 
-def _invalid_args_outcome(call: ToolCall, validation_error: ValidationError) -> DispatchInvalidToolArgs:
+def _details_from_pydantic(validation_error: ValidationError) -> tuple[InvalidToolArgsDetail, ...]:
+    """Map a pydantic ValidationError to the neutral details at the outcome boundary.
+
+    Only loc and msg carry over; url, ctx, and input are dropped at the source
+    so the model reads no type codes, documentation URLs, or echoed input.
+    """
+    return tuple(
+        InvalidToolArgsDetail(path=tuple(error["loc"]), message=error["msg"])
+        for error in validation_error.errors(
+            include_url=False, include_context=False, include_input=False
+        )
+    )
+
+
+def _details_from_jsonschema(
+    errors: Iterable[jsonschema.exceptions.ValidationError],
+) -> tuple[InvalidToolArgsDetail, ...]:
+    """Map jsonschema ValidationErrors to the neutral details at the outcome boundary.
+
+    Only absolute_path and message carry over, in iteration order; the validator keyword and schema path are
+    dropped at the source, symmetric with _details_from_pydantic. message rides verbatim, and jsonschema's
+    messages name the offending value themselves, so the model sees what to correct.
+    """
+    return tuple(
+        InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
+        for error in errors
+    )
+
+
+def _invalid_args_outcome(
+    call: ToolCall, details: tuple[InvalidToolArgsDetail, ...]
+) -> DispatchInvalidToolArgs:
     """Build the DispatchInvalidToolArgs for a call whose arguments failed validation.
 
-    Shared by Tool.dispatch (a pydantic args_model failure) and RawSchemaTool.dispatch (a non-object JSON failure):
-    both render the same is_error ToolMessage and carry the live ValidationError for a caller reading the detail.
+    Shared by Tool.dispatch and both RawSchemaTool.dispatch failure paths
+    (a non-object args_json, a jsonschema violation):
+    all render the same is_error ToolMessage and carry the neutral details for a caller reading the failure.
+    render_invalid_tool_args's ValueError cannot fire from here: every caller passes a non-empty tuple
+    (a pydantic ValidationError carries at least one error,
+    and RawSchemaTool.dispatch checks the mapped jsonschema details for emptiness first),
+    so the dispatch methods do not list it.
     """
     tool_message = ToolMessage(
         tool_call_id=call.id,
-        content=render_invalid_tool_args(tool_name=call.name, validation_error=validation_error),
+        content=render_invalid_tool_args(tool_name=call.name, details=details),
         is_error=True,
     )
-    return DispatchInvalidToolArgs(tool_message=tool_message, validation_error=validation_error)
+    return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
 
 def _handled_outcome[AppDataT](call: ToolCall, result: ToolOutput[AppDataT]) -> DispatchHandled[AppDataT]:

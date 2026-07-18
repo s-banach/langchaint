@@ -118,7 +118,8 @@ async def reading_dispatch_outcomes() -> None:
 
     Match the arms only when you want more than the reply to append:
     DispatchHandled carries the function's app_data (data the model never sees, e.g. records the tool persisted);
-    DispatchInvalidToolArgs carries the pydantic ValidationError as a required field, read with no cast or assert;
+    DispatchInvalidToolArgs carries the neutral InvalidToolArgsDetail tuple as a required details field,
+    read with no cast or assert;
     DispatchUnknownTool carries the off-list called_name.
     """
     tool_manager = ToolManager([weather_tool])
@@ -132,8 +133,8 @@ async def reading_dispatch_outcomes() -> None:
         match outcome:
             case DispatchHandled(app_data=app_data):
                 print("tool ran; app-facing data:", app_data)
-            case DispatchInvalidToolArgs(validation_error=validation_error):
-                print("model sent bad arguments:", validation_error.errors())
+            case DispatchInvalidToolArgs(details=details):
+                print("model sent bad arguments:", details)
             case DispatchUnknownTool(called_name=called_name):
                 print("model called an unknown tool:", called_name)
 

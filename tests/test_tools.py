@@ -10,6 +10,8 @@ import asyncio
 from collections.abc import Mapping, Sequence
 
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import UnknownType
 from pydantic import BaseModel, Field, ValidationError
 
 from langchaint import (
@@ -19,6 +21,7 @@ from langchaint import (
     DispatchOutcome,
     DispatchUnknownTool,
     ImagePart,
+    InvalidToolArgsDetail,
     InvalidToolArgsError,
     Part,
     RawSchemaTool,
@@ -28,7 +31,7 @@ from langchaint import (
     ToolManager,
     ToolOutputExplicit,
 )
-from langchaint.tools import render_invalid_tool_args, render_unknown_tool
+from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
 
 _WEATHER_SCHEMA: Mapping[str, object] = {
     "type": "object",
@@ -105,11 +108,11 @@ def test_invalid_tool_args_holds_the_validation_error() -> None:
     assert "text" in str(error)
 
 
-def test_render_invalid_tool_args_formats_per_field() -> None:
-    """The renderer emits a header then one loc:msg line per failure, dropping the noise.
+def test_details_from_pydantic_and_renderer_format_per_field() -> None:
+    """The pydantic conversion keeps loc and msg, and the renderer emits a header then one path:msg line each.
 
     A nested-object path renders dot-joined (to.0.email), a list-index path stringifies the int segment (to.1),
-    proving the str(segment) join rather than a bare ".".join(loc) that would TypeError on the int.
+    proving the str(segment) join rather than a bare ".".join(path) that would TypeError on the int.
     type codes, documentation URLs, and echoed input never appear.
     """
 
@@ -127,13 +130,15 @@ def test_render_invalid_tool_args_formats_per_field() -> None:
     with pytest.raises(ValidationError) as caught:
         _SendArgs.model_validate_json('{"to":[{"x":1},5],"subject":""}')
     validation_error = caught.value
-    rendered = render_invalid_tool_args("send_email", validation_error)
+    details = _details_from_pydantic(validation_error)
+    assert details == tuple(
+        InvalidToolArgsDetail(path=tuple(entry["loc"]), message=entry["msg"])
+        for entry in validation_error.errors()
+    )
+    rendered = render_invalid_tool_args("send_email", details)
     expected = "\n".join(
         ["invalid arguments for send_email:"]
-        + [
-            f"  {'.'.join(str(segment) for segment in entry['loc'])}: {entry['msg']}"
-            for entry in validation_error.errors()
-        ]
+        + [f"  {'.'.join(str(segment) for segment in detail.path)}: {detail.message}" for detail in details]
     )
     assert rendered == expected
     assert "\n  to.0.email: " in rendered
@@ -143,24 +148,30 @@ def test_render_invalid_tool_args_formats_per_field() -> None:
     assert "type=" not in rendered
 
 
-def test_render_invalid_tool_args_renders_empty_loc_as_root() -> None:
-    """A failure with an empty loc (a non-object input) renders as the (root) path.
+def test_render_invalid_tool_args_formats_neutral_details() -> None:
+    """One header line, then one dot-joined path: message line per detail, in input order.
 
-    An empty loc cannot coexist with per-field locs in one ValidationError,
-    so this branch needs its own input: a JSON that is not an object fails at the whole model with loc ().
+    The details are constructed literally in jsonschema's shapes rather than produced by a validator,
+    so this pins the renderer alone: the empty path is that library's shape for a missing required property
+    (the message names the field), and the message carries the offending value verbatim, rendered untouched.
     """
+    details = [
+        InvalidToolArgsDetail(path=(), message="'name' is a required property"),
+        InvalidToolArgsDetail(path=("items", 0, "id"), message="'x' is not of type 'integer'"),
+        InvalidToolArgsDetail(path=("mode",), message="'fast' is not one of ['safe', 'slow']"),
+    ]
+    assert render_invalid_tool_args("search", details) == (
+        "invalid arguments for search:\n"
+        "  (root): 'name' is a required property\n"
+        "  items.0.id: 'x' is not of type 'integer'\n"
+        "  mode: 'fast' is not one of ['safe', 'slow']"
+    )
 
-    class _SendArgs(BaseModel):
-        """Send arguments; validated here against a non-object payload."""
 
-        subject: str
-
-    with pytest.raises(ValidationError) as caught:
-        _SendArgs.model_validate_json("5")
-    rendered = render_invalid_tool_args("send_email", caught.value)
-    header, root_line = rendered.splitlines()
-    assert header == "invalid arguments for send_email:"
-    assert root_line.startswith("  (root): ")
+def test_render_invalid_tool_args_rejects_empty_details() -> None:
+    """Empty details raise ValueError: claiming invalid arguments with no listed failure would mislead the model."""
+    with pytest.raises(ValueError, match="no details to render"):
+        render_invalid_tool_args("search", [])
 
 
 def test_dispatch_wraps_success_in_a_tool_message() -> None:
@@ -202,10 +213,10 @@ def test_dispatch_carries_a_parts_result_into_tool_message_content() -> None:
 
 
 def test_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
-    """An invalid args_json is model data: a DispatchInvalidToolArgs holding the ValidationError, no raise.
+    """An invalid args_json is model data: a DispatchInvalidToolArgs holding the neutral details, no raise.
 
     The tool_message must carry the validation detail (the failing field), or the model has nothing to correct against,
-    and validation_error names the failing field for a caller authoring its own reply.
+    and details names the failing field for a caller authoring its own reply.
     """
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
@@ -213,39 +224,42 @@ def test_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
     assert result.tool_message.is_error is True
     assert "invalid arguments for echo" in result.tool_message.content
     assert "text" in result.tool_message.content
-    assert any("text" in entry["loc"] for entry in result.validation_error.errors())
+    assert any("text" in detail.path for detail in result.details)
 
 
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
-    """The invalid-args content is exactly render_invalid_tool_args of the stored error.
+    """The Tool path's content and details are exactly the conversion and rendering of the pydantic error.
 
-    Catching the InvalidToolArgsError from the same validate_and_run and rendering its
-    validation_error reproduces the content, pinning that dispatch passes the tool name and the
-    held ValidationError through to the renderer rather than formatting the string itself.
+    Catching the InvalidToolArgsError from the same validate_and_run, converting its validation_error
+    through _details_from_pydantic, and rendering reproduces both fields, pinning that dispatch passes
+    the tool name and the converted details through to the renderer rather than formatting the string itself,
+    and that the stored details are the same conversion the content was rendered from.
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(InvalidToolArgsError) as caught:
         asyncio.run(_echo_tool().validate_and_run(args_json))
-    expected_content = render_invalid_tool_args("echo", caught.value.validation_error)
+    expected_details = _details_from_pydantic(caught.value.validation_error)
+    expected_content = render_invalid_tool_args("echo", expected_details)
     call = ToolCall(id="call1", name="echo", args_json=args_json)
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
     assert result.tool_message.content == expected_content
+    assert result.details == expected_details
 
 
-def test_dispatch_invalid_args_match_arm_reads_errors_without_assert() -> None:
-    """Matching DispatchInvalidToolArgs narrows validation_error, so errors() reads with no assert.
+def test_dispatch_invalid_args_match_arm_reads_details_without_assert() -> None:
+    """Matching DispatchInvalidToolArgs narrows details, read with no assert.
 
-    The match arm reads result.validation_error.errors() directly;
+    The match arm reads result.details directly;
     pyrefly checks that this typechecks with no assert, cast, or type ignore, which is the point of the split arm.
     """
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     match result:
         case DispatchInvalidToolArgs():
-            fields = [entry["loc"] for entry in result.validation_error.errors()]
-            assert any("text" in loc for loc in fields)
+            paths = [detail.path for detail in result.details]
+            assert any("text" in path for path in paths)
         case DispatchHandled():
             pytest.fail("invalid args must return DispatchInvalidToolArgs")
 
@@ -454,14 +468,14 @@ def test_tool_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
     """Tool.dispatch is the same validate-then-wrap as the manager: bad args are a DispatchInvalidToolArgs.
 
     The manager delegates to Tool.dispatch, so the argument-validation rendering must live here;
-    a bad payload comes back as the invalid-args arm holding the ValidationError, not a raise.
+    a bad payload comes back as the invalid-args arm holding the neutral details, not a raise.
     """
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
     result = asyncio.run(_echo_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
     assert "invalid arguments for echo" in result.tool_message.content
-    assert any("text" in entry["loc"] for entry in result.validation_error.errors())
+    assert any("text" in detail.path for detail in result.details)
 
 
 def test_plain_function_exception_propagates_as_a_defect() -> None:
@@ -532,30 +546,40 @@ def test_schema_tool_dispatch_passes_the_parsed_mapping_to_the_function() -> Non
     assert result.app_data is None
 
 
-def test_schema_tool_dispatch_does_no_field_level_validation() -> None:
-    """An argument outside the schema still runs: field rules are the tool owner's, not RawSchemaTool's.
+def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> None:
+    """An out-of-schema argument object becomes a DispatchInvalidToolArgs built from jsonschema's own errors.
 
-    The JSON is a well-formed object, so the only local check passes; the schema requires city and forbids extras,
-    yet dispatch runs the function unchanged, proving RawSchemaTool defers field validation to the server.
+    The payload violates the schema twice (city missing, town unexpected); details is exactly the
+    absolute_path/message mapping of iter_errors and the content is render_invalid_tool_args of it,
+    so the RawSchemaTool failure lands in the same arm through the same formatter as a pydantic Tool failure.
+    Draft202012Validator pins the default draft: _WEATHER_SCHEMA carries no $schema key,
+    so dispatch must validate under Draft 2020-12.
     """
-    call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo", "city": "Bergen"}')
+    call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo"}')
     result = asyncio.run(_weather_tool().dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert result.tool_message.content == "sunny in Bergen"
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.is_error is True
+    expected_details = tuple(
+        InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
+        for error in Draft202012Validator(_WEATHER_SCHEMA).iter_errors({"town": "Oslo"})
+    )
+    assert result.details == expected_details
+    assert any(detail.message == "'city' is a required property" for detail in result.details)
+    assert result.tool_message.content == render_invalid_tool_args("weather", expected_details)
 
 
 def test_schema_tool_dispatch_returns_invalid_args_for_non_object_json() -> None:
     """A non-object args_json is the one thing RawSchemaTool rejects locally: a DispatchInvalidToolArgs, no raise.
 
-    A scalar JSON payload cannot be a tool's arguments, so it comes back as the invalid-args arm holding a live
-    ValidationError, symmetric with the pydantic tool, so the loop and the model can recover.
+    A scalar JSON payload cannot be a tool's arguments, so it comes back as the invalid-args arm holding the
+    neutral details, symmetric with the pydantic tool, so the loop and the model can recover.
     """
     call = ToolCall(id="call1", name="weather", args_json="5")
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
     assert "invalid arguments for weather" in result.tool_message.content
-    assert result.validation_error.error_count() >= 1
+    assert len(result.details) >= 1
 
 
 def test_schema_tool_dispatch_returns_invalid_args_for_malformed_json() -> None:
@@ -564,6 +588,69 @@ def test_schema_tool_dispatch_returns_invalid_args_for_malformed_json() -> None:
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
+
+
+def _recording_weather_tool(calls: list[str]) -> RawSchemaTool:
+    """Build the weather RawSchemaTool with a function recording each run in calls."""
+
+    async def _recording_function(args: dict[str, object]) -> str:
+        """Record the run, then report the weather."""
+        calls.append("function")
+        return f"sunny in {args['city']}"
+
+    return RawSchemaTool(
+        name="weather",
+        description="Report the weather.",
+        args_schema=_WEATHER_SCHEMA,
+        function=_recording_function,
+    )
+
+
+def test_schema_tool_valid_args_run_the_function() -> None:
+    """Arguments satisfying args_schema reach the function: validation passed, a DispatchHandled."""
+    calls: list[str] = []
+    tool = _recording_weather_tool(calls)
+    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}')))
+    assert isinstance(result, DispatchHandled)
+    assert result.tool_message.content == "sunny in Oslo"
+    assert result.tool_message.is_error is False
+    assert calls == ["function"]
+
+
+def test_schema_tool_schema_violation_skips_the_function() -> None:
+    """A schema violation becomes a DispatchInvalidToolArgs and the function never runs."""
+    calls: list[str] = []
+    tool = _recording_weather_tool(calls)
+    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"town": "Oslo"}')))
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.tool_call_id == "c1"
+    assert calls == []
+
+
+def test_schema_tool_non_object_json_skips_the_function() -> None:
+    """A non-object args_json fails the JSON-object precondition: jsonschema never sees it, the function never runs."""
+    calls: list[str] = []
+    tool = _recording_weather_tool(calls)
+    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json="5")))
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert calls == []
+
+
+def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None:
+    """An args_schema jsonschema cannot interpret raises jsonschema's own exception from dispatch, no arm.
+
+    "strng" is not a JSON Schema type, so validation can never mean anything; the raise propagates as a
+    user-code defect like a function exception, rather than becoming a DispatchInvalidToolArgs that would
+    blame the model for arguments it got right.
+    """
+    tool = RawSchemaTool(
+        name="bad",
+        description="Malformed schema.",
+        args_schema={"type": "strng"},
+        function=_weather_function,
+    )
+    with pytest.raises(UnknownType):
+        asyncio.run(tool.dispatch(ToolCall(id="c1", name="bad", args_json='{"city": "Oslo"}')))
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:

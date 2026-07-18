@@ -306,7 +306,7 @@ class InvalidToolArgsError(Exception):
     so catching it cannot swallow a function defect.
     This is model data the model can correct:
     ToolManager.dispatch catches it and returns a DispatchInvalidToolArgs
-    holding the ValidationError and an is_error ToolMessage.
+    holding the neutral InvalidToolArgsDetail tuple and an is_error ToolMessage.
     A tool function must not raise it:
     dispatch's catch spans the whole validate_and_run call,
     so a function raising it is classified as bad model args, not as a defect.

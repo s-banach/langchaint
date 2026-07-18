@@ -15,6 +15,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    # jsonschema validates RawSchemaTool arguments in the neutral core, where no
+    # import path separates its users from Tool users, so it cannot be an extra.
+    "jsonschema>=4.25",
     "pydantic>=2.13.4",
 ]
 

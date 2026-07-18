@@ -1,27 +1,93 @@
-name: Publish to PyPI
+name: Release and publish
 
-# Publishes on a published GitHub Release.
-# Authentication is PyPI Trusted Publishing (OIDC): no API token is stored anywhere.
-# Before the first run, register a pending publisher on https://pypi.org/manage/account/publishing/ with owner s-banach, repo langchaint, workflow publish.yml, and no environment (the job below declares none).
-# No approval gate is deliberate: a published Release publishes to PyPI immediately, chosen for a solo maintainer where cutting the Release is already the deliberate act, so a GitHub environment with a required reviewer would only gate a release against its own author.
+# The version in pyproject.toml is the single source of truth for a release.
+# This runs after CI succeeds on a push to main, reads that version, and publishes when it is strictly above every existing release tag under PEP 440 ordering: bumping to a higher version publishes it, an unchanged version does nothing, and a typo to a lower-but-new version is rejected rather than published out of order (PyPI itself does not enforce monotonic versions). The publish job builds the distribution, publishes it to PyPI over OIDC, then cuts the Release and its v{version} tag.
+# The trigger is workflow_run on CI, not push, so scripts/CI.sh runs once (in ci.yml) and publishing follows only a green CI run: a red matrix leaves conclusion != success and nothing publishes. The commit acted on is github.event.workflow_run.head_sha, the exact commit CI validated, not the main tip, which may have advanced. To recover from a run that published but failed before cutting the Release, re-run the CI run from the Actions UI; it re-emits the completion event, uv publish --check-url skips the already-uploaded files, and the missing Release is cut.
+# The event == 'push' guard restricts publishing to CI runs that were pushes to main. A workflow_run job runs with full repository permissions even when the CI it followed came from a fork pull request, so without this guard a fork PR whose CI passed could reach the publish path; the guard and branches: [main] together admit only a passing push to main.
+# Cutting the Release and publishing live in one job on purpose: a Release created by the built-in GITHUB_TOKEN does not trigger a separate release-published workflow (GitHub suppresses that to avoid recursion), so a two-workflow split would tag but never publish. Keeping the filename publish.yml also keeps the PyPI Trusted Publisher registration valid, so no PyPI reconfiguration is needed.
+# Authentication to PyPI is Trusted Publishing (OIDC): no API token is stored anywhere. Before the first run, register a pending publisher on https://pypi.org/manage/account/publishing/ with owner s-banach, repo langchaint, workflow publish.yml, and no environment (the job below declares none).
+# No approval gate is deliberate: merging the version bump to main is the deliberate release act for a solo maintainer, so a GitHub environment with a required reviewer would only gate a release against its own author.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# One release run at a time so two version bumps cannot race into a duplicate uv publish. cancel-in-progress is false so a running publish is never interrupted mid-upload.
+# Accepted limit: with cancel-in-progress false, GitHub keeps only the newest pending run and cancels an older pending one, so if two distinct version bumps land inside one publish run's window the intermediate version is skipped and only the newest publishes. For a solo maintainer whose bumps are spaced far wider than a CI-plus-publish run this cannot arise, so serializing without a per-version queue is the cost-appropriate choice.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  gate:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # The gate only reads (git tags and pyproject.toml); naming any permission sets every unnamed one to none, so checkout needs contents spelled out or its checkout 403s.
+      contents: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The exact commit CI validated, not the current main tip; fetch-depth 0 fetches the full tag history the gate compares against, which the default shallow checkout omits.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.13"
+      - name: Publish only when pyproject.toml names a version above every release tag
+        id: check
+        run: |
+          uv run --no-project --with packaging python - <<'PY'
+          import os, subprocess, tomllib
+          from packaging.version import InvalidVersion, Version
+
+          version = Version(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])
+          tags = subprocess.run(
+              ["git", "tag", "--list", "v*"], capture_output=True, text=True, check=True
+          ).stdout.split()
+          released = []
+          for tag in tags:
+              try:
+                  released.append(Version(tag[1:]))
+              except InvalidVersion:
+                  continue
+          highest = max(released, default=None)
+          proceed = highest is None or version > highest
+          print(f"pyproject={version}; highest release tag={highest}; proceed={proceed}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"tag=v{version}\n")
+              out.write(f"proceed={'true' if proceed else 'false'}\n")
+          PY
+
   publish:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     permissions:
       # id-token lets uv mint the short-lived OIDC token PyPI trusts.
       id-token: write
-      # Naming any permission sets every unnamed one to none, so actions/checkout needs contents spelled out or its checkout 403s.
-      contents: read
+      # Creating the tag and the Release writes to the repository.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - name: Install uv
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: "3.13"
       - run: uv build
       # No token: uv detects the GitHub Actions OIDC environment and uses Trusted Publishing (the default --trusted-publishing automatic).
-      - run: uv publish
+      # --check-url skips files PyPI already holds, so a rerun after uv publish succeeded but the Release step failed uploads nothing and falls through to cut the missing Release, instead of erroring on the duplicate and wedging.
+      - run: uv publish --check-url https://pypi.org/simple/
+      # The Release is cut after PyPI has the artifact; gh creates the v{version} tag at the validated commit when it does not exist yet.
+      - run: gh release create "$TAG" --target "$HEAD_SHA" --title "$TAG" --generate-notes

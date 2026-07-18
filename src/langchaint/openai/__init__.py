@@ -1,7 +1,7 @@
 """The openai backend: the Responses adapter, its model catalog, and pricing.
 
-Importing this subpackage requires the openai package (install langchaint[openai]);
-the import below raises a ModuleNotFoundError naming the extra to install.
+Importing this subpackage requires the openai package;
+the import below raises a ModuleNotFoundError naming the package to install.
 
 openai_model takes the provider's own model identifier, the same string the wire accepts,
 so switching models never changes an import; it constructs the Responses adapter and wraps it in an LLM.
@@ -29,7 +29,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "openai":
         raise
     raise ModuleNotFoundError(
-        "langchaint's openai backend requires the openai package; install langchaint[openai]."
+        "langchaint's openai backend requires the openai package; install openai."
     ) from exc
 
 from langchaint.llm import LLM

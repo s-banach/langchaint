@@ -24,26 +24,15 @@ Homepage = "https://github.com/s-banach/langchaint"
 Repository = "https://github.com/s-banach/langchaint"
 Issues = "https://github.com/s-banach/langchaint/issues"
 
-[project.optional-dependencies]
-# One extra per backend: the langchaint.anthropic / langchaint.openai subpackages
-# import their SDK at module top, so an application installs only the backends it uses.
-anthropic = ["anthropic>=0.116.0"]
-openai = ["openai>=2.45.0"]
-all = ["anthropic>=0.116.0", "openai>=2.45.0"]
-# The langchaint.tracing subpackage imports only opentelemetry-api (trace, Tracer,
-# Status, StatusCode); a production app installs the api and wires its own SDK,
-# matching OTel's api/sdk split. Deliberately not folded into all, which stays
-# backends-only: an app that wants both SDKs but no tracing must not pull OTel.
-otel = ["opentelemetry-api>=1.30.0"]
-
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "langchaint[all]",
-    "langchaint[otel]",
+    "anthropic>=0.116.0",
+    "openai>=2.45.0",
+    "opentelemetry-api>=1.30.0",
     # opentelemetry-sdk is needed only by the tracing tests' in-memory exporter
     # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper
     # itself imports only opentelemetry-api.

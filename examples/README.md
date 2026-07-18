@@ -1,9 +1,9 @@
 # Examples
 
 Short, runnable examples of langchaint.
-Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK extra installed and the provider's API key in the environment.
-`langchaint[openai]` and `OPENAI_API_KEY` cover the openai examples.
-`05_rate_limiting_and_errors.py` and `06_prompt_caching.py` also build anthropic models, so they additionally need `langchaint[anthropic]` and `ANTHROPIC_API_KEY`.
+Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK installed and the provider's API key in the environment.
+The `openai` package and `OPENAI_API_KEY` cover the openai examples.
+`05_rate_limiting_and_errors.py` and `06_prompt_caching.py` also build anthropic models, so they additionally need the `anthropic` package and `ANTHROPIC_API_KEY`.
 Where a tool's specifics do not matter, the code uses a minimal placeholder tool rather than a realistic one.
 `07_raw_schema_tool_validation.py` is the one exception: it needs no API key, because it dispatches constructed `ToolCall`s with no provider involved.
 

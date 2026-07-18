@@ -24,11 +24,11 @@ Every generate and stream method takes a conversation of `Message`s; a bare `str
 Anthropic Bedrock is a second sibling constructor, `anthropic_bedrock_model(model, aws_region=...)`: it names the same catalog model and reads the model's Bedrock surface (which of two SDK client classes) and wire model id from a table, so the application names neither the client class nor the Bedrock id.
 Constructing an adapter directly covers models outside the catalog.
 
-**The SDKs are optional dependencies, one extra per backend.**
+**The SDKs are optional dependencies, pinned directly by the application.**
 The neutral core (`LLM`, the message tree, the error taxonomy) imports no SDK, so `import langchaint` needs neither package.
-Each backend lives in its own subpackage that imports its SDK at module top: install `langchaint[openai]` or `langchaint[anthropic]` (or `langchaint[all]`) for the ones you use, and importing `langchaint.openai` without the openai package raises a `ModuleNotFoundError` naming the extra to install.
+Each backend lives in its own subpackage that imports its SDK at module top: install `openai` or `anthropic` (pinning the SDK variant you need, such as `anthropic[bedrock]`) for the ones you use, and importing `langchaint.openai` without the openai package raises a `ModuleNotFoundError` naming the package to install. langchaint declares no extras of its own.
 The import path is the boundary: only code that reaches for a backend requires its SDK, and a type checker following `langchaint.openai` never resolves anthropic's types.
-OTel tracing follows the same pattern: `langchaint.tracing` imports only opentelemetry-api, install `langchaint[otel]`, and it stays off `import langchaint`.
+OTel tracing follows the same pattern: `langchaint.tracing` imports only opentelemetry-api, install `opentelemetry-api`, and it stays off `import langchaint`.
 
 **Adapters wrap SDK clients and delegate to the SDK.**
 `AnthropicMessagesProvider(client=AsyncAnthropic(...))` and `OpenAIResponsesProvider(client=AsyncOpenAI(...))` call `messages.create/parse/stream` and `responses.create/parse/stream`; stream assembly and structured-output parsing are the SDK's, not hand-written.
@@ -136,8 +136,8 @@ Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, o
                              OpenAIModelName, cost_breakdown;
                              responses_provider.py has the adapter
                              OpenAIResponsesProvider
-        tracing/             OTel span tracing (needs opentelemetry-api,
-                             install langchaint[otel]): __init__ has
+        tracing/             OTel span tracing (needs opentelemetry-api):
+                             __init__ has
                              TracedLLM, TracedBoundLLM, TracedStreamHandle
 
 ## Verification

@@ -15,8 +15,8 @@ and leaves per-item detail to the returned rows (to_row).
 The mapper owns only attribute names and values, the part that varies by convention;
 a mapper cannot change the span name, kind, or status, and a raising mapper is caught and logged, never propagated.
 
-Importing this subpackage requires opentelemetry-api (install langchaint[otel]);
-the import below raises a ModuleNotFoundError naming the extra to install.
+Importing this subpackage requires opentelemetry-api;
+the import below raises a ModuleNotFoundError naming the package to install.
 The wrapper imports only opentelemetry-api, so a production app installs the api and wires its own SDK.
 
 Every GenAI semantic-convention attribute key is verified against the pinned revision, never asserted from memory:
@@ -43,7 +43,7 @@ except ModuleNotFoundError as exc:
     if exc.name is not None and not exc.name.startswith("opentelemetry"):
         raise
     raise ModuleNotFoundError(
-        "langchaint's tracing subpackage requires opentelemetry-api; install langchaint[otel]."
+        "langchaint's tracing subpackage requires opentelemetry-api; install opentelemetry-api."
     ) from exc
 
 from langchaint.exceptions import GenerationError

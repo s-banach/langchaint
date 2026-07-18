@@ -1,7 +1,7 @@
 """The anthropic backend: the Messages adapter, its model catalog, and pricing.
 
-Importing this subpackage requires the anthropic package (install langchaint[anthropic]);
-the import below raises a ModuleNotFoundError naming the extra to install.
+Importing this subpackage requires the anthropic package;
+the import below raises a ModuleNotFoundError naming the package to install.
 
 anthropic_model takes the provider's own model identifier, the same string the wire accepts,
 so switching models never changes an import; it constructs the Messages adapter and wraps it in an LLM.
@@ -37,7 +37,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "anthropic":
         raise
     raise ModuleNotFoundError(
-        "langchaint's anthropic backend requires the anthropic package; install langchaint[anthropic]."
+        "langchaint's anthropic backend requires the anthropic package; install anthropic."
     ) from exc
 
 from langchaint.anthropic.messages_provider import (

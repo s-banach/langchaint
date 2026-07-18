@@ -7,7 +7,7 @@ TracedLLM mirrors bind and rebind, so a rebound object stays traced.
 The default "gen_ai" mapper emits GenAI-convention attributes plus langchaint scalars (cost, attempts, the cache
 partition); the mapper never receives the conversation, so no built-in mapper can leak a prompt.
 
-Install: langchaint[otel] provides opentelemetry-api, which the tracing subpackage imports.
+Install: opentelemetry-api, which the tracing subpackage imports.
 Exporting spans additionally needs opentelemetry-sdk (shown below); a production app wires the SDK it already runs.
 
 The LangChain call-for-call map (LangSmith, callbacks, LANGCHAIN_TRACING_V2) lives in MIGRATING_FROM_LANGCHAIN.md.

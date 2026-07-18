@@ -7,7 +7,7 @@ The same two controls hit different wire mechanics per provider, and those thorn
 anthropic's 4-marker request limit and cache_ttl, openai's implicit/explicit modes and model-version cutoff,
 and the two places a mark is rejected because the providers diverge.
 
-Running this file needs langchaint[anthropic] with ANTHROPIC_API_KEY and langchaint[openai] with OPENAI_API_KEY.
+Running this file needs the anthropic package with ANTHROPIC_API_KEY and the openai package with OPENAI_API_KEY.
 """
 
 import asyncio

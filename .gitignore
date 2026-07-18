@@ -6,7 +6,8 @@ uv.lock
 __pycache__/
 *.pyc
 *.egg-info/
-.claude/
+.claude/*
+!.claude/agents/
 
 .env
 

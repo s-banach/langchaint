@@ -15,8 +15,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # jsonschema validates RawSchemaTool arguments in the neutral core, where no
-    # import path separates its users from Tool users, so it cannot be an extra.
     "jsonschema>=4.25",
     "pydantic>=2.13.4",
 ]
@@ -122,9 +120,9 @@ lint.select = [
     "TRY",
     "W505",  # doc-line-too-long, capped by pycodestyle.max-doc-length below
     # Docstrings, selected as exact codes with no pydocstyle convention.
-    # The dropped google convention was an ignore-overlay whose removals
-    # the code satisfies anyway, and it ignored D401, which then needed an
-    # exact-code select to win over the convention. Deliberately absent:
+    # A convention is an ignore-overlay whose removals the code satisfies
+    # anyway, and the google convention ignores D401, which this project
+    # enforces. Deliberately absent:
     # D203 and D213, which conflict with D211 and D212; D405-D414 and
     # D416, which enforce underlined rst/numpy section headers instead of
     # the Args:/Raises:/Yields: prose sections used here; and the preview

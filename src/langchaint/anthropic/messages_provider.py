@@ -34,9 +34,8 @@ spend slots first; a binding whose markers alone exceed the limit fails at bind 
 The remainder is the per-request budget for marked message parts:
 the latest marks up to that budget are written and older ones left unwritten,
 mirroring openai's documented latest-N rule so a conversation that accrues one mark per turn keeps working.
-Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default,
-so the wire form matches markers written before cache_ttl existed; "1h" writes ttl "1h",
-whose writes bill at the PricingTable's cache_write_1h_usd_per_million_tokens).
+Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
+"1h" writes ttl "1h", whose writes bill at the PricingTable's cache_write_1h_usd_per_million_tokens).
 
 Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
@@ -148,8 +147,8 @@ type CacheTtl = Literal["5m", "1h"]
 def _cache_control_param(cache_ttl: CacheTtl) -> CacheControlEphemeralParam:
     """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
 
-    The omission keeps the "5m" wire form byte-identical to a marker written before cache_ttl existed,
-    so upgrading the package alone cannot invalidate a live cache entry.
+    The "5m" wire form must stay byte-stable across releases,
+    so that upgrading the package alone cannot invalidate a caller's live cache entry.
     """
     if cache_ttl == "5m":
         return {"type": "ephemeral"}

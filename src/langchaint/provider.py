@@ -128,7 +128,7 @@ class Binding:
     and the openai adapter sends the parts as a developer-role input message ahead of the conversation
     (the SDK documents `instructions` as "a system (or developer) message inserted into the model's context",
     and only input message parts carry prompt_cache_breakpoint).
-    A plain str renders exactly as before (one anthropic system block; the openai instructions parameter).
+    A plain str renders as one anthropic system block and as the openai instructions parameter.
     """
 
     tool_schemas: tuple[ToolSchema, ...]

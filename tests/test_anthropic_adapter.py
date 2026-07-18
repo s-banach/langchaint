@@ -1115,8 +1115,8 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
         )
 
 
-def test_request_str_system_budget_matches_the_previous_reservation() -> None:
-    """A str system prompt under automatic caching leaves two slots for message marks, as before."""
+def test_request_str_system_budget_leaves_two_slots_for_message_marks() -> None:
+    """A str system prompt under automatic caching leaves two slots for message marks."""
     request = _provider()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )

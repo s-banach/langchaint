@@ -60,7 +60,7 @@ _USAGE = Usage(
     cost_in_usd=0.0,
 )
 _USAGE_BILLED = _USAGE.model_copy(update={"cost_in_usd": 0.25})
-"""The billing a rejected 200 (a refusal or truncation) carries; cost now rides inside Usage."""
+"""The billing a rejected 200 (a refusal or truncation) carries."""
 _USAGE_STREAM = _USAGE.model_copy(update={"cost_in_usd": 0.001})
 """The stream final()'s assembled usage, distinct so a stream cost is visible."""
 

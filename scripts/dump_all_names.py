@@ -4,8 +4,8 @@ The output is a naming-review inventory: classes, functions, methods, properties
 type aliases, module constants, class fields, instance attributes, and parameters,
 each flagged public or private (leading underscore, dunders excepted).
 Parameters and fields are included because most of the package's naming rules govern
-them (system_prompt not system, exact_name=exact_name, input_tokens_* family, unit
-suffixes like _seconds), so a review that omitted them would miss its main target.
+them (system_prompt not system, input_tokens_* family, unit suffixes like _seconds),
+so a review that omitted them would miss its main target.
 
 Regenerate after any rename: `uv run python -m scripts.dump_all_names` from the repo
 root, or `uv run python scripts/dump_all_names.py`. Zero arguments; the source root

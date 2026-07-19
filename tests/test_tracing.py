@@ -1,6 +1,7 @@
-"""TracedLLM / TracedBoundLLM / TracedStreamHandle driven by fake providers and an in-memory exporter.
+"""Tracing wrappers driven by fake providers and an in-memory exporter.
 
 The fake providers are the ones test_bound_llm builds; here they feed the tracing wrapper instead of the plain BoundLLM.
+TracedToolManager is driven directly with constructed ToolCalls; its spans land in the same exporter.
 A locally built TracerProvider with a SimpleSpanProcessor and an InMemorySpanExporter captures every span,
 so the assertions read span names, kinds, statuses, attributes, events,
 and parentage without any collector or network access.
@@ -22,12 +23,19 @@ from pydantic import BaseModel
 from langchaint import (
     LLM,
     AbortBatchError,
+    DispatchHandled,
+    DispatchInvalidToolArgs,
+    DispatchUnknownTool,
     GenerationError,
     MaxCompletionTokensExceededError,
+    PydanticTool,
     RefusalError,
     Response,
     RetriesExhaustedError,
     StreamItem,
+    ToolCall,
+    ToolManager,
+    ToolOutputExplicit,
     TransientError,
     UserMessage,
     to_row,
@@ -38,6 +46,8 @@ from langchaint.tracing import (
     TracedBoundLLM,
     TracedLLM,
     TracedStreamHandle,
+    TracedToolManager,
+    gen_ai_attributes,
 )
 from tests.test_bound_llm import (
     _FAKE_RAW_USAGE,
@@ -652,6 +662,335 @@ def test_wrapping_a_stream_creates_a_traced_stream() -> None:
     traced = TracedLLM(LLM(_FakeProvider()))
     handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
     assert isinstance(handle, TracedStreamHandle)
+
+
+def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() -> None:
+    """extra_attributes land at span start on generate spans; a mapper key of the same name wins."""
+
+    async def scenario() -> None:
+        """Generate under extra_attributes plus a colliding mapper key and inspect the span."""
+
+        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+            """Emit one attribute colliding with an extra_attributes key."""
+            return {"shared.key": "mapped"}
+
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeProvider(echo=True)),
+            attribute_format=_mapper,
+            extra_attributes={"gen_ai.agent.name": "agent_a", "shared.key": "extra"},
+            tracer=tracer,
+        )
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.agent.name"] == "agent_a"
+        assert span.attributes["shared.key"] == "mapped"
+
+    asyncio.run(scenario())
+
+
+def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_spans() -> None:
+    """extra_attributes pass through rebind and land on the stream span and the batch span."""
+
+    async def scenario() -> None:
+        """Rebind, then stream and batch under one extra_attributes mapping; both spans carry it."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeProvider(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            extra_attributes={"gen_ai.agent.name": "agent_a"},
+            tracer=tracer,
+        )
+        rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(
+            system_prompt="s2"
+        )
+        async with rebound.stream_one("hi") as stream:
+            await stream.final()
+        await rebound.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        assert all(
+            span.attributes is not None and span.attributes["gen_ai.agent.name"] == "agent_a"
+            for span in spans
+        )
+
+    asyncio.run(scenario())
+
+
+def test_gen_ai_attributes_is_public_and_composable() -> None:
+    """A custom mapper extending gen_ai_attributes lands every standard key plus the added one."""
+
+    async def scenario() -> None:
+        """Generate under a composed mapper and check a standard key and the extension key."""
+
+        def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
+            """Extend the built-in attributes with an agent name."""
+            return {**gen_ai_attributes(result), "gen_ai.agent.name": "agent_a"}
+
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider(echo=True)), attribute_format=_mapper, tracer=tracer)
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.agent.name"] == "agent_a"
+        assert span.attributes["gen_ai.request.model"] == "fake-model"
+        assert span.attributes["langchaint.attempts"] == 1
+
+    asyncio.run(scenario())
+
+
+class _EchoToolArgs(BaseModel):
+    """Arguments of the echo tool the TracedToolManager tests dispatch."""
+
+    text: str
+
+
+async def _echo_tool_function(args: _EchoToolArgs) -> str:
+    """Return the validated text unchanged."""
+    return args.text
+
+
+async def _raising_tool_function(_args: _EchoToolArgs) -> str:
+    """Raise to simulate a tool-function defect.
+
+    Raises:
+        RuntimeError: always.
+    """
+    raise RuntimeError("tool bug")
+
+
+def _echo_tool() -> PydanticTool[_EchoToolArgs]:
+    """Build the echo tool."""
+    return PydanticTool(
+        name="echo",
+        description="Echo the text back",
+        args_model=_EchoToolArgs,
+        function=_echo_tool_function,
+    )
+
+
+def _raising_tool() -> PydanticTool[_EchoToolArgs]:
+    """Build a tool whose function always raises, a user-code defect."""
+    return PydanticTool(
+        name="boom",
+        description="Always raises",
+        args_model=_EchoToolArgs,
+        function=_raising_tool_function,
+    )
+
+
+async def _erring_tool_function(args: _EchoToolArgs) -> ToolOutputExplicit[None]:
+    """Return a function-authored failure: a handled outcome whose ToolMessage carries is_error True."""
+    return ToolOutputExplicit(content=f"cannot process {args.text}", is_error=True)
+
+
+def _erring_tool() -> PydanticTool[_EchoToolArgs]:
+    """Build a tool whose function returns a model-visible failure instead of raising."""
+    return PydanticTool(
+        name="erring",
+        description="Always returns a model-visible failure",
+        args_model=_EchoToolArgs,
+        function=_erring_tool_function,
+    )
+
+
+def test_traced_tool_manager_handled_dispatch_emits_one_execute_tool_span() -> None:
+    """A handled dispatch emits one OK INTERNAL execute_tool span with identity and outcome keys."""
+
+    async def scenario() -> None:
+        """Dispatch one valid call and inspect the single finished span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_echo_tool()], tracer=tracer)
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
+        )
+        assert isinstance(outcome, DispatchHandled)
+        assert outcome.tool_message.content == "hi"
+        (span,) = exporter.get_finished_spans()
+        assert span.name == "execute_tool echo"
+        assert span.kind == SpanKind.INTERNAL
+        assert span.status.status_code == StatusCode.OK
+        assert span.attributes is not None
+        assert dict(span.attributes) == {
+            "gen_ai.tool.name": "echo",
+            "gen_ai.tool.call.id": "call1",
+            "langchaint.dispatch_outcome": "handled",
+            "langchaint.tool_message_is_error": False,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_function_authored_failure_is_handled_with_is_error() -> None:
+    """A function-authored failure keeps dispatch_outcome "handled" while tool_message_is_error is True.
+
+    This is the one input where the two attributes part ways,
+    so an implementation deriving the bool from the outcome arm instead of the ToolMessage fails here.
+    """
+
+    async def scenario() -> None:
+        """Dispatch a call whose function returns ToolOutputExplicit(is_error=True) and inspect the span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_erring_tool()], tracer=tracer)
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="erring", args_json='{"text": "x"}')
+        )
+        assert isinstance(outcome, DispatchHandled)
+        assert outcome.tool_message.is_error is True
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.OK
+        assert span.attributes is not None
+        assert span.attributes["langchaint.dispatch_outcome"] == "handled"
+        assert span.attributes["langchaint.tool_message_is_error"] is True
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_invalid_args_span_is_ok_with_outcome_attribute() -> None:
+    """An invalid-arguments dispatch is an answered call: OK span, invalid_tool_args, is_error True."""
+
+    async def scenario() -> None:
+        """Dispatch a call whose arguments fail validation and inspect the span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_echo_tool()], tracer=tracer)
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"wrong": 1}')
+        )
+        assert isinstance(outcome, DispatchInvalidToolArgs)
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.OK
+        assert span.attributes is not None
+        assert span.attributes["langchaint.dispatch_outcome"] == "invalid_tool_args"
+        assert span.attributes["langchaint.tool_message_is_error"] is True
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_unknown_tool_span_is_ok_with_outcome_attribute() -> None:
+    """An off-list name is an answered call: OK span named for the called name, unknown_tool outcome."""
+
+    async def scenario() -> None:
+        """Dispatch a call naming a tool the manager does not hold and inspect the span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_echo_tool()], tracer=tracer)
+        outcome = await tool_manager.dispatch(ToolCall(id="call1", name="missing", args_json="{}"))
+        assert isinstance(outcome, DispatchUnknownTool)
+        (span,) = exporter.get_finished_spans()
+        assert span.name == "execute_tool missing"
+        assert span.status.status_code == StatusCode.OK
+        assert span.attributes is not None
+        assert span.attributes["langchaint.dispatch_outcome"] == "unknown_tool"
+        assert span.attributes["langchaint.tool_message_is_error"] is True
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_function_exception_marks_the_span_error_and_propagates() -> None:
+    """A tool-function defect records the exception, sets error status, and propagates."""
+
+    async def scenario() -> None:
+        """Dispatch a call whose function raises and inspect the error span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_raising_tool()], tracer=tracer)
+        with pytest.raises(RuntimeError, match="tool bug"):
+            await tool_manager.dispatch(
+                ToolCall(id="call1", name="boom", args_json='{"text": "x"}')
+            )
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.ERROR
+        assert [event.name for event in span.events] == ["exception"]
+        assert span.attributes is not None
+        assert "langchaint.dispatch_outcome" not in span.attributes
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
+    """dispatch_many inherits per-call spans: two calls yield two execute_tool spans, outcomes ordered."""
+
+    async def scenario() -> None:
+        """Dispatch two calls concurrently and read both spans."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager([_echo_tool()], tracer=tracer)
+        outcomes = await tool_manager.dispatch_many([
+            ToolCall(id="call1", name="echo", args_json='{"text": "a"}'),
+            ToolCall(id="call2", name="missing", args_json="{}"),
+        ])
+        assert isinstance(outcomes[0], DispatchHandled)
+        assert isinstance(outcomes[1], DispatchUnknownTool)
+        spans = exporter.get_finished_spans()
+        assert sorted(span.name for span in spans) == ["execute_tool echo", "execute_tool missing"]
+        call_ids = {
+            span.attributes["gen_ai.tool.call.id"]
+            for span in spans
+            if span.attributes is not None
+        }
+        assert call_ids == {"call1", "call2"}
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
+    """The dispatch span is current while the function runs: a span the function starts nests under it."""
+
+    async def scenario() -> None:
+        """Dispatch a tool whose function opens its own span and assert the parentage."""
+        tracer, exporter = _in_memory_tracer()
+
+        async def nesting_tool_function(args: _EchoToolArgs) -> str:
+            """Open one inner span on the same tracer and return the text."""
+            with tracer.start_as_current_span("inner"):
+                return args.text
+
+        tool = PydanticTool(
+            name="nesting",
+            description="Opens an inner span",
+            args_model=_EchoToolArgs,
+            function=nesting_tool_function,
+        )
+        tool_manager = TracedToolManager([tool], tracer=tracer)
+        await tool_manager.dispatch(ToolCall(id="call1", name="nesting", args_json='{"text": "x"}'))
+        inner_span, dispatch_span = exporter.get_finished_spans()
+        assert inner_span.name == "inner"
+        assert dispatch_span.name == "execute_tool nesting"
+        assert dispatch_span.parent is None
+        assert dispatch_span.context is not None
+        assert inner_span.parent is not None
+        assert inner_span.parent.span_id == dispatch_span.context.span_id
+
+    asyncio.run(scenario())
+
+
+def test_traced_tool_manager_is_a_tool_manager_bindable_as_one() -> None:
+    """TracedToolManager subclasses ToolManager, so bind's tool_manager parameter accepts it unchanged."""
+    tool_manager = TracedToolManager([_echo_tool()])
+    assert isinstance(tool_manager, ToolManager)
+    bound = TracedLLM(LLM(_FakeProvider())).bind(
+        tool_manager=tool_manager, automatic_prompt_caching=True
+    )
+    assert bound.tool_manager is tool_manager
+    (schema,) = tool_manager.schemas()
+    assert schema.name == "echo"
+
+
+def test_traced_tool_manager_extra_attributes_ride_on_dispatch_spans() -> None:
+    """extra_attributes land on every dispatch span; a dispatch-set identity key of the same name wins."""
+
+    async def scenario() -> None:
+        """Dispatch under extra_attributes including a colliding identity key and inspect the span."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()],
+            tracer=tracer,
+            extra_attributes={"gen_ai.agent.name": "agent_a", "gen_ai.tool.name": "spoofed"},
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "a"}'))
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.agent.name"] == "agent_a"
+        assert span.attributes["gen_ai.tool.name"] == "echo"
+
+    asyncio.run(scenario())
 
 
 def test_generate_many_passes_warm_cache_through() -> None:

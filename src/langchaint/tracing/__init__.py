@@ -4,6 +4,12 @@ TracedLLM wraps an LLM and mirrors bind / rebind so every binding stays traced;
 TracedBoundLLM wraps a BoundLLM and opens one span per generate call (CLIENT for generate_one,
 which wraps one outbound call, INTERNAL for generate_many's aggregate span, which makes no call of its own);
 TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
+TracedToolManager is a ToolManager whose every dispatch opens one INTERNAL execute_tool span;
+it is a subclass, not a wrapper, so it passes to LLM.bind's tool_manager parameter as one object,
+and dispatch_many gains per-call spans by inheritance because it runs through self.dispatch.
+Every Traced class accepts extra_attributes, a constant mapping set on each span it opens at span start
+(an agent name for cross-trace aggregation, a deployment tag);
+an attribute set at completion (a mapper's, a dispatch outcome's) wins a key collision.
 
 The wrapper owns the span lifecycle (lazy start, exactly-once end, error status on every exception path)
 and never fakes an event boundary a span is supposed to measure:
@@ -21,7 +27,9 @@ The wrapper imports only opentelemetry-api, so a production app installs the api
 
 Every GenAI semantic-convention attribute key is verified against the pinned revision, never asserted from memory:
 opentelemetry-semantic-conventions 0.64b0.
-The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT).
+The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT);
+the tool-execution operation value is "execute_tool" (GenAiOperationNameValues.EXECUTE_TOOL),
+and the tool span's identity keys are gen_ai.tool.name and gen_ai.tool.call.id.
 The pinned revision defines no reasoning message part;
 reasoning appears only as the counter gen_ai.usage.reasoning.output_tokens.
 A convention change is a deliberate edit to this module.
@@ -32,7 +40,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import Any, Literal, overload
+from typing import Any, Literal, overload, override
 
 from pydantic import BaseModel
 
@@ -55,12 +63,18 @@ from langchaint.llm import (
     SequenceNotStr,
     Unchanged,
 )
-from langchaint.messages import Message, TextPart
+from langchaint.messages import Message, TextPart, ToolCall
 from langchaint.provider import Binding, Provider, StreamItem, ToolChoice
 from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response
 from langchaint.streaming import StreamHandle
-from langchaint.tools import ToolManager
+from langchaint.tools import (
+    DispatchHandled,
+    DispatchInvalidToolArgs,
+    DispatchOutcome,
+    Tool,
+    ToolManager,
+)
 
 type SpanAttributes = Mapping[str, str | bool | int | float | Sequence[str]]
 """A span's attributes, keyed by name.
@@ -87,12 +101,19 @@ _PACKAGE_VERSION = importlib.metadata.version("langchaint")
 _CHAT_OPERATION = "chat"
 """The GenAI operation value for a chat completion (GenAiOperationNameValues.CHAT)."""
 
+_EXECUTE_TOOL_OPERATION = "execute_tool"
+"""The GenAI operation value for a tool execution (GenAiOperationNameValues.EXECUTE_TOOL)."""
+
 _logger = logging.getLogger("langchaint.tracing")
 
 
-def _gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttributes:
+def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
+    The built-in "gen_ai" AttributeFormat resolves to this function.
+    It is public so a custom AttributeMapper extends it instead of restating its keys:
+    {**gen_ai_attributes(result), "gen_ai.agent.name": "researcher"}.
+    Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
     Reads only the shared Response/GenerationError fields, so it cannot leak a prompt and cannot meaningfully fail.
     Keys the GenAI convention has not defined stay under the langchaint.* prefix,
     including the three-way cache partition (the convention has no cache_none counterpart,
@@ -120,7 +141,7 @@ def _gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttrib
     return attributes
 
 
-_BUILTIN_MAPPERS: dict[AttributeFormat, AttributeMapper] = {"gen_ai": _gen_ai_attributes}
+_BUILTIN_MAPPERS: dict[AttributeFormat, AttributeMapper] = {"gen_ai": gen_ai_attributes}
 """The built-in mappers, one per AttributeFormat literal."""
 
 
@@ -190,6 +211,17 @@ def _apply_result_attributes(
     span.set_attributes(attributes)
 
 
+def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> None:
+    """Set the constant extra_attributes on a just-started span, when recording and non-empty.
+
+    Applied at span start, so the attributes are present however the span later ends;
+    an attribute set at completion (a mapper's, a dispatch outcome's) is set after these
+    and wins a key collision.
+    """
+    if extra_attributes and span.is_recording():
+        span.set_attributes(extra_attributes)
+
+
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error status from a terminal GenerationError, whose attributes are set separately."""
     span.set_status(Status(StatusCode.ERROR, error.error_text))
@@ -214,18 +246,25 @@ class TracedLLM:
         llm: LLM,
         *,
         attribute_format: AttributeFormat | AttributeMapper = "gen_ai",
+        extra_attributes: SpanAttributes | None = None,
         tracer: Tracer | None = None,
     ) -> None:
         """Resolve the mapper and the tracer once, at construction.
 
         tracer None resolves trace.get_tracer("langchaint.tracing", <package version>) now, not at import.
         attribute_format is resolved to one AttributeMapper and passed down unchanged to every binding.
+        extra_attributes is a constant mapping set at span start on every span every binding opens
+        (an agent name for cross-trace aggregation, a deployment tag); None means no such attributes.
+        A key the mapper also emits resolves to the mapper's value, set at completion.
 
         Raises:
             KeyError: attribute_format is a string outside the AttributeFormat set.
         """
         self._llm = llm
         self._attribute_mapper = _resolve_attribute_mapper(attribute_format)
+        self._extra_attributes: SpanAttributes = (
+            extra_attributes if extra_attributes is not None else {}
+        )
         self._tracer = (
             tracer
             if tracer is not None
@@ -294,6 +333,7 @@ class TracedLLM:
             ),
             tracer=self._tracer,
             attribute_mapper=self._attribute_mapper,
+            extra_attributes=self._extra_attributes,
         )
 
 
@@ -316,11 +356,17 @@ class TracedBoundLLM[OutputT]:
         bound_llm: BoundLLM[OutputT],
         tracer: Tracer,
         attribute_mapper: AttributeMapper,
+        extra_attributes: SpanAttributes,
     ) -> None:
-        """Store the wrapped BoundLLM, the tracer, and the mapper; compute the span name once."""
+        """Store the wrapped BoundLLM and the span pieces; compute the span name once.
+
+        extra_attributes (possibly empty, never None here) is set at span start on every span
+        this binding opens; TracedLLM documents its semantics.
+        """
         self._bound_llm = bound_llm
         self._tracer = tracer
         self._attribute_mapper = attribute_mapper
+        self._extra_attributes = extra_attributes
         self._span_name = f"{_CHAT_OPERATION} {bound_llm.provider.model}"
 
     @property
@@ -414,6 +460,7 @@ class TracedBoundLLM[OutputT]:
             ),
             tracer=self._tracer,
             attribute_mapper=self._attribute_mapper,
+            extra_attributes=self._extra_attributes,
         )
 
     async def generate_one(self, conversation: str | Sequence[Message]) -> Response[OutputT]:
@@ -433,6 +480,7 @@ class TracedBoundLLM[OutputT]:
         """
         span = self._tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
         try:
+            _apply_extra_attributes(span, self._extra_attributes)
             try:
                 response = await self._bound_llm.generate_one(conversation)
             except GenerationError as exc:
@@ -468,7 +516,7 @@ class TracedBoundLLM[OutputT]:
         kind is INTERNAL because it makes no outbound call of its own, the delegated items do;
         a CLIENT batch span would register as a phantom outbound call in APM dependency graphs.
         The mapper is not invoked (there is no single result to map);
-        the span carries only langchaint.batch_item_count, the number of conversations
+        the span carries the extra_attributes and langchaint.batch_item_count, the number of conversations
         (a langchaint.* attribute because the GenAI convention defines no batch-size key).
         The span stays OK on mixed per-item results, which come back as rows,
         and takes error status only when an AbortBatchError propagates.
@@ -481,6 +529,7 @@ class TracedBoundLLM[OutputT]:
         """
         span = self._tracer.start_span(self._span_name, kind=SpanKind.INTERNAL)
         try:
+            _apply_extra_attributes(span, self._extra_attributes)
             try:
                 results = await self._bound_llm.generate_many(conversations, warm_cache=warm_cache)
             except Exception as exc:
@@ -503,6 +552,7 @@ class TracedBoundLLM[OutputT]:
             stream_handle=self._bound_llm.stream_one(conversation),
             tracer=self._tracer,
             attribute_mapper=self._attribute_mapper,
+            extra_attributes=self._extra_attributes,
             span_name=self._span_name,
         )
 
@@ -524,12 +574,18 @@ class TracedStreamHandle[OutputT]:
         stream_handle: StreamHandle[OutputT],
         tracer: Tracer,
         attribute_mapper: AttributeMapper,
+        extra_attributes: SpanAttributes,
         span_name: str,
     ) -> None:
-        """Store the wrapped handle and the span pieces; the span is not started here."""
+        """Store the wrapped handle and the span pieces; the span is not started here.
+
+        extra_attributes (possibly empty, never None here) is set when the lazy span starts;
+        TracedLLM documents its semantics.
+        """
         self._stream_handle = stream_handle
         self._tracer = tracer
         self._attribute_mapper = attribute_mapper
+        self._extra_attributes = extra_attributes
         self._span_name = span_name
         self._span: Span | None = None
         self._span_started_at_monotonic_seconds: float | None = None
@@ -540,6 +596,7 @@ class TracedStreamHandle[OutputT]:
         """Start the span on first use, recording its start time for langchaint.time_to_first_token_seconds."""
         if self._span is None:
             self._span = self._tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
+            _apply_extra_attributes(self._span, self._extra_attributes)
             self._span_started_at_monotonic_seconds = time.monotonic()
         return self._span
 
@@ -663,6 +720,101 @@ class TracedStreamHandle[OutputT]:
         return response
 
 
+def _dispatch_outcome_name(outcome: DispatchOutcome) -> str:
+    """Name a dispatch outcome's arm for the langchaint.dispatch_outcome span attribute."""
+    if isinstance(outcome, DispatchHandled):
+        return "handled"
+    if isinstance(outcome, DispatchInvalidToolArgs):
+        return "invalid_tool_args"
+    return "unknown_tool"
+
+
+class TracedToolManager(ToolManager):
+    """A ToolManager whose every dispatch opens one execute_tool span.
+
+    A subclass rather than a TracedLLM-style wrapper, for two reasons the wrapper shape cannot meet:
+    LLM.bind types tool_manager as ToolManager, so only a subclass reaches bind and the app's loop
+    as one object; and ToolManager.dispatch_many runs through self.dispatch,
+    so overriding dispatch alone gives every concurrent call of a batch its own span
+    without restating the settle-and-group semantics documented on dispatch_many.
+    The span name is "execute_tool {call.name}", the GenAI convention's {operation} {target} pattern;
+    kind is INTERNAL because dispatch runs an in-process function
+    (a CLIENT span would register as an outbound call this package cannot see being made).
+    dispatch makes its span current while the tool function runs (trace.use_span).
+    Spans the function starts (an instrumented HTTP request, a nested agent loop) nest under the execute_tool span.
+    dispatch_many stays safe: asyncio.gather runs each dispatch in its own task with a copied context.
+    Concurrent dispatch spans are therefore siblings, never nested in one another.
+    The identity attributes gen_ai.tool.name and gen_ai.tool.call.id are set at span start;
+    at completion the span gains langchaint.dispatch_outcome ("handled", "invalid_tool_args",
+    or "unknown_tool", the DispatchOutcome arm) and langchaint.tool_message_is_error
+    (the ToolMessage's bool, carried separately because a handled outcome can still be a
+    function-authored failure).
+    Every returned outcome is an answered call, so the span status is OK on all three arms;
+    error status is reserved for a propagating function exception, a user-code defect.
+    There is no attribute mapper seam: the attributes are the fixed keys above,
+    and app constants ride in through extra_attributes.
+    """
+
+    def __init__(
+        self,
+        tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        *,
+        tracer: Tracer | None = None,
+        extra_attributes: SpanAttributes | None = None,
+    ) -> None:
+        """Index the tools (ToolManager.__init__) and resolve the span pieces once.
+
+        tracer None resolves trace.get_tracer("langchaint.tracing", <package version>), as on TracedLLM.
+        extra_attributes is a constant mapping set at span start on every dispatch span;
+        None means no such attributes.
+        A key dispatch also sets (an identity or outcome attribute) resolves to the dispatch-set value.
+
+        Raises:
+            ValueError: two tools share a name.
+        """
+        super().__init__(tools)
+        self._tracer = (
+            tracer
+            if tracer is not None
+            else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
+        )
+        self._extra_attributes: SpanAttributes = (
+            extra_attributes if extra_attributes is not None else {}
+        )
+
+    @override
+    async def dispatch(self, call: ToolCall) -> DispatchOutcome:
+        """Open one execute_tool span around ToolManager.dispatch and attribute it from the outcome.
+
+        The dispatch semantics are the base method's own; the override adds only the span.
+        The span is current while the base dispatch runs, so a span the tool function starts nests under it.
+        A function exception (a user-code defect) is recorded on the span, sets error status, and propagates.
+        trace.use_span ends the span exactly once on exit, with its exception recording and status setting off.
+        This method records and sets status itself.
+        """
+        span = self._tracer.start_span(
+            f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
+        )
+        with trace.use_span(
+            span, end_on_exit=True, record_exception=False, set_status_on_exception=False
+        ):
+            _apply_extra_attributes(span, self._extra_attributes)
+            if span.is_recording():
+                span.set_attributes({"gen_ai.tool.name": call.name, "gen_ai.tool.call.id": call.id})
+            try:
+                outcome = await super().dispatch(call)
+            except Exception as exc:
+                _record_other_exception(span, exc)
+                raise
+            if span.is_recording():
+                span.set_attributes({
+                    "langchaint.dispatch_outcome": _dispatch_outcome_name(outcome),
+                    "langchaint.tool_message_is_error": outcome.tool_message.is_error,
+                })
+            span.set_status(Status(StatusCode.OK))
+            return outcome
+
+
 __all__ = [
     "AttributeFormat",
     "AttributeMapper",
@@ -670,4 +822,6 @@ __all__ = [
     "TracedBoundLLM",
     "TracedLLM",
     "TracedStreamHandle",
+    "TracedToolManager",
+    "gen_ai_attributes",
 ]

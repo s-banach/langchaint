@@ -1,11 +1,9 @@
 """The ReAct tool loop: the app owns it, langchaint ships no agent class.
 
-The core loop is about fifteen lines and cannot be subtly wrong, because retries, pacing, classification, and argument
-validation all live below generate_one and dispatch.
 Owning the loop is what lets you enforce a budget mid-run, gate a call for approval, or swap the binding between turns;
 a fixed agent surface exposes none of that.
-The one run_agent below is both the plain loop and the human-in-the-loop loop: an approval gate is the three added lines
-of an optional argument, not a second copy of the loop, which is exactly the point that owning the loop makes.
+The one run_agent below is both the plain loop and the human-in-the-loop loop.
+An approval gate is one optional parameter and the four-line block that reads it, not a second copy of the loop.
 
 The LangChain call-for-call map (bind_tools, create_react_agent, interrupts) lives in MIGRATING_FROM_LANGCHAIN.md.
 """

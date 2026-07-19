@@ -69,13 +69,13 @@ async def stream_agent(
     raise RuntimeError(f"agent did not finish within {max_turns} turns")
 
 
-class CityArgs(BaseModel):
-    """A placeholder tool's arguments; the tool's specifics do not matter to the streaming point."""
+class WeatherArgs(BaseModel):
+    """Arguments of the weather tool the streaming loop dispatches between turns."""
 
     city: str
 
 
-async def get_weather(args: CityArgs) -> str:
+async def get_weather(args: WeatherArgs) -> str:
     """Return a canned weather string for the streaming tool loop to dispatch."""
     return f"It is 18C and clear in {args.city}."
 
@@ -83,7 +83,7 @@ async def get_weather(args: CityArgs) -> str:
 weather_tool = PydanticTool(
     name="get_weather",
     description="Return the current weather for a city.",
-    args_model=CityArgs,
+    args_model=WeatherArgs,
     function=get_weather,
 )
 

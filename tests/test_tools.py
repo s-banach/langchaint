@@ -15,6 +15,8 @@ from jsonschema.exceptions import UnknownType
 from pydantic import BaseModel, Field, ValidationError
 
 from langchaint import (
+    CaptureTool,
+    DispatchCaptured,
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
@@ -980,3 +982,117 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
         assert sorted(unwound) == ["a", "b"]
 
     asyncio.run(_run())
+
+
+class _CapturedAnswer(BaseModel):
+    """The captured model of the CaptureTool tests."""
+
+    answer: str
+
+
+def _answer_capture_tool() -> CaptureTool[_CapturedAnswer]:
+    """Build the capture tool."""
+    return CaptureTool(
+        name="final_response",
+        description="Submit the final answer.",
+        args_model=_CapturedAnswer,
+        acknowledgement="Answer received",
+    )
+
+
+def test_capture_tool_schema_converts_name_description_and_args_schema() -> None:
+    """CaptureTool.schema carries the name, description, and args_model's JSON schema, like PydanticTool."""
+    schema = _answer_capture_tool().schema()
+    assert schema.name == "final_response"
+    assert schema.description == "Submit the final answer."
+    assert schema.args_schema == _CapturedAnswer.model_json_schema()
+
+
+def test_capture_returns_the_validated_instance_as_a_required_field() -> None:
+    """A valid call returns DispatchCaptured: the acknowledgement tool_message plus the typed instance.
+
+    Matching the arm reads captured.answer directly, with no None guard and no isinstance beyond the arm match;
+    pyrefly checks that this typechecks, which is the point of the required field.
+    The tool_message carries the call id and the acknowledgement as non-error content.
+    """
+    call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
+    outcome = asyncio.run(_answer_capture_tool().capture(call))
+    assert isinstance(outcome, DispatchCaptured)
+    assert outcome.captured.answer == "tide"
+    assert outcome.tool_message.tool_call_id == "call1"
+    assert outcome.tool_message.content == "Answer received"
+    assert outcome.tool_message.is_error is False
+
+
+def test_capture_tool_default_acknowledgement() -> None:
+    """A CaptureTool built without acknowledgement answers a valid call with "Acknowledged"."""
+    tool = CaptureTool(
+        name="final_response", description="Submit the final answer.", args_model=_CapturedAnswer
+    )
+    call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
+    outcome = asyncio.run(tool.capture(call))
+    assert isinstance(outcome, DispatchCaptured)
+    assert outcome.tool_message.content == "Acknowledged"
+
+
+def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
+    """An invalid call returns the same DispatchInvalidToolArgs any tool form produces.
+
+    The content and details are exactly the pydantic conversion and rendering,
+    so the model reads identical field-level corrections whether it miscalled a CaptureTool or a PydanticTool.
+    """
+    args_json = '{"wrong": "key"}'
+    with pytest.raises(ValidationError) as caught:
+        _CapturedAnswer.model_validate_json(args_json)
+    expected_details = _details_from_pydantic(caught.value)
+    expected_content = render_invalid_tool_args("final_response", expected_details)
+    call = ToolCall(id="call1", name="final_response", args_json=args_json)
+    outcome = asyncio.run(_answer_capture_tool().capture(call))
+    assert isinstance(outcome, DispatchInvalidToolArgs)
+    assert outcome.tool_message.is_error is True
+    assert outcome.tool_message.tool_call_id == "call1"
+    assert outcome.tool_message.content == expected_content
+    assert outcome.details == expected_details
+
+
+def test_capture_malformed_and_non_object_json_return_the_invalid_args_arm() -> None:
+    """Malformed JSON and a non-object JSON value land in the same DispatchInvalidToolArgs arm, no raise.
+
+    args_model.model_validate_json raises ValidationError for both shapes,
+    so capture returns rendered corrections exactly as it does for a well-formed object with wrong fields.
+    """
+    for args_json in ("not json", '"scalar"'):
+        call = ToolCall(id="call1", name="final_response", args_json=args_json)
+        outcome = asyncio.run(_answer_capture_tool().capture(call))
+        assert isinstance(outcome, DispatchInvalidToolArgs)
+        assert outcome.tool_message.is_error is True
+        assert "invalid arguments for final_response" in outcome.tool_message.content
+        assert len(outcome.details) >= 1
+
+
+def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
+    """A manager-routed call is answered like any tool's: DispatchHandled with the capture as app_data.
+
+    A CaptureTool sits in a ToolManager beside a function-bearing form, the mix that motivates dispatch existing,
+    so bind sends its schema with the rest;
+    a call routed there instead of through capture still validates and acknowledges,
+    with the instance on the erased app_data channel.
+    """
+    manager = ToolManager([_echo_tool(), _answer_capture_tool()])
+    assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
+    call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
+    result = asyncio.run(manager.dispatch(call))
+    assert isinstance(result, DispatchHandled)
+    assert result.tool_message.content == "Answer received"
+    assert result.tool_message.is_error is False
+    assert result.app_data == _CapturedAnswer(answer="tide")
+
+
+def test_capture_tool_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
+    """A manager-routed invalid call comes back as the same DispatchInvalidToolArgs capture returns."""
+    call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
+    result = asyncio.run(ToolManager([_answer_capture_tool()]).dispatch(call))
+    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.is_error is True
+    assert "invalid arguments for final_response" in result.tool_message.content
+    assert any("answer" in detail.path for detail in result.details)

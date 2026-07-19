@@ -49,6 +49,8 @@ from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response, RowValue, to_row
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
+    CaptureTool,
+    DispatchCaptured,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
@@ -71,7 +73,9 @@ __all__ = [
     "AssistantMessage",
     "AttemptRecord",
     "BoundLLM",
+    "CaptureTool",
     "CostBreakdown",
+    "DispatchCaptured",
     "DispatchExceptionGroup",
     "DispatchHandled",
     "DispatchInvalidToolArgs",

@@ -1,6 +1,6 @@
 """Tools.
 
-A tool comes in two forms, both async callables returning ToolOutput and both dispatched by ToolManager.
+A tool comes in three forms, all dispatched by ToolManager.
 PydanticTool is the pydantic form: its function accepts one validated BaseModel argument, and its args_model is both the
 schema source (model_json_schema) and the validator of the model-produced argument JSON.
 JSONSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JSON schema, not a pydantic model
@@ -8,8 +8,12 @@ JSONSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JS
 args_schema rides through to the provider unchanged, and dispatch validates the arguments against args_schema
 with jsonschema (first that they are a JSON object, then the schema's field-level rules), so a schema violation
 renders through the same formatter as a PydanticTool failure and the function only ever sees valid arguments.
-Both return str or a Sequence[Part] (text and images the model then sees), or a ToolOutputExplicit carrying that
-content plus is_error and app_data.
+Both function-bearing forms return str or a Sequence[Part] (text and images the model then sees).
+They may instead return a ToolOutputExplicit carrying that content plus is_error and app_data.
+CaptureTool is the function-free form: a tool whose whole job is carrying a validated instance to the application.
+The archetype is the final-response tool that ends a tool loop.
+Its capture returns the instance as a required field of DispatchCaptured.
+Its fixed reply is the acknowledgement the model reads.
 A tool function returns data and nothing that steers control flow:
 stop, route, escalate, and needs-approval are decisions the application makes in its own loop between turns,
 reading app_data or is_error.
@@ -72,15 +76,14 @@ AppDataT is the explicit arm's app_data type, defaulting to None for a function 
 
 @dataclass(frozen=True, kw_only=True)
 class DispatchHandled[AppDataT = None]:
-    """A tool call a function ran: the model-facing tool_message plus app_data.
+    """A tool call the tool executed: the model-facing tool_message plus app_data.
 
-    Covers both success and a function-authored failure;
-    tool_message.is_error distinguishes them, the same bool the function set.
+    Covers success and a tool-authored failure; tool_message.is_error distinguishes them, the same bool the tool set.
     tool_message is the ToolMessage the application appends to the conversation and the provider sees.
-    app_data is the function's app_data, passed through live so the application reads it back at its concrete type:
-    PydanticTool.dispatch carries the tool's own AppDataT onto this arm,
-    so a caller that dispatched a known tool reads app_data with no isinstance.
-    It is None when the function returned bare content.
+    app_data is what the tool routed to the application, passed through live and read back at its concrete type.
+    PydanticTool.dispatch carries the tool's own AppDataT onto this arm, so a known-tool caller needs no isinstance.
+    For the function-bearing forms app_data is the function's, None when the function returned bare content.
+    For CaptureTool it is the capture, present on every valid manager-routed call.
     It never reaches the provider: only tool_message enters the conversation the adapters convert.
     ToolManager.dispatch dispatches a heterogeneous tool set whose per-call AppDataT is erased,
     so its DispatchHandled is parameterized with the widest app_data the channel allows
@@ -239,6 +242,78 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         return _handled_outcome(call, result)
 
 
+@dataclass(frozen=True, kw_only=True)
+class DispatchCaptured[CapturedT: BaseModel]:
+    """A capture call whose arguments validated: the acknowledgement tool_message plus the captured instance.
+
+    tool_message is the acknowledgement ToolMessage the application appends to the conversation for the model to read.
+    captured is the validated args_model instance, a required field.
+    Matching this arm proves the capture happened, so no consumer revalidates or None-guards captured.
+    Returned only by CaptureTool.capture; a manager-routed call erases the capture onto DispatchHandled.app_data.
+    """
+
+    tool_message: ToolMessage
+    captured: CapturedT
+
+
+@dataclass(frozen=True, kw_only=True)
+class CaptureTool[CapturedT: BaseModel]:
+    """A tool with no function: it receives one validated CapturedT instance from the model.
+
+    This is the form for a tool whose whole job is carrying structured data from the model to the application.
+    The archetypes: a final-response tool ending a tool_choice="required" loop, and a forced side capture.
+    As on PydanticTool, args_model is both the schema the provider sees and the validator of the argument JSON.
+    The checker solves CapturedT from args_model, so capture returns the instance typed, with no isinstance.
+    There is no function field because the behavior is fixed: validate, acknowledge, hand the instance to the caller.
+    acknowledgement is the model-facing content answering a valid call; the model reads it as the tool result.
+    The application's loop calls capture and matches DispatchCaptured, whose captured field is required.
+    dispatch exists for Tool conformance, so a CaptureTool sits in a ToolManager and bind sends its schema.
+    A manager-routed call is still answered, with the capture riding the erased app_data channel.
+    A CaptureTool returns data, never a control-flow signal.
+    Whether a capture ends the loop is the application's decision, made in its own loop between turns.
+    """
+
+    name: str
+    description: str
+    args_model: type[CapturedT]
+    acknowledgement: str = "Acknowledged"
+
+    def schema(self) -> ToolSchema:
+        """Convert to the provider-neutral schema."""
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            args_schema=self.args_model.model_json_schema(),
+        )
+
+    async def capture(self, call: ToolCall) -> DispatchCaptured[CapturedT] | DispatchInvalidToolArgs:
+        """Validate call.args_json against args_model and return the typed capture.
+
+        A validation failure returns the same DispatchInvalidToolArgs any tool form produces.
+        Its tool_message renders the field-level corrections for the model.
+        The caller must already have matched call.name to this tool, as on PydanticTool.dispatch.
+        """
+        try:
+            captured = self.args_model.model_validate_json(call.args_json)
+        except ValidationError as error:
+            return _invalid_args_outcome(call, _details_from_pydantic(error))
+        return DispatchCaptured(
+            tool_message=ToolMessage(tool_call_id=call.id, content=self.acknowledgement),
+            captured=captured,
+        )
+
+    async def dispatch(self, call: ToolCall) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
+        """Answer a manager-routed call: capture's outcome with the capture as app_data.
+
+        The manager's channel erases per-tool types, so the capture rides DispatchHandled.app_data there.
+        A caller that wants the required captured field calls capture directly.
+        """
+        outcome = await self.capture(call)
+        if isinstance(outcome, DispatchInvalidToolArgs):
+            return outcome
+        return DispatchHandled(tool_message=outcome.tool_message, app_data=outcome.captured)
+
+
 _ARGS_OBJECT = TypeAdapter(dict[str, object])
 """Validates that a tool call's args_json is a JSON object, parsing it to a dict without coercing the values.
 
@@ -321,11 +396,11 @@ class JSONSchemaTool[AppDataT = None]:
 class Tool[AppDataT](Protocol):
     """The interface ToolManager needs from a tool: a name, a schema, and dispatch.
 
-    Both PydanticTool (arguments validated by its args_model) and JSONSchemaTool (arguments validated against its
-    raw args_schema) satisfy it structurally, so one ToolManager holds a mix of the two, and an application may add
-    its own tool type by satisfying this interface. AppDataT appears only in dispatch's return, so it is covariant:
+    PydanticTool, JSONSchemaTool, and CaptureTool all satisfy it structurally, so one ToolManager holds a mix of them.
+    An application may add its own tool type by satisfying this interface.
+    AppDataT appears only in dispatch's return, so it is covariant:
     a Tool of a concrete app_data type is a Tool of the manager's wider channel type.
-    name is a read-only property so a frozen-dataclass name field (PydanticTool, JSONSchemaTool) satisfies it;
+    name is a read-only property so a frozen-dataclass name field (all three concrete forms) satisfies it;
     a plain attribute would demand a read-write name the frozen tools do not have.
     """
 
@@ -407,13 +482,13 @@ def _invalid_args_outcome(
 ) -> DispatchInvalidToolArgs:
     """Build the DispatchInvalidToolArgs for a call whose arguments failed validation.
 
-    Shared by PydanticTool.dispatch and both JSONSchemaTool.dispatch failure paths
+    Shared by PydanticTool.dispatch, CaptureTool.capture, and both JSONSchemaTool.dispatch failure paths
     (a non-object args_json, a jsonschema violation):
     all render the same is_error ToolMessage and carry the neutral details for a caller reading the failure.
-    render_invalid_tool_args's ValueError cannot fire from here: every caller passes a non-empty tuple
-    (a pydantic ValidationError carries at least one error,
-    and JSONSchemaTool.dispatch checks the mapped jsonschema details for emptiness first),
-    so the dispatch methods do not list it.
+    render_invalid_tool_args's ValueError cannot fire from here: every caller passes a non-empty tuple.
+    A pydantic ValidationError carries at least one error, covering the PydanticTool and CaptureTool paths.
+    JSONSchemaTool.dispatch checks the mapped jsonschema details for emptiness first.
+    The calling methods therefore do not list the ValueError.
     """
     tool_message = ToolMessage(
         tool_call_id=call.id,
@@ -451,8 +526,8 @@ class ToolManager:
     ) -> None:
         """Index the tools by name.
 
-        Each element is any Tool implementation, so a manager holds a mix of PydanticTool and JSONSchemaTool
-        (and an application's own tool type) keyed by name.
+        Each element is any Tool implementation, keyed by name.
+        A manager holds a mix of PydanticTool, JSONSchemaTool, CaptureTool, and an application's own tool type.
         The app_data bound BaseModel | Mapping[str, object] | None is the widest the manager surfaces:
         it dispatches a heterogeneous set whose per-call AppDataT is erased,
         so a tool whose function carries any of those app_data types is accepted

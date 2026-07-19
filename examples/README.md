@@ -4,8 +4,8 @@ Short, runnable examples of langchaint.
 Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK installed and the provider's API key in the environment.
 The `openai` package and `OPENAI_API_KEY` cover the openai examples.
 `05_rate_limiting_and_errors.py` and `06_prompt_caching.py` also build anthropic models, so they additionally need the `anthropic` package and `ANTHROPIC_API_KEY`.
-Where a tool's specifics do not matter, the code uses a minimal placeholder tool rather than a realistic one.
-`07_json_schema_tool_validation.py` is the one exception: it needs no API key, because it dispatches constructed `ToolCall`s with no provider involved.
+`07_json_schema_tool_validation.py` is the one exception to needing an API key: it dispatches constructed `ToolCall`s with no provider involved.
+Where a tool's specifics do not matter, the code uses a minimal tool (a canned weather lookup, a canned search) rather than a realistic one.
 
 | File | Shows |
 | --- | --- |
@@ -18,5 +18,4 @@ Where a tool's specifics do not matter, the code uses a minimal placeholder tool
 | [`07_json_schema_tool_validation.py`](07_json_schema_tool_validation.py) | `JSONSchemaTool` argument validation: `dispatch` validates the arguments against `args_schema`, landing schema violations in the same `DispatchInvalidToolArgs` house message as the `PydanticTool` path |
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | the call-for-call API map and what replaces the middleware layer |
 
-Each `.py` file carries the langchaint calls; the LangChain call-for-call map for all of them lives in one place, `MIGRATING_FROM_LANGCHAIN.md`, so start there for the mental model, then read `01_basics.py`.
-The centerpiece is `02_tool_loop.py`: the loop is the thing LangChain's agent classes hide, and langchaint's whole premise is that you write the core loop yourself in about fifteen lines because everything hard lives below `generate_one` and `dispatch`.
+Start with `MIGRATING_FROM_LANGCHAIN.md` for the mental model, then `01_basics.py`; the centerpiece is `02_tool_loop.py`, because the loop LangChain's agent classes hide is the one langchaint expects you to write yourself.

@@ -149,3 +149,28 @@ def test_assistant_turn_rejects_a_marked_text_part() -> None:
 def test_assistant_turn_still_accepts_unmarked_text() -> None:
     """The validator rejects only marked parts; the plain turn is untouched."""
     assert AssistantMessage("hey").text == "hey"
+
+
+def test_model_copy_rejects_a_derived_property_key() -> None:
+    """model_copy(update={"tool_calls": ...}) raises instead of silently dropping the key.
+
+    pydantic's unvalidated copy would leave turn unchanged while the property shadows the dead key,
+    so an app filtering an assistant turn's tool calls this way would re-send the unfiltered turn.
+    """
+    message = AssistantMessage(turn=(ToolCall(id="c1", name="probe", args_json="{}"),))
+    with pytest.raises(TypeError, match="derived property of AssistantMessage"):
+        message.model_copy(update={"tool_calls": ()})
+
+
+def test_model_copy_rejects_a_key_that_is_not_a_field() -> None:
+    """A typo key raises and the message lists the model's fields."""
+    with pytest.raises(TypeError, match="not a field of UserMessage"):
+        UserMessage("hi").model_copy(update={"contnet": "bye"})
+
+
+def test_model_copy_with_a_field_key_returns_the_modified_copy() -> None:
+    """A field key passes the check and modifies the frozen model's copy as on pydantic's model_copy."""
+    message = ToolMessage(tool_call_id="c1", content="ok")
+    copy = message.model_copy(update={"is_error": True})
+    assert copy.is_error is True
+    assert message.is_error is False

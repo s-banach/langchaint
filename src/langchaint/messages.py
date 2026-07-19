@@ -10,10 +10,12 @@ because providers place it in different request locations.
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BeforeValidator, ConfigDict, Field, model_validator
+
+from langchaint.checked_copy import CheckedCopyModel
 
 
-class TextPart(BaseModel):
+class TextPart(CheckedCopyModel):
     """One text span of a message's content.
 
     cache_breakpoint True marks the exact end of a reusable prompt prefix:
@@ -29,7 +31,7 @@ class TextPart(BaseModel):
     cache_breakpoint: bool = False
 
 
-class ImagePart(BaseModel):
+class ImagePart(CheckedCopyModel):
     """media_type is an IANA media type such as "image/png".
 
     cache_breakpoint has the same meaning as on TextPart: the reusable prompt prefix ends at this part.
@@ -54,7 +56,7 @@ which can be a parsed BaseModel that is not a Part and never round-trips back in
 """
 
 
-class ToolCall(BaseModel):
+class ToolCall(CheckedCopyModel):
     """One tool call requested by the model.
 
     args_json is the raw argument JSON text before validation;
@@ -69,7 +71,7 @@ class ToolCall(BaseModel):
     args_json: str
 
 
-class UserMessage(BaseModel):
+class UserMessage(CheckedCopyModel):
     """One user turn; content is plain text or a tuple of parts.
 
     role discriminates the Message union,
@@ -93,7 +95,7 @@ class UserMessage(BaseModel):
         super().__init__(content=content, role=role)
 
 
-class ReasoningTrace(BaseModel):
+class ReasoningTrace(CheckedCopyModel):
     """One reasoning element the model produced, round-tripped verbatim.
 
     The core never inspects reasoning: reasoning is the producing SDK item's
@@ -138,7 +140,7 @@ def _text_only_turn(turn: object) -> object:
     return turn
 
 
-class AssistantMessage(BaseModel):
+class AssistantMessage(CheckedCopyModel):
     """One assistant turn, stored as the ordered element sequence the provider emitted.
 
     Both providers emit and require the order (Anthropic cannot rearrange thinking blocks;
@@ -197,7 +199,7 @@ class AssistantMessage(BaseModel):
         return tuple(element for element in self.turn if isinstance(element, ToolCall))
 
 
-class ToolMessage(BaseModel):
+class ToolMessage(CheckedCopyModel):
     """One tool result sent back to the model.
 
     tool_call_id must match the id of the ToolCall it answers.

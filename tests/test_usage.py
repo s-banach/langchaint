@@ -90,3 +90,9 @@ def test_sum_of_totals_a_batch() -> None:
 def test_sum_of_empty_is_zero_usage() -> None:
     """Usage.sum_of over an empty iterable returns ZERO_USAGE."""
     assert Usage.sum_of([]) == ZERO_USAGE
+
+
+def test_model_copy_rejects_the_derived_total() -> None:
+    """model_copy(update={"input_tokens_total": ...}) raises instead of silently dropping the key."""
+    with pytest.raises(TypeError, match="derived property of Usage"):
+        _usage().model_copy(update={"input_tokens_total": 5})

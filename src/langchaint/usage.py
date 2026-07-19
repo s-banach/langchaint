@@ -10,10 +10,12 @@ they are born together in each adapter's _normalized_usage, and one sum folds bo
 
 from collections.abc import Iterable
 
-from pydantic import BaseModel, ConfigDict, NonNegativeFloat, NonNegativeInt
+from pydantic import ConfigDict, NonNegativeFloat, NonNegativeInt
+
+from langchaint.checked_copy import CheckedCopyModel
 
 
-class Usage(BaseModel):
+class Usage(CheckedCopyModel):
     """Token counts for one request, normalized across providers, plus the adapter's cost estimate.
 
     The counters are provider-reported facts. cost_in_usd is the package's estimate,

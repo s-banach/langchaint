@@ -537,7 +537,7 @@ class AnthropicMessagesProvider(Provider):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
     The three clients expose the same messages.create/parse/stream methods and with_options,
-    so the adapter logic is identical across the first-party API and both Bedrock surfaces.
+    so the adapter logic is identical across the first-party API and both Bedrock APIs.
     default_max_completion_tokens fills the API-required max_tokens
     when the binding's inference_params leave max_completion_tokens None.
     """

@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 from langchaint import PricingTable, RateLimiter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
+    AnthropicBedrockModelName,
     AnthropicMessagesProvider,
     AnthropicModelName,
     anthropic_bedrock_model,
@@ -56,10 +57,13 @@ def test_adapter_client_never_retries_beneath_the_package() -> None:
     assert provider.client.api_key == client.api_key
 
 
-# One model per Bedrock surface: claude-opus-4-8 routes to "mantle", claude-opus-4-6 to "legacy".
-# The transport-drop bug lives in each surface's own copy() override, so both surfaces are exercised.
-@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-4-6"])
-def test_bedrock_http_client_survives_the_retry_suppression_copy(model: AnthropicModelName) -> None:
+# One wire model id per Bedrock API: anthropic.claude-opus-4-8 routes to "mantle",
+# us.anthropic.claude-opus-4-6-v1 to "legacy".
+# The transport-drop bug lives in each client class's own copy() override, so both classes are tested.
+@pytest.mark.parametrize("model", ["anthropic.claude-opus-4-8", "us.anthropic.claude-opus-4-6-v1"])
+def test_bedrock_http_client_survives_the_retry_suppression_copy(
+    model: AnthropicBedrockModelName,
+) -> None:
     """A custom httpx client passed to anthropic_bedrock_model reaches the stored adapter client.
 
     The two Bedrock client classes override copy() without reusing the existing transport (anthropic
@@ -79,7 +83,7 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
     with pytest.raises(ValueError, match="at most one"):
         anthropic_bedrock_model(
-            "claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
+            "anthropic.claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
         )
 
 

@@ -1,148 +1,132 @@
 # langchaint
 
-Provider-neutral async LLM client over the official provider SDKs (anthropic >= 0.116.0, openai >= 2.45.0).
+Provider-neutral async LLM client over the official provider SDKs, verified against anthropic 0.116.0 and openai 2.45.0.
 Alpha: the API is unstable and may change without notice.
 
-## Design
+## The point
+
+langchaint is the layer between an application's own agent loop and the provider SDKs.
+It gives one message tree, one error taxonomy, one `Usage` shape with a priced `cost_in_usd` on every result, and one `RateLimiter` that owns retrying and pacing, the same across providers.
+The application keeps the loop: langchaint ships no agent class, and every billing-relevant choice (prompt caching above all) is stated by the application rather than defaulted by the library.
+
+## Install
+
+Requires Python >= 3.13.
+The hard dependencies are `pydantic` and `jsonschema`; the provider SDKs are optional dependencies the application pins directly, and langchaint declares no extras.
+
+    pip install langchaint openai        # or anthropic, or both
+
+`import langchaint` needs neither SDK.
+Each backend subpackage imports its SDK at module top, so importing `langchaint.openai` without the openai package raises a `ModuleNotFoundError` naming the package to install.
+
+## Example
+
+```python
+import asyncio
+
+from pydantic import BaseModel
+
+from langchaint.openai import openai_model
+
+
+class Sentiment(BaseModel):
+    label: str
+    confidence: float
+
+
+async def main() -> None:
+    llm = openai_model("gpt-5.6-terra")
+    classifier = llm.bind(
+        system_prompt="Classify the sentiment of the user's message.",
+        response_format=Sentiment,
+        automatic_prompt_caching=False,
+    )
+    response = await classifier.generate_one("This is the best day I have had in months.")
+    print(response.output.label, response.usage.cost_in_usd)
+
+
+asyncio.run(main())
+```
+
+`bind(response_format=Sentiment)` returns `BoundLLM[Sentiment]` by overload, so `response.output` is a validated `Sentiment` instance; without `response_format` it returns `BoundLLM[str]` and `output` is the assistant text.
+A bare `str` argument is shorthand for a conversation of one `UserMessage` holding that text.
+`examples/` holds runnable files from basics through the streaming tool loop, prompt caching, and a budgeted `tool_choice="required"` loop, plus `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
+
+## What it has
 
 **Generation only via binding.**
-`LLM` has no generate methods.
-`LLM.bind(...) -> BoundLLM[OutputT]` freezes everything that determines the cacheable prompt prefix: `system_prompt`, `tool_manager`, `inference_params`, `tool_choice`, `parallel_tool_calls`, `automatic_prompt_caching`.
-`response_format` is frozen too, as the field that fixes the output type.
-`automatic_prompt_caching` has no default: caching changes billing, so every `bind` states it.
-A `TextPart` or `ImagePart` with `cache_breakpoint=True` places a prompt-cache boundary at exactly that part, under either `automatic_prompt_caching` value, so binding `False` and marking parts is the fully user-specified caching configuration.
-`generate_many(conversations, warm_cache=True)` runs the first conversation to completion before admitting the rest, so a batch sharing a cached prefix pays one cache write instead of one per in-flight item; it is opt-in because it costs one item of serial latency.
-`system_prompt` also binds as a sequence of `TextPart`s, so a boundary can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
-There are no per-call parameter overrides; changing parameters is `rebind(...)`, which returns a new `BoundLLM` with the SDK keyword arguments converted again.
-`bind(response_format=Model)` returns `BoundLLM[Model]`; without `response_format` it returns `BoundLLM[str]`, selected by overload.
-`rebind` carries the same overload, so `rebind(response_format=Model)` switches the output type to `BoundLLM[Model]`, `rebind(response_format=None)` switches it back to `BoundLLM[str]`, and leaving it out keeps the current type.
-Every generate and stream method takes a conversation of `Message`s; a bare `str` is accepted as shorthand for a conversation of one `UserMessage` holding that text.
+`LLM` has no generate methods; `LLM.bind(...)` freezes everything that determines the cacheable prompt prefix (`system_prompt`, `tool_manager`, `inference_params`, `tool_choice`, `parallel_tool_calls`, `automatic_prompt_caching`, and `response_format`, which fixes the output type) into a `BoundLLM[OutputT]`.
+Changing parameters is `rebind(...)`, which returns a new `BoundLLM` and carries the same `response_format` overloads.
+`BoundLLM` has `generate_one`, `generate_many` (an order-aligned `list[Response[OutputT] | GenerationError]`), and `stream_one`.
 
-**The catalog is a constructor function per backend returning a ready LLM (anthropic adds a second for Bedrock).**
-`from langchaint.openai import openai_model` then `openai_model("gpt-5.6-terra")`, and `from langchaint.anthropic import anthropic_model` then `anthropic_model("claude-sonnet-5")`, take the provider's own model identifier (a `Literal`, so typos fail the type check), look up the public prices, construct the adapter, and wrap it in an `LLM`.
-`client=None` constructs the native first-party SDK client from environment credentials.
-Anthropic Bedrock is a second sibling constructor, `anthropic_bedrock_model(model, aws_region=...)`: it takes the Bedrock wire model id (`AnthropicBedrockModelName`, also a `Literal`) and sends it verbatim, so the id in application code, on the wire, and in traces is one string; the id's Bedrock API (which of two SDK client classes) and default pricing come from a table, so the application never names the client class.
-Constructing an adapter directly covers models outside the catalog.
+**A constructor per backend returning a ready `LLM`.**
+`openai_model("gpt-5.6-terra")`, `anthropic_model("claude-sonnet-5")`, and `anthropic_bedrock_model(model, aws_region=...)` each take a `Literal` model name (so typos fail the type check), look up public prices, and wrap the adapter in an `LLM`; `client`, `pricing`, and `rate_limiter` default sensibly and are overridable.
+`anthropic_bedrock_model` takes the Bedrock wire model id and sends it verbatim, routing each id to its Bedrock API and pricing through `ANTHROPIC_BEDROCK`; OpenAI on Bedrock is the SDK's bundled `AsyncBedrockOpenAI` passed as `client`.
+Models outside a catalog are built directly from the adapter: `LLM(AnthropicMessagesProvider(...))`.
 
-**The SDKs are optional dependencies, pinned directly by the application.**
-The neutral core (`LLM`, the message tree, the error taxonomy) imports no SDK, so `import langchaint` needs neither package.
-Each backend lives in its own subpackage that imports its SDK at module top: install `openai` or `anthropic` (pinning the SDK variant you need, such as `anthropic[bedrock]`) for the ones you use, and importing `langchaint.openai` without the openai package raises a `ModuleNotFoundError` naming the package to install. langchaint declares no extras of its own.
-The import path is the boundary: only code that reaches for a backend requires its SDK, and a type checker following `langchaint.openai` never resolves anthropic's types.
-OTel tracing follows the same pattern: `langchaint.tracing` imports only opentelemetry-api, install `opentelemetry-api`, and it stays off `import langchaint`.
+**One result shape for success and failure.**
+Success is a frozen `Response[OutputT]`; a terminal failure is a `GenerationError` leaf: `RetriesExhaustedError`, `RefusalError`, or `MaxCompletionTokensExceededError` (the structured path never returns silently wrong data).
+Both carry `attempt_records`, one `AttemptRecord` per request sent, and `usage`, the paid total across every attempt, so the default a caller bills on is the money actually spent; `to_row` flattens either to one row shape, so a mixed batch is one table.
+`Response.raw` is the SDK's own response object held by reference, and `usage_raw` is the raw SDK usage beside every `Usage`.
 
-**Adapters wrap SDK clients and delegate to the SDK.**
-`AnthropicMessagesProvider(client=AsyncAnthropic(...))` and `OpenAIResponsesProvider(client=AsyncOpenAI(...))` call `messages.create/parse/stream` and `responses.create/parse/stream`; stream assembly and structured-output parsing are the SDK's, not hand-written.
-Adapters store a `with_options(max_retries=0)` copy of the client, so the SDK never retries beneath the package's retry loop.
-OpenAI support is the Responses API only: every supported OpenAI model speaks it, so there is no Chat Completions adapter.
-The adapter always sends `store=False` because conversation state is the caller's conversation argument.
-Anthropic Bedrock is two distinct APIs, the legacy `InvokeModel` API served by `AsyncAnthropicBedrock` and the Messages API served by `AsyncAnthropicBedrockMantle`, and the cataloged ids split across them, so `anthropic_bedrock_model` reads the client class per id from `ANTHROPIC_BEDROCK`.
-OpenAI on Bedrock is the bundled `AsyncBedrockOpenAI` passed as `client`; there is no Converse adapter.
-Requests travel as typed frozen dataclasses whose optional fields are `X | Omit`, passed to the SDK as explicit keywords: no `**kwargs`, no hand-written wire TypedDicts, and the SDK overloads resolve without casts.
+**Priced usage.**
+`Usage` partitions input tokens into `input_tokens_cache_read`, `input_tokens_cache_write`, and `input_tokens_cache_none` (the partition both providers' counters map onto), counts `output_tokens` and `output_tokens_reasoning`, and carries `cost_in_usd`, computed inside the adapter against a `PricingTable`.
+`Usage.sum_of` folds usages and costs together; each backend's `cost_breakdown(usage_raw, pricing)` reports the per-category split through the same `price` call that produced the stored `cost_in_usd`, so the two cannot drift.
 
-**Anthropic prompt caching is placed by the adapter.**
-A bind-time `cache_control` marker goes on the system block (or the last tool when there is no system prompt), and a per-request marker goes on the last block of the last message, so the breakpoint follows a growing conversation.
-Placement is manual because `messages.parse` lacks the top-level `cache_control` parameter; manual placement keeps create/parse/stream uniform.
-Every marker's TTL is the adapter's `cache_ttl` (`"5m"` default, `"1h"` for entries that must survive longer gaps at 2x write cost), a keyword of `anthropic_model` and `anthropic_bedrock_model`.
+**One `RateLimiter` owning retrying and pacing.**
+It holds `max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`, and `max_in_flight`; it is stateful and shareable, so one instance passed to several `LLM`s is one shared budget for the account they hit, gating every request start (first attempts, retries, batch items, stream openings).
+A rate-limit error pauses admission for everyone sharing it, honoring a server-stated retry-after up to 60 seconds, then admits one probe at a time until a probe succeeds; other transient errors pause nobody.
+Adapters store a `with_options(max_retries=0)` copy of the SDK client, so the SDK never retries beneath the package and attempt counts stay true.
 
-**Usage counters partition, and it carries the adapter-priced cost.**
-`Usage` stores `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, `output_tokens`, and `output_tokens_reasoning` (the reasoning share of output tokens); the three input counters are a disjoint partition and `input_tokens_total` is derived.
-The counters are validated non-negative, which is what guards the openai path, where `input_tokens_cache_none` is derived by subtraction from the provider's all-inclusive `input_tokens`.
-`Usage` also carries `cost_in_usd`, computed inside the adapter from raw provider counts against a `PricingTable`: it is stored, never derived from the counters, because providers split counters the normalized `Usage` collapses (anthropic bills 5-minute and 1-hour cache writes at different rates, and an adapter that sees 1-hour writes without `cache_write_1h_usd_per_million_tokens` raises `AbortBatchError` rather than misbill). Cost riding inside `Usage` means the two are born together and one `sum()` folds both; total across several results with `Usage.sum_of(...)`.
-Provider-specific detail the partition drops (the 5m/1h write split, `server_tool_use`, `service_tier`) stays readable on `usage_raw`, the raw SDK usage object carried by reference beside every `Usage`.
-For a per-category cost split, each backend has `cost_breakdown(usage_raw, pricing)` (`langchaint.anthropic.cost_breakdown` / `langchaint.openai.cost_breakdown`): it extracts the counts from the raw SDK usage (only there does the 5m/1h write split survive) and prices them through the same neutral `price` call that produced the stored `cost_in_usd`, so the returned `CostBreakdown`'s `total_cost_in_usd` equals it.
-`CostBreakdown` carries one cost per category, the derived `input_tokens_cost_in_usd` and `total_cost_in_usd`, and the priced `counts`, from which an application computes its own caching counterfactual against whatever baseline it chooses; cache writes bill above the uncached rate (1.25x at 5 minutes, 2x at 1 hour), so savings are negative on the turn that writes the cache and land on later read turns, meaning any savings number is only meaningful aggregated over a conversation.
+**User-stated prompt caching.**
+`automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.
+`cache_breakpoint=True` on a `TextPart` or `ImagePart` places a prompt-cache boundary at exactly that part, honored under either binding value; `system_prompt` also binds as a sequence of `TextPart`s, so a boundary can sit inside the frozen prefix.
+The anthropic adapter takes `cache_ttl` (`"5m"` default, `"1h"` at 2x write cost); `generate_many(conversations, warm_cache=True)` runs the first conversation to completion before admitting the rest, so a batch sharing a prefix pays one cache write instead of one per in-flight item.
+The wire mechanics, including the anthropic 4-marker budget, are in the two adapter module docstrings.
 
-**Success is a `Response`, failure is a `GenerationError`.**
-A generate that succeeds returns a frozen `Response[OutputT]` with every field present; one that ends terminally raises (or, in a batch, returns) a `GenerationError`.
-Its three leaves are the terminal per-item outcomes: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `MaxCompletionTokensExceededError` (the structured response hit the token cap before its JSON parsed).
-On the base, `stop_reason` is `StopReason | None`: `"refusal"` or `"max_tokens"` on those two leaves, `None` on `RetriesExhaustedError`, whose attempts never reached a completed turn.
-Both hold `attempt_records`, one `AttemptRecord` per request sent: raw `time.monotonic()` start and end readings bracketing the send only (slot waits and backoff sleeps excluded, so rate limiting is distinguishable from slow requests), the attempt's `TransientError` (None on the attempt that succeeded or a rejected 200), the attempt's `usage` (carrying `cost_in_usd`; `ZERO_USAGE` for a transport failure that billed nothing), and `usage_raw` (the raw SDK usage, None when no wire payload existed).
-On a `Response` every record but the last failed; on a `GenerationError` the records describe the terminal outcome.
-`attempts` is derived from the records on both.
-Both also carry `model`, `provider_name`, and `elapsed_seconds` (first request to completion, waits included, so stored rather than derived), so the module-level `to_row(result)` flattens either to the same scalar keys and a mixed list of successes and failures is one table.
-`usage` is the paid total across every attempt, folded from the records, on both `Response` and `GenerationError`: it is the number to bill on (its `cost_in_usd` is the money the call spent), so a refusal or truncation reports its real cost while a retry-exhausted item whose attempts billed nothing reports zero; `error_text` carries the failure reason.
-On a `Response`, `stop_reason`, `assistant_message`, and `raw` are always present; `usage_successful_attempt` is the single kept answer's own usage (the one matching `output` and `raw.usage`), equal to `usage` unless a billed 200 was retried (an empty structured parse retried as transient), in which case `usage` is larger by the retried attempt's billing.
-`raw` is the SDK's own response model held by reference; it is never dumped to a dict, because dumping deep-copies every response body per request.
-
-**One RateLimiter owns retrying and pacing.**
-`RateLimiter` holds `max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`, and `max_in_flight`; it is stateful and shareable, so one instance passed to several `LLM`s is one shared budget for the account they hit.
-Its slot gates every request start on every path (first attempts, retries, batch items, stream openings); backoff sleeps outside the slot.
-There is deliberately no `requests_per_minute`: an in-flight bound self-adjusts throughput along request duration, while a client-side rate number models one dimension of the provider's multi-dimensional limit and goes stale with the account tier.
-A rate-limit error (`Provider.classify` returning `"rate_limit"`, or any error naming a server-stated retry-after) pauses admission for everyone sharing the limiter: for the server-stated wait when one was sent (parsed from the `retry-after-ms` / `retry-after` headers onto `TransientError.retry_after_seconds`, capped at 60 seconds), else for the failing task's backoff delay.
-After the pause, admission stays limited to one probe request at a time until the probe succeeds; other transient errors (timeouts, 5xx) pause nobody, because they say nothing about the account's quota.
-
-**Retry stays in the package, classification in the adapter.**
-Adapters raise `TransientError`, `AbortBatchError`, or a `GenerationError` leaf directly where they know the answer: rate limits and overload (transient), a bad request (abort), and an empty structured parse, which splits three ways (a refusal is `RefusalError`, a token-cap truncation is `MaxCompletionTokensExceededError`, anything else is `TransientError`).
-The retry loop retries only `TransientError`; it honors the rest without asking.
-Unrecognized exceptions go through `Provider.classify`, which returns `"rate_limit"`, `"transient"`, or `"abort"`, and anything it does not recognize is abort.
-`generate_one` raises `RetriesExhaustedError` for transient exhaustion, `RefusalError` or `MaxCompletionTokensExceededError` on the structured path, and `AbortBatchError` for an abort classification; the first three share the `GenerationError` base a caller can catch at once.
-`generate_many` returns `list[Response[OutputT] | GenerationError]`, so a terminal per-item failure is a row in its slot rather than a raise, while an `AbortBatchError` still cancels the siblings and raises; results stay order-aligned.
-
-**Streaming is a handle.**
+**Streaming as a handle.**
 `stream_one` returns a `StreamHandle`: an async iterator of `StreamItem = str | ToolCall`, an idempotent `await handle.final()` returning the assembled `Response`, and an async context manager so abandoning a stream closes the connection.
-Text chunks are the provider SDK's own strings passed through without a wrapper class or copy, and each `ToolCall` is yielded once, complete, when its block closes.
-There are deliberately no tool-call delta items (a consumer cannot act on partial argument JSON, and both SDKs accumulate the arguments and hand over the finished call) and no usage or stop items (`usage` (carrying `cost_in_usd`) and `stop_reason` live on `final()`'s `Response`, and a bare-`str` stop reason could not share a union with bare-`str` text chunks).
-Connection failures before the first yielded item retry under the `RateLimiter`; after the first yielded item nothing retries, because replaying chunks the caller already consumed would duplicate output.
-An open stream holds one `RateLimiter` slot from opening until it closes or exhausts, so long-lived streams count against `max_in_flight`.
+Text chunks are the SDK's own strings passed through without a wrapper, and each `ToolCall` is yielded once, complete, when its block closes.
 
-**Tools are explicit, dispatch is owned.**
-A `PydanticTool` is an async function taking one pydantic model and returning str or a sequence of content parts (text and images the model then sees), plus an explicit name and description; the args model is the schema source, so there is no signature introspection and no docstring scraping.
-Tool content is model-facing, so it is exactly `MessageContent` (`str | Sequence[Part]`, the model-facing message body, aliased in `messages.py`): a function with a typed result serializes it to that form itself.
-A function may instead return a `ToolOutputExplicit` wrapping that content plus `is_error` and `app_data` (the app-facing channel, which does carry a typed `BaseModel` or `Mapping` the model never sees).
-`PydanticTool.validate_and_run` validates raw call JSON against `args_model` and runs the function; it lives on `PydanticTool` because there the args type parameter is concrete, so the validated arguments reach the function fully typed.
-`PydanticTool.dispatch` returns `DispatchHandled[AppDataT] | DispatchInvalidToolArgs`, so on the handled outcome a caller that dispatched a known tool reads `app_data` back at its concrete type with no `isinstance`.
-For a tool whose schema is a raw JSON schema and not a pydantic model (an MCP tool discovered at run time), `JSONSchemaTool` carries the JSON schema as `args_schema` (sent to the provider unchanged) and a function taking the parsed arguments as a `dict[str, object]` (the type dispatch builds; a `Mapping[str, object]` annotation is also accepted by contravariance); `dispatch` validates the arguments against `args_schema` with `jsonschema` (first that they are a JSON object, then the schema's field-level rules), so the function only ever sees valid arguments, a `JSONSchemaTool` failure renders through the same formatter as a `PydanticTool` failure, and wrapping an MCP tool needs no hand-written pydantic model or validation code per tool. `PydanticTool` and `JSONSchemaTool` share the `Tool` protocol (a `name`, a `schema()`, a `dispatch()`), so one `ToolManager` holds a mix of the two, and an application adds its own tool form by implementing `Tool`.
-`ToolManager` serializes the tools provider-neutrally, resolves the called name, and returns each outcome as a `DispatchOutcome`, a three-arm union over a heterogeneous tool set (where `app_data` erases to `BaseModel | Mapping[str, object] | None`): `DispatchHandled` carries the model-facing `ToolMessage` the caller appends to the conversation, paired with the function's `app_data` (data the model never sees); `DispatchInvalidToolArgs` carries a default `is_error` `ToolMessage` plus the neutral `InvalidToolArgsDetail` tuple as a required `details` field, so a caller that authors its own reply reads the per-failure paths and messages with no narrowing crutch; `DispatchUnknownTool` carries a default `is_error` `ToolMessage` naming the held tools plus the off-list `called_name`.
-Every arm carries `tool_message`, so a caller that only appends the reply reads `result.tool_message` with no `match`.
-An off-list tool name becomes a `DispatchUnknownTool` outcome rather than a raise, just like argument JSON the model got wrong becomes a `DispatchInvalidToolArgs` outcome: both are model data the model can correct (a provider can emit a name outside the sent schemas, and a rebind can strand an earlier turn's `tool_call`).
-`ToolManager.dispatch_many` dispatches one assistant turn's several tool calls concurrently and returns the outcomes in call order.
-A tool function exception is still a defect and still raises, but only after every sibling settles: the raise is a `DispatchExceptionGroup` (an `ExceptionGroup`, so every traceback prints and `except*` works) whose `completed_outcomes` carries the settled calls' outcomes, so `app_data` a completed sibling produced (a billing record for money the tool spent) survives the raise.
-Cancellation propagates bare, never grouped, and only after the cancelled sibling dispatches finish unwinding; defects co-occurring with it chain as its `__cause__` in a `DispatchExceptionGroup`, so they still surface.
-`tool_choice` is the neutral vocabulary `"auto" | "required" | SpecificToolChoice | "none"` (anthropic's `"any"` maps from `"required"`); `parallel_tool_calls: bool` maps to anthropic `disable_parallel_tool_use` and openai `parallel_tool_calls`.
+**Three tool forms under one protocol.**
+`PydanticTool` (an async function taking one validated `args_model` instance), `JSONSchemaTool` (a raw JSON `args_schema`, for tools discovered at run time such as MCP tools, with arguments validated against it by `jsonschema` before the function runs), and `CaptureTool` (no function; `capture` returns the validated `args_model` instance as `DispatchCaptured.captured`, the structured exit for a `tool_choice="required"` loop) share the `Tool` protocol, so one `ToolManager` holds a mix and an application adds its own form by implementing `Tool`.
+`ToolManager.dispatch` returns a `DispatchOutcome` union (`DispatchHandled`, `DispatchInvalidToolArgs`, `DispatchUnknownTool`); every arm carries the `tool_message` to append, and bad argument JSON or an off-list tool name becomes an outcome the model can correct rather than a raise.
+A tool function returns model-facing content, or `ToolOutputExplicit` adding `is_error` and `app_data`, a typed channel the model never sees.
+`dispatch_many` runs one turn's calls concurrently, returns outcomes in call order, and raises tool-function defects as a `DispatchExceptionGroup` only after every sibling settles.
 
-**The ReAct loop is a recipe, not vendored code.**
-There is no agent class.
-The loop is ~15 lines and is correct because the hard parts (retries, pacing, classification, validation) live below `generate_one` and `dispatch`, so a hand-copied loop cannot be subtly wrong.
-The non-streaming loop runs over `generate_one`; the streaming loop runs over `stream_one`, printing text chunks as they arrive and dispatching the completed `ToolCall`s between turns, reading `dispatch(call).tool_message` for the ToolMessage it appends and matching `DispatchHandled` for the function's model-invisible `app_data` or `DispatchInvalidToolArgs` for the `details`.
-Owning the loop is what lets a caller enforce a budget mid-run, stream tokens, or swap the binding on a tool result, none of which a fixed agent surface exposes.
+**Reasoning preserved across turns.**
+Each provider reasoning element becomes one `ReasoningTrace` in `AssistantMessage.turn`, re-sent verbatim on later requests, so tool-use continuations satisfy each provider's replay rules without application code.
+
+**OTel tracing as a wrapper.**
+`langchaint.tracing` (imports only opentelemetry-api) has `TracedLLM`, `TracedBoundLLM`, `TracedStreamHandle`, and `TracedToolManager`; attribute mappers own span attribute names and never receive the conversation, so no built-in mapper can leak a prompt.
+
+## What it does not have
+
+Each absence is deliberate; the reasons are recorded in `CLAUDE.md` and the module docstrings.
+
+- No agent class or library-owned tool loop: the loop is ~15 lines of application code over `generate_one` (or `stream_one`) and `dispatch`, shown in `examples/02_tool_loop.py`, and a tool returns data, never a control-flow signal, so stop, route, and escalate stay decisions the application makes between turns.
+- No per-call parameter overrides: changing parameters is `rebind`.
+- No default for `automatic_prompt_caching`: every `bind` states it.
+- No `requests_per_minute`: the `max_in_flight` bound self-adjusts throughput along request duration, while a client-side rate number goes stale with the account tier.
+- No Chat Completions adapter and no third-party chat-completions-compatible servers (vLLM, Ollama): OpenAI support is the Responses API only.
+- No Converse adapter for Bedrock: Bedrock is served through the SDKs' bundled clients.
+- No provider-parameter passthrough dict: `InferenceParams` is `max_completion_tokens`, `reasoning_effort`, and `temperature` (no `top_p`, no `seed`), and an unmapped provider parameter is reached by subclassing the adapter.
+- No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, SDK objects ride by reference instead of being copied into same-shaped package objects, and invalid inputs are sent so the provider's own error surfaces.
+- No tool-call delta stream items and no usage or stop stream items: a stream yields `str | ToolCall`, and `usage` and `stop_reason` live on `final()`'s `Response`.
+- No extras and no bundled SDKs: the application pins `anthropic`, `openai`, or `opentelemetry-api` itself, and only the subpackage imports require them.
 
 ## Layout
 
-    CLAUDE.md                design, naming, and review rules
-    README.md                this file
-    src/langchaint/
-        messages.py          message and part models, StopReason
-        usage.py             Usage counters
-        pricing.py           PriceableCounts, CostBreakdown, price
-        inference_params.py  InferenceParams
-        exceptions.py        error vocabulary: TransientError,
-                             AbortBatchError, AttemptRecord,
-                             GenerationError and its leaves
-        response.py          Response[OutputT], to_row
-        rate_limiter.py      RateLimiter
-        tools.py             Tool, PydanticTool, JSONSchemaTool,
-                             ToolSchema, ToolManager
-        provider.py          Binding, ToolChoice, PricingTable,
-                             StreamItem, ProviderResult,
-                             ProviderStream, BoundProvider, Provider
-        streaming.py         StreamHandle
-        llm.py               LLM, BoundLLM, the retry loop
-        anthropic/           the anthropic backend (needs the anthropic
-                             SDK): __init__ has anthropic_model,
-                             ANTHROPIC_PRICING, AnthropicModelName,
-                             cost_breakdown; messages_provider.py has
-                             the adapter AnthropicMessagesProvider
-        openai/              the openai backend (needs the openai SDK):
-                             __init__ has openai_model, OPENAI_PRICING,
-                             OpenAIModelName, cost_breakdown;
-                             responses_provider.py has the adapter
-                             OpenAIResponsesProvider
-        tracing/             OTel span tracing (needs opentelemetry-api):
-                             __init__ has
-                             TracedLLM, TracedBoundLLM, TracedStreamHandle
+    src/langchaint/           the neutral core (imports no SDK): llm.py, messages.py, tools.py, rate_limiter.py, exceptions.py, response.py, streaming.py, usage.py, pricing.py, inference_params.py, provider.py, checked_copy.py
+    src/langchaint/anthropic/ the anthropic backend: anthropic_model, anthropic_bedrock_model, pricing tables, AnthropicMessagesProvider
+    src/langchaint/openai/    the openai backend: openai_model, OPENAI_PRICING, OpenAIResponsesProvider
+    src/langchaint/tracing/   the OTel tracing subpackage
+    examples/                 runnable examples and MIGRATING_FROM_LANGCHAIN.md
+    CLAUDE.md                 design tenets, naming rules, and the per-module map
+
+Module docstrings are the spec of record for mechanics; `CLAUDE.md` holds the design rules and the reasons behind each deliberate absence.
 
 ## Verification
 
-Run `scripts/CI.sh`; it runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the tools resolve from the locked dev dependency group, not a hand-activated `.venv`.
-All must pass with zero errors.
+Run `scripts/CI.sh`; it runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the tools resolve from the locked dev dependency group, and all must pass with zero errors.
 The tests are offline: they feed constructed SDK objects into the adapter helpers and drive `BoundLLM`/`StreamHandle` with stub providers, so they need no API keys.

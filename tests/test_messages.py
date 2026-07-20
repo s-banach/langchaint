@@ -62,19 +62,35 @@ def test_validation_selects_the_member_from_the_role_tag() -> None:
 
 
 def test_turn_elements_validate_by_field_match() -> None:
-    """TurnElement has no discriminator: the three members' disjoint field sets select the type.
+    """TurnElement has no discriminator: matching the most fields selects the type.
 
     A persisted turn whose dicts re-validate to the wrong member would silently corrupt replay.
+    ReasoningTrace and TextPart share a text field, so the reasoning key is what separates them,
+    and it separates them by fields matched rather than by failing TextPart validation:
+    TextPart ignores extra keys, so it accepts the two-key dict on its own and still loses.
     """
     message = AssistantMessage.model_validate({
         "role": "assistant",
         "turn": [
-            {"reasoning": {"type": "reasoning", "id": "rs_1"}},
+            {"reasoning": {"type": "reasoning", "id": "rs_1"}, "text": "thought it over"},
+            {"reasoning": {"type": "reasoning", "id": "rs_2"}},
             {"text": "hi"},
             {"id": "c1", "name": "probe", "args_json": "{}"},
         ],
     })
-    assert [type(element) for element in message.turn] == [ReasoningTrace, TextPart, ToolCall]
+    assert [type(element) for element in message.turn] == [
+        ReasoningTrace,
+        ReasoningTrace,
+        TextPart,
+        ToolCall,
+    ]
+    with_text, without_text = message.turn[0], message.turn[1]
+    assert isinstance(with_text, ReasoningTrace)
+    assert isinstance(without_text, ReasoningTrace)
+    assert with_text.text == "thought it over"
+    assert without_text.text is None
+    accepted_alone = TextPart.model_validate({"reasoning": {}, "text": "thought it over"})
+    assert accepted_alone.text == "thought it over"
 
 
 def test_validation_without_a_role_tag_is_rejected() -> None:

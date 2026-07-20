@@ -1531,6 +1531,66 @@ class _ReasoningOnlyProvider(_FakeProvider):
         return _ReasoningOnlyBoundProvider()
 
 
+class _EmptyTextTurnBoundProvider(_FakeBoundProvider):
+    """A bound provider whose success carries an empty-text trace beside an empty TextPart."""
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+        """Return a result whose turn holds one empty-text ReasoningTrace and one empty TextPart."""
+        return ProviderResult(
+            output="",
+            assistant_message=AssistantMessage(
+                turn=(
+                    ReasoningTrace(reasoning={"signature": "opaque"}, text=""),
+                    TextPart(text=""),
+                )
+            ),
+            usage=_USAGE,
+            usage_raw=_FAKE_RAW_USAGE,
+            stop_reason="end_turn",
+            raw=_FakeRawResponse(),
+        )
+
+
+class _EmptyTextTurnProvider(_FakeProvider):
+    """A provider handing out bound providers whose turn elements all carry empty text."""
+
+    @override
+    def bind_text(self, binding: Binding) -> BoundProvider[str]:
+        """Hand out the empty-text bound provider."""
+        return _EmptyTextTurnBoundProvider()
+
+
+class _ReasoningWithTextBoundProvider(_FakeBoundProvider):
+    """A bound provider whose success carries reasoning with readable text, then text."""
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+        """Return a result whose turn holds one texted ReasoningTrace and one TextPart."""
+        return ProviderResult(
+            output="answer",
+            assistant_message=AssistantMessage(
+                turn=(
+                    ReasoningTrace(reasoning={"signature": "opaque"}, text="thought it over"),
+                    TextPart(text="answer"),
+                )
+            ),
+            usage=_USAGE,
+            usage_raw=_FAKE_RAW_USAGE,
+            stop_reason="end_turn",
+            raw=_FakeRawResponse(),
+        )
+
+
+class _ReasoningWithTextProvider(_FakeProvider):
+    """A provider handing out bound providers whose reasoning carries readable text."""
+
+    @override
+    def bind_text(self, binding: Binding) -> BoundProvider[str]:
+        """Hand out the reasoning-with-text bound provider."""
+        return _ReasoningWithTextBoundProvider()
+
+
 def _captured(exporter: InMemorySpanExporter, key: str) -> object:
     """Read one span's JSON content attribute back as Python data."""
     (span,) = exporter.get_finished_spans()
@@ -1680,11 +1740,11 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
     asyncio.run(scenario())
 
 
-def test_reasoning_is_excluded_leaving_an_empty_parts_array() -> None:
-    """A turn of reasoning alone still emits its message, with parts emptied by the exclusion.
+def test_text_free_reasoning_is_excluded_leaving_an_empty_parts_array() -> None:
+    """A turn of text-free reasoning alone still emits its message, with parts emptied by the exclusion.
 
     The empty array is the deliberate exception to the omit-an-absent-source rule:
-    there was an assistant turn, and excluding reasoning is what emptied it.
+    there was an assistant turn, and it held nothing the convention's parts can carry.
     """
 
     async def scenario() -> None:
@@ -1696,6 +1756,59 @@ def test_reasoning_is_excluded_leaving_an_empty_parts_array() -> None:
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
             {"role": "assistant", "parts": [], "finish_reason": "stop"}
+        ]
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert "opaque" not in str(span.attributes["gen_ai.output.messages"])
+
+    asyncio.run(scenario())
+
+
+def test_empty_text_is_excluded_from_reasoning_and_text_parts_alike() -> None:
+    """An empty-text trace and an empty TextPart both emit no part, so neither reaches a span.
+
+    Adapters store None rather than "" and drop empty text on the wire side, so this is the
+    app-constructed turn: both convention parts require a content string, and an empty one
+    carries nothing.
+    """
+
+    async def scenario() -> None:
+        """Generate a turn of empty-text elements and read the output messages back."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_EmptyTextTurnProvider()), tracer=tracer, capture_message_content=True
+        )
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        assert _captured(exporter, "gen_ai.output.messages") == [
+            {"role": "assistant", "parts": [], "finish_reason": "stop"}
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
+    """A trace carrying text emits the convention's reasoning part holding exactly that text.
+
+    The opaque reasoning payload stays off the span whether or not the trace has text,
+    so the part carries the readable copy and never the signature beside it.
+    """
+
+    async def scenario() -> None:
+        """Generate a turn holding a texted trace and a TextPart, and read the messages back."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_ReasoningWithTextProvider()), tracer=tracer, capture_message_content=True
+        )
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        assert _captured(exporter, "gen_ai.output.messages") == [
+            {
+                "role": "assistant",
+                "parts": [
+                    {"type": "reasoning", "content": "thought it over"},
+                    {"type": "text", "content": "answer"},
+                ],
+                "finish_reason": "stop",
+            }
         ]
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None

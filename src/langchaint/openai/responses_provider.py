@@ -35,6 +35,12 @@ Verified against openai 2.45.0:
   so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`.
   The SDK documents `include` as what populates `encrypted_content`;
   a live run on 2026-07-17 saw it populated without the flag, undocumented behavior the adapter does not rely on.
+- `reasoning.summary` carries the constructor's `reasoning_summary`.
+  The SDK types it as "auto", "concise", or "detailed" and describes it as a summary of the reasoning
+  the model performed; `generate_summary` carries the same values and the SDK marks it deprecated in
+  favor of `summary`, so it is never sent.
+  `reasoning.effort` and `reasoning.summary` are assembled key by key so an unset one is omitted
+  rather than sent as an explicit null.
 
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;
@@ -74,6 +80,7 @@ from openai.types.responses import (
     ResponseInputMessageContentListParam,
     ResponseInputTextContentParam,
     ResponseInputTextParam,
+    ResponseReasoningItem,
     ResponseUsage,
     ToolChoiceFunctionParam,
 )
@@ -99,6 +106,7 @@ from langchaint.exceptions import (
     StreamProtocolError,
     TransientError,
 )
+from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
     ImagePart,
@@ -131,6 +139,27 @@ from langchaint.usage import ZERO_USAGE, Usage
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
+
+type ReasoningSummary = Literal["auto", "concise", "detailed"]
+"""How much readable text to ask the API for, the values reasoning.summary takes."""
+
+
+def _wire_reasoning(
+    effort: ReasoningEffort | None, summary: ReasoningSummary | None
+) -> Reasoning | Omit:
+    """Assemble the reasoning object from the keys that are set, omitting it when neither is.
+
+    Reasoning is a total=False TypedDict whose effort and summary are both Optional, so passing None
+    type-checks and sends an explicit null, a different request from omitting the key.
+    The other keys the TypedDict carries (context, mode, and the deprecated generate_summary alias
+    of summary) are not mapped, so they are never sent.
+    """
+    reasoning: Reasoning = {}
+    if effort is not None:
+        reasoning["effort"] = effort
+    if summary is not None:
+        reasoning["summary"] = summary
+    return reasoning or omit
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -353,10 +382,33 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
             return "other"
 
 
+def _reasoning_text(item: ResponseReasoningItem) -> str | None:
+    """Join a reasoning item's readable text, None when it holds none.
+
+    The text arrives as summary parts, several per item: the SDK types summary as a list, and the
+    stream carries one summary_index per part, each accumulating its own text deltas, so a part is a
+    separately delimited unit and the parts join on a blank line rather than concatenating into one run.
+    Asking for a summary is what the constructor's reasoning_summary does.
+
+    summary wins over content where both hold text, because summary is the list the request asks for.
+    content is read at all because the SDK models it as a list of reasoning_text elements and ships
+    delta and done events for it; which of the two a given model fills is request-time behavior SDK
+    introspection cannot show, so the adapter reads both.
+    Reading only summary would drop returned text into an unreportable None.
+
+    Empty parts are dropped before the join, so an item whose parts are all empty yields None
+    rather than the separator alone; text-free stays the single condition text is None.
+    """
+    summary = "\n\n".join(part.text for part in item.summary if part.text)
+    content = "\n\n".join(part.text for part in item.content or () if part.text)
+    return summary or content or None
+
+
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     """Build the package assistant turn from the output items, item order preserved.
 
-    A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay;
+    A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay,
+    beside the readable text _reasoning_text extracts from it;
     a message item becomes one TextPart per output_text content part it holds, in their order
     (a refusal content part is not a TextPart and is not captured);
     built-in tool call items are dropped (built-in tools are out of scope).
@@ -365,7 +417,10 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     for item in response.output:
         if item.type == "reasoning":
             turn.append(
-                ReasoningTrace(reasoning=item.model_dump(mode="python", exclude_none=True))
+                ReasoningTrace(
+                    reasoning=item.model_dump(mode="python", exclude_none=True),
+                    text=_reasoning_text(item),
+                )
             )
         elif item.type == "function_call":
             turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
@@ -468,15 +523,23 @@ class OpenAIResponsesProvider(Provider):
         client: AsyncOpenAI | AsyncBedrockOpenAI,
         model: str,
         pricing: PricingTable,
+        reasoning_summary: ReasoningSummary | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
         The stored client is a with_options(max_retries=0) copy: the package's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
+
+        reasoning_summary asks the API for readable text, which arrives on each
+        ReasoningTrace.text and on the traced conversation; None sends no summary field and leaves
+        the provider default in place. A model may return no summary even when one is requested.
+        It is a constructor parameter rather than an InferenceParams field because InferenceParams
+        is neutral and anthropic has no reasoning summary of its own.
         """
         super().__init__(model=model, pricing=pricing)
         self.client = client.with_options(max_retries=0)
+        self.reasoning_summary = reasoning_summary
 
     def _request(self, binding: Binding) -> _OpenAIRequest:
         """Precompute the typed request fields the binding determines.
@@ -519,10 +582,8 @@ class OpenAIResponsesProvider(Provider):
                 if binding.inference_params.temperature is not None
                 else omit
             ),
-            reasoning=(
-                Reasoning(effort=binding.inference_params.reasoning_effort)
-                if binding.inference_params.reasoning_effort is not None
-                else omit
+            reasoning=_wire_reasoning(
+                binding.inference_params.reasoning_effort, self.reasoning_summary
             ),
             tools=tools,
             tool_choice=tool_choice,

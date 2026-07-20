@@ -33,7 +33,11 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.llm import LLM
-from langchaint.openai.responses_provider import OpenAIResponsesProvider, cost_breakdown
+from langchaint.openai.responses_provider import (
+    OpenAIResponsesProvider,
+    ReasoningSummary,
+    cost_breakdown,
+)
 from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
@@ -108,6 +112,7 @@ def openai_model(
     client: AsyncOpenAI | AsyncBedrockOpenAI | None = None,
     pricing: PricingTable | None = None,
     rate_limiter: RateLimiter | None = None,
+    reasoning_summary: ReasoningSummary | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on the Responses API.
 
@@ -116,12 +121,15 @@ def openai_model(
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
+    reasoning_summary asks the API for readable text, which arrives on each
+    ReasoningTrace.text; None leaves the provider default in place.
     """
     return LLM(
         OpenAIResponsesProvider(
             client=client if client is not None else AsyncOpenAI(),
             model=model,
             pricing=pricing if pricing is not None else OPENAI_PRICING[model],
+            reasoning_summary=reasoning_summary,
         ),
         rate_limiter=rate_limiter,
     )
@@ -131,6 +139,7 @@ __all__ = [
     "OPENAI_PRICING",
     "OpenAIModelName",
     "OpenAIResponsesProvider",
+    "ReasoningSummary",
     "cost_breakdown",
     "openai_model",
 ]

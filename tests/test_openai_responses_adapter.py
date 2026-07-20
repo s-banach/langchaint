@@ -46,6 +46,7 @@ from langchaint import (
     InferenceParams,
     MaxCompletionTokensExceededError,
     PricingTable,
+    ReasoningEffort,
     ReasoningTrace,
     RefusalError,
     SpecificToolChoice,
@@ -56,7 +57,7 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.exceptions import StreamProtocolError, TransientError
-from langchaint.openai import OpenAIResponsesProvider, cost_breakdown
+from langchaint.openai import OpenAIResponsesProvider, ReasoningSummary, cost_breakdown
 from langchaint.openai.responses_provider import (
     _assistant_items,
     _assistant_message_from,
@@ -297,6 +298,102 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     }
 
 
+def _reasoning_item(
+    *, summary: tuple[str, ...] = (), content: tuple[str, ...] | None = None
+) -> dict[str, object]:
+    """Build a reasoning output item whose summary and content hold the given texts."""
+    item: dict[str, object] = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": text} for text in summary],
+    }
+    if content is not None:
+        item["content"] = [{"type": "reasoning_text", "text": text} for text in content]
+    return item
+
+
+def test_one_summary_part_becomes_the_trace_text() -> None:
+    """A single summary part lands on the trace verbatim."""
+    response = _response(usage=None, output=[_reasoning_item(summary=("thought it over",))])
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "thought it over"
+
+
+def test_several_summary_parts_join_on_a_blank_line() -> None:
+    """Summary parts join on a blank line, because each is a separately delimited unit.
+
+    Joining on the empty string runs one part's last line into the next one's first.
+    """
+    response = _response(
+        usage=None,
+        output=[
+            _reasoning_item(
+                summary=("**Reading the question**\n\nFirst.", "**Answering**\n\nThen.")
+            )
+        ],
+    )
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "**Reading the question**\n\nFirst.\n\n**Answering**\n\nThen."
+
+
+def test_summary_wins_over_content_when_both_hold_text() -> None:
+    """Both lists populated take the summary, the one the request asks for.
+
+    Reading content first, or concatenating the two, passes every other case here,
+    so this is what pins the precedence.
+    """
+    response = _response(
+        usage=None,
+        output=[_reasoning_item(summary=("the summary",), content=("the content",))],
+    )
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "the summary"
+
+
+def test_content_supplies_the_text_when_the_summary_is_empty() -> None:
+    """An empty summary falls back to the content parts rather than dropping returned text."""
+    response = _response(usage=None, output=[_reasoning_item(content=("worked it out",))])
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "worked it out"
+
+
+def test_a_reasoning_item_holding_no_text_leaves_the_trace_text_none() -> None:
+    """Empty summary and content leave text None, the no-readable-text signal."""
+    response = _response(usage=None, output=[_reasoning_item()])
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text is None
+
+
+def test_parts_that_are_all_empty_leave_the_trace_text_none() -> None:
+    r"""Several empty parts yield None, not the separator they would otherwise join into.
+
+    Present-but-empty parts are the case a trailing falsy check alone misses:
+    two of them join into "\n\n", which is truthy, so it would reach a span as a
+    reasoning part carrying nothing.
+    """
+    response = _response(usage=None, output=[_reasoning_item(summary=("", ""))])
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text is None
+    content_only = _response(usage=None, output=[_reasoning_item(content=("", ""))])
+    content_trace = _assistant_message_from(content_only).turn[0]
+    assert isinstance(content_trace, ReasoningTrace)
+    assert content_trace.text is None
+
+
+def test_an_empty_part_beside_a_real_one_drops_out_of_the_join() -> None:
+    """An empty part contributes no leading or trailing blank line to the joined text."""
+    response = _response(usage=None, output=[_reasoning_item(summary=("", "real"))])
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "real"
+
+
 def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
     """A message item with two text parts yields two adjacent TextParts.
 
@@ -435,10 +532,13 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {"type": "function", "name": "x"}
 
 
-def _provider() -> OpenAIResponsesProvider:
+def _provider(*, reasoning_summary: ReasoningSummary | None = None) -> OpenAIResponsesProvider:
     """Build an adapter over a keyless client, valid because no request is sent."""
     return OpenAIResponsesProvider(
-        client=AsyncOpenAI(api_key="test"), model="m", pricing=_PRICING
+        client=AsyncOpenAI(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        reasoning_summary=reasoning_summary,
     )
 
 
@@ -446,16 +546,55 @@ def _binding(
     *,
     automatic_prompt_caching: bool,
     system_prompt: str | tuple[TextPart, ...] | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> Binding:
-    """Assemble a toolless binding varying only caching and the system prompt."""
+    """Assemble a toolless binding varying only caching, the system prompt, and reasoning effort."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=(),
         tool_choice="auto",
         parallel_tool_calls=True,
-        inference_params=InferenceParams(),
+        inference_params=InferenceParams(reasoning_effort=reasoning_effort),
         automatic_prompt_caching=automatic_prompt_caching,
     )
+
+
+def test_request_sends_a_summary_alone_when_no_effort_is_bound() -> None:
+    """reasoning_summary alone still sends the reasoning object, holding only the summary key.
+
+    A summary is reached through the same object effort travels in, so gating that object on effort
+    would silently ask for no summary whenever a caller set one without an effort.
+    """
+    request = _provider(reasoning_summary="detailed")._request(
+        _binding(automatic_prompt_caching=True)
+    )
+    assert request.reasoning == {"summary": "detailed"}
+
+
+def test_request_sends_an_effort_alone_without_a_summary_key() -> None:
+    """A bound effort with no summary sends the effort key and no summary key.
+
+    An explicit null summary is a different request from omitting the key,
+    which is what key-by-key assembly buys over one Reasoning(effort=..., summary=...) call.
+    """
+    request = _provider()._request(
+        _binding(automatic_prompt_caching=True, reasoning_effort="high")
+    )
+    assert request.reasoning == {"effort": "high"}
+
+
+def test_request_sends_both_reasoning_keys_when_both_are_set() -> None:
+    """Effort and summary set together travel in one reasoning object."""
+    request = _provider(reasoning_summary="auto")._request(
+        _binding(automatic_prompt_caching=True, reasoning_effort="low")
+    )
+    assert request.reasoning == {"effort": "low", "summary": "auto"}
+
+
+def test_request_omits_reasoning_when_neither_key_is_set() -> None:
+    """Neither key set leaves reasoning at the omit sentinel, sending no reasoning object."""
+    request = _provider()._request(_binding(automatic_prompt_caching=True))
+    assert isinstance(request.reasoning, openai.Omit)
 
 
 def test_request_omits_prompt_cache_options_under_automatic_caching() -> None:

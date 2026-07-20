@@ -47,6 +47,9 @@ Mapping decisions:
   The value passes through as given, wider than the SDK's effort literal
   (ReasoningEffort is the union of both providers' vocabularies, and openai's "none"/"minimal" are outside it),
   and a model or value the API rejects surfaces as the provider's own error.
+  `thinking.display` is never sent: it takes `"summarized"` or `"omitted"` and chooses whether thinking
+  text is returned or redacted, and the SDK documents the default as `"summarized"`, which returns it,
+  so the adapter leaves the default in place rather than opting into redaction.
 """
 
 import base64
@@ -420,6 +423,9 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
 
     A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
     model_dump for verbatim replay; server tool blocks are dropped (built-in tools are out of scope).
+    The two reasoning block types get an arm each because only thinking carries readable text:
+    a redacted_thinking block holds an opaque string under data and nothing a reader can display,
+    so its trace has no text.
     """
     turn: list[TurnElement] = []
     for block in message.content:
@@ -429,7 +435,14 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
             turn.append(
                 ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
             )
-        elif block.type in ("thinking", "redacted_thinking"):
+        elif block.type == "thinking":
+            turn.append(
+                ReasoningTrace(
+                    reasoning=block.model_dump(mode="python", exclude_none=True),
+                    text=block.thinking or None,
+                )
+            )
+        elif block.type == "redacted_thinking":
             turn.append(
                 ReasoningTrace(reasoning=block.model_dump(mode="python", exclude_none=True))
             )

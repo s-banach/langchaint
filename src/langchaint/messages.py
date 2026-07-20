@@ -114,17 +114,31 @@ class ReasoningTrace(CheckedCopyModel):
     and for prompt caching:
     reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
     The dict field makes this model unhashable, unlike its frozen siblings; messages are never hashed.
+
+    text is the provider's readable text, assembled from text already inside reasoning
+    and adding nothing reasoning does not hold;
+    reasoning alone is what the adapter replays, so editing text changes what telemetry and an
+    application display and never changes the request.
+    None means no readable text came back: an anthropic redacted_thinking block (which carries only
+    an opaque string), an anthropic thinking block whose thinking is empty, or an openai response
+    holding neither a reasoning summary nor reasoning content.
+    No adapter stores the empty string, so text-free is the single condition text is None.
     """
 
     model_config = ConfigDict(frozen=True)
 
     reasoning: Mapping[str, object]
+    text: str | None = None
 
 
 type TurnElement = ReasoningTrace | TextPart | ToolCall
 """One element of an assistant turn, ordered as the provider emitted them.
-The three members have disjoint field sets, so pydantic selects the member by field match
-on re-validation of a persisted conversation, like the Part union.
+ReasoningTrace and TextPart both carry a text field, so pydantic selects among the three by
+matching the most fields on re-validation of a persisted conversation:
+an element carrying reasoning is a ReasoningTrace and one carrying text alone is a TextPart.
+TextPart accepts the two-key form on its own, ignoring the extra key as every model here does,
+and loses the selection on fields matched rather than on validation failure,
+in either union member order.
 TextPart, not Part: assistant turns still return no images.
 """
 

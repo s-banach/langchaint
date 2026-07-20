@@ -351,6 +351,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         "thinking": "check first",
         "signature": "sig-1",
     }
+    assert reasoning_trace.text == "check first"
     assert assistant_message.text == "hello"
     assert assistant_message.tool_calls == (
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
@@ -367,12 +368,34 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     }
 
 
+def test_empty_thinking_text_normalizes_to_none() -> None:
+    """A thinking block whose text is "" yields text None, the single text-free condition.
+
+    The openai adapter cannot produce "", so storing it here would make a text-free trace
+    two values to test for, one of them provider-specific.
+    """
+    message = _message_with_content([
+        at.ThinkingBlock(type="thinking", thinking="", signature="sig")
+    ])
+    reasoning_trace = _assistant_message_from(message).turn[0]
+    assert isinstance(reasoning_trace, ReasoningTrace)
+    assert reasoning_trace.text is None
+    assert reasoning_trace.reasoning["thinking"] == ""
+
+
 def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
-    """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire."""
+    """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire.
+
+    Its trace carries no text: the block holds an opaque string under data and nothing readable,
+    which is the arm that exists because a redacted block has no text to carry.
+    """
     message = _message_with_content([
         at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes")
     ])
     assistant_message = _assistant_message_from(message)
+    reasoning_trace = assistant_message.turn[0]
+    assert isinstance(reasoning_trace, ReasoningTrace)
+    assert reasoning_trace.text is None
     assert _assistant_content_blocks(assistant_message) == [
         {"type": "redacted_thinking", "data": "opaque-bytes"}
     ]

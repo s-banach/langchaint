@@ -57,8 +57,8 @@ asserts every gen_ai.* literal below against that revision's constants.
 The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT);
 the tool-execution operation value is "execute_tool" (GenAiOperationNameValues.EXECUTE_TOOL),
 and the tool span's identity keys are gen_ai.tool.name and gen_ai.tool.call.id.
-This module emits reasoning only as the counter gen_ai.usage.reasoning.output_tokens;
-the payload schemas do define a reasoning message part, and _turn_parts records why nothing fills it.
+Reasoning reaches a span as the counter gen_ai.usage.reasoning.output_tokens and, where the provider
+returned readable text, as the payload schemas' ReasoningPart; _turn_parts documents when it appears.
 Content payload shapes are verified against the JSON schemas the convention attaches to the attributes
 whose semconv type is any. GenAI moved out of open-telemetry/semantic-conventions and publishes no
 package-registry artifact, so those schemas are not in the tree the pinned package ships and cannot be
@@ -103,6 +103,7 @@ from langchaint.llm import (
 from langchaint.messages import (
     Message,
     Part,
+    ReasoningTrace,
     StopReason,
     TextPart,
     ToolCall,
@@ -325,18 +326,25 @@ def _tool_call_arguments(args_json: str) -> object:
 def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
     """Render an assistant turn as the convention's parts array, in emission order.
 
-    ReasoningTrace elements are skipped: the payload is the producing SDK item's model_dump,
-    opaque by construction (an anthropic signature that may be redacted, an openai encrypted_content),
-    so shipping it buys a reader nothing.
-    The convention's ReasoningPart does not take it either: that part requires a content string holding
-    reasoning text, which is what a provider withholds wherever it hands back a signature or a
-    ciphertext instead.
-    A turn holding only reasoning therefore renders as an empty parts array, not as a missing message.
+    A ReasoningTrace renders as the convention's ReasoningPart and a TextPart as the convention's
+    TextPart, each carrying its text. An element whose text is absent or empty renders as nothing,
+    since both parts require a content string and an empty one carries nothing;
+    the two adapters drop empty text on the wire side likewise.
+    The reasoning payload itself is never emitted: it is the
+    producing SDK item's model_dump, opaque by construction (an anthropic signature that may be
+    redacted, an openai encrypted_content), so shipping it buys a reader nothing, and ReasoningPart
+    takes a content string rather than an opaque object.
+    A turn holding only text-free elements therefore renders as an empty parts array,
+    not as a missing message.
     """
     parts: list[dict[str, object]] = []
     for element in turn:
-        if isinstance(element, TextPart):
-            parts.append({"type": "text", "content": element.text})
+        if isinstance(element, ReasoningTrace):
+            if element.text:
+                parts.append({"type": "reasoning", "content": element.text})
+        elif isinstance(element, TextPart):
+            if element.text:
+                parts.append({"type": "text", "content": element.text})
         elif isinstance(element, ToolCall):
             parts.append({
                 "type": "tool_call",

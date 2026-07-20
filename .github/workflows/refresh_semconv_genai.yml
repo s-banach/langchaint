@@ -1,0 +1,98 @@
+name: Refresh GenAI schemas
+
+# The vendored GenAI payload schemas under tests/semconv_genai are a copy of files that no package
+# registry publishes, so no dependency update surfaces a change to them. This job is that signal:
+# monthly it refetches them and, when they moved, runs the gate and opens a pull request carrying
+# the diff and the result.
+# The gate runs here rather than on the pull request because a pull request opened with GITHUB_TOKEN
+# does not trigger workflow runs, so this job's own status is the green-or-red answer.
+
+on:
+  schedule:
+    # 07:00 UTC on the 1st of each month.
+    - cron: "0 7 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: semconv-genai-refresh
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      # Zero arguments: the upstream repository, file list, and destination are constants in the script.
+      - name: Refresh the vendored schemas
+        run: uv run python -m scripts.refresh_semconv_genai
+
+      # Drift is measured on the schemas alone. SOURCE.md carries the fetched sha, which changes on
+      # every upstream commit including the many that touch no schema, so including it here would
+      # open a pull request monthly regardless of whether anything this package depends on moved.
+      # When only the sha moved, the rewritten SOURCE.md is discarded and its recorded commit stays
+      # the one whose schema bytes are actually vendored.
+      - name: Detect whether the schemas moved
+        id: drift
+        run: |
+          if git diff --quiet -- 'tests/semconv_genai/*.json'; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            echo "The vendored schemas match upstream; nothing to do."
+            git checkout -- tests/semconv_genai/SOURCE.md
+          else
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            git diff --stat -- tests/semconv_genai
+          fi
+
+      # The gate decides what the pull request means: failing names the payload that no longer
+      # conforms, passing says every payload still validates, which is weaker (see the verdict below).
+      # Its exit code is kept for the final step so the pull request is opened either way and the job
+      # still reports the failure.
+      - name: Run the gate against the refreshed schemas
+        if: steps.drift.outputs.moved == 'true'
+        id: gate
+        continue-on-error: true
+        run: bash scripts/CI.sh
+
+      - name: Open or update the pull request
+        if: steps.drift.outputs.moved == 'true'
+        run: |
+          set -euo pipefail
+          # A passing gate is not full conformance, and the limit travels with the claim rather than
+          # sitting in the test file: each anyOf over element types ends in a catch-all arm, so a
+          # renamed type const on an arm this package emits still validates through that arm.
+          if [ "${{ steps.gate.outcome }}" = "success" ]; then
+            verdict="The gate passes: every payload still validates. That does not cover a renamed element type, because the schemas' catch-all arms admit unrecognized ones, so read the diff for \`const\` and \`required\` changes on the arms this package emits (TextPart, ToolCallRequestPart, ToolCallResponsePart, FunctionToolDefinition)."
+          else
+            verdict="The gate FAILS. A payload the tracing module emits no longer conforms; the run log names the attribute and the schema."
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add tests/semconv_genai
+          git commit -m "Refresh the vendored GenAI payload schemas"
+          git push --force origin "$BRANCH"
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --head "$BRANCH" --base main \
+              --title "Refresh the vendored GenAI payload schemas" \
+              --body "$verdict"$'\n\n'"Opened by .github/workflows/refresh_semconv_genai.yml. The diff is upstream's; \`tests/semconv_genai/SOURCE.md\` records the new commit."
+          else
+            gh pr comment "$BRANCH" --body "Refreshed again. $verdict"
+          fi
+
+      # continue-on-error above keeps the pull request step reachable, so the gate's verdict is
+      # re-raised here to decide the job's own status.
+      - name: Report the gate's verdict
+        if: steps.drift.outputs.moved == 'true' && steps.gate.outcome != 'success'
+        run: |
+          echo "The refreshed schemas fail the gate; see the pull request." >&2
+          exit 1

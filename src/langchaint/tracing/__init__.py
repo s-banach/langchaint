@@ -57,11 +57,15 @@ asserts every gen_ai.* literal below against that revision's constants.
 The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT);
 the tool-execution operation value is "execute_tool" (GenAiOperationNameValues.EXECUTE_TOOL),
 and the tool span's identity keys are gen_ai.tool.name and gen_ai.tool.call.id.
-The pinned revision defines no reasoning message part;
-reasoning appears only as the counter gen_ai.usage.reasoning.output_tokens.
-Content payload shapes are verified against the JSON schemas in open-telemetry/semantic-conventions-genai at main,
-fetched 2026-07-20; GenAI moved out of open-telemetry/semantic-conventions,
-so those schemas are not in the tree the pinned package ships and cannot be pinned in pyproject.toml.
+This module emits reasoning only as the counter gen_ai.usage.reasoning.output_tokens;
+the payload schemas do define a reasoning message part, and _turn_parts records why nothing fills it.
+Content payload shapes are verified against the JSON schemas the convention attaches to the attributes
+whose semconv type is any. GenAI moved out of open-telemetry/semantic-conventions and publishes no
+package-registry artifact, so those schemas are not in the tree the pinned package ships and cannot be
+pinned in pyproject.toml; they are vendored under tests/semconv_genai at a recorded commit, refreshed by
+scripts/refresh_semconv_genai.py, and every payload the test suite produces is validated against them,
+except gen_ai.tool.call.arguments where it carries something other than an object, the one
+disagreement, listed with its reason in that suite's _UNVALIDATED_PAYLOAD_ATTRIBUTES.
 A convention change is a deliberate edit to this module.
 """
 
@@ -323,7 +327,10 @@ def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
 
     ReasoningTrace elements are skipped: the payload is the producing SDK item's model_dump,
     opaque by construction (an anthropic signature that may be redacted, an openai encrypted_content),
-    so shipping it buys a reader nothing, and the pinned revision defines no reasoning message part to put it in.
+    so shipping it buys a reader nothing.
+    The convention's ReasoningPart does not take it either: that part requires a content string holding
+    reasoning text, which is what a provider withholds wherever it hands back a signature or a
+    ciphertext instead.
     A turn holding only reasoning therefore renders as an empty parts array, not as a missing message.
     """
     parts: list[dict[str, object]] = []
@@ -1163,7 +1170,8 @@ class TracedToolManager(ToolManager):
     gen_ai.input.messages carries it in on a generate span, so one tool result reaches a backend under one
     shape from both spans that report it.
     That shape is an object, which is what the key's note asks for ("It's expected to be an object");
-    no JSON schema governs the key, so the choice among objects is this module's.
+    the key's JSON schema requires an object and no property of one, so the choice among objects is
+    this module's.
     Its response field is the parts array every other content key uses, so a str content and a
     Sequence[Part] content reach a backend in one shape.
     gen_ai.tool.call.arguments is the model's own argument JSON, deserialized on a best effort:

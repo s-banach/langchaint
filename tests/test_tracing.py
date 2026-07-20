@@ -2,12 +2,17 @@
 
 The fake providers are the ones test_bound_llm builds; here they feed the tracing wrapper instead of the plain BoundLLM.
 TracedToolManager is driven directly with constructed ToolCalls; its spans land in the same exporter.
-A locally built TracerProvider with a SimpleSpanProcessor and an InMemorySpanExporter captures every span,
-so the assertions read span names, kinds, statuses, attributes, events,
+A locally built TracerProvider with a _SchemaValidatingSpanProcessor and an InMemorySpanExporter captures
+every span, so the assertions read span names, kinds, statuses, attributes, events,
 and parentage without any collector or network access.
+
+That processor also validates every structured payload attribute against the vendored GenAI JSON
+schemas in tests/semconv_genai, so conformance is checked on the spans the tests already build rather
+than on fixtures written for the schemas.
 """
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
@@ -16,9 +21,10 @@ import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import assert_type, override
 
+import jsonschema
 import pytest
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
@@ -64,6 +70,7 @@ from langchaint.tracing import (
     TracedToolManager,
     gen_ai_attributes,
 )
+from scripts import refresh_semconv_genai
 from tests.test_bound_llm import (
     _FAKE_RAW_USAGE,
     _USAGE,
@@ -76,12 +83,135 @@ from tests.test_bound_llm import (
     _RefusingStream,
 )
 
+_SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
+
+_PAYLOAD_SCHEMA_FILES: Mapping[str, str] = refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES
+"""Each structured payload attribute the tracing module emits, mapped to its vendored schema.
+
+Taken from the refresh script rather than restated, because that map is what decides which schemas
+are fetched and how SOURCE.md labels them, so a second copy could only ever prove the two copies
+agree. test_vendored_schemas_and_the_payload_attributes_account_for_each_other checks the map
+against three independent sources instead: a key the tracing module never writes fails its
+emitted-keys assertion, a schema file no attribute claims fails its vendored-set assertion, and a
+pair whose filename is not the one upstream's naming implies fails its derivation assertion.
+"""
+
+_VALIDATED_PAYLOAD_ATTRIBUTES: set[str] = set()
+"""Every payload attribute _validate_payload_attributes has actually checked.
+
+A schema validates nothing if no test produces its attribute, and that silence is otherwise
+invisible: the assertions comparing declared keys against the tracing module's source stay green
+whether or not any span ever carries the key.
+test_every_payload_attribute_reaches_validation reads this set to fail instead.
+"""
+
+_UNVALIDATED_PAYLOAD_ATTRIBUTES = frozenset({"gen_ai.tool.call.arguments"})
+"""Payload attributes whose schema the module deliberately does not satisfy.
+
+gen_ai.tool.call.arguments is typed `type: object` with no alternative arm, and its convention note
+says only "It's expected to be an object - in case a serialized string is available to the
+instrumentation, the instrumentation SHOULD do the best effort to deserialize it to an object".
+Both are silent on what to emit when a model's arguments are not a JSON object, which is a routine
+outcome the DispatchInvalidToolArgs arm exists to report. The module shows the text the model
+actually sent (_tool_call_arguments), so the payload is a JSON string on that path and does not
+conform. The gap is the convention's: it models no representation for malformed tool arguments,
+so conforming here would mean dropping evidence of the failure from the span.
+Validation is therefore skipped rather than the module changed, and only on that path:
+_validate_payload_attributes still validates a listed attribute whose payload is an object.
+"""
+
+
+@functools.cache
+def _payload_schema(file: str) -> Mapping[str, object]:
+    """Load one vendored schema, cached because every ending span consults them.
+
+    Raises:
+        OSError: the vendored file could not be read.
+        json.JSONDecodeError: the file does not hold JSON.
+        AssertionError: the file holds JSON that is not an object, so a refresh wrote
+            something that is not a schema.
+    """
+    schema = json.loads((_SEMCONV_GENAI_DIR / file).read_text())
+    assert isinstance(schema, dict), f"{file} does not hold a JSON object"
+    return schema
+
+
+def _validate_payload_attributes(span: ReadableSpan) -> None:
+    """Check every payload attribute on one span against the schema the convention attaches to it.
+
+    The attributes hold JSON strings because OTel attribute values cannot nest, so each is parsed
+    before validation. An attribute absent from _PAYLOAD_SCHEMA_FILES is a scalar the convention
+    types directly and needs no schema. One in _UNVALIDATED_PAYLOAD_ATTRIBUTES is skipped only where
+    its documented disagreement lies, on a payload that is not a JSON object, so the same attribute
+    carrying an object is validated like any other and the exemption costs only the path it names.
+
+    What the upstream schemas enforce is weaker than "the payload is correct", and the difference
+    matters when a green run is read as the convention having moved compatibly. Every schema that
+    lists element types ends its anyOf in a catch-all arm constraining almost nothing, so an element
+    whose type is unrecognized or whose required fields are missing matches that arm and passes:
+    GenericPart (requiring only a string type) for gen_ai.input.messages, gen_ai.output.messages,
+    and gen_ai.system_instructions, and GenericToolDefinition (type and name) for
+    gen_ai.tool.definitions. What survives for the message attributes is the message envelope,
+    an array of objects carrying role and a parts array of objects, plus finish_reason on each
+    gen_ai.output.messages element. gen_ai.tool.call.result is weaker still, its whole schema being
+    an object with no required property, so any object passes.
+    Emitted element shapes are pinned by the exact-equality assertions in this module instead, which
+    catch a renamed type or a dropped field that these schemas admit.
+
+    Raises:
+        AssertionError: a payload does not conform, is not a JSON string, or does not parse,
+            naming the span and the attribute in each case.
+    """
+    for key, value in (span.attributes or {}).items():
+        file = _PAYLOAD_SCHEMA_FILES.get(key)
+        if file is None:
+            continue
+        assert isinstance(value, str), f"{span.name}: {key} is not a JSON string"
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise AssertionError(f"{span.name}: {key} is not JSON: {error}") from error
+        if key in _UNVALIDATED_PAYLOAD_ATTRIBUTES and not isinstance(payload, dict):
+            continue
+        _VALIDATED_PAYLOAD_ATTRIBUTES.add(key)
+        try:
+            jsonschema.Draft202012Validator(_payload_schema(file)).validate(payload)
+        except jsonschema.ValidationError as error:
+            raise AssertionError(
+                f"{span.name}: {key} violates {file} at "
+                f"{list(error.absolute_path)}: {error.message}"
+            ) from error
+
+
+class _SchemaValidatingSpanProcessor(SimpleSpanProcessor):
+    """A SimpleSpanProcessor that validates payload attributes as each span ends.
+
+    Validating here rather than in each assertion covers every span that reaches it, including spans
+    built by tests written for something else, and a test added later inherits the check by using
+    _in_memory_tracer, the one helper here that builds a recording tracer and the only place this
+    processor is installed.
+    The check sits in the processor rather than in the exporter because SimpleSpanProcessor.on_end
+    wraps the export call in `except Exception` and only logs, so an exporter that raised would be
+    swallowed and the suite would stay green while validating nothing. Span.end calls on_end with no
+    such guard, so raising before delegating reaches the test.
+    """
+
+    @override
+    def on_end(self, span: ReadableSpan) -> None:
+        """Validate the ending span's payload attributes, then hand it to the exporter.
+
+        Raises:
+            AssertionError: the span carries a payload that does not conform to its schema.
+        """
+        _validate_payload_attributes(span)
+        super().on_end(span)
+
 
 def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
-    """Build a fresh recording tracer whose spans land in an InMemorySpanExporter."""
+    """Build a fresh recording tracer whose spans are schema-validated, then land in an exporter."""
     exporter = InMemorySpanExporter()
     tracer_provider = TracerProvider()
-    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer_provider.add_span_processor(_SchemaValidatingSpanProcessor(exporter))
     return tracer_provider.get_tracer("test"), exporter
 
 
@@ -1267,6 +1397,111 @@ def test_emitted_convention_keys_are_defined_at_the_pinned_revision() -> None:
     assert emitted, "the source scan found no keys, so this assertion would pass vacuously"
     assert emitted <= defined
     assert error_semconv.ERROR_TYPE == "error.type"
+
+
+def test_vendored_schemas_and_the_payload_attributes_account_for_each_other() -> None:
+    """The schema files on disk, the attributes claiming them, and the module's emitted keys agree.
+
+    Three sets that drift apart independently: the schemas refreshed into semconv_genai, the
+    attribute-to-schema pairing that decides what is fetched and how SOURCE.md labels it, and the
+    keys the tracing module writes. A schema nobody claims is dead weight nothing validates, and a
+    claimed attribute the module never emits both mislabels SOURCE.md and leaves its schema
+    validating nothing, so each direction fails here rather than passing quietly.
+    Whether a claimed attribute reaches a span is a separate question, since a key can be emitted
+    somewhere in the module and still never appear in a test; that is
+    test_every_payload_attribute_reaches_validation.
+    Those three set comparisons all survive a mispairing, two payload attributes trading schemas,
+    because a swap changes neither set. The pairing is checked by derivation instead: upstream names
+    each schema file after the attribute it describes, dots and underscores becoming dashes, so the
+    expected filename follows from the key and a swap fails without a second copy of the map to
+    compare against. An upstream file that breaks that naming fails here too, which is the reason
+    ATTRIBUTE_SCHEMA_FILES stays a written-out map rather than a comprehension over the keys.
+    """
+    vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("*.json")}
+    assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
+    assert vendored == set(_PAYLOAD_SCHEMA_FILES.values())
+    assert set(_PAYLOAD_SCHEMA_FILES) <= _emitted_convention_keys()
+    assert set(_PAYLOAD_SCHEMA_FILES) >= _UNVALIDATED_PAYLOAD_ATTRIBUTES
+    for key, file in _PAYLOAD_SCHEMA_FILES.items():
+        assert file == key.replace(".", "-").replace("_", "-") + ".json"
+
+
+def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:
+    """The payload _UNVALIDATED_PAYLOAD_ATTRIBUTES exempts is still one the schema rejects.
+
+    An exemption that outlives the disagreement it was written for is dead weight nothing reports,
+    so this asserts the violation rather than the conformance: it fails when upstream gives
+    gen_ai.tool.call.arguments an arm that admits a non-object, which is the moment to delete the
+    exemption and let the payload validate like every other.
+    It reads the attribute off a real dispatch, so what is checked is the value the module emits.
+    Producing a violating payload takes a scenario written for the one attribute, so the exempt set
+    is pinned whole here instead of iterated: a second exemption fails this assertion, which is the
+    request for the scenario that would justify it.
+    """
+    assert frozenset({"gen_ai.tool.call.arguments"}) == _UNVALIDATED_PAYLOAD_ATTRIBUTES
+
+    async def scenario() -> None:
+        """Dispatch a call whose arguments are not JSON and confirm the emitted payload violates."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=True
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json="not json at all"))
+        emitted = _captured(exporter, "gen_ai.tool.call.arguments")
+        schema = _payload_schema(_PAYLOAD_SCHEMA_FILES["gen_ai.tool.call.arguments"])
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.Draft202012Validator(schema).validate(emitted)
+
+    asyncio.run(scenario())
+
+
+def test_every_payload_attribute_reaches_validation() -> None:
+    """Each schema is exercised by a payload a span actually carried, not merely declared.
+
+    A vendored schema whose attribute no span produces validates nothing, and every other assertion
+    here stays green while that is true, since they compare declared keys against the tracing
+    module's source rather than against emitted spans.
+    This drives the two span kinds that between them carry all six attributes rather than reading
+    what earlier tests happened to leave behind, so it reports the same way whether the suite runs
+    whole or one test at a time.
+    """
+
+    async def scenario() -> None:
+        """Generate over a full conversation, then dispatch a tool call with object arguments."""
+        tracer, _exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        bound = traced.bind(
+            system_prompt="be brief",
+            tool_manager=ToolManager([_echo_tool()]),
+            automatic_prompt_caching=True,
+        )
+        await bound.generate_one([UserMessage(content="look it up")])
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=True
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "x"}'))
+
+    _VALIDATED_PAYLOAD_ATTRIBUTES.clear()
+    asyncio.run(scenario())
+    assert set(_PAYLOAD_SCHEMA_FILES) == _VALIDATED_PAYLOAD_ATTRIBUTES
+
+
+def test_a_payload_that_violates_its_schema_fails_the_span() -> None:
+    """A span carrying a malformed payload raises as it ends, so the validation cannot silently no-op.
+
+    Every other assertion here passes when the payloads conform, so all of them stay green if the
+    validation stops running at all, the failure mode that would make the whole schema apparatus
+    look healthy while testing nothing. A raise that the span pipeline swallows rather than
+    propagates is one way to reach it, which is why this asserts the failure arrives at the caller
+    and not merely that the validator raises.
+    gen_ai.output.messages is an array of messages, so a bare object violates it.
+    """
+    tracer, _exporter = _in_memory_tracer()
+    with (
+        pytest.raises(AssertionError, match=re.escape("gen_ai.output.messages violates")),
+        tracer.start_as_current_span("chat") as span,
+    ):
+        span.set_attribute("gen_ai.output.messages", json.dumps({"role": "assistant"}))
 
 
 class _ReasoningOnlyBoundProvider(_FakeBoundProvider):

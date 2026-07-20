@@ -67,7 +67,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Literal, overload, override
+from typing import Any, overload, override
 
 from pydantic import BaseModel
 
@@ -127,13 +127,13 @@ type AttributeMapper = Callable[[Response[object] | GenerationError], SpanAttrib
 The parameter is Response[object] | GenerationError
 because the mapper reads the shared Response/GenerationError fields; Response[object] accepts any Response[OutputT]
 because Response's OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
-The mapper deliberately never receives the conversation, so no mapper can leak a prompt.
+No mapper receives the conversation, so gen_ai_attributes cannot put a prompt on a span.
+A custom mapper is bounded only by what it reaches on the result, which includes raw, the SDK response object
+held by reference; openai 2.45.0's response model declares an instructions field,
+which is where a str system_prompt is sent.
 Capturing prompt content is the capture_message_content parameter, which the wrapper applies itself
 because the wrapper already has the conversation in scope as a method argument.
 """
-
-type AttributeFormat = Literal["gen_ai"]
-"""The built-in attribute-mapper names; named after the attribute_format parameter, one name for the concept."""
 
 _PACKAGE_VERSION = importlib.metadata.version("langchaint")
 _CHAT_OPERATION = "chat"
@@ -189,9 +189,12 @@ def _finish_reason(stop_reason: StopReason) -> str:
 def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
-    The built-in "gen_ai" AttributeFormat resolves to this function.
-    It is public so a custom AttributeMapper extends it instead of restating its keys:
-    {**gen_ai_attributes(result), "gen_ai.agent.name": "researcher"}.
+    It is the default attribute_mapper, and public so a custom AttributeMapper extends it
+    instead of restating its keys, for a value derived from the result that the keys below do not carry:
+    {**gen_ai_attributes(result), "app.request_seconds": sum(a.elapsed_seconds for a in result.attempt_records)}.
+    An extending key belongs in the application's own namespace, not under langchaint.*, which is reserved
+    for the keys listed in the module docstring and can grow.
+    A constant needs no mapper; extra_attributes sets one on every span.
     Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
     Reads only the shared Response/GenerationError fields, so it cannot leak a prompt and cannot meaningfully fail.
     A key stays under the langchaint.* prefix only where the GenAI convention defines no counterpart,
@@ -225,32 +228,6 @@ def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttribu
     if result.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
     return attributes
-
-
-_BUILTIN_MAPPERS: dict[AttributeFormat, AttributeMapper] = {"gen_ai": gen_ai_attributes}
-"""The built-in mappers, one per AttributeFormat literal."""
-
-
-def _resolve_attribute_mapper(
-    attribute_format: AttributeFormat | AttributeMapper,
-) -> AttributeMapper:
-    """Resolve the attribute_format parameter to one AttributeMapper.
-
-    A callable passes through as the mapper; a literal selects its built-in.
-
-    Raises:
-        KeyError: attribute_format is a string outside the AttributeFormat set (a static type error for a typed caller;
-            this guards an untyped one).
-    """
-    if callable(attribute_format):
-        return attribute_format
-    try:
-        return _BUILTIN_MAPPERS[attribute_format]
-    except KeyError:
-        raise KeyError(
-            f"unknown attribute_format {attribute_format!r}; "
-            f"known formats: {sorted(_BUILTIN_MAPPERS)}"
-        ) from None
 
 
 def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
@@ -450,7 +427,7 @@ def _apply_result_attributes(
         attributes = attribute_mapper(result)
     except Exception:
         _logger.warning(
-            "attribute_format mapper raised; leaving span attributes partial", exc_info=True
+            "attribute_mapper raised; leaving span attributes partial", exc_info=True
         )
         return
     span.set_attributes(attributes)
@@ -527,11 +504,11 @@ class TracedLLM:
         llm: LLM,
         *,
         capture_message_content: bool,
-        attribute_format: AttributeFormat | AttributeMapper = "gen_ai",
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
         tracer: Tracer | None = None,
     ) -> None:
-        """Resolve the mapper and the tracer once, at construction.
+        """Resolve the tracer once, at construction.
 
         capture_message_content True puts the bound system prompt, the bound tool definitions, the conversation,
         and the assistant turn on every span this LLM's bindings open.
@@ -542,13 +519,11 @@ class TracedLLM:
         The value propagates to every binding and every stream handle, and rebind carries it unchanged,
         so a rebound object cannot silently gain or lose capture.
         tracer None resolves trace.get_tracer("langchaint.tracing", <package version>) now, not at import.
-        attribute_format is resolved to one AttributeMapper and passed down unchanged to every binding.
+        attribute_mapper is passed down unchanged to every binding; it defaults to gen_ai_attributes,
+        the OTel GenAI semantic convention at the revision the module docstring pins.
         extra_attributes is a constant mapping set at span start on every span every binding opens
         (an agent name for cross-trace aggregation, a deployment tag); None means no such attributes.
         A key the mapper also emits resolves to the mapper's value, set at completion.
-
-        Raises:
-            KeyError: attribute_format is a string outside the AttributeFormat set.
         """
         self._llm = llm
         self._span_config = _SpanConfig(
@@ -557,7 +532,7 @@ class TracedLLM:
                 if tracer is not None
                 else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
             ),
-            attribute_mapper=_resolve_attribute_mapper(attribute_format),
+            attribute_mapper=attribute_mapper,
             extra_attributes=extra_attributes if extra_attributes is not None else {},
             capture_message_content=capture_message_content,
         )
@@ -1206,7 +1181,6 @@ class TracedToolManager(ToolManager):
 
 
 __all__ = [
-    "AttributeFormat",
     "AttributeMapper",
     "SpanAttributes",
     "TracedBoundLLM",

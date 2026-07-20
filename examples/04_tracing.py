@@ -4,9 +4,10 @@ Wrapping is unconditional; enabling, disabling, or routing tracing is OTel SDK c
 An app that never configures a TracerProvider gets non-recording no-op spans,
 so the wrapper is free when tracing is off.
 TracedLLM mirrors bind and rebind, so a rebound object stays traced.
-The default "gen_ai" mapper emits GenAI-convention attributes (token counts, cache counters, finish reason)
+The default mapper, gen_ai_attributes, emits GenAI-convention attributes (token counts, cache counters, finish reason)
 plus the two langchaint scalars the convention has no counterpart for, cost and attempts;
-the mapper never receives the conversation, so no built-in mapper can leak a prompt.
+no mapper receives the conversation, so gen_ai_attributes cannot put a prompt on a span,
+while a custom mapper reads whatever it reaches on the result, raw included.
 
 capture_message_content decides separately whether the spans carry the conversation itself.
 It is required and has no default, because recording prompts is a privacy choice the library never makes for you.

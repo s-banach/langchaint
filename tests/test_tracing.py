@@ -513,7 +513,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider(echo=True)),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -536,8 +536,8 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
     asyncio.run(scenario())
 
 
-def test_callable_attribute_format_emits_exactly_its_keys() -> None:
-    """A callable attribute_format sets exactly the keys it returns, no gen_ai keys."""
+def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
+    """A custom attribute_mapper sets exactly the keys it returns, no gen_ai keys."""
 
     async def scenario() -> None:
         """Generate under a two-key mapper and assert the span carries only those two keys."""
@@ -549,7 +549,7 @@ def test_callable_attribute_format_emits_exactly_its_keys() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider()),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -561,7 +561,7 @@ def test_callable_attribute_format_emits_exactly_its_keys() -> None:
 
 
 def test_mapper_not_invoked_on_a_non_recording_span() -> None:
-    """A callable attribute_format never fires when the tracer's spans are non-recording."""
+    """A custom attribute_mapper never fires when the tracer's spans are non-recording."""
 
     async def scenario() -> None:
         """Generate under a TracerProvider-less tracer and assert the mapper never ran."""
@@ -576,7 +576,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         tracer = trace.get_tracer("no-sdk")
         traced = TracedLLM(
             LLM(_FakeProvider()),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -606,7 +606,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider()),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -640,7 +640,7 @@ def test_generate_many_does_not_invoke_the_mapper() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -678,7 +678,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider()),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
@@ -691,14 +691,6 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
         assert span.status.status_code == StatusCode.OK
 
     asyncio.run(scenario())
-
-
-def test_unknown_attribute_format_string_raises_key_error() -> None:
-    """An untyped caller passing an unknown format string gets a KeyError naming the known formats."""
-    llm = LLM(_FakeProvider())
-    with pytest.raises(KeyError, match="gen_ai"):
-        # pyrefly: ignore[bad-argument-type]  # the Literal rejects this statically; runtime guard here
-        TracedLLM(llm, attribute_format="openinference", capture_message_content=False)
 
 
 def test_bind_output_types_are_mirrored() -> None:
@@ -755,7 +747,7 @@ def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() ->
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider(echo=True)),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             extra_attributes={"gen_ai.agent.name": "agent_a", "shared.key": "extra"},
             tracer=tracer,
             capture_message_content=False,
@@ -798,26 +790,36 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_spans() -> N
 
 
 def test_gen_ai_attributes_is_public_and_composable() -> None:
-    """A custom mapper extending gen_ai_attributes lands every standard key plus the added one."""
+    """A custom mapper extending gen_ai_attributes lands every standard key plus the added one.
+
+    The extension is a value derived from the result, the case a mapper exists for:
+    a constant would ride in through extra_attributes instead.
+    Deriving it also proves the mapper receives the real result, not a stand-in carrying only the mapped keys.
+    """
 
     async def scenario() -> None:
-        """Generate under a composed mapper and check a standard key and the extension key."""
+        """Generate under a composed mapper and check a standard key and the derived key."""
 
         def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
-            """Extend the built-in attributes with an agent name."""
-            return {**gen_ai_attributes(result), "gen_ai.agent.name": "agent_a"}
+            """Extend the built-in attributes with the call's total request time."""
+            return {
+                **gen_ai_attributes(result),
+                "app.request_seconds": sum(a.elapsed_seconds for a in result.attempt_records),
+            }
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeProvider(echo=True)),
-            attribute_format=_mapper,
+            attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
         )
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
-        assert span.attributes["gen_ai.agent.name"] == "agent_a"
+        assert span.attributes["app.request_seconds"] == sum(
+            a.elapsed_seconds for a in response.attempt_records
+        )
         assert span.attributes["gen_ai.request.model"] == "fake-model"
         assert span.attributes["langchaint.attempts"] == 1
 

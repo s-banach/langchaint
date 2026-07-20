@@ -22,7 +22,7 @@ SDK usage, through the same arithmetic that produced the stored Usage.cost_in_us
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://platform.claude.com/docs/en/about-claude/pricing.
-Prices are the one provider fact this package cannot verify by SDK introspection;
+Prices are the one provider fact langchaint cannot verify by SDK introspection;
 re-check the page before relying on a table for billing.
 Rates derive from the base input price: cache read 0.1x, 5-minute cache write 1.25x, 1-hour cache write 2x.
 """

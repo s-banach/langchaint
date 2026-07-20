@@ -1,4 +1,4 @@
-"""Offline tests: constructed SDK objects and fake providers through the package.
+"""Offline tests: constructed SDK objects and fake providers through langchaint.
 
 Every test runs without network access or API keys.
 Adapter tests feed constructed anthropic and openai SDK objects into the module-level helpers

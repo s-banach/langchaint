@@ -1,4 +1,4 @@
-"""The provider adapter contract.
+"""The adapter contract.
 
 An adapter wraps one official SDK client and is the only place provider knowledge lives:
 converting the binding to SDK keyword arguments, sending, translating stream events, normalizing usage, computing cost,
@@ -114,7 +114,7 @@ class PricingTable:
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
-    """The frozen prefix of one BoundLLM, in package terms only.
+    """The frozen prefix of one BoundLLM, in langchaint terms only.
 
     Every field here determines the provider's cacheable prompt prefix or is fixed per binding by design;
     per-request data is the conversation argument of the BoundProvider methods, nothing else.
@@ -154,11 +154,11 @@ class Binding:
 
 @dataclass(frozen=True, kw_only=True)
 class ProviderResult[OutputT]:
-    """One successful provider turn, normalized to package terms.
+    """One successful provider turn, normalized to langchaint terms.
 
     output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
     assistant_message is the full turn including tool calls, for appending to a conversation.
-    usage carries the adapter-priced cost_in_usd, computed from raw provider counts against its PricingTable.
+    usage carries cost_in_usd, priced from raw provider counts against the adapter's PricingTable.
     usage_raw is the raw SDK usage object usage was normalized from, held by reference (no dump, no copy),
     None when the response reported no usage; a caller recovers provider-specific counts from it.
     raw is the SDK's own response model, held by reference (no dump, no copy).
@@ -186,7 +186,7 @@ class ProviderStream[OutputT](ABC):
         """Yield text chunks and completed tool calls in arrival order.
 
         Yields:
-            Stream items; SDK events the package does not model are dropped.
+            Stream items; SDK events langchaint does not model are dropped.
         """
         ...
 
@@ -205,7 +205,7 @@ class ProviderStream[OutputT](ABC):
 
 
 class BoundProvider[OutputT](ABC):
-    """One provider adapter bound to a frozen prefix.
+    """One adapter bound to a frozen prefix.
 
     Constructed by Provider.bind_text or Provider.bind_structured, which precompute the SDK keyword arguments once;
     both request methods take only the per-request conversation.

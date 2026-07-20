@@ -11,7 +11,7 @@ Every Traced class accepts extra_attributes, a constant mapping set on each span
 (an agent name for cross-trace aggregation, a deployment tag);
 an attribute set at completion (a mapper's, an outcome's) wins a key collision.
 Every Traced class also requires capture_message_content, which decides whether the spans carry
-the conversation itself; it has no default, because recording prompts is a privacy choice the library never makes.
+the conversation itself; it has no default, because recording prompts is a privacy choice langchaint never makes.
 
 Every span the convention defines a kind for carries gen_ai.operation.name, which it marks required:
 "chat" on the generate_one and stream spans, "execute_tool" on a dispatch span.
@@ -127,7 +127,7 @@ from langchaint.tools import (
 type SpanAttributes = Mapping[str, str | bool | int | float | Sequence[str]]
 """A span's attributes, keyed by name.
 
-The value union is the subset of OTel's AttributeValue this package emits;
+The value union is the subset of OTel's AttributeValue langchaint emits;
 the Sequence[str] arm exists because OTel attribute values include homogeneous string arrays
 and the GenAI convention's finish-reason key gen_ai.response.finish_reasons is one.
 """
@@ -162,8 +162,9 @@ class _SpanConfig:
 
     These four values are identical at every step of TracedLLM -> TracedBoundLLM -> TracedStreamHandle,
     so they travel as one object rather than as four parallel parameters restated at each constructor.
-    TracedToolManager holds its own and does not take one: it is constructed by the application, not by
-    a TracedLLM, and it has no attribute_mapper seam.
+    TracedToolManager does not take one: it is constructed by the application, not by a TracedLLM,
+    and it takes no attribute_mapper, so it stores its tracer, extra_attributes,
+    and capture_message_content directly.
     """
 
     tracer: Tracer
@@ -360,7 +361,7 @@ def _conversation_messages(conversation: str | Sequence[Message]) -> list[dict[s
 
     A bare str conversation is the one-user-message form BoundLLM accepts, and renders as that message.
     A ToolMessage becomes a tool_call_response part inside a tool-role message,
-    the shape the schema specifies rather than the package's own.
+    the shape the schema specifies rather than langchaint's own.
     """
     if isinstance(conversation, str):
         return [{"role": "user", "parts": [{"type": "text", "content": conversation}]}]
@@ -606,7 +607,7 @@ class TracedLLM:
 
         capture_message_content True puts the bound system prompt, the bound tool definitions, the conversation,
         and the assistant turn on every span this LLM's bindings open.
-        It is required and has no default: recording prompts is a privacy choice the library never makes for the user,
+        It is required and has no default: recording prompts is a privacy choice langchaint never makes for the user,
         the way automatic_prompt_caching is a billing choice bind never makes.
         The convention takes the same position, that instrumentations SHOULD NOT capture content by default
         but SHOULD provide an opt-in; requiring the keyword is stricter, in the safe direction.
@@ -1147,7 +1148,7 @@ class TracedToolManager(ToolManager):
     without restating the settle-and-group semantics documented on dispatch_many.
     The span name is "execute_tool {call.name}", the GenAI convention's {operation} {target} pattern;
     kind is INTERNAL because dispatch runs an in-process function
-    (a CLIENT span would register as an outbound call this package cannot see being made).
+    (a CLIENT span would register as an outbound call langchaint cannot see being made).
     dispatch makes its span current while the tool function runs (trace.use_span).
     Spans the function starts (an instrumented HTTP request, a nested agent loop) nest under the execute_tool span.
     dispatch_many stays safe: asyncio.gather runs each dispatch in its own task with a copied context.
@@ -1196,7 +1197,7 @@ class TracedToolManager(ToolManager):
 
     gen_ai.tool.call.result is recorded on every arm, including the two where the tool function never ran.
     The convention defines that key as the result "if any and if execution was successful",
-    so this is a deliberate departure: on those arms the value is the package-rendered correction the model
+    so this is a deliberate departure: on those arms the value is the langchaint-rendered correction the model
     reads and adapts to, which is the payload a reader debugging a tool loop wants, and error.type on the
     same span already says no tool produced it, so a consumer reading both is not misled.
     gen_ai.tool.call.result is what dispatch returned, which is not necessarily what the model read:
@@ -1206,7 +1207,7 @@ class TracedToolManager(ToolManager):
     correct, each reporting its own boundary; the difference is the application's edit made visible.
     The two join on the tool call id, which is gen_ai.tool.call.id here and the tool_call_response part's id there.
 
-    There is no attribute mapper seam: the attributes are the fixed keys above,
+    There is no attribute_mapper parameter: the attributes are the fixed keys above,
     and app constants ride in through extra_attributes.
     """
 

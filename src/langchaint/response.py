@@ -2,8 +2,8 @@
 
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
 or a truncation at the token cap) raises or returns a GenerationError.
-They share the per-attempt history the package-owned retry loop produces,
-because that loop has no callback seam and the history survives only if the result carries it:
+They share the per-attempt history langchaint's retry loop produces,
+because that loop takes no callback and the history survives only if the result carries it:
 attempt_records is that history, one record per request sent.
 On a Response every record but the last failed and the last succeeded;
 on a GenerationError the records describe the terminal outcome.

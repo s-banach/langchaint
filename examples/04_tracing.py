@@ -10,7 +10,7 @@ no mapper receives the conversation, so gen_ai_attributes cannot put a prompt on
 while a custom mapper reads whatever it reaches on the result, raw included.
 
 capture_message_content decides separately whether the spans carry the conversation itself.
-It is required and has no default, because recording prompts is a privacy choice the library never makes for you.
+It is required and has no default, because recording prompts is a privacy choice langchaint never makes for you.
 False below: the spans carry metrics and no message content.
 The tracing module docstring lists every attribute each span kind emits under either value.
 

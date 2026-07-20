@@ -12,7 +12,7 @@ TransientError and AbortBatchError are per-attempt / control signals.
 The GenerationError leaves are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RefusalError, and MaxCompletionTokensExceededError.
 
-Classification of raw SDK exceptions into these lives in the provider adapter (Provider.classify);
+Classification of raw SDK exceptions into these lives in the adapter (Provider.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
 so the adapter detects them where it reads the response and raises the matching leaf directly.
 
@@ -99,7 +99,7 @@ class AttemptRecord:
 
     started_at_monotonic_seconds and ended_at_monotonic_seconds are raw time.monotonic() readings:
     only differences are meaningful, and only within one process.
-    The package defines no time origin because it does not own the enclosing loop;
+    langchaint defines no time origin because it does not own the enclosing loop;
     subtract whatever origin the caller holds (an agent-loop start, another record)
     to place records on a shared timeline.
     The bracket spans the request itself and excludes RateLimiter slot waits and backoff sleeps,
@@ -271,7 +271,7 @@ class RefusalError(GenerationError):
     Not retried, by policy:
     a refusal can flip under sampling,
     but retrying spends the full input tokens
-    (cache-read rate when warm, never zero) on an expected-value bet the library does not take by default.
+    (cache-read rate when warm, never zero) on an expected-value bet langchaint does not take by default.
     An app whose economics differ overrides the adapter's _parsed_output.
     stop_reason is "refusal".
     """

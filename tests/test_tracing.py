@@ -2236,7 +2236,7 @@ def test_tool_span_captures_the_result_on_both_arms_where_no_tool_ran() -> None:
 
     The convention defines the key as the result "if any and if execution was successful", so recording it
     here is the deliberate departure the TracedToolManager docstring states.
-    Pinned in both directions on each arm: the package-rendered correction is what the model reads and
+    Pinned in both directions on each arm: the langchaint-rendered correction is what the model reads and
     adapts to, and error.type on the same span is what tells a consumer no tool produced it.
     """
 

@@ -932,7 +932,7 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
 
 
 def test_adapter_pins_sdk_retries_off() -> None:
-    """The stored client copy carries max_retries=0 so only the package retries."""
+    """The stored client copy carries max_retries=0 so only langchaint retries."""
     assert _provider().client.max_retries == 0
 
 

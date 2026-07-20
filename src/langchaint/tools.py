@@ -17,7 +17,7 @@ Its fixed reply is the acknowledgement the model reads.
 A tool function returns data and nothing that steers control flow:
 stop, route, escalate, and needs-approval are decisions the application makes in its own loop between turns,
 reading app_data or is_error.
-The application owns that loop and langchaint ships no library-owned agent loop,
+The application owns that loop and langchaint ships no agent loop of its own,
 so a control-flow return channel (a goto or an engine-state update smuggled through a tool's return value) is forbidden.
 No signature introspection and no docstring scraping: name, description, and schema are explicit,
 so what the provider sees is exactly what the code states.
@@ -104,7 +104,7 @@ class InvalidToolArgsDetail:
     jsonschema's absolute_path; an empty path means the failure is about the arguments as a whole.
     message is the reason verbatim from the validator that produced it,
     so the tool owner's own words reach the model unrewritten.
-    Both producers are in-package boundary conversions (_details_from_pydantic, _details_from_jsonschema),
+    Both producers are boundary conversions inside langchaint (_details_from_pydantic, _details_from_jsonschema),
     so a consumer reads one vocabulary whichever tool form failed.
     A frozen dataclass, not pydantic: it is a constructed detail value, not a persisted message-tree node,
     so serde and validation buy nothing here.
@@ -348,7 +348,7 @@ class JSONSchemaTool[AppDataT = None]:
     ToolOutputExplicit with is_error=True.
     AppDataT is the app_data type the function carries, defaulting to None, solved from the function's
     ToolOutputExplicit return exactly as on PydanticTool, so JSONSchemaTool.dispatch returns DispatchHandled[AppDataT].
-    There is no validate_and_run counterpart here: that seam exists on PydanticTool because the validated
+    There is no validate_and_run counterpart here: that method exists on PydanticTool because the validated
     arguments reach the caller typed, and a JSONSchemaTool caller gains nothing over parsing the JSON itself.
     """
 

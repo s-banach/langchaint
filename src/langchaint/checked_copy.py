@@ -1,10 +1,10 @@
-"""CheckedCopyModel, the base of the package's pydantic models: model_copy rejects non-field update keys.
+"""CheckedCopyModel, the base of langchaint's pydantic models: model_copy rejects non-field update keys.
 
 pydantic's model_copy applies update without validation:
 a key that is not a field lands in the instance __dict__,
 where any class-level property of that name shadows it and model_dump ignores it,
 so the caller's intended change is dropped silently.
-Under this package's model configuration (frozen, no extra fields, no private attributes)
+Under langchaint's model configuration (frozen, no extra fields, no private attributes)
 a non-field update key therefore can never do anything,
 and the override turns that defect into an immediate TypeError,
 matching dataclasses.replace, which raises TypeError for an unknown field name on the same operation shape.

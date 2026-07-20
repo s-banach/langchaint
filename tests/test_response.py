@@ -5,7 +5,7 @@ so these invariants are what stops a refactor of either loop from building a suc
 the retry tests in test_bound_llm.py pin the record values themselves.
 usage is the paid total folded from attempt_records and usage_successful_attempt is the last record's own,
 so a retried billed 200 makes them diverge; both are exercised here.
-to_row is the table seam: a success and a RetriesExhaustedError must flatten to the same keys,
+to_row is the table boundary: a success and a RetriesExhaustedError must flatten to the same keys,
 or a mixed batch could not become one table.
 """
 

@@ -6,7 +6,7 @@ Verified against anthropic 0.116.0:
 - `messages.stream(...)` returns a manager whose entered stream assembles deltas into a `ParsedMessage` snapshot;
   `get_final_message()` returns it.
 - `Usage.input_tokens` excludes cache reads and writes,
-  so the three package counters map directly and no all-inclusive provider total exists to cross-check.
+  so the three langchaint counters map directly and no all-inclusive provider total exists to cross-check.
 - `Usage.cache_creation` splits cache writes into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`,
   which bill at different rates.
 
@@ -151,7 +151,7 @@ def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
     """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
 
     The "5m" wire form must stay byte-stable across releases,
-    so that upgrading the package alone cannot invalidate a caller's live cache entry.
+    so that upgrading langchaint alone cannot invalidate a caller's live cache entry.
     """
     if cache_ttl == "5m":
         return {"type": "ephemeral"}
@@ -412,14 +412,14 @@ def _wire_tools(
 
 
 def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
-    """Map the provider stop reason into the package vocabulary."""
+    """Map the provider stop reason into langchaint's vocabulary."""
     if stop_reason in ("end_turn", "tool_use", "max_tokens", "refusal"):
         return stop_reason
     return "other"
 
 
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
-    """Build the package assistant turn from the SDK message, block order preserved.
+    """Build the langchaint assistant turn from the SDK message, block order preserved.
 
     A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
     model_dump for verbatim replay; server tool blocks are dropped (built-in tools are out of scope).
@@ -450,7 +450,7 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
 
 
 def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Usage:
-    """Map the raw counters onto the package's disjoint partition and price them.
+    """Map the raw counters onto langchaint's disjoint partition and price them.
 
     `usage.input_tokens` excludes cache reads and writes (verified against anthropic 0.116.0),
     so it is exactly the uncached-input counter.
@@ -568,7 +568,7 @@ class AnthropicMessagesProvider(Provider):
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
-        The stored client is a with_options(max_retries=0) copy: the package's retry loop owns all retrying,
+        The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
         The copy re-feeds client._client (the caller's httpx.AsyncClient) explicitly:
@@ -759,7 +759,7 @@ class _AnthropicStream[OutputT](ProviderStream[OutputT]):
         built from the SDK-accumulated block exactly like the non-streaming path.
 
         Yields:
-            Stream items; SDK events the package does not model are dropped.
+            Stream items; SDK events langchaint does not model are dropped.
 
         Raises:
             StreamProtocolError: the stream ended without a stop reason.

@@ -7,7 +7,7 @@ Alpha: the API is unstable and may change without notice.
 
 langchaint is the layer between an application's own agent loop and the provider SDKs.
 It gives one message tree, one error taxonomy, one `Usage` shape with a priced `cost_in_usd` on every result, and one `RateLimiter` that owns retrying and pacing, the same across providers.
-The application keeps the loop: langchaint ships no agent class, and every billing-relevant choice (prompt caching above all) is stated by the application rather than defaulted by the library.
+The application keeps the loop: langchaint ships no agent class, and every billing-relevant choice (prompt caching above all) is stated by the application rather than defaulted by langchaint.
 
 ## Install
 
@@ -76,7 +76,7 @@ Both carry `attempt_records`, one `AttemptRecord` per request sent, and `usage`,
 **One `RateLimiter` owning retrying and pacing.**
 It holds `max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`, and `max_in_flight`; it is stateful and shareable, so one instance passed to several `LLM`s is one shared budget for the account they hit, gating every request start (first attempts, retries, batch items, stream openings).
 A rate-limit error pauses admission for everyone sharing it, honoring a server-stated retry-after up to 60 seconds, then admits one probe at a time until a probe succeeds; other transient errors pause nobody.
-Adapters store a `with_options(max_retries=0)` copy of the SDK client, so the SDK never retries beneath the package and attempt counts stay true.
+Adapters store a `with_options(max_retries=0)` copy of the SDK client, so the SDK never retries beneath langchaint and attempt counts stay true.
 
 **User-stated prompt caching.**
 `automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.
@@ -99,20 +99,20 @@ Each provider reasoning element becomes one `ReasoningTrace` in `AssistantMessag
 
 **OTel tracing as a wrapper.**
 `langchaint.tracing` (imports only opentelemetry-api) has `TracedLLM`, `TracedBoundLLM`, `TracedStreamHandle`, and `TracedToolManager`.
-Recording the conversation is `capture_message_content`, a required keyword with no default on every Traced class, because recording prompts is a privacy choice the library never makes for you.
+Recording the conversation is `capture_message_content`, a required keyword with no default on every Traced class, because recording prompts is a privacy choice langchaint never makes for you.
 
 ## What it does not have
 
 Each absence is deliberate; the reasons are recorded in `CLAUDE.md` and the module docstrings.
 
-- No agent class or library-owned tool loop: the loop is ~15 lines of application code over `generate_one` (or `stream_one`) and `dispatch`, shown in `examples/02_tool_loop.py`, and a tool returns data, never a control-flow signal, so stop, route, and escalate stay decisions the application makes between turns.
+- No agent class and no agent loop of langchaint's own: the loop is ~15 lines of application code over `generate_one` (or `stream_one`) and `dispatch`, shown in `examples/02_tool_loop.py`, and a tool returns data, never a control-flow signal, so stop, route, and escalate stay decisions the application makes between turns.
 - No per-call parameter overrides: changing parameters is `rebind`.
 - No default for `automatic_prompt_caching`: every `bind` states it.
 - No `requests_per_minute`: the `max_in_flight` bound self-adjusts throughput along request duration, while a client-side rate number goes stale with the account tier.
 - No Chat Completions adapter and no third-party chat-completions-compatible servers (vLLM, Ollama): OpenAI support is the Responses API only.
 - No Converse adapter for Bedrock: Bedrock is served through the SDKs' bundled clients.
-- No provider-parameter passthrough dict: `InferenceParams` is `max_completion_tokens`, `reasoning_effort`, and `temperature` (no `top_p`, no `seed`), and an unmapped provider parameter is reached by subclassing the adapter.
-- No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, SDK objects ride by reference instead of being copied into same-shaped package objects, and invalid inputs are sent so the provider's own error surfaces.
+- No provider-parameter passthrough dict: `InferenceParams` is `max_completion_tokens`, `reasoning_effort`, and `temperature` (no `top_p`, no `seed`), and an unmapped provider parameter is reached by subclassing the concrete adapter.
+- No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, SDK objects ride by reference instead of being copied into same-shaped langchaint objects, and invalid inputs are sent so the provider's own error surfaces.
 - No tool-call delta stream items and no usage or stop stream items: a stream yields `str | ToolCall`, and `usage` and `stop_reason` live on `final()`'s `Response`.
 - No extras and no bundled SDKs: the application pins `anthropic`, `openai`, or `opentelemetry-api` itself, and only the subpackage imports require them.
 

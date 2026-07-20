@@ -14,7 +14,7 @@ SDK usage, through the same arithmetic that produced the stored Usage.cost_in_us
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://developers.openai.com/api/docs/pricing.
-Prices are the one provider fact this package cannot verify by SDK introspection;
+Prices are the one provider fact langchaint cannot verify by SDK introspection;
 re-check the page before relying on a table for billing.
 OpenAI has no 1-hour cache tier, and only the gpt-5.6 family bills cache writes;
 earlier models cache automatically with free writes, so their tables carry a zero cache-write rate.

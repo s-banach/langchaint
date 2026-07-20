@@ -47,7 +47,7 @@ def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     assert provider.pricing is OPENAI_PRICING[model]
 
 
-def test_adapter_client_never_retries_beneath_the_package() -> None:
+def test_adapter_client_never_retries_beneath_langchaint() -> None:
     """The stored client is a max_retries=0 copy keeping the caller's credentials."""
     client = AsyncAnthropic(api_key="offline")
     llm = anthropic_model("claude-sonnet-5", client=client)

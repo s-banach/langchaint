@@ -16,7 +16,7 @@ where the attribute's own semconv type is `any`:
         json_schema: model/gen-ai/gen-ai-tool-definitions.json
 
 Only the six schemas the tracing module can emit are vendored; gen-ai-memory-records.json
-and gen-ai-retrieval-documents.json describe attributes the package never writes.
+and gen-ai-retrieval-documents.json describe attributes langchaint never writes.
 
 Run it with zero arguments: `uv run python -m scripts.refresh_semconv_genai`. The upstream
 repository, the file list, and the destination are the constants below, so the run is

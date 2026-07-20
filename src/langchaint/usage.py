@@ -1,4 +1,4 @@
-"""Token accounting and the adapter-priced cost that travels with it.
+"""Token accounting and the cost_in_usd that travels with it.
 
 The three input counters are a disjoint partition of all input tokens, so their sum is the total;
 a bare input_tokens field was rejected because Anthropic's field of that name excludes cache reads
@@ -16,13 +16,13 @@ from langchaint.checked_copy import CheckedCopyModel
 
 
 class Usage(CheckedCopyModel):
-    """Token counts for one request, normalized across providers, plus the adapter's cost estimate.
+    """Token counts for one request, normalized across providers, plus cost_in_usd.
 
-    The counters are provider-reported facts. cost_in_usd is the package's estimate,
+    The counters are provider-reported facts. cost_in_usd is langchaint's estimate,
     priced by the adapter from the raw provider counts against its PricingTable:
     it is stored rather than derived because the normalized counters collapse the 5-minute / 1-hour
     cache-write split that Anthropic bills at different rates, so cost cannot be recomputed from Usage alone.
-    No validator cross-checks cost_in_usd; that would require the pricing table and the raw write split here.
+    No validator cross-checks cost_in_usd; that would require the PricingTable and the raw write split here.
 
     output_tokens_reasoning is the reasoning share of output_tokens
     (Anthropic thinking_tokens, OpenAI reasoning_tokens); whether a provider counts it inside output_tokens

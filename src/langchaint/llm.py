@@ -1,6 +1,6 @@
 """The client; generation happens only through a binding.
 
-LLM composes a provider adapter and a RateLimiter.
+LLM composes an adapter and a RateLimiter.
 LLM has no generate methods.
 bind() freezes everything that determines the cacheable prompt prefix,
 fixes the output type, and precomputes SDK keyword arguments once;
@@ -215,7 +215,7 @@ class LLM:
         response_format=Model gives BoundLLM[Model] whose output is the SDK-parsed instance;
         absent gives BoundLLM[str] whose output is the assistant text.
         automatic_prompt_caching has no default: caching changes billing,
-        so the library never chooses a caching configuration for the caller.
+        so langchaint never chooses a caching configuration for the caller.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
         """
         binding = _build_binding(

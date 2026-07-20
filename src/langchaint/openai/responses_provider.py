@@ -405,7 +405,7 @@ def _reasoning_text(item: ResponseReasoningItem) -> str | None:
 
 
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
-    """Build the package assistant turn from the output items, item order preserved.
+    """Build the langchaint assistant turn from the output items, item order preserved.
 
     A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay,
     beside the readable text _reasoning_text extracts from it;
@@ -434,7 +434,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
 
 
 def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
-    """Map the raw counters onto the package's disjoint partition and price them.
+    """Map the raw counters onto langchaint's disjoint partition and price them.
 
     input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
     so the uncached counter is the remainder after subtracting them.
@@ -527,7 +527,7 @@ class OpenAIResponsesProvider(Provider):
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
-        The stored client is a with_options(max_retries=0) copy: the package's retry loop owns all retrying,
+        The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
 
@@ -658,7 +658,7 @@ class _OpenAIStream[OutputT](ProviderStream[OutputT]):
         that raises RuntimeError unless the terminal event is response.completed.
 
         Yields:
-            Stream items; SDK events the package does not model (reasoning, built-in tool activity) are dropped.
+            Stream items; SDK events langchaint does not model (reasoning, built-in tool activity) are dropped.
 
         Raises:
             StreamProtocolError: the stream ended without a terminal response.

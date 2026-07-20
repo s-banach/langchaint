@@ -38,7 +38,7 @@ jobs:
 
       # Drift is measured on the schemas alone. SOURCE.md carries the fetched sha, which changes on
       # every upstream commit including the many that touch no schema, so including it here would
-      # open a pull request monthly regardless of whether anything this package depends on moved.
+      # open a pull request monthly regardless of whether anything langchaint depends on moved.
       # When only the sha moved, the rewritten SOURCE.md is discarded and its recorded commit stays
       # the one whose schema bytes are actually vendored.
       - name: Detect whether the schemas moved
@@ -69,9 +69,9 @@ jobs:
           set -euo pipefail
           # A passing gate is not full conformance, and the limit travels with the claim rather than
           # sitting in the test file: each anyOf over element types ends in a catch-all arm, so a
-          # renamed type const on an arm this package emits still validates through that arm.
+          # renamed type const on an arm langchaint emits still validates through that arm.
           if [ "${{ steps.gate.outcome }}" = "success" ]; then
-            verdict="The gate passes: every payload still validates. That does not cover a renamed element type, because the schemas' catch-all arms admit unrecognized ones, so read the diff for \`const\` and \`required\` changes on the arms this package emits (TextPart, ToolCallRequestPart, ToolCallResponsePart, FunctionToolDefinition)."
+            verdict="The gate passes: every payload still validates. That does not cover a renamed element type, because the schemas' catch-all arms admit unrecognized ones, so read the diff for \`const\` and \`required\` changes on the arms langchaint emits (TextPart, ToolCallRequestPart, ToolCallResponsePart, FunctionToolDefinition)."
           else
             verdict="The gate FAILS. A payload the tracing module emits no longer conforms; the run log names the attribute and the schema."
           fi

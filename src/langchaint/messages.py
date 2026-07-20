@@ -1,7 +1,7 @@
 """Provider-neutral messages and content parts.
 
 Messages carry no provider knowledge;
-provider adapters convert whole conversations to wire shapes because conversion depends on the full sequence,
+adapters convert whole conversations to wire shapes because conversion depends on the full sequence,
 not on one message at a time.
 The system prompt is a generate-method parameter, not a message type,
 because providers place it in different request locations.

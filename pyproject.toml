@@ -167,7 +167,7 @@ lint.select = [
     # `raise SomeError(...)` / `raise SomeError` shapes; they cannot see through
     # `raise type(exc)(...)` (re-raising the same leaf class enriched) or
     # `raise Class.factory(...)` (they read the last attribute, `factory`, as the
-    # exception name), both of which this package uses. Under them a correctly
+    # exception name), both of which langchaint uses. Under them a correctly
     # documented raise reports as extraneous and a real raise reports as missing,
     # so documenting raises is a CLAUDE.md convention (see "Document what a
     # function raises") checked in review instead.

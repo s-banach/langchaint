@@ -45,7 +45,7 @@ class CostBreakdown:
     total_cost_in_usd equals the Usage.cost_in_usd stored for the same request,
     because the adapter routes the stored scalar through the same price() call.
     counts is kept so an application can write its own caching counterfactual against
-    whatever baseline it chooses; the library ships only the per-category facts,
+    whatever baseline it chooses; langchaint ships only the per-category facts,
     because a savings baseline (for example, repricing every cache token at the uncached rate)
     is a billing opinion.
     """

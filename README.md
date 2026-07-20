@@ -99,6 +99,7 @@ Each provider reasoning element becomes one `ReasoningTrace` in `AssistantMessag
 
 **OTel tracing as a wrapper.**
 `langchaint.tracing` (imports only opentelemetry-api) has `TracedLLM`, `TracedBoundLLM`, `TracedStreamHandle`, and `TracedToolManager`; attribute mappers own span attribute names and never receive the conversation, so no built-in mapper can leak a prompt.
+Recording the conversation itself is `capture_message_content`, a required keyword with no default on every Traced class, because recording prompts is a privacy choice the library never makes for you.
 
 ## What it does not have
 

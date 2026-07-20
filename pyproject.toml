@@ -37,6 +37,11 @@ dev = [
     # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper
     # itself imports only opentelemetry-api.
     "opentelemetry-sdk>=1.30.0",
+    # opentelemetry-semantic-conventions arrives transitively with the sdk, and is
+    # declared here so the GenAI attribute keys the tracing module emits are checked
+    # against installed source rather than asserted from memory. The tracing module
+    # docstring names the revision it was verified against.
+    "opentelemetry-semantic-conventions>=0.64b0",
     "pytest>=9.0.2",
     "pyrefly>=1.2.0.dev2",
     "ruff>=0.15.20",

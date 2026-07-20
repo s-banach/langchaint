@@ -119,6 +119,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
         assert span.status.status_code == StatusCode.OK
         assert span.attributes is not None
         assert dict(span.attributes) == {
+            "gen_ai.operation.name": "chat",
             "gen_ai.provider.name": "fake",
             "gen_ai.request.model": "fake-model",
             "gen_ai.response.finish_reasons": ("stop",),
@@ -237,7 +238,10 @@ def test_generate_one_abort_records_the_exception_and_ends_the_span() -> None:
         assert span.status.status_code == StatusCode.ERROR
         # An abort carries no shared-field attributes; it is recorded as an exception event
         # plus the error.type classification every failing span kind takes.
-        assert dict(span.attributes or {}) == {"error.type": "AbortBatchError"}
+        assert dict(span.attributes or {}) == {
+            "gen_ai.operation.name": "chat",
+            "error.type": "AbortBatchError",
+        }
         assert [event.name for event in span.events] == ["exception"]
 
     asyncio.run(scenario())
@@ -527,7 +531,11 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
                 pass
             await stream.final()
         generate_span, stream_span = exporter.get_finished_spans()
-        assert generate_span.attributes == {"custom.mapped": True}
+        # gen_ai.operation.name is the wrapper's required attribute, outside the mapper's control.
+        assert generate_span.attributes == {
+            "gen_ai.operation.name": "chat",
+            "custom.mapped": True,
+        }
         assert stream_span.attributes is not None
         # The stream span also carries the wrapper-owned time_to_first_chunk plus the mapped one.
         assert stream_span.attributes["custom.mapped"] is True
@@ -537,10 +545,15 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
 
 
 def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
-    """A custom attribute_mapper sets exactly the keys it returns, no gen_ai keys."""
+    """A custom attribute_mapper displaces every mapped gen_ai key, keeping only the required one.
+
+    The mapper owns the result-derived attributes, so none of gen_ai_attributes' keys survive it.
+    gen_ai.operation.name is the exception by design: the wrapper sets it at span start, before the
+    mapper runs, because the convention marks it required on the span kinds it defines.
+    """
 
     async def scenario() -> None:
-        """Generate under a two-key mapper and assert the span carries only those two keys."""
+        """Generate under a two-key mapper and assert the span carries those two plus the required one."""
 
         def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
             """Emit two fixed attributes drawn from the result."""
@@ -555,7 +568,11 @@ def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
         )
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
-        assert span.attributes == {"custom.model": "fake-model", "custom.attempts": 1}
+        assert span.attributes == {
+            "gen_ai.operation.name": "chat",
+            "custom.model": "fake-model",
+            "custom.attempts": 1,
+        }
 
     asyncio.run(scenario())
 
@@ -920,6 +937,7 @@ def test_traced_tool_manager_handled_dispatch_emits_one_execute_tool_span() -> N
         assert span.status.status_code == StatusCode.OK
         assert span.attributes is not None
         assert dict(span.attributes) == {
+            "gen_ai.operation.name": "execute_tool",
             "gen_ai.tool.name": "echo",
             "gen_ai.tool.call.id": "call1",
         }
@@ -1131,6 +1149,93 @@ def test_generate_many_passes_warm_cache_through() -> None:
     asyncio.run(scenario())
 
 
+def test_each_convention_defined_span_kind_carries_the_required_operation_name() -> None:
+    """gen_ai.operation.name is set on every span kind but generate_many's aggregate.
+
+    One test over every kind rather than one assertion added to each kind's own test:
+    a required attribute missing from one span-opening site is the failure worth catching,
+    and that is visible only by covering the sites together.
+    The values are read in end order rather than keyed by span name, because three of the four
+    spans share the name "chat fake-model"; keying by name would collapse them and let a wrong
+    value on generate_one or generate_many pass.
+    """
+
+    async def scenario() -> None:
+        """Open one span of each kind and read the operation name each carries, in end order."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        bound = traced.bind(automatic_prompt_caching=True)
+        await bound.generate_one("hi")
+        await bound.generate_many([[UserMessage(content="hi")]])
+        async with bound.stream_one("hi") as stream:
+            await stream.final()
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=False
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "hi"}'))
+        spans = exporter.get_finished_spans()
+        # generate_many delegates to the plain BoundLLM, so its batch span has no traced children.
+        assert len(spans) == 4
+        assert [span.name for span in spans] == [
+            "chat fake-model",
+            "chat fake-model",
+            "chat fake-model",
+            "execute_tool echo",
+        ]
+        assert [(span.attributes or {}).get("gen_ai.operation.name") for span in spans] == [
+            "chat",
+            None,
+            "chat",
+            "execute_tool",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_extra_attributes_cannot_displace_the_operation_name() -> None:
+    """A required attribute set at span start wins over an application constant of the same key."""
+
+    async def scenario() -> None:
+        """Generate under extra_attributes claiming the operation name key."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeProvider()),
+            tracer=tracer,
+            capture_message_content=False,
+            extra_attributes={"gen_ai.operation.name": "not-the-operation"},
+        )
+        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.operation.name"] == "chat"
+
+    asyncio.run(scenario())
+
+
+def test_extra_attributes_cannot_displace_the_operation_name_on_a_dispatch_span() -> None:
+    """The same precedence holds on the dispatch span, which sets the key inline.
+
+    A dispatch span does not route through the helper the generate spans use, so the ordering is
+    written twice and a test of one site does not cover the other.
+    """
+
+    async def scenario() -> None:
+        """Dispatch under extra_attributes claiming the operation name key."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()],
+            tracer=tracer,
+            capture_message_content=False,
+            extra_attributes={"gen_ai.operation.name": "not-the-operation"},
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "hi"}'))
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert span.attributes["gen_ai.operation.name"] == "execute_tool"
+
+    asyncio.run(scenario())
+
+
 def _emitted_convention_keys() -> set[str]:
     """Collect every quoted gen_ai.* literal in the tracing module's source.
 
@@ -1268,7 +1373,7 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
                         "type": "tool_call",
                         "id": "call1",
                         "name": "echo",
-                        "arguments": '{"text": "x"}',
+                        "arguments": {"text": "x"},
                     }
                 ],
             },
@@ -1575,7 +1680,7 @@ def test_capture_survives_rebind_and_reaches_the_rebound_binding() -> None:
 
 
 def test_tool_span_captures_arguments_and_result_under_capture() -> None:
-    """A dispatch span records the raw argument JSON and the tool_message as a tool_call_response part."""
+    """A dispatch span records the arguments as an object and the tool_message as a tool_call_response part."""
 
     async def scenario() -> None:
         """Dispatch one valid call under capture and read both content keys."""
@@ -1583,15 +1688,179 @@ def test_tool_span_captures_arguments_and_result_under_capture() -> None:
         tool_manager = TracedToolManager(
             [_echo_tool()], tracer=tracer, capture_message_content=True
         )
-        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "hi"}'))
+        await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"text":"hi",   "n":1}')
+        )
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
-        assert span.attributes["gen_ai.tool.call.arguments"] == '{"text": "hi"}'
+        # The attribute's own string, not its decoded value: the effect on this key is normalization,
+        # and the spacing here differs from args_json, so a decoded comparison would also pass
+        # against an implementation that set the attribute to args_json untouched.
+        assert span.attributes["gen_ai.tool.call.arguments"] == '{"text": "hi", "n": 1}'
         assert _captured(exporter, "gen_ai.tool.call.result") == {
             "type": "tool_call_response",
             "id": "call1",
             "response": [{"type": "text", "content": "hi"}],
         }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "args_json",
+    ['{"n": 1e400}', '{"n": Infinity}', '{"n": -Infinity}', '{"n": NaN}'],
+)
+def test_tool_span_arguments_fall_back_when_the_parse_cannot_re_serialize_as_json(
+    args_json: str,
+) -> None:
+    """Input whose parse does not round-trip as JSON falls back to the raw text.
+
+    Python's json accepts and emits Infinity and NaN, which JSON has no syntax for, and reaches them
+    from ordinary input too (1e400 overflows to inf). Emitting the parsed value would put a bare
+    Infinity or NaN token on the span, which a strict consumer rejects, so these route to the
+    raw-text arm and go out as a JSON string instead.
+    """
+
+    async def scenario() -> None:
+        """Dispatch a call carrying the number and read the attribute back."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=True
+        )
+        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json=args_json))
+        assert _captured(exporter, "gen_ai.tool.call.arguments") == args_json
+
+    asyncio.run(scenario())
+
+
+def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_parse() -> None:
+    """Malformed argument text is preserved on the span, as a JSON string rather than as raw bytes.
+
+    The deserialization is best effort, so the span still shows what the model emitted rather than
+    dropping the key or raising; the outcome is the DispatchInvalidToolArgs arm reporting the same input.
+    The attribute goes out through the same re-serialization as a parsed value, so the text arrives
+    quoted and escaped; a consumer decodes the attribute and gets the original back.
+    """
+
+    async def scenario() -> None:
+        """Dispatch a call whose argument text is not JSON and read the attribute back."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=True
+        )
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json="not json at all")
+        )
+        assert isinstance(outcome, DispatchInvalidToolArgs)
+        assert _captured(exporter, "gen_ai.tool.call.arguments") == "not json at all"
+
+    asyncio.run(scenario())
+
+
+def test_conversation_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
+    """A parsed argument object nests inside gen_ai.input.messages; unparseable text stays a string there.
+
+    This is the site where the nesting matters: the parts array is serialized as a whole, so a parsed
+    object arrives as nested JSON rather than as a string a consumer decodes a second time.
+    One turn carrying both kinds pins them against each other, so an implementation that parsed every
+    call, dropping or raising on the second, fails here.
+    """
+
+    async def scenario() -> None:
+        """Generate over a turn holding one parseable and one unparseable tool call."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        bound = traced.bind(automatic_prompt_caching=True)
+        await bound.generate_one([
+            AssistantMessage(
+                turn=(
+                    ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
+                    ToolCall(id="call2", name="echo", args_json="{oops"),
+                )
+            )
+        ])
+        assert _captured(exporter, "gen_ai.input.messages") == [
+            {
+                "role": "assistant",
+                "parts": [
+                    {
+                        "type": "tool_call",
+                        "id": "call1",
+                        "name": "echo",
+                        "arguments": {"text": "x"},
+                    },
+                    {"type": "tool_call", "id": "call2", "name": "echo", "arguments": "{oops"},
+                ],
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("args_json", "expected"),
+    [('[1, 2]', [1, 2]), ('"bare"', "bare"), ("7", 7), ("null", None)],
+)
+def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
+    args_json: str, expected: object
+) -> None:
+    """Best effort covers any JSON value, not only an object, so a non-object nests rather than falling back.
+
+    The convention expects an object here and every other argument test feeds one, so an implementation
+    that parsed and then kept the text unless the result was a dict would pass all of them.
+    A model producing a non-object is what the DispatchInvalidToolArgs arm reports; the span records
+    the value it produced.
+    """
+
+    async def scenario() -> None:
+        """Generate over a turn whose tool call carries a non-object argument value."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        await traced.bind(automatic_prompt_caching=True).generate_one([
+            AssistantMessage(turn=(ToolCall(id="call1", name="echo", args_json=args_json),))
+        ])
+        assert _captured(exporter, "gen_ai.input.messages") == [
+            {
+                "role": "assistant",
+                "parts": [
+                    {"type": "tool_call", "id": "call1", "name": "echo", "arguments": expected}
+                ],
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_an_ordinary_float_argument_survives_the_parse() -> None:
+    """A finite float nests as the number it is, so the number hooks reject only what cannot round-trip.
+
+    The other argument tests carry strings and integers, which reach json.loads' parse_int, never its
+    parse_float; without this case a parse_float that rejected every input would pass them all,
+    since the non-finite cases expect the fallback anyway.
+    """
+
+    async def scenario() -> None:
+        """Generate over a turn whose tool call carries a finite float and read the arguments back."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        await traced.bind(automatic_prompt_caching=True).generate_one([
+            AssistantMessage(
+                turn=(ToolCall(id="call1", name="echo", args_json='{"n": 1.5, "big": 1e300}'),)
+            )
+        ])
+        assert _captured(exporter, "gen_ai.input.messages") == [
+            {
+                "role": "assistant",
+                "parts": [
+                    {
+                        "type": "tool_call",
+                        "id": "call1",
+                        "name": "echo",
+                        "arguments": {"n": 1.5, "big": 1e300},
+                    }
+                ],
+            }
+        ]
 
     asyncio.run(scenario())
 

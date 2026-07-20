@@ -13,7 +13,12 @@ an attribute set at completion (a mapper's, an outcome's) wins a key collision.
 Every Traced class also requires capture_message_content, which decides whether the spans carry
 the conversation itself; it has no default, because recording prompts is a privacy choice the library never makes.
 
-The attributes each span kind carries, capture_message_content True included:
+Every span the convention defines a kind for carries gen_ai.operation.name, which it marks required:
+"chat" on the generate_one and stream spans, "execute_tool" on a dispatch span.
+It is set at span start, after extra_attributes, so an application constant cannot displace it.
+generate_many's aggregate span carries no operation name; TracedBoundLLM.generate_many says why.
+
+The further attributes each span kind carries, capture_message_content True included:
 
 generate_one (CLIENT) and the stream span (CLIENT): gen_ai.provider.name, gen_ai.request.model,
 gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, gen_ai.usage.reasoning.output_tokens,
@@ -63,11 +68,12 @@ A convention change is a deliberate edit to this module.
 import importlib.metadata
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, overload, override
+from typing import Any, NoReturn, overload, override
 
 from pydantic import BaseModel
 
@@ -251,6 +257,67 @@ def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
     return parts
 
 
+def _finite_float(number_text: str) -> float:
+    """Parse a JSON number, rejecting one that overflows the float range.
+
+    json.dumps writes a non-finite float back as the bare token Infinity or NaN, which is not JSON,
+    so a value that cannot round-trip is treated as a parse failure instead.
+
+    Raises:
+        ValueError: the text parses to a non-finite float (1e400 overflows to inf).
+            _tool_call_arguments catches this type to reach its raw-text arm.
+    """
+    value = float(number_text)
+    if not math.isfinite(value):
+        raise ValueError(f"JSON number is not finite as a float: {number_text}")
+    return value
+
+
+def _reject_non_json_constant(token: str) -> NoReturn:
+    """Reject the Infinity, -Infinity, and NaN literals json.loads accepts as an extension.
+
+    They are not JSON, and json.dumps writes them straight back out, so they are a parse failure here.
+
+    Raises:
+        ValueError: always; json.loads calls this only for those three literals.
+            _tool_call_arguments catches this type to reach its raw-text arm.
+    """
+    raise ValueError(f"not a JSON constant: {token}")
+
+
+def _tool_call_arguments(args_json: str) -> object:
+    """Deserialize a tool call's argument JSON, falling back to the raw text when it does not parse.
+
+    The convention asks for an object here ("in case a serialized string is available to the
+    instrumentation, the instrumentation SHOULD do the best effort to deserialize it to an object"),
+    so a well-formed args_json reaches a backend as nested JSON rather than as a string a consumer
+    decodes a second time.
+    Best effort covers any JSON value, an object or not, and text that does not parse is returned
+    unchanged, to be emitted as a JSON string by the caller.
+    That fallback is why a parse failure is neither raised nor logged here: a malformed or non-object
+    args_json is what the DispatchInvalidToolArgs arm reports, and the span should show the text that
+    produced it.
+
+    The two parse hooks narrow json.loads to what json.dumps can write back as JSON.
+    Python's json accepts and emits Infinity and NaN, which RFC 8259 has no syntax for, and reaches them
+    from ordinary input as well: 1e400 parses to inf, so a returned value would re-serialize to a token
+    a strict consumer rejects.
+    Inside gen_ai.input.messages the cost is not one field, since the value is nested into a structure
+    serialized as a whole, so one such number would make the entire attribute unparseable.
+    Routing these to the raw-text arm keeps every emitted payload standard JSON.
+
+    Only ValueError is caught, the parse failure this fallback is for.
+    json.loads can also exhaust the stack on deeply nested input, and that RecursionError propagates to
+    the caller's own telemetry guard rather than being silently reported as unparseable text.
+    """
+    try:
+        return json.loads(
+            args_json, parse_float=_finite_float, parse_constant=_reject_non_json_constant
+        )
+    except ValueError:
+        return args_json
+
+
 def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
     """Render an assistant turn as the convention's parts array, in emission order.
 
@@ -258,7 +325,6 @@ def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
     opaque by construction (an anthropic signature that may be redacted, an openai encrypted_content),
     so shipping it buys a reader nothing, and the pinned revision defines no reasoning message part to put it in.
     A turn holding only reasoning therefore renders as an empty parts array, not as a missing message.
-    args_json rides through unparsed, so the arguments reach the backend exactly as the model produced them.
     """
     parts: list[dict[str, object]] = []
     for element in turn:
@@ -269,7 +335,7 @@ def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
                 "type": "tool_call",
                 "id": element.id,
                 "name": element.name,
-                "arguments": element.args_json,
+                "arguments": _tool_call_arguments(element.args_json),
             })
     return parts
 
@@ -460,12 +526,25 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
 def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> None:
     """Set the constant extra_attributes on a just-started span, when recording and non-empty.
 
-    Applied at span start, so the attributes are present however the span later ends;
-    an attribute set at completion (a mapper's, a dispatch outcome's) is set after these
-    and wins a key collision.
+    Applied first, so the attributes are present however the span later ends, and so every attribute
+    this module sets itself wins a key collision against them: gen_ai.operation.name and the dispatch
+    identity keys, set immediately after at span start, and a mapper's or a dispatch outcome's,
+    set at completion.
     """
     if extra_attributes and span.is_recording():
         span.set_attributes(extra_attributes)
+
+
+def _apply_operation_name(span: Span, operation_name: str) -> None:
+    """Set gen_ai.operation.name on a just-started span.
+
+    The convention marks this attribute required on the span kinds it defines, which is every span
+    this module opens except generate_many's aggregate; TracedBoundLLM.generate_many says why it is absent there.
+    Applied at span start, so it is present however the span ends, and after extra_attributes,
+    so an application constant cannot displace a required attribute.
+    """
+    if span.is_recording():
+        span.set_attribute("gen_ai.operation.name", operation_name)
 
 
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
@@ -752,6 +831,7 @@ class TracedBoundLLM[OutputT]:
         span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
+            _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, conversation)
             try:
                 response = await self._bound_llm.generate_one(conversation)
@@ -791,6 +871,11 @@ class TracedBoundLLM[OutputT]:
         The mapper is not invoked (there is no single result to map);
         the span carries the extra_attributes and langchaint.batch_item_count, the number of conversations
         (a langchaint.* attribute because the GenAI convention defines no batch-size key).
+        It is the one span here with no gen_ai.operation.name, which the convention marks required on the
+        span kinds it defines: it defines no batch-aggregate span, so nothing is required of this one,
+        and claiming "chat" would make every batch count as one more chat request on a backend that groups
+        by that key, while carrying no model, no token counts, and no finish reason to back the claim.
+        The span name still reads "chat {model}", which the convention leaves free-form.
         No content attributes are set under any capture_message_content value:
         the span covers a batch with no single conversation and no single assistant turn,
         the same reason the mapper is not invoked here.
@@ -886,6 +971,7 @@ class TracedStreamHandle[OutputT]:
         if self._span is None:
             self._span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
             _apply_extra_attributes(self._span, self._span_config.extra_attributes)
+            _apply_operation_name(self._span, _CHAT_OPERATION)
             if self._span_config.capture_message_content:
                 _apply_content_attributes(
                     self._span, lambda: _input_content_attributes(self._binding, self._conversation)
@@ -1051,7 +1137,7 @@ class TracedToolManager(ToolManager):
     Spans the function starts (an instrumented HTTP request, a nested agent loop) nest under the execute_tool span.
     dispatch_many stays safe: asyncio.gather runs each dispatch in its own task with a copied context.
     Concurrent dispatch spans are therefore siblings, never nested in one another.
-    The identity attributes gen_ai.tool.name and gen_ai.tool.call.id are set at span start;
+    The identity attributes gen_ai.operation.name, gen_ai.tool.name, and gen_ai.tool.call.id are set at span start;
     at completion the span takes its status and error.type from the outcome:
 
     | dispatch result                     | status | error.type              |
@@ -1080,9 +1166,17 @@ class TracedToolManager(ToolManager):
     no JSON schema governs the key, so the choice among objects is this module's.
     Its response field is the parts array every other content key uses, so a str content and a
     Sequence[Part] content reach a backend in one shape.
-    gen_ai.tool.call.arguments is the model's own argument JSON, passed through unparsed:
-    a malformed or non-object args_json is exactly what the DispatchInvalidToolArgs arm exists to report,
-    and rewriting it would hide the value that produced the failure the span records.
+    gen_ai.tool.call.arguments is the model's own argument JSON, deserialized on a best effort:
+    the convention expects an object and asks an instrumentation holding a serialized string to try to
+    deserialize it.
+    A span attribute cannot hold a nested object, so the deserialized value is re-serialized to the
+    JSON string the convention permits when structured form is unsupported.
+    On this key the effect is therefore normalization; the nesting matters on the generate span,
+    whose gen_ai.input.messages embeds the same arguments in a structure serialized as a whole.
+    Text that does not parse is preserved, so the value that produced the DispatchInvalidToolArgs arm
+    is still readable, and it goes out through that same re-serialization:
+    it reaches the span as a JSON string, quoted and escaped, and a consumer decoding the attribute
+    gets the model's text back.
 
     gen_ai.tool.call.result is recorded on every arm, including the two where the tool function never ran.
     The convention defines that key as the result "if any and if execution was successful",
@@ -1151,11 +1245,19 @@ class TracedToolManager(ToolManager):
             _apply_extra_attributes(span, self._extra_attributes)
             if span.is_recording():
                 span.set_attributes({
+                    "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
                     "gen_ai.tool.name": call.name,
                     "gen_ai.tool.call.id": call.id,
                 })
                 if self._capture_message_content:
-                    span.set_attribute("gen_ai.tool.call.arguments", call.args_json)
+                    _apply_content_attributes(
+                        span,
+                        lambda: {
+                            "gen_ai.tool.call.arguments": json.dumps(
+                                _tool_call_arguments(call.args_json)
+                            )
+                        },
+                    )
             try:
                 outcome = await super().dispatch(call)
             except Exception as exc:

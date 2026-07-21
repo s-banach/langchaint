@@ -56,9 +56,11 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
+from langchaint.adapter import Binding
 from langchaint.exceptions import StreamProtocolError, TransientError
-from langchaint.openai import OpenAIResponsesProvider, ReasoningSummary, cost_breakdown
-from langchaint.openai.responses_provider import (
+from langchaint.openai import OpenAIResponsesAdapter, ReasoningSummary, cost_breakdown
+from langchaint.openai.responses_adapter import (
+    _adapter_result,
     _assistant_items,
     _assistant_message_from,
     _BoundOpenAIStructured,
@@ -67,11 +69,9 @@ from langchaint.openai.responses_provider import (
     _normalized_stop_reason,
     _normalized_usage,
     _OpenAIStream,
-    _provider_result,
     _wire_input,
     _wire_tool_choice,
 )
-from langchaint.provider import Binding
 
 _PRICING = PricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -443,14 +443,14 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     ]
 
 
-def test_provider_result_normalizes_a_response_with_usage() -> None:
+def test_adapter_result_normalizes_a_response_with_usage() -> None:
     """A response with usage yields the normalized partition, cost, and stop reason.
 
     raw must be the SDK response object itself (identity, not equality):
     an equal copy would silently reintroduce the per-request deep copy the no-rewrap rule bans.
     """
     response = _response(usage=_usage_with_cache())
-    result = _provider_result(response=response, output="hey", pricing=_PRICING)
+    result = _adapter_result(response=response, output="hey", pricing=_PRICING)
     assert result.output == "hey"
     assert result.usage.input_tokens_total == 1000
     assert result.usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
@@ -459,9 +459,9 @@ def test_provider_result_normalizes_a_response_with_usage() -> None:
     assert result.raw is response
 
 
-def test_provider_result_falls_back_to_zero_usage_without_usage() -> None:
+def test_adapter_result_falls_back_to_zero_usage_without_usage() -> None:
     """A response missing usage normalizes to zero counters and zero cost."""
-    result = _provider_result(response=_response(usage=None), output="hey", pricing=_PRICING)
+    result = _adapter_result(response=_response(usage=None), output="hey", pricing=_PRICING)
     assert result.usage.input_tokens_total == 0
     assert result.usage.output_tokens == 0
     assert result.usage.cost_in_usd == 0.0
@@ -519,7 +519,7 @@ def test_wire_input_converts_tool_result_parts_to_structured_output_content() ->
 
 def test_wire_input_has_no_system_item() -> None:
     """The system prompt travels as the instructions parameter, never as an item."""
-    request = _provider()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
+    request = _adapter()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
     assert request.instructions == "sys"
     assert _wire_input([UserMessage(content="q")]) == [{"role": "user", "content": "q"}]
 
@@ -532,12 +532,13 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {"type": "function", "name": "x"}
 
 
-def _provider(*, reasoning_summary: ReasoningSummary | None = None) -> OpenAIResponsesProvider:
+def _adapter(*, reasoning_summary: ReasoningSummary | None = None) -> OpenAIResponsesAdapter:
     """Build an adapter over a keyless client, valid because no request is sent."""
-    return OpenAIResponsesProvider(
+    return OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
         model="m",
         pricing=_PRICING,
+        provider_name="openai",
         reasoning_summary=reasoning_summary,
     )
 
@@ -565,7 +566,7 @@ def test_request_sends_a_summary_alone_when_no_effort_is_bound() -> None:
     A summary is reached through the same object effort travels in, so gating that object on effort
     would silently ask for no summary whenever a caller set one without an effort.
     """
-    request = _provider(reasoning_summary="detailed")._request(
+    request = _adapter(reasoning_summary="detailed")._request(
         _binding(automatic_prompt_caching=True)
     )
     assert request.reasoning == {"summary": "detailed"}
@@ -577,7 +578,7 @@ def test_request_sends_an_effort_alone_without_a_summary_key() -> None:
     An explicit null summary is a different request from omitting the key,
     which is what key-by-key assembly buys over one Reasoning(effort=..., summary=...) call.
     """
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(automatic_prompt_caching=True, reasoning_effort="high")
     )
     assert request.reasoning == {"effort": "high"}
@@ -585,7 +586,7 @@ def test_request_sends_an_effort_alone_without_a_summary_key() -> None:
 
 def test_request_sends_both_reasoning_keys_when_both_are_set() -> None:
     """Effort and summary set together travel in one reasoning object."""
-    request = _provider(reasoning_summary="auto")._request(
+    request = _adapter(reasoning_summary="auto")._request(
         _binding(automatic_prompt_caching=True, reasoning_effort="low")
     )
     assert request.reasoning == {"effort": "low", "summary": "auto"}
@@ -593,25 +594,25 @@ def test_request_sends_both_reasoning_keys_when_both_are_set() -> None:
 
 def test_request_omits_reasoning_when_neither_key_is_set() -> None:
     """Neither key set leaves reasoning at the omit sentinel, sending no reasoning object."""
-    request = _provider()._request(_binding(automatic_prompt_caching=True))
+    request = _adapter()._request(_binding(automatic_prompt_caching=True))
     assert isinstance(request.reasoning, openai.Omit)
 
 
 def test_request_omits_prompt_cache_options_under_automatic_caching() -> None:
     """Automatic caching leaves prompt_cache_options at the omit sentinel."""
-    request = _provider()._request(_binding(automatic_prompt_caching=True))
+    request = _adapter()._request(_binding(automatic_prompt_caching=True))
     assert isinstance(request.prompt_cache_options, openai.Omit)
 
 
 def test_request_requests_explicit_mode_when_caching_disabled() -> None:
     """Disabled caching sends explicit mode with no breakpoints."""
-    request = _provider()._request(_binding(automatic_prompt_caching=False))
+    request = _adapter()._request(_binding(automatic_prompt_caching=False))
     assert request.prompt_cache_options == {"mode": "explicit"}
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _provider()._request(_binding(automatic_prompt_caching=True))
+    unset = _adapter()._request(_binding(automatic_prompt_caching=True))
     assert isinstance(unset.temperature, openai.Omit)
     binding = Binding(
         system_prompt=None,
@@ -621,12 +622,12 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         inference_params=InferenceParams(temperature=0.2),
         automatic_prompt_caching=True,
     )
-    assert _provider()._request(binding).temperature == 0.2
+    assert _adapter()._request(binding).temperature == 0.2
 
 
 def test_request_omits_tool_fields_without_tools() -> None:
     """No tools leaves tools, tool_choice, and parallel_tool_calls at the omit sentinel."""
-    request = _provider()._request(_binding(automatic_prompt_caching=True))
+    request = _adapter()._request(_binding(automatic_prompt_caching=True))
     assert isinstance(request.tools, openai.Omit)
     assert isinstance(request.tool_choice, openai.Omit)
     assert isinstance(request.parallel_tool_calls, openai.Omit)
@@ -854,11 +855,11 @@ class _StructuredReport(BaseModel):
 
 
 def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
-    """Build a structured-bound provider over a keyless client; no request is sent."""
-    provider = _provider()
-    request = provider._request(_binding(automatic_prompt_caching=False, system_prompt="sys"))
+    """Build a structured-bound adapter over a keyless client; no request is sent."""
+    adapter = _adapter()
+    request = adapter._request(_binding(automatic_prompt_caching=False, system_prompt="sys"))
     return _BoundOpenAIStructured(
-        adapter=provider, request=request, response_format=_StructuredReport
+        adapter=adapter, request=request, response_format=_StructuredReport
     )
 
 
@@ -899,7 +900,7 @@ def _parsed_response(
 
 
 def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
-    """The structured bound provider hands back the SDK-parsed response_format instance as content."""
+    """The structured bound adapter hands back the SDK-parsed response_format instance as content."""
     report = _StructuredReport(city="Nairobi", celsius=25)
     assert _structured_bound()._parsed_output(_parsed_response(report)) == report
 
@@ -945,8 +946,8 @@ def test_every_request_carries_the_reasoning_include(
     the SDK documents include as what populates encrypted_content,
     so without this parameter every replayed reasoning item could be silently empty.
     """
-    provider = _provider()
-    request = provider._request(_binding(automatic_prompt_caching=True))
+    adapter = _adapter()
+    request = adapter._request(_binding(automatic_prompt_caching=True))
     includes: list[object] = []
 
     async def fake_create(**request_kwargs: object) -> OpenAIResponse:
@@ -965,12 +966,12 @@ def test_every_request_carries_the_reasoning_include(
         includes.append(request_kwargs["include"])
         return _FakeStreamManager()
 
-    monkeypatch.setattr(provider.client.responses, "create", fake_create)
-    monkeypatch.setattr(provider.client.responses, "parse", fake_parse)
-    monkeypatch.setattr(provider.client.responses, "stream", fake_stream)
-    text_bound = _BoundOpenAIText(adapter=provider, request=request)
+    monkeypatch.setattr(adapter.client.responses, "create", fake_create)
+    monkeypatch.setattr(adapter.client.responses, "parse", fake_parse)
+    monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
+    text_bound = _BoundOpenAIText(adapter=adapter, request=request)
     structured_bound = _BoundOpenAIStructured(
-        adapter=provider, request=request, response_format=_StructuredReport
+        adapter=adapter, request=request, response_format=_StructuredReport
     )
 
     async def scenario() -> None:
@@ -997,31 +998,31 @@ def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
 def test_retry_after_seconds_prefers_the_millisecond_header() -> None:
     """retry-after-ms wins over retry-after because it is more precise."""
     error = _rate_limit_error({"retry-after-ms": "1500", "retry-after": "49"})
-    assert _provider().retry_after_seconds(error) == 1.5
+    assert _adapter().retry_after_seconds(error) == 1.5
 
 
 def test_retry_after_seconds_parses_the_seconds_header() -> None:
     """Without retry-after-ms, retry-after is parsed as float seconds."""
     error = _rate_limit_error({"retry-after": "49"})
-    assert _provider().retry_after_seconds(error) == 49.0
+    assert _adapter().retry_after_seconds(error) == 49.0
 
 
 def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
     """No headers, an unparseable value, and a non-SDK error all yield None."""
-    provider = _provider()
-    assert provider.retry_after_seconds(_rate_limit_error({})) is None
+    adapter = _adapter()
+    assert adapter.retry_after_seconds(_rate_limit_error({})) is None
     assert (
-        provider.retry_after_seconds(
+        adapter.retry_after_seconds(
             _rate_limit_error({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
         )
         is None
     )
-    assert provider.retry_after_seconds(ValueError("boom")) is None
+    assert adapter.retry_after_seconds(ValueError("boom")) is None
 
 
 def test_adapter_pins_sdk_retries_off() -> None:
     """The stored client copy carries max_retries=0 so only langchaint retries."""
-    assert _provider().client.max_retries == 0
+    assert _adapter().client.max_retries == 0
 
 
 def test_wire_input_marks_marked_user_and_tool_parts() -> None:
@@ -1090,7 +1091,7 @@ def test_wire_input_sends_every_mark_without_a_client_side_cap() -> None:
 
 def test_request_system_parts_become_a_developer_input_message() -> None:
     """A parts system_prompt travels as a developer-role input message; instructions stays unset."""
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(
             automatic_prompt_caching=True,
             system_prompt=(
@@ -1117,6 +1118,6 @@ def test_request_system_parts_become_a_developer_input_message() -> None:
 
 def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> None:
     """A str system_prompt keeps the instructions mapping and sends no prefix item."""
-    request = _provider()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
+    request = _adapter()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
     assert request.instructions == "sys"
     assert request.input_prefix == []

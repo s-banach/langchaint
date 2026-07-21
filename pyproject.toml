@@ -186,8 +186,8 @@ lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
 
-# The tests exercise private helpers and attributes directly (Provider._request,
-# BoundLLM._bound_provider); those accesses are the unit under test, so SLF001
+# The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._request,
+# BoundLLM._bound_adapter); those accesses are the unit under test, so SLF001
 # (private-member-access) cannot be satisfied without exposing internals.
 lint.per-file-ignores."tests/*" = ["SLF001"]
 

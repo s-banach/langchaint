@@ -1,6 +1,6 @@
-"""Tracing wrappers driven by fake providers and an in-memory exporter.
+"""Tracing wrappers driven by fake adapters and an in-memory exporter.
 
-The fake providers are the ones test_bound_llm builds; here they feed the tracing wrapper instead of the plain BoundLLM.
+The fake adapters are the ones test_bound_llm builds; here they feed the tracing wrapper instead of the plain BoundLLM.
 TracedToolManager is driven directly with constructed ToolCalls; its spans land in the same exporter.
 A locally built TracerProvider with a _SchemaValidatingSpanProcessor and an InMemorySpanExporter captures
 every span, so the assertions read span names, kinds, statuses, attributes, events,
@@ -60,7 +60,7 @@ from langchaint import (
     UserMessage,
     to_row,
 )
-from langchaint.provider import Binding, BoundProvider, ProviderResult
+from langchaint.adapter import AdapterResult, Binding, BoundAdapter
 from langchaint.tracing import (
     AttributeMapper,
     SpanAttributes,
@@ -75,8 +75,8 @@ from tests.test_bound_llm import (
     _FAKE_RAW_USAGE,
     _USAGE,
     _USAGE_BILLED,
-    _FakeBoundProvider,
-    _FakeProvider,
+    _FakeAdapter,
+    _FakeBoundAdapter,
     _FakeRawResponse,
     _FakeStream,
     _fast_rate_limiter,
@@ -239,7 +239,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
         """Drive one generate_one to success and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True)), tracer=tracer, capture_message_content=False
+            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
         )
         response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert response.output == "hi"
@@ -270,7 +270,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose send refuses, then inspect the error span."""
-        provider = _FakeProvider(
+        adapter = _FakeAdapter(
             failures=[
                 RefusalError.for_rejected_200(
                     usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
@@ -279,7 +279,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -300,7 +300,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
 
     async def scenario() -> None:
         """Drive one generate_one whose send truncates, then inspect the error span."""
-        provider = _FakeProvider(
+        adapter = _FakeAdapter(
             failures=[
                 MaxCompletionTokensExceededError.for_rejected_200(
                     usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
@@ -309,7 +309,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -329,10 +329,10 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
 
     async def scenario() -> None:
         """Exhaust the budget on transport failures and inspect the error span."""
-        provider = _FakeProvider(failures=[TransientError("e1"), TransientError("e2")])
+        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -355,10 +355,10 @@ def test_generate_one_abort_records_the_exception_and_ends_the_span() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose send aborts, then inspect the error span."""
-        provider = _FakeProvider(failures=[AbortBatchError("misconfigured")])
+        adapter = _FakeAdapter(failures=[AbortBatchError("misconfigured")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -382,10 +382,10 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
 
     async def scenario() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
-        provider = _FakeProvider(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(failures=[TransientError("boom")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -405,7 +405,7 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item refuses, then inspect the batch span."""
-        provider = _FakeProvider(
+        adapter = _FakeAdapter(
             echo=True,
             failures=[
                 RefusalError.for_rejected_200(
@@ -416,7 +416,7 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
+            LLM(adapter, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
         )
         results = await traced.bind(automatic_prompt_caching=True).generate_many([
             [UserMessage(content="a")],
@@ -455,20 +455,20 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
             [UserMessage(content="c")],
         ]
 
-        def _provider() -> _FakeProvider:
-            """Build a fresh provider whose first serialized item exhausts under a one-attempt budget."""
-            return _FakeProvider(echo=True, failures=[TransientError("x")])
+        def _adapter() -> _FakeAdapter:
+            """Build a fresh adapter whose first serialized item exhausts under a one-attempt budget."""
+            return _FakeAdapter(echo=True, failures=[TransientError("x")])
 
         plain = (
             await LLM(
-                _provider(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)
+                _adapter(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)
             )
             .bind(automatic_prompt_caching=True)
             .generate_many(conversations)
         )
         tracer, _exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_provider(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)),
+            LLM(_adapter(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -489,11 +489,11 @@ def test_generate_many_abort_marks_the_batch_span_error() -> None:
 
     async def scenario() -> None:
         """Serialize a two-item batch whose first item aborts, then inspect the batch span."""
-        provider = _FakeProvider(echo=True, failures=[AbortBatchError("misconfigured")])
+        adapter = _FakeAdapter(echo=True, failures=[AbortBatchError("misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
+            LLM(adapter, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
         )
         with pytest.raises(AbortBatchError):
             await traced.bind(automatic_prompt_caching=True).generate_many([
@@ -513,7 +513,7 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
     async def scenario() -> None:
         """Iterate the stream fully, call final(), and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
@@ -536,7 +536,7 @@ def test_stream_final_is_idempotent_and_ends_the_span_once() -> None:
     async def scenario() -> None:
         """Call final() twice on one drained stream and count the spans."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             first = await stream.final()
             second = await stream.final()
@@ -552,7 +552,7 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
     async def scenario() -> None:
         """Break out after one item and confirm one span ended without error status."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             async for _item in stream:
                 break
@@ -568,7 +568,7 @@ def test_stream_never_iterated_emits_no_span() -> None:
     async def scenario() -> None:
         """Enter and leave the context without driving the stream."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
             pass
         assert exporter.get_finished_spans() == ()
@@ -587,10 +587,10 @@ def test_stream_failing_mid_iteration_ends_its_span_with_error_status() -> None:
 
     async def scenario() -> None:
         """Iterate a mid-failing stream and confirm the error span."""
-        provider = _FakeProvider(stream=_MidFailStream(), classify_result="transient")
+        adapter = _FakeAdapter(stream=_MidFailStream(), classify_result="transient")
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -608,10 +608,10 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
 
     async def scenario() -> None:
         """Drain a stream whose final() refuses and inspect the error span."""
-        provider = _FakeProvider(stream=_RefusingStream())
+        adapter = _FakeAdapter(stream=_RefusingStream())
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -646,7 +646,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True)),
+            LLM(_FakeAdapter(echo=True)),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -691,7 +691,7 @@ def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider()),
+            LLM(_FakeAdapter()),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -722,7 +722,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         # No global SDK provider is configured, so get_tracer yields non-recording spans.
         tracer = trace.get_tracer("no-sdk")
         traced = TracedLLM(
-            LLM(_FakeProvider()),
+            LLM(_FakeAdapter()),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -752,7 +752,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider()),
+            LLM(_FakeAdapter()),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -786,7 +786,7 @@ def test_generate_many_does_not_invoke_the_mapper() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -824,7 +824,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider()),
+            LLM(_FakeAdapter()),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -842,7 +842,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
 
 def test_bind_output_types_are_mirrored() -> None:
     """The overloads mirror LLM.bind: a model gives TracedBoundLLM[Model], absent gives [str]."""
-    traced = TracedLLM(LLM(_FakeProvider()), capture_message_content=False)
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
     structured = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(structured, TracedBoundLLM[_Answer])
     text = traced.bind(automatic_prompt_caching=True)
@@ -860,14 +860,14 @@ def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> Spa
 
 
 def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
-    """The provider and rate_limiter pass through TracedLLM; the BoundLLM fields through TracedBoundLLM."""
-    provider = _FakeProvider()
+    """The adapter and rate_limiter pass through TracedLLM; the BoundLLM fields through TracedBoundLLM."""
+    adapter = _FakeAdapter()
     rate_limiter = _fast_rate_limiter()
-    traced = TracedLLM(LLM(provider, rate_limiter=rate_limiter), capture_message_content=False)
-    assert traced.provider is provider
+    traced = TracedLLM(LLM(adapter, rate_limiter=rate_limiter), capture_message_content=False)
+    assert traced.adapter is adapter
     assert traced.rate_limiter is rate_limiter
     bound = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
-    assert bound.provider is provider
+    assert bound.adapter is adapter
     assert bound.rate_limiter is rate_limiter
     assert bound.response_format is _Answer
     assert bound.tool_manager is None
@@ -876,7 +876,7 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
 
 def test_wrapping_a_stream_creates_a_traced_stream() -> None:
     """The stream_one call returns a TracedStreamHandle, the wrapper that owns the stream span."""
-    traced = TracedLLM(LLM(_FakeProvider()), capture_message_content=False)
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
     handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
     assert isinstance(handle, TracedStreamHandle)
 
@@ -893,7 +893,7 @@ def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() ->
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True)),
+            LLM(_FakeAdapter(echo=True)),
             attribute_mapper=_mapper,
             extra_attributes={"gen_ai.agent.name": "agent_a", "shared.key": "extra"},
             tracer=tracer,
@@ -915,7 +915,7 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_spans() -> N
         """Rebind, then stream and batch under one extra_attributes mapping; both spans carry it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
             extra_attributes={"gen_ai.agent.name": "agent_a"},
             tracer=tracer,
             capture_message_content=False,
@@ -956,7 +956,7 @@ def test_gen_ai_attributes_is_public_and_composable() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True)),
+            LLM(_FakeAdapter(echo=True)),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -1227,7 +1227,7 @@ def test_traced_tool_manager_is_a_tool_manager_bindable_as_one() -> None:
     """TracedToolManager subclasses ToolManager, so bind's tool_manager parameter accepts it unchanged."""
     tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
     assert isinstance(tool_manager, ToolManager)
-    bound = TracedLLM(LLM(_FakeProvider()), capture_message_content=False).bind(
+    bound = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False).bind(
         tool_manager=tool_manager, automatic_prompt_caching=True
     )
     assert bound.tool_manager is tool_manager
@@ -1261,10 +1261,10 @@ def test_generate_many_passes_warm_cache_through() -> None:
 
     async def scenario() -> None:
         """Run a three-item batch on a slow fake with a wide slot and read the recorded peak."""
-        provider = _FakeProvider(echo=True, send_seconds=0.01)
+        adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter(max_in_flight=8)),
+            LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -1272,7 +1272,7 @@ def test_generate_many_passes_warm_cache_through() -> None:
             [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
         )
         assert all(isinstance(result, Response) for result in results)
-        assert provider.bound_providers[0].peak_in_flight == 2
+        assert adapter.bound_adapters[0].peak_in_flight == 2
         (span,) = exporter.get_finished_spans()
         assert span.kind == SpanKind.INTERNAL
 
@@ -1293,7 +1293,7 @@ def test_each_convention_defined_span_kind_carries_the_required_operation_name()
     async def scenario() -> None:
         """Open one span of each kind and read the operation name each carries, in end order."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=False)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         bound = traced.bind(automatic_prompt_caching=True)
         await bound.generate_one("hi")
         await bound.generate_many([[UserMessage(content="hi")]])
@@ -1329,7 +1329,7 @@ def test_extra_attributes_cannot_displace_the_operation_name() -> None:
         """Generate under extra_attributes claiming the operation name key."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider()),
+            LLM(_FakeAdapter()),
             tracer=tracer,
             capture_message_content=False,
             extra_attributes={"gen_ai.operation.name": "not-the-operation"},
@@ -1469,7 +1469,7 @@ def test_every_payload_attribute_reaches_validation() -> None:
     async def scenario() -> None:
         """Generate over a full conversation, then dispatch a tool call with object arguments."""
         tracer, _exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt="be brief",
             tool_manager=ToolManager([_echo_tool()]),
@@ -1504,13 +1504,13 @@ def test_a_payload_that_violates_its_schema_fails_the_span() -> None:
         span.set_attribute("gen_ai.output.messages", json.dumps({"role": "assistant"}))
 
 
-class _ReasoningOnlyBoundProvider(_FakeBoundProvider):
-    """A bound provider whose success carries a turn of reasoning and nothing else."""
+class _ReasoningOnlyBoundAdapter(_FakeBoundAdapter):
+    """A bound adapter whose success carries a turn of reasoning and nothing else."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
         """Return a result whose assistant turn holds one ReasoningTrace and no text."""
-        return ProviderResult(
+        return AdapterResult(
             output="",
             assistant_message=AssistantMessage(
                 turn=(ReasoningTrace(reasoning={"signature": "opaque"}),)
@@ -1522,22 +1522,22 @@ class _ReasoningOnlyBoundProvider(_FakeBoundProvider):
         )
 
 
-class _ReasoningOnlyProvider(_FakeProvider):
-    """A provider handing out bound providers whose turns hold only reasoning."""
+class _ReasoningOnlyAdapter(_FakeAdapter):
+    """An adapter handing out bound adapters whose turns hold only reasoning."""
 
     @override
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
-        """Hand out the reasoning-only bound provider."""
-        return _ReasoningOnlyBoundProvider()
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+        """Hand out the reasoning-only bound adapter."""
+        return _ReasoningOnlyBoundAdapter()
 
 
-class _EmptyTextTurnBoundProvider(_FakeBoundProvider):
-    """A bound provider whose success carries an empty-text trace beside an empty TextPart."""
+class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
+    """A bound adapter whose success carries an empty-text trace beside an empty TextPart."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
         """Return a result whose turn holds one empty-text ReasoningTrace and one empty TextPart."""
-        return ProviderResult(
+        return AdapterResult(
             output="",
             assistant_message=AssistantMessage(
                 turn=(
@@ -1552,22 +1552,22 @@ class _EmptyTextTurnBoundProvider(_FakeBoundProvider):
         )
 
 
-class _EmptyTextTurnProvider(_FakeProvider):
-    """A provider handing out bound providers whose turn elements all carry empty text."""
+class _EmptyTextTurnAdapter(_FakeAdapter):
+    """An adapter handing out bound adapters whose turn elements all carry empty text."""
 
     @override
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
-        """Hand out the empty-text bound provider."""
-        return _EmptyTextTurnBoundProvider()
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+        """Hand out the empty-text bound adapter."""
+        return _EmptyTextTurnBoundAdapter()
 
 
-class _ReasoningWithTextBoundProvider(_FakeBoundProvider):
-    """A bound provider whose success carries reasoning with readable text, then text."""
+class _ReasoningWithTextBoundAdapter(_FakeBoundAdapter):
+    """A bound adapter whose success carries reasoning with readable text, then text."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
         """Return a result whose turn holds one texted ReasoningTrace and one TextPart."""
-        return ProviderResult(
+        return AdapterResult(
             output="answer",
             assistant_message=AssistantMessage(
                 turn=(
@@ -1582,13 +1582,13 @@ class _ReasoningWithTextBoundProvider(_FakeBoundProvider):
         )
 
 
-class _ReasoningWithTextProvider(_FakeProvider):
-    """A provider handing out bound providers whose reasoning carries readable text."""
+class _ReasoningWithTextAdapter(_FakeAdapter):
+    """An adapter handing out bound adapters whose reasoning carries readable text."""
 
     @override
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
-        """Hand out the reasoning-with-text bound provider."""
-        return _ReasoningWithTextBoundProvider()
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
+        """Hand out the reasoning-with-text bound adapter."""
+        return _ReasoningWithTextBoundAdapter()
 
 
 def _captured(exporter: InMemorySpanExporter, key: str) -> object:
@@ -1611,7 +1611,7 @@ def test_capture_off_leaves_every_content_key_off_the_span() -> None:
         """Generate under a binding carrying a system prompt and a tool, with capture off."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True)), tracer=tracer, capture_message_content=False
+            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
         )
         bound = traced.bind(
             system_prompt="be brief",
@@ -1637,7 +1637,7 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
     async def scenario() -> None:
         """Generate over a conversation carrying every message role and inspect the shapes."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt="be brief",
             tool_manager=ToolManager([_echo_tool()]),
@@ -1700,7 +1700,7 @@ def test_a_str_conversation_is_captured_as_one_user_message() -> None:
     async def scenario() -> None:
         """Generate from a str conversation and read the input messages back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert _captured(exporter, "gen_ai.input.messages") == [
             {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
@@ -1715,7 +1715,7 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
     async def scenario() -> None:
         """Generate over a conversation holding an image and read the input messages back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one([
             UserMessage(
                 content=(
@@ -1751,7 +1751,7 @@ def test_text_free_reasoning_is_excluded_leaving_an_empty_parts_array() -> None:
         """Generate a reasoning-only turn and read the output messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_ReasoningOnlyProvider()), tracer=tracer, capture_message_content=True
+            LLM(_ReasoningOnlyAdapter()), tracer=tracer, capture_message_content=True
         )
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
@@ -1776,7 +1776,7 @@ def test_empty_text_is_excluded_from_reasoning_and_text_parts_alike() -> None:
         """Generate a turn of empty-text elements and read the output messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_EmptyTextTurnProvider()), tracer=tracer, capture_message_content=True
+            LLM(_EmptyTextTurnAdapter()), tracer=tracer, capture_message_content=True
         )
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
@@ -1797,7 +1797,7 @@ def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
         """Generate a turn holding a texted trace and a TextPart, and read the messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_ReasoningWithTextProvider()), tracer=tracer, capture_message_content=True
+            LLM(_ReasoningWithTextAdapter()), tracer=tracer, capture_message_content=True
         )
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
@@ -1826,7 +1826,7 @@ def test_an_absent_system_prompt_omits_its_key_while_capture_stays_on() -> None:
     async def scenario() -> None:
         """Generate under a binding with no system prompt and no tools."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
@@ -1843,7 +1843,7 @@ def test_system_prompt_parts_become_one_instruction_element_each() -> None:
     async def scenario() -> None:
         """Bind a two-part system prompt and read the instructions back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt=[TextPart(text="be brief"), TextPart(text="cite sources")],
             automatic_prompt_caching=True,
@@ -1862,7 +1862,7 @@ def test_the_error_path_captures_input_and_no_output() -> None:
 
     async def scenario() -> None:
         """Drive a refusal under capture and inspect the error span."""
-        provider = _FakeProvider(
+        adapter = _FakeAdapter(
             failures=[
                 RefusalError.for_rejected_200(
                     usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
@@ -1871,7 +1871,7 @@ def test_the_error_path_captures_input_and_no_output() -> None:
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(provider, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=True,
         )
@@ -1896,7 +1896,7 @@ def test_generate_many_captures_no_content_even_under_capture() -> None:
         """Run a two-item batch under capture and inspect the aggregate span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeProvider(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
             tracer=tracer,
             capture_message_content=True,
         )
@@ -1927,7 +1927,7 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
     async def scenario() -> None:
         """Generate under capture with the unserializable tool bound, then read the span and the log."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             tool_manager=ToolManager([_unserializable_schema_tool()]),
             automatic_prompt_caching=True,
@@ -1965,7 +1965,7 @@ def test_unserializable_content_leaves_a_bare_iterator_stream_and_its_span_intac
     async def scenario() -> None:
         """Stream to completion with the unserializable tool bound, then read the span and the log."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             tool_manager=ToolManager([_unserializable_schema_tool()]),
             automatic_prompt_caching=True,
@@ -1991,7 +1991,7 @@ def test_the_stream_span_captures_input_at_start_and_output_at_final() -> None:
     async def scenario() -> None:
         """Drive a stream to completion under capture and read both sides back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(system_prompt="be brief", automatic_prompt_caching=True)
         async with bound.stream_one("hi") as stream:
             _ = [item async for item in stream]
@@ -2015,7 +2015,7 @@ def test_capture_survives_rebind_and_reaches_the_rebound_binding() -> None:
     async def scenario() -> None:
         """Rebind a captured binding and confirm the new one still captures."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(
             system_prompt="s2"
         )
@@ -2117,7 +2117,7 @@ def test_conversation_tool_calls_nest_parsed_arguments_and_keep_unparseable_text
     async def scenario() -> None:
         """Generate over a turn holding one parseable and one unparseable tool call."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(automatic_prompt_caching=True)
         await bound.generate_one([
             AssistantMessage(
@@ -2163,7 +2163,7 @@ def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
     async def scenario() -> None:
         """Generate over a turn whose tool call carries a non-object argument value."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one([
             AssistantMessage(turn=(ToolCall(id="call1", name="echo", args_json=args_json),))
         ])
@@ -2190,7 +2190,7 @@ def test_an_ordinary_float_argument_survives_the_parse() -> None:
     async def scenario() -> None:
         """Generate over a turn whose tool call carries a finite float and read the arguments back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeProvider()), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one([
             AssistantMessage(
                 turn=(ToolCall(id="call1", name="echo", args_json='{"n": 1.5, "big": 1e300}'),)

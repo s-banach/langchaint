@@ -54,9 +54,9 @@ Mapping decisions:
 
 import base64
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast, override
+from typing import Any, ClassVar, Literal, cast, override
 
 import anthropic
 from anthropic import (
@@ -85,6 +85,19 @@ from anthropic.types import (
 )
 from pydantic import BaseModel
 
+from langchaint.adapter import (
+    Adapter,
+    AdapterResult,
+    AdapterStream,
+    Binding,
+    BoundAdapter,
+    ErrorClass,
+    PricingTable,
+    SpecificToolChoice,
+    StreamItem,
+    ToolChoice,
+    retry_after_seconds_from_headers,
+)
 from langchaint.exceptions import (
     AbortBatchError,
     MaxCompletionTokensExceededError,
@@ -105,19 +118,6 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.pricing import CostBreakdown, PriceableCounts, price
-from langchaint.provider import (
-    Binding,
-    BoundProvider,
-    ErrorClass,
-    PricingTable,
-    Provider,
-    ProviderResult,
-    ProviderStream,
-    SpecificToolChoice,
-    StreamItem,
-    ToolChoice,
-    retry_after_seconds_from_headers,
-)
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
@@ -527,16 +527,16 @@ def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
         raise AbortBatchError(str(exc), usage_raw=usage) from exc
 
 
-def _provider_result[OutputT](
+def _adapter_result[OutputT](
     message: anthropic.types.Message, output: OutputT, pricing: PricingTable
-) -> ProviderResult[OutputT]:
+) -> AdapterResult[OutputT]:
     """Normalize one completed message around already-extracted output.
 
     Raises:
         AbortBatchError: propagated from _normalized_usage when the response reports 1-hour cache writes
             but the PricingTable has no cache_write_1h_usd_per_million_tokens.
     """
-    return ProviderResult(
+    return AdapterResult(
         output=output,
         assistant_message=_assistant_message_from(message),
         usage=_normalized_usage(message.usage, pricing=pricing),
@@ -546,7 +546,7 @@ def _provider_result[OutputT](
     )
 
 
-class AnthropicMessagesProvider(Provider):
+class AnthropicMessagesAdapter(Adapter):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
     The three clients expose the same messages.create/parse/stream methods and with_options,
@@ -555,7 +555,15 @@ class AnthropicMessagesProvider(Provider):
     when the binding's inference_params leave max_completion_tokens None.
     """
 
-    name = "anthropic_messages"
+    provider_name_by_client_class: ClassVar[Mapping[type, str]] = {
+        AsyncAnthropicBedrock: "aws.bedrock",
+        AsyncAnthropicBedrockMantle: "aws.bedrock",
+    }
+    """AsyncAnthropic is deliberately absent: it reaches whatever its base_url points at.
+
+    Both classes here speak Bedrock's auth and URL scheme, so the class fixes the provider,
+    and the caller's stated value stands for anything else.
+    """
 
     def __init__(
         self,
@@ -563,10 +571,18 @@ class AnthropicMessagesProvider(Provider):
         client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
         model: str,
         pricing: PricingTable,
+        provider_name: str,
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
+
+        provider_name says which provider the client reaches: "anthropic" for AsyncAnthropic,
+        "aws.bedrock" for either Bedrock client class.
+        anthropic_model and anthropic_bedrock_model each pass the one value their client serves.
+        Both Bedrock classes are in provider_name_by_client_class, so a value contradicting either
+        is refused by Adapter.__init__; an AsyncAnthropic takes the value its caller states, since
+        its base_url decides what it reaches.
 
         The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
@@ -590,13 +606,16 @@ class AnthropicMessagesProvider(Provider):
                 Every 1-hour marker this adapter would write produces 1-hour cache writes the table
                 cannot price, so the first cached response would abort its batch; failing here turns
                 that mid-batch abort into an immediate config error before any request is sent.
+                Also raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
         if cache_ttl == "1h" and pricing.cache_write_1h_usd_per_million_tokens is None:
             raise ValueError(
                 f"cache_ttl='1h' for model {model!r} requires a PricingTable with "
                 f"cache_write_1h_usd_per_million_tokens, which prices the 2x 1-hour cache writes"
             )
-        super().__init__(model=model, pricing=pricing)
+        super().__init__(
+            client=client, model=model, pricing=pricing, provider_name=provider_name
+        )
         # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
         # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
         self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
@@ -697,14 +716,14 @@ class AnthropicMessagesProvider(Provider):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O."""
         return _BoundAnthropicText(adapter=self, request=self._request(binding))
 
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundProvider[ModelT]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output parsed by the SDK; pure conversion, no I/O."""
         return _BoundAnthropicStructured(
             adapter=self,
@@ -736,7 +755,7 @@ class AnthropicMessagesProvider(Provider):
         return None
 
 
-class _AnthropicStream[OutputT](ProviderStream[OutputT]):
+class _AnthropicStream[OutputT](AdapterStream[OutputT]):
     """One open Messages stream, backed by the SDK's AsyncMessageStream."""
 
     def __init__(
@@ -778,10 +797,10 @@ class _AnthropicStream[OutputT](ProviderStream[OutputT]):
             raise StreamProtocolError("stream ended without a stop reason")
 
     @override
-    async def final(self) -> ProviderResult[OutputT]:
+    async def final(self) -> AdapterResult[OutputT]:
         """Return the SDK-assembled result after the stream ends."""
         message = await self._sdk_stream.get_final_message()
-        return _provider_result(
+        return _adapter_result(
             message=message, output=self._output_from_message(message), pricing=self._pricing
         )
 
@@ -791,15 +810,15 @@ class _AnthropicStream[OutputT](ProviderStream[OutputT]):
         await self._sdk_stream.close()
 
 
-class _BoundAnthropicText(BoundProvider[str]):
-    """Text-bound provider: output is the concatenated text of the turn."""
+class _BoundAnthropicText(BoundAdapter[str]):
+    """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(self, *, adapter: AnthropicMessagesProvider, request: _AnthropicRequest) -> None:
+    def __init__(self, *, adapter: AnthropicMessagesAdapter, request: _AnthropicRequest) -> None:
         self._adapter = adapter
         self._request = request
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
         """Send one non-streaming request via messages.create."""
         message = await self._adapter.client.messages.create(
             model=self._request.model,
@@ -817,14 +836,14 @@ class _BoundAnthropicText(BoundProvider[str]):
                 message_mark_budget=self._request.message_mark_budget,
             ),
         )
-        return _provider_result(
+        return _adapter_result(
             message=message,
             output=_assistant_message_from(message).text,
             pricing=self._adapter.pricing,
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> ProviderStream[str]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
@@ -850,13 +869,13 @@ class _BoundAnthropicText(BoundProvider[str]):
         )
 
 
-class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
-    """Structured-bound provider: output is the SDK-parsed response_format instance."""
+class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
+    """Structured-bound adapter: output is the SDK-parsed response_format instance."""
 
     def __init__(
         self,
         *,
-        adapter: AnthropicMessagesProvider,
+        adapter: AnthropicMessagesAdapter,
         request: _AnthropicRequest,
         response_format: type[ModelT],
     ) -> None:
@@ -900,7 +919,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
         return parsed_output
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[ModelT]:
         """Send one non-streaming request via messages.parse."""
         message = await self._adapter.client.messages.parse(
             model=self._request.model,
@@ -919,14 +938,14 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             ),
             output_format=self._response_format,
         )
-        return _provider_result(
+        return _adapter_result(
             message=message,
             output=self._parsed_output(message),
             pricing=self._adapter.pricing,
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> ProviderStream[ModelT]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[ModelT]:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.messages.stream(
             model=self._request.model,

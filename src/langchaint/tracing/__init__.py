@@ -91,6 +91,7 @@ except ModuleNotFoundError as exc:
         "langchaint's tracing subpackage requires opentelemetry-api; install opentelemetry-api."
     ) from exc
 
+from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
 from langchaint.exceptions import GenerationError
 from langchaint.inference_params import InferenceParams
 from langchaint.llm import (
@@ -111,7 +112,6 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.provider import Binding, Provider, StreamItem, ToolChoice
 from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response
 from langchaint.streaming import StreamHandle
@@ -633,9 +633,9 @@ class TracedLLM:
         )
 
     @property
-    def provider(self) -> Provider:
-        """The wrapped LLM's provider, so an app never reaches for a private field."""
-        return self._llm.provider
+    def adapter(self) -> Adapter:
+        """The wrapped LLM's adapter, so an app never reaches for a private field."""
+        return self._llm.adapter
 
     @property
     def rate_limiter(self) -> RateLimiter:
@@ -716,7 +716,7 @@ class TracedBoundLLM[OutputT]:
         """
         self._bound_llm = bound_llm
         self._span_config = span_config
-        self._span_name = f"{_CHAT_OPERATION} {bound_llm.provider.model}"
+        self._span_name = f"{_CHAT_OPERATION} {bound_llm.adapter.model}"
 
     def _apply_input_content(self, span: Span, conversation: str | Sequence[Message]) -> None:
         """Set the input-side content attributes on a just-started span, when capture is on and it is recording.
@@ -735,9 +735,9 @@ class TracedBoundLLM[OutputT]:
             _apply_content_attributes(span, lambda: _output_content_attributes(response))
 
     @property
-    def provider(self) -> Provider:
-        """The wrapped BoundLLM's provider."""
-        return self._bound_llm.provider
+    def adapter(self) -> Adapter:
+        """The wrapped BoundLLM's adapter."""
+        return self._bound_llm.adapter
 
     @property
     def binding(self) -> Binding:
@@ -1094,7 +1094,7 @@ class TracedStreamHandle[OutputT]:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
                 on the structured path, or retries exhausted while draining); the span is attributed and closed first.
             AbortBatchError: draining hit an error classified as abort; the span records it and closes.
-            StreamProtocolError: the inner stream violated the event contract; the span records it and closes.
+            StreamProtocolError: the adapter stream violated the event contract; the span records it and closes.
         """
         span = self._ensure_span()
         if self._span_ended:

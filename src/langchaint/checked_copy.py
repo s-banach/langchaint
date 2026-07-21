@@ -1,18 +1,17 @@
-"""CheckedCopyModel, the base of langchaint's pydantic models: model_copy rejects non-field update keys.
+"""CheckedCopyModel, the base of langchaint's pydantic models: a key that is not a field is an error.
 
-pydantic's model_copy applies update without validation:
-a key that is not a field lands in the instance __dict__,
-where any class-level property of that name shadows it and model_dump ignores it,
-so the caller's intended change is dropped silently.
-Under langchaint's model configuration (frozen, no extra fields, no private attributes)
-a non-field update key therefore can never do anything,
-and the override turns that defect into an immediate TypeError,
-matching dataclasses.replace, which raises TypeError for an unknown field name on the same operation shape.
-A subclass setting extra="allow" is rejected at class definition:
-that configuration is the one under which unknown update keys become meaningful
-(pydantic stores them in __pydantic_extra__), so the check would reject legitimate updates on such a model.
+Construction and validation are covered by extra="forbid", which the hook below requires of every
+subclass: pydantic's "ignore" default would drop a misspelled field name silently, leaving an object
+without the value its caller supplied. The cost is that a conversation written by a newer langchaint
+raises when an older one loads it, instead of the added field being discarded.
+model_copy needs its own override, because it applies update without validation and so never
+consults extra: the key would land in the instance __dict__, where a same-named property shadows it
+and model_dump ignores it. It raises TypeError, as dataclasses.replace does for an unknown field.
+model_construct is left as pydantic ships it, dropping the key silently, since it exists to skip
+validation on data the caller vouches for.
 """
 
+import inspect
 from collections.abc import Mapping
 from typing import Self, override
 
@@ -34,24 +33,53 @@ def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
 
 
 class CheckedCopyModel(BaseModel):
-    """Base class whose model_copy raises on update keys that are not model fields."""
+    """Base class on which a key that is not a field raises, whether it arrives by construction or copy."""
 
     @classmethod
     @override
     def __pydantic_init_subclass__(cls, **kwargs: object) -> None:
-        """Reject a subclass whose configuration would make the model_copy check misfire.
+        """Require the subclass to forbid extra keys, which is what makes construction reject a non-field key.
 
         The **kwargs pass-through is the hook's signature: pydantic forwards class-definition keyword arguments.
 
+        The config is checked before the signature, so each message names a fix that is the whole
+        remaining fix.
+
         Raises:
-            TypeError: the subclass sets extra="allow", whose legitimate extra-key updates
-                model_copy would wrongly reject as non-field keys.
+            TypeError: the subclass does not set extra="forbid". Leaving pydantic's "ignore"
+                default drops a misspelled key silently, and the fix is to set "forbid"; "allow"
+                keeps unknown keys as meaningful data that model_copy would wrongly reject, and
+                the fix is to not inherit this base.
+            TypeError: the subclass defines its own __init__ without a var-keyword parameter,
+                so a key that is not a field would never reach extra="forbid".
         """
         super().__pydantic_init_subclass__(**kwargs)
-        if cls.model_config.get("extra") == "allow":
+        extra = cls.model_config.get("extra")
+        if extra == "allow":
             raise TypeError(
-                f"{cls.__name__} sets extra='allow', whose legitimate extra-key updates "
-                "CheckedCopyModel.model_copy would wrongly reject; do not inherit the guard"
+                f"{cls.__name__} sets extra='allow', under which a key that is not a field is kept "
+                "in __pydantic_extra__ as meaningful data, so CheckedCopyModel.model_copy would "
+                "reject legitimate updates; such a model must not inherit CheckedCopyModel"
+            )
+        if extra != "forbid":
+            states = (
+                f"it sets extra={extra!r}"
+                if extra is not None
+                else "it sets no extra, leaving pydantic's 'ignore' default"
+            )
+            raise TypeError(
+                f"{cls.__name__} must set model_config = ConfigDict(extra='forbid'); {states}, under "
+                "which a key that is not a field is dropped silently on construction instead of raising"
+            )
+        if cls.__pydantic_custom_init__ and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(cls.__init__).parameters.values()
+        ):
+            raise TypeError(
+                f"{cls.__name__} defines __init__, which sets pydantic's custom_init: pydantic "
+                "binds the raw input to that signature, so a key that is not a field is rejected "
+                "by argument binding as an unlocated TypeError before extra='forbid' is consulted. "
+                "Add a **extra parameter and forward it to super().__init__"
             )
 
     @override

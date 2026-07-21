@@ -15,7 +15,7 @@ where a shared pricing-table defect genuinely dooms a batch.
 
 from dataclasses import dataclass
 
-from langchaint.provider import PricingTable
+from langchaint.adapter import PricingTable
 
 
 @dataclass(frozen=True, kw_only=True)

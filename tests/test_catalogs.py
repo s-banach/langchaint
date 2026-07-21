@@ -5,16 +5,20 @@ what tests can catch is a catalog function wiring the wrong model identifier, th
 or losing an override, a copy-paste error that would type-check and ship silently.
 """
 
+from collections.abc import Callable
+
 import httpx
 import pytest
-from anthropic import AsyncAnthropic, AsyncAnthropicBedrockMantle
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
+from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 
-from langchaint import PricingTable, RateLimiter
+from langchaint import LLM, PricingTable, RateLimiter
+from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
     AnthropicBedrockModelName,
-    AnthropicMessagesProvider,
+    AnthropicMessagesAdapter,
     AnthropicModelName,
     anthropic_bedrock_model,
     anthropic_model,
@@ -22,39 +26,103 @@ from langchaint.anthropic import (
 from langchaint.openai import (
     OPENAI_PRICING,
     OpenAIModelName,
-    OpenAIResponsesProvider,
+    OpenAIResponsesAdapter,
+    openai_bedrock_model,
     openai_model,
 )
+
+_ARBITRARY_PRICING = PricingTable(
+    input_cache_none_usd_per_million_tokens=1.0,
+    output_usd_per_million_tokens=1.0,
+    cache_read_usd_per_million_tokens=1.0,
+    cache_write_usd_per_million_tokens=1.0,
+)
+"""Stands in wherever a constructor requires pricing but the assertion is about something else.
+
+openai_bedrock_model has no catalog to default from, so its callers always supply a table.
+"""
 
 
 @pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
 def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> None:
     """anthropic_model returns an LLM whose adapter carries the model's prices."""
     llm = anthropic_model(model, client=AsyncAnthropic(api_key="offline"))
-    provider = llm.provider
-    assert isinstance(provider, AnthropicMessagesProvider)
-    assert provider.model == model
-    assert provider.pricing is ANTHROPIC_PRICING[model]
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.model == model
+    assert adapter.pricing is ANTHROPIC_PRICING[model]
 
 
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
 def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     """openai_model returns an LLM whose adapter carries the model's prices."""
     llm = openai_model(model, client=AsyncOpenAI(api_key="offline"))
-    provider = llm.provider
-    assert isinstance(provider, OpenAIResponsesProvider)
-    assert provider.model == model
-    assert provider.pricing is OPENAI_PRICING[model]
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.model == model
+    assert adapter.pricing is OPENAI_PRICING[model]
+
+
+@pytest.mark.parametrize(
+    ("build", "provider_name"),
+    [
+        (
+            lambda: AnthropicMessagesAdapter(
+                client=AsyncAnthropic(api_key="offline", base_url="https://example.invalid"),
+                model="claude-sonnet-5",
+                pricing=_ARBITRARY_PRICING,
+                provider_name="groq",
+            ),
+            "groq",
+        ),
+        (
+            lambda: OpenAIResponsesAdapter(
+                client=AsyncOpenAI(api_key="offline", base_url="https://example.invalid"),
+                model="gpt-5.6-terra",
+                pricing=_ARBITRARY_PRICING,
+                provider_name="groq",
+            ),
+            "groq",
+        ),
+    ],
+)
+def test_a_base_client_takes_the_stated_provider_name(
+    build: Callable[[], Adapter], provider_name: str
+) -> None:
+    """A base client carries no provider of its own, so the caller's value stands unchallenged.
+
+    This is how an OpenAI-compatible endpoint is labeled with the provider it actually reaches.
+    Mapping a base client class to its own provider would pass every other test here while
+    turning this construction into a ValueError, so the acceptance needs its own assertion.
+    """
+    assert build().provider_name == provider_name
+
+
+def test_openai_bedrock_model_wires_model_pricing_and_region() -> None:
+    """The default-client path builds AsyncBedrockOpenAI on the stated region.
+
+    Dropping aws_region here would send every request to whatever region the AWS environment
+    resolves, which no other assertion catches: the constructor's other tests all pass a client.
+    """
+    llm = openai_bedrock_model(
+        "openai.gpt-oss-120b-1:0", pricing=_ARBITRARY_PRICING, aws_region="eu-west-1"
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.model == "openai.gpt-oss-120b-1:0"
+    assert adapter.pricing is _ARBITRARY_PRICING
+    assert isinstance(adapter.client, AsyncBedrockOpenAI)
+    assert adapter.client.aws_region == "eu-west-1"
 
 
 def test_adapter_client_never_retries_beneath_langchaint() -> None:
     """The stored client is a max_retries=0 copy keeping the caller's credentials."""
     client = AsyncAnthropic(api_key="offline")
     llm = anthropic_model("claude-sonnet-5", client=client)
-    provider = llm.provider
-    assert isinstance(provider, AnthropicMessagesProvider)
-    assert provider.client.max_retries == 0
-    assert provider.client.api_key == client.api_key
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.client.max_retries == 0
+    assert adapter.client.api_key == client.api_key
 
 
 # One wire model id per Bedrock API: anthropic.claude-opus-4-8 routes to "mantle",
@@ -72,10 +140,10 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
     """
     http_client = httpx.AsyncClient()
     llm = anthropic_bedrock_model(model, aws_region="us-east-1", http_client=http_client)
-    provider = llm.provider
-    assert isinstance(provider, AnthropicMessagesProvider)
-    assert provider.client.max_retries == 0
-    assert provider.client._client is http_client
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.client.max_retries == 0
+    assert adapter.client._client is http_client
 
 
 def test_bedrock_rejects_client_and_http_client_together() -> None:
@@ -84,6 +152,27 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     with pytest.raises(ValueError, match="at most one"):
         anthropic_bedrock_model(
             "anthropic.claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
+        )
+
+
+def test_both_bedrock_constructors_refuse_a_region_beside_a_client() -> None:
+    """A passed client carries its own region, so the aws_region beside it would be dropped.
+
+    Silently, and every request would go to the client's region: the constructor cannot apply the
+    stated region to a client it did not build.
+    """
+    with pytest.raises(ValueError, match="at most one"):
+        anthropic_bedrock_model(
+            "anthropic.claude-opus-4-8",
+            aws_region="eu-west-1",
+            client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
+        )
+    with pytest.raises(ValueError, match="at most one"):
+        openai_bedrock_model(
+            "openai.gpt-oss-120b-1:0",
+            pricing=_ARBITRARY_PRICING,
+            aws_region="eu-west-1",
+            client=AsyncBedrockOpenAI(aws_region="us-east-1"),
         )
 
 
@@ -101,7 +190,7 @@ def test_pricing_override_replaces_the_default() -> None:
         client=AsyncAnthropic(api_key="offline"),
         pricing=custom_pricing,
     )
-    assert llm.provider.pricing is custom_pricing
+    assert llm.adapter.pricing is custom_pricing
 
 
 def test_rate_limiter_lands_on_the_llm() -> None:
@@ -123,20 +212,120 @@ def test_reasoning_summary_lands_on_the_adapter() -> None:
     llm = openai_model(
         "gpt-5.6-terra", client=AsyncOpenAI(api_key="offline"), reasoning_summary="detailed"
     )
-    provider = llm.provider
-    assert isinstance(provider, OpenAIResponsesProvider)
-    assert provider.reasoning_summary == "detailed"
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.reasoning_summary == "detailed"
     defaulted = openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="offline"))
-    assert isinstance(defaulted.provider, OpenAIResponsesProvider)
-    assert defaulted.provider.reasoning_summary is None
+    assert isinstance(defaulted.adapter, OpenAIResponsesAdapter)
+    assert defaulted.adapter.reasoning_summary is None
 
 
 def test_cache_ttl_lands_on_the_adapter() -> None:
     """A caller-supplied cache_ttl reaches the adapter; the default is "5m"."""
     llm = anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="offline"), cache_ttl="1h")
-    provider = llm.provider
-    assert isinstance(provider, AnthropicMessagesProvider)
-    assert provider.cache_ttl == "1h"
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.cache_ttl == "1h"
     defaulted = anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="offline"))
-    assert isinstance(defaulted.provider, AnthropicMessagesProvider)
-    assert defaulted.provider.cache_ttl == "5m"
+    assert isinstance(defaulted.adapter, AnthropicMessagesAdapter)
+    assert defaulted.adapter.cache_ttl == "5m"
+
+
+@pytest.mark.parametrize(
+    ("build_llm", "expected_provider_name"),
+    [
+        (lambda: anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="k")), "anthropic"),
+        (
+            lambda: anthropic_bedrock_model(
+                "us.anthropic.claude-sonnet-4-6", client=AsyncAnthropicBedrock(aws_region="us-east-1")
+            ),
+            "aws.bedrock",
+        ),
+        (lambda: openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="k")), "openai"),
+        (
+            lambda: openai_bedrock_model(
+                "openai.gpt-oss-120b-1:0",
+                pricing=_ARBITRARY_PRICING,
+                client=AsyncBedrockOpenAI(aws_region="us-east-1"),
+            ),
+            "aws.bedrock",
+        ),
+    ],
+)
+def test_each_constructor_states_a_convention_provider_name(
+    build_llm: Callable[[], LLM], expected_provider_name: str
+) -> None:
+    """Every provider_name langchaint itself writes is a value the convention defines.
+
+    The value reaches a backend as gen_ai.provider.name, whose value set the convention enumerates,
+    so a typo like "bedrock" or a withdrawn value files langchaint's spans in their own bucket and
+    joins them with no other instrumented client's.
+    A direct adapter construction states its own provider_name and is the caller's to get right;
+    what this pins is the set of literals langchaint writes on the application's behalf.
+    """
+    defined = {member.value for member in gen_ai_semconv.GenAiProviderNameValues}
+    adapter = build_llm().adapter
+    assert adapter.provider_name == expected_provider_name
+    assert adapter.provider_name in defined
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        AsyncBedrockOpenAI(aws_region="us-east-1"),
+        AsyncAzureOpenAI(
+            api_key="k", api_version="2024-02-01", azure_endpoint="https://x.openai.azure.com"
+        ),
+    ],
+)
+def test_openai_model_refuses_a_client_that_does_not_reach_openai(client: AsyncOpenAI) -> None:
+    """openai_model states provider_name="openai", so it refuses the clients that reach elsewhere.
+
+    Both classes subclass AsyncOpenAI, so the parameter annotation accepts them and only the
+    adapter's provider_name_by_client_class check stops them; without it the adapter reports
+    "openai" for a Bedrock- or Azure-served request and nothing surfaces the error until spans are
+    grouped by provider.
+    """
+    with pytest.raises(ValueError, match="contradicts the client"):
+        openai_model("gpt-5.6-terra", client=client)
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        AsyncAnthropicBedrock(aws_region="us-east-1"),
+        AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
+    ],
+)
+def test_the_adapter_refuses_anthropic_over_a_bedrock_client(
+    client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
+) -> None:
+    """Both Bedrock client classes are mapped, so stating "anthropic" over either is refused.
+
+    Unlike the openai side, the annotations already stop this at the catalog constructors, since
+    the Bedrock classes are siblings of AsyncAnthropic rather than subclasses. This covers the
+    direct adapter construction, where nothing but the map stands between a Bedrock-served
+    request and a span reporting "anthropic".
+    """
+    with pytest.raises(ValueError, match="contradicts the client"):
+        AnthropicMessagesAdapter(
+            client=client,
+            model="claude-sonnet-5",
+            pricing=_ARBITRARY_PRICING,
+            provider_name="anthropic",
+        )
+
+
+def test_a_subclass_of_a_platform_client_is_refused_like_its_base() -> None:
+    """Subclassing a platform client to add headers or auth is ordinary application code.
+
+    provider_name_by_client_class holds no base client class, which is what lets the lookup use
+    isinstance: matching by exact type instead would let this subclass through with "openai" and
+    file every Bedrock-served span under openai.
+    """
+
+    class SigV4BedrockOpenAI(AsyncBedrockOpenAI):
+        pass
+
+    with pytest.raises(ValueError, match="contradicts the client"):
+        openai_model("gpt-5.6-terra", client=SigV4BedrockOpenAI(aws_region="us-east-1"))

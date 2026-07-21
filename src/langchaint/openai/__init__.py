@@ -5,10 +5,21 @@ the import below raises a ModuleNotFoundError naming the package to install.
 
 openai_model takes the provider's own model identifier, the same string the wire accepts,
 so switching models never changes an import; it constructs the Responses adapter and wraps it in an LLM.
-client None constructs the native SDK client, which reads credentials from the environment;
-Bedrock routing is passing an AsyncBedrockOpenAI client instead.
-pricing None selects the model's public prices from OPENAI_PRICING.
-Pass your own PricingTable to override, for example when your account bills at a custom rate.
+client None constructs the native SDK client, which reads credentials from the environment.
+openai_model states provider_name="openai" for the adapter,
+and the adapter checks that pair against OpenAIResponsesAdapter.provider_name_by_client_class,
+which refuses AsyncBedrockOpenAI and AsyncAzureOpenAI:
+both subclass AsyncOpenAI, so the annotation cannot refuse them on its own.
+A base AsyncOpenAI is accepted whatever its base_url,
+so reaching an OpenAI-compatible endpoint through openai_model labels it "openai";
+a binding that should report the provider it actually reaches (groq and deepseek are gen_ai.provider.name values)
+is OpenAIResponsesAdapter(client=..., provider_name="groq", ...) wrapped in an LLM.
+openai_bedrock_model is the constructor for OpenAI models served by Bedrock;
+Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
+provider_name="azure.ai.openai", ...) wrapped in an LLM.
+openai_model's pricing None selects the model's public prices from OPENAI_PRICING;
+pass your own PricingTable to override, for example when your account bills at a custom rate.
+openai_bedrock_model has no catalog to fall back on, so its pricing is required.
 cost_breakdown(usage_raw, pricing) reports the exact per-category cost of one response from its raw
 SDK usage, through the same arithmetic that produced the stored Usage.cost_in_usd.
 
@@ -32,13 +43,13 @@ except ModuleNotFoundError as exc:
         "langchaint's openai backend requires the openai package; install openai."
     ) from exc
 
+from langchaint.adapter import PricingTable
 from langchaint.llm import LLM
-from langchaint.openai.responses_provider import (
-    OpenAIResponsesProvider,
+from langchaint.openai.responses_adapter import (
+    OpenAIResponsesAdapter,
     ReasoningSummary,
     cost_breakdown,
 )
-from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
 type OpenAIModelName = Literal[
@@ -109,7 +120,7 @@ OPENAI_PRICING: dict[OpenAIModelName, PricingTable] = {
 def openai_model(
     model: OpenAIModelName,
     *,
-    client: AsyncOpenAI | AsyncBedrockOpenAI | None = None,
+    client: AsyncOpenAI | None = None,
     pricing: PricingTable | None = None,
     rate_limiter: RateLimiter | None = None,
     reasoning_summary: ReasoningSummary | None = None,
@@ -123,12 +134,68 @@ def openai_model(
     built in the same event loop as the LLMs, since one instance serves one loop.
     reasoning_summary asks the API for readable text, which arrives on each
     ReasoningTrace.text; None leaves the provider default in place.
+
+    Raises:
+        ValueError: client is an AsyncBedrockOpenAI or AsyncAzureOpenAI, raised by the adapter.
+            This constructor states provider_name="openai", which neither client reaches, and both
+            subclass AsyncOpenAI, so the annotation alone accepts them. Reach those providers with
+            openai_bedrock_model, or by building the adapter directly with the provider_name the
+            client reaches.
     """
     return LLM(
-        OpenAIResponsesProvider(
+        OpenAIResponsesAdapter(
             client=client if client is not None else AsyncOpenAI(),
             model=model,
             pricing=pricing if pricing is not None else OPENAI_PRICING[model],
+            provider_name="openai",
+            reasoning_summary=reasoning_summary,
+        ),
+        rate_limiter=rate_limiter,
+    )
+
+
+def openai_bedrock_model(
+    model: str,
+    *,
+    pricing: PricingTable,
+    aws_region: str | None = None,
+    client: AsyncBedrockOpenAI | None = None,
+    rate_limiter: RateLimiter | None = None,
+    reasoning_summary: ReasoningSummary | None = None,
+) -> LLM:
+    """Build a ready LLM for one OpenAI model served by Bedrock, on the Responses API.
+
+    model is the Bedrock wire model id, sent verbatim, so the id in application code, on the wire,
+    and in traces is one string. It is a str rather than a Literal catalog, and pricing is required
+    rather than defaulted, because both asymmetries with anthropic_bedrock_model come from the same
+    absence: langchaint carries no verified list of OpenAI's Bedrock model ids or their AWS rates,
+    and prices are the one provider fact langchaint cannot verify by SDK introspection.
+    client None constructs AsyncBedrockOpenAI(aws_region=aws_region)
+    (None resolves the region from the AWS credential chain).
+    There is no http_client parameter, because the Bedrock Responses API has one client class,
+    so client=AsyncBedrockOpenAI(http_client=...) loses nothing; anthropic_bedrock_model takes one
+    only because it picks between two client classes and would forgo that routing.
+    rate_limiter None means the RateLimiter defaults;
+    pass one shared instance across models on the same account to share its budget,
+    built in the same event loop as the LLMs, since one instance serves one loop.
+    reasoning_summary asks the API for readable text, which arrives on each
+    ReasoningTrace.text; None leaves the provider default in place.
+
+    Raises:
+        ValueError: both client and aws_region are given. A passed client already carries its
+            region, so the aws_region beside it would be dropped and every request would go to
+            the client's region instead, silently.
+    """
+    if client is not None and aws_region is not None:
+        raise ValueError(
+            "Pass at most one of client= or aws_region=; a passed client already carries its region."
+        )
+    return LLM(
+        OpenAIResponsesAdapter(
+            client=client if client is not None else AsyncBedrockOpenAI(aws_region=aws_region),
+            model=model,
+            pricing=pricing,
+            provider_name="aws.bedrock",
             reasoning_summary=reasoning_summary,
         ),
         rate_limiter=rate_limiter,
@@ -138,8 +205,9 @@ def openai_model(
 __all__ = [
     "OPENAI_PRICING",
     "OpenAIModelName",
-    "OpenAIResponsesProvider",
+    "OpenAIResponsesAdapter",
     "ReasoningSummary",
     "cost_breakdown",
+    "openai_bedrock_model",
     "openai_model",
 ]

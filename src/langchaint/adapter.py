@@ -7,10 +7,10 @@ Adapters delegate stream assembly and structured-output parsing to the SDK
 (`get_final_response` / `get_final_message`), which is generic in the response format,
 so the output type flows from the SDK to the caller without reconstruction.
 
-Binding model: `Provider.bind_text` and `Provider.bind_structured` convert the frozen prefix
+Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
 (system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
 to precomputed SDK keyword arguments once;
-the returned `BoundProvider` accepts only the per-request conversation.
+the returned `BoundAdapter` accepts only the per-request conversation.
 The split into two bind methods is what fixes the output type at bind time:
 each method is monomorphic in its output type, so no sentinel value has to imply a type downstream.
 """
@@ -18,7 +18,7 @@ each method is monomorphic in its output type, so no sentinel value has to imply
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel
 
@@ -117,7 +117,7 @@ class Binding:
     """The frozen prefix of one BoundLLM, in langchaint terms only.
 
     Every field here determines the provider's cacheable prompt prefix or is fixed per binding by design;
-    per-request data is the conversation argument of the BoundProvider methods, nothing else.
+    per-request data is the conversation argument of the BoundAdapter methods, nothing else.
     """
 
     system_prompt: str | tuple[TextPart, ...] | None
@@ -153,7 +153,7 @@ class Binding:
 
 
 @dataclass(frozen=True, kw_only=True)
-class ProviderResult[OutputT]:
+class AdapterResult[OutputT]:
     """One successful provider turn, normalized to langchaint terms.
 
     output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
@@ -174,7 +174,7 @@ class ProviderResult[OutputT]:
     raw: BaseModel
 
 
-class ProviderStream[OutputT](ABC):
+class AdapterStream[OutputT](ABC):
     """One open stream, backed by the SDK's stream manager.
 
     The adapter translates SDK events into StreamItem values as they pass through;
@@ -191,7 +191,7 @@ class ProviderStream[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def final(self) -> ProviderResult[OutputT]:
+    async def final(self) -> AdapterResult[OutputT]:
         """Return the SDK-assembled result after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
@@ -204,19 +204,19 @@ class ProviderStream[OutputT](ABC):
         ...
 
 
-class BoundProvider[OutputT](ABC):
+class BoundAdapter[OutputT](ABC):
     """One adapter bound to a frozen prefix.
 
-    Constructed by Provider.bind_text or Provider.bind_structured, which precompute the SDK keyword arguments once;
+    Constructed by Adapter.bind_text or Adapter.bind_structured, which precompute the SDK keyword arguments once;
     both request methods take only the per-request conversation.
     """
 
     @abstractmethod
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[OutputT]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[OutputT]:
         """Send one non-streaming request.
 
         Raises:
-            Exception: the SDK's own exceptions propagate unchanged; Provider.classify maps them to transient or abort.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify maps them to transient or abort.
                 For defects the SDK reports as data rather than as an exception,
                 the adapter raises TransientError, AbortBatchError, or a GenerationError leaf directly,
                 and the retry loop honors those without classification.
@@ -224,35 +224,99 @@ class BoundProvider[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def open_stream(self, conversation: Sequence[Message]) -> ProviderStream[OutputT]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[OutputT]:
         """Open one streaming request and return the live stream.
 
         Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.
 
         Raises:
-            Exception: the SDK's own exceptions propagate unchanged; Provider.classify maps them to transient or abort.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify maps them to transient or abort.
         """
         ...
 
 
-class Provider(ABC):
+class Adapter(ABC):
     """Base class for one adapter per provider SDK.
 
-    An adapter is constructed with the SDK client to use, which is how Bedrock support arrives:
-    pass AsyncAnthropicBedrock or AsyncBedrockOpenAI instead of the direct client.
+    An adapter is constructed with the SDK client to use and the provider_name that client reaches,
+    which together are how Bedrock support arrives: pass AsyncAnthropicBedrock or AsyncBedrockOpenAI
+    instead of the direct client, with provider_name "aws.bedrock".
     Credentials and endpoints belong to the SDK client.
     """
 
-    name: str
-    """The provider identifier recorded on every Response as provider_name."""
+    provider_name: str
+    """Which provider served the request, recorded on every Response and GenerationError.
 
-    def __init__(self, *, model: str, pricing: PricingTable) -> None:
-        """Store the model identifier and the pricing the adapter bills by."""
+    The value comes from the OpenTelemetry GenAI convention's gen_ai.provider.name value set,
+    whose members include the three langchaint's own constructors write
+    ("anthropic", "openai", "aws.bedrock"), and the tracing subpackage emits it
+    under that key, so a backend groups langchaint spans with any other instrumented client's.
+    Whoever constructs the adapter states it, because the SDK client class does not determine it:
+    one AsyncOpenAI carrying a base_url reaches any of several providers. For the client classes
+    langchaint does know, provider_name_by_client_class refuses a stated value contradicting them.
+    When the company that trained the model and the platform serving it differ, the platform is the
+    value: the convention states the attribute may differ from the actual model provider, and its
+    worked example sets "aws.bedrock" for Bedrock spans (opentelemetry-semantic-conventions 0.64b0,
+    gen_ai.provider.name). Which company trained the model is read from the model identifier.
+    """
+
+    provider_name_by_client_class: ClassVar[Mapping[type, str]] = {}
+    """The SDK client classes whose own auth and URL scheme fixes the provider they reach.
+
+    Deliberately partial, and never a source for provider_name:
+    it holds only the platform client classes (the Bedrock and Azure ones),
+    because a base client reaches whatever its base_url points at.
+    Pointing an AsyncOpenAI at another vendor's OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached,
+    all of them gen_ai.provider.name values,
+    so a base client in this map would refuse every one of them.
+    A client matching nothing here takes the caller's value.
+
+    Never enter a base client class: that invariant is what lets the lookup use isinstance.
+    An application's own subclass of a platform client is then still recognized as reaching that platform,
+    whatever it adds (headers, auth, instrumentation).
+    Enter AsyncOpenAI and isinstance would match AsyncBedrockOpenAI and AsyncAzureOpenAI through it,
+    since both subclass it.
+    """
+
+    def __init__(
+        self, *, client: object, model: str, pricing: PricingTable, provider_name: str
+    ) -> None:
+        """Check client against the stated provider_name, then store model, pricing, provider_name.
+
+        client is checked here and not stored;
+        each adapter stores its own with_options copy.
+        Its object annotation is the price of checking every adapter in one place.
+        Moving the check into a base helper each adapter calls with its own precisely typed client is rejected:
+        it makes the check opt-in, so an adapter whose author forgets the call is silently unguarded,
+        which is the failure the check exists to prevent.
+
+        Raises:
+            ValueError: client is an instance of a class in provider_name_by_client_class
+                listed under a provider other than provider_name.
+                Such a request succeeds and bills normally
+                while every span it produces carries the wrong provider,
+                a defect nothing surfaces until telemetry is grouped by provider,
+                so it is refused before the first request.
+        """
+        reached = next(
+            (
+                name
+                for client_class, name in self.provider_name_by_client_class.items()
+                if isinstance(client, client_class)
+            ),
+            None,
+        )
+        if reached is not None and reached != provider_name:
+            raise ValueError(
+                f"provider_name={provider_name!r} contradicts the client: "
+                f"{type(client).__name__} reaches {reached!r}"
+            )
         self.model = model
         self.pricing = pricing
+        self.provider_name = provider_name
 
     @abstractmethod
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
@@ -262,7 +326,7 @@ class Provider(ABC):
     @abstractmethod
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundProvider[ModelT]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output parsed by the SDK into response_format.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.

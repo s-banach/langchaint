@@ -59,16 +59,16 @@ Mapping decisions:
   status "incomplete" with reason "max_output_tokens" means max_tokens, and anything else is "other".
 - Streaming yields the SDK's own delta strings unwrapped and each tool call once, complete,
   from its `response.output_item.done` event; argument fragments are never surfaced.
-  Usage, cost, and stop reason arrive only on final()'s ProviderResult.
+  Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
 
 import base64
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast, override
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
 
 import openai
-from openai import AsyncBedrockOpenAI, AsyncOpenAI, Omit, omit
+from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI, Omit, omit
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
@@ -100,6 +100,19 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
 
+from langchaint.adapter import (
+    Adapter,
+    AdapterResult,
+    AdapterStream,
+    Binding,
+    BoundAdapter,
+    ErrorClass,
+    PricingTable,
+    SpecificToolChoice,
+    StreamItem,
+    ToolChoice,
+    retry_after_seconds_from_headers,
+)
 from langchaint.exceptions import (
     MaxCompletionTokensExceededError,
     RefusalError,
@@ -121,19 +134,6 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.pricing import CostBreakdown, PriceableCounts, price
-from langchaint.provider import (
-    Binding,
-    BoundProvider,
-    ErrorClass,
-    PricingTable,
-    Provider,
-    ProviderResult,
-    ProviderStream,
-    SpecificToolChoice,
-    StreamItem,
-    ToolChoice,
-    retry_after_seconds_from_headers,
-)
 from langchaint.tools import ToolSchema
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -494,15 +494,15 @@ def _cost_in_usd(usage: ResponseUsage, pricing: PricingTable) -> float:
     return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
 
 
-def _provider_result[OutputT](
+def _adapter_result[OutputT](
     response: OpenAIResponse, output: OutputT, pricing: PricingTable
-) -> ProviderResult[OutputT]:
+) -> AdapterResult[OutputT]:
     """Normalize one completed request around already-extracted output.
 
     response.usage is typed optional; a response without it normalizes to ZERO_USAGE (zero cost) and
     usage_raw None.
     """
-    return ProviderResult(
+    return AdapterResult(
         output=output,
         assistant_message=_assistant_message_from(response),
         usage=_normalized_usage(response.usage, pricing=pricing) if response.usage else ZERO_USAGE,
@@ -512,17 +512,34 @@ def _provider_result[OutputT](
     )
 
 
-class OpenAIResponsesProvider(Provider):
-    """Adapter over an AsyncOpenAI or AsyncBedrockOpenAI client."""
+class OpenAIResponsesAdapter(Adapter):
+    """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
-    name = "openai_responses"
+    All three expose the same responses.create/parse/stream methods and with_options,
+    so the adapter logic is identical across the first-party API, Bedrock, and Azure.
+    The client parameter is annotated AsyncOpenAI because the other two subclass it;
+    provider_name_by_client_class is what tells them apart.
+    """
+
+    provider_name_by_client_class: ClassVar[Mapping[type, str]] = {
+        AsyncBedrockOpenAI: "aws.bedrock",
+        AsyncAzureOpenAI: "azure.ai.openai",
+    }
+    """AsyncOpenAI is deliberately absent: it reaches whatever its base_url points at.
+
+    The two classes here each speak one platform's auth and URL scheme, so the class fixes the
+    provider. A plain AsyncOpenAI does not: pointing its base_url at another vendor's
+    OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached, all of them
+    gen_ai.provider.name values, so mapping AsyncOpenAI to "openai" would refuse every one of them.
+    """
 
     def __init__(
         self,
         *,
-        client: AsyncOpenAI | AsyncBedrockOpenAI,
+        client: AsyncOpenAI,
         model: str,
         pricing: PricingTable,
+        provider_name: str,
         reasoning_summary: ReasoningSummary | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
@@ -536,8 +553,20 @@ class OpenAIResponsesProvider(Provider):
         the provider default in place. A model may return no summary even when one is requested.
         It is a constructor parameter rather than an InferenceParams field because InferenceParams
         is neutral and anthropic has no reasoning summary of its own.
+
+        provider_name says which provider the client reaches: "openai" for AsyncOpenAI,
+        "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI.
+        openai_model passes "openai" and openai_bedrock_model "aws.bedrock".
+        The two platform classes are in provider_name_by_client_class, so a value contradicting
+        either is refused by Adapter.__init__; an AsyncOpenAI takes the provider_name its caller
+        states, since its base_url decides what it reaches.
+
+        Raises:
+            ValueError: raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
-        super().__init__(model=model, pricing=pricing)
+        super().__init__(
+            client=client, model=model, pricing=pricing, provider_name=provider_name
+        )
         self.client = client.with_options(max_retries=0)
         self.reasoning_summary = reasoning_summary
 
@@ -595,14 +624,14 @@ class OpenAIResponsesProvider(Provider):
         )
 
     @override
-    def bind_text(self, binding: Binding) -> BoundProvider[str]:
+    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O."""
         return _BoundOpenAIText(adapter=self, request=self._request(binding))
 
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundProvider[ModelT]:
+    ) -> BoundAdapter[ModelT]:
         """Bind for structured output parsed by the SDK; pure conversion, no I/O."""
         return _BoundOpenAIStructured(
             adapter=self,
@@ -633,7 +662,7 @@ class OpenAIResponsesProvider(Provider):
         return None
 
 
-class _OpenAIStream[OutputT](ProviderStream[OutputT]):
+class _OpenAIStream[OutputT](AdapterStream[OutputT]):
     """One open Responses stream, backed by the SDK's stream helper."""
 
     def __init__(
@@ -681,7 +710,7 @@ class _OpenAIStream[OutputT](ProviderStream[OutputT]):
             raise StreamProtocolError("stream ended without a terminal response")
 
     @override
-    async def final(self) -> ProviderResult[OutputT]:
+    async def final(self) -> AdapterResult[OutputT]:
         """Return the result assembled from the captured terminal response.
 
         Only response.completed carries a ParsedResponse;
@@ -700,7 +729,7 @@ class _OpenAIStream[OutputT](ProviderStream[OutputT]):
             if isinstance(self._terminal_response, ParsedResponse)
             else ParsedResponse[None].model_validate(self._terminal_response.model_dump())
         )
-        return _provider_result(
+        return _adapter_result(
             response=parsed_response,
             output=self._output_from_response(parsed_response),
             pricing=self._pricing,
@@ -712,15 +741,15 @@ class _OpenAIStream[OutputT](ProviderStream[OutputT]):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAIText(BoundProvider[str]):
-    """Text-bound provider: output is the concatenated output text."""
+class _BoundOpenAIText(BoundAdapter[str]):
+    """Text-bound adapter: output is the concatenated output text."""
 
-    def __init__(self, *, adapter: OpenAIResponsesProvider, request: _OpenAIRequest) -> None:
+    def __init__(self, *, adapter: OpenAIResponsesAdapter, request: _OpenAIRequest) -> None:
         self._adapter = adapter
         self._request = request
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
         """Send one non-streaming request via responses.create."""
         response = await self._adapter.client.responses.create(
             model=self._request.model,
@@ -736,14 +765,14 @@ class _BoundOpenAIText(BoundProvider[str]):
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
-        return _provider_result(
+        return _adapter_result(
             response=response,
             output=response.output_text,
             pricing=self._adapter.pricing,
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> ProviderStream[str]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.responses.stream(
             model=self._request.model,
@@ -767,13 +796,13 @@ class _BoundOpenAIText(BoundProvider[str]):
         )
 
 
-class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
-    """Structured-bound provider: output is the SDK-parsed response_format instance."""
+class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
+    """Structured-bound adapter: output is the SDK-parsed response_format instance."""
 
     def __init__(
         self,
         *,
-        adapter: OpenAIResponsesProvider,
+        adapter: OpenAIResponsesAdapter,
         request: _OpenAIRequest,
         response_format: type[ModelT],
     ) -> None:
@@ -822,7 +851,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
         return response.output_parsed
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ProviderResult[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[ModelT]:
         """Send one non-streaming request via responses.parse.
 
         Raises:
@@ -844,14 +873,14 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundProvider[ModelT]):
             input=[*self._request.input_prefix, *_wire_input(conversation)],
             text_format=self._response_format,
         )
-        return _provider_result(
+        return _adapter_result(
             response=response,
             output=self._parsed_output(response),
             pricing=self._adapter.pricing,
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> ProviderStream[ModelT]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[ModelT]:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.responses.stream(
             model=self._request.model,

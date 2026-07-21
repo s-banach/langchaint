@@ -3,7 +3,7 @@
 A StreamHandle is three things at once: an async iterator of stream items (text chunks and completed tool calls),
 the source of the assembled Response via final(),
 and an async context manager so an abandoned stream closes its connection deterministically.
-Assembly and structured-output parsing live in the SDK behind ProviderStream.final();
+Assembly and structured-output parsing live in the SDK behind AdapterStream.final();
 the handle owns retry, pacing, and accounting.
 Connection failures before the first yielded item are retried under the RateLimiter;
 after the first yielded item nothing is retried,
@@ -17,6 +17,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
 
+from langchaint.adapter import Adapter, AdapterStream, BoundAdapter, StreamItem
 from langchaint.exceptions import (
     AbortBatchError,
     AttemptRecord,
@@ -27,7 +28,6 @@ from langchaint.exceptions import (
     _extract_transient_errors,
 )
 from langchaint.messages import Message
-from langchaint.provider import BoundProvider, Provider, ProviderStream, StreamItem
 from langchaint.rate_limiter import Admission, RateLimiter
 from langchaint.response import Response
 
@@ -45,17 +45,17 @@ class StreamHandle[OutputT]:
     def __init__(
         self,
         *,
-        provider: Provider,
-        bound_provider: BoundProvider[OutputT],
+        adapter: Adapter,
+        bound_adapter: BoundAdapter[OutputT],
         conversation: Sequence[Message],
         rate_limiter: RateLimiter,
     ) -> None:
         """Store the request; called by BoundLLM.stream_one only."""
-        self._provider = provider
-        self._bound_provider = bound_provider
+        self._adapter = adapter
+        self._bound_adapter = bound_adapter
         self._conversation = conversation
         self._rate_limiter = rate_limiter
-        self._provider_stream: ProviderStream[OutputT] | None = None
+        self._adapter_stream: AdapterStream[OutputT] | None = None
         self._items: AsyncIterator[StreamItem] | None = None
         self._attempt_records: list[AttemptRecord] = []
         self._admission: Admission | None = None
@@ -76,7 +76,7 @@ class StreamHandle[OutputT]:
         traceback: TracebackType | None,
     ) -> None:
         """Close the underlying connection if one is open."""
-        await self._close_provider_stream()
+        await self._close_adapter_stream()
 
     def _release_slot(self) -> None:
         """Return the held RateLimiter admission, if this handle holds one."""
@@ -84,11 +84,11 @@ class StreamHandle[OutputT]:
             self._rate_limiter.release(self._admission)
             self._admission = None
 
-    async def _close_provider_stream(self) -> None:
-        """Close and forget the current provider stream, releasing its slot."""
-        if self._provider_stream is not None:
-            await self._provider_stream.close()
-            self._provider_stream = None
+    async def _close_adapter_stream(self) -> None:
+        """Close and forget the current adapter stream, releasing its slot."""
+        if self._adapter_stream is not None:
+            await self._adapter_stream.close()
+            self._adapter_stream = None
             self._items = None
         self._release_slot()
 
@@ -107,8 +107,8 @@ class StreamHandle[OutputT]:
         else:
             wrapped = TransientError(
                 str(exc),
-                retry_after_seconds=self._provider.retry_after_seconds(exc),
-                is_rate_limit=self._provider.classify(exc) == "rate_limit",
+                retry_after_seconds=self._adapter.retry_after_seconds(exc),
+                is_rate_limit=self._adapter.classify(exc) == "rate_limit",
             )
             wrapped.__cause__ = exc
         assert self._attempt_started_at_monotonic_seconds is not None
@@ -136,8 +136,8 @@ class StreamHandle[OutputT]:
             assert self._started_at_monotonic_seconds is not None
             raise RetriesExhaustedError(
                 attempt_records=tuple(self._attempt_records),
-                model=self._provider.model,
-                provider_name=self._provider.name,
+                model=self._adapter.model,
+                provider_name=self._adapter.provider_name,
                 elapsed_seconds=time.monotonic() - self._started_at_monotonic_seconds,
                 stop_reason=None,
             ) from exc
@@ -154,7 +154,7 @@ class StreamHandle[OutputT]:
             return None
         if isinstance(exc, (AbortBatchError, GenerationError)):
             return exc
-        if self._provider.classify(exc) == "abort":
+        if self._adapter.classify(exc) == "abort":
             abort = AbortBatchError(f"abort provider error: {exc}")
             abort.__cause__ = exc
             return abort
@@ -165,7 +165,7 @@ class StreamHandle[OutputT]:
         return self
 
     async def _ensure_stream_open(self) -> None:
-        """Open the provider stream if none is held, retrying pre-first-item failures under the limiter.
+        """Open the adapter stream if none is held, retrying pre-first-item failures under the limiter.
 
         A fresh admission is acquired for each open attempt and released before the backoff sleep,
         so a waiting task never holds capacity while this one backs off.
@@ -178,13 +178,13 @@ class StreamHandle[OutputT]:
         so a stream slow to first token cannot stall the shared account's admission.
         The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
         """
-        while self._provider_stream is None:
+        while self._adapter_stream is None:
             self._admission = await self._rate_limiter.acquire()
             self._attempt_started_at_monotonic_seconds = time.monotonic()
             if self._started_at_monotonic_seconds is None:
                 self._started_at_monotonic_seconds = self._attempt_started_at_monotonic_seconds
             try:
-                self._provider_stream = await self._bound_provider.open_stream(self._conversation)
+                self._adapter_stream = await self._bound_adapter.open_stream(self._conversation)
             except Exception as exc:
                 non_retriable = self._non_retriable_or_none(exc)
                 if non_retriable is not None:
@@ -194,7 +194,7 @@ class StreamHandle[OutputT]:
                 self._release_slot()
                 await self._backoff_or_exhaust(exc, delay_seconds)
                 continue
-            self._items = self._provider_stream.items()
+            self._items = self._adapter_stream.items()
             assert self._admission is not None
             self._rate_limiter.register_success(self._admission)
 
@@ -208,7 +208,7 @@ class StreamHandle[OutputT]:
             TransientError: the stream failed after items were yielded.
             AbortBatchError: the adapter classified an open or item error as abort.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget while opening the stream.
-            StreamProtocolError: the provider stream violated the stream contract; propagates unchanged.
+            StreamProtocolError: the adapter stream violated the event contract; propagates unchanged.
             StopAsyncIteration: the stream is exhausted.
         """
         while True:
@@ -222,20 +222,20 @@ class StreamHandle[OutputT]:
                 self._release_slot()
                 raise
             except StreamProtocolError:
-                await self._close_provider_stream()
+                await self._close_adapter_stream()
                 raise
             except Exception as exc:
                 non_retriable = self._non_retriable_or_none(exc)
                 if non_retriable is not None:
-                    await self._close_provider_stream()
+                    await self._close_adapter_stream()
                     raise non_retriable from exc
                 if self._yielded_any:
-                    await self._close_provider_stream()
+                    await self._close_adapter_stream()
                     raise TransientError(
                         f"stream failed after items were yielded: {exc}"
                     ) from exc
                 delay_seconds = self._record_transient_error(exc)
-                await self._close_provider_stream()
+                await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, delay_seconds)
                 continue
             except BaseException:
@@ -270,13 +270,13 @@ class StreamHandle[OutputT]:
             return self._response
         async for _ in self:
             pass
-        if self._provider_stream is None:
+        if self._adapter_stream is None:
             raise StreamProtocolError("stream ended without producing a result")
         assert self._attempt_started_at_monotonic_seconds is not None
         assert self._started_at_monotonic_seconds is not None
         ended_at_monotonic_seconds = time.monotonic() if self._ended_at_monotonic_seconds is None else self._ended_at_monotonic_seconds
         try:
-            provider_result = await self._provider_stream.final()
+            adapter_result = await self._adapter_stream.final()
         except GenerationError as exc:
             self._attempt_records.append(
                 AttemptRecord(
@@ -289,29 +289,29 @@ class StreamHandle[OutputT]:
             )
             raise type(exc)(
                 attempt_records=tuple(self._attempt_records),
-                model=self._provider.model,
-                provider_name=self._provider.name,
+                model=self._adapter.model,
+                provider_name=self._adapter.provider_name,
                 elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
                 stop_reason=exc.stop_reason,
             ) from exc
         response = Response(
-            output=provider_result.output,
-            model=self._provider.model,
-            provider_name=self._provider.name,
+            output=adapter_result.output,
+            model=self._adapter.model,
+            provider_name=self._adapter.provider_name,
             attempt_records=(
                 *self._attempt_records,
                 AttemptRecord(
                     started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                     error=None,
-                    usage=provider_result.usage,
-                    usage_raw=provider_result.usage_raw,
+                    usage=adapter_result.usage,
+                    usage_raw=adapter_result.usage_raw,
                 ),
             ),
             elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
-            raw=provider_result.raw,
-            stop_reason=provider_result.stop_reason,
-            assistant_message=provider_result.assistant_message,
+            raw=adapter_result.raw,
+            stop_reason=adapter_result.stop_reason,
+            assistant_message=adapter_result.assistant_message,
         )
         self._response = response
         return response

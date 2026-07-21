@@ -45,16 +45,18 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
+from langchaint.adapter import Binding
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
     AnthropicBedrockModelName,
-    AnthropicMessagesProvider,
+    AnthropicMessagesAdapter,
     anthropic_bedrock_model,
     anthropic_model,
     cost_breakdown,
 )
-from langchaint.anthropic.messages_provider import (
+from langchaint.anthropic.messages_adapter import (
+    _adapter_result,
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
@@ -62,13 +64,11 @@ from langchaint.anthropic.messages_provider import (
     _cost_in_usd,
     _normalized_stop_reason,
     _normalized_usage,
-    _provider_result,
     _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,
 )
 from langchaint.exceptions import StreamProtocolError, TransientError
-from langchaint.provider import Binding
 from langchaint.tools import ToolSchema
 
 _PRICING = PricingTable(
@@ -237,15 +237,19 @@ def test_one_hour_ttl_requires_the_one_hour_rate_at_construction() -> None:
             "anthropic.claude-sonnet-5", aws_region="us-east-1", cache_ttl="1h", pricing=_PRICING_NO_1H
         )
     with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
-        AnthropicMessagesProvider(
-            client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING_NO_1H, cache_ttl="1h"
+        AnthropicMessagesAdapter(
+            client=AsyncAnthropic(api_key="test"),
+            model="m",
+            pricing=_PRICING_NO_1H,
+            provider_name="anthropic",
+            cache_ttl="1h",
         )
 
 
 def test_one_hour_ttl_constructs_with_a_one_hour_rate() -> None:
     """The default ANTHROPIC_PRICING carries the 1h rate, and "5m" never needs it."""
     assert (
-        _anthropic_provider_of(
+        _anthropic_adapter_of(
             anthropic_model(
                 "claude-sonnet-5", client=AsyncAnthropic(api_key="test"), cache_ttl="1h"
             )
@@ -253,13 +257,13 @@ def test_one_hour_ttl_constructs_with_a_one_hour_rate() -> None:
         == "1h"
     )
     assert (
-        _anthropic_provider_of(
+        _anthropic_adapter_of(
             anthropic_bedrock_model("anthropic.claude-sonnet-5", aws_region="us-east-1", cache_ttl="1h")
         ).cache_ttl
         == "1h"
     )
     assert (
-        _anthropic_provider_of(
+        _anthropic_adapter_of(
             anthropic_model(
                 "claude-sonnet-5",
                 client=AsyncAnthropic(api_key="test"),
@@ -287,7 +291,7 @@ def test_stop_reason_mapping(raw: str | None, expected: str) -> None:
     assert _normalized_stop_reason(raw) == expected
 
 
-def test_provider_result_extracts_text_and_tool_use() -> None:
+def test_adapter_result_extracts_text_and_tool_use() -> None:
     """Text blocks concatenate and tool_use blocks become ToolCalls with JSON args."""
     message = at.Message(
         id="msg_1",
@@ -304,7 +308,7 @@ def test_provider_result_extracts_text_and_tool_use() -> None:
         type="message",
         usage=_usage_with_cache_split(),
     )
-    result = _provider_result(message=message, output="hello world", pricing=_PRICING)
+    result = _adapter_result(message=message, output="hello world", pricing=_PRICING)
     assert result.output == "hello world"
     assert result.assistant_message.text == "hello world"
     tool_call = result.assistant_message.tool_calls[0]
@@ -472,7 +476,6 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
             turn=(
                 TextPart(text="t"),
                 ReasoningTrace(
-                    provider_name="anthropic_messages",
                     reasoning={"type": "thinking", "thinking": "x", "signature": "s"},
                 ),
             )
@@ -556,10 +559,10 @@ def test_wire_tool_choice_none_forbids_calls() -> None:
     assert _wire_tool_choice("none", parallel_tool_calls=True) == {"type": "none"}
 
 
-def _provider() -> AnthropicMessagesProvider:
+def _adapter() -> AnthropicMessagesAdapter:
     """Build an adapter over a keyless client, valid because no request is sent."""
-    return AnthropicMessagesProvider(
-        client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING
+    return AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING, provider_name="anthropic"
     )
 
 
@@ -582,7 +585,7 @@ def _binding(
 
 def test_request_omits_tool_sentinels_without_tools() -> None:
     """No tools leaves both tools and tool_choice at the omit sentinel."""
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
     assert request.max_tokens == 4096
@@ -602,7 +605,7 @@ def test_request_passes_widened_reasoning_effort_through() -> None:
         inference_params=InferenceParams(reasoning_effort="minimal"),
         automatic_prompt_caching=False,
     )
-    request = _provider()._request(binding)
+    request = _adapter()._request(binding)
     assert request.output_config == {"effort": "minimal"}
     assert request.thinking == {"type": "adaptive"}
 
@@ -617,14 +620,14 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
         inference_params=InferenceParams(),
         automatic_prompt_caching=False,
     )
-    request = _provider()._request(binding)
+    request = _adapter()._request(binding)
     assert isinstance(request.output_config, anthropic.Omit)
     assert isinstance(request.thinking, anthropic.Omit)
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _provider()._request(
+    unset = _adapter()._request(
         _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
     )
     assert isinstance(unset.temperature, anthropic.Omit)
@@ -636,16 +639,16 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         inference_params=InferenceParams(temperature=0.2),
         automatic_prompt_caching=False,
     )
-    assert _provider()._request(binding).temperature == 0.2
+    assert _adapter()._request(binding).temperature == 0.2
 
 
 def test_request_marks_the_system_block_only_when_caching() -> None:
     """The system block carries a breakpoint under caching and none without it."""
-    cached = _provider()._request(
+    cached = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
     assert _block_list(cached.system)[0]["cache_control"] == {"type": "ephemeral"}
-    uncached = _provider()._request(
+    uncached = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     assert "cache_control" not in _block_list(uncached.system)[0]
@@ -654,11 +657,11 @@ def test_request_marks_the_system_block_only_when_caching() -> None:
 def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
     """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
-    without_system = _provider()._request(
+    without_system = _adapter()._request(
         _binding(system_prompt=None, tool_schemas=schemas, automatic_prompt_caching=True)
     )
     assert _block_list(without_system.tools)[-1]["cache_control"] == {"type": "ephemeral"}
-    with_system = _provider()._request(
+    with_system = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_prompt_caching=True)
     )
     assert "cache_control" not in _block_list(with_system.tools)[-1]
@@ -835,13 +838,13 @@ class _StructuredReport(BaseModel):
 
 
 def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
-    """Build a structured-bound provider over a keyless client; no request is sent."""
-    provider = _provider()
-    request = provider._request(
+    """Build a structured-bound adapter over a keyless client; no request is sent."""
+    adapter = _adapter()
+    request = adapter._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     return _BoundAnthropicStructured(
-        adapter=provider, request=request, response_format=_StructuredReport
+        adapter=adapter, request=request, response_format=_StructuredReport
     )
 
 
@@ -866,7 +869,7 @@ def _parsed_message(
 
 
 def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
-    """The structured bound provider hands back the SDK-parsed response_format instance as content."""
+    """The structured bound adapter hands back the SDK-parsed response_format instance as content."""
     report = _StructuredReport(city="Nairobi", celsius=25)
     assert _structured_bound()._parsed_output(_parsed_message(report)) == report
 
@@ -909,38 +912,38 @@ def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
 def test_retry_after_seconds_prefers_the_millisecond_header() -> None:
     """retry-after-ms wins over retry-after because it is more precise."""
     error = _rate_limit_error({"retry-after-ms": "1500", "retry-after": "49"})
-    assert _provider().retry_after_seconds(error) == 1.5
+    assert _adapter().retry_after_seconds(error) == 1.5
 
 
 def test_retry_after_seconds_parses_the_seconds_header() -> None:
     """Without retry-after-ms, retry-after is parsed as float seconds."""
     error = _rate_limit_error({"retry-after": "49"})
-    assert _provider().retry_after_seconds(error) == 49.0
+    assert _adapter().retry_after_seconds(error) == 49.0
 
 
 def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
     """No headers, an unparseable value, and a non-SDK error all yield None."""
-    provider = _provider()
-    assert provider.retry_after_seconds(_rate_limit_error({})) is None
+    adapter = _adapter()
+    assert adapter.retry_after_seconds(_rate_limit_error({})) is None
     assert (
-        provider.retry_after_seconds(
+        adapter.retry_after_seconds(
             _rate_limit_error({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
         )
         is None
     )
-    assert provider.retry_after_seconds(ValueError("boom")) is None
+    assert adapter.retry_after_seconds(ValueError("boom")) is None
 
 
 def test_adapter_pins_sdk_retries_off() -> None:
     """The stored client copy carries max_retries=0 so only langchaint retries."""
-    assert _provider().client.max_retries == 0
+    assert _adapter().client.max_retries == 0
 
 
-def _anthropic_provider_of(llm: LLM) -> AnthropicMessagesProvider:
-    """Narrow an LLM's provider to the concrete adapter so tests read its client/model/pricing."""
-    provider = llm.provider
-    assert isinstance(provider, AnthropicMessagesProvider)
-    return provider
+def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
+    """Narrow an LLM to its concrete adapter so tests read its client/model/pricing."""
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    return adapter
 
 
 @pytest.mark.parametrize(
@@ -958,41 +961,41 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
     expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     """Each Bedrock wire model id reaches its API's client class unchanged, retries pinned off."""
-    provider = _anthropic_provider_of(anthropic_bedrock_model(model, aws_region="us-east-1"))
-    assert provider.model == model
-    assert isinstance(provider.client, expected_client_class)
-    assert provider.client.max_retries == 0
+    adapter = _anthropic_adapter_of(anthropic_bedrock_model(model, aws_region="us-east-1"))
+    assert adapter.model == model
+    assert isinstance(adapter.client, expected_client_class)
+    assert adapter.client.max_retries == 0
 
 
 def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
     """The Bedrock default pricing is the same PricingTable object anthropic_model uses, not a copy."""
-    provider = _anthropic_provider_of(
+    adapter = _anthropic_adapter_of(
         anthropic_bedrock_model("us.anthropic.claude-opus-4-6-v1", aws_region="us-east-1")
     )
-    assert provider.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
+    assert adapter.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
 
 
 def test_bedrock_model_threads_cache_ttl_to_the_adapter() -> None:
     """A caller-supplied cache_ttl reaches the adapter through anthropic_bedrock_model."""
-    provider = _anthropic_provider_of(
+    adapter = _anthropic_adapter_of(
         anthropic_bedrock_model("us.anthropic.claude-opus-4-6-v1", aws_region="us-east-1", cache_ttl="1h")
     )
-    assert provider.cache_ttl == "1h"
+    assert adapter.cache_ttl == "1h"
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     """A supplied client whose class serves the model's Bedrock API passes through, retries pinned off."""
-    provider = _anthropic_provider_of(
+    adapter = _anthropic_adapter_of(
         anthropic_bedrock_model(
             "anthropic.claude-opus-4-8", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
         )
     )
-    assert isinstance(provider.client, AsyncAnthropicBedrockMantle)
-    assert provider.model == "anthropic.claude-opus-4-8"
-    assert provider.client.max_retries == 0
+    assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
+    assert adapter.model == "anthropic.claude-opus-4-8"
+    assert adapter.client.max_retries == 0
     # aws_region survives with_options; the supplied client's distinctive region proves it is the one
     # used, not a default rebuilt from the constructor's own aws_region (which is None here).
-    assert provider.client.aws_region == "eu-west-1"
+    assert adapter.client.aws_region == "eu-west-1"
 
 
 def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_api() -> None:
@@ -1009,13 +1012,16 @@ def test_bedrock_table_is_total_over_the_bedrock_ids() -> None:
 
 
 def test_adapter_accepts_a_mantle_client() -> None:
-    """AnthropicMessagesProvider takes an AsyncAnthropicBedrockMantle and pins its retries off."""
+    """AnthropicMessagesAdapter takes an AsyncAnthropicBedrockMantle and pins its retries off."""
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
-    provider = AnthropicMessagesProvider(
-        client=client, model="anthropic.claude-opus-4-8", pricing=_PRICING
+    adapter = AnthropicMessagesAdapter(
+        client=client,
+        model="anthropic.claude-opus-4-8",
+        pricing=_PRICING,
+        provider_name="aws.bedrock",
     )
-    assert isinstance(provider.client, AsyncAnthropicBedrockMantle)
-    assert provider.client.max_retries == 0
+    assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
+    assert adapter.client.max_retries == 0
 
 
 def test_wire_messages_marks_a_marked_user_part() -> None:
@@ -1090,7 +1096,7 @@ def test_wire_messages_reserves_two_slots_for_automatic_markers() -> None:
 
 def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
     """A parts system_prompt is one block per part; marked parts and the automatic last block carry markers."""
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(
             system_prompt=(
                 TextPart(text="stable instructions", cache_breakpoint=True),
@@ -1109,7 +1115,7 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
 
 def test_request_system_parts_without_automatic_caching_mark_only_marked_parts() -> None:
     """Bound False, only the marked system part carries a marker; the budget spends only on it."""
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(
             system_prompt=(
                 TextPart(text="stable", cache_breakpoint=True),
@@ -1129,7 +1135,7 @@ def test_request_system_parts_without_automatic_caching_mark_only_marked_parts()
 def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> None:
     """Four marked system parts plus the automatic markers cannot fit the 4-marker limit."""
     with pytest.raises(ValueError, match="limit"):
-        _provider()._request(
+        _adapter()._request(
             _binding(
                 system_prompt=tuple(
                     TextPart(text=f"s{index}", cache_breakpoint=True) for index in range(4)
@@ -1142,11 +1148,11 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
 
 def test_request_str_system_budget_leaves_two_slots_for_message_marks() -> None:
     """A str system prompt under automatic caching leaves two slots for message marks."""
-    request = _provider()._request(
+    request = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
     assert request.message_mark_budget == 2
-    uncached = _provider()._request(
+    uncached = _adapter()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     assert uncached.message_mark_budget == 4
@@ -1184,16 +1190,20 @@ def test_wire_messages_writes_no_marks_at_zero_budget() -> None:
     wire = _wire_messages(conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=0)
     assert "cache_control" not in _content_blocks(wire[0])[0]
 
-def _provider_1h() -> AnthropicMessagesProvider:
+def _adapter_1h() -> AnthropicMessagesAdapter:
     """Build an adapter with the 1-hour cache TTL over a keyless client."""
-    return AnthropicMessagesProvider(
-        client=AsyncAnthropic(api_key="test"), model="m", pricing=_PRICING, cache_ttl="1h"
+    return AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="anthropic",
+        cache_ttl="1h",
     )
 
 
 def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the automatic system marker and flows into the request."""
-    request = _provider_1h()._request(
+    request = _adapter_1h()._request(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
     assert _block_list(request.system)[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -1202,7 +1212,7 @@ def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
 
 def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the last-tool marker."""
-    request = _provider_1h()._request(
+    request = _adapter_1h()._request(
         _binding(system_prompt=None, tool_schemas=_tool_schemas(), automatic_prompt_caching=True)
     )
     assert _block_list(request.tools)[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -1222,6 +1232,6 @@ def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() ->
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
     """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
     with pytest.raises(ValueError, match="empty tuple"):
-        _provider()._request(
+        _adapter()._request(
             _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
         )

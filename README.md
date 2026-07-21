@@ -60,9 +60,9 @@ Changing parameters is `rebind(...)`, which returns a new `BoundLLM` and carries
 `BoundLLM` has `generate_one`, `generate_many` (an order-aligned `list[Response[OutputT] | GenerationError]`), and `stream_one`.
 
 **A constructor per backend returning a ready `LLM`.**
-`openai_model("gpt-5.6-terra")`, `anthropic_model("claude-sonnet-5")`, and `anthropic_bedrock_model(model, aws_region=...)` each take a `Literal` model name (so typos fail the type check), look up public prices, and wrap the adapter in an `LLM`; `client`, `pricing`, and `rate_limiter` default sensibly and are overridable.
-`anthropic_bedrock_model` takes the Bedrock wire model id and sends it verbatim, routing each id to its Bedrock API and pricing through `ANTHROPIC_BEDROCK`; OpenAI on Bedrock is the SDK's bundled `AsyncBedrockOpenAI` passed as `client`.
-Models outside a catalog are built directly from the adapter: `LLM(AnthropicMessagesProvider(...))`.
+`openai_model("gpt-5.6-terra")`, `anthropic_model("claude-sonnet-5")`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)` each select a model and wrap the adapter in an `LLM`, over a `PricingTable` the constructor either defaults or requires.
+Each function's docstring states its parameters, its defaults, and where it differs from the others.
+Models outside a catalog are built directly from the adapter: `LLM(AnthropicMessagesAdapter(...))`.
 
 **One result shape for success and failure.**
 Success is a frozen `Response[OutputT]`; a terminal failure is a `GenerationError` leaf: `RetriesExhaustedError`, `RefusalError`, or `MaxCompletionTokensExceededError` (the structured path never returns silently wrong data).
@@ -118,9 +118,9 @@ Each absence is deliberate; the reasons are recorded in `CLAUDE.md` and the modu
 
 ## Layout
 
-    src/langchaint/           the neutral core (imports no SDK): llm.py, messages.py, tools.py, rate_limiter.py, exceptions.py, response.py, streaming.py, usage.py, pricing.py, inference_params.py, provider.py, checked_copy.py
-    src/langchaint/anthropic/ the anthropic backend: anthropic_model, anthropic_bedrock_model, pricing tables, AnthropicMessagesProvider
-    src/langchaint/openai/    the openai backend: openai_model, OPENAI_PRICING, OpenAIResponsesProvider
+    src/langchaint/           the neutral core (imports no SDK): llm.py, messages.py, tools.py, rate_limiter.py, exceptions.py, response.py, streaming.py, usage.py, pricing.py, inference_params.py, adapter.py, checked_copy.py
+    src/langchaint/anthropic/ the anthropic backend: anthropic_model, anthropic_bedrock_model, pricing tables, AnthropicMessagesAdapter
+    src/langchaint/openai/    the openai backend: openai_model, openai_bedrock_model, OPENAI_PRICING, OpenAIResponsesAdapter
     src/langchaint/tracing/   the OTel tracing subpackage
     examples/                 runnable examples and MIGRATING_FROM_LANGCHAIN.md
     CLAUDE.md                 design tenets, naming rules, and the per-module map
@@ -130,4 +130,4 @@ Module docstrings are the spec of record for mechanics; `CLAUDE.md` holds the de
 ## Verification
 
 Run `scripts/CI.sh`; it runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the tools resolve from the locked dev dependency group, and all must pass with zero errors.
-The tests are offline: they feed constructed SDK objects into the adapter helpers and drive `BoundLLM`/`StreamHandle` with stub providers, so they need no API keys.
+The tests are offline: they feed constructed SDK objects into the adapter helpers and drive `BoundLLM`/`StreamHandle` with stub adapters, so they need no API keys.

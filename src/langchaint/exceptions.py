@@ -12,7 +12,7 @@ TransientError and AbortBatchError are per-attempt / control signals.
 The GenerationError leaves are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RefusalError, and MaxCompletionTokensExceededError.
 
-Classification of raw SDK exceptions into these lives in the adapter (Provider.classify);
+Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
 so the adapter detects them where it reads the response and raises the matching leaf directly.
 
@@ -44,7 +44,7 @@ class TransientError(Exception):
     when the provider sent one;
     RateLimiter honors it up to a 60-second cap and uses it to pause admission account-wide.
     is_rate_limit marks errors saying the account or service refuses further requests right now
-    (Provider.classify returned "rate_limit");
+    (Adapter.classify returned "rate_limit");
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
     usage (carrying cost_in_usd) and stop_reason describe the attempt's billable completion
     when the failing attempt was a completed 200 the adapter rejected downstream
@@ -385,7 +385,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
 
 
 class StreamProtocolError(Exception):
-    """A provider stream violated the event contract.
+    """An adapter stream violated the event contract.
 
     Example: the stream ended without a stop event.
     """

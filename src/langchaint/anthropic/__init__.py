@@ -41,13 +41,13 @@ except ModuleNotFoundError as exc:
         "langchaint's anthropic backend requires the anthropic package; install anthropic."
     ) from exc
 
-from langchaint.anthropic.messages_provider import (
-    AnthropicMessagesProvider,
+from langchaint.adapter import PricingTable
+from langchaint.anthropic.messages_adapter import (
+    AnthropicMessagesAdapter,
     CacheTTL,
     cost_breakdown,
 )
 from langchaint.llm import LLM
-from langchaint.provider import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
 type AnthropicModelName = Literal[
@@ -171,7 +171,7 @@ _BEDROCK_CLIENT_CLASS: dict[
 def anthropic_model(
     model: AnthropicModelName,
     *,
-    client: AsyncAnthropic | AsyncAnthropicBedrock | None = None,
+    client: AsyncAnthropic | None = None,
     pricing: PricingTable | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
@@ -189,15 +189,20 @@ def anthropic_model(
     built in the same event loop as the LLMs, since one instance serves one loop.
 
     Raises:
-        ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
-            (from AnthropicMessagesProvider.__init__; every ANTHROPIC_PRICING entry carries the
+        ValueError: client is a Bedrock client, which does not reach the "anthropic" provider this
+            constructor states (from Adapter.__init__; the narrowed client annotation already
+            refuses one at check time, since the Bedrock classes are siblings of AsyncAnthropic
+            rather than subclasses),
+            or cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
+            (from AnthropicMessagesAdapter.__init__; every ANTHROPIC_PRICING entry carries the
             rate, so only a custom pricing can trip this).
     """
     return LLM(
-        AnthropicMessagesProvider(
+        AnthropicMessagesAdapter(
             client=client if client is not None else AsyncAnthropic(),
             model=model,
             pricing=pricing if pricing is not None else ANTHROPIC_PRICING[model],
+            provider_name="anthropic",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         ),
@@ -224,6 +229,9 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     client None constructs the API's client class with aws_region
     (None resolves the region from the AWS credential chain).
     Pass client to supply your own; its class must serve the model's Bedrock API.
+    aws_region is only for the default-client path, so passing both it and client raises:
+    a passed client already carries its region, and the aws_region beside it would be dropped,
+    sending every request to the client's region instead.
     http_client passes a custom httpx.AsyncClient (loaded certs, a proxy) to the API's client class,
     keeping the class-routing convenience that passing a whole client would forgo;
     it is only for the default-client path, so passing both client and http_client raises
@@ -240,10 +248,10 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     built in the same event loop as the LLMs, since one instance serves one loop.
 
     Raises:
-        ValueError: both client and http_client are provided,
+        ValueError: client is provided together with http_client or aws_region,
             or client is provided but its class does not serve model's Bedrock API,
             or cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
-            (from AnthropicMessagesProvider.__init__; every ANTHROPIC_PRICING entry carries the
+            (from AnthropicMessagesAdapter.__init__; every ANTHROPIC_PRICING entry carries the
             rate, so only a custom pricing can trip this).
     """
     routing = ANTHROPIC_BEDROCK[model]
@@ -254,6 +262,10 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
             raise ValueError(
                 "Pass at most one of client= or http_client=; a passed client already owns its transport."
             )
+        if aws_region is not None:
+            raise ValueError(
+                "Pass at most one of client= or aws_region=; a passed client already carries its region."
+            )
         required_class = _BEDROCK_CLIENT_CLASS[routing.api]
         if not isinstance(client, required_class):
             raise ValueError(
@@ -261,10 +273,11 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
                 f"{required_class.__name__} client, but a {type(client).__name__} was passed."
             )
     return LLM(
-        AnthropicMessagesProvider(
+        AnthropicMessagesAdapter(
             client=client,
             model=model,
             pricing=pricing if pricing is not None else ANTHROPIC_PRICING[routing.pricing_key],
+            provider_name="aws.bedrock",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         ),
@@ -276,7 +289,7 @@ __all__ = [
     "ANTHROPIC_BEDROCK",
     "ANTHROPIC_PRICING",
     "AnthropicBedrockModelName",
-    "AnthropicMessagesProvider",
+    "AnthropicMessagesAdapter",
     "AnthropicModelName",
     "BedrockRouting",
     "CacheTTL",

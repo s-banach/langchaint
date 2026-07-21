@@ -18,6 +18,7 @@ from typing import Any, Protocol, SupportsIndex, overload
 
 from pydantic import BaseModel
 
+from langchaint.adapter import Adapter, Binding, BoundAdapter, ToolChoice
 from langchaint.exceptions import (
     AbortBatchError,
     AttemptRecord,
@@ -28,7 +29,6 @@ from langchaint.exceptions import (
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import Message, TextPart, UserMessage
-from langchaint.provider import Binding, BoundProvider, Provider, ToolChoice
 from langchaint.rate_limiter import RateLimiter
 from langchaint.response import Response
 from langchaint.streaming import StreamHandle
@@ -143,23 +143,23 @@ def _build_binding(
     )
 
 
-def _bind_provider(
-    provider: Provider, binding: Binding, response_format: type[Any] | None
-) -> BoundProvider[Any]:
-    """Dispatch to the provider bind method the response_format selects.
+def _bind_adapter(
+    adapter: Adapter, binding: Binding, response_format: type[Any] | None
+) -> BoundAdapter[Any]:
+    """Dispatch to the adapter bind method the response_format selects.
 
     response_format None routes to bind_text (output is assistant text);
     a model routes to bind_structured (output is the SDK-parsed instance).
     The caller-visible output type comes from the bind / rebind overloads,
-    so this returns BoundProvider[Any] and the Any is confined here.
+    so this returns BoundAdapter[Any] and the Any is confined here.
     The parameter is type[Any] | None, not type[BaseModel] | None,
     because rebind feeds it the stored response_format typed type[OutputT] | None:
     type[OutputT] with OutputT unbounded is not assignable to a BaseModel-bounded parameter,
     and narrowing with is None narrows the value, not OutputT.
     """
     if response_format is None:
-        return provider.bind_text(binding)
-    return provider.bind_structured(binding, response_format)
+        return adapter.bind_text(binding)
+    return adapter.bind_structured(binding, response_format)
 
 
 class LLM:
@@ -167,12 +167,12 @@ class LLM:
 
     def __init__(
         self,
-        provider: Provider,
+        adapter: Adapter,
         *,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
         """Store the shared pieces; rate_limiter None means the defaults."""
-        self.provider = provider
+        self.adapter = adapter
         self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
 
     @overload
@@ -229,8 +229,8 @@ class LLM:
             automatic_prompt_caching=automatic_prompt_caching,
         )
         return BoundLLM(
-            provider=self.provider,
-            bound_provider=_bind_provider(self.provider, binding, response_format),
+            adapter=self.adapter,
+            bound_adapter=_bind_adapter(self.adapter, binding, response_format),
             response_format=response_format,
             binding=binding,
             tool_manager=tool_manager,
@@ -248,20 +248,20 @@ class BoundLLM[OutputT]:
     def __init__(
         self,
         *,
-        provider: Provider,
-        bound_provider: BoundProvider[OutputT],
+        adapter: Adapter,
+        bound_adapter: BoundAdapter[OutputT],
         response_format: type[OutputT] | None,
         binding: Binding,
         tool_manager: ToolManager | None,
         rate_limiter: RateLimiter,
     ) -> None:
         """Store the frozen pieces; called by LLM.bind and rebind only."""
-        self.provider = provider
+        self.adapter = adapter
         self.binding = binding
         self.response_format = response_format
         self.tool_manager = tool_manager
         self.rate_limiter = rate_limiter
-        self._bound_provider = bound_provider
+        self._bound_adapter = bound_adapter
 
     @overload
     def rebind[NewModelT: BaseModel](
@@ -355,8 +355,8 @@ class BoundLLM[OutputT]:
             self.response_format if isinstance(response_format, Unchanged) else response_format
         )
         return BoundLLM(
-            provider=self.provider,
-            bound_provider=_bind_provider(self.provider, new_binding, new_response_format),
+            adapter=self.adapter,
+            bound_adapter=_bind_adapter(self.adapter, new_binding, new_response_format),
             response_format=new_response_format,
             binding=new_binding,
             tool_manager=new_tool_manager,
@@ -397,7 +397,7 @@ class BoundLLM[OutputT]:
             async with self.rate_limiter.slot() as admission:
                 attempt_started_at_monotonic_seconds = time.monotonic()
                 try:
-                    provider_result = await self._bound_provider.send(conversation)
+                    adapter_result = await self._bound_adapter.send(conversation)
                 except AbortBatchError:
                     raise
                 except GenerationError as exc:
@@ -413,20 +413,20 @@ class BoundLLM[OutputT]:
                     )
                     raise type(exc)(
                         attempt_records=tuple(attempt_records),
-                        model=self.provider.model,
-                        provider_name=self.provider.name,
+                        model=self.adapter.model,
+                        provider_name=self.adapter.provider_name,
                         elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
                         stop_reason=exc.stop_reason,
                     ) from exc
                 except TransientError as exc:
                     error: TransientError = exc
                 except Exception as exc:
-                    error_class = self.provider.classify(exc)
+                    error_class = self.adapter.classify(exc)
                     if error_class == "abort":
                         raise AbortBatchError(f"abort provider error: {exc}") from exc
                     error = TransientError(
                         str(exc),
-                        retry_after_seconds=self.provider.retry_after_seconds(exc),
+                        retry_after_seconds=self.adapter.retry_after_seconds(exc),
                         is_rate_limit=error_class == "rate_limit",
                     )
                     error.__cause__ = exc
@@ -437,19 +437,19 @@ class BoundLLM[OutputT]:
                             started_at_monotonic_seconds=attempt_started_at_monotonic_seconds,
                             ended_at_monotonic_seconds=time.monotonic(),
                             error=None,
-                            usage=provider_result.usage,
-                            usage_raw=provider_result.usage_raw,
+                            usage=adapter_result.usage,
+                            usage_raw=adapter_result.usage_raw,
                         )
                     )
                     return Response(
-                        output=provider_result.output,
-                        model=self.provider.model,
-                        provider_name=self.provider.name,
+                        output=adapter_result.output,
+                        model=self.adapter.model,
+                        provider_name=self.adapter.provider_name,
                         attempt_records=tuple(attempt_records),
                         elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                        raw=provider_result.raw,
-                        stop_reason=provider_result.stop_reason,
-                        assistant_message=provider_result.assistant_message,
+                        raw=adapter_result.raw,
+                        stop_reason=adapter_result.stop_reason,
+                        assistant_message=adapter_result.assistant_message,
                     )
                 attempt_records.append(
                     AttemptRecord(
@@ -467,8 +467,8 @@ class BoundLLM[OutputT]:
                 await asyncio.sleep(delay_seconds)
         raise RetriesExhaustedError(
             attempt_records=tuple(attempt_records),
-            model=self.provider.model,
-            provider_name=self.provider.name,
+            model=self.adapter.model,
+            provider_name=self.adapter.provider_name,
             elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
             stop_reason=None,
         )
@@ -556,8 +556,8 @@ class BoundLLM[OutputT]:
         see StreamHandle for the retry and close contracts.
         """
         return StreamHandle(
-            provider=self.provider,
-            bound_provider=self._bound_provider,
+            adapter=self.adapter,
+            bound_adapter=self._bound_adapter,
             conversation=_as_conversation(conversation),
             rate_limiter=self.rate_limiter,
         )

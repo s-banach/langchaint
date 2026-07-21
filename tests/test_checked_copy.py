@@ -1,11 +1,14 @@
-"""The package-wide inheritance check behind CheckedCopyModel.
+"""The two class-definition checks behind CheckedCopyModel, and the construction rule they enforce.
 
-CheckedCopyModel guards model_copy only for models that inherit it,
-so a model declared on plain BaseModel would silently drop non-field update keys.
-This test walks every module under langchaint and fails on any package-defined pydantic model outside the base.
-There is deliberately no allowlist: a model that must not inherit the guard
-(say one that sets extra="allow", whose legitimate extra-key updates the guard would reject)
+CheckedCopyModel covers a model only if that model inherits it,
+so a model declared on plain BaseModel would take neither the model_copy guard nor extra="forbid".
+The first test walks every module under langchaint and fails on any package-defined pydantic model
+outside the base. There is deliberately no allowlist: a model that must not inherit the base
+(say one that sets extra="allow", whose legitimate extra-key updates model_copy would reject)
 fails here and forces that design discussion instead of slipping in undocumented.
+The rest cover __pydantic_init_subclass__, which requires each subclass's effective config to be
+extra="forbid" (pydantic merges model_config from bases, so a subclass of a model that sets it
+inherits it), and the construction-time rejection that setting buys.
 """
 
 import importlib
@@ -15,10 +18,12 @@ from collections.abc import Iterator
 from types import ModuleType
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 import langchaint
 from langchaint.checked_copy import CheckedCopyModel
+from langchaint.messages import Message
+from langchaint.usage import Usage
 
 
 def _package_modules() -> Iterator[ModuleType]:
@@ -52,6 +57,22 @@ def test_every_package_pydantic_model_inherits_checked_copy_model() -> None:
     assert offenders == []
 
 
+def test_a_subclass_defining_init_without_a_var_keyword_is_rejected() -> None:
+    """A model with its own __init__ must take **extra, for the reason given on UserMessage.__init__.
+
+    The hook checks this rather than a walk over the package's own models, because it fires at
+    class definition and so covers a subclass an application defines outside langchaint.
+    """
+    with pytest.raises(TypeError, match="custom_init"):
+
+        class PositionalModel(CheckedCopyModel):
+            model_config = ConfigDict(extra="forbid")
+            value: int
+
+            def __init__(self, value: int) -> None:
+                super().__init__(value=value)
+
+
 def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> None:
     """Under extra="allow" unknown update keys are meaningful, so the guard would reject legitimate copies.
 
@@ -61,3 +82,90 @@ def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> Non
 
         class ExtraAllowModel(CheckedCopyModel):
             model_config = ConfigDict(extra="allow")
+
+
+def test_a_subclass_leaving_extra_unset_is_rejected_at_class_definition() -> None:
+    """Omitting extra leaves pydantic's "ignore" default, under which construction drops unknown keys.
+
+    This is the other half of the rule, and the common way to break it: a new model that simply
+    does not think about extra reads as fine until a misspelled key goes missing at runtime.
+    """
+    with pytest.raises(TypeError, match="no extra"):
+
+        class DefaultExtraModel(CheckedCopyModel):
+            value: int
+
+
+def test_a_subclass_setting_extra_ignore_is_rejected_at_class_definition() -> None:
+    """Stating the "ignore" default explicitly is rejected the same way as omitting it.
+
+    The two reach the same pydantic behavior by different routes, so the message differs (it names
+    the value rather than the default) while the rejection does not.
+    """
+    with pytest.raises(TypeError, match="extra='ignore'"):
+
+        class ExtraIgnoreModel(CheckedCopyModel):
+            model_config = ConfigDict(extra="ignore")
+
+
+def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it() -> None:
+    """The hook reads the merged config, so a model built on another model needs no second line.
+
+    Reading only the class's own model_config would pass every other test here, since no langchaint
+    model subclasses another today, and would reject the first one that does.
+    """
+
+    class Base(CheckedCopyModel):
+        model_config = ConfigDict(extra="forbid")
+        value: int
+
+    class Child(Base):
+        other: int
+
+    with pytest.raises(ValidationError, match="junk"):
+        Child(value=1, other=2, junk=3)  # pyrefly: ignore[unexpected-keyword]
+
+
+def test_construction_rejects_a_key_that_is_not_a_field() -> None:
+    """The point of requiring extra="forbid": a misspelled field name raises instead of vanishing.
+
+    Usage stands in for the models pydantic constructs itself; the class-definition hook above is
+    what keeps the rest of them from regressing. The two with a positional __init__ take the other
+    path, pinned by the test below.
+    """
+    with pytest.raises(ValidationError, match="inpit_tokens_cache_read"):
+        Usage(
+            input_tokens_cache_read=0,
+            input_tokens_cache_write=0,
+            input_tokens_cache_none=1,
+            output_tokens=1,
+            output_tokens_reasoning=0,
+            cost_in_usd=0.0,
+            inpit_tokens_cache_read=1,  # pyrefly: ignore[unexpected-keyword]
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "key"),
+    [
+        ({"content": "x", "role": "user", "junk": 1}, "junk"),
+        ({"turn": [{"text": "a"}], "role": "assistant", "junk": 1}, "junk"),
+        ({"content": "x", "role": "user", "self": 1}, "self"),
+        ({"turn": [{"text": "a"}], "role": "assistant", "self": 1}, "self"),
+    ],
+)
+def test_a_model_with_a_positional_init_rejects_the_key_as_a_validation_error(
+    payload: dict[str, object], key: str
+) -> None:
+    """UserMessage and AssistantMessage refuse the key as ValidationError, like every sibling.
+
+    This is the reload path for a persisted conversation, so one exception type across the tree
+    is what lets an application catch every bad key with ValidationError and read its location.
+    Dropping the **extra parameter these two carry turns this into an unlocated TypeError.
+    A key named self is the case **extra alone does not cover: it collides with the receiver
+    during argument binding unless the receiver is positional-only.
+    """
+    adapter = TypeAdapter[Message](Message)
+    with pytest.raises(ValidationError, match=key) as caught:
+        adapter.validate_python(payload)
+    assert [error["loc"][-1] for error in caught.value.errors()] == [key]

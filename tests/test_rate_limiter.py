@@ -1,4 +1,4 @@
-"""RateLimiter admission driven directly, without any provider.
+"""RateLimiter admission driven directly, without any adapter.
 
 Each test drives acquire/release/register_success/register_transient_error by hand to pin the admission cycle:
 the hard pause, probe-only recovery, and the success that restores full admission.

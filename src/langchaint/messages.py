@@ -25,7 +25,7 @@ class TextPart(CheckedCopyModel):
     so a conversation that accrues one mark per turn keeps working as it grows.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     text: str
     cache_breakpoint: bool = False
@@ -37,7 +37,7 @@ class ImagePart(CheckedCopyModel):
     cache_breakpoint has the same meaning as on TextPart: the reusable prompt prefix ends at this part.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     data: bytes
     media_type: str
@@ -64,7 +64,7 @@ class ToolCall(CheckedCopyModel):
     so every provider yields the same shape.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
     name: str
@@ -78,21 +78,32 @@ class UserMessage(CheckedCopyModel):
     so a persisted conversation re-validates to the same message types by construction instead of by union member order.
 
     Raises:
-        pydantic.ValidationError: content is neither a str nor a sequence of Parts.
+        pydantic.ValidationError: content is neither a str nor a sequence of Parts,
+            or a key that is not a field was passed (see __init__).
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     content: str | tuple[Part, ...]
     role: Literal["user"] = "user"
 
-    def __init__(self, content: MessageContent, role: Literal["user"] = "user") -> None:
+    def __init__(
+        self, /, content: MessageContent, role: Literal["user"] = "user", **extra: object
+    ) -> None:
         """Accept content positionally, so a conversation reads UserMessage("Hello").
 
-        role stays a parameter because pydantic validation (model_validate, TypeAdapter)
-        routes through a custom __init__ and passes every field.
+        role stays a parameter because pydantic validation routes through a custom __init__ and
+        passes every field.
+        extra and the positional-only receiver carry a key that is not a field through to
+        extra="forbid", which reports it as a located ValidationError; without them argument
+        binding rejects it first, as a TypeError naming no location. The cost is that a misspelled
+        keyword here is caught at run time rather than by the type checker.
+
+        Raises:
+            pydantic.ValidationError: a key that is not a field was passed, or content is neither
+                a str nor a sequence of Parts.
         """
-        super().__init__(content=content, role=role)
+        super().__init__(content=content, role=role, **extra)
 
 
 class ReasoningTrace(CheckedCopyModel):
@@ -125,7 +136,7 @@ class ReasoningTrace(CheckedCopyModel):
     No adapter stores the empty string, so text-free is the single condition text is None.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     reasoning: Mapping[str, object]
     text: str | None = None
@@ -133,12 +144,11 @@ class ReasoningTrace(CheckedCopyModel):
 
 type TurnElement = ReasoningTrace | TextPart | ToolCall
 """One element of an assistant turn, ordered as the provider emitted them.
-ReasoningTrace and TextPart both carry a text field, so pydantic selects among the three by
-matching the most fields on re-validation of a persisted conversation:
+ReasoningTrace and TextPart both carry a text field, so what separates them on re-validation of a
+persisted conversation is the reasoning key:
 an element carrying reasoning is a ReasoningTrace and one carrying text alone is a TextPart.
-TextPart accepts the two-key form on its own, ignoring the extra key as every model here does,
-and loses the selection on fields matched rather than on validation failure,
-in either union member order.
+Every model here forbids extra keys, so that separation is total in either union member order:
+the two-key form fails TextPart outright, leaving ReasoningTrace the only member that accepts it.
 TextPart, not Part: assistant turns still return no images.
 """
 
@@ -163,14 +173,15 @@ class AssistantMessage(CheckedCopyModel):
     A bare string turn is one TextPart, for hand-written turns such as few-shot examples.
 
     Raises:
-        pydantic.ValidationError: turn is neither a str nor a sequence of TurnElements,
+        pydantic.ValidationError: a key that is not a field was passed (see __init__),
+            or turn is neither a str nor a sequence of TurnElements,
             or a TextPart in the turn sets cache_breakpoint
             (openai has no breakpoint on assistant replay text,
             so a marked assistant part would be a provider-divergent runtime failure;
             mark the following user or tool message instead).
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     turn: Annotated[tuple[TurnElement, ...], BeforeValidator(_text_only_turn)]
     role: Literal["assistant"] = "assistant"
@@ -193,14 +204,24 @@ class AssistantMessage(CheckedCopyModel):
         return self
 
     def __init__(
-        self, turn: str | Sequence[TurnElement], role: Literal["assistant"] = "assistant"
+        self,
+        /,
+        turn: str | Sequence[TurnElement],
+        role: Literal["assistant"] = "assistant",
+        **extra: object,
     ) -> None:
         """Accept turn positionally, so a conversation reads AssistantMessage("hey").
 
         role stays a parameter because pydantic validation (model_validate, TypeAdapter)
         routes through a custom __init__ and passes every field.
+        extra carries a key that is not a field through to extra="forbid", for the reason given
+        in full on UserMessage.__init__.
+
+        Raises:
+            pydantic.ValidationError: a key that is not a field was passed, or turn is neither a
+                str nor a sequence of TurnElements, or a TextPart in the turn sets cache_breakpoint.
         """
-        super().__init__(turn=turn, role=role)
+        super().__init__(turn=turn, role=role, **extra)
 
     @property
     def text(self) -> str:
@@ -220,7 +241,7 @@ class ToolMessage(CheckedCopyModel):
     is_error True tells the model the tool failed; content then holds the error text.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     tool_call_id: str
     content: str | tuple[Part, ...]

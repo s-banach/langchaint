@@ -33,7 +33,7 @@ class Usage(CheckedCopyModel):
     so a response over-reporting its cache counters would otherwise produce a silently negative remainder.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     input_tokens_cache_read: NonNegativeInt
     input_tokens_cache_write: NonNegativeInt

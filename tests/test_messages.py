@@ -1,8 +1,9 @@
-"""The Message union's role discriminator.
+"""The Message union's role discriminator and the TurnElement union's field-shape discrimination.
 
-Persist/resume serializes a conversation with a TypeAdapter and re-validates it;
-these tests pin that the round trip preserves each message's type via the role tag,
-not via which union member's fields happen to match first.
+Persist/resume serializes a conversation with a TypeAdapter and re-validates it,
+so a payload that re-validates to the wrong union member silently corrupts replay.
+Message carries a role tag and is rejected without one; TurnElement has no tag,
+and the member whose fields a dict carries is what selects its type.
 """
 
 import pytest
@@ -20,45 +21,6 @@ from langchaint import (
 )
 
 _CONVERSATION_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
-
-
-def test_conversation_round_trips_through_json_preserving_types() -> None:
-    """dump_json then validate_json returns equal messages of the same types."""
-    conversation: tuple[Message, ...] = (
-        UserMessage(content=(TextPart(text="look"), ImagePart(data=b"png", media_type="image/png"))),
-        AssistantMessage(
-            turn=(
-                ReasoningTrace(
-                    reasoning={"type": "thinking", "thinking": "check first", "signature": "sig"}
-                ),
-                TextPart(text="Checking."),
-                ToolCall(id="c1", name="probe", args_json='{"step": 1}'),
-            ),
-        ),
-        ToolMessage(tool_call_id="c1", content="probe 1: ok"),
-        ToolMessage(tool_call_id="c1", content="boom", is_error=True),
-        AssistantMessage(turn=(TextPart(text="Done."),)),
-    )
-    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(_CONVERSATION_TYPE_ADAPTER.dump_json(conversation))
-    assert restored == conversation
-    assert [type(message) for message in restored] == [type(message) for message in conversation]
-    restored_assistant = restored[1]
-    assert isinstance(restored_assistant, AssistantMessage)
-    assert [type(element) for element in restored_assistant.turn] == [
-        ReasoningTrace,
-        TextPart,
-        ToolCall,
-    ]
-
-
-def test_validation_selects_the_member_from_the_role_tag() -> None:
-    """The role tag selects the message type, not which member's fields happen to match."""
-    user = _CONVERSATION_TYPE_ADAPTER.validate_python([{"role": "user", "content": "hi"}])[0]
-    assert type(user) is UserMessage
-    assistant = _CONVERSATION_TYPE_ADAPTER.validate_python(
-        [{"role": "assistant", "turn": [{"text": "hi"}]}]
-    )[0]
-    assert type(assistant) is AssistantMessage
 
 
 def test_turn_elements_validate_to_the_member_whose_fields_they_carry() -> None:

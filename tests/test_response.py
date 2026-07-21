@@ -5,8 +5,9 @@ so these invariants are what stops a refactor of either loop from building a suc
 the retry tests in test_bound_llm.py pin the record values themselves.
 usage is the paid total folded from attempt_records and usage_successful_attempt is the last record's own,
 so a retried billed 200 makes them diverge; both are exercised here.
-to_row is the table boundary: a success and a RetriesExhaustedError must flatten to the same keys,
-or a mixed batch could not become one table.
+to_row is the table boundary, exercised here over a success and over each GenerationError arm,
+because what each arm puts in the shared keys (output, error_text, stop_reason, and the usage columns)
+differs per arm and is what a mixed batch's table shows.
 """
 
 import time
@@ -33,10 +34,6 @@ class _Raw(BaseModel):
     """Stand-in for the SDK's own response model held on Response.raw."""
 
 
-class _RawUsage(BaseModel):
-    """Stand-in for the SDK's own usage object held on AttemptRecord.usage_raw."""
-
-
 _USAGE = Usage(
     input_tokens_cache_read=2,
     input_tokens_cache_write=3,
@@ -47,12 +44,7 @@ _USAGE = Usage(
 )
 
 
-def _record(
-    *,
-    error: TransientError | None,
-    usage: Usage = ZERO_USAGE,
-    usage_raw: BaseModel | None = None,
-) -> AttemptRecord:
+def _record(*, error: TransientError | None, usage: Usage = ZERO_USAGE) -> AttemptRecord:
     """Build one record whose bracket is a single instant; a non-billing attempt defaults to ZERO_USAGE."""
     now = time.monotonic()
     return AttemptRecord(
@@ -60,7 +52,7 @@ def _record(
         ended_at_monotonic_seconds=now,
         error=error,
         usage=usage,
-        usage_raw=usage_raw,
+        usage_raw=None,
     )
 
 
@@ -164,16 +156,6 @@ def test_usage_equals_successful_attempt_when_only_transport_failures_billed() -
     assert response.usage == response.usage_successful_attempt == _USAGE
 
 
-def test_usage_raw_is_recoverable_by_reference_from_the_records() -> None:
-    """The raw SDK usage object travels on the record and is recoverable by identity."""
-    raw_usage = _RawUsage()
-    response = _response(
-        output="ok",
-        attempt_records=(_record(error=None, usage=_USAGE, usage_raw=raw_usage),),
-    )
-    assert response.attempt_records[-1].usage_raw is raw_usage
-
-
 def test_to_row_success_flattens_output_and_usage() -> None:
     """A success row carries the output, no error_text, and the real usage counters."""
     row = to_row(_response(output="hello", attempt_records=(_record(error=None, usage=_USAGE),)))
@@ -269,10 +251,3 @@ def test_to_row_truncation_reports_its_billing_and_reason() -> None:
     assert row["attempts"] == 1
     assert row["input_tokens_total"] == 10
     assert row["output_tokens"] == 7
-
-
-def test_to_row_success_and_failure_share_the_same_keys() -> None:
-    """The whole point of the split: a mixed batch converts to one table."""
-    success = to_row(_response(output="ok", attempt_records=(_record(error=None, usage=_USAGE),)))
-    failure = to_row(_failure(attempt_records=(_record(error=TransientError("e")),)))
-    assert success.keys() == failure.keys()

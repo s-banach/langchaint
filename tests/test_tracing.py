@@ -908,8 +908,12 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
     asyncio.run(scenario())
 
 
-def test_bind_output_types_are_mirrored() -> None:
-    """The overloads mirror LLM.bind: a model gives TracedBoundLLM[Model], absent gives [str]."""
+def _bind_overload_pin() -> None:
+    """Pin that the bind overloads mirror LLM.bind: a model gives TracedBoundLLM[Model], absent gives [str].
+
+    pyrefly type-checks this module, so a break in the overload split surfaces as a type error here.
+    Not a test: assert_type is a runtime no-op, so pytest could only ever report it as passing.
+    """
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
     structured = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(structured, TracedBoundLLM[_Answer])

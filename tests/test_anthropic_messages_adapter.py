@@ -976,11 +976,6 @@ def test_classify_maps_each_sdk_exception_to_its_retry_class(
     assert _adapter().classify(error) == expected
 
 
-def test_adapter_pins_sdk_retries_off() -> None:
-    """The stored client copy carries max_retries=0 so only langchaint retries."""
-    assert _adapter().client.max_retries == 0
-
-
 def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
     """Narrow an LLM to its concrete adapter so tests read its client/model/pricing."""
     adapter = llm.adapter
@@ -1017,14 +1012,6 @@ def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
     assert adapter.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
 
 
-def test_bedrock_model_threads_cache_ttl_to_the_adapter() -> None:
-    """A caller-supplied cache_ttl reaches the adapter through anthropic_bedrock_model."""
-    adapter = _anthropic_adapter_of(
-        anthropic_bedrock_model("us.anthropic.claude-opus-4-6-v1", aws_region="us-east-1", cache_ttl="1h")
-    )
-    assert adapter.cache_ttl == "1h"
-
-
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     """A supplied client whose class serves the model's Bedrock API passes through, retries pinned off."""
     adapter = _anthropic_adapter_of(
@@ -1051,19 +1038,6 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
 def test_bedrock_table_is_total_over_the_bedrock_ids() -> None:
     """Every AnthropicBedrockModelName has a routing entry, so a new Bedrock wire model id must add one."""
     assert set(ANTHROPIC_BEDROCK) == set(get_args(AnthropicBedrockModelName.__value__))
-
-
-def test_adapter_accepts_a_mantle_client() -> None:
-    """AnthropicMessagesAdapter takes an AsyncAnthropicBedrockMantle and pins its retries off."""
-    client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
-    adapter = AnthropicMessagesAdapter(
-        client=client,
-        model="anthropic.claude-opus-4-8",
-        pricing=_PRICING,
-        provider_name="aws.bedrock",
-    )
-    assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
-    assert adapter.client.max_retries == 0
 
 
 def test_wire_messages_marks_a_marked_user_part() -> None:

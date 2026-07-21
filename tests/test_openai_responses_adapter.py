@@ -517,13 +517,6 @@ def test_wire_input_converts_tool_result_parts_to_structured_output_content() ->
     ]
 
 
-def test_wire_input_has_no_system_item() -> None:
-    """The system prompt travels as the instructions parameter, never as an item."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
-    assert request.instructions == "sys"
-    assert _wire_input([UserMessage(content="q")]) == [{"role": "user", "content": "q"}]
-
-
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
     """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"

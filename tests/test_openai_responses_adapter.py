@@ -56,7 +56,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding
+from langchaint.adapter import Binding, ErrorClass
 from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.openai import OpenAIResponsesAdapter, ReasoningSummary, cost_breakdown
 from langchaint.openai.responses_adapter import (
@@ -1018,6 +1018,46 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
         is None
     )
     assert adapter.retry_after_seconds(ValueError("boom")) is None
+
+
+def _status_error[ErrorT: openai.APIStatusError](
+    error_class: type[ErrorT], status_code: int
+) -> ErrorT:
+    """Build one of the SDK's status exceptions around a constructed httpx response."""
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    return error_class("boom", response=response, body=None)
+
+
+def _connection_error() -> openai.APIConnectionError:
+    """Build the SDK's transport-failure exception, which carries a request and no response."""
+    return openai.APIConnectionError(
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses")
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_status_error(openai.RateLimitError, 429), "rate_limit"),
+        (_status_error(openai.InternalServerError, 500), "transient"),
+        (_connection_error(), "transient"),
+        (openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")), "transient"),
+        (_status_error(openai.BadRequestError, 400), "abort"),
+        (ValueError("boom"), "abort"),
+    ],
+)
+def test_classify_maps_each_sdk_exception_to_its_retry_class(
+    error: Exception, expected: ErrorClass
+) -> None:
+    """Each SDK exception lands on the retry class the adapter's classify docstring names.
+
+    Each status code is the one the SDK raises that class for, read from openai 2.45.0.
+    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
+    """
+    assert _adapter().classify(error) == expected
 
 
 def test_adapter_pins_sdk_retries_off() -> None:

@@ -45,7 +45,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding
+from langchaint.adapter import Binding, ErrorClass
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
@@ -932,6 +932,48 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
         is None
     )
     assert adapter.retry_after_seconds(ValueError("boom")) is None
+
+
+def _status_error[ErrorT: anthropic.APIStatusError](
+    error_class: type[ErrorT], status_code: int
+) -> ErrorT:
+    """Build one of the SDK's status exceptions around a constructed httpx response."""
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    return error_class("boom", response=response, body=None)
+
+
+def _connection_error() -> anthropic.APIConnectionError:
+    """Build the SDK's transport-failure exception, which carries a request and no response."""
+    return anthropic.APIConnectionError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_status_error(anthropic.RateLimitError, 429), "rate_limit"),
+        (_status_error(anthropic.OverloadedError, 529), "rate_limit"),
+        (_status_error(anthropic.InternalServerError, 500), "transient"),
+        (_connection_error(), "transient"),
+        (anthropic.APITimeoutError(httpx.Request("POST", "https://api.anthropic.com")), "transient"),
+        (_status_error(anthropic.BadRequestError, 400), "abort"),
+        (ValueError("boom"), "abort"),
+    ],
+)
+def test_classify_maps_each_sdk_exception_to_its_retry_class(
+    error: Exception, expected: ErrorClass
+) -> None:
+    """Each SDK exception lands on the retry class the adapter's classify docstring names.
+
+    Each status code is the one the SDK raises that class for, read from anthropic 0.116.0.
+    OverloadedError is anthropic's own overload signal and shares the rate_limit class with RateLimitError.
+    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
+    """
+    assert _adapter().classify(error) == expected
 
 
 def test_adapter_pins_sdk_retries_off() -> None:

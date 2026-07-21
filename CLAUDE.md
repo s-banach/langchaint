@@ -87,9 +87,11 @@ It runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the too
 
 # Commit Review
 
-After each commit lands, spawn the `commit-reviewer` agent (`.claude/agents/commit-reviewer.md`) with the commit sha as its prompt. Before that spawn, `scripts/CI.sh` reports zero errors and you have run the author's pre-commit pass ("Re-read before committing" in the global CLAUDE.md) to completion on every staged file. The reviewer is the second pass, which is what lets its rule 2 forbid re-running the checks. Scale the reviewer model with the commit's stakes: Opus for serious work, Sonnet only for the most trivial docstring changes.
+After each commit lands, spawn the `commit-reviewer` agent (`.claude/agents/commit-reviewer.md`) with the commit sha as its prompt. Before that spawn, `scripts/CI.sh` reports zero errors and you have run the author's pre-staging pass ("Before running `git add`" in the global CLAUDE.md) to completion on every staged file. The reviewer is the second pass, which is what lets its rule 2 forbid re-running the checks. Scale the reviewer model with the commit's stakes: Opus for serious work, Sonnet only for the most trivial docstring changes.
 
-Done gate: count a commit as Done only after its review has returned, confirmed issues are fixed, and every objection is resolved: adopted by editing what its premise challenges, or rejected by recording the alternative and reason per the placement rule in Docstrings and comments. Deferring an objection is not resolving it. Keep one feature one commit: amend fixes into the reviewed commit and re-review it; the resolution edit rides in the same amend, and there is no separate open-items file. Never hand off or build on a not-Done commit; the loop's own amend-and-force-push is how a commit reaches Done, not a violation.
+Done gate: count a commit as Done only after its review has returned, confirmed issues are fixed, and every objection is resolved: adopted by editing what its premise challenges, or rejected by recording the alternative and reason per the placement rule in Docstrings and comments. Deferring an objection is not resolving it. There is no separate open-items file.
+
+Fix a review's findings in a new commit and review that one too; never amend a reviewed commit, because a review names a sha and an amend moves the code out from under the review that passed. A fix commit that changes no behavior and no prose closes without review, so whitespace and a private rename with no callers do not start another round. Squash the chain into one commit before pushing, so one feature reaches the remote as one commit and the review chain stays local. Never build on a not-Done commit.
 
 # Code smells
 

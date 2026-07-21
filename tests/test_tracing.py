@@ -562,8 +562,11 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_never_iterated_emits_no_span() -> None:
-    """A handle constructed and abandoned without iterating or calling final() emits no span."""
+def test_stream_entered_but_never_iterated_emits_a_span() -> None:
+    """Entering opens a request, so an entered handle emits a span even with no item pulled.
+
+    The request is billed whether or not the caller reads it; a silent span would hide it.
+    """
 
     async def scenario() -> None:
         """Enter and leave the context without driving the stream."""
@@ -571,6 +574,71 @@ def test_stream_never_iterated_emits_no_span() -> None:
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
             pass
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.UNSET
+        assert span.attributes is not None
+        assert "gen_ai.response.time_to_first_chunk" not in span.attributes
+
+    asyncio.run(scenario())
+
+
+def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Iterating after the block raises from the inner handle without writing to the closed span.
+
+    Recording that RuntimeError on the ended span would make the OTel SDK log a warning of its own,
+    so langchaint's instrumentation would be the source of noise for an ordinary caller mistake.
+    """
+
+    async def scenario() -> None:
+        """Drain a stream, leave the block, then pull one more item."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        async with handle:
+            _ = [item async for item in handle]
+            await handle.final()
+        with (
+            caplog.at_level(logging.WARNING, logger="opentelemetry.sdk.trace"),
+            pytest.raises(RuntimeError, match="finished"),
+        ):
+            await anext(handle)
+        assert "ended span" not in caplog.text
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.OK
+
+    asyncio.run(scenario())
+
+
+def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
+    """Re-entering a traced handle raises without marking the completed stream's span failed."""
+
+    async def scenario() -> None:
+        """Drain a stream, leave the block, then enter the same handle again."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        async with handle:
+            _ = [item async for item in handle]
+            await handle.final()
+        with pytest.raises(RuntimeError, match="already entered"):
+            async with handle:
+                pass
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.OK
+
+    asyncio.run(scenario())
+
+
+def test_stream_never_entered_emits_no_span() -> None:
+    """stream_one does no I/O, so a handle abandoned without entering emits no span."""
+
+    async def scenario() -> None:
+        """Build a handle and drop it."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        _handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
         assert exporter.get_finished_spans() == ()
 
     asyncio.run(scenario())
@@ -1949,17 +2017,16 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
     asyncio.run(scenario())
 
 
-def test_unserializable_content_leaves_a_bare_iterator_stream_and_its_span_intact(
+def test_unserializable_content_leaves_the_stream_and_its_span_intact(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The stream path holds the same guarantee generate_one does, at _ensure_span.
+    """The stream path holds the same guarantee generate_one does, at _start_span.
 
-    _ensure_span is the one site on this path a reachable value can fail at.
+    _start_span is the one site on this path a reachable value can fail at.
     An unserializable args_schema reaches json.dumps only through _input_content_attributes;
     every field final()'s output build serializes is typed str.
-    Driven as a bare async iterator rather than with async with, so nothing outside the handle would end
-    the span: an unguarded raise out of _ensure_span both kills the stream and orphans the span,
-    since __anext__ and final() both call it outside their own try.
+    _start_span runs in __aenter__ outside its own try, so an unguarded raise there would both
+    kill the stream before it opens and orphan the span.
     """
 
     async def scenario() -> None:
@@ -1971,9 +2038,9 @@ def test_unserializable_content_leaves_a_bare_iterator_stream_and_its_span_intac
             automatic_prompt_caching=True,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            stream = bound.stream_one("hi")
-            _ = [item async for item in stream]
-            response = await stream.final()
+            async with bound.stream_one("hi") as stream:
+                _ = [item async for item in stream]
+                response = await stream.final()
         assert response.output == "ab"
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
@@ -1986,7 +2053,7 @@ def test_unserializable_content_leaves_a_bare_iterator_stream_and_its_span_intac
 
 
 def test_the_stream_span_captures_input_at_start_and_output_at_final() -> None:
-    """A traced stream records the input attributes when its lazy span starts and the turn at final()."""
+    """A traced stream records the input attributes when its span starts and the turn at final()."""
 
     async def scenario() -> None:
         """Drive a stream to completion under capture and read both sides back."""

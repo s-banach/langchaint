@@ -85,7 +85,8 @@ The anthropic adapter takes `cache_ttl` (`"5m"` default, `"1h"` at 2x write cost
 The wire mechanics, including the anthropic 4-marker budget, are in the two adapter module docstrings.
 
 **Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async iterator of `StreamItem = str | ToolCall`, an idempotent `await handle.final()` returning the assembled `Response`, and an async context manager so abandoning a stream closes the connection.
+`stream_one` returns a `StreamHandle`: an async iterator of `StreamItem = str | ToolCall`, an idempotent `await handle.final()` returning the assembled `Response`, and an async context manager whose entry opens the request and whose exit closes it.
+A handle is unusable outside its `async with` block, so nothing after the block can start another request.
 Text chunks are the SDK's own strings passed through without a wrapper, and each `ToolCall` is yielded once, complete, when its block closes.
 
 **Three tool forms under one protocol.**

@@ -2,7 +2,8 @@
 
 A StreamHandle is three things at once: an async iterator of stream items (text chunks and completed tool calls),
 the source of the assembled Response via final(),
-and an async context manager so an abandoned stream closes its connection deterministically.
+and an async context manager whose entry opens the request and whose exit closes it.
+A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
 Assembly and structured-output parsing live in the SDK behind AdapterStream.final();
 the handle owns retry, pacing, and accounting.
 Connection failures before the first yielded item are retried under the RateLimiter;
@@ -16,6 +17,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
+from typing import Literal
 
 from langchaint.adapter import Adapter, AdapterStream, BoundAdapter, StreamItem
 from langchaint.exceptions import (
@@ -31,14 +33,18 @@ from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, RateLimiter
 from langchaint.response import Response
 
+type _State = Literal["unopened", "open", "finished"]
+
+_UNOPENED_MESSAGE = "stream not open: enter the handle with `async with` before using it"
+_FINISHED_MESSAGE = "stream is finished: call stream_one again for a new one"
+_ALREADY_ENTERED_MESSAGE = "stream already entered: call stream_one again for a new one"
+
 
 class StreamHandle[OutputT]:
     """One stream: an item iterator, a Response source, a context manager.
 
-    Iterate for items as they arrive; await final() at any point to drain silently and get the assembled Response;
-    use async with so leaving the block closes the connection.
-    Nothing starts until the first item is requested;
-    a RateLimiter slot is acquired then, held while the stream is open, and reacquired before each pre-first-item retry.
+    Iterate for items as they arrive; await final() at any point in the block to drain silently and get the Response.
+    The request opens on entry, so open failures surface there rather than at the first item.
     A transient failure after the first yielded item propagates as TransientError; retry by calling stream_one again.
     """
 
@@ -64,9 +70,31 @@ class StreamHandle[OutputT]:
         self._started_at_monotonic_seconds: float | None = None
         self._ended_at_monotonic_seconds: float | None = None
         self._response: Response[OutputT] | None = None
+        self._state: _State = "unopened"
 
     async def __aenter__(self) -> "StreamHandle[OutputT]":
-        """Return self; opening is deferred until the first item."""
+        """Open the request and return self.
+
+        Raises:
+            AbortBatchError: the adapter classified the open failure as abort.
+            GenerationError: the adapter raised one of its leaves while opening.
+            RetriesExhaustedError: the opens spent the retry budget.
+            RuntimeError: this handle was already entered; build a new one with stream_one.
+        """
+        if self._state != "unopened":
+            raise RuntimeError(_ALREADY_ENTERED_MESSAGE)
+        self._state = "open"
+        try:
+            await self._open_stream_with_retries()
+        except BaseException:
+            # __aexit__ does not run when __aenter__ raises, so finish and release here.
+            # _open_stream_with_retries returns the slot on every Exception path but not on a
+            # CancelledError, which is a BaseException: cancelling a suspended open would otherwise
+            # strand this admission for the process's life, and a stranded probe freezes the whole
+            # limiter's recovery, not just one slot.
+            self._state = "finished"
+            self._release_slot()
+            raise
         return self
 
     async def __aexit__(
@@ -75,7 +103,8 @@ class StreamHandle[OutputT]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the underlying connection if one is open."""
+        """Close the underlying connection and finish the handle."""
+        self._state = "finished"
         await self._close_adapter_stream()
 
     def _release_slot(self) -> None:
@@ -164,19 +193,20 @@ class StreamHandle[OutputT]:
         """Return self; the handle is its own iterator."""
         return self
 
-    async def _ensure_stream_open(self) -> None:
-        """Open the adapter stream if none is held, retrying pre-first-item failures under the limiter.
+    async def _open_stream_with_retries(self) -> None:
+        """Open one adapter stream, retrying transient failures under the limiter.
 
-        A fresh admission is acquired for each open attempt and released before the backoff sleep,
+        A fresh admission is acquired for each attempt and released before the backoff sleep,
         so a waiting task never holds capacity while this one backs off.
-        A non-retriable open failure (an AbortBatchError,
-        or an abort classification) propagates and pre-first-item transient exhaustion raises RetriesExhaustedError,
-        both through the shared helpers, as when the open ran inline in __anext__.
-        A successful open registers the admission with the limiter:
-        the open is a completed request that already cleared the quota,
-        so it ends any recovery this handle's probe was serving,
+        A successful open registers the admission with the limiter,
+        ending any recovery this handle's probe was serving,
         so a stream slow to first token cannot stall the shared account's admission.
         The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
+
+        Raises:
+            AbortBatchError: the adapter classified the failure as abort.
+            GenerationError: the adapter raised one of its leaves directly.
+            RetriesExhaustedError: the attempts spent the retry budget.
         """
         while self._adapter_stream is None:
             self._admission = await self._rate_limiter.acquire()
@@ -199,20 +229,34 @@ class StreamHandle[OutputT]:
             self._rate_limiter.register_success(self._admission)
 
     async def __anext__(self) -> StreamItem:
-        """Return the next item, opening the stream on demand.
+        """Return the next item.
 
-        Attempt errors propagate as AbortBatchError when the adapter classifies them so,
-        and pre-first-item transient exhaustion raises RetriesExhaustedError (both from the shared helpers).
+        Every error but StopAsyncIteration finishes the handle, so nothing later reopens the request.
 
         Raises:
             TransientError: the stream failed after items were yielded.
-            AbortBatchError: the adapter classified an open or item error as abort.
-            RetriesExhaustedError: a pre-first-item failure spent the retry budget while opening the stream.
+            AbortBatchError: the adapter classified an item or reopen error as abort.
+            RetriesExhaustedError: a pre-first-item failure spent the retry budget.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
             StopAsyncIteration: the stream is exhausted.
+            RuntimeError: the handle is unopened or finished.
+        """
+        if self._state != "open":
+            raise RuntimeError(_UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE)
+        try:
+            return await self._next_item()
+        except StopAsyncIteration:
+            raise
+        except BaseException:
+            self._state = "finished"
+            raise
+
+    async def _next_item(self) -> StreamItem:
+        """Pull the next item, reopening for a transient failure that precedes the first item.
+
+        Raises what __anext__ documents.
         """
         while True:
-            await self._ensure_stream_open()
             assert self._items is not None
             try:
                 item = await self._items.__anext__()
@@ -237,12 +281,13 @@ class StreamHandle[OutputT]:
                 delay_seconds = self._record_transient_error(exc)
                 await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, delay_seconds)
+                await self._open_stream_with_retries()
                 continue
             except BaseException:
                 # CancelledError is a BaseException the clauses above do not catch.
-                # A cancellation while iterating outside `async with` would otherwise strand this slot,
-                # and because a stranded probe leaves _probe_admission set it freezes the whole limiter's recovery,
-                # not just one slot. Return the slot, then let the cancellation propagate.
+                # Cancelling an item pull in its own task leaves the block open, so waiting for __aexit__
+                # would strand this slot, and because a stranded probe leaves _probe_admission set it freezes
+                # the whole limiter's recovery, not just one slot. Return the slot, then let it propagate.
                 self._release_slot()
                 raise
             self._yielded_any = True
@@ -258,20 +303,22 @@ class StreamHandle[OutputT]:
         the enriched leaf carries the attempt records this handle built.
 
         Raises:
-            StreamProtocolError: the stream ended without a terminal response.
-            AbortBatchError: draining the stream hit an open or item error the adapter classified as abort.
+            StreamProtocolError: the provider's event stream ended without a terminal event.
+            AbortBatchError: draining the stream hit an item or reopen error the adapter classified as abort.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
             RefusalError: the structured parse found a refusal; enriched with this handle's attempt records.
             MaxCompletionTokensExceededError: the structured response hit the token cap; enriched likewise.
             TransientError: the structured parse produced no instance for another reason; not retried,
                 because the stream already yielded items to the caller.
+            RuntimeError: the handle is unopened or finished.
         """
         if self._response is not None:
             return self._response
+        if self._state != "open":
+            raise RuntimeError(_UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE)
         async for _ in self:
             pass
-        if self._adapter_stream is None:
-            raise StreamProtocolError("stream ended without producing a result")
+        assert self._adapter_stream is not None
         assert self._attempt_started_at_monotonic_seconds is not None
         assert self._started_at_monotonic_seconds is not None
         ended_at_monotonic_seconds = time.monotonic() if self._ended_at_monotonic_seconds is None else self._ended_at_monotonic_seconds

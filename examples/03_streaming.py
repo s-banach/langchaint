@@ -1,11 +1,11 @@
 """Streaming: a handle that is an item iterator, a Response source, and a context manager.
 
-stream_one returns a StreamHandle without doing any I/O.
+stream_one returns a StreamHandle without doing any I/O; entering it with async with opens the request.
 Iterating yields StreamItem = str | ToolCall and nothing else: text chunks are the SDK's own strings passed through,
 and each ToolCall is yielded once, complete, when its block closes (there are no partial-argument delta items).
 await handle.final() drains the rest silently and returns the assembled Response,
 where usage, cost, and stop_reason live.
-Use async with so an abandoned stream closes its connection.
+The handle is unusable outside its async with block, which closes the connection and bounds the requests it can send.
 
 The LangChain call-for-call map (stream, astream, astream_events) lives in MIGRATING_FROM_LANGCHAIN.md.
 """
@@ -21,7 +21,7 @@ from langchaint.openai import openai_model
 async def stream_text() -> None:
     """Print text as it arrives, then read usage off the final Response.
 
-    Nothing starts until the first item is requested; the async with block guarantees the connection closes.
+    The request opens at the async with, which also guarantees the connection closes.
     """
     bound = openai_model("gpt-5.6-terra").bind(
         system_prompt="Answer in a short paragraph.",

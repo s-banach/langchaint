@@ -549,10 +549,10 @@ class BoundLLM[OutputT]:
             raise
 
     def stream_one(self, conversation: str | Sequence[Message]) -> StreamHandle[OutputT]:
-        """Build the stream handle; no I/O happens yet.
+        """Build the stream handle; entering it with `async with` opens the request.
 
         A bare str is shorthand for a conversation of one UserMessage holding that text.
-        Sync because nothing suspends until the handle is first iterated or drained;
+        Sync because nothing suspends until the handle is entered;
         see StreamHandle for the retry and close contracts.
         """
         return StreamHandle(

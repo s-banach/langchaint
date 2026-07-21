@@ -187,6 +187,34 @@ class _ProtocolErrorStream(_FakeStream):
         yield "unreachable"
 
 
+class _FailsBeforeFirstItemStream(_FakeStream):
+    """A stream whose first items() call fails transiently before yielding, then behaves normally.
+
+    One instance is reused across reopens, so the counter records which items() call is running.
+    """
+
+    def __init__(self) -> None:
+        """Start with no items() call made."""
+        super().__init__()
+        self.items_calls = 0
+
+    @override
+    async def items(self) -> AsyncIterator[StreamItem]:
+        """Fail before the first yield on the first call, else yield the base sequence.
+
+        Yields:
+            Nothing on the first call; the base class's items on every later call.
+
+        Raises:
+            TransientError: on the first call, before the first yield.
+        """
+        self.items_calls += 1
+        if self.items_calls == 1:
+            raise TransientError("dropped before the first item")
+        async for item in super().items():
+            yield item
+
+
 class _HangingStream(_FakeStream):
     """A stream whose items() opens then suspends forever, to be cancelled mid-iteration."""
 
@@ -212,19 +240,24 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         echo: bool = False,
         stream: _FakeStream | None = None,
         send_seconds: float = 0.0,
+        hang_from_open: int | None = None,
     ) -> None:
         """Store the failure scripts, echo mode, and the stream open_stream returns.
 
         failures scripts send; open_failures scripts open_stream, exercising the pre-first-item stream retry path.
         send_seconds > 0 makes each send suspend that long,
         so a batch overlaps and peak_in_flight records the concurrency it reached.
+        hang_from_open is the 1-based open_stream call from which every open suspends forever,
+        so a cancellation lands on the open itself rather than on a later item pull.
         """
         self._failures = list(failures)
         self._open_failures = list(open_failures)
         self._echo = echo
         self._send_seconds = send_seconds
+        self._hang_from_open = hang_from_open
         self.stream = stream if stream is not None else _FakeStream()
         self.send_count = 0
+        self.open_count = 0
         self.in_flight = 0
         self.peak_in_flight = 0
 
@@ -251,7 +284,10 @@ class _FakeBoundAdapter(BoundAdapter[str]):
 
     @override
     async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
-        """Raise the next scripted open failure, else return the stored fake stream."""
+        """Count the attempt, suspend or raise the next scripted open failure, else return the stored fake stream."""
+        self.open_count += 1
+        if self._hang_from_open is not None and self.open_count >= self._hang_from_open:
+            await asyncio.Event().wait()
         if self._open_failures:
             raise self._open_failures.pop(0)
         return self.stream
@@ -287,6 +323,7 @@ class _FakeAdapter(Adapter):
         stream: _FakeStream | None = None,
         classify_result: ErrorClass = "abort",
         send_seconds: float = 0.0,
+        hang_from_open: int | None = None,
     ) -> None:
         """Store how each freshly bound adapter behaves and the classify verdict."""
         # This adapter reaches no SDK, so it passes client=None, which matches no entry in the
@@ -300,6 +337,7 @@ class _FakeAdapter(Adapter):
         self._stream = stream
         self._classify_result = classify_result
         self._send_seconds = send_seconds
+        self._hang_from_open = hang_from_open
         self.bound_adapters: list[_FakeBoundAdapter] = []
         self.structured_bind_count = 0
 
@@ -312,6 +350,7 @@ class _FakeAdapter(Adapter):
             echo=self._echo,
             stream=self._stream,
             send_seconds=self._send_seconds,
+            hang_from_open=self._hang_from_open,
         )
         self.bound_adapters.append(bound)
         return bound
@@ -830,24 +869,130 @@ def test_stream_one_accepts_a_bare_str() -> None:
 
 
 def test_stream_cancelled_mid_iteration_releases_the_slot() -> None:
-    """A StreamHandle iterated without async with and cancelled mid-item returns its slot."""
+    """A cancelled item pull returns its slot without waiting for the block to exit."""
 
     async def scenario() -> None:
-        """Open a hanging stream, cancel the suspended item pull, then prove the slot is free."""
+        """Cancel a suspended item pull inside the block, then prove the slot is free."""
         adapter = _FakeAdapter(stream=_HangingStream())
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        handle = bound_llm.stream_one([UserMessage(content="hi")])
-        consumer = asyncio.create_task(anext(handle))
-        await asyncio.sleep(0.01)
-        consumer.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await consumer
-        # The one in-flight slot must be free again; a slot leaked by the cancellation would block this.
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            consumer = asyncio.create_task(anext(handle))
+            await asyncio.sleep(0.01)
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            # Still inside the block, so only the cancellation can have freed the one in-flight slot.
+            admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
+            rate_limiter.release(admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
+    """A cancellation while the open is in flight returns its slot.
+
+    __aexit__ never runs when __aenter__ raises, so only __aenter__ itself can free the admission here.
+    """
+
+    async def scenario() -> None:
+        """Time out an entry whose open_stream never returns, then prove the slot is free."""
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        bound_llm = LLM(_FakeAdapter(hang_from_open=1), rate_limiter=rate_limiter).bind(
+            automatic_prompt_caching=True
+        )
+
+        async def enter_and_leave() -> None:
+            """Enter the handle whose open never returns; the wait_for below cancels this."""
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(enter_and_leave(), timeout=0.02)
         admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
         rate_limiter.release(admission)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
+    """A cancellation while the pre-first-item retry is reopening returns its slot.
+
+    The reopen runs inside __anext__'s transient-failure handler, which no sibling except clause covers,
+    so the release here is __aexit__'s: the block is still open, unlike a cancellation inside __aenter__.
+    """
+
+    async def scenario() -> None:
+        """Time out an iteration whose second open never returns, then prove the slot is free."""
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream(), hang_from_open=2)
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+
+        async def drain() -> None:
+            """Enter and iterate; the first items() fails, so the retry reopens into the hang."""
+            async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+                async for _item in handle:
+                    pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(drain(), timeout=0.05)
+        admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
+        rate_limiter.release(admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_sends_one_request_when_final_follows_the_block() -> None:
+    """final() after the block raises instead of opening a second billed request."""
+
+    async def scenario() -> None:
+        """Drain a stream inside the block, then call final() after it."""
+        adapter = _FakeAdapter()
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
+        handle = bound_llm.stream_one([UserMessage(content="hi")])
+        async with handle:
+            async for _item in handle:
+                pass
+        with pytest.raises(RuntimeError, match="finished"):
+            await handle.final()
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_stream_unentered_handle_refuses_to_open() -> None:
+    """Iterating or draining a handle that was never entered raises rather than opening a request."""
+
+    async def scenario() -> None:
+        """Use a handle straight from stream_one, without async with."""
+        adapter = _FakeAdapter()
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
+        handle = bound_llm.stream_one([UserMessage(content="hi")])
+        with pytest.raises(RuntimeError, match="async with"):
+            await anext(handle)
+        with pytest.raises(RuntimeError, match="async with"):
+            await handle.final()
+        assert adapter.bound_adapters[0].open_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_stream_handle_refuses_a_second_entry() -> None:
+    """Re-entering a spent handle raises rather than opening a second request."""
+
+    async def scenario() -> None:
+        """Enter, leave, then enter the same handle again."""
+        adapter = _FakeAdapter()
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
+        handle = bound_llm.stream_one([UserMessage(content="hi")])
+        async with handle:
+            pass
+        with pytest.raises(RuntimeError, match="already entered"):
+            async with handle:
+                pass
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
 
 
 def test_stream_passes_items_through_and_assembles_final() -> None:
@@ -918,6 +1063,44 @@ def test_stream_retry_populates_attempt_records() -> None:
             <= succeeded.started_at_monotonic_seconds
             <= succeeded.ended_at_monotonic_seconds
         )
+
+    asyncio.run(scenario())
+
+
+def test_stream_open_raising_a_generation_leaf_propagates_it_from_the_entry() -> None:
+    """A GenerationError leaf raised by open_stream reaches the caller from the async with, unretried."""
+
+    async def scenario() -> None:
+        """Enter a handle whose open_stream raises a refusal leaf."""
+        leaf = RefusalError.for_rejected_200(
+            usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
+        )
+        adapter = _FakeAdapter(open_failures=[leaf])
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
+        with pytest.raises(RefusalError):
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_stream_item_failure_before_the_first_item_reopens_and_retries() -> None:
+    """A transient failure from items() before any item reopens the stream and records both attempts."""
+
+    async def scenario() -> None:
+        """Drain a stream whose first items() call fails before yielding."""
+        adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            collected_items = [item async for item in handle]
+            response = await handle.final()
+        assert collected_items == ["a", "b", _FAKE_TOOL_CALL]
+        assert adapter.bound_adapters[0].open_count == 2
+        assert response.attempts == 2
+        failed, succeeded = response.attempt_records
+        assert str(failed.error) == "dropped before the first item"
+        assert succeeded.error is None
 
     asyncio.run(scenario())
 
@@ -1070,16 +1253,16 @@ def test_stream_protocol_error_releases_the_slot() -> None:
     """A StreamProtocolError from items() returns the slot and closes the stream."""
 
     async def scenario() -> None:
-        """Drive final() into the protocol error without a context manager."""
+        """Drive final() into the protocol error, then acquire the slot inside the still-open block."""
         stream = _ProtocolErrorStream()
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        handle = bound_llm.stream_one([UserMessage(content="hi")])
-        with pytest.raises(StreamProtocolError):
-            await handle.final()
-        assert stream.closed is True
-        async with rate_limiter.slot():
-            pass
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(StreamProtocolError):
+                await handle.final()
+            assert stream.closed is True
+            async with rate_limiter.slot():
+                pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -1143,8 +1326,8 @@ def test_stream_open_rate_limit_registers_and_recovery_ends_at_open() -> None:
         rate_limiter = _fast_rate_limiter()
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            await handle._ensure_stream_open()
-            # No item has been pulled yet; the open alone must have ended recovery.
+            # Entering opened the stream and no item has been pulled yet,
+            # so the open alone must have ended recovery.
             assert handle._yielded_any is False
             # Admission fully reopened only if two concurrent acquires are both admitted;
             # probe-only recovery admits one, so a register_success not fired at open fails here.

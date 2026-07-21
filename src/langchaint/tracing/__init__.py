@@ -36,7 +36,8 @@ langchaint.* is the prefix for the attributes the GenAI convention defines no co
 which is exactly langchaint.attempts, langchaint.cost_in_usd, and langchaint.batch_item_count.
 The langchaint.attempt_failed span event carries error_text and elapsed_seconds per failed attempt.
 
-The wrapper owns the span lifecycle (lazy start, exactly-once end, error status on every exception path)
+The wrapper owns the span lifecycle
+(start at the traced operation, exactly-once end, error status on every exception path)
 and never fakes an event boundary a span is supposed to measure:
 TracedStreamHandle iterates so it can record gen_ai.response.time_to_first_chunk
 and close the span on a failing or abandoned stream, rather than delegating the iteration it needs to witness.
@@ -922,10 +923,10 @@ class TracedBoundLLM[OutputT]:
     def stream_one(self, conversation: str | Sequence[Message]) -> "TracedStreamHandle[OutputT]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
 
-        The span opens lazily at the first item or at final(), matching StreamHandle's own contract that
-        nothing starts until the stream is first driven.
+        The span opens when the handle is entered, matching StreamHandle's own contract that
+        the request opens there.
         The binding and the conversation are passed down rather than rendered here:
-        the handle needs them to build its input attributes when its lazy span starts,
+        the handle needs them to build its input attributes when the span starts,
         and rendering them here would serialize the conversation unconditionally, including for the
         non-recording spans an application with no configured TracerProvider gets.
         The cost is that the handle holds the conversation for the stream's whole life.
@@ -945,10 +946,10 @@ class TracedStreamHandle[OutputT]:
     Items pass through by reference;
     nothing is rewrapped (the no-rewrap rule bans copying data into same-shape containers;
     observing an iterator is unaffected).
-    The span opens lazily at the first __anext__ or at final(),
+    The span opens at __aenter__, where the request opens,
     records gen_ai.response.time_to_first_chunk at the first item,
     takes error status on a failing or abandoned stream, and ends exactly once.
-    Under capture_message_content the input content attributes are set when that lazy span starts,
+    Under capture_message_content the input content attributes are set when the span starts,
     and gen_ai.output.messages when final() returns a Response.
     """
 
@@ -977,23 +978,24 @@ class TracedStreamHandle[OutputT]:
         self._span_ended = False
         self._first_item_seen = False
 
-    def _ensure_span(self) -> Span:
-        """Start the span on first use, recording its start time for gen_ai.response.time_to_first_chunk.
+    def _start_span(self) -> Span:
+        """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
 
+        Called by __aenter__ alone, which refuses a second entry, so this runs at most once per handle.
         The input content attributes are built here rather than in stream_one: stream_one opens no span and
         does no I/O by contract, so rendering there would serialize the conversation even for the
         non-recording spans an unconfigured application gets, which _apply_content_attributes skips.
         """
-        if self._span is None:
-            self._span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
-            _apply_extra_attributes(self._span, self._span_config.extra_attributes)
-            _apply_operation_name(self._span, _CHAT_OPERATION)
-            if self._span_config.capture_message_content:
-                _apply_content_attributes(
-                    self._span, lambda: _input_content_attributes(self._binding, self._conversation)
-                )
-            self._span_started_at_monotonic_seconds = time.monotonic()
-        return self._span
+        span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
+        self._span = span
+        _apply_extra_attributes(span, self._span_config.extra_attributes)
+        _apply_operation_name(span, _CHAT_OPERATION)
+        if self._span_config.capture_message_content:
+            _apply_content_attributes(
+                span, lambda: _input_content_attributes(self._binding, self._conversation)
+            )
+        self._span_started_at_monotonic_seconds = time.monotonic()
+        return span
 
     def _end_span(self) -> None:
         """End the span if one is open and it has not already ended; ends at most once."""
@@ -1004,11 +1006,10 @@ class TracedStreamHandle[OutputT]:
     def _mark_first_item(self, span: Span) -> None:
         """Record the gen_ai.response.time_to_first_chunk attribute on the first item's arrival, once.
 
-        The value is the monotonic seconds from the span's start (the first __anext__,
-        which is when the underlying request begins) to the first item.
+        The value is the monotonic seconds from the span's start (__aenter__) to the first item.
         The convention defines this key as measured from request issuance;
-        the span starts one step earlier, at the first __anext__, so the value here also covers the
-        RateLimiter slot wait and any backoff before the request went out.
+        the span starts one step earlier, so the value here also covers the RateLimiter slot wait
+        and any backoff before the request went out.
         That is the interval a caller waited for its first chunk, and the wider origin is stated
         so a reader comparing this against another instrumentation's value knows which way it leans.
         Set only when a first item passes through this iterator,
@@ -1028,7 +1029,7 @@ class TracedStreamHandle[OutputT]:
         return self
 
     async def __anext__(self) -> StreamItem:
-        """Delegate to the inner handle, opening the span lazily and observing the first item and failures.
+        """Delegate to the inner handle, observing the first item and any failure.
 
         StopAsyncIteration passes through without ending the span,
         so a following final() can still set attributes and end it.
@@ -1039,7 +1040,11 @@ class TracedStreamHandle[OutputT]:
             Exception: the inner stream raised (a transient failure after items, an abort, a protocol violation);
                 the span records it, takes error status, and ends before the re-raise.
         """
-        span = self._ensure_span()
+        if self._span is None or self._span_ended:
+            # Never entered, or the span already closed: the inner handle raises, and recording that
+            # raise on an ended span only makes the OTel SDK log "Tried calling ... on an ended span".
+            return await self._stream_handle.__anext__()
+        span = self._span
         try:
             item = await self._stream_handle.__anext__()
         except StopAsyncIteration:
@@ -1055,8 +1060,28 @@ class TracedStreamHandle[OutputT]:
         return item
 
     async def __aenter__(self) -> "TracedStreamHandle[OutputT]":
-        """Enter the inner handle's context and return self; opening is still deferred."""
-        await self._stream_handle.__aenter__()
+        """Start the span, then open the inner handle's request.
+
+        The span starts first so a failing open is recorded on it rather than escaping untraced.
+        __aexit__ does not run when __aenter__ raises, so the span is ended here on that path.
+        A second entry is refused before the span is touched, so it cannot mark the first stream's span failed.
+
+        Raises:
+            RuntimeError: this handle was already entered; build a new one with stream_one.
+            Exception: the inner handle failed to open; the span records it, takes error status, and ends.
+        """
+        if self._span is not None:
+            raise RuntimeError("stream already entered: call stream_one again for a new one")
+        span = self._start_span()
+        try:
+            await self._stream_handle.__aenter__()
+        except Exception as exc:
+            _record_other_exception(span, exc)
+            self._end_span()
+            raise
+        except BaseException:
+            self._end_span()
+            raise
         return self
 
     async def __aexit__(
@@ -1067,7 +1092,6 @@ class TracedStreamHandle[OutputT]:
     ) -> None:
         """Close the inner handle, then end the span if it is still open.
 
-        A never-started span (constructed and abandoned without iterating or calling final()) ends nothing.
         A span already ended by a mid-iteration failure or by final() is left alone.
         An open span abandoned with an in-flight exception (a consuming loop body that raised) records that exception
         and takes error status before ending.
@@ -1094,11 +1118,13 @@ class TracedStreamHandle[OutputT]:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
                 on the structured path, or retries exhausted while draining); the span is attributed and closed first.
             AbortBatchError: draining hit an error classified as abort; the span records it and closes.
-            StreamProtocolError: the stream ended without a terminal response; the span records it and closes.
+            StreamProtocolError: the provider's event stream ended without a terminal event;
+                the span records it and closes.
         """
-        span = self._ensure_span()
-        if self._span_ended:
+        if self._span is None or self._span_ended:
+            # Never entered, or a prior final()/failure/__aexit__ already closed the span.
             return await self._stream_handle.final()
+        span = self._span
         try:
             response = await self._stream_handle.final()
         except GenerationError as exc:

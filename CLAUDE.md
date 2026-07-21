@@ -85,6 +85,12 @@ Trigger: before committing. Run `scripts/CI.sh`; fix every error it reports and 
 
 It runs `pyrefly check`, `ruff check`, `ruff format --check`, and `pytest` through `uv run`, so the tools resolve from the locked dev group. The de-selected docstring rules and their reasons are in `pyproject.toml`. Keep the tests offline (constructed SDK objects, stub adapters, no API keys). `tests/*` carries a `SLF001` per-file-ignore because the tests exercise private helpers directly.
 
+## Releasing
+
+Trigger: releasing a version. Bump `version` in `pyproject.toml` and push to `main`. Never create a `v*` tag by hand: `.github/workflows/publish.yml` publishes to PyPI and cuts the tag, and its gate publishes only a version strictly above every existing `v*` tag, so a hand-made tag stops the release it was meant to mark.
+
+Pushing the bump to `main` is therefore the release act, and PyPI refuses a re-upload of a version that already exists. Confirm with the user before pushing a commit that changes `version`.
+
 # Commit Review
 
 After each commit lands, spawn the `commit-reviewer` agent (`.claude/agents/commit-reviewer.md`) with the commit sha as its prompt. Before that spawn, `scripts/CI.sh` reports zero errors and you have run the author's pre-staging pass ("Before running `git add`" in the global CLAUDE.md) to completion on every staged file. The reviewer is the second pass, which is what lets its rule 2 forbid re-running the checks. Scale the reviewer model with the commit's stakes: Opus for serious work, Sonnet only for the most trivial docstring changes.

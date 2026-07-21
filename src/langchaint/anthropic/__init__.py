@@ -226,8 +226,10 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     model is sent verbatim, so the id in application code, on the wire, and in traces is one string;
     its Bedrock API and default pricing come from ANTHROPIC_BEDROCK[model],
     so the application never names the client class.
-    client None constructs the API's client class with aws_region
-    (None resolves the region from the AWS credential chain).
+    client None constructs the API's client class with aws_region.
+    aws_region None leaves the client class to resolve the region itself, and the two classes do it
+    differently. Pass aws_region to make the region explicit rather than depending on which class
+    the model routes to.
     Pass client to supply your own; its class must serve the model's Bedrock API.
     aws_region is only for the default-client path, so passing both it and client raises:
     a passed client already carries its region, and the aws_region beside it would be dropped,
@@ -253,6 +255,8 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
             or cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
             (from AnthropicMessagesAdapter.__init__; every ANTHROPIC_PRICING entry carries the
             rate, so only a custom pricing can trip this).
+        anthropic.AnthropicError: model is served by the "mantle" Bedrock API, client is None, and
+            AsyncAnthropicBedrockMantle.__init__ resolves neither a region nor a base URL.
     """
     routing = ANTHROPIC_BEDROCK[model]
     if client is None:

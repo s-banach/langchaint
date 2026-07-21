@@ -149,7 +149,7 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
 def test_bedrock_rejects_client_and_http_client_together() -> None:
     """Passing both client and http_client raises: a passed client already owns its transport."""
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
-    with pytest.raises(ValueError, match="at most one"):
+    with pytest.raises(ValueError, match="http_client="):
         anthropic_bedrock_model(
             "anthropic.claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
         )
@@ -158,16 +158,19 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
 def test_both_bedrock_constructors_refuse_a_region_beside_a_client() -> None:
     """A passed client carries its own region, so the aws_region beside it would be dropped.
 
-    Silently, and every request would go to the client's region: the constructor cannot apply the
-    stated region to a client it did not build.
+    Silently, and every request would go to the client's region.
+    Both constructors raise rather than rewrite a client the caller built, and rewriting is not
+    uniformly available anyway: AsyncAnthropicBedrockMantle.copy(aws_region=...) sets the attribute
+    and leaves base_url pointing at the original region, while AsyncBedrockOpenAI.copy recomputes it
+    (anthropic 0.116.0, openai 2.45.0).
     """
-    with pytest.raises(ValueError, match="at most one"):
+    with pytest.raises(ValueError, match="aws_region="):
         anthropic_bedrock_model(
             "anthropic.claude-opus-4-8",
             aws_region="eu-west-1",
             client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
         )
-    with pytest.raises(ValueError, match="at most one"):
+    with pytest.raises(ValueError, match="aws_region="):
         openai_bedrock_model(
             "openai.gpt-oss-120b-1:0",
             pricing=_ARBITRARY_PRICING,

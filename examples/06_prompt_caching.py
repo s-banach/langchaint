@@ -98,7 +98,7 @@ async def openai_explicit_mode() -> None:
     question = TextPart(text="Do you handle refunds?")
     assistant = openai_model("gpt-5.6-terra").bind(automatic_prompt_caching=False)
     for label in ("first call", "second call"):
-        response = await assistant.generate_one([UserMessage([marked_context, question])])
+        response = await assistant.generate_one([UserMessage(content=[marked_context, question])])
         usage = response.usage
         print(
             f"{label}: cache_read={usage.input_tokens_cache_read}",
@@ -136,13 +136,13 @@ async def provider_divergent_marks_are_rejected() -> None:
     Both raises happen before any request is sent, so this function costs nothing to run.
     """
     try:
-        AssistantMessage([TextPart(text="Reply text.", cache_breakpoint=True)])
+        AssistantMessage(turn=[TextPart(text="Reply text.", cache_breakpoint=True)])
     except ValidationError as err:
         print(f"AssistantMessage rejected the marked turn part: {err.errors()[0]['msg']}")
     tool_call = ToolCall(id="call_1", name="lookup_policy", args_json="{}")
     conversation: list[Message] = [
-        UserMessage("Do you handle refunds?"),
-        AssistantMessage([tool_call]),
+        UserMessage(content="Do you handle refunds?"),
+        AssistantMessage(turn=[tool_call]),
         ToolMessage(
             tool_call_id="call_1",
             content=[

@@ -19,7 +19,7 @@ from langchaint import (
     UserMessage,
 )
 
-_CONVERSATION_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
+_CONVERSATION_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
 def test_conversation_round_trips_through_json_preserving_types() -> None:
@@ -39,7 +39,7 @@ def test_conversation_round_trips_through_json_preserving_types() -> None:
         ToolMessage(tool_call_id="c1", content="boom", is_error=True),
         AssistantMessage(turn=(TextPart(text="Done."),)),
     )
-    restored = _CONVERSATION_ADAPTER.validate_json(_CONVERSATION_ADAPTER.dump_json(conversation))
+    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(_CONVERSATION_TYPE_ADAPTER.dump_json(conversation))
     assert restored == conversation
     assert [type(message) for message in restored] == [type(message) for message in conversation]
     restored_assistant = restored[1]
@@ -53,9 +53,9 @@ def test_conversation_round_trips_through_json_preserving_types() -> None:
 
 def test_validation_selects_the_member_from_the_role_tag() -> None:
     """The role tag selects the message type, not which member's fields happen to match."""
-    user = _CONVERSATION_ADAPTER.validate_python([{"role": "user", "content": "hi"}])[0]
+    user = _CONVERSATION_TYPE_ADAPTER.validate_python([{"role": "user", "content": "hi"}])[0]
     assert type(user) is UserMessage
-    assistant = _CONVERSATION_ADAPTER.validate_python(
+    assistant = _CONVERSATION_TYPE_ADAPTER.validate_python(
         [{"role": "assistant", "turn": [{"text": "hi"}]}]
     )[0]
     assert type(assistant) is AssistantMessage
@@ -96,16 +96,12 @@ def test_turn_elements_validate_to_the_member_whose_fields_they_carry() -> None:
 def test_validation_without_a_role_tag_is_rejected() -> None:
     """A message payload missing role fails validation, proving the discriminator is engaged."""
     with pytest.raises(ValidationError):
-        _CONVERSATION_ADAPTER.validate_python([{"content": "hi"}])
+        _CONVERSATION_TYPE_ADAPTER.validate_python([{"content": "hi"}])
 
 
-def test_positional_construction_and_string_turn_coercion() -> None:
-    """UserMessage and AssistantMessage take their one argument positionally.
-
-    A bare string turn coerces to one TextPart on every construction path.
-    """
-    assert UserMessage("Hello") == UserMessage(content="Hello")
-    assistant = AssistantMessage("hey")
+def test_string_turn_coercion() -> None:
+    """A bare string turn coerces to one TextPart on every construction path."""
+    assistant = AssistantMessage(turn="hey")
     assert assistant.turn == (TextPart(text="hey"),)
     assert assistant == AssistantMessage(turn=(TextPart(text="hey"),))
     assert AssistantMessage.model_validate({"role": "assistant", "turn": "hey"}) == assistant
@@ -141,7 +137,7 @@ def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
             content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),),
         ),
     )
-    restored = _CONVERSATION_ADAPTER.validate_json(_CONVERSATION_ADAPTER.dump_json(conversation))
+    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(_CONVERSATION_TYPE_ADAPTER.dump_json(conversation))
     assert restored == conversation
     restored_user = restored[0]
     assert isinstance(restored_user, UserMessage)
@@ -164,7 +160,7 @@ def test_assistant_turn_rejects_a_marked_text_part() -> None:
 
 def test_assistant_turn_still_accepts_unmarked_text() -> None:
     """The validator rejects only marked parts; the plain turn is untouched."""
-    assert AssistantMessage("hey").text == "hey"
+    assert AssistantMessage(turn="hey").text == "hey"
 
 
 def test_model_copy_rejects_a_derived_property_key() -> None:
@@ -181,7 +177,7 @@ def test_model_copy_rejects_a_derived_property_key() -> None:
 def test_model_copy_rejects_a_key_that_is_not_a_field() -> None:
     """A typo key raises and the message lists the model's fields."""
     with pytest.raises(TypeError, match="not a field of UserMessage"):
-        UserMessage("hi").model_copy(update={"contnet": "bye"})
+        UserMessage(content="hi").model_copy(update={"contnet": "bye"})
 
 
 def test_model_copy_with_a_field_key_returns_the_modified_copy() -> None:

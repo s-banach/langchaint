@@ -4,6 +4,13 @@ Construction and validation are covered by extra="forbid", which the hook below 
 subclass: pydantic's "ignore" default would drop a misspelled field name silently, leaving an object
 without the value its caller supplied. The cost is that a conversation written by a newer langchaint
 raises when an older one loads it, instead of the added field being discarded.
+The hook also rejects a subclass that defines __init__, so every model here keeps pydantic's
+generated keyword-only constructor and one error shape. A positional constructor, the custom
+__init__ that would let a message read UserMessage("Hello"), is rejected: pydantic binds the raw
+input to such a signature before extra="forbid" is consulted, so both a surplus key and a missing
+field raise TypeError naming no location. Giving that __init__ a **extra parameter routes a surplus
+key past binding but does nothing for a missing field, and absorbs a misspelled optional argument
+that the generated constructor would have failed at check time.
 model_copy needs its own override, because it applies update without validation and so never
 consults extra: the key would land in the instance __dict__, where a same-named property shadows it
 and model_dump ignores it. It raises TypeError, as dataclasses.replace does for an unknown field.
@@ -11,7 +18,6 @@ model_construct is left as pydantic ships it, dropping the key silently, since i
 validation on data the caller vouches for.
 """
 
-import inspect
 from collections.abc import Mapping
 from typing import Self, override
 
@@ -38,11 +44,13 @@ class CheckedCopyModel(BaseModel):
     @classmethod
     @override
     def __pydantic_init_subclass__(cls, **kwargs: object) -> None:
-        """Require the subclass to forbid extra keys, which is what makes construction reject a non-field key.
+        """Require the subclass to forbid extra keys and to leave __init__ to pydantic.
 
+        Together those two make construction reject a key that is not a field, with a located
+        ValidationError.
         The **kwargs pass-through is the hook's signature: pydantic forwards class-definition keyword arguments.
 
-        The config is checked before the signature, so each message names a fix that is the whole
+        The config is checked before __init__, so each message names a fix that is the whole
         remaining fix.
 
         Raises:
@@ -50,8 +58,8 @@ class CheckedCopyModel(BaseModel):
                 default drops a misspelled key silently, and the fix is to set "forbid"; "allow"
                 keeps unknown keys as meaningful data that model_copy would wrongly reject, and
                 the fix is to not inherit this base.
-            TypeError: the subclass defines its own __init__ without a var-keyword parameter,
-                so a key that is not a field would never reach extra="forbid".
+            TypeError: the subclass defines its own __init__, which pydantic binds the raw input to
+                before extra="forbid" is consulted, so a bad key raises an unlocated TypeError.
         """
         super().__pydantic_init_subclass__(**kwargs)
         extra = cls.model_config.get("extra")
@@ -71,15 +79,12 @@ class CheckedCopyModel(BaseModel):
                 f"{cls.__name__} must set model_config = ConfigDict(extra='forbid'); {states}, under "
                 "which a key that is not a field is dropped silently on construction instead of raising"
             )
-        if cls.__pydantic_custom_init__ and not any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in inspect.signature(cls.__init__).parameters.values()
-        ):
+        if cls.__pydantic_custom_init__:
             raise TypeError(
                 f"{cls.__name__} defines __init__, which sets pydantic's custom_init: pydantic "
-                "binds the raw input to that signature, so a key that is not a field is rejected "
-                "by argument binding as an unlocated TypeError before extra='forbid' is consulted. "
-                "Add a **extra parameter and forward it to super().__init__"
+                "binds the raw input to that signature, so a surplus or missing key is rejected by "
+                "argument binding as an unlocated TypeError before extra='forbid' is consulted. "
+                "Let pydantic generate the constructor; its arguments are keyword-only"
             )
 
     @override

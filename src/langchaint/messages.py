@@ -77,33 +77,19 @@ class UserMessage(CheckedCopyModel):
     role discriminates the Message union,
     so a persisted conversation re-validates to the same message types by construction instead of by union member order.
 
+    content is keyword-only, as on every model here; CheckedCopyModel's module docstring says why a
+    positional UserMessage("Hello") is rejected. A conversation that is one user turn goes to
+    BoundLLM.generate_one as a bare string, which wraps it in a UserMessage.
+
     Raises:
         pydantic.ValidationError: content is neither a str nor a sequence of Parts,
-            or a key that is not a field was passed (see __init__).
+            or a key that is not a field was passed.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     content: str | tuple[Part, ...]
     role: Literal["user"] = "user"
-
-    def __init__(
-        self, /, content: MessageContent, role: Literal["user"] = "user", **extra: object
-    ) -> None:
-        """Accept content positionally, so a conversation reads UserMessage("Hello").
-
-        role stays a parameter because pydantic validation routes through a custom __init__ and
-        passes every field.
-        extra and the positional-only receiver carry a key that is not a field through to
-        extra="forbid", which reports it as a located ValidationError; without them argument
-        binding rejects it first, as a TypeError naming no location. The cost is that a misspelled
-        keyword here is caught at run time rather than by the type checker.
-
-        Raises:
-            pydantic.ValidationError: a key that is not a field was passed, or content is neither
-                a str nor a sequence of Parts.
-        """
-        super().__init__(content=content, role=role, **extra)
 
 
 class ReasoningTrace(CheckedCopyModel):
@@ -154,7 +140,7 @@ TextPart, not Part: assistant turns still return no images.
 
 
 def _text_only_turn(turn: object) -> object:
-    """Coerce a bare string to a one-TextPart turn, so AssistantMessage("hey") works.
+    """Coerce a bare string to a one-TextPart turn, so AssistantMessage(turn="hey") works.
 
     Runs before validation on every construction path (the constructor and model_validate alike),
     so the stored turn is always the tuple form and readers never branch on a string.
@@ -172,8 +158,10 @@ class AssistantMessage(CheckedCopyModel):
     so the one stored sequence is turn and text/tool_calls are filtered views of it.
     A bare string turn is one TextPart, for hand-written turns such as few-shot examples.
 
+    turn is keyword-only, as on every model here.
+
     Raises:
-        pydantic.ValidationError: a key that is not a field was passed (see __init__),
+        pydantic.ValidationError: a key that is not a field was passed,
             or turn is neither a str nor a sequence of TurnElements,
             or a TextPart in the turn sets cache_breakpoint
             (openai has no breakpoint on assistant replay text,
@@ -202,26 +190,6 @@ class AssistantMessage(CheckedCopyModel):
                 "mark the following user or tool message instead"
             )
         return self
-
-    def __init__(
-        self,
-        /,
-        turn: str | Sequence[TurnElement],
-        role: Literal["assistant"] = "assistant",
-        **extra: object,
-    ) -> None:
-        """Accept turn positionally, so a conversation reads AssistantMessage("hey").
-
-        role stays a parameter because pydantic validation (model_validate, TypeAdapter)
-        routes through a custom __init__ and passes every field.
-        extra carries a key that is not a field through to extra="forbid", for the reason given
-        in full on UserMessage.__init__.
-
-        Raises:
-            pydantic.ValidationError: a key that is not a field was passed, or turn is neither a
-                str nor a sequence of TurnElements, or a TextPart in the turn sets cache_breakpoint.
-        """
-        super().__init__(turn=turn, role=role, **extra)
 
     @property
     def text(self) -> str:

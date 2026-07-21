@@ -57,20 +57,32 @@ def test_every_package_pydantic_model_inherits_checked_copy_model() -> None:
     assert offenders == []
 
 
-def test_a_subclass_defining_init_without_a_var_keyword_is_rejected() -> None:
-    """A model with its own __init__ must take **extra, for the reason given on UserMessage.__init__.
+def test_a_subclass_defining_its_own_init_is_rejected() -> None:
+    """A subclass must leave __init__ to pydantic; the checked_copy module docstring says why.
 
     The hook checks this rather than a walk over the package's own models, because it fires at
     class definition and so covers a subclass an application defines outside langchaint.
+    The second shape is a positional-only receiver plus **extra, which does route a surplus key past
+    argument binding, and is rejected anyway, because a missing field still binds to the signature
+    and raises TypeError there.
     """
     with pytest.raises(TypeError, match="custom_init"):
 
-        class PositionalModel(CheckedCopyModel):
+        class CustomInitModel(CheckedCopyModel):
             model_config = ConfigDict(extra="forbid")
             value: int
 
             def __init__(self, value: int) -> None:
                 super().__init__(value=value)
+
+    with pytest.raises(TypeError, match="custom_init"):
+
+        class ForwardingInitModel(CheckedCopyModel):
+            model_config = ConfigDict(extra="forbid")
+            value: int
+
+            def __init__(self, /, value: int, **extra: object) -> None:
+                super().__init__(value=value, **extra)
 
 
 def test_a_subclass_setting_extra_allow_is_rejected_at_class_definition() -> None:
@@ -129,9 +141,8 @@ def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it(
 def test_construction_rejects_a_key_that_is_not_a_field() -> None:
     """The point of requiring extra="forbid": a misspelled field name raises instead of vanishing.
 
-    Usage stands in for the models pydantic constructs itself; the class-definition hook above is
-    what keeps the rest of them from regressing. The two with a positional __init__ take the other
-    path, pinned by the test below.
+    Usage stands in for every model here, which pydantic constructs the same way; the
+    class-definition hook above is what keeps the rest of them from regressing.
     """
     with pytest.raises(ValidationError, match="inpit_tokens_cache_read"):
         Usage(
@@ -146,26 +157,27 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
 
 
 @pytest.mark.parametrize(
-    ("payload", "key"),
+    ("payload", "key", "error_type"),
     [
-        ({"content": "x", "role": "user", "junk": 1}, "junk"),
-        ({"turn": [{"text": "a"}], "role": "assistant", "junk": 1}, "junk"),
-        ({"content": "x", "role": "user", "self": 1}, "self"),
-        ({"turn": [{"text": "a"}], "role": "assistant", "self": 1}, "self"),
+        ({"content": "x", "role": "user", "junk": 1}, "junk", "extra_forbidden"),
+        ({"turn": [{"text": "a"}], "role": "assistant", "junk": 1}, "junk", "extra_forbidden"),
+        ({"role": "user"}, "content", "missing"),
+        ({"role": "assistant"}, "turn", "missing"),
     ],
 )
-def test_a_model_with_a_positional_init_rejects_the_key_as_a_validation_error(
-    payload: dict[str, object], key: str
+def test_reloading_a_malformed_conversation_locates_the_key_as_a_validation_error(
+    payload: dict[str, object], key: str, error_type: str
 ) -> None:
-    """UserMessage and AssistantMessage refuse the key as ValidationError, like every sibling.
+    """A surplus key and a missing field both raise ValidationError naming where they are.
 
     This is the reload path for a persisted conversation, so one exception type across the tree
-    is what lets an application catch every bad key with ValidationError and read its location.
-    Dropping the **extra parameter these two carry turns this into an unlocated TypeError.
-    A key named self is the case **extra alone does not cover: it collides with the receiver
-    during argument binding unless the receiver is positional-only.
+    is what lets an application catch every malformed message with ValidationError and read its
+    location. A message model defining its own __init__ breaks both halves: pydantic binds the
+    payload to that signature first, and the binding failure is a TypeError naming no location.
     """
-    adapter = TypeAdapter[Message](Message)
+    message_type_adapter = TypeAdapter[Message](Message)
     with pytest.raises(ValidationError, match=key) as caught:
-        adapter.validate_python(payload)
-    assert [error["loc"][-1] for error in caught.value.errors()] == [key]
+        message_type_adapter.validate_python(payload)
+    assert [(error["loc"][-1], error["type"]) for error in caught.value.errors()] == [
+        (key, error_type)
+    ]

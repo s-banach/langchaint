@@ -19,7 +19,8 @@ Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
 provider_name="azure.ai.openai", ...) wrapped in an LLM.
 openai_model's pricing None selects the model's public prices from OPENAI_PRICING;
 pass your own PricingTable to override, for example when your account bills at a custom rate.
-openai_bedrock_model has no catalog to fall back on, so its pricing is required.
+openai_bedrock_model has no catalog to fall back on,
+so its pricing and supports_prompt_cache_options are required.
 cost_breakdown(usage_raw, pricing) reports the exact per-category cost of one response from its raw
 SDK usage, through the same arithmetic that produced the stored Usage.cost_in_usd.
 
@@ -29,6 +30,7 @@ Prices are the one provider fact langchaint cannot verify by SDK introspection;
 re-check the page before relying on a table for billing.
 OpenAI has no 1-hour cache tier, and only the gpt-5.6 family bills cache writes;
 earlier models cache automatically with free writes, so their tables carry a zero cache-write rate.
+That family is also the one taking prompt_cache_options, listed in PROMPT_CACHE_OPTIONS_MODELS.
 The bare gpt-5.6 model identifier is an alias for gpt-5.6-sol; the catalog uses the explicit identifier.
 """
 
@@ -116,6 +118,21 @@ OPENAI_PRICING: dict[OpenAIModelName, PricingTable] = {
 }
 """Public prices per openai model; the default pricing lookup."""
 
+PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+})
+"""Cataloged models accepting the prompt_cache_options request parameter.
+
+openai documents the parameter as gpt-5.6-and-later (openai 2.45.0), and it is what carries a
+binding's automatic_prompt_caching False to the wire, so a model absent here keeps caching under
+either binding value. At the OPENAI_PRICING rates that costs nothing: every model absent here
+bills zero for a cache write and reads cached input below its uncached rate.
+Held apart from those rates rather than derived from them, because a price and a parameter's
+availability are two facts openai can change independently.
+"""
+
 
 def openai_model(
     model: OpenAIModelName,
@@ -129,6 +146,8 @@ def openai_model(
 
     client None constructs AsyncOpenAI(), which reads OPENAI_API_KEY from the environment.
     pricing None selects OPENAI_PRICING[model].
+    Whether the model takes prompt_cache_options comes from PROMPT_CACHE_OPTIONS_MODELS,
+    whose docstring gives what a model outside it does with bind(automatic_prompt_caching=False).
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
@@ -148,6 +167,7 @@ def openai_model(
             model=model,
             pricing=pricing if pricing is not None else OPENAI_PRICING[model],
             provider_name="openai",
+            supports_prompt_cache_options=model in PROMPT_CACHE_OPTIONS_MODELS,
             reasoning_summary=reasoning_summary,
         ),
         rate_limiter=rate_limiter,
@@ -158,6 +178,7 @@ def openai_bedrock_model(
     model: str,
     *,
     pricing: PricingTable,
+    supports_prompt_cache_options: bool,
     aws_region: str | None = None,
     client: AsyncBedrockOpenAI | None = None,
     rate_limiter: RateLimiter | None = None,
@@ -170,6 +191,12 @@ def openai_bedrock_model(
     rather than defaulted, because both asymmetries with anthropic_bedrock_model come from the same
     absence: langchaint carries no verified list of OpenAI's Bedrock model ids or their AWS rates,
     and prices are the one provider fact langchaint cannot verify by SDK introspection.
+    supports_prompt_cache_options is required for the same absence of a catalog: it says whether
+    the model takes the prompt_cache_options request parameter, which openai documents as
+    gpt-5.6-and-later (openai 2.45.0), and no Bedrock id maps to that boundary here.
+    False leaves the parameter unsent, so the model keeps caching under either binding value;
+    pass False only where the pricing beside it charges nothing for a cache write, since otherwise
+    a caller binding automatic_prompt_caching False pays for the caching they declined.
     client None constructs AsyncBedrockOpenAI(aws_region=aws_region)
     (None resolves the region from the AWS credential chain).
     There is no http_client parameter, because the Bedrock Responses API has one client class,
@@ -196,6 +223,7 @@ def openai_bedrock_model(
             model=model,
             pricing=pricing,
             provider_name="aws.bedrock",
+            supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         ),
         rate_limiter=rate_limiter,
@@ -204,6 +232,7 @@ def openai_bedrock_model(
 
 __all__ = [
     "OPENAI_PRICING",
+    "PROMPT_CACHE_OPTIONS_MODELS",
     "OpenAIModelName",
     "OpenAIResponsesAdapter",
     "ReasoningSummary",

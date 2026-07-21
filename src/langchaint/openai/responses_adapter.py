@@ -15,19 +15,22 @@ Verified against openai 2.45.0:
 - `usage.input_tokens` includes `input_tokens_details.cached_tokens` and `input_tokens_details.cache_write_tokens`,
   so it is the provider-reported all-inclusive input total the Usage partition is checked against.
   Cache writes bill starting with gpt-5.6, so the PricingTable's cache-write rate applies here too.
-- `prompt_cache_options` (supported on gpt-5.6 and later) controls caching per request;
+- `prompt_cache_options` controls caching per request;
   `{"mode": "explicit"}` with no explicit breakpoints disables it.
-  The adapter sends it only when the binding sets automatic_prompt_caching False; bound True,
+  The adapter sends it only when the binding sets automatic_prompt_caching False and the
+  constructor's supports_prompt_cache_options is True; bound True,
   the provider's implicit caching is left in place and nothing is sent.
-  The adapter sends it regardless of model (it keeps no model-version table),
-  so binding False with a pre-gpt-5.6 model may be rejected by the API.
+  openai documents the parameter as gpt-5.6-and-later (openai 2.45.0), so a model that predates it
+  has no way to turn caching off and gets no caching parameter at all,
+  which keeps automatic_prompt_caching a binding parameter every model accepts.
   `prompt_cache_options.ttl` takes "30m" as its only value,
   so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
 - A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
   under either binding value: implicit mode writes up to the latest three explicit breakpoints,
   explicit mode up to the latest four, and older marks are read-only for matching,
   so the adapter sends every mark and caps nothing.
-  With automatic_prompt_caching False, marked parts are what re-enables caching at exactly those boundaries.
+  With automatic_prompt_caching False on a model taking `prompt_cache_options`,
+  marked parts are what re-enables caching at exactly those boundaries.
 - The API stores responses server-side for later retrieval by default;
   the adapter always sends `store=False` because conversation state is the caller's conversation argument,
   and a stored copy would be an unused side effect.
@@ -540,6 +543,7 @@ class OpenAIResponsesAdapter(Adapter):
         model: str,
         pricing: PricingTable,
         provider_name: str,
+        supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
@@ -561,6 +565,20 @@ class OpenAIResponsesAdapter(Adapter):
         either is refused by Adapter.__init__; an AsyncOpenAI takes the provider_name its caller
         states, since its base_url decides what it reaches.
 
+        supports_prompt_cache_options says whether the model accepts the prompt_cache_options
+        request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
+        False leaves the parameter unsent under either binding value, so a model that cannot be
+        told to stop caching is sent no caching parameter instead of one it does not document,
+        and automatic_prompt_caching stays a binding parameter every model accepts.
+        It has no default because a wrong value is silent either way: True on a model without the
+        parameter risks a rejected request, False on one with it leaves caching running for a
+        caller who declined it, at whatever that model charges for it. openai_model reads the
+        value from PROMPT_CACHE_OPTIONS_MODELS; openai_bedrock_model requires it from its own
+        caller, having no catalog of Bedrock ids to read. It is a parameter here rather than a
+        lookup on model because model is a str whose namespace this adapter cannot know: it
+        serves the platforms provider_name_by_client_class maps and every OpenAI-compatible
+        endpoint a base AsyncOpenAI's base_url reaches.
+
         Raises:
             ValueError: raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
@@ -568,6 +586,7 @@ class OpenAIResponsesAdapter(Adapter):
             client=client, model=model, pricing=pricing, provider_name=provider_name
         )
         self.client = client.with_options(max_retries=0)
+        self.supports_prompt_cache_options = supports_prompt_cache_options
         self.reasoning_summary = reasoning_summary
 
     def _request(self, binding: Binding) -> _OpenAIRequest:
@@ -618,7 +637,9 @@ class OpenAIResponsesAdapter(Adapter):
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             prompt_cache_options=(
-                omit if binding.automatic_prompt_caching else PromptCacheOptions(mode="explicit")
+                PromptCacheOptions(mode="explicit")
+                if self.supports_prompt_cache_options and not binding.automatic_prompt_caching
+                else omit
             ),
             include=["reasoning.encrypted_content"],
         )

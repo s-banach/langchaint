@@ -525,13 +525,22 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {"type": "function", "name": "x"}
 
 
-def _adapter(*, reasoning_summary: ReasoningSummary | None = None) -> OpenAIResponsesAdapter:
-    """Build an adapter over a keyless client, valid because no request is sent."""
+def _adapter(
+    *,
+    reasoning_summary: ReasoningSummary | None = None,
+    supports_prompt_cache_options: bool = True,
+) -> OpenAIResponsesAdapter:
+    """Build an adapter over a keyless client, valid because no request is sent.
+
+    supports_prompt_cache_options defaults True, the gpt-5.6-and-later case, so every caller
+    that does not name it exercises the path where a binding's caching value reaches the wire.
+    """
     return OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
         model="m",
         pricing=_PRICING,
         provider_name="openai",
+        supports_prompt_cache_options=supports_prompt_cache_options,
         reasoning_summary=reasoning_summary,
     )
 
@@ -601,6 +610,15 @@ def test_request_requests_explicit_mode_when_caching_disabled() -> None:
     """Disabled caching sends explicit mode with no breakpoints."""
     request = _adapter()._request(_binding(automatic_prompt_caching=False))
     assert request.prompt_cache_options == {"mode": "explicit"}
+
+
+def test_request_omits_prompt_cache_options_where_the_model_lacks_the_parameter() -> None:
+    """A model not taking prompt_cache_options gets none under either binding value."""
+    adapter = _adapter(supports_prompt_cache_options=False)
+    disabled = adapter._request(_binding(automatic_prompt_caching=False))
+    assert isinstance(disabled.prompt_cache_options, openai.Omit)
+    enabled = adapter._request(_binding(automatic_prompt_caching=True))
+    assert isinstance(enabled.prompt_cache_options, openai.Omit)
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:

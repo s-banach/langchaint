@@ -63,6 +63,66 @@ def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     assert adapter.pricing is OPENAI_PRICING[model]
 
 
+_PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
+    "gpt-5.1": False,
+    "gpt-5.2": False,
+    "gpt-5.4": False,
+    "gpt-5.4-mini": False,
+    "gpt-5.5": False,
+    "gpt-5.6-luna": True,
+    "gpt-5.6-terra": True,
+    "gpt-5.6-sol": True,
+}
+"""What openai_model is expected to pass for each cataloged model.
+
+Spelled out rather than recomputed from PROMPT_CACHE_OPTIONS_MODELS, which would restate the
+implementation and pass however that set were edited.
+"""
+
+
+def test_the_prompt_cache_options_expectations_cover_the_catalog() -> None:
+    """Every cataloged model has an expected value, so adding one to OPENAI_PRICING fails here.
+
+    Without this, a new model reaches openai_model untested and silently takes the absent-model
+    branch, sending no caching parameter however openai prices or documents it.
+    """
+    assert set(_PROMPT_CACHE_OPTIONS_SUPPORT) == set(OPENAI_PRICING)
+
+
+@pytest.mark.parametrize(("model", "supported"), list(_PROMPT_CACHE_OPTIONS_SUPPORT.items()))
+def test_openai_model_wires_prompt_cache_options_support(
+    model: OpenAIModelName, *, supported: bool
+) -> None:
+    """openai_model reads the flag from PROMPT_CACHE_OPTIONS_MODELS, gpt-5.6 and later.
+
+    A model dropped from that set, or misspelled in it, fails here instead of silently sending
+    no caching parameter for a model that takes one.
+    """
+    llm = openai_model(model, client=AsyncOpenAI(api_key="offline"))
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.supports_prompt_cache_options is supported
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported: bool) -> None:
+    """The caller's value reaches the adapter, no Bedrock id being cataloged to derive it from.
+
+    Both values are asserted because forwarding is the whole contract here: an implementation
+    hardcoding either one satisfies every other Bedrock test, and hardcoding False would leave a
+    caller who asked to stop caching paying for it on a model that bills cache writes.
+    """
+    llm = openai_bedrock_model(
+        "openai.gpt-oss-120b-1:0",
+        pricing=_ARBITRARY_PRICING,
+        supports_prompt_cache_options=supported,
+        client=AsyncBedrockOpenAI(aws_region="us-east-1"),
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.supports_prompt_cache_options is supported
+
+
 @pytest.mark.parametrize(
     ("build", "provider_name"),
     [
@@ -81,6 +141,7 @@ def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
                 model="gpt-5.6-terra",
                 pricing=_ARBITRARY_PRICING,
                 provider_name="groq",
+                supports_prompt_cache_options=False,
             ),
             "groq",
         ),
@@ -105,7 +166,10 @@ def test_openai_bedrock_model_wires_model_pricing_and_region() -> None:
     resolves, which no other assertion catches: the constructor's other tests all pass a client.
     """
     llm = openai_bedrock_model(
-        "openai.gpt-oss-120b-1:0", pricing=_ARBITRARY_PRICING, aws_region="eu-west-1"
+        "openai.gpt-oss-120b-1:0",
+        pricing=_ARBITRARY_PRICING,
+        supports_prompt_cache_options=False,
+        aws_region="eu-west-1",
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
@@ -174,6 +238,7 @@ def test_both_bedrock_constructors_refuse_a_region_beside_a_client() -> None:
         openai_bedrock_model(
             "openai.gpt-oss-120b-1:0",
             pricing=_ARBITRARY_PRICING,
+            supports_prompt_cache_options=False,
             aws_region="eu-west-1",
             client=AsyncBedrockOpenAI(aws_region="us-east-1"),
         )
@@ -249,6 +314,7 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
             lambda: openai_bedrock_model(
                 "openai.gpt-oss-120b-1:0",
                 pricing=_ARBITRARY_PRICING,
+                supports_prompt_cache_options=False,
                 client=AsyncBedrockOpenAI(aws_region="us-east-1"),
             ),
             "aws.bedrock",

@@ -2,7 +2,8 @@
 
 Caching is always user-stated because it changes billing: bind requires automatic_prompt_caching with no default,
 and cache_breakpoint on a TextPart/ImagePart marks the exact end of a reusable prompt prefix.
-Marks are honored under either automatic_prompt_caching value; bound False with no marks caches nothing.
+Marks are honored under either automatic_prompt_caching value; bound False with no marks caches nothing,
+except on the openai models that predate prompt_cache_options, the thorn openai_explicit_mode covers.
 The same two controls hit different wire mechanics per provider, and those thorns are this file's subject:
 anthropic's 4-marker request limit and cache_ttl, openai's implicit/explicit modes and model-version cutoff,
 and the two places a mark is rejected because the providers diverge.
@@ -90,8 +91,10 @@ async def openai_explicit_mode() -> None:
     Bound False, the adapter sends prompt_cache_options {"mode": "explicit"},
     which disables the implicit breakpoint so the server caches only at explicit breakpoints:
     False with no marks disables caching, and a marked part re-enables it at exactly that boundary.
-    prompt_cache_options exists on gpt-5.6 and later, so binding False with an older model may be rejected
-    by the API; bound True works on any model because nothing extra is sent.
+    prompt_cache_options exists on gpt-5.6 and later, the models PROMPT_CACHE_OPTIONS_MODELS lists.
+    Binding False on a model outside that set sends no caching parameter at all, so the server keeps
+    caching: at the OPENAI_PRICING rates that is free, since those models bill nothing for a cache
+    write and read cached input below their uncached rate.
     There is also no TTL to choose: "30m" is openai's only value, so openai_model has no cache_ttl parameter.
     """
     marked_context = TextPart(text=STABLE_INSTRUCTIONS, cache_breakpoint=True)

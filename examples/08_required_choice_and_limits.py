@@ -180,6 +180,10 @@ async def run_agent[FinalT: BaseModel](
         final_response = await take_turn(bound, forcing=False)
         if final_response is not None:
             return completed(final_response)
+    # A tool_choice-only rebind is not always a prompt-cache miss, and which change costs a cache write varies.
+    # Measured 2026-07-21 on us.anthropic.claude-sonnet-4-6: "required" -> SpecificToolChoice kept the cache.
+    # So did one SpecificToolChoice -> another, while "required" -> "auto" missed the cache.
+    # Measured 2026-07-21 on gpt-5.6-luna: every rebind measured kept the cache.
     forced = bound.rebind(tool_choice=SpecificToolChoice(tool_name=final_response_tool.name))
     for _ in range(FORCED_TRIES):
         final_response = await take_turn(forced, forcing=True)

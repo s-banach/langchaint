@@ -318,9 +318,11 @@ class BoundLLM[OutputT]:
         Replace semantics: a passed inference_params replaces the bound one whole, never field-wise.
         Every rebind converts the binding to SDK keyword arguments again, a pure conversion with no I/O.
         Whether a rebind preserves the provider's prompt cache is provider-specific and partly undocumented
-        (Anthropic documents the prefix order tools -> system -> messages
-        and that tool_choice changes invalidate the messages-level cache);
-        a cache_safe_rebind with an adapter-owned safety matrix is deferred until a real workload wants it.
+        (Anthropic documents the prefix order tools -> system -> messages),
+        and it depends on which field a rebind changes and on which value that field moves between,
+        so measure it on the deployment you ship on.
+        langchaint owns no cache-safety matrix over this.
+        A matrix carried in the code goes stale the moment a provider changes a model.
         """
         new_tool_manager = (
             self.tool_manager if isinstance(tool_manager, Unchanged) else tool_manager

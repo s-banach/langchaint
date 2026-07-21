@@ -447,11 +447,15 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
 
 def test_abort_batch_error_raises_immediately_without_retry() -> None:
-    """An AbortBatchError from send is raised on the first attempt and never retried."""
+    """An AbortBatchError from send is raised on the first attempt and never retried.
+
+    classify returns "transient" here, so retrying is what the classifier asks for:
+    only the retry loop honoring AbortBatchError ahead of classification stops the second attempt.
+    """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises AbortBatchError."""
-        adapter = _FakeAdapter(failures=[AbortBatchError("nope")])
+        """Drive one generate_one whose send raises AbortBatchError under a transient classify verdict."""
+        adapter = _FakeAdapter(failures=[AbortBatchError("nope")], classify_result="transient")
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(automatic_prompt_caching=True)
         with pytest.raises(AbortBatchError):
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1225,7 +1229,10 @@ def test_backoff_sleep_does_not_hold_the_in_flight_slot(
 
     The failure carries no retry_after_seconds, so nothing pauses admission;
     only a held slot could delay the second request.
-    The second request must complete while the first is still backing off, which the first_task.done() check pins.
+    What pins the release is the second request's own duration: it is admitted while the first backs off,
+    so it finishes in far less than the backoff it would otherwise queue behind.
+    first_task.done() cannot pin this alone: a slot held across the sleep passes to the waiting second request
+    the moment the first retries, so the first is unfinished under either placement.
     The full-jitter draw is pinned to its ceiling so the backoff outlasts the second request deterministically.
     """
     monkeypatch.setattr(rate_limiter_module.random, "uniform", lambda _low, high: high)
@@ -1233,14 +1240,18 @@ def test_backoff_sleep_does_not_hold_the_in_flight_slot(
     async def scenario() -> None:
         """Interleave a retrying item with a clean one under one slot."""
         adapter = _FakeAdapter(failures=[TransientError("boom")])
+        backoff_base_seconds = 0.2
         rate_limiter = RateLimiter(
-            max_attempts=2, backoff_base_seconds=0.2, max_in_flight=1
+            max_attempts=2, backoff_base_seconds=backoff_base_seconds, max_in_flight=1
         )
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         first_task = asyncio.create_task(bound_llm.generate_one([UserMessage(content="a")]))
         await asyncio.sleep(0.01)
+        started_at = time.monotonic()
         second = await bound_llm.generate_one([UserMessage(content="b")])
+        second_elapsed_seconds = time.monotonic() - started_at
         assert second.output == "ok"
+        assert second_elapsed_seconds < backoff_base_seconds / 2
         assert not first_task.done()
         first = await first_task
         assert first.output == "ok"
@@ -1268,17 +1279,21 @@ def test_stream_protocol_error_releases_the_slot() -> None:
 
 
 def test_stream_releases_its_slot_when_exhausted() -> None:
-    """After a stream drains, its RateLimiter slot is available again."""
+    """Exhausting a stream returns its RateLimiter slot before the handle's block exits.
+
+    The acquire sits inside the still-open block, so only the release on exhaustion can satisfy it;
+    acquiring after the block would be satisfied by the release on block exit instead.
+    """
 
     async def scenario() -> None:
-        """Drain one stream under max_in_flight=1, then acquire the slot."""
+        """Drain one stream under max_in_flight=1, then acquire the slot inside the still-open block."""
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(_FakeAdapter(), rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
-        async with rate_limiter.slot():
-            pass
+            async with rate_limiter.slot():
+                pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

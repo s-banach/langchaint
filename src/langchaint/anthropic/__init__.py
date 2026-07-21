@@ -151,9 +151,13 @@ ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
     "anthropic.claude-opus-4-8": BedrockRouting(api="mantle", pricing_key="claude-opus-4-8"),
     "anthropic.claude-opus-4-7": BedrockRouting(api="mantle", pricing_key="claude-opus-4-7"),
     "anthropic.claude-sonnet-5": BedrockRouting(api="mantle", pricing_key="claude-sonnet-5"),
-    "anthropic.claude-haiku-4-5": BedrockRouting(api="mantle", pricing_key="claude-haiku-4-5-20251001"),
+    "anthropic.claude-haiku-4-5": BedrockRouting(
+        api="mantle", pricing_key="claude-haiku-4-5-20251001"
+    ),
     "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy", pricing_key="claude-opus-4-6"),
-    "us.anthropic.claude-sonnet-4-6": BedrockRouting(api="legacy", pricing_key="claude-sonnet-4-6"),
+    "us.anthropic.claude-sonnet-4-6": BedrockRouting(
+        api="legacy", pricing_key="claude-sonnet-4-6"
+    ),
 }
 """Routing per Bedrock wire model id.
 

@@ -64,6 +64,7 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
             return retry_after_seconds
     return None
 
+
 type StreamItem = str | ToolCall
 """What a stream yields: text chunks and completed tool calls.
 

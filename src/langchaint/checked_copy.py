@@ -88,7 +88,9 @@ class CheckedCopyModel(BaseModel):
             )
 
     @override
-    def model_copy(self, *, update: Mapping[str, object] | None = None, deep: bool = False) -> Self:
+    def model_copy(
+        self, *, update: Mapping[str, object] | None = None, deep: bool = False
+    ) -> Self:
         """Copy with the update keys checked against the model's fields before pydantic's unvalidated copy.
 
         Field values still bypass validation, as on pydantic's model_copy:

@@ -78,7 +78,9 @@ class FinalResponse(BaseModel):
     sources: list[str]
 
 
-def build_final_response_tool[FinalT: BaseModel](response_model: type[FinalT]) -> CaptureTool[FinalT]:
+def build_final_response_tool[FinalT: BaseModel](
+    response_model: type[FinalT],
+) -> CaptureTool[FinalT]:
     """Build one loop's final_response tool; only args_model varies between the parent and the sub-agent."""
     return CaptureTool(
         name="final_response",
@@ -169,7 +171,10 @@ async def run_agent[FinalT: BaseModel](
     def completed(final_response: FinalT) -> RunResult[FinalT]:
         """Assemble the RunResult; usage folds from the retained records."""
         generate_usage = Usage.sum_of(response.usage for response in responses)
-        return RunResult(final_response=final_response, usage=generate_usage + Usage.sum_of(tool_reported_usages))
+        return RunResult(
+            final_response=final_response,
+            usage=generate_usage + Usage.sum_of(tool_reported_usages),
+        )
 
     for _ in range(max_turns):
         final_response = await take_turn(bound, forcing=False)
@@ -180,7 +185,9 @@ async def run_agent[FinalT: BaseModel](
         final_response = await take_turn(forced, forcing=True)
         if final_response is not None:
             return completed(final_response)
-    raise RuntimeError(f"no valid {final_response_tool.name} call within {FORCED_TRIES} forced turns")
+    raise RuntimeError(
+        f"no valid {final_response_tool.name} call within {FORCED_TRIES} forced turns"
+    )
 
 
 class SubAgentReport(BaseModel):
@@ -223,7 +230,9 @@ def build_delegate_tool() -> PydanticTool[DelegateArgs, Usage]:
             max_turns=4,
             tool_budget_in_usd=0.01,
         )
-        return ToolOutputExplicit(content=sub_run.final_response.model_dump_json(), app_data=sub_run.usage)
+        return ToolOutputExplicit(
+            content=sub_run.final_response.model_dump_json(), app_data=sub_run.usage
+        )
 
     return PydanticTool(
         name="delegate",

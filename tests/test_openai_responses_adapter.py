@@ -172,9 +172,7 @@ def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
         _normalized_usage(
             ResponseUsage(
                 input_tokens=1000,
-                input_tokens_details=InputTokensDetails(
-                    cached_tokens=900, cache_write_tokens=200
-                ),
+                input_tokens_details=InputTokensDetails(cached_tokens=900, cache_write_tokens=200),
                 output_tokens=40,
                 output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
                 total_tokens=1040,
@@ -209,9 +207,7 @@ def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
 
 def test_stop_reason_is_tool_use_with_a_function_call_item() -> None:
     """Any function_call output item derives tool_use, whatever the status."""
-    response = _response(
-        usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]
-    )
+    response = _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM])
     assert _normalized_stop_reason(response) == "tool_use"
 
 
@@ -522,7 +518,10 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     assert _wire_tool_choice("auto") == "auto"
     assert _wire_tool_choice("required") == "required"
     assert _wire_tool_choice("none") == "none"
-    assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {"type": "function", "name": "x"}
+    assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {
+        "type": "function",
+        "name": "x",
+    }
 
 
 def _adapter(
@@ -580,9 +579,7 @@ def test_request_sends_an_effort_alone_without_a_summary_key() -> None:
     An explicit null summary is a different request from omitting the key,
     which is what key-by-key assembly buys over one Reasoning(effort=..., summary=...) call.
     """
-    request = _adapter()._request(
-        _binding(automatic_prompt_caching=True, reasoning_effort="high")
-    )
+    request = _adapter()._request(_binding(automatic_prompt_caching=True, reasoning_effort="high"))
     assert request.reasoning == {"effort": "high"}
 
 
@@ -1080,7 +1077,10 @@ def test_wire_input_marks_marked_user_and_tool_parts() -> None:
     """A marked part carries prompt_cache_breakpoint on its wire part; unmarked siblings carry none."""
     wire = _wire_input([
         UserMessage(
-            content=(TextPart(text="shared context", cache_breakpoint=True), TextPart(text="question"))
+            content=(
+                TextPart(text="shared context", cache_breakpoint=True),
+                TextPart(text="question"),
+            )
         ),
         ToolMessage(
             tool_call_id="c1",

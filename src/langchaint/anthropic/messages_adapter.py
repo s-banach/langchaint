@@ -432,9 +432,7 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
         if block.type == "text":
             turn.append(TextPart(text=block.text))
         elif block.type == "tool_use":
-            turn.append(
-                ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input))
-            )
+            turn.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
         elif block.type == "thinking":
             turn.append(
                 ReasoningTrace(
@@ -613,9 +611,7 @@ class AnthropicMessagesAdapter(Adapter):
                 f"cache_ttl='1h' for model {model!r} requires a PricingTable with "
                 f"cache_write_1h_usd_per_million_tokens, which prices the 2x 1-hour cache writes"
             )
-        super().__init__(
-            client=client, model=model, pricing=pricing, provider_name=provider_name
-        )
+        super().__init__(client=client, model=model, pricing=pricing, provider_name=provider_name)
         # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
         # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
         self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001

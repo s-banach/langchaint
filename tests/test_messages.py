@@ -93,13 +93,20 @@ def test_tool_message_is_frozen() -> None:
 def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
     """A marked part survives the JSON round trip; an unmarked part re-validates with the default."""
     conversation: tuple[Message, ...] = (
-        UserMessage(content=(TextPart(text="shared context", cache_breakpoint=True), TextPart(text="question"))),
+        UserMessage(
+            content=(
+                TextPart(text="shared context", cache_breakpoint=True),
+                TextPart(text="question"),
+            )
+        ),
         ToolMessage(
             tool_call_id="c1",
             content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),),
         ),
     )
-    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(_CONVERSATION_TYPE_ADAPTER.dump_json(conversation))
+    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(
+        _CONVERSATION_TYPE_ADAPTER.dump_json(conversation)
+    )
     assert restored == conversation
     restored_user = restored[0]
     assert isinstance(restored_user, UserMessage)

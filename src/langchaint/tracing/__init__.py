@@ -503,15 +503,11 @@ def _apply_result_attributes(
     try:
         _record_attempt_failed_events(span, result)
     except Exception:
-        _logger.warning(
-            "attempt_failed events raised; leaving span events partial", exc_info=True
-        )
+        _logger.warning("attempt_failed events raised; leaving span events partial", exc_info=True)
     try:
         attributes = attribute_mapper(result)
     except Exception:
-        _logger.warning(
-            "attribute_mapper raised; leaving span attributes partial", exc_info=True
-        )
+        _logger.warning("attribute_mapper raised; leaving span attributes partial", exc_info=True)
         return
     span.set_attributes(attributes)
 

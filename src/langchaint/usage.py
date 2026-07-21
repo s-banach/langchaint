@@ -55,7 +55,8 @@ class Usage(CheckedCopyModel):
         """Fieldwise sum, cost included; the counters and dollars of two attempts combine to one."""
         return Usage(
             input_tokens_cache_read=self.input_tokens_cache_read + other.input_tokens_cache_read,
-            input_tokens_cache_write=self.input_tokens_cache_write + other.input_tokens_cache_write,
+            input_tokens_cache_write=self.input_tokens_cache_write
+            + other.input_tokens_cache_write,
             input_tokens_cache_none=self.input_tokens_cache_none + other.input_tokens_cache_none,
             output_tokens=self.output_tokens + other.output_tokens,
             output_tokens_reasoning=self.output_tokens_reasoning + other.output_tokens_reasoning,

@@ -229,7 +229,9 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
     return {"role": "user", "content": parts}
 
 
-def _function_call_output(content: str | tuple[Part, ...]) -> str | ResponseFunctionCallOutputItemListParam:
+def _function_call_output(
+    content: str | tuple[Part, ...],
+) -> str | ResponseFunctionCallOutputItemListParam:
     """Convert one ToolMessage's content to the function_call_output output field.
 
     The installed openai SDK's function_call_output output field is `str | ResponseFunctionCallOutputItemListParam`,
@@ -582,9 +584,7 @@ class OpenAIResponsesAdapter(Adapter):
         Raises:
             ValueError: raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
-        super().__init__(
-            client=client, model=model, pricing=pricing, provider_name=provider_name
-        )
+        super().__init__(client=client, model=model, pricing=pricing, provider_name=provider_name)
         self.client = client.with_options(max_retries=0)
         self.supports_prompt_cache_options = supports_prompt_cache_options
         self.reasoning_summary = reasoning_summary
@@ -725,7 +725,11 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
                     name=sdk_event.item.name,
                     args_json=sdk_event.item.arguments,
                 )
-            elif sdk_event.type in ("response.completed", "response.incomplete", "response.failed"):
+            elif sdk_event.type in (
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            ):
                 self._terminal_response = sdk_event.response
         if self._terminal_response is None:
             raise StreamProtocolError("stream ended without a terminal response")

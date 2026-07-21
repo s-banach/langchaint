@@ -460,9 +460,7 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
             return _FakeAdapter(echo=True, failures=[TransientError("x")])
 
         plain = (
-            await LLM(
-                _adapter(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1)
-            )
+            await LLM(_adapter(), rate_limiter=_fast_rate_limiter(max_attempts=1, max_in_flight=1))
             .bind(automatic_prompt_caching=True)
             .generate_many(conversations)
         )
@@ -2218,7 +2216,7 @@ def test_conversation_tool_calls_nest_parsed_arguments_and_keep_unparseable_text
 
 @pytest.mark.parametrize(
     ("args_json", "expected"),
-    [('[1, 2]', [1, 2]), ('"bare"', "bare"), ("7", 7), ("null", None)],
+    [("[1, 2]", [1, 2]), ('"bare"', "bare"), ("7", 7), ("null", None)],
 )
 def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
     args_json: str, expected: object

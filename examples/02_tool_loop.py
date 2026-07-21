@@ -85,7 +85,9 @@ async def run_agent(
             return response.output
         for call in response.tool_calls:
             if approve is not None and not approve(call):
-                declined = ToolMessage(tool_call_id=call.id, content="The user declined this action.", is_error=True)
+                declined = ToolMessage(
+                    tool_call_id=call.id, content="The user declined this action.", is_error=True
+                )
                 conversation.append(declined)
                 continue
             outcome = await tool_manager.dispatch(call)
@@ -121,7 +123,9 @@ async def reading_dispatch_outcomes() -> None:
     DispatchUnknownTool carries the off-list called_name.
     """
     tool_manager = ToolManager([weather_tool])
-    bound = openai_model("gpt-5.6-terra").bind(tool_manager=tool_manager, automatic_prompt_caching=False)
+    bound = openai_model("gpt-5.6-terra").bind(
+        tool_manager=tool_manager, automatic_prompt_caching=False
+    )
     conversation: list[Message] = [UserMessage(content="What is the weather in Oslo?")]
     response = await bound.generate_one(conversation)
     conversation.append(response.assistant_message)
@@ -187,7 +191,9 @@ async def approval_run() -> None:
         tool_manager=tool_manager,
         automatic_prompt_caching=True,
     )
-    answer = await run_agent(bound, tool_manager, "Transfer 50 USD to account A-1.", approve=require_approval)
+    answer = await run_agent(
+        bound, tool_manager, "Transfer 50 USD to account A-1.", approve=require_approval
+    )
     print(answer)
 
 

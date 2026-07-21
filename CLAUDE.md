@@ -83,7 +83,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 
 Trigger: before committing. Run `scripts/CI.sh`; fix every error it reports and rerun until it reports zero.
 
-It runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the tools resolve from the locked dev group. The de-selected docstring rules and their reasons are in `pyproject.toml`. Keep the tests offline (constructed SDK objects, stub adapters, no API keys). `tests/*` carries a `SLF001` per-file-ignore because the tests exercise private helpers directly.
+It runs `pyrefly check`, `ruff check`, `ruff format --check`, and `pytest` through `uv run`, so the tools resolve from the locked dev group. The de-selected docstring rules and their reasons are in `pyproject.toml`. Keep the tests offline (constructed SDK objects, stub adapters, no API keys). `tests/*` carries a `SLF001` per-file-ignore because the tests exercise private helpers directly.
 
 # Commit Review
 

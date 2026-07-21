@@ -119,9 +119,7 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         usage = result.usage
     else:
         output = result.output
-        output_cell = (
-            output.model_dump_json() if isinstance(output, BaseModel) else str(output)
-        )
+        output_cell = output.model_dump_json() if isinstance(output, BaseModel) else str(output)
         error_text = None
         stop_reason = result.stop_reason
         usage = result.usage

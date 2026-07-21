@@ -42,7 +42,9 @@ async def main() -> None:
     jsonschema's own errors, the same arm and format a PydanticTool's argument failure lands in,
     so the app's loop handles both tool forms identically.
     """
-    valid = await search_tool.dispatch(ToolCall(id="c1", name="search", args_json='{"query": "tides"}'))
+    valid = await search_tool.dispatch(
+        ToolCall(id="c1", name="search", args_json='{"query": "tides"}')
+    )
     print(valid.tool_message.content)
 
     invalid = await search_tool.dispatch(

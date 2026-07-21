@@ -217,9 +217,7 @@ class ToolMessage(CheckedCopyModel):
     role: Literal["tool"] = "tool"
 
 
-type Message = Annotated[
-    UserMessage | AssistantMessage | ToolMessage, Field(discriminator="role")
-]
+type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="role")]
 """Discriminated on role: pydantic validation selects the member from the tag,
 never from which member's fields happen to match,
 so callers can persist a conversation as JSON and re-validate it with a TypeAdapter.

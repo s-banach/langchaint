@@ -26,7 +26,9 @@ async def plain_text() -> None:
     these one-shot prompts reuse no prefix, so False. 02_tool_loop.py shows the case where True pays.
     """
     llm = openai_model("gpt-5.6-terra")
-    assistant = llm.bind(system_prompt="You are a terse assistant.", automatic_prompt_caching=False)
+    assistant = llm.bind(
+        system_prompt="You are a terse assistant.", automatic_prompt_caching=False
+    )
     response = await assistant.generate_one("Name three primary colors.")
     print(response.output)
     print(f"{response.usage.cost_in_usd:.6f} USD, {response.usage.output_tokens} output tokens")

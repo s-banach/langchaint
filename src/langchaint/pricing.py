@@ -99,13 +99,17 @@ def price(counts: PriceableCounts, pricing: PricingTable) -> CostBreakdown:
     return CostBreakdown(
         counts=counts,
         input_tokens_cache_none_cost_in_usd=(
-            counts.input_tokens_cache_none * pricing.input_cache_none_usd_per_million_tokens / 1_000_000
+            counts.input_tokens_cache_none
+            * pricing.input_cache_none_usd_per_million_tokens
+            / 1_000_000
         ),
         input_tokens_cache_read_cost_in_usd=(
             counts.input_tokens_cache_read * pricing.cache_read_usd_per_million_tokens / 1_000_000
         ),
         input_tokens_cache_write_cost_in_usd=(
-            counts.input_tokens_cache_write * pricing.cache_write_usd_per_million_tokens / 1_000_000
+            counts.input_tokens_cache_write
+            * pricing.cache_write_usd_per_million_tokens
+            / 1_000_000
         ),
         input_tokens_cache_write_1h_cost_in_usd=input_tokens_cache_write_1h_cost_in_usd,
         output_tokens_cost_in_usd=(

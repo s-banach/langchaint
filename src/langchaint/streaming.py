@@ -150,7 +150,9 @@ class StreamHandle[OutputT]:
                 usage_raw=wrapped.usage_raw,
             )
         )
-        return self._rate_limiter.register_transient_error(_extract_transient_errors(self._attempt_records))
+        return self._rate_limiter.register_transient_error(
+            _extract_transient_errors(self._attempt_records)
+        )
 
     async def _backoff_or_exhaust(self, exc: Exception, delay_seconds: float) -> None:
         """Back off before the next open attempt; call after the failed attempt's release.
@@ -242,7 +244,9 @@ class StreamHandle[OutputT]:
             RuntimeError: the handle is unopened or finished.
         """
         if self._state != "open":
-            raise RuntimeError(_UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE)
+            raise RuntimeError(
+                _UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE
+            )
         try:
             return await self._next_item()
         except StopAsyncIteration:
@@ -275,9 +279,7 @@ class StreamHandle[OutputT]:
                     raise non_retriable from exc
                 if self._yielded_any:
                     await self._close_adapter_stream()
-                    raise TransientError(
-                        f"stream failed after items were yielded: {exc}"
-                    ) from exc
+                    raise TransientError(f"stream failed after items were yielded: {exc}") from exc
                 delay_seconds = self._record_transient_error(exc)
                 await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, delay_seconds)
@@ -315,13 +317,19 @@ class StreamHandle[OutputT]:
         if self._response is not None:
             return self._response
         if self._state != "open":
-            raise RuntimeError(_UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE)
+            raise RuntimeError(
+                _UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE
+            )
         async for _ in self:
             pass
         assert self._adapter_stream is not None
         assert self._attempt_started_at_monotonic_seconds is not None
         assert self._started_at_monotonic_seconds is not None
-        ended_at_monotonic_seconds = time.monotonic() if self._ended_at_monotonic_seconds is None else self._ended_at_monotonic_seconds
+        ended_at_monotonic_seconds = (
+            time.monotonic()
+            if self._ended_at_monotonic_seconds is None
+            else self._ended_at_monotonic_seconds
+        )
         try:
             adapter_result = await self._adapter_stream.final()
         except GenerationError as exc:

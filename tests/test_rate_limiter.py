@@ -227,9 +227,10 @@ def test_probe_rate_limit_failure_pauses_admission_again() -> None:
         first_chain = [_rate_limit_error()]
         rate_limiter.register_transient_error(first_chain)
         probe_admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-        rate_limiter.register_transient_error(
-            [*first_chain, _rate_limit_error(retry_after_seconds=0.05)]
-        )
+        rate_limiter.register_transient_error([
+            *first_chain,
+            _rate_limit_error(retry_after_seconds=0.05),
+        ])
         rate_limiter.release(probe_admission)
         started_at = time.monotonic()
         async with rate_limiter.slot():

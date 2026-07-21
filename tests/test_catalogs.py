@@ -290,7 +290,9 @@ def test_reasoning_summary_lands_on_the_adapter() -> None:
 
 def test_cache_ttl_lands_on_the_adapter() -> None:
     """A caller-supplied cache_ttl reaches the adapter; the default is "5m"."""
-    llm = anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="offline"), cache_ttl="1h")
+    llm = anthropic_model(
+        "claude-sonnet-5", client=AsyncAnthropic(api_key="offline"), cache_ttl="1h"
+    )
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.cache_ttl == "1h"
@@ -302,10 +304,14 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
 @pytest.mark.parametrize(
     ("build_llm", "expected_provider_name"),
     [
-        (lambda: anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="k")), "anthropic"),
+        (
+            lambda: anthropic_model("claude-sonnet-5", client=AsyncAnthropic(api_key="k")),
+            "anthropic",
+        ),
         (
             lambda: anthropic_bedrock_model(
-                "us.anthropic.claude-sonnet-4-6", client=AsyncAnthropicBedrock(aws_region="us-east-1")
+                "us.anthropic.claude-sonnet-4-6",
+                client=AsyncAnthropicBedrock(aws_region="us-east-1"),
             ),
             "aws.bedrock",
         ),

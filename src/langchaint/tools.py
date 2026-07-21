@@ -223,7 +223,9 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
             raise InvalidToolArgsError(exc) from exc
         return await self.function(args)
 
-    async def dispatch(self, call: ToolCall) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
+    async def dispatch(
+        self, call: ToolCall
+    ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
         """Run this tool on call and wrap the outcome as a DispatchHandled or DispatchInvalidToolArgs.
 
         Assembles the ToolMessage the application appends
@@ -286,7 +288,9 @@ class CaptureTool[CapturedT: BaseModel]:
             args_schema=self.args_model.model_json_schema(),
         )
 
-    async def capture(self, call: ToolCall) -> DispatchCaptured[CapturedT] | DispatchInvalidToolArgs:
+    async def capture(
+        self, call: ToolCall
+    ) -> DispatchCaptured[CapturedT] | DispatchInvalidToolArgs:
         """Validate call.args_json against args_model and return the typed capture.
 
         A validation failure returns the same DispatchInvalidToolArgs any tool form produces.
@@ -302,7 +306,9 @@ class CaptureTool[CapturedT: BaseModel]:
             captured=captured,
         )
 
-    async def dispatch(self, call: ToolCall) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
+    async def dispatch(
+        self, call: ToolCall
+    ) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
         """Answer a manager-routed call: capture's outcome with the capture as app_data.
 
         The manager's channel erases per-tool types, so the capture rides DispatchHandled.app_data there.
@@ -368,9 +374,13 @@ class JSONSchemaTool[AppDataT = None]:
 
     def schema(self) -> ToolSchema:
         """Convert to the provider-neutral schema, passing args_schema through unchanged."""
-        return ToolSchema(name=self.name, description=self.description, args_schema=self.args_schema)
+        return ToolSchema(
+            name=self.name, description=self.description, args_schema=self.args_schema
+        )
 
-    async def dispatch(self, call: ToolCall) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
+    async def dispatch(
+        self, call: ToolCall
+    ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
         """Parse call.args_json to a dict, validate it against args_schema, run the function, and wrap the outcome.
 
         The JSON-object precondition runs first, then jsonschema validation of the parsed object;
@@ -413,7 +423,9 @@ class Tool[AppDataT](Protocol):
         """Return the provider-neutral schema of this tool."""
         ...
 
-    async def dispatch(self, call: ToolCall) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
+    async def dispatch(
+        self, call: ToolCall
+    ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
         """Run this tool on call and wrap the outcome."""
         ...
 
@@ -433,7 +445,9 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
         raise ValueError(f"render_invalid_tool_args for {tool_name} received no details to render")
     lines = [f"invalid arguments for {tool_name}:"]
     for detail in details:
-        joined_path = ".".join(str(segment) for segment in detail.path) if detail.path else "(root)"
+        joined_path = (
+            ".".join(str(segment) for segment in detail.path) if detail.path else "(root)"
+        )
         lines.append(f"  {joined_path}: {detail.message}")
     return "\n".join(lines)
 
@@ -498,7 +512,9 @@ def _invalid_args_outcome(
     return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
 
-def _handled_outcome[AppDataT](call: ToolCall, result: ToolOutput[AppDataT]) -> DispatchHandled[AppDataT]:
+def _handled_outcome[AppDataT](
+    call: ToolCall, result: ToolOutput[AppDataT]
+) -> DispatchHandled[AppDataT]:
     """Wrap a tool function's result into the DispatchHandled the application appends.
 
     Shared by PydanticTool.dispatch and JSONSchemaTool.dispatch: a ToolOutputExplicit carries its content,
@@ -521,9 +537,7 @@ class ToolManager:
     the manager only resolves the called name and returns the outcome as a DispatchOutcome.
     """
 
-    def __init__(
-        self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]
-    ) -> None:
+    def __init__(self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]) -> None:
         """Index the tools by name.
 
         Each element is any Tool implementation, keyed by name.
@@ -564,9 +578,7 @@ class ToolManager:
         if tool is None:
             tool_message = ToolMessage(
                 tool_call_id=call.id,
-                content=render_unknown_tool(
-                    called_name=call.name, held_names=tuple(self._tools)
-                ),
+                content=render_unknown_tool(called_name=call.name, held_names=tuple(self._tools)),
                 is_error=True,
             )
             return DispatchUnknownTool(tool_message=tool_message, called_name=call.name)

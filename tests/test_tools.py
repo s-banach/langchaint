@@ -140,7 +140,10 @@ def test_details_from_pydantic_and_renderer_format_per_field() -> None:
     rendered = render_invalid_tool_args("send_email", details)
     expected = "\n".join(
         ["invalid arguments for send_email:"]
-        + [f"  {'.'.join(str(segment) for segment in detail.path)}: {detail.message}" for detail in details]
+        + [
+            f"  {'.'.join(str(segment) for segment in detail.path)}: {detail.message}"
+            for detail in details
+        ]
     )
     assert rendered == expected
     assert "\n  to.0.email: " in rendered
@@ -192,6 +195,7 @@ def test_dispatch_carries_a_parts_result_into_tool_message_content() -> None:
 
     A success path that dropped or stringified the result would fail this equality.
     """
+
     async def _parts_function(args: _EchoArgs) -> Sequence[Part]:
         """Return content parts built from the validated text instead of a string."""
         return [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
@@ -288,7 +292,9 @@ def test_dispatch_unknown_tool_content_delegates_to_the_renderer() -> None:
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     assert isinstance(result, DispatchUnknownTool)
-    assert result.tool_message.content == render_unknown_tool(called_name="missing", held_names=("echo",))
+    assert result.tool_message.content == render_unknown_tool(
+        called_name="missing", held_names=("echo",)
+    )
 
 
 def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
@@ -398,9 +404,7 @@ def test_dispatch_carries_app_data_on_the_error_outcome() -> None:
 
     async def _persist_then_fail_function(args: _EchoArgs) -> ToolOutputExplicit[_Receipt]:
         """Persist a record, then report a model-visible failure carrying that record."""
-        return ToolOutputExplicit(
-            content=f"declined {args.text}", is_error=True, app_data=receipt
-        )
+        return ToolOutputExplicit(content=f"declined {args.text}", is_error=True, app_data=receipt)
 
     tool = PydanticTool(
         name="persist",
@@ -612,7 +616,9 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     """Arguments satisfying args_schema reach the function: validation passed, a DispatchHandled."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
-    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}')))
+    result = asyncio.run(
+        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
+    )
     assert isinstance(result, DispatchHandled)
     assert result.tool_message.content == "sunny in Oslo"
     assert result.tool_message.is_error is False
@@ -623,7 +629,9 @@ def test_schema_tool_schema_violation_skips_the_function() -> None:
     """A schema violation becomes a DispatchInvalidToolArgs and the function never runs."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
-    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"town": "Oslo"}')))
+    result = asyncio.run(
+        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"town": "Oslo"}'))
+    )
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.tool_call_id == "c1"
     assert calls == []
@@ -659,7 +667,9 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
     """A JSONSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel."""
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
-    async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
+    async def _mcp_function(
+        args: Mapping[str, object],
+    ) -> ToolOutputExplicit[Mapping[str, object]]:
         """Return model-visible content plus the raw MCP result the model never sees.
 
         Annotated Mapping[str, object]: accepted against the dict[str, object] parameter by contravariance,
@@ -690,8 +700,12 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
     names = {schema.name for schema in manager.schemas()}
     assert names == {"echo", "weather"}
 
-    echo_result = asyncio.run(manager.dispatch(ToolCall(id="c1", name="echo", args_json='{"text": "hi"}')))
-    weather_result = asyncio.run(manager.dispatch(ToolCall(id="c2", name="weather", args_json='{"city": "Oslo"}')))
+    echo_result = asyncio.run(
+        manager.dispatch(ToolCall(id="c1", name="echo", args_json='{"text": "hi"}'))
+    )
+    weather_result = asyncio.run(
+        manager.dispatch(ToolCall(id="c2", name="weather", args_json='{"city": "Oslo"}'))
+    )
     assert isinstance(echo_result, DispatchHandled)
     assert isinstance(weather_result, DispatchHandled)
     assert echo_result.tool_message.content == "hi"
@@ -706,9 +720,13 @@ def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> 
     This is the JSONSchemaTool analogue of the PydanticTool.dispatch test.
     """
 
-    async def _mcp_function(args: Mapping[str, object]) -> ToolOutputExplicit[Mapping[str, object]]:
+    async def _mcp_function(
+        args: Mapping[str, object],
+    ) -> ToolOutputExplicit[Mapping[str, object]]:
         """Return content plus a mapping app_data."""
-        return ToolOutputExplicit(content=f"weather for {args['city']}", app_data={"source": "mcp"})
+        return ToolOutputExplicit(
+            content=f"weather for {args['city']}", app_data={"source": "mcp"}
+        )
 
     tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
         name="weather",
@@ -716,7 +734,9 @@ def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> 
         args_schema=_WEATHER_SCHEMA,
         function=_mcp_function,
     )
-    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}')))
+    result = asyncio.run(
+        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
+    )
     assert isinstance(result, DispatchHandled)
     raw: Mapping[str, object] | None = result.app_data
     assert raw is not None
@@ -764,8 +784,15 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
             return f"set {args.text}"
 
         manager = ToolManager([
-            PydanticTool(name="waiter", description="Waits.", args_model=_EchoArgs, function=_waiter_function),
-            PydanticTool(name="setter", description="Sets.", args_model=_EchoArgs, function=_setter_function),
+            PydanticTool(
+                name="waiter",
+                description="Waits.",
+                args_model=_EchoArgs,
+                function=_waiter_function,
+            ),
+            PydanticTool(
+                name="setter", description="Sets.", args_model=_EchoArgs, function=_setter_function
+            ),
         ])
         tool_calls = [
             ToolCall(id="c1", name="waiter", args_json='{"text": "a"}'),
@@ -967,7 +994,9 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
 
     async def _run() -> None:
         manager = ToolManager([
-            PydanticTool(name="hang", description="Hangs.", args_model=_EchoArgs, function=_hanging_function)
+            PydanticTool(
+                name="hang", description="Hangs.", args_model=_EchoArgs, function=_hanging_function
+            )
         ])
         tool_calls = [
             ToolCall(id="c1", name="hang", args_json='{"text": "a"}'),

@@ -127,22 +127,21 @@ class AttemptRecord:
         return self.ended_at_monotonic_seconds - self.started_at_monotonic_seconds
 
 
-def _extract_transient_errors(attempt_records: Sequence[AttemptRecord]) -> tuple[TransientError, ...]:
+def _extract_transient_errors(
+    attempt_records: Sequence[AttemptRecord],
+) -> tuple[TransientError, ...]:
     """Return the errors of the failed attempts, in order.
 
     The fold RetriesExhaustedError and RateLimiter.delay_seconds consume;
     on a failure this is every record's error, on a success all but the last.
     """
-    return tuple(
-        record.error for record in attempt_records if record.error is not None
-    )
+    return tuple(record.error for record in attempt_records if record.error is not None)
 
 
 def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
     """Flatten the failure chain to one line, numbering each attempt."""
     return "; ".join(
-        f"attempt {index + 1}: {record.error}"
-        for index, record in enumerate(attempt_records)
+        f"attempt {index + 1}: {record.error}" for index, record in enumerate(attempt_records)
     )
 
 

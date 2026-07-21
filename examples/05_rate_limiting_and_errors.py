@@ -74,9 +74,13 @@ def report_billing(response: Response[str]) -> None:
     paid_total = response.usage
     kept_answer = response.usage_successful_attempt
     print(f"paid total: {paid_total.cost_in_usd:.6f} USD across {response.attempts} attempt(s)")
-    print(f"kept answer: {kept_answer.cost_in_usd:.6f} USD (equal unless a billed 200 was retried)")
+    print(
+        f"kept answer: {kept_answer.cost_in_usd:.6f} USD (equal unless a billed 200 was retried)"
+    )
     for index, record in enumerate(response.attempt_records):
-        print(f"  attempt {index + 1}: usage_raw={'present' if record.usage_raw is not None else 'none'}")
+        print(
+            f"  attempt {index + 1}: usage_raw={'present' if record.usage_raw is not None else 'none'}"
+        )
 
 
 async def generate_with_fallback(

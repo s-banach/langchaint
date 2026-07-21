@@ -38,9 +38,9 @@ def configure_otel() -> None:
     ConsoleSpanExporter prints spans to stdout; swap in an OTLPSpanExporter to send them to a collector.
     This is the only tracing-related code that is not langchaint: langchaint emits spans, the SDK routes them.
     """
-    provider = TracerProvider()
-    provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
-    trace.set_tracer_provider(provider)
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(tracer_provider)
 
 
 async def traced_generate() -> None:

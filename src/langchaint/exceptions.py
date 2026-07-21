@@ -385,7 +385,10 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
 
 
 class StreamProtocolError(Exception):
-    """An adapter stream violated the event contract.
+    """A stream did not follow the event contract.
 
-    Example: the stream ended without a stop event.
+    Raised where a stream ends without the terminal event carrying its result
+    (no stop reason on the Messages API, no terminal response on the Responses API,
+    or a StreamHandle that finished iterating with no adapter stream left to ask),
+    and where final() is called before items() is exhausted, so no terminal response was captured.
     """

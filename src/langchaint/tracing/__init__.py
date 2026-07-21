@@ -1094,7 +1094,7 @@ class TracedStreamHandle[OutputT]:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
                 on the structured path, or retries exhausted while draining); the span is attributed and closed first.
             AbortBatchError: draining hit an error classified as abort; the span records it and closes.
-            StreamProtocolError: the adapter stream violated the event contract; the span records it and closes.
+            StreamProtocolError: the stream ended without a terminal response; the span records it and closes.
         """
         span = self._ensure_span()
         if self._span_ended:

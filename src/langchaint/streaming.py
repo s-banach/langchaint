@@ -208,7 +208,7 @@ class StreamHandle[OutputT]:
             TransientError: the stream failed after items were yielded.
             AbortBatchError: the adapter classified an open or item error as abort.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget while opening the stream.
-            StreamProtocolError: the adapter stream violated the event contract; propagates unchanged.
+            StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
             StopAsyncIteration: the stream is exhausted.
         """
         while True:

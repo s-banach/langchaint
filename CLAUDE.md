@@ -16,7 +16,7 @@ Document what a function raises. In every function whose body can raise (directl
 
 Never assert provider behavior (wire parameters, usage-field semantics, exception taxonomies, cache rules) from memory; verify it against the installed `anthropic`/`openai` packages by introspection before writing or reviewing code that depends on it.
 
-Put a verified fact in the docstring of the code that depends on it, with the SDK version when the fact could drift. Record in CLAUDE.md only facts that justify a rule spanning modules, cited inside that rule.
+Put a verified fact in a docstring only where the caller acts on it, naming the outcome the caller handles and not the SDK mechanism reaching it, with the SDK version when it could drift.
 
 ## Naming rules
 

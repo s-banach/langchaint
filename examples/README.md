@@ -4,7 +4,8 @@ Short, runnable examples of langchaint.
 Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK installed and the provider's API key in the environment.
 The `openai` package and `OPENAI_API_KEY` cover the openai examples.
 `05_rate_limiting_and_errors.py` and `06_prompt_caching.py` also build anthropic models, so they additionally need the `anthropic` package and `ANTHROPIC_API_KEY`.
-`07_json_schema_tool_validation.py` is the one exception to needing an API key: it dispatches constructed `ToolCall`s with no provider involved.
+`07_json_schema_tool_validation.py` needs no API key: it dispatches constructed `ToolCall`s with no provider involved.
+`full_app/` needs none either: its adapter is scripted and offline.
 Where a tool's specifics do not matter, the code uses a minimal tool (a canned weather lookup, a canned search) rather than a realistic one.
 
 | File | Shows |
@@ -18,5 +19,7 @@ Where a tool's specifics do not matter, the code uses a minimal tool (a canned w
 | [`07_json_schema_tool_validation.py`](07_json_schema_tool_validation.py) | `JSONSchemaTool` argument validation: `dispatch` validates the arguments against `args_schema`, landing schema violations in the same `DispatchInvalidToolArgs` house message as the `PydanticTool` path |
 | [`08_required_choice_and_limits.py`](08_required_choice_and_limits.py) | the budgeted `tool_choice="required"` loop: a structured exit captured through a `CaptureTool`, `SpecificToolChoice` forcing that exit when `max_turns` is spent, a tool budget fed by `Usage` reported as `app_data`, and a whole sub-agent loop wrapped as one tool |
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | the call-for-call API map and what replaces the middleware layer |
+| [`full_app/`](full_app/README.md) | the reference architecture for a streaming multi-agent app: `AgentRun`, sub-agents as tools, three nested deadlines, and accounting that survives every failure |
 
 Start with `MIGRATING_FROM_LANGCHAIN.md` for the mental model, then `01_basics.py`; the centerpiece is `02_tool_loop.py`, because the loop LangChain's agent classes hide is the one langchaint expects you to write yourself.
+`full_app/` is where those pieces compose into a whole application.

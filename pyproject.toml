@@ -57,8 +57,10 @@ preset = "strict"
 project-includes = ["src", "tests", "examples", "scripts"]
 # src is the langchaint import root; the repo root is added so cross-module test
 # imports (tests.test_bound_llm reused by tests.test_tracing) resolve the same way
-# pytest resolves them at runtime.
-search-path = ["src", "."]
+# pytest resolves them at runtime. examples/full_app is added because its modules import
+# each other by bare name (from events import Event), the way they resolve when run
+# by path with that directory on sys.path.
+search-path = ["src", ".", "examples/full_app"]
 
 # Enabled above strict: redundant-cast enforces the "no cast" smell's
 # stale half (every finding is a deletable cast), and deprecated flags
@@ -75,7 +77,11 @@ redundant-cast = "error"
 deprecated = "error"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# examples/full_app is in because its claims suite asserts what the app's docstrings say,
+# the span nesting and the timeout layers; an unchecked claim is a claim that rots.
+testpaths = ["tests", "examples/full_app"]
+# examples/full_app's modules import each other by bare name, the way they resolve when run by path.
+pythonpath = ["examples/full_app"]
 
 [tool.ruff]
 line-length = 99
@@ -84,6 +90,11 @@ format.preview = true
 lint.preview = true
 lint.explicit-preview-rules = true
 lint.select = [
+    # A context manager held across a yield in an async generator stays open while the consumer runs,
+    # because an async generator has no context of its own: an asyncio.timeout then measures the
+    # consumer's pace and cancels into the consumer's frame, and a current span is adopted by whatever
+    # the consumer opens next. Preview-only, so selecting the ASYNC group alone does not enable it.
+    "ASYNC119",
     "ANN",
     "BLE",
     "FBT",
@@ -198,5 +209,13 @@ lint.per-file-ignores."tests/*" = ["SLF001", "PLR0913"]
 # deliberately not an importable package, so INP001 (implicit-namespace-package,
 # which would demand an examples/__init__.py) does not apply.
 lint.per-file-ignores."examples/*" = ["INP001"]
+
+# examples/full_app/ holds the multi-agent example app whose README argues for its shape. Like the
+# numbered examples its modules are standalone scripts run by path, hence INP001. BLE001 (blind-except)
+# is ignored because catching bare Exception around a sub-run is deliberate: a narrower except
+# turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
+# of a message the parent model can answer around. Each such except carries a comment stating
+# that.
+lint.per-file-ignores."examples/full_app/*" = ["INP001", "BLE001"]
 
 [tool.typos.default.extend-words]

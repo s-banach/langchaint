@@ -4,7 +4,7 @@ The schema is the only validation code: dispatch checks that the arguments are a
 them against args_schema with jsonschema (a langchaint dependency, like pydantic), so an invalid call becomes
 the same DispatchInvalidToolArgs house message a PydanticTool's argument failure produces
 and the function only ever sees valid arguments.
-This is the one example that needs no API key: it dispatches constructed ToolCalls, no provider involved.
+This example needs no API key: it dispatches constructed ToolCalls, no provider involved.
 """
 
 import asyncio

@@ -46,6 +46,16 @@ langchaint ships no loop, so there is nothing to splice into: each hook is plain
 
 The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full conversation in scope, not a callback fighting an engine that holds the state.
 
+## From LangGraph
+
+`StateGraph` nodes and conditional edges are plain control flow in the loop you own, and the middleware table above covers the `create_agent` hooks. Three mappings are specific to LangGraph apps.
+
+| LangGraph | langchaint |
+| --- | --- |
+| summing `AIMessage.usage_metadata` across turns to bill a run | `response.usage` is the paid total across retries and carries `cost_in_usd`; `Usage.sum_of` folds a run, and a cancelled call's settled spend lands in `abandoned_call_log` |
+| a per-call deadline as `awrap_model_call` middleware | `asyncio.timeout` around the call it bounds, in the loop you own (see `examples/full_app`) |
+| `get_stream_writer()` and `astream(subgraphs=True)` stream a nested sub-agent progress tree to one consumer with no reference passing | no counterpart: the application owns the event stream, and `examples/full_app` (`events.py`, `harness.py`) is the runnable pattern |
+
 ## Retries and rate limiting: one RateLimiter, not per-call config
 
 There is no retry setting on a generate call and no rate-limit middleware.

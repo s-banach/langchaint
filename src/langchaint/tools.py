@@ -381,10 +381,9 @@ class JSONSchemaTool[AppDataT = None]:
     async def dispatch(
         self, call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Parse call.args_json to a dict, validate it against args_schema, run the function, and wrap the outcome.
+        """Validate call.args_json and run the function on it, wrapping the outcome.
 
-        The JSON-object precondition runs first, then jsonschema validation of the parsed object;
-        either failure becomes a DispatchInvalidToolArgs without calling the function.
+        A validation failure becomes a DispatchInvalidToolArgs without calling the function.
         The returned DispatchHandled carries this tool's AppDataT, read at its concrete type with no isinstance.
         Every function exception propagates, and so does any jsonschema exception for a malformed args_schema
         (jsonschema.exceptions.UnknownType, typically): both are defects in user code.
@@ -433,8 +432,6 @@ class Tool[AppDataT](Protocol):
 def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDetail]) -> str:
     """Build the model-facing content for an argument-validation failure.
 
-    A header naming the tool, then one line per failure: the dot-joined path and the message.
-    A path segment is stringified before the join; an empty path renders as (root).
     Shared by the PydanticTool path (pydantic errors mapped through _details_from_pydantic) and the JSONSchemaTool path
     (jsonschema errors mapped through _details_from_jsonschema), so the two cannot drift.
 
@@ -456,7 +453,6 @@ def render_unknown_tool(called_name: str, held_names: Sequence[str]) -> str:
     """Build the model-facing content for a call naming a tool the manager does not hold.
 
     Names the off-list tool and lists the held tool names so the model can retry with a valid one.
-    An empty tool set renders the held list as (none).
     """
     held = ", ".join(held_names) if held_names else "(none)"
     return f"unknown tool {called_name!r}; available tools: {held}"
@@ -517,9 +513,7 @@ def _handled_outcome[AppDataT](
 ) -> DispatchHandled[AppDataT]:
     """Wrap a tool function's result into the DispatchHandled the application appends.
 
-    Shared by PydanticTool.dispatch and JSONSchemaTool.dispatch: a ToolOutputExplicit carries its content,
-    is_error, and app_data onto the ToolMessage and the arm; bare content becomes a non-error ToolMessage
-    with no app_data.
+    Shared by PydanticTool.dispatch and JSONSchemaTool.dispatch, so the assembly exists once.
     """
     if isinstance(result, ToolOutputExplicit):
         tool_message = ToolMessage(
@@ -540,7 +534,6 @@ class ToolManager:
     def __init__(self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]) -> None:
         """Index the tools by name.
 
-        Each element is any Tool implementation, keyed by name.
         A manager holds a mix of PydanticTool, JSONSchemaTool, CaptureTool, and an application's own tool type.
         The app_data bound BaseModel | Mapping[str, object] | None is the widest the manager surfaces:
         it dispatches a heterogeneous set whose per-call AppDataT is erased,
@@ -564,8 +557,6 @@ class ToolManager:
     async def dispatch(self, call: ToolCall) -> DispatchOutcome:
         """Resolve call.name to a held tool and delegate to that tool's dispatch.
 
-        The ToolMessage assembly and argument-validation rendering live on the tool's dispatch;
-        the manager only resolves the name and returns that outcome.
         app_data is erased to the manager's channel type (BaseModel | Mapping[str, object] | None)
         because the set is heterogeneous.
         An off-list name is an expected outcome:

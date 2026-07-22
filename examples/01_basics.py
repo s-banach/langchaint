@@ -97,7 +97,7 @@ async def batch_to_rows() -> None:
     rows = [to_row(result) for result in results]
     for row in rows:
         print(row["output"], "|", row["cost_in_usd"])
-    # rows is a list of flat dicts; pandas.DataFrame(rows) turns it into a dataframe for eval logging.
+    # pandas.DataFrame(rows) turns rows into a dataframe for eval logging.
 
 
 async def main() -> None:

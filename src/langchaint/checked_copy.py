@@ -25,7 +25,6 @@ from pydantic import BaseModel
 
 
 def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
-    """Explain one rejected update key: a derived property gets its specific fix, anything else the field list."""
     if isinstance(getattr(model_class, key, None), property):
         return (
             f"model_copy update key {key!r} is a derived property of {model_class.__name__}, "

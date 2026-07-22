@@ -53,8 +53,8 @@ class Admission:
 def _is_rate_limit_evidence(transient_error: TransientError) -> bool:
     """Whether the error says the account or service is refusing further requests right now.
 
-    An explicit is_rate_limit classification and a server-stated retry_after_seconds both qualify:
-    a server that names a wait is throttling, whatever the status code.
+    A server-stated retry_after_seconds qualifies because a server that names a wait is throttling,
+    whatever the status code.
     """
     return transient_error.is_rate_limit or transient_error.retry_after_seconds is not None
 
@@ -93,19 +93,15 @@ class RateLimiter:
         """Wakes probe-gate waiters; replaced on each wake so late waiters do not see a stale set."""
 
     def _wake_recovery_waiters(self) -> None:
-        """Wake every task waiting on the probe gate and arm a fresh event for the next wait."""
         self._recovery_changed.set()
         self._recovery_changed = asyncio.Event()
 
     def _is_probe_gate_closed(self) -> bool:
-        """Whether admission is currently limited to the probe already in flight."""
         return self._recovering and self._probe_admission is not None
 
     async def acquire(self) -> Admission:
         """Suspend until a request may start, then hold one in-flight slot.
 
-        Admission requires, in order: no active pause,
-        the probe gate open (either no recovery in progress or no probe in flight yet), and a free in-flight slot.
         During recovery the returned Admission is the probe; the caller does not need to know,
         release handles both cases.
         Every acquire needs exactly one release of the returned Admission.
@@ -155,7 +151,6 @@ class RateLimiter:
     def register_success(self, admission: Admission) -> None:
         """Record that the recovery probe completed successfully, reopening full admission.
 
-        Ends recovery only when admission is the in-flight probe.
         A request admitted before the incident, or any other non-probe request,
         proves nothing about whether the exhausted quota reopened, so its success must not lift the probe-only gate:
         doing so would admit max_in_flight requests at once into a possibly-still-exhausted quota,
@@ -177,15 +172,13 @@ class RateLimiter:
         so the pause is in place before the release admits anyone else;
         the caller's backoff sleep stays outside the slot.
         Only the chain's last error is the new failure; the earlier entries shape the pause length.
-        A rate-limit error (is_rate_limit, or any error naming retry_after_seconds) pauses admission
-        for delay_seconds of the chain and starts recovery; an existing later pause is never shortened.
-        Other transient errors set no pause; the failing task's own backoff covers them,
-        because a timeout or 5xx says nothing about the account's quota.
+        Only a rate-limit error pauses admission account-wide,
+        because a timeout or 5xx says nothing about the account's quota;
+        an existing later pause is never shortened.
 
         Returns:
             The backoff delay the caller must sleep before its own retry, in seconds.
-            delay_seconds is drawn once here (one full-jitter draw when the last error has no server-stated wait),
-            so the returned value is exactly the account-wide pause length:
+            The delay is drawn once here, so the returned value is exactly the account-wide pause length:
             the pause and the failing task's retry expire together,
             which makes the waking task the natural recovery probe.
             A non-rate-limit transient sets no pause but still returns its backoff so the failing task can sleep it.
@@ -199,14 +192,11 @@ class RateLimiter:
     def delay_seconds(self, errors_from_attempts: Sequence[TransientError]) -> float:
         """Delay before the next attempt after the given failure chain.
 
-        The last error's server-stated retry_after_seconds is honored when present,
-        capped at _RETRY_AFTER_MAX_SECONDS so an erroneous or hostile header cannot stall the client indefinitely;
-        below that cap retrying before the stated wait is a guaranteed wasted request.
-        This branch is un-jittered: the server states the wait exactly, so no jitter is needed.
-        Otherwise exponential backoff with AWS full jitter: a single random.uniform draw over [0, ceiling],
-        where ceiling is the base doubled per failure and capped at backoff_max_seconds.
-        Because the exponential branch draws once,
-        callers that need the pause and the retry sleep to agree must draw here once and share the value;
+        A server-stated wait is followed exactly, un-jittered,
+        because retrying before it is a guaranteed wasted request;
+        the _RETRY_AFTER_MAX_SECONDS cap keeps an erroneous or hostile header from stalling the client indefinitely.
+        The backoff branch is AWS full jitter and draws once per call,
+        so callers that need the pause and the retry sleep to agree must call once and share the value;
         register_transient_error does exactly that and returns it.
         """
         last = errors_from_attempts[-1]

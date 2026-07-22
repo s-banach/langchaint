@@ -63,8 +63,6 @@ async def run_agent(
 ) -> str:
     """Run the whole ReAct loop.
 
-    Generate a turn and append the assistant message; with no tool calls the run is done and output is the answer.
-    Otherwise dispatch each call, append the resulting tool message, and loop.
     dispatch never raises for a bad tool name or bad arguments; it returns an is_error tool message the model corrects,
     so the loop survives a hallucinated call.
     The approve gate is where a between-turns decision goes (a human approval prompt, a budget check, a routing choice):

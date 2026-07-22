@@ -50,18 +50,17 @@ asyncio.run(main())
 
 `bind(response_format=Sentiment)` returns `BoundLLM[Sentiment]` by overload, so `response.output` is a validated `Sentiment` instance; without `response_format` it returns `BoundLLM[str]` and `output` is the assistant text.
 A bare `str` argument is shorthand for a conversation of one `UserMessage` holding that text.
-`examples/` holds runnable files from basics through the streaming tool loop, prompt caching, and a budgeted `tool_choice="required"` loop, plus `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
+`examples/` holds runnable files and `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
 
 ## What it has
 
 **Generation only via binding.**
-`LLM` has no generate methods; `LLM.bind(...)` freezes everything that determines the cacheable prompt prefix (`system_prompt`, `tool_manager`, `inference_params`, `tool_choice`, `parallel_tool_calls`, `automatic_prompt_caching`, and `response_format`, which fixes the output type) into a `BoundLLM[OutputT]`.
+`LLM` has no generate methods; `LLM.bind(...)` freezes everything that determines the cacheable prompt prefix into a `BoundLLM[OutputT]`, with `response_format` fixing the output type.
 Changing parameters is `rebind(...)`, which returns a new `BoundLLM` and carries the same `response_format` overloads.
 `BoundLLM` has `generate_one`, `generate_many` (an order-aligned `list[Response[OutputT] | GenerationError]`), and `stream_one`.
 
 **A constructor per backend returning a ready `LLM`.**
 `openai_model("gpt-5.6-terra")`, `anthropic_model("claude-sonnet-5")`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)` each select a model and wrap the adapter in an `LLM`, over a `PricingTable` the constructor either defaults or requires.
-Each function's docstring states its parameters, its defaults, and where it differs from the others.
 Models outside a catalog are built directly from the adapter: `LLM(AnthropicMessagesAdapter(...))`.
 
 **One result shape for success and failure.**
@@ -74,8 +73,8 @@ Both carry `attempt_records`, one `AttemptRecord` per request sent, and `usage`,
 `Usage.sum_of` folds usages and costs together; each backend's `cost_breakdown(usage_raw, pricing)` reports the per-category split through the same `price` call that produced the stored `cost_in_usd`, so the two cannot drift.
 
 **One `RateLimiter` owning retrying and pacing.**
-It holds `max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`, and `max_in_flight`; it is stateful and shareable, so one instance passed to several `LLM`s is one shared budget for the account they hit, gating every request start (first attempts, retries, batch items, stream openings).
-A rate-limit error pauses admission for everyone sharing it, honoring a server-stated retry-after up to 60 seconds, then admits one probe at a time until a probe succeeds; other transient errors pause nobody.
+It is stateful and shareable: one instance passed to several `LLM`s is one shared budget for the account they hit, gating every request start (first attempts, retries, batch items, stream openings).
+A rate-limit error pauses admission for everyone sharing it; other transient errors pause nobody.
 Adapters store a `with_options(max_retries=0)` copy of the SDK client, so the SDK never retries beneath langchaint and attempt counts stay true.
 
 **User-stated prompt caching.**
@@ -115,13 +114,12 @@ Each absence is deliberate; the reasons are recorded in `CLAUDE.md` and the modu
 - No provider-parameter passthrough dict: `InferenceParams` is `max_completion_tokens`, `reasoning_effort`, and `temperature` (no `top_p`, no `seed`), and an unmapped provider parameter is reached by subclassing the concrete adapter.
 - No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, SDK objects ride by reference instead of being copied into same-shaped langchaint objects, and invalid inputs are sent so the provider's own error surfaces.
 - No tool-call delta stream items and no usage or stop stream items: a stream yields `str | ToolCall`, and `usage` and `stop_reason` live on `final()`'s `Response`.
-- No extras and no bundled SDKs: the application pins `anthropic`, `openai`, or `opentelemetry-api` itself, and only the subpackage imports require them.
 
 ## Layout
 
-    src/langchaint/           the neutral core (imports no SDK): llm.py, messages.py, tools.py, rate_limiter.py, exceptions.py, response.py, streaming.py, usage.py, pricing.py, inference_params.py, adapter.py, checked_copy.py
-    src/langchaint/anthropic/ the anthropic backend: anthropic_model, anthropic_bedrock_model, pricing tables, AnthropicMessagesAdapter
-    src/langchaint/openai/    the openai backend: openai_model, openai_bedrock_model, OPENAI_PRICING, OpenAIResponsesAdapter
+    src/langchaint/           the neutral core; imports no SDK
+    src/langchaint/anthropic/ the anthropic backend
+    src/langchaint/openai/    the openai backend
     src/langchaint/tracing/   the OTel tracing subpackage
     examples/                 runnable examples and MIGRATING_FROM_LANGCHAIN.md
     CLAUDE.md                 design tenets, naming rules, and the per-module map
@@ -130,5 +128,5 @@ Module docstrings are the spec of record for mechanics; `CLAUDE.md` holds the de
 
 ## Verification
 
-Run `scripts/CI.sh`; it runs `pyrefly check`, `ruff check`, and `pytest` through `uv run`, so the tools resolve from the locked dev dependency group, and all must pass with zero errors.
-The tests are offline: they feed constructed SDK objects into the adapter helpers and drive `BoundLLM`/`StreamHandle` with stub adapters, so they need no API keys.
+Run `scripts/CI.sh`; everything it runs must pass with zero errors.
+The tests are offline and need no API keys.

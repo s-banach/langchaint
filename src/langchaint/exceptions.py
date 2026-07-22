@@ -123,7 +123,7 @@ class AttemptRecord:
 
     @property
     def elapsed_seconds(self) -> float:
-        """ended_at_monotonic_seconds minus started_at_monotonic_seconds."""
+        """The bracket's length."""
         return self.ended_at_monotonic_seconds - self.started_at_monotonic_seconds
 
 
@@ -139,7 +139,6 @@ def _extract_transient_errors(
 
 
 def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
-    """Flatten the failure chain to one line, numbering each attempt."""
     return "; ".join(
         f"attempt {index + 1}: {record.error}" for index, record in enumerate(attempt_records)
     )
@@ -188,7 +187,7 @@ class GenerationError(Exception):
         elapsed_seconds: float,
         stop_reason: StopReason | None,
     ) -> None:
-        """Fill the row-shape fields; usage (with cost_in_usd) is the paid total summed from the records."""
+        """Fill the row-shape fields."""
         self.attempt_records = attempt_records
         self.model = model
         self.provider_name = provider_name
@@ -245,7 +244,6 @@ class RetriesExhaustedError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        """Name the failed attempts and quote the last error."""
         errors = _extract_transient_errors(self.attempt_records)
         last = str(errors[-1]) if errors else "no attempts recorded"
         return f"{len(errors)} attempts failed; last: {last}"
@@ -277,7 +275,6 @@ class RefusalError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        """State the refusal."""
         return "the model refused to produce structured output"
 
 
@@ -294,7 +291,6 @@ class MaxCompletionTokensExceededError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        """State the truncation."""
         return "the structured response reached max_completion_tokens before its JSON parsed"
 
 

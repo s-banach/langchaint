@@ -159,17 +159,13 @@ async def run_agent[FinalT: BaseModel](
         return final_response
 
     async def take_turn(turn_bound: BoundLLM[str], *, forcing: bool) -> FinalT | None:
-        """Generate one turn on turn_bound, retain its Response, and answer its calls.
-
-        GenerationError propagates from generate_one.
-        """
+        """GenerationError propagates from generate_one."""
         response = await turn_bound.generate_one(conversation)
         responses.append(response)
         conversation.append(response.assistant_message)
         return await answer_calls(response.tool_calls, forcing=forcing)
 
     def completed(final_response: FinalT) -> RunResult[FinalT]:
-        """Assemble the RunResult; usage folds from the retained records."""
         generate_usage = Usage.sum_of(response.usage for response in responses)
         return RunResult(
             final_response=final_response,

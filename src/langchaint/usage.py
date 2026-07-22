@@ -52,7 +52,7 @@ class Usage(CheckedCopyModel):
         )
 
     def __add__(self, other: "Usage") -> "Usage":
-        """Fieldwise sum, cost included; the counters and dollars of two attempts combine to one."""
+        """Fieldwise sum, cost included."""
         return Usage(
             input_tokens_cache_read=self.input_tokens_cache_read + other.input_tokens_cache_read,
             input_tokens_cache_write=self.input_tokens_cache_write

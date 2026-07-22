@@ -334,7 +334,6 @@ def _wire_messages(
     marked_blocks: list[TextBlockParam | ImageBlockParam | ToolResultBlockParam] = []
 
     def flush_tool_results() -> None:
-        """Group buffered consecutive tool results into one user message."""
         if pending_tool_results:
             wire.append(("user", list(pending_tool_results)))
             pending_tool_results.clear()
@@ -412,7 +411,6 @@ def _wire_tools(
 
 
 def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
-    """Map the provider stop reason into langchaint's vocabulary."""
     if stop_reason in ("end_turn", "tool_use", "max_tokens", "refusal"):
         return stop_reason
     return "other"
@@ -452,7 +450,7 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
 
     `usage.input_tokens` excludes cache reads and writes (verified against anthropic 0.116.0),
     so it is exactly the uncached-input counter.
-    output_tokens_details is optional on the SDK Usage; its thinking_tokens counter is 0 when it is absent.
+    output_tokens_details is optional on the SDK Usage.
 
     Raises:
         AbortBatchError: propagated from _cost_in_usd when the response reports 1-hour cache writes
@@ -731,10 +729,8 @@ class AnthropicMessagesAdapter(Adapter):
     def classify(self, error: Exception) -> ErrorClass:
         """Map the SDK exception to rate_limit, transient, or abort.
 
-        Rate limit: RateLimitError (429) and OverloadedError (529);
-        both mean further requests from this account fail the same way right now,
-        so admission should pause account-wide.
-        Transient: other 5xx, timeouts, connection failures.
+        RateLimitError (429) and OverloadedError (529) both mean further requests from this account
+        fail the same way right now, so admission should pause account-wide.
         Everything unrecognized is abort so bugs are not retried.
         """
         if isinstance(error, (anthropic.RateLimitError, anthropic.OverloadedError)):
@@ -769,9 +765,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate the SDK stream into text chunks and completed tool calls.
 
-        Text chunks are the SDK deltas' own strings, passed through without wrapping.
-        A tool call is yielded once, when its content block closes,
-        built from the SDK-accumulated block exactly like the non-streaming path.
+        A tool call is built from the SDK-accumulated block exactly like the non-streaming path.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.

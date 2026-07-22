@@ -97,6 +97,8 @@ After each commit lands, spawn the `commit-reviewer` agent (`.claude/agents/comm
 
 Done gate: count a commit as Done only after its review has returned, confirmed issues are fixed, and every objection is resolved: adopted by editing what its premise challenges, or rejected by recording the alternative and reason per the placement rule in Docstrings and comments. Deferring an objection is not resolving it. There is no separate open-items file.
 
+When a finding says a comment or a docstring sentence is inaccurate, delete the sentence unless it states a constraint, a reason, or a behavior a reader acts on. Rewriting it costs another review round and risks a fresh inaccuracy: an unconditional claim rewritten to be conditional acquires a new edge to get wrong, and prose that survived only because it was there is prose nobody needed. Rewrite instead of deleting only when you can name what a reader loses without the sentence.
+
 Fix a review's findings in a new commit and review that one too; never amend a reviewed commit, because a review names a sha and an amend moves the code out from under the review that passed. A fix commit that changes no behavior and no prose closes without review, so whitespace and a private rename with no callers do not start another round. Squash the chain into one commit before pushing, so one feature reaches the remote as one commit and the review chain stays local. Never build on a not-Done commit.
 
 # Code smells

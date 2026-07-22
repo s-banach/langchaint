@@ -59,7 +59,7 @@ class CostBreakdown:
 
     @property
     def input_tokens_cost_in_usd(self) -> float:
-        """The four input components summed: uncached, cache read, and the two write tiers."""
+        """The input share of the total."""
         return (
             self.input_tokens_cache_none_cost_in_usd
             + self.input_tokens_cache_read_cost_in_usd
@@ -69,12 +69,12 @@ class CostBreakdown:
 
     @property
     def total_cost_in_usd(self) -> float:
-        """input_tokens_cost_in_usd plus output_tokens_cost_in_usd."""
+        """The whole request's cost."""
         return self.input_tokens_cost_in_usd + self.output_tokens_cost_in_usd
 
 
 def price(counts: PriceableCounts, pricing: PricingTable) -> CostBreakdown:
-    """Price already-split counts against a table, one tokens * rate / 1_000_000 product per category.
+    """Price already-split counts against a table.
 
     The total is the sum of the per-category products, so the parts are individually meaningful
     and sum to total_cost_in_usd exactly; that association differs from a fused single-division

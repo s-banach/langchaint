@@ -196,7 +196,6 @@ class _OpenAIRequest:
 
 
 def _image_data_uri(image_part: ImagePart) -> str:
-    """Encode an ImagePart as a base64 data: URI carrying its media type."""
     encoded_data = base64.b64encode(image_part.data).decode("ascii")
     return f"data:{image_part.media_type};base64,{encoded_data}"
 
@@ -281,7 +280,6 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     pending_texts: list[str] = []
 
     def flush_text_run() -> None:
-        """Emit the buffered adjacent TextParts as one assistant message item."""
         if pending_texts:
             items.append({"role": "assistant", "content": "".join(pending_texts)})
             pending_texts.clear()
@@ -332,10 +330,7 @@ def _wire_input(conversation: Sequence[Message]) -> list[ResponseInputItemParam]
 
 
 def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
-    """Convert the neutral tool choice.
-
-    "auto", "required", and "none" map to the same strings; SpecificToolChoice becomes the named-function form.
-    """
+    """Convert the neutral tool choice."""
     if isinstance(tool_choice, SpecificToolChoice):
         return {"type": "function", "name": tool_choice.tool_name}
     return tool_choice
@@ -360,7 +355,6 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]
 
 
 def _has_refusal(response: OpenAIResponse) -> bool:
-    """Whether any output message carries a ResponseOutputRefusal content block."""
     return any(
         content_part.type == "refusal"
         for item in response.output
@@ -664,9 +658,8 @@ class OpenAIResponsesAdapter(Adapter):
     def classify(self, error: Exception) -> ErrorClass:
         """Map the SDK exception to rate_limit, transient, or abort.
 
-        Rate limit: RateLimitError (429), meaning further requests from this account fail the same way right now,
+        RateLimitError (429) means further requests from this account fail the same way right now,
         so admission should pause account-wide.
-        Transient: 5xx, timeouts, connection failures.
         Everything unrecognized is abort so bugs are not retried.
         """
         if isinstance(error, openai.RateLimitError):
@@ -702,8 +695,6 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate the SDK stream into text chunks and completed tool calls.
 
-        Text chunks are the SDK deltas' own strings, passed through without wrapping.
-        A tool call is yielded once, complete, from the output_item.done event that carries its finished item.
         The terminal event's response is kept for final(), which must not call the SDK's get_final_response():
         that raises RuntimeError unless the terminal event is response.completed.
 

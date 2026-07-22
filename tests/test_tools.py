@@ -64,7 +64,6 @@ async def _validation_error_function(args: _EchoArgs) -> str:
 
 
 def _echo_tool() -> PydanticTool[_EchoArgs]:
-    """Build the echo tool."""
     return PydanticTool(
         name="echo",
         description="Echo the text back.",
@@ -1020,7 +1019,6 @@ class _CapturedAnswer(BaseModel):
 
 
 def _answer_capture_tool() -> CaptureTool[_CapturedAnswer]:
-    """Build the capture tool."""
     return CaptureTool(
         name="final_response",
         description="Submit the final answer.",

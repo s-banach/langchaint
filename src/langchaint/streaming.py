@@ -31,7 +31,7 @@ from langchaint.exceptions import (
 )
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, RateLimiter
-from langchaint.response import Response
+from langchaint.response import AbandonedCall, AbandonedCallLog, Response
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -55,12 +55,14 @@ class StreamHandle[OutputT]:
         bound_adapter: BoundAdapter[OutputT],
         conversation: Sequence[Message],
         rate_limiter: RateLimiter,
+        abandoned_call_log: AbandonedCallLog | None,
     ) -> None:
         """Store the request; called by BoundLLM.stream_one only."""
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._conversation = conversation
         self._rate_limiter = rate_limiter
+        self._abandoned_call_log = abandoned_call_log
         self._adapter_stream: AdapterStream[OutputT] | None = None
         self._items: AsyncIterator[StreamItem] | None = None
         self._attempt_records: list[AttemptRecord] = []
@@ -70,6 +72,7 @@ class StreamHandle[OutputT]:
         self._started_at_monotonic_seconds: float | None = None
         self._ended_at_monotonic_seconds: float | None = None
         self._response: Response[OutputT] | None = None
+        self._final_concluded = False
         self._state: _State = "unopened"
 
     async def __aenter__(self) -> "StreamHandle[OutputT]":
@@ -86,13 +89,16 @@ class StreamHandle[OutputT]:
         self._state = "open"
         try:
             await self._open_stream_with_retries()
-        except BaseException:
+        except BaseException as exc:
             # __aexit__ does not run when __aenter__ raises, so finish and release here.
             # _open_stream_with_retries returns the slot on every Exception path but not on a
             # CancelledError, which is a BaseException: cancelling a suspended open would otherwise
             # strand this admission for the process's life, and a stranded probe freezes the whole
-            # limiter's recovery, not just one slot.
+            # limiter's recovery, not just one slot. The abandonment is recorded here for the same
+            # reason: no other frame sees a cancellation that lands during the open.
             self._state = "finished"
+            if isinstance(exc, asyncio.CancelledError):
+                self._append_abandoned_call()
             self._release_slot()
             raise
         return self
@@ -103,18 +109,46 @@ class StreamHandle[OutputT]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the underlying connection and finish the handle."""
+        """Close the underlying connection and finish the handle.
+
+        A CancelledError exiting the block appends an AbandonedCall to the handle's
+        abandoned_call_log, when one was given and final() never concluded the call:
+        a Response and a raised GenerationError both reached the caller through final() carrying
+        their own usage, and a consumer that leaves the block early without an exception chose to
+        walk away in live code, so only the cancellation, which destroys the frames that could
+        have observed the stream, gets a record.
+        """
         self._state = "finished"
+        if isinstance(exc, asyncio.CancelledError):
+            self._append_abandoned_call()
         await self._close_adapter_stream()
 
+    def _append_abandoned_call(self) -> None:
+        """Record the abandonment, unless no log was given or final() already concluded the call.
+
+        A call final() concluded is excluded on both exits: a Response and a raised GenerationError
+        each carry their own usage to the caller, so appending here would double-count it and
+        mislabel a concluded call as an in-flight abandonment.
+        The settled attempt records are only pre-first-item open failures (nothing is retried after
+        the first yielded item), so usage_settled is usually zero here and the record's value is
+        the count; the streaming request itself is the unobservable in-flight attempt.
+        """
+        if self._abandoned_call_log is None or self._final_concluded:
+            return
+        self._abandoned_call_log.append(
+            AbandonedCall(
+                attempt_records=tuple(self._attempt_records),
+                model=self._adapter.model,
+                provider_name=self._adapter.provider_name,
+            )
+        )
+
     def _release_slot(self) -> None:
-        """Return the held RateLimiter admission, if this handle holds one."""
         if self._admission is not None:
             self._rate_limiter.release(self._admission)
             self._admission = None
 
     async def _close_adapter_stream(self) -> None:
-        """Close and forget the current adapter stream, releasing its slot."""
         if self._adapter_stream is not None:
             await self._adapter_stream.close()
             self._adapter_stream = None
@@ -175,12 +209,7 @@ class StreamHandle[OutputT]:
         await asyncio.sleep(delay_seconds)
 
     def _non_retriable_or_none(self, exc: Exception) -> AbortBatchError | GenerationError | None:
-        """Map one attempt error to the non-retriable error to propagate, or None when transient.
-
-        A TransientError retries (None).
-        An AbortBatchError or a GenerationError leaf raised directly by the adapter propagates as itself.
-        An unrecognized exception the adapter classifies "abort" becomes an AbortBatchError; anything else is transient.
-        """
+        """Map one attempt error to the non-retriable error to propagate, or None when transient."""
         if isinstance(exc, TransientError):
             return None
         if isinstance(exc, (AbortBatchError, GenerationError)):
@@ -342,6 +371,7 @@ class StreamHandle[OutputT]:
                     usage_raw=exc.usage_raw,
                 )
             )
+            self._final_concluded = True
             raise type(exc)(
                 attempt_records=tuple(self._attempt_records),
                 model=self._adapter.model,
@@ -369,4 +399,5 @@ class StreamHandle[OutputT]:
             assistant_message=adapter_result.assistant_message,
         )
         self._response = response
+        self._final_concluded = True
         return response

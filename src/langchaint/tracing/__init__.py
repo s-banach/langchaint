@@ -2,7 +2,8 @@
 
 TracedLLM wraps an LLM and mirrors bind / rebind so every binding stays traced;
 TracedBoundLLM wraps a BoundLLM and opens one span per generate call (CLIENT for generate_one,
-which wraps one outbound call, INTERNAL for generate_many's aggregate span, which makes no call of its own);
+which wraps one outbound call, INTERNAL for generate_many's aggregate span,
+which makes no call of its own);
 TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
 TracedToolManager is a ToolManager whose every dispatch opens one INTERNAL execute_tool span;
 it is a subclass, not a wrapper, so it passes to LLM.bind's tool_manager parameter as one object,
@@ -31,9 +32,13 @@ generate_many (INTERNAL): langchaint.batch_item_count and the extra_attributes, 
 it has no single result to map and no single conversation to capture.
 execute_tool (INTERNAL): gen_ai.tool.name, gen_ai.tool.call.id, error.type on a failure,
 and under capture gen_ai.tool.call.arguments and gen_ai.tool.call.result.
+invoke_agent (INTERNAL) is the one span the application opens itself, through agent_span, around its
+own agent loop: gen_ai.agent.name, langchaint.agent_path, the usage partition summed over the run,
+langchaint.cost_in_usd, and whatever the application's exit-time extra_attributes adds.
 Every span kind carries error.type when it ends on an exception.
-langchaint.* is the prefix for the attributes the GenAI convention defines no counterpart for,
-which is exactly langchaint.attempts, langchaint.cost_in_usd, and langchaint.batch_item_count.
+langchaint.* is the prefix for the attributes the GenAI convention defines no counterpart for, which is
+exactly langchaint.attempts, langchaint.cost_in_usd, langchaint.batch_item_count, and
+langchaint.agent_path.
 The langchaint.attempt_failed span event carries error_text and elapsed_seconds per failed attempt.
 
 The wrapper owns the span lifecycle
@@ -58,6 +63,8 @@ asserts every gen_ai.* literal below against that revision's constants.
 The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT);
 the tool-execution operation value is "execute_tool" (GenAiOperationNameValues.EXECUTE_TOOL),
 and the tool span's identity keys are gen_ai.tool.name and gen_ai.tool.call.id.
+The agent-invocation operation value is "invoke_agent" (GenAiOperationNameValues.INVOKE_AGENT),
+with gen_ai.agent.name as its identity key.
 Reasoning reaches a span as the counter gen_ai.usage.reasoning.output_tokens and, where the provider
 returned readable text, as the payload schemas' ReasoningPart; _turn_parts documents when it appears.
 Content payload shapes are verified against the JSON schemas the convention attaches to the attributes
@@ -75,7 +82,8 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, NoReturn, overload, override
@@ -114,7 +122,7 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import Response
+from langchaint.response import AbandonedCallLog, Response
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
     DispatchHandled,
@@ -124,6 +132,7 @@ from langchaint.tools import (
     ToolManager,
     ToolSchema,
 )
+from langchaint.usage import Usage
 
 type SpanAttributes = Mapping[str, str | bool | int | float | Sequence[str]]
 """A span's attributes, keyed by name.
@@ -241,6 +250,110 @@ def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttribu
     if result.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
     return attributes
+
+
+@contextmanager
+def agent_span(
+    tracer: Tracer,
+    *,
+    agent_name: str,
+    agent_path: str,
+    usage: Callable[[], Usage],
+    extra_attributes: Callable[[], SpanAttributes] | None = None,
+) -> Generator[Span]:
+    """Open one INTERNAL invoke_agent span around an application's own agent loop.
+
+    langchaint traces the calls an agent makes (generate, execute_tool), never the loop that makes them,
+    because it ships no loop. An application that runs its own loop owns the invoke_agent span the GenAI
+    convention defines for an agent invocation; this opens that span with the convention's identity
+    attributes and, on every exit path, sets the run's paid usage and cost.
+
+    The usage keys are the same ones gen_ai_attributes emits for a single call, here summed over the run:
+    gen_ai.usage.input_tokens is Usage.input_tokens_total (cached tokens included), with
+    cache_read.input_tokens and cache_creation.input_tokens as its parts, reasoning.output_tokens as the
+    reasoning share of output_tokens, and langchaint.cost_in_usd as the run's estimated cost.
+
+    usage is called once, at exit rather than at entry, so a run cancelled in flight still records what it
+    spent up to the cancellation. extra_attributes, when given, is called at exit too, for the counters
+    only the finished loop knows (a turn count); its pairs are set before the identity and usage
+    attributes, so an application value cannot displace an attribute this helper owns, the same
+    collision rule every Traced class applies to its extra_attributes.
+    For a usage key the overwrite happens only when usage() returns: a raising usage() leaves the
+    usage attributes unset, so an extra claiming a gen_ai.usage.* key survives on that path.
+
+    A raise from usage() or extra_attributes() is caught and logged at warning level and never
+    propagated, the same guard the attribute mapper gets: the exit runs in a finally, where a raise
+    would displace the exception already unwinding the loop, a CancelledError included.
+
+    Yields:
+        The started invoke_agent span, already the current span. A body that sets no attributes of its
+        own can ignore it; the usage and extras are set from the callables at exit, not through it.
+
+    Raises: nothing of its own. An exception from the wrapped body propagates, and the span is closed
+    by start_as_current_span with an error status.
+    """
+    identity: dict[str, str] = {
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.agent.name": agent_name,
+        "langchaint.agent_path": agent_path,
+    }
+    with tracer.start_as_current_span(
+        f"invoke_agent {agent_name}", kind=SpanKind.INTERNAL, attributes=identity
+    ) as span:
+        try:
+            yield span
+        finally:
+            _apply_agent_exit_attributes(
+                span, identity=identity, usage=usage, extra_attributes=extra_attributes
+            )
+
+
+def _apply_agent_exit_attributes(
+    span: Span,
+    *,
+    identity: Mapping[str, str],
+    usage: Callable[[], Usage],
+    extra_attributes: Callable[[], SpanAttributes] | None,
+) -> None:
+    """Set an ending invoke_agent span's extras, then re-set its identity, then set its usage.
+
+    The order is what enforces agent_span's collision rule: the extras go first, and the identity keys
+    (set at span start so the span is searchable while the run is live) are set again after them, so an
+    extra cannot displace gen_ai.operation.name or gen_ai.agent.name any more than it can a usage key.
+    The usage-key half of that rule holds only when usage() returns, since a raising usage() leaves
+    nothing to overwrite an extra with; agent_span's docstring states the same limit.
+    Each callable runs under its own guard, so a raising usage() still leaves the extras set and a
+    raising extra_attributes() still leaves the usage set; either is logged, never propagated, because
+    this runs in agent_span's finally where a raise would displace the loop's own exception.
+    Skipped when the span is not recording, the OTel guard for not computing attributes a
+    non-recording span discards.
+    """
+    if not span.is_recording():
+        return
+    if extra_attributes is not None:
+        try:
+            span.set_attributes(extra_attributes())
+        except Exception:
+            _logger.warning(
+                "agent_span extra_attributes raised; leaving span attributes partial",
+                exc_info=True,
+            )
+    span.set_attributes(identity)
+    try:
+        spent = usage()
+    except Exception:
+        _logger.warning(
+            "agent_span usage raised; leaving span usage attributes unset", exc_info=True
+        )
+        return
+    span.set_attributes({
+        "gen_ai.usage.input_tokens": spent.input_tokens_total,
+        "gen_ai.usage.output_tokens": spent.output_tokens,
+        "gen_ai.usage.reasoning.output_tokens": spent.output_tokens_reasoning,
+        "gen_ai.usage.cache_read.input_tokens": spent.input_tokens_cache_read,
+        "gen_ai.usage.cache_creation.input_tokens": spent.input_tokens_cache_write,
+        "langchaint.cost_in_usd": spent.cost_in_usd,
+    })
 
 
 def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
@@ -823,23 +936,28 @@ class TracedBoundLLM[OutputT]:
             span_config=self._span_config,
         )
 
-    async def generate_one(self, conversation: str | Sequence[Message]) -> Response[OutputT]:
+    async def generate_one(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = None,
+    ) -> Response[OutputT]:
         """Open a span around the whole generate_one call, delegate, attribute, and end the span.
 
         The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
-        A GenerationError sets error status and the shared-field attributes and re-raises;
-        any other exception sets error status and record_exception and re-raises;
-        a success sets OK status and the attributes.
         Under capture_message_content the input attributes are set at span start, so they are present on the
         failing paths too; gen_ai.output.messages is set only on success, GenerationError carrying no
         assistant turn to record.
-        The span ends exactly once, in the finally.
+        abandoned_call_log passes through to the delegated generate_one, which documents it;
+        the CancelledError it re-raises propagates here and the span ends with no status set.
 
         Raises:
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
                 a refusal, or a truncation); the span is attributed and closed first.
             AbortBatchError: the wrapped generate_one classified an error as abort;
                 the span records the exception and closes first.
+            asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
+                appended any AbandonedCall first, and the span ends.
         """
         span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
         try:
@@ -847,7 +965,9 @@ class TracedBoundLLM[OutputT]:
             _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, conversation)
             try:
-                response = await self._bound_llm.generate_one(conversation)
+                response = await self._bound_llm.generate_one(
+                    conversation, abandoned_call_log=abandoned_call_log
+                )
             except GenerationError as exc:
                 _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
                 _set_generation_error_status(span, exc)
@@ -916,11 +1036,17 @@ class TracedBoundLLM[OutputT]:
         finally:
             span.end()
 
-    def stream_one(self, conversation: str | Sequence[Message]) -> "TracedStreamHandle[OutputT]":
+    def stream_one(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = None,
+    ) -> "TracedStreamHandle[OutputT]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
 
         The span opens when the handle is entered, matching StreamHandle's own contract that
         the request opens there.
+        abandoned_call_log passes through to the wrapped StreamHandle, which documents it.
         The binding and the conversation are passed down rather than rendered here:
         the handle needs them to build its input attributes when the span starts,
         and rendering them here would serialize the conversation unconditionally, including for the
@@ -928,7 +1054,9 @@ class TracedBoundLLM[OutputT]:
         The cost is that the handle holds the conversation for the stream's whole life.
         """
         return TracedStreamHandle(
-            stream_handle=self._bound_llm.stream_one(conversation),
+            stream_handle=self._bound_llm.stream_one(
+                conversation, abandoned_call_log=abandoned_call_log
+            ),
             span_config=self._span_config,
             span_name=self._span_name,
             binding=self._bound_llm.binding,
@@ -994,7 +1122,6 @@ class TracedStreamHandle[OutputT]:
         return span
 
     def _end_span(self) -> None:
-        """End the span if one is open and it has not already ended; ends at most once."""
         if self._span is not None and not self._span_ended:
             self._span.end()
             self._span_ended = True
@@ -1103,9 +1230,6 @@ class TracedStreamHandle[OutputT]:
     async def final(self) -> Response[OutputT]:
         """Drain the inner stream, attribute the span from the Response, and end the span.
 
-        A GenerationError from the inner final() (a structured refusal or truncation detected
-        when the SDK parses the assembled message) sets error status and the shared-field attributes and re-raises;
-        any other exception records it and takes error status; a success sets OK status and the attributes.
         The span ends exactly once: if a prior final(), a mid-iteration failure, or __aexit__ already ended it,
         this delegates to the inner final() (which re-raises or returns its cached Response)
         without touching the span again.
@@ -1328,5 +1452,6 @@ __all__ = [
     "TracedLLM",
     "TracedStreamHandle",
     "TracedToolManager",
+    "agent_span",
     "gen_ai_attributes",
 ]

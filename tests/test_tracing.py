@@ -35,6 +35,7 @@ from pydantic import BaseModel
 import langchaint.tracing
 from langchaint import (
     LLM,
+    AbandonedCall,
     AbortBatchError,
     AssistantMessage,
     DispatchHandled,
@@ -68,8 +69,10 @@ from langchaint.tracing import (
     TracedLLM,
     TracedStreamHandle,
     TracedToolManager,
+    agent_span,
     gen_ai_attributes,
 )
+from langchaint.usage import Usage
 from scripts import refresh_semconv_genai
 from tests.test_bound_llm import (
     _FAKE_RAW_USAGE,
@@ -375,6 +378,31 @@ def test_generate_one_abort_records_the_exception_and_ends_the_span() -> None:
         assert [event.name for event in span.events] == ["exception"]
 
     asyncio.run(scenario())
+
+
+def test_generate_one_cancellation_appends_through_the_wrapper_and_ends_the_span() -> None:
+    """The traced generate_one passes abandoned_call_log through; the cancelled span ends, status unset."""
+
+    async def scenario() -> None:
+        """Time out a traced call whose send hangs, then read the log and the span."""
+        adapter = _FakeAdapter(hang_from_send=1)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await traced.bind(automatic_prompt_caching=True).generate_one(
+                    "hi", abandoned_call_log=abandoned_call_log
+                )
+        assert len(abandoned_call_log) == 1
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.UNSET
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
@@ -1083,7 +1111,6 @@ async def _raising_tool_function(_args: _EchoToolArgs) -> str:
 
 
 def _echo_tool() -> PydanticTool[_EchoToolArgs]:
-    """Build the echo tool."""
     return PydanticTool(
         name="echo",
         description="Echo the text back",
@@ -1436,6 +1463,158 @@ def test_extra_attributes_cannot_displace_the_operation_name_on_a_dispatch_span(
     asyncio.run(scenario())
 
 
+def test_agent_span_carries_the_run_identity_and_summed_usage() -> None:
+    """agent_span emits one INTERNAL invoke_agent span carrying the run's identity, usage, and extras."""
+    tracer, exporter = _in_memory_tracer()
+    spent = Usage(
+        input_tokens_cache_read=2,
+        input_tokens_cache_write=3,
+        input_tokens_cache_none=5,
+        output_tokens=7,
+        output_tokens_reasoning=4,
+        cost_in_usd=0.5,
+    )
+    with agent_span(
+        tracer,
+        agent_name="research_climate",
+        agent_path="root/research_climate",
+        usage=lambda: spent,
+        extra_attributes=lambda: {"langchaint.agent.turns": 3},
+    ) as span:
+        assert span.is_recording()
+    (finished,) = exporter.get_finished_spans()
+    assert finished.name == "invoke_agent research_climate"
+    assert finished.kind == SpanKind.INTERNAL
+    # agent_span leaves the status UNSET on success, which OTel reads as success; it sets ERROR only
+    # when the wrapped body raises. It does not claim OK, matching start_as_current_span's own default.
+    assert finished.status.status_code == StatusCode.UNSET
+    assert finished.attributes is not None
+    assert dict(finished.attributes) == {
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.agent.name": "research_climate",
+        "langchaint.agent_path": "root/research_climate",
+        "gen_ai.usage.input_tokens": 10,
+        "gen_ai.usage.output_tokens": 7,
+        "gen_ai.usage.reasoning.output_tokens": 4,
+        "gen_ai.usage.cache_read.input_tokens": 2,
+        "gen_ai.usage.cache_creation.input_tokens": 3,
+        "langchaint.cost_in_usd": 0.5,
+        "langchaint.agent.turns": 3,
+    }
+
+
+def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() -> None:
+    """usage() is read on the way out, so a run that raises still closes the span with its final spend."""
+    tracer, exporter = _in_memory_tracer()
+    spent = Usage(
+        input_tokens_cache_read=0,
+        input_tokens_cache_write=0,
+        input_tokens_cache_none=0,
+        output_tokens=0,
+        output_tokens_reasoning=0,
+        cost_in_usd=0.0,
+    )
+    with (  # noqa: PT012
+        pytest.raises(RuntimeError, match="loop gave up"),
+        agent_span(
+            tracer,
+            agent_name="specialist",
+            agent_path="root/specialist",
+            usage=lambda: spent,
+        ),
+    ):
+        spent = Usage(
+            input_tokens_cache_read=0,
+            input_tokens_cache_write=0,
+            input_tokens_cache_none=6,
+            output_tokens=2,
+            output_tokens_reasoning=0,
+            cost_in_usd=0.02,
+        )
+        raise RuntimeError("loop gave up")
+    (finished,) = exporter.get_finished_spans()
+    assert finished.status.status_code == StatusCode.ERROR
+    assert finished.attributes is not None
+    assert finished.attributes["gen_ai.usage.input_tokens"] == 6
+    assert finished.attributes["gen_ai.usage.output_tokens"] == 2
+    assert finished.attributes["langchaint.cost_in_usd"] == pytest.approx(0.02)
+
+
+def test_agent_span_extra_attributes_cannot_displace_identity_or_usage_keys() -> None:
+    """An extra sharing a key with an identity or usage attribute loses the collision.
+
+    Same rule as every Traced class's extra_attributes: what this module sets itself wins. The extras
+    are set first at exit and the identity keys are set again after them, so even the keys written at
+    span start cannot be displaced by an exit-time extra.
+    """
+    tracer, exporter = _in_memory_tracer()
+    spent = Usage(
+        input_tokens_cache_read=0,
+        input_tokens_cache_write=0,
+        input_tokens_cache_none=1,
+        output_tokens=1,
+        output_tokens_reasoning=0,
+        cost_in_usd=0.01,
+    )
+    with agent_span(
+        tracer,
+        agent_name="specialist",
+        agent_path="root/specialist",
+        usage=lambda: spent,
+        extra_attributes=lambda: {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.agent.name": "impostor",
+            "gen_ai.usage.input_tokens": 999,
+            "langchaint.agent.turns": 2,
+        },
+    ):
+        pass
+    (finished,) = exporter.get_finished_spans()
+    assert finished.attributes is not None
+    assert finished.attributes["gen_ai.operation.name"] == "invoke_agent"
+    assert finished.attributes["gen_ai.agent.name"] == "specialist"
+    assert finished.attributes["gen_ai.usage.input_tokens"] == 1
+    assert finished.attributes["langchaint.agent.turns"] == 2
+
+
+def test_agent_span_logs_a_raising_usage_callable_instead_of_propagating(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raise from usage() or extra_attributes() is logged, never propagated.
+
+    The callables run in agent_span's finally, so propagating would displace the exception already
+    unwinding the loop; here the body's RuntimeError must survive both callables raising, and the
+    extras guard is separate from the usage guard, so neither failure hides the other's log line.
+    """
+    tracer, exporter = _in_memory_tracer()
+
+    def raising_usage() -> Usage:
+        raise ValueError("usage read failed")
+
+    def raising_extras() -> dict[str, int]:
+        raise ValueError("extras read failed")
+
+    with (
+        pytest.raises(RuntimeError, match="loop gave up"),
+        caplog.at_level(logging.WARNING, logger="langchaint.tracing"),
+        agent_span(
+            tracer,
+            agent_name="specialist",
+            agent_path="root/specialist",
+            usage=raising_usage,
+            extra_attributes=raising_extras,
+        ),
+    ):
+        raise RuntimeError("loop gave up")
+    assert "agent_span usage raised" in caplog.text
+    assert "agent_span extra_attributes raised" in caplog.text
+    (finished,) = exporter.get_finished_spans()
+    assert finished.status.status_code == StatusCode.ERROR
+    assert finished.attributes is not None
+    assert "gen_ai.usage.input_tokens" not in finished.attributes
+    assert finished.attributes["gen_ai.agent.name"] == "specialist"
+
+
 def _emitted_convention_keys() -> set[str]:
     """Collect every quoted gen_ai.* literal in the tracing module's source.
 
@@ -1597,7 +1776,6 @@ class _ReasoningOnlyAdapter(_FakeAdapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Hand out the reasoning-only bound adapter."""
         return _ReasoningOnlyBoundAdapter()
 
 
@@ -1627,7 +1805,6 @@ class _EmptyTextTurnAdapter(_FakeAdapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Hand out the empty-text bound adapter."""
         return _EmptyTextTurnBoundAdapter()
 
 
@@ -1657,7 +1834,6 @@ class _ReasoningWithTextAdapter(_FakeAdapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Hand out the reasoning-with-text bound adapter."""
         return _ReasoningWithTextBoundAdapter()
 
 

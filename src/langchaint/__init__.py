@@ -46,7 +46,7 @@ from langchaint.messages import (
 )
 from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import Response, RowValue, to_row
+from langchaint.response import AbandonedCall, AbandonedCallLog, Response, RowValue, to_row
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
     CaptureTool,
@@ -69,6 +69,8 @@ from langchaint.usage import ZERO_USAGE, Usage
 __all__ = [
     "LLM",
     "ZERO_USAGE",
+    "AbandonedCall",
+    "AbandonedCallLog",
     "AbortBatchError",
     "AssistantMessage",
     "AttemptRecord",

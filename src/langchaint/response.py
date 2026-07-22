@@ -1,18 +1,21 @@
-"""The generate results: the success Response and the terminal GenerationError.
+"""The generate results: the success Response, the terminal GenerationError, and the AbandonedCall record.
 
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
-or a truncation at the token cap) raises or returns a GenerationError.
-They share the per-attempt history langchaint's retry loop produces,
+or a truncation at the token cap) raises or returns a GenerationError;
+one a cancellation cuts off leaves an AbandonedCall on the caller's abandoned_call_log.
+The three carriers share the per-attempt history langchaint's retry loop produces,
 because that loop takes no callback and the history survives only if the result carries it:
 attempt_records is that history, one record per request sent.
 On a Response every record but the last failed and the last succeeded;
-on a GenerationError the records describe the terminal outcome.
-attempts is derived from the records on both.
-to_row flattens either result to one dict of scalars with the same keys,
+on a GenerationError the records describe the terminal outcome;
+on an AbandonedCall they cover the attempts that settled before the cancellation.
+attempts is derived from the records on Response and GenerationError.
+to_row flattens a Response or a GenerationError to one dict of scalars with the same keys,
 so a mixed list of successes and failures converts directly to a table.
 """
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from pydantic import BaseModel
 
@@ -97,8 +100,51 @@ class Response[OutputT]:
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """The turn's tool calls, from assistant_message."""
+        """The turn's tool calls."""
         return self.assistant_message.tool_calls
+
+
+@dataclass(frozen=True, kw_only=True)
+class AbandonedCall:
+    """The record of one generate call a cancellation cut off, appended to the caller's log.
+
+    A cancelled call returns no value, and the CancelledError must propagate for the cancelling
+    scope's teardown to run, so this record is the only carrier of the call's history:
+    generate_one and stream_one append it to their abandoned_call_log before re-raising.
+    Its presence in the log is the count of abandoned calls.
+
+    attempt_records covers only the attempts that settled before the cancellation.
+    The in-flight attempt has no record: it may have completed and billed server-side,
+    so its cost is unobservable client-side and no usage is fabricated for it
+    ("unbilled" would overclaim).
+    Reconciliation closes the gap from the provider's side, which model and provider_name identify.
+    """
+
+    attempt_records: tuple[AttemptRecord, ...]
+    model: str
+    provider_name: str
+
+    @property
+    def usage_settled(self) -> Usage:
+        """The folded paid total of the attempts that settled before the cancellation.
+
+        Deliberately not named usage: on the other result carriers, usage is the call's whole paid
+        total, and this value structurally lacks the in-flight attempt's share.
+        """
+        return sum((record.usage for record in self.attempt_records), start=ZERO_USAGE)
+
+
+class AbandonedCallLog(Protocol):
+    """Where generate_one and stream_one append an AbandonedCall when a cancellation cuts a call off.
+
+    append is the one required method, so a list[AbandonedCall] satisfies it, and so does an
+    application's own log of turn records whose element union includes AbandonedCall; total spend is
+    then one fold over the log's rows. The log must be append-only: a conversation the application
+    trims or rebuilds is the wrong target, because spend is monotone and a trim would shrink it.
+    """
+
+    def append(self, abandoned_call: AbandonedCall, /) -> None:
+        """Receive one record; called before the CancelledError re-raises."""
 
 
 def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, RowValue]:

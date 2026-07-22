@@ -189,7 +189,10 @@ lint.pylint.max-args = 7
 # The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._request,
 # BoundLLM._bound_adapter); those accesses are the unit under test, so SLF001
 # (private-member-access) cannot be satisfied without exposing internals.
-lint.per-file-ignores."tests/*" = ["SLF001"]
+# PLR0913 (too-many-arguments) is ignored because the fake adapters' constructors take one
+# keyword per scripted behavior (a failure list, a hang point, a delay); grouping them into a
+# config object would relocate the count without shrinking it.
+lint.per-file-ignores."tests/*" = ["SLF001", "PLR0913"]
 
 # The examples are standalone scripts run by path (python examples/01_basics.py),
 # deliberately not an importable package, so INP001 (implicit-namespace-package,

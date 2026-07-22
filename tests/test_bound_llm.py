@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from langchaint import (
     LLM,
+    ZERO_USAGE,
+    AbandonedCall,
     AbortBatchError,
     AssistantMessage,
     BoundLLM,
@@ -124,11 +126,6 @@ class _FakeStream(AdapterStream[str]):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Yield two text chunks, then one completed tool call.
-
-        Yields:
-            The scripted stream items in order.
-        """
         yield "a"
         yield "b"
         yield _FAKE_TOOL_CALL
@@ -147,7 +144,6 @@ class _FakeStream(AdapterStream[str]):
 
     @override
     async def close(self) -> None:
-        """Record that the connection was closed."""
         self.closed = True
 
 
@@ -241,6 +237,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         stream: _FakeStream | None = None,
         send_seconds: float = 0.0,
         hang_from_open: int | None = None,
+        hang_from_send: int | None = None,
     ) -> None:
         """Store the failure scripts, echo mode, and the stream open_stream returns.
 
@@ -249,12 +246,14 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         so a batch overlaps and peak_in_flight records the concurrency it reached.
         hang_from_open is the 1-based open_stream call from which every open suspends forever,
         so a cancellation lands on the open itself rather than on a later item pull.
+        hang_from_send is the same for send, so a deadline fires while that attempt is in flight.
         """
         self._failures = list(failures)
         self._open_failures = list(open_failures)
         self._echo = echo
         self._send_seconds = send_seconds
         self._hang_from_open = hang_from_open
+        self._hang_from_send = hang_from_send
         self.stream = stream if stream is not None else _FakeStream()
         self.send_count = 0
         self.open_count = 0
@@ -268,6 +267,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         try:
+            if self._hang_from_send is not None and self.send_count >= self._hang_from_send:
+                await asyncio.Event().wait()
             if self._send_seconds:
                 await asyncio.sleep(self._send_seconds)
             if self._failures:
@@ -324,6 +325,7 @@ class _FakeAdapter(Adapter):
         classify_result: ErrorClass = "abort",
         send_seconds: float = 0.0,
         hang_from_open: int | None = None,
+        hang_from_send: int | None = None,
     ) -> None:
         """Store how each freshly bound adapter behaves and the classify verdict."""
         # This adapter reaches no SDK, so it passes client=None, which matches no entry in the
@@ -336,12 +338,12 @@ class _FakeAdapter(Adapter):
         self._classify_result = classify_result
         self._send_seconds = send_seconds
         self._hang_from_open = hang_from_open
+        self._hang_from_send = hang_from_send
         self.bound_adapters: list[_FakeBoundAdapter] = []
         self.structured_bind_count = 0
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Build a fresh fake bound adapter and record it."""
         bound = _FakeBoundAdapter(
             failures=self._failures,
             open_failures=self._open_failures,
@@ -349,6 +351,7 @@ class _FakeAdapter(Adapter):
             stream=self._stream,
             send_seconds=self._send_seconds,
             hang_from_open=self._hang_from_open,
+            hang_from_send=self._hang_from_send,
         )
         self.bound_adapters.append(bound)
         return bound
@@ -550,6 +553,113 @@ def test_unrecognized_error_classified_abort_raises() -> None:
         with pytest.raises(AbortBatchError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].send_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_generate_one_success_and_failure_append_no_abandoned_call() -> None:
+    """A call that returns or raises appends nothing: its usage travels on the value."""
+
+    async def scenario() -> None:
+        """Drive one clean finish and one retry exhaustion over the same log."""
+        abandoned_call_log: list[AbandonedCall] = []
+        adapter = _FakeAdapter()
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        response = await bound_llm.generate_one(
+            [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+        )
+        assert response.output == "ok"
+        failing_adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        failing_bound_llm = LLM(
+            failing_adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)
+        ).bind(automatic_prompt_caching=True)
+        with pytest.raises(RetriesExhaustedError):
+            await failing_bound_llm.generate_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            )
+        assert abandoned_call_log == []
+
+    asyncio.run(scenario())
+
+
+def test_generate_one_cancellation_appends_the_settled_attempts() -> None:
+    """A caller's deadline cancelling the call leaves an AbandonedCall carrying the settled usage.
+
+    The settled attempt's record lives inside the cancelled retry frame, so without the append the
+    billed 200's known paid usage would vanish with the frame; the CancelledError still propagates,
+    which is the caller's scope converting it to this TimeoutError.
+    """
+
+    async def scenario() -> None:
+        """Settle one billed transient attempt, then hang the retry into the caller's deadline."""
+        adapter = _FakeAdapter(
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
+            ],
+            hang_from_send=2,
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await bound_llm.generate_one(
+                    [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+                )
+        assert adapter.bound_adapters[0].send_count == 2
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.usage_settled.cost_in_usd == 0.25
+        assert len(abandoned_call.attempt_records) == 1
+        assert abandoned_call.model == adapter.model
+        assert abandoned_call.provider_name == adapter.provider_name
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_one_cancellation_with_nothing_settled_fabricates_no_usage() -> None:
+    """A call cancelled before any attempt settled appends a record with no attempt records."""
+
+    async def scenario() -> None:
+        """Cancel the call's task while the first send hangs."""
+        adapter = _FakeAdapter(hang_from_send=1)
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        call = asyncio.create_task(
+            bound_llm.generate_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            )
+        )
+        await asyncio.sleep(0.01)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.attempt_records == ()
+        assert abandoned_call.usage_settled == ZERO_USAGE
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_one_abort_appends_no_abandoned_call() -> None:
+    """An AbortBatchError propagates with nothing appended: it abandons no request."""
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send raises a classify-abort exception."""
+        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="abort")
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(AbortBatchError):
+            await bound_llm.generate_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            )
+        assert abandoned_call_log == []
 
     asyncio.run(scenario())
 
@@ -965,6 +1075,127 @@ def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
             await asyncio.wait_for(drain(), timeout=0.05)
         admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
         rate_limiter.release(admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_inside_the_block_appends_one_abandoned_call() -> None:
+    """A cancellation unwinding the block leaves an AbandonedCall; the stream's own spend is unobservable.
+
+    The record's attempt_records are empty because the streaming request is the in-flight attempt:
+    only pre-first-item open failures settle records on a stream.
+    """
+
+    async def scenario() -> None:
+        """Time out a consumer suspended on a hanging stream, then read the log."""
+        abandoned_call_log: list[AbandonedCall] = []
+        adapter = _FakeAdapter(stream=_HangingStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+
+        async def drain() -> None:
+            """Enter and iterate into the hang; the wait_for below cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                async for _item in handle:
+                    pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(drain(), timeout=0.05)
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.attempt_records == ()
+        assert abandoned_call.usage_settled == ZERO_USAGE
+        assert abandoned_call.model == adapter.model
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_during_the_open_appends_one_abandoned_call() -> None:
+    """A cancellation landing in __aenter__ still records the abandonment.
+
+    __aexit__ never runs when __aenter__ raises, so only __aenter__ itself can append here.
+    """
+
+    async def scenario() -> None:
+        """Time out an entry whose open never returns, then read the log."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(_FakeAdapter(hang_from_open=1), rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+
+        async def enter_and_leave() -> None:
+            """Enter the handle whose open never returns; the wait_for below cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ):
+                pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(enter_and_leave(), timeout=0.02)
+        assert len(abandoned_call_log) == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_completed_or_left_early_appends_no_abandoned_call() -> None:
+    """final() completing, or a consumer leaving the block voluntarily, appends nothing.
+
+    Only a cancellation gets a record: an assembled Response reached the caller, and a voluntary
+    early exit is the caller walking away in live code.
+    """
+
+    async def scenario() -> None:
+        """Consume one stream to final(), leave a second before its first item."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(_FakeAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one(
+            [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+        ) as handle:
+            await handle.final()
+        second_adapter = _FakeAdapter(stream=_HangingStream())
+        second_bound_llm = LLM(second_adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with second_bound_llm.stream_one(
+            [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+        ):
+            pass
+        assert abandoned_call_log == []
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None:
+    """A cancellation after final() raised its GenerationError appends nothing.
+
+    The refusal's enriched leaf carried its usage to the caller, so an AbandonedCall here would
+    double-count that spend and mislabel a concluded call as an in-flight abandonment.
+    """
+
+    async def scenario() -> None:
+        """Absorb a refusal from final() inside the block, then hang into the caller's deadline."""
+        abandoned_call_log: list[AbandonedCall] = []
+        adapter = _FakeAdapter(stream=_RefusingStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+
+        async def consume() -> None:
+            """Let final() refuse, then sleep; the wait_for below cancels this inside the block."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                with pytest.raises(RefusalError):
+                    await handle.final()
+                await asyncio.sleep(60)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        assert abandoned_call_log == []
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

@@ -30,7 +30,7 @@ from langchaint.exceptions import (
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import Message, TextPart, UserMessage
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import Response
+from langchaint.response import AbandonedCall, AbandonedCallLog, Response
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
 
@@ -104,7 +104,6 @@ def _reject_bare_str_batch(conversations: SequenceNotStr[str | Sequence[Message]
 
 
 def _as_conversation(conversation: str | Sequence[Message]) -> Sequence[Message]:
-    """Expand a bare str into a conversation of one UserMessage."""
     if isinstance(conversation, str):
         return (UserMessage(content=conversation),)
     return conversation
@@ -121,8 +120,7 @@ def _build_binding(
 ) -> Binding:
     """Convert bind arguments to the frozen Binding.
 
-    Tool schema conversion happens here, once per binding;
-    a system_prompt given as parts is coerced to the frozen tuple form.
+    Tool schema conversion happens here, once per binding.
 
     Raises:
         ValueError: system_prompt is an empty sequence of parts; pass None to bind no system prompt.
@@ -148,8 +146,6 @@ def _bind_adapter(
 ) -> BoundAdapter[Any]:
     """Dispatch to the adapter bind method the response_format selects.
 
-    response_format None routes to bind_text (output is assistant text);
-    a model routes to bind_structured (output is the SDK-parsed instance).
     The caller-visible output type comes from the bind / rebind overloads,
     so this returns BoundAdapter[Any] and the Any is confined here.
     The parameter is type[Any] | None, not type[BaseModel] | None,
@@ -312,9 +308,8 @@ class BoundLLM[OutputT]:
     ) -> "BoundLLM[Any]":
         """Replace bound fields; a left-out field keeps its current value.
 
-        response_format left out keeps the current output type;
-        passing a model switches to BoundLLM[that model], and passing None switches to BoundLLM[str].
-        This is the one field whose change alters the static output type, so it drives the overload return type.
+        response_format is the one field whose change alters the static output type,
+        so it drives the overload return type.
         Replace semantics: a passed inference_params replaces the bound one whole, never field-wise.
         Every rebind converts the binding to SDK keyword arguments again, a pure conversion with no I/O.
         Whether a rebind preserves the provider's prompt cache is provider-specific and partly undocumented
@@ -365,13 +360,19 @@ class BoundLLM[OutputT]:
             rate_limiter=self.rate_limiter,
         )
 
-    async def _generate_with_retries(self, conversation: Sequence[Message]) -> Response[OutputT]:
+    async def _generate_with_retries(
+        self,
+        conversation: Sequence[Message],
+        *,
+        attempt_records: list[AttemptRecord] | None = None,
+    ) -> Response[OutputT]:
         """Run the retry loop every generate method shares.
 
-        Only a TransientError is retried.
-        Transient exhaustion raises RetriesExhaustedError.
-        A refusal or a token-cap truncation on the structured path raises the matching GenerationError leaf on the
-        first attempt without a retry; an abort classification raises AbortBatchError immediately.
+        attempt_records, when given, is the caller's own empty list (the retry budget counts its
+        length), appended to in place as each attempt settles: generate_one passes one so a
+        cancellation that kills this frame leaves the settled attempts' records readable outside it.
+        Appends happen only between awaits, so the list never holds a partial record.
+
         TransientError, AbortBatchError,
         and the GenerationError leaves raised directly by the adapter are honored without classification.
         Each attempt holds a RateLimiter slot for the request only;
@@ -393,7 +394,8 @@ class BoundLLM[OutputT]:
                 re-raised enriched on the first attempt without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
-        attempt_records: list[AttemptRecord] = []
+        if attempt_records is None:
+            attempt_records = []
         started_at_monotonic_seconds = time.monotonic()
         while len(attempt_records) < self.rate_limiter.max_attempts:
             async with self.rate_limiter.slot() as admission:
@@ -475,7 +477,12 @@ class BoundLLM[OutputT]:
             stop_reason=None,
         )
 
-    async def generate_one(self, conversation: str | Sequence[Message]) -> Response[OutputT]:
+    async def generate_one(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = None,
+    ) -> Response[OutputT]:
         """Generate one response under the retry loop.
 
         A bare str is shorthand for a conversation of one UserMessage holding that text.
@@ -483,15 +490,39 @@ class BoundLLM[OutputT]:
         RefusalError or MaxCompletionTokensExceededError on the structured path,
         and AbortBatchError on an abort classification;
         the first three share the GenerationError base a caller can catch at once.
+
+        abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's
+        asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts this call off. The append is
+        the only channel that path has: no value reaches the caller, and the settled attempts'
+        records live in this frame, which the cancellation unwinds. Every other outcome appends
+        nothing, because its usage travels on the Response or the raised GenerationError, which the
+        caller records itself.
+
+        Raises:
+            asyncio.CancelledError: an outer scope cancelled this call; when abandoned_call_log is
+                given, the AbandonedCall is appended first.
         """
-        return await self._generate_with_retries(_as_conversation(conversation))
+        attempt_records: list[AttemptRecord] = []
+        try:
+            return await self._generate_with_retries(
+                _as_conversation(conversation), attempt_records=attempt_records
+            )
+        except asyncio.CancelledError:
+            if abandoned_call_log is not None:
+                abandoned_call_log.append(
+                    AbandonedCall(
+                        attempt_records=tuple(attempt_records),
+                        model=self.adapter.model,
+                        provider_name=self.adapter.provider_name,
+                    )
+                )
+            raise
 
     async def _generate_or_failure(
         self, conversation: str | Sequence[Message]
     ) -> Response[OutputT] | GenerationError:
         """One batch item: the Response, or the GenerationError caught as the failure row.
 
-        Every GenerationError leaf (retries exhausted, refusal, truncation) becomes a failure row.
         An AbortBatchError is not caught here, so it propagates out of the batch and cancels the siblings.
         """
         try:
@@ -538,7 +569,6 @@ class BoundLLM[OutputT]:
     async def _gather_or_cancel(
         self, conversations: Sequence[str | Sequence[Message]]
     ) -> list[Response[OutputT] | GenerationError]:
-        """Run the conversations concurrently; on any raise, cancel the in-flight siblings and re-raise."""
         tasks = [
             asyncio.create_task(self._generate_or_failure(conversation))
             for conversation in conversations
@@ -550,16 +580,22 @@ class BoundLLM[OutputT]:
                 task.cancel()
             raise
 
-    def stream_one(self, conversation: str | Sequence[Message]) -> StreamHandle[OutputT]:
+    def stream_one(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = None,
+    ) -> StreamHandle[OutputT]:
         """Build the stream handle; entering it with `async with` opens the request.
 
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Sync because nothing suspends until the handle is entered;
-        see StreamHandle for the retry and close contracts.
+        see StreamHandle for the retry, close, and abandoned_call_log contracts.
         """
         return StreamHandle(
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,
             conversation=_as_conversation(conversation),
             rate_limiter=self.rate_limiter,
+            abandoned_call_log=abandoned_call_log,
         )

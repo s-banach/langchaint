@@ -2,38 +2,64 @@
 
 Two of these are the reason the module has its shape.
 
-The first is the guardrail: an application that writes run() as a generator is rejected at
-construction. That is the whole encapsulation argument in one assertion, and if it ever stops holding,
-the design has lost its point rather than merely a feature.
+The first is the accounting claim: the totals are final the moment an app deadline's except runs,
+with no settling step, because the cancellation unwinds the whole tree before it propagates and every
+record was written where the spend happened.
 
-The second is the consumer-latency property: a consumer slower than the run's own deadline does not
-kill the run, because the loop runs in its own task and the deadline measures the loop's work, not the
-consumer's pulls. A design that drives the loop from the consumer's pulls cannot have this property,
-which is why run() is a coroutine and not a generator.
+The second is the reach claim: a tool function reports into the on_event of whichever run dispatched
+it through the ambient GuiEmitter, with no emitter parameter on any tool.
 
 Async tests run through asyncio.run in a sync test function, the convention the rest of this repo's
 suite uses, so no pytest-asyncio plugin is needed.
 """
 
 import asyncio
+from collections.abc import Callable
+from typing import override
 
 import pytest
 from config import AgentConfig, build_configs
-from events import AgentFailed, AgentFinished, ToolProgress, TurnStarted, current_gui_emitter
-from harness import Turn, build_llm, call
-from opentelemetry import trace
+from events import (
+    AgentFailed,
+    AgentFinished,
+    Event,
+    ToolProgress,
+    current_gui_emitter,
+)
+from harness import Turn, build_llm
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from scenario import build_scripts, reset_critique, search_tool
-from task_stream import AgentRun, App, ReActAgent
+from scenario import build_scripts
+from task_stream import AgentRun, App, ReActAgent, build_delegate_tool
 
-from langchaint.tracing import TracedLLM, TracedToolManager
+from langchaint import AbandonedCall
+from langchaint.tracing import TracedLLM
 
 
-def _build_app(scenario: str, *, exporter: InMemorySpanExporter | None = None) -> App:
+def _discard(event: Event) -> None:
+    """Drop the event; a test using this reads the runs and the totals instead."""
+
+
+def _abandoned_count(app: App) -> int:
+    """Count the AbandonedCall records across every run's turn_log, folded after the run."""
+    return sum(
+        isinstance(record, AbandonedCall) for run in app.runs.values() for record in run.turn_log
+    )
+
+
+def _total_cost(app: App) -> float:
+    """Fold the tree's whole cost from every run's turn_log, after the run."""
+    return sum(run.own_usage.cost_in_usd for run in app.runs.values())
+
+
+def _build_app(
+    scenario: str,
+    *,
+    on_event: Callable[[Event], None] = _discard,
+    exporter: InMemorySpanExporter | None = None,
+) -> App:
     """Build an app for one scenario under a local TracerProvider."""
-    reset_critique()
     tracer_provider = TracerProvider()
     if exporter is not None:
         tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -41,25 +67,23 @@ def _build_app(scenario: str, *, exporter: InMemorySpanExporter | None = None) -
         llm=build_llm(build_scripts(scenario)),
         configs=build_configs(),
         tracer=tracer_provider.get_tracer("full_app.test"),
+        on_event=on_event,
     )
-
-
-def _drive(app: App) -> None:
-    """Consume an app's whole event stream so every run settles."""
-
-    async def run() -> None:
-        async for _ in app:
-            pass
-
-    asyncio.run(run())
 
 
 def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableSpan | None:
     """Return the span that is the given span's parent, or None when it is a root."""
     if span.parent is None:
         return None
-    by_id = {other.context.span_id: other for other in spans if other.context is not None}
-    return by_id.get(span.parent.span_id)
+    parent_id = span.parent.span_id
+    return next(
+        (
+            other
+            for other in spans
+            if other.context is not None and other.context.span_id == parent_id
+        ),
+        None,
+    )
 
 
 def _named(spans: tuple[ReadableSpan, ...], name: str) -> ReadableSpan:
@@ -75,137 +99,42 @@ def _attribute(span: ReadableSpan, key: str) -> object:
     return span.attributes.get(key)
 
 
-def test_a_generator_run_is_rejected_at_construction() -> None:
-    """Writing run() as an async generator fails immediately, with a message naming the alternative.
+def test_one_on_event_receives_the_whole_tree() -> None:
+    """Every run's events reach the one on_event, the specialist's through no forwarding at all.
 
-    This is the encapsulation: the hazard is not merely absent from application code, it is unwritable.
-    Without this check the same mistake surfaces as "'async_generator' object can't be awaited" on the
-    first pull, which does not tell the author what to do instead.
+    delegate constructs its sub-run with the same on_event, so three levels report to one consumer,
+    and the parent's total is the prefix fold over the registry: its own log plus the specialist's.
     """
-
-    class GeneratorRun(AgentRun):
-        """An agent whose author reached for a generator, the shape this class exists to reject.
-
-        Every suppression below is the point of the test: a type checker rejects this class too, and the
-        runtime check exists for the authors who do not run one, or who reach for `# type: ignore` to
-        quiet it. The check must fire on the class as written here, suppressions and all.
-        """
-
-        # pyrefly: ignore[bad-override]
-        # pyrefly: ignore[missing-override-decorator]
-        # pyrefly: ignore[bad-return]
-        async def run(self) -> str:
-            """Yield instead of emitting, which is the mistake under test.
-
-            Yields:
-                Nothing reachable: constructing this class is what fails, so the body never runs.
-            """
-            yield "an event"
-
-    with pytest.raises(TypeError, match="must be a coroutine"):
-        GeneratorRun(
-            agent_path="root/wrong",
-            config=AgentConfig(name="wrong", system_prompt="[wrong] p"),
-            tracer=TracerProvider().get_tracer("full_app.test"),
-            registry={},
-        )
-
-
-SLOW_CONSUMER_PAUSE_SECONDS = 0.4
-"""What the consumer sleeps per event, against the 1.0s run deadline the setup below configures."""
-
-
-def _slow_consumer_setup() -> ReActAgent:
-    """Build one agent whose run outlives a consumer slower than its deadline.
-
-    The script is a search turn then an answer, so the loop's own work is milliseconds against a 1.0s
-    deadline, while the consumer sleeps 0.4s per event and takes several seconds to drain the run. A
-    run whose deadline measured the consumer's pulls would time out; this one finishes, and the margin
-    is seconds against milliseconds, so neither outcome is a race.
-    """
-    reset_critique()
-    tracer = TracerProvider().get_tracer("full_app.test")
-    scripts = {
-        "slow": [
-            Turn(tool_calls=(call("search", '{"query": "q"}'),)),
-            Turn(text="done"),
-        ]
-    }
-    config = AgentConfig(
-        name="slow",
-        system_prompt="[slow] answer",
-        max_turns=4,
-        timeout_seconds=1.0,
-        per_call_timeout_seconds=1.0,
-    )
-    llm = TracedLLM(build_llm(scripts), capture_message_content=False, tracer=tracer)
-    tool_manager = TracedToolManager([search_tool], capture_message_content=False, tracer=tracer)
-    return ReActAgent(
-        agent_path="root/slow",
-        config=config,
-        tracer=tracer,
-        registry={},
-        bound=llm.bind(
-            system_prompt=config.system_prompt,
-            tool_manager=tool_manager,
-            automatic_prompt_caching=True,
-        ),
-        tool_manager=tool_manager,
-        prompt="go",
-    )
-
-
-def test_a_consumer_slower_than_the_deadline_does_not_kill_the_run() -> None:
-    """The loop runs in its own task, so it finishes long before the slow consumer has drained it."""
-    agent = _slow_consumer_setup()
-
-    async def drive_slowly() -> None:
-        async for _ in agent:
-            await asyncio.sleep(SLOW_CONSUMER_PAUSE_SECONDS)
-
-    asyncio.run(drive_slowly())
-    assert agent.answer == "done"
-    assert agent.failure is None
-
-
-def test_the_stream_carries_the_sub_agents_events() -> None:
-    """The specialist's events reach the top-level consumer, forwarded through its parent's stream."""
-    app = _build_app("happy")
-    paths: set[str] = set()
-
-    async def drive() -> None:
-        async for event in app:
-            paths.add(event.agent_path)
-
-    asyncio.run(drive())
-    assert paths == {
+    events: list[Event] = []
+    app = _build_app("happy", on_event=events.append)
+    asyncio.run(app.run())
+    assert {event.agent_path for event in events} == {
         "root/research_climate",
-        "root/research_climate/specialist",
+        "root/research_climate/specialist#0",
         "root/research_energy",
         "root/synthesize",
     }
-    specialist = app.runs["root/research_climate/specialist"]
-    assert specialist.answer is not None
+    climate = app.runs["root/research_climate"]
+    specialist = app.runs["root/research_climate/specialist#0"]
     assert specialist.usage.cost_in_usd > 0
+    assert climate.usage.cost_in_usd == pytest.approx(
+        climate.own_usage.cost_in_usd + specialist.own_usage.cost_in_usd
+    )
 
 
-def test_a_tools_progress_lands_in_the_stream_of_the_run_that_dispatched_it() -> None:
+def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() -> None:
     """ToolProgress from search carries the dispatching run's path, the specialist's included.
 
-    One search function, no emitter parameter: each run's task installed its own GuiEmitter, so the
-    same function reports to whichever run called it, and the specialist's progress is stamped with the
-    specialist's path rather than its parent's.
+    One search function, no emitter parameter: each run's final() installed its own GuiEmitter, and
+    the dispatch task copied the context holding it, so the same function reports to whichever run
+    called it, and the specialist's progress is stamped with the specialist's path rather than its
+    parent's.
     """
-    app = _build_app("happy")
-    progress_paths: list[str] = []
-
-    async def drive() -> None:
-        progress_paths.extend([
-            event.agent_path async for event in app if isinstance(event, ToolProgress)
-        ])
-
-    asyncio.run(drive())
-    assert "root/research_climate/specialist" in progress_paths
+    events: list[Event] = []
+    app = _build_app("happy", on_event=events.append)
+    asyncio.run(app.run())
+    progress_paths = [event.agent_path for event in events if isinstance(event, ToolProgress)]
+    assert "root/research_climate/specialist#0" in progress_paths
     assert "root/research_energy" in progress_paths
 
 
@@ -219,34 +148,16 @@ def test_reading_the_emitter_outside_a_run_raises_naming_what_to_install() -> No
         current_gui_emitter()
 
 
-def test_final_resumes_a_partially_iterated_run_rather_than_restarting_it() -> None:
-    """Reading some events and then awaiting final() drives one run, not two."""
-    agent = _slow_consumer_setup()
-
-    async def drive() -> str:
-        """Take two events, abandon the loop, then finish the same run through final()."""
-        seen = 0
-        async for _ in agent:
-            seen += 1
-            if seen == 2:
-                break
-        return await agent.final()
-
-    assert asyncio.run(drive()) == "done"
-    # Two generate turns at $0.01 and one search at $0.002: the script played once, not twice.
-    assert agent.usage.cost_in_usd == pytest.approx(0.022)
-
-
 def test_sub_agent_span_nests_under_the_delegate_tool_span() -> None:
     """The specialist's span parents to the delegate execute_tool span with no context plumbing.
 
-    _drain creates the run's task from the frame delegate iterates in, and create_task copies the
-    context active at creation, which is the one the tool span is current in. A task boundary would
-    break this if it were created anywhere else, so it is asserted rather than assumed.
+    The sub-run's final() runs in the frame delegate awaits in, which is the one the tool span is
+    current in, so the nesting is ordinary frame nesting; it is asserted rather than assumed because
+    moving final() behind a task created elsewhere would silently break it.
     """
     exporter = InMemorySpanExporter()
     app = _build_app("happy", exporter=exporter)
-    _drive(app)
+    asyncio.run(app.run())
     spans = exporter.get_finished_spans()
     specialist = _named(spans, "invoke_agent specialist")
     delegate_span = _parent_of(specialist, spans)
@@ -259,7 +170,7 @@ def test_the_agent_span_parents_its_own_generate_spans() -> None:
     """A run's generate spans sit under its agent span, with the span opened the ordinary way."""
     exporter = InMemorySpanExporter()
     app = _build_app("happy", exporter=exporter)
-    _drive(app)
+    asyncio.run(app.run())
     spans = exporter.get_finished_spans()
     energy = _named(spans, "invoke_agent research_energy")
     generate_spans = [
@@ -272,127 +183,65 @@ def test_the_agent_span_parents_its_own_generate_spans() -> None:
     assert len(generate_spans) == 2
 
 
-def test_no_agent_span_is_current_in_the_consumer() -> None:
-    """A consumer receiving an event has no agent span current.
-
-    The span is entered in the run's own task, so it is not in the consumer's context to leak; a shape
-    that entered it around a generator's yield would leave it current in the consumer instead.
-    """
-    app = _build_app("happy")
-
-    async def drive() -> None:
-        events = 0
-        async for _ in app:
-            events += 1
-            assert not trace.get_current_span().get_span_context().is_valid
-        assert events > 0
-
-    asyncio.run(drive())
-
-
 def test_the_per_agent_deadline_fires_on_cumulative_time() -> None:
     """An ordinary enclosing timeout cuts a run off on cumulative time, no fixed-instant arithmetic."""
     app = _build_app("agent_timeout")
-    _drive(app)
+    asyncio.run(app.run())
     energy = app.runs["root/research_energy"]
     assert isinstance(energy, ReActAgent)
-    assert energy.answer is None
+    assert "root/research_energy" in app.failures
+    assert "root/research_energy" not in app.answers
     assert energy.usage.cost_in_usd > 0
-    assert app.abandoned_calls == 1
+    assert _abandoned_count(app) == 1
     # More than one call completed before the cut-off, which is the whole difference from the per-call
     # deadline: that one would have ended the run on its first delayed call, at turn 1.
     assert energy.turn_number >= 2
 
 
-def test_a_whole_app_deadline_counts_the_calls_it_cancelled() -> None:
-    """Both researchers are mid-request when the app deadline fires, and both cancellations are counted.
+def test_the_accounting_is_final_when_the_app_deadline_lands() -> None:
+    """Both researchers are mid-request when the app deadline fires; the except reads final totals.
 
-    settle() asks each run to unwind rather than tracking pumps, because each run owns its own task.
+    The TaskGroup in App.run awaits every child's unwind before the cancellation propagates, and
+    generate_one appends each cancelled call's AbandonedCall inside the frame the cancellation
+    unwinds, so nothing stands between the except and the totals.
     """
     app = _build_app("app_timeout")
-    before_settle: list[int] = []
+    at_except: list[tuple[int, float]] = []
 
     async def drive() -> None:
         try:
             async with asyncio.timeout(0.5):
-                async for _ in app:
-                    pass
+                await app.run()
         except TimeoutError:
-            before_settle.append(app.abandoned_calls)
-            await app.settle()
+            at_except.append((_abandoned_count(app), _total_cost(app)))
 
     asyncio.run(drive())
-    # Read before settle(), the count is short: the cancelled calls have not reached their handler yet.
-    # Without this a no-op settle() would pass the assertion below on a tree that never unwound.
-    assert before_settle == [0]
-    assert app.abandoned_calls == 2
-    assert app.total_usage.cost_in_usd > 0
-
-
-def _pending_run_paths(app: App) -> set[str]:
-    """Return the paths of registered runs whose tasks have not finished unwinding."""
-    tasks = {path: run._task for path, run in app.runs.items()}  # noqa: SLF001  # done-ness of the run's task is the claim under test
-    return {path for path, task in tasks.items() if task is not None and not task.done()}
-
-
-def test_a_client_disconnect_settles_through_the_registry_not_the_generator_chain() -> None:
-    """A consumer that aclose()s the stream mid-run leaves the runs to one settle() in its finally.
-
-    The offline model of a server stream handler whose client disconnected. aclose() throws
-    GeneratorExit at App.__aiter__'s suspended yield and closes nothing beneath it: _fan_in is left
-    to the event loop's async-generator finalizer, which has not run by the reads below, and the run
-    tasks keep running, held by the registry. So right after aclose() both researchers' tasks are
-    still pending and the in-flight calls' AbandonedCall rows are missing; settle(), reaching every
-    run through the registry, is what unwinds them and makes the accounting final.
-    """
-    app = _build_app("app_timeout")
-    pending_before: list[set[str]] = []
-    abandoned_before: list[int] = []
-
-    async def drive() -> None:
-        """Consume until both researchers are inside their stalled second call, then disconnect."""
-        events = aiter(app)
-        second_turns_started = 0
-        try:
-            async for event in events:
-                if isinstance(event, TurnStarted) and event.turn_number == 2:
-                    second_turns_started += 1
-                    if second_turns_started == 2:
-                        break
-        finally:
-            await events.aclose()
-            pending_before.append(_pending_run_paths(app))
-            abandoned_before.append(app.abandoned_calls)
-            await app.settle()
-
-    asyncio.run(drive())
-    assert pending_before == [{"root/research_climate", "root/research_energy"}]
-    assert abandoned_before == [0]
-    assert _pending_run_paths(app) == set()
-    assert app.abandoned_calls == 2
     # Climate's first turn ($0.01 plus two searches at $0.002) and energy's ($0.01 plus one search).
     # The two abandoned calls had no settled attempt, and no usage is fabricated for an in-flight
     # attempt, so they add nothing.
-    assert app.total_usage.cost_in_usd == pytest.approx(0.026)
+    assert at_except == [(2, pytest.approx(0.026))]
 
 
-def test_a_run_cancelled_from_outside_ends_its_stream_without_a_terminal_event() -> None:
-    """An outside cancellation closes the queue, so iteration ends with no AgentFinished or AgentFailed.
+def test_a_run_cancelled_from_outside_emits_no_terminal_event() -> None:
+    """An outside cancellation ends a run with no AgentFinished or AgentFailed.
 
-    _driven lets the CancelledError propagate rather than recording it, so the run has no outcome to
-    report. The queue still closes, which is what keeps a consumer from waiting on a stopped run. A UI
-    that treats a terminal event as guaranteed would hang here, which is why _drain says so.
+    final() lets the CancelledError propagate rather than reporting it, so the run has no outcome to
+    report. A UI that treats a terminal event as guaranteed would show these runs in flight forever,
+    which is why final() says so.
     """
-    app = _build_app("app_timeout")
-    events_by_path: dict[str, list[object]] = {}
+    events_by_path: dict[str, list[Event]] = {}
+
+    def collect(event: Event) -> None:
+        events_by_path.setdefault(event.agent_path, []).append(event)
+
+    app = _build_app("app_timeout", on_event=collect)
 
     async def drive() -> None:
         try:
             async with asyncio.timeout(0.5):
-                async for event in app:
-                    events_by_path.setdefault(event.agent_path, []).append(event)
+                await app.run()
         except TimeoutError:
-            await app.settle()
+            pass
 
     asyncio.run(drive())
     climate = events_by_path["root/research_climate"]
@@ -403,12 +252,86 @@ def test_a_run_cancelled_from_outside_ends_its_stream_without_a_terminal_event()
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
-    """A sub-agent failure is data for the parent model, and its spend stands."""
-    app = _build_app("subagent_error")
-    _drive(app)
-    specialist = app.runs["root/research_climate/specialist"]
-    assert specialist.failure is not None
-    assert specialist.answer is None
-    # One turn at $0.01 and one search at $0.002 before the second turn raised; both rows stand.
-    assert specialist.usage.cost_in_usd == pytest.approx(0.012)
-    assert app.runs["root/research_climate"].answer is not None
+    """A sub-agent failure is data for the parent model, and its spend stands.
+
+    The specialist's final() emits AgentFailed before re-raising, delegate catches the raise and
+    returns an is_error tool message, and the records written as the sub-run spent survive the unwind.
+    """
+    events: list[Event] = []
+    app = _build_app("subagent_error", on_event=events.append)
+    asyncio.run(app.run())
+    specialist_terminals = [
+        type(event)
+        for event in events
+        if event.agent_path == "root/research_climate/specialist#0"
+        and isinstance(event, AgentFinished | AgentFailed)
+    ]
+    assert specialist_terminals == [AgentFailed]
+    # One turn at $0.01 and one search at $0.002 before the second turn raised; both records stand.
+    assert app.runs["root/research_climate/specialist#0"].usage.cost_in_usd == pytest.approx(0.012)
+    assert "root/research_climate" in app.answers
+
+
+def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
+    """Two delegate calls register two runs, at spawn indices #0 and #1.
+
+    An agent's name is not unique within a parent, so identity is per spawn: without the index the
+    second run would collide with the first in the registry, and a registry row is the run object
+    itself, which two spawns cannot share.
+    """
+    tracer = TracerProvider().get_tracer("full_app.test")
+    registry: dict[str, AgentRun] = {}
+    # Two text turns: the shared script serves both spawns, one send each.
+    llm = TracedLLM(
+        build_llm({"specialist": [Turn(text="first"), Turn(text="second")]}),
+        capture_message_content=False,
+        tracer=tracer,
+    )
+    delegate_tool = build_delegate_tool(
+        llm=llm,
+        parent_path="root/parent",
+        sub_config=AgentConfig(name="specialist", system_prompt="[specialist] answer"),
+        tracer=tracer,
+        capture_message_content=False,
+        registry=registry,
+        on_event=_discard,
+    )
+
+    async def spawn_twice() -> None:
+        await delegate_tool.validate_and_run('{"question": "q1"}')
+        await delegate_tool.validate_and_run('{"question": "q2"}')
+
+    asyncio.run(spawn_twice())
+    assert set(registry) == {"root/parent/specialist#0", "root/parent/specialist#1"}
+
+
+def test_a_second_run_under_one_agent_path_is_rejected() -> None:
+    """Registering a run under an already-registered path raises instead of replacing the row.
+
+    A registry row is one run held by reference, so a silent replacement would drop the first run's
+    turn_log records from every fold; the raise forces a spawner that reuses a name to disambiguate
+    the path, as delegate does with its spawn index.
+    """
+
+    class NoOpRun(AgentRun):
+        """The smallest concrete run: registration is the behavior under test, so run() never runs."""
+
+        @override
+        async def run(self) -> str:
+            """Return a constant; nothing in this test drives the run."""
+            return "unused"
+
+    registry: dict[str, AgentRun] = {}
+    config = AgentConfig(name="twin", system_prompt="[twin] p")
+    tracer = TracerProvider().get_tracer("full_app.test")
+    NoOpRun(
+        agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard
+    )
+    with pytest.raises(ValueError, match="already registered"):
+        NoOpRun(
+            agent_path="root/twin",
+            config=config,
+            tracer=tracer,
+            registry=registry,
+            on_event=_discard,
+        )

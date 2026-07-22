@@ -4,7 +4,7 @@ A generate that succeeds returns a Response; one that ends terminally (retries e
 or a truncation at the token cap) raises or returns a GenerationError;
 one a cancellation cuts off leaves an AbandonedCall on the caller's abandoned_call_log.
 The three carriers share the per-attempt history langchaint's retry loop produces,
-because that loop takes no callback and the history survives only if the result carries it:
+because the history survives only if the result carries it:
 attempt_records is that history, one record per request sent.
 On a Response every record but the last failed and the last succeeded;
 on a GenerationError the records describe the terminal outcome;

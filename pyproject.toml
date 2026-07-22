@@ -215,7 +215,9 @@ lint.per-file-ignores."examples/*" = ["INP001"]
 # is ignored because catching bare Exception around a sub-run is deliberate: a narrower except
 # turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
 # of a message the parent model can answer around. Each such except carries a comment stating
-# that.
-lint.per-file-ignores."examples/full_app/*" = ["INP001", "BLE001"]
+# that. PLR0911 (too-many-return-statements) is ignored because the event renderer is one
+# exhaustive match over the closed Event union, one return per arm; splitting it would
+# reintroduce an unreachable fallback arm.
+lint.per-file-ignores."examples/full_app/*" = ["INP001", "BLE001", "PLR0911"]
 
 [tool.typos.default.extend-words]

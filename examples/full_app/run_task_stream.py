@@ -1,4 +1,4 @@
-"""Drive task_stream.py through every failure layer and print what the UI saw and what usage survived.
+"""Drive task_stream.py through every failure layer and print what the UI saw.
 
 SCENARIOS is the run configuration, committed as data: each row names the script to play and the limits
 to play it under, so narrowing a run means editing a row that shows in `git diff` rather than passing an
@@ -6,14 +6,15 @@ argument that leaves no trace. main() takes no arguments for the same reason.
 """
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from config import build_configs
+from events import Event
 from harness import build_llm
 from opentelemetry import trace
 from render import render
-from scenario import build_scripts, reset_critique
-from task_stream import App, ReActAgent
+from scenario import build_scripts
+from task_stream import App
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,7 @@ class Scenario:
 
     script_name is separate from name because tool_budget is the happy script run under a smaller
     budget, so it perturbs the config rather than the script.
-    climate_max_tool_calls of None leaves build_configs' own default in place, so the default has one
+    climate_max_tool_calls of None leaves AgentConfig's own default in place, so the default has one
     home and cannot drift from a copy written here.
     """
 
@@ -43,6 +44,11 @@ SCENARIOS = (
 )
 
 
+def print_event(event: Event) -> None:
+    """Render one event as a single line and print it; every scenario's App gets this as on_event."""
+    print(render(event))
+
+
 def build_app(scenario: Scenario) -> App:
     """Build the App over one scenario's scripted LLM and configs.
 
@@ -50,46 +56,35 @@ def build_app(scenario: Scenario) -> App:
     this run gets non-recording spans, so tracing costs nothing here and enabling it is SDK
     configuration, never a change to this file.
     """
+    configs = build_configs()
+    if scenario.climate_max_tool_calls is not None:
+        configs["research_climate"] = replace(
+            configs["research_climate"], max_tool_calls=scenario.climate_max_tool_calls
+        )
     return App(
         llm=build_llm(build_scripts(scenario.script_name)),
-        configs=build_configs(climate_max_tool_calls=scenario.climate_max_tool_calls),
+        configs=configs,
         tracer=trace.get_tracer("examples.full_app"),
+        on_event=print_event,
     )
 
 
 async def run_scenario(scenario: Scenario) -> None:
-    """Run one scenario end to end and print the event stream, then the surviving accounting."""
-    reset_critique()
+    """Run one scenario end to end and print the event stream, then the outcome."""
     app = build_app(scenario)
     print(f"\n=== {scenario.name} (app timeout {scenario.app_timeout_seconds}s) ===")
     timed_out = False
     try:
         async with asyncio.timeout(scenario.app_timeout_seconds):
-            async for event in app:
-                print(render(event))
+            await app.run()
     except TimeoutError:
+        # The turn logs are already final here: the cancellation unwound the whole tree before the
+        # TimeoutError reached this frame.
         timed_out = True
         print("!! whole-app timeout fired")
-    finally:
-        # Unconditional: every abandon path (a deadline here, a client disconnect in a server) ends
-        # in this one settle(), and after a completed run it does nothing. Cancelling is not the
-        # same as having unwound; the counts below are read after this.
-        await app.settle()
     print(f"--- final answer: {app.final_answer!r}")
     print(f"--- app timed out: {timed_out}")
-    print(
-        f"--- total usage: ${app.total_usage.cost_in_usd:.4f} "
-        f"({app.total_usage.input_tokens_total}in/{app.total_usage.output_tokens}out)"
-    )
-    print(f"--- abandoned (cancelled) calls: {app.abandoned_calls}")
-    # Each line is that run's subtree, so a parent's figure contains its sub-agents' and the lines
-    # deliberately do not add up to the total above.
-    for path, run in app.runs.items():
-        assert isinstance(run, ReActAgent), "every run this app builds is a ReActAgent"
-        print(
-            f"---   {path}: ${run.usage.cost_in_usd:.4f}, turns={run.turn_number}, "
-            f"tool_calls={run.tool_calls_made}, answered={run.answer is not None}"
-        )
+    # Any metric one could want is a fold over each run's ordered turn_log; none is computed here.
 
 
 async def main() -> None:

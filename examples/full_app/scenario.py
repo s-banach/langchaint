@@ -10,7 +10,7 @@ Scripts are keyed by agent tag; a binding's system prompt starts with "[tag]" an
 Each named scenario perturbs one script to exercise one failure layer, leaving the rest of the graph intact.
 """
 
-from events import ToolProgress, current_gui_emitter
+from events import current_gui_emitter
 from harness import Turn, call
 from pydantic import BaseModel
 
@@ -52,13 +52,8 @@ async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
     Raises:
         LookupError: dispatched outside a run's loop, where no emitter is installed.
     """
-    emitter = current_gui_emitter()
-    emitter.emit(
-        ToolProgress(
-            agent_path=emitter.agent_path,
-            tool_name="search",
-            message=f"searching the corpus for {args.query!r}",
-        )
+    current_gui_emitter().emit_tool_progress(
+        tool_name="search", message=f"searching the corpus for {args.query!r}"
     )
     return ToolOutputExplicit(
         content=f"Top result for {args.query!r}: a paragraph of findings.",
@@ -69,23 +64,44 @@ async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
 _FIRST_VERDICT = "revise: the draft cites no figures."
 """The one rejection every self-correcting run gets, so the revision path is always exercised."""
 
-_pending_verdicts: list[str] = [_FIRST_VERDICT]
-"""Verdicts critique has yet to hand out; mutated in place so no rebinding is needed."""
 
+class CritiqueVerdict(BaseModel):
+    """The verdict critique routes to the loop through app_data, read back by matching the type.
 
-async def critique(args: CritiqueArgs) -> str:  # noqa: ARG001  # the verdict is scripted, so the draft is deliberately unread
-    """Hand out the next scripted verdict, driving one revision then approval.
-
-    A bare str is sugar for a successful ToolOutputExplicit with no app_data,
-    so a tool that reports no spend of its own needs no ceremony.
-    Once the scripted rejections run out every draft is approved, which is what ends the loop.
+    approved is the release condition of a self-correcting run; the words the model reads ride
+    content. A pydantic model rather than a dataclass because ToolManager's app_data channel is
+    BaseModel | Mapping[str, object] | None.
     """
-    return _pending_verdicts.pop(0) if _pending_verdicts else "approved"
+
+    approved: bool
 
 
-def reset_critique() -> None:
-    """Rewind the verdict script so every scenario run sees the same self-correction sequence."""
-    _pending_verdicts[:] = [_FIRST_VERDICT]
+def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
+    """Build critique with its own verdict script: the scripted rejection once, then approval forever.
+
+    A fresh tool per tool manager gives each self-correcting run its own script, so no run or
+    scenario rewinds another's leftover verdicts.
+    """
+    pending_rejections = [_FIRST_VERDICT]
+
+    async def critique(args: CritiqueArgs) -> ToolOutputExplicit[CritiqueVerdict]:  # noqa: ARG001  # the verdict is scripted, so the draft is deliberately unread
+        """Hand out the next scripted verdict, driving one revision then approval.
+
+        The approval rides app_data as a CritiqueVerdict, so the loop reads the verdict by type
+        instead of parsing the prose the model reads.
+        """
+        if pending_rejections:
+            return ToolOutputExplicit(
+                content=pending_rejections.pop(0), app_data=CritiqueVerdict(approved=False)
+            )
+        return ToolOutputExplicit(content="approved", app_data=CritiqueVerdict(approved=True))
+
+    return PydanticTool(
+        name="critique",
+        description="Critique a draft; returns 'approved' or a revision instruction.",
+        args_model=CritiqueArgs,
+        function=critique,
+    )
 
 
 search_tool = PydanticTool(
@@ -93,13 +109,6 @@ search_tool = PydanticTool(
     description="Search the corpus for a query.",
     args_model=SearchArgs,
     function=search,
-)
-
-critique_tool = PydanticTool(
-    name="critique",
-    description="Critique a draft; returns 'approved' or a revision instruction.",
-    args_model=CritiqueArgs,
-    function=critique,
 )
 
 

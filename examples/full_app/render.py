@@ -35,12 +35,6 @@ def _render_body(event: Event) -> str:
             return f"! {path} FAILED ({error[:40]}), spent ${usage.cost_in_usd:.4f}"
         case ToolProgress(tool_name=name, message=message):
             return f"  .. {name}: {message}"
-        case _:
-            return _render_activity(event)
-
-
-def _render_activity(event: Event) -> str:
-    match event:
         case TurnStarted(turn_number=turn, usage_so_far=usage):
             return f"  turn {turn} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
         case LlmResponse(turn_number=turn, text=text, usage_so_far=usage):
@@ -62,5 +56,3 @@ def _render_activity(event: Event) -> str:
             mark = "ERR" if is_error else "ok"
             fee = f" +${reported.cost_in_usd:.4f}" if reported.cost_in_usd else ""
             return f"  <- {name} {mark}: {content[:38]!r}{fee} -> ${usage.cost_in_usd:.4f}"
-        case _:
-            return f"? {event}"

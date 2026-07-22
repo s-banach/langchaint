@@ -1,6 +1,6 @@
 [project]
 name = "langchaint"
-version = "0.6.0"
+version = "0.7.0"
 description = "It ain't langchain."
 readme = "README.md"
 license = "MIT"

@@ -83,9 +83,7 @@ async def run_agent(
             return response.output
         for call in response.tool_calls:
             if approve is not None and not approve(call):
-                declined = ToolMessage(
-                    tool_call_id=call.id, content="The user declined this action.", is_error=True
-                )
+                declined = ToolMessage.error(call, "The user declined this action.")
                 conversation.append(declined)
                 continue
             outcome = await tool_manager.dispatch(call)

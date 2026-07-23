@@ -528,10 +528,8 @@ def _invalid_args_outcome(
     JSONSchemaTool.dispatch checks the mapped jsonschema details for emptiness first.
     The calling methods therefore do not list the ValueError.
     """
-    tool_message = ToolMessage(
-        tool_call_id=call.id,
-        content=render_invalid_tool_args(tool_name=call.name, details=details),
-        is_error=True,
+    tool_message = ToolMessage.error(
+        call, render_invalid_tool_args(tool_name=call.name, details=details)
     )
     return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
@@ -624,10 +622,8 @@ class ToolManager:
         """
         tool = self._tools.get(call.name)
         if tool is None:
-            tool_message = ToolMessage(
-                tool_call_id=call.id,
-                content=render_unknown_tool(called_name=call.name, held_names=tuple(self._tools)),
-                is_error=True,
+            tool_message = ToolMessage.error(
+                call, render_unknown_tool(called_name=call.name, held_names=tuple(self._tools))
             )
             return DispatchUnknownTool(tool_message=tool_message, called_name=call.name)
         return await tool.dispatch(call)

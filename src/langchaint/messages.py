@@ -216,6 +216,14 @@ class ToolMessage(CheckedCopyModel):
     is_error: bool = False
     role: Literal["tool"] = "tool"
 
+    @classmethod
+    def error(cls, tool_call: ToolCall, content: str | tuple[Part, ...]) -> "ToolMessage":
+        """Build an is_error ToolMessage answering tool_call.
+
+        tool_call_id is bound from tool_call.id, so the message answers that call by construction.
+        """
+        return cls(tool_call_id=tool_call.id, content=content, is_error=True)
+
 
 type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="role")]
 """Discriminated on role: pydantic validation selects the member from the tag,

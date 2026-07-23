@@ -83,6 +83,22 @@ def test_tool_message_content_still_round_trips_a_bare_string() -> None:
     assert message.content == "ok"
 
 
+def test_tool_message_error_binds_the_call_id_and_sets_is_error() -> None:
+    """ToolMessage.error equals the keyword construction with tool_call_id from the call and is_error True."""
+    tool_call = ToolCall(id="c1", name="lookup", args_json="{}")
+    message = ToolMessage.error(tool_call, "boom")
+    assert message == ToolMessage(tool_call_id="c1", content="boom", is_error=True)
+
+
+def test_tool_message_error_accepts_part_content() -> None:
+    """ToolMessage.error takes the same part-tuple content as the keyword construction."""
+    tool_call = ToolCall(id="c1", name="lookup", args_json="{}")
+    parts = (TextPart(text="saw"), ImagePart(data=b"png", media_type="image/png"))
+    message = ToolMessage.error(tool_call, parts)
+    assert message.content == parts
+    assert message.is_error is True
+
+
 def test_tool_message_is_frozen() -> None:
     """ToolMessage is immutable; reassigning content raises."""
     message = ToolMessage(tool_call_id="c1", content="ok")

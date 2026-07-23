@@ -439,13 +439,10 @@ class ReActAgent(AgentRun):
         def _refuse_over_budget(tool_call: ToolCall) -> ToolMessage | None:
             if tool_call.id in affordable_ids:
                 return None
-            return ToolMessage(
-                tool_call_id=tool_call.id,
-                content=(
-                    f"Tool call budget of {self.config.max_tool_calls} is spent. "
-                    "Answer with what you already have."
-                ),
-                is_error=True,
+            return ToolMessage.error(
+                tool_call,
+                f"Tool call budget of {self.config.max_tool_calls} is spent. "
+                "Answer with what you already have.",
             )
 
         try:

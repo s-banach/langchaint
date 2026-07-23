@@ -145,10 +145,10 @@ async def run_agent[FinalT: BaseModel](
                 tool_message = outcome.tool_message
             elif forcing:
                 redirect = f"Call {final_response_tool.name}."
-                tool_message = ToolMessage(tool_call_id=call.id, content=redirect, is_error=True)
+                tool_message = ToolMessage.error(call, redirect)
             elif sum(usage.cost_in_usd for usage in tool_reported_usages) >= tool_budget_in_usd:
                 refusal = "Stop calling tools: the run's tool budget is spent."
-                tool_message = ToolMessage(tool_call_id=call.id, content=refusal, is_error=True)
+                tool_message = ToolMessage.error(call, refusal)
             else:
                 dispatch_outcome = await tool_manager.dispatch(call)
                 match dispatch_outcome:

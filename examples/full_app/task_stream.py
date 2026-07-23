@@ -72,7 +72,7 @@ from langchaint import (
     AbandonedCall,
     DispatchExceptionGroup,
     DispatchHandled,
-    DispatchOutcome,
+    DispatchManyOutcome,
     GenerationError,
     Message,
     PydanticTool,
@@ -409,6 +409,8 @@ class ReActAgent(AgentRun):
 
         Every call is announced before any dispatch starts, so a UI shows the whole fan-out at once
         rather than one call appearing per completion.
+        A call over config.max_tool_calls is refused through dispatch_many's precomputed argument,
+        so one dispatch_many call answers the whole batch, refusals slotted in call order.
 
         Raises:
             DispatchExceptionGroup: one or more tool functions raised. Its completed_outcomes are
@@ -429,18 +431,15 @@ class ReActAgent(AgentRun):
                 )
             )
         remaining = max(0, self.config.max_tool_calls - self.tool_calls_made)
-        affordable, refused = list(tool_calls[:remaining]), list(tool_calls[remaining:])
+        affordable_ids = {tool_call.id for tool_call in tool_calls[:remaining]}
         # Charged where the calls are dispatched rather than where they settle, so a turn that raises
         # partway still spends the budget it used.
-        self.tool_calls_made += len(affordable)
-        try:
-            outcomes = await self.tool_manager.dispatch_many(affordable)
-        except DispatchExceptionGroup as group:
-            self._settle_outcomes(affordable, group.completed_outcomes)
-            raise
-        settled = self._settle_outcomes(affordable, outcomes)
-        for tool_call in refused:
-            message = ToolMessage(
+        self.tool_calls_made += len(affordable_ids)
+
+        def _refuse_over_budget(tool_call: ToolCall) -> ToolMessage | None:
+            if tool_call.id in affordable_ids:
+                return None
+            return ToolMessage(
                 tool_call_id=tool_call.id,
                 content=(
                     f"Tool call budget of {self.config.max_tool_calls} is spent. "
@@ -448,17 +447,24 @@ class ReActAgent(AgentRun):
                 ),
                 is_error=True,
             )
-            settled[tool_call.id] = message
-            self._record_and_emit(tool_call, message, reported_usage=ZERO_USAGE)
+
+        try:
+            outcomes = await self.tool_manager.dispatch_many(
+                tool_calls, precomputed=_refuse_over_budget
+            )
+        except DispatchExceptionGroup as group:
+            self._settle_outcomes(tool_calls, group.completed_outcomes)
+            raise
+        self._settle_outcomes(tool_calls, outcomes)
         # Every call the model made gets a reply in its original order, refused ones included:
         # a provider rejects a turn whose tool calls are not all answered.
-        for tool_call in tool_calls:
-            self.conversation.append(settled[tool_call.id])
+        for outcome in outcomes:
+            self.conversation.append(outcome.tool_message)
 
     def _settle_outcomes(
-        self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchOutcome]
-    ) -> dict[str, ToolMessage]:
-        """Record each settled outcome on turn_log, emit its ToolResponse, and collect its message.
+        self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyOutcome]
+    ) -> None:
+        """Record each settled outcome on turn_log and emit its ToolResponse.
 
         Outcomes are matched to calls by tool_call_id rather than by position: a
         DispatchExceptionGroup's completed_outcomes covers only the calls that settled, so it is
@@ -466,13 +472,12 @@ class ReActAgent(AgentRun):
 
         app_data is read here, at its type.
         A Usage is spend the tool reported, carried only by DispatchHandled:
-        the invalid-args and unknown-tool arms are model mistakes that billed nothing,
+        the invalid-args, unknown-tool, and budget-refused arms are calls that billed nothing,
         and delegate reports None, because a sub-run wrote its own turn_log
         and folding a reported total would count the whole subtree twice.
         An approving CritiqueVerdict is what releases a self-correcting run to answer.
         """
         call_of_id = {tool_call.id: tool_call for tool_call in tool_calls}
-        settled: dict[str, ToolMessage] = {}
         for outcome in outcomes:
             tool_call = call_of_id[outcome.tool_message.tool_call_id]
             match outcome:
@@ -483,37 +488,26 @@ class ReActAgent(AgentRun):
                     reported_usage = ZERO_USAGE
                 case _:
                     reported_usage = ZERO_USAGE
-            self._record_and_emit(tool_call, outcome.tool_message, reported_usage=reported_usage)
-            settled[tool_call.id] = outcome.tool_message
-        return settled
-
-    def _record_and_emit(
-        self, tool_call: ToolCall, message: ToolMessage, *, reported_usage: Usage
-    ) -> None:
-        """Append the settled call's ToolTurn to turn_log and emit its ToolResponse.
-
-        Serves dispatched and budget-refused calls alike, so the record and the event have one home.
-        """
-        self.turn_log.append(
-            ToolTurn(
-                turn_number=self.turn_number,
-                tool_name=tool_call.name,
-                tool_message=message,
-                reported_usage=reported_usage,
+            self.turn_log.append(
+                ToolTurn(
+                    turn_number=self.turn_number,
+                    tool_name=tool_call.name,
+                    tool_message=outcome.tool_message,
+                    reported_usage=reported_usage,
+                )
             )
-        )
-        self.on_event(
-            ToolResponse(
-                agent_path=self.agent_path,
-                turn_number=self.turn_number,
-                tool_call_id=message.tool_call_id,
-                tool_name=tool_call.name,
-                content=content_text(message),
-                is_error=message.is_error,
-                reported_usage=reported_usage,
-                usage_so_far=self.usage,
+            self.on_event(
+                ToolResponse(
+                    agent_path=self.agent_path,
+                    turn_number=self.turn_number,
+                    tool_call_id=outcome.tool_message.tool_call_id,
+                    tool_name=tool_call.name,
+                    content=content_text(outcome.tool_message),
+                    is_error=outcome.tool_message.is_error,
+                    reported_usage=reported_usage,
+                    usage_so_far=self.usage,
+                )
             )
-        )
 
 
 def top_level_path(name: str) -> str:

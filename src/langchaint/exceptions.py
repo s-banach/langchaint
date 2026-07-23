@@ -33,7 +33,7 @@ from langchaint.usage import ZERO_USAGE, Usage
 if TYPE_CHECKING:
     # Type-only: tools.py imports this module at runtime, so importing the dispatch
     # outcome types here at runtime would be a cycle. The annotations below quote them.
-    from langchaint.tools import DispatchOutcome
+    from langchaint.tools import DispatchManyOutcome
 
 
 class TransientError(Exception):
@@ -323,6 +323,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
 
     Raised only after every sibling dispatch settled, so it carries what the batch still produced:
     completed_outcomes holds the settled calls' outcomes ordered by tool_calls position,
+    a call answered through dispatch_many's precomputed argument included as its DispatchPrecomputed,
     each naming its call via tool_message.tool_call_id,
     so app_data a completed sibling produced (a billing record for money the tool spent) survives the raise,
     the same principle as GenerationError preserving a rejected 200's billing on attempt_records.
@@ -335,14 +336,14 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     chained as the re-raised exception's __cause__ instead of being the raise itself.
     """
 
-    completed_outcomes: "tuple[DispatchOutcome, ...]"
+    completed_outcomes: "tuple[DispatchManyOutcome, ...]"
 
     def __new__(
         cls,
         message: str,
         exceptions: Sequence[Exception],
         *,
-        completed_outcomes: "tuple[DispatchOutcome, ...]",
+        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
     ) -> Self:
         """Pass message and exceptions to the base __new__, which takes nothing else; __init__ stores the keyword."""
         group = super().__new__(cls, message, exceptions)
@@ -354,7 +355,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         message: str,
         exceptions: Sequence[Exception],
         *,
-        completed_outcomes: "tuple[DispatchOutcome, ...]",
+        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
     ) -> None:
         """Store completed_outcomes and set args on the base.
 

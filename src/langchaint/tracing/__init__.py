@@ -7,7 +7,8 @@ which makes no call of its own);
 TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
 TracedToolManager is a ToolManager whose every dispatch opens one INTERNAL execute_tool span;
 it is a subclass, not a wrapper, so it passes to LLM.bind's tool_manager parameter as one object,
-and dispatch_many gains per-call spans by inheritance because it runs through self.dispatch.
+and dispatch_many gains per-call spans by inheritance because it runs through self.dispatch;
+a call answered through dispatch_many's precomputed argument opens no span, because no tool executed.
 Every Traced class accepts extra_attributes, a constant mapping set on each span it opens at span start
 (an agent name for cross-trace aggregation, a deployment tag);
 an attribute set at completion (a mapper's, an outcome's) wins a key collision.

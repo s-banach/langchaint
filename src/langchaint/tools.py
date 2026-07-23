@@ -148,6 +148,22 @@ class DispatchUnknownTool:
     called_name: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class DispatchPrecomputed:
+    """A tool call the application answered itself: no tool ran.
+
+    Produced only by ToolManager.dispatch_many, for a call its precomputed argument answered.
+    tool_message is the application-supplied ToolMessage,
+    carried through unread except for the tool_call_id pairing check,
+    so the application appends it exactly as it wrote it.
+    Matching this arm tells a consumer the reply is the application's own:
+    langchaint validated no arguments and ran no function.
+    There is no app_data field because no function ran to produce any.
+    """
+
+    tool_message: ToolMessage
+
+
 type DispatchOutcome = (
     DispatchHandled[BaseModel | Mapping[str, object] | None]
     | DispatchInvalidToolArgs
@@ -162,6 +178,18 @@ own dispatch instead.
 Every arm carries tool_message, so a consumer that only appends the reply reads result.tool_message with no match.
 A consumer that reads the field-level failure detail matches DispatchInvalidToolArgs;
 one that reads the off-list name matches DispatchUnknownTool.
+"""
+
+
+type DispatchManyOutcome = DispatchOutcome | DispatchPrecomputed
+"""One position's outcome of ToolManager.dispatch_many.
+
+The DispatchPrecomputed arm exists only here:
+it marks a call the application answered through dispatch_many's precomputed argument,
+which only dispatch_many takes,
+so ToolManager.dispatch keeps the narrower DispatchOutcome
+and a match on its result never handles an arm it cannot return.
+Every arm carries tool_message, so a consumer that only appends the replies reads it with no match.
 """
 
 
@@ -508,6 +536,35 @@ def _invalid_args_outcome(
     return DispatchInvalidToolArgs(tool_message=tool_message, details=details)
 
 
+def _split_precomputed(
+    tool_calls: Sequence[ToolCall],
+    precomputed: Callable[[ToolCall], ToolMessage | None] | None,
+) -> tuple[dict[int, DispatchPrecomputed], list[tuple[int, ToolCall]]]:
+    """Ask precomputed about every call: answered outcomes by position, and the calls left to dispatch.
+
+    The precomputed pass of ToolManager.dispatch_many, run to completion before any dispatch starts.
+    precomputed None means no call is answered.
+
+    Raises:
+        ValueError: precomputed returned a ToolMessage whose tool_call_id is not its call's id,
+            a defect that would otherwise silently answer a different call.
+    """
+    answered: dict[int, DispatchPrecomputed] = {}
+    to_dispatch: list[tuple[int, ToolCall]] = []
+    for index, tool_call in enumerate(tool_calls):
+        supplied = precomputed(tool_call) if precomputed is not None else None
+        if supplied is None:
+            to_dispatch.append((index, tool_call))
+        elif supplied.tool_call_id != tool_call.id:
+            raise ValueError(
+                f"precomputed answered the call with id {tool_call.id!r} with a ToolMessage "
+                f"whose tool_call_id is {supplied.tool_call_id!r}"
+            )
+        else:
+            answered[index] = DispatchPrecomputed(tool_message=supplied)
+    return answered, to_dispatch
+
+
 def _handled_outcome[AppDataT](
     call: ToolCall, result: ToolOutput[AppDataT]
 ) -> DispatchHandled[AppDataT]:
@@ -575,11 +632,28 @@ class ToolManager:
             return DispatchUnknownTool(tool_message=tool_message, called_name=call.name)
         return await tool.dispatch(call)
 
-    async def dispatch_many(self, tool_calls: Sequence[ToolCall]) -> tuple[DispatchOutcome, ...]:
-        """Dispatch every call concurrently and return the outcomes ordered by tool_calls position.
+    async def dispatch_many(
+        self,
+        tool_calls: Sequence[ToolCall],
+        *,
+        precomputed: Callable[[ToolCall], ToolMessage | None] | None = None,
+    ) -> tuple[DispatchManyOutcome, ...]:
+        """Dispatch the calls concurrently and return one outcome per call, ordered by tool_calls position.
 
         The concurrent counterpart of dispatch for the several tool calls of one assistant turn:
-        every call starts at once, and each outcome sits at its call's index regardless of completion order.
+        every dispatched call starts at once,
+        and each outcome sits at its call's index regardless of completion order.
+        precomputed lets the application answer some calls itself instead of dispatching them
+        (a call over its call limit, a duplicate of one already run, a turn it is forcing to terminate):
+        it is asked once per call,
+        a ToolMessage return answers that call as a DispatchPrecomputed at the call's position,
+        and None means dispatch the call normally,
+        so the batch stays ordered and every tool_use gets a paired tool_result.
+        The precomputed pass runs to completion before any dispatch starts,
+        so an exception it raises starts no tool function:
+        precomputed's own exception propagates as a user-code defect,
+        and a supplied ToolMessage whose tool_call_id is not its call's id raises the pass's ValueError,
+        a defect that would otherwise silently answer a different call.
         A function exception (a user-code defect, as on dispatch) does not interrupt the siblings:
         every call settles first, then the defects raise together as one DispatchExceptionGroup
         whose completed_outcomes carries the settled calls' outcomes,
@@ -594,7 +668,7 @@ class ToolManager:
         Raises:
             DispatchExceptionGroup: one or more tool functions raised;
                 its exceptions holds the defects and completed_outcomes the settled calls' outcomes,
-                both ordered by tool_calls position.
+                DispatchPrecomputed ones included, both ordered by tool_calls position.
             asyncio.CancelledError: the enclosing task was cancelled;
                 re-raised after the sibling dispatches finish unwinding.
             BaseException: a sibling produced a non-Exception BaseException
@@ -604,7 +678,9 @@ class ToolManager:
                 a second CancelledError duplicates the first's only fact (the batch was abandoned),
                 and a KeyboardInterrupt or SystemExit tears down the event loop before this function can observe it.
         """
-        tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for tool_call in tool_calls]
+        answered, to_dispatch = _split_precomputed(tool_calls, precomputed)
+        settled: dict[int, DispatchManyOutcome | BaseException] = dict(answered)
+        tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for _, tool_call in to_dispatch]
         try:
             results: list[DispatchOutcome | BaseException] = await asyncio.gather(
                 *tasks, return_exceptions=True
@@ -616,10 +692,13 @@ class ToolManager:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        completed_outcomes: list[DispatchOutcome] = []
+        for (index, _), result in zip(to_dispatch, results, strict=True):
+            settled[index] = result
+        completed_outcomes: list[DispatchManyOutcome] = []
         raised_exceptions: list[Exception] = []
         base_exceptions: list[BaseException] = []
-        for result in results:
+        for index in range(len(tool_calls)):
+            result = settled[index]
             if isinstance(result, Exception):
                 raised_exceptions.append(result)
             elif isinstance(result, BaseException):

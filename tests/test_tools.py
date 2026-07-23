@@ -20,7 +20,8 @@ from langchaint import (
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
-    DispatchOutcome,
+    DispatchManyOutcome,
+    DispatchPrecomputed,
     DispatchUnknownTool,
     ImagePart,
     InvalidToolArgsDetail,
@@ -31,6 +32,7 @@ from langchaint import (
     TextPart,
     ToolCall,
     ToolManager,
+    ToolMessage,
     ToolOutputExplicit,
 )
 from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
@@ -769,7 +771,7 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
     and the first outcome still belongs to the first call although it completed last.
     """
 
-    async def _run() -> tuple[DispatchOutcome, ...]:
+    async def _run() -> tuple[DispatchManyOutcome, ...]:
         gate = asyncio.Event()
 
         async def _waiter_function(args: _EchoArgs) -> str:
@@ -823,6 +825,124 @@ def test_dispatch_many_returns_every_arm_in_call_order() -> None:
 def test_dispatch_many_of_no_calls_returns_empty() -> None:
     """An empty tool_calls returns an empty outcome tuple."""
     assert asyncio.run(ToolManager([_echo_tool()]).dispatch_many([])) == ()
+
+
+def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
+    """Build an echo tool that appends each call's text to ran_texts, recording which calls executed."""
+
+    async def _recording_function(args: _EchoArgs) -> str:
+        """Record the text, then echo it."""
+        ran_texts.append(args.text)
+        return args.text
+
+    return PydanticTool(
+        name="echo",
+        description="Echo the text back.",
+        args_model=_EchoArgs,
+        function=_recording_function,
+    )
+
+
+def test_dispatch_many_precomputed_slots_the_supplied_message_at_its_position() -> None:
+    """A call precomputed answers is not dispatched: its ToolMessage rides a DispatchPrecomputed at the call's index.
+
+    The middle call is answered, its neighbors dispatch normally (precomputed returned None for them),
+    and the supplied ToolMessage arrives by reference, so the application appends exactly what it wrote.
+    """
+    supplied_message = ToolMessage(
+        tool_call_id="c2", content="skipped: duplicate call", is_error=True
+    )
+    tool_calls = [
+        ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
+        ToolCall(id="c3", name="echo", args_json='{"text": "c"}'),
+    ]
+    ran_texts: list[str] = []
+    manager = ToolManager([_running_echo_tool(ran_texts)])
+    outcomes = asyncio.run(
+        manager.dispatch_many(
+            tool_calls,
+            precomputed=lambda tool_call: supplied_message if tool_call.id == "c2" else None,
+        )
+    )
+    assert [type(outcome) for outcome in outcomes] == [
+        DispatchHandled,
+        DispatchPrecomputed,
+        DispatchHandled,
+    ]
+    assert [outcome.tool_message.tool_call_id for outcome in outcomes] == ["c1", "c2", "c3"]
+    assert outcomes[1].tool_message is supplied_message
+    assert sorted(ran_texts) == ["a", "c"]
+
+
+def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> None:
+    """A supplied ToolMessage whose tool_call_id is not its call's id is a defect: ValueError, no tool ran.
+
+    The first call is left to dispatch and the mismatch sits on the second,
+    so the ValueError fires from a batch that mixes both precomputed answers.
+    """
+    tool_calls = [
+        ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
+    ]
+    ran_texts: list[str] = []
+    manager = ToolManager([_running_echo_tool(ran_texts)])
+
+    def _mismatched(tool_call: ToolCall) -> ToolMessage | None:
+        if tool_call.id != "c2":
+            return None
+        return ToolMessage(tool_call_id="other-id", content="skipped")
+
+    with pytest.raises(ValueError, match=r"'c2'.*'other-id'"):
+        asyncio.run(manager.dispatch_many(tool_calls, precomputed=_mismatched))
+    assert ran_texts == []
+
+
+def test_dispatch_many_precomputed_raising_propagates_before_any_dispatch() -> None:
+    """A precomputed that raises is a user-code defect: the exception propagates ungrouped and no tool ran."""
+    tool_calls = [
+        ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
+    ]
+    ran_texts: list[str] = []
+    manager = ToolManager([_running_echo_tool(ran_texts)])
+
+    def _broken(tool_call: ToolCall) -> ToolMessage | None:
+        raise RuntimeError(f"broken precomputed on {tool_call.id}")
+
+    with pytest.raises(RuntimeError, match="broken precomputed on c1"):
+        asyncio.run(manager.dispatch_many(tool_calls, precomputed=_broken))
+    assert ran_texts == []
+
+
+def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
+    """A batch that raises still carries a precomputed-answered call in completed_outcomes, at its position."""
+    supplied_message = ToolMessage(
+        tool_call_id="c1", content="skipped: over the call limit", is_error=True
+    )
+    tool_calls = [
+        ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
+        ToolCall(id="c2", name="raiser", args_json='{"text": "b"}'),
+        ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
+    ]
+    manager = ToolManager([_raiser_tool(), _echo_tool()])
+    with pytest.raises(DispatchExceptionGroup) as caught:
+        asyncio.run(
+            manager.dispatch_many(
+                tool_calls,
+                precomputed=lambda tool_call: supplied_message if tool_call.id == "c1" else None,
+            )
+        )
+    group = caught.value
+    assert [str(error) for error in group.exceptions] == ["broke on b"]
+    assert [type(outcome) for outcome in group.completed_outcomes] == [
+        DispatchPrecomputed,
+        DispatchHandled,
+    ]
+    assert [outcome.tool_message.tool_call_id for outcome in group.completed_outcomes] == [
+        "c1",
+        "c3",
+    ]
 
 
 def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:

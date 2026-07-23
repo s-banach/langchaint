@@ -30,7 +30,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClass,
+    ErrorClassification,
 )
 
 _PRICING = PricingTable(
@@ -106,9 +106,9 @@ class ScriptedAdapter(Adapter):
         raise NotImplementedError
 
     @override
-    def classify(self, error: Exception) -> ErrorClass:
-        """Treat every unrecognized error as abort so nothing silently retries in the example."""
-        return "abort"
+    def classify(self, error: Exception) -> ErrorClassification:
+        """Classify every error as fatal so nothing silently retries in the example."""
+        return "fatal"
 
 
 def _tag_of(binding: Binding) -> str:

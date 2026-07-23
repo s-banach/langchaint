@@ -68,13 +68,13 @@ There is deliberately no `requests_per_minute`: an in-flight bound self-adjusts 
 ## Fallbacks: a try/except over two bindings
 
 There is no `.with_fallbacks`. A fallback is app code, because the app decides what counts as worth failing over.
-The runnable version, a `try`/`except (GenerationError, AbortBatchError)` over two bindings, is `generate_with_fallback` in `05_rate_limiting_and_errors.py`.
+The runnable version, a `try`/`except (GenerationError, FatalError)` over two bindings, is `generate_with_fallback` in `05_rate_limiting_and_errors.py`.
 
 ## Errors: success is a Response, failure is a GenerationError
 
 `generate_one` returns a `Response` on success and raises on a terminal outcome.
-`GenerationError` is the base of the three terminal per-item leaves: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), and `MaxCompletionTokensExceededError` (the structured response hit the token cap).
-Catch `GenerationError` to handle all three at once.
-`AbortBatchError` is separate: it means the request is misconfigured (a bad request, an unmapped cache rate), so retrying cannot help, and in a batch it cancels the siblings.
+`GenerationError` is the base of the four terminal per-item leaves: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), `MaxCompletionTokensExceededError` (the structured response hit the token cap), and `UnrecognizedError` (the adapter did not recognize the attempt's error, so it is not retried).
+Catch `GenerationError` to handle all four at once.
+`FatalError` is separate: it means the request is misconfigured (a bad request, an unmapped cache rate), so retrying cannot help, and in a batch it cancels the siblings and `generate_many` raises `BatchAbortedError` carrying every slot's outcome.
 In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_row` renders successes and failures to the same table.
 The runnable catch, one `try`/`except GenerationError` around a structured `generate_one`, is `catch_generation_error` in `05_rate_limiting_and_errors.py`.

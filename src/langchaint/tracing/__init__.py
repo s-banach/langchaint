@@ -689,7 +689,7 @@ def _record_other_exception(span: Span, exc: Exception) -> None:
     """Record a non-GenerationError exception, set error.type and error status; no shared-field attributes exist.
 
     error.type is the exception's class name, the convention's low-cardinality classification of how an operation
-    ended, which gives every span kind here a groupable failure signal (AbortBatchError, StreamProtocolError,
+    ended, which gives every span kind here a groupable failure signal (FatalError, StreamProtocolError,
     a tool function's own exception) beside the message string record_exception carries.
     """
     span.record_exception(exc)
@@ -954,8 +954,8 @@ class TracedBoundLLM[OutputT]:
 
         Raises:
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
-                a refusal, or a truncation); the span is attributed and closed first.
-            AbortBatchError: the wrapped generate_one classified an error as abort;
+                a refusal, a truncation, or an unrecognized provider error); the span is attributed and closed first.
+            FatalError: the wrapped generate_one classified an error as fatal;
                 the span records the exception and closes first.
             asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
                 appended any AbandonedCall first, and the span ends.
@@ -1014,13 +1014,12 @@ class TracedBoundLLM[OutputT]:
         the span covers a batch with no single conversation and no single assistant turn,
         the same reason the mapper is not invoked here.
         The span stays OK on mixed per-item results, which come back as rows,
-        and takes error status only when an AbortBatchError propagates.
+        and takes error status only when a BatchAbortedError propagates.
 
         Raises:
             TypeError: conversations is a bare str (the whole-batch guard, in the delegated method).
-            AbortBatchError: one item classified an error as abort;
-                the delegated method cancels the in-flight siblings and the span records the exception
-                before re-raising.
+            BatchAbortedError: one item raised FatalError; the delegated method cancels and awaits
+                the siblings and the span records the exception before re-raising.
         """
         span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.INTERNAL)
         try:
@@ -1161,8 +1160,8 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
-            Exception: the inner stream raised (a transient failure after items, an abort, a protocol violation);
-                the span records it, takes error status, and ends before the re-raise.
+            Exception: the inner stream raised (a transient failure after items, a fatal or unrecognized
+                error, a protocol violation); the span records it, takes error status, and ends before the re-raise.
         """
         if self._span is None or self._span_ended:
             # Never entered, or the span already closed: the inner handle raises, and recording that
@@ -1237,8 +1236,9 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
-                on the structured path, or retries exhausted while draining); the span is attributed and closed first.
-            AbortBatchError: draining hit an error classified as abort; the span records it and closes.
+                on the structured path, retries exhausted while draining, or an unrecognized provider error);
+                the span is attributed and closed first.
+            FatalError: draining hit an error classified as fatal; the span records it and closes.
             StreamProtocolError: the provider's event stream ended without a terminal event;
                 the span records it and closes.
         """

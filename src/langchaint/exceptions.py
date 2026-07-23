@@ -4,13 +4,14 @@ Two orthogonal properties decide an error's fate, and this module keeps them sep
 
 - Retry axis (read by the retry loop in llm.py): a TransientError is retried, everything else is not.
   No NonRetriableError class exists; "non-retriable" simply means "not a TransientError".
-- Batch axis (read by generate_many): an AbortBatchError cancels the sibling requests,
+- Batch axis (read by generate_many): a FatalError cancels the sibling requests,
+  and generate_many reports the abort as a BatchAbortedError carrying every item's outcome,
   while a GenerationError becomes one item's failure row.
-  AbortBatchError and the GenerationError leaves are all non-retriable; they differ only on this batch axis.
+  FatalError and the GenerationError leaves are all non-retriable; they differ only on this batch axis.
 
-TransientError and AbortBatchError are per-attempt / control signals.
+TransientError and FatalError are per-attempt / control signals.
 The GenerationError leaves are terminal per-item results a to_row failure row is built from:
-RetriesExhaustedError, RefusalError, and MaxCompletionTokensExceededError.
+RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
@@ -31,8 +32,9 @@ from langchaint.messages import StopReason
 from langchaint.usage import ZERO_USAGE, Usage
 
 if TYPE_CHECKING:
-    # Type-only: tools.py imports this module at runtime, so importing the dispatch
-    # outcome types here at runtime would be a cycle. The annotations below quote them.
+    # Type-only: tools.py and response.py import this module at runtime, so importing the dispatch
+    # outcome types and the result carriers here at runtime would be a cycle. The annotations below quote them.
+    from langchaint.response import AbandonedCall, Response
     from langchaint.tools import DispatchManyOutcome
 
 
@@ -72,25 +74,6 @@ class TransientError(Exception):
         self.usage = usage
         self.usage_raw = usage_raw
         self.stop_reason = stop_reason
-
-
-class AbortBatchError(Exception):
-    """A non-retriable error that cancels the whole batch instead of becoming one item's row.
-
-    generate_many cancels the in-flight siblings and re-raises this, because the batch is misconfigured, not unlucky;
-    generate_one just propagates it.
-    It is deliberately not a GenerationError: those are per-item rows, this aborts every item.
-    Examples: bad credentials, an invalid request, an ImagePart media_type outside the API's set,
-    a response with 1-hour cache writes but no cache_write_1h_usd_per_million_tokens, and the classify default.
-    Adapters must classify unrecognized exceptions as abort so bugs are not retried silently.
-    usage_raw is the raw SDK usage object when the abort fired after a billed 200
-    (the unpriced-1-hour-write case), None otherwise, so that one payload stays recoverable.
-    """
-
-    def __init__(self, message: str, *, usage_raw: BaseModel | None = None) -> None:
-        """Store the raw SDK usage object when the abort followed a billed 200."""
-        super().__init__(message)
-        self.usage_raw = usage_raw
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -144,13 +127,45 @@ def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
     )
 
 
+class FatalError(Exception):
+    """A non-retriable error fatal to every call sharing the configuration.
+
+    The worst classification: retrying cannot help, and every sibling request of a batch would fail
+    the same way, so generate_many cancels the siblings and reports the abort as a BatchAbortedError;
+    generate_one propagates this error itself.
+    It is deliberately not a GenerationError: those are per-item rows, this kills every item.
+    Examples: bad credentials, an invalid request, an ImagePart media_type outside the API's set,
+    a response with 1-hour cache writes but no cache_write_1h_usd_per_million_tokens.
+    Adapters classify only known-systematic provider errors as "fatal";
+    an unrecognized error becomes the per-item UnrecognizedError instead.
+    attempt_records holds the raising call's prior transient attempts, so their usage survives the raise;
+    adapter raise sites leave it empty and the retry loop fills it before propagating.
+    The fatal attempt itself has no record: __cause__ carries its exception where one exists, and
+    usage_raw is the raw SDK usage object when the fatal error fired after a billed 200
+    (the unpriced-1-hour-write case), None otherwise, so that one payload stays recoverable.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage_raw: BaseModel | None = None,
+        attempt_records: tuple[AttemptRecord, ...] = (),
+    ) -> None:
+        """Store the billed-200 evidence and the prior attempts' records."""
+        super().__init__(message)
+        self.usage_raw = usage_raw
+        self.attempt_records = attempt_records
+
+
 class GenerationError(Exception):
     """A terminal per-item generate result that becomes a to_row failure row.
 
-    The base for the three non-retriable per-item outcomes:
+    The base for the four non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
-    RefusalError (the model refused on the structured path), and
-    MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed).
+    RefusalError (the model refused on the structured path),
+    MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed), and
+    UnrecognizedError (the adapter did not recognize the attempt's error).
     generate_one raises any of them;
     generate_many returns each in the slot of the item it belongs to,
     so to_row renders a uniform failure row and siblings keep running.
@@ -292,6 +307,86 @@ class MaxCompletionTokensExceededError(GenerationError):
     @override
     def _summary(self) -> str:
         return "the structured response reached max_completion_tokens before its JSON parsed"
+
+
+class UnrecognizedError(GenerationError):
+    """A provider error the adapter does not recognize; the item fails as a row, siblings continue.
+
+    Adapter.classify's default: not a known transient or rate-limit condition (which retry), and not
+    a known-systematic one (which is fatal to every sibling), so the safe treatment is to fail this
+    item visibly and let the rest of the batch run.
+    Not retried: the error may be a defect (in langchaint, the SDK, or the provider), and a defect
+    must surface, not be retried silently at billing expense.
+    error is the unrecognized exception, also chained as __cause__.
+    attempt_records covers the prior transient attempts; the unrecognized attempt itself has no
+    record, because its billing is unobservable through an exception the adapter cannot read.
+    stop_reason is None: no completed turn reported one.
+    """
+
+    def __init__(
+        self,
+        *,
+        error: Exception,
+        attempt_records: tuple[AttemptRecord, ...],
+        model: str,
+        provider_name: str,
+        elapsed_seconds: float,
+    ) -> None:
+        """Store the unrecognized exception, then fill the row-shape fields."""
+        self.error = error
+        super().__init__(
+            attempt_records=attempt_records,
+            model=model,
+            provider_name=provider_name,
+            elapsed_seconds=elapsed_seconds,
+            stop_reason=None,
+        )
+
+    @override
+    def _summary(self) -> str:
+        return f"unrecognized provider error: {self.error}"
+
+
+class BatchAbortedError[OutputT = object](Exception):
+    """A FatalError aborted generate_many; carries every item's outcome so nothing settled is lost.
+
+    Raised only by generate_many, after cancelling and awaiting every started sibling,
+    so the collection is complete by construction: outcomes[i] belongs to conversations[i].
+    A slot holds the item's settled Response or GenerationError; the FatalError of an item whose
+    error doomed the batch (more than one item can go fatal before the cancellation lands); or an
+    AbandonedCall for an item the abort cancelled, whose attempt_records hold the attempts that
+    settled first (empty for an item that never started).
+    """
+
+    outcomes: "tuple[Response[OutputT] | GenerationError | FatalError | AbandonedCall, ...]"
+
+    def __init__(
+        self,
+        *,
+        outcomes: "tuple[Response[OutputT] | GenerationError | FatalError | AbandonedCall, ...]",
+    ) -> None:
+        """Store the slots and derive the message from the first fatal one.
+
+        Raises:
+            ValueError: no slot is a FatalError (from fatal_error); an abort needs a trigger,
+                so only a caller other than generate_many can construct this state.
+        """
+        self.outcomes = outcomes
+        super().__init__(f"batch aborted: {self.fatal_error}")
+
+    @property
+    def fatal_error(self) -> FatalError:
+        """The first fatal slot in conversation order, the abort's explanation.
+
+        Temporal trigger order is not recoverable from the slots; any fatal slot explains the abort.
+
+        Raises:
+            ValueError: no slot is a FatalError.
+        """
+        for outcome in self.outcomes:
+            if isinstance(outcome, FatalError):
+                return outcome
+        raise ValueError("BatchAbortedError requires at least one FatalError slot")
 
 
 class InvalidToolArgsError(Exception):

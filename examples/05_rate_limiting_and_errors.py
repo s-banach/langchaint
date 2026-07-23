@@ -4,7 +4,7 @@ One RateLimiter owns retrying (max_attempts, backoff_base_seconds, backoff_max_s
 It is stateful and shareable: pass one instance to every LLM hitting the same account and they share one budget,
 so a rate-limit error pauses admission for all of them until a request succeeds again.
 generate_one returns a Response on success and raises a GenerationError leaf on a terminal per-item outcome;
-AbortBatchError is separate and means the request is misconfigured, so retrying cannot help.
+FatalError is separate and means the request is misconfigured, so retrying cannot help.
 
 The LangChain map (RunnableRetry, InMemoryRateLimiter, with_fallbacks) lives in MIGRATING_FROM_LANGCHAIN.md.
 """
@@ -14,7 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import AbortBatchError, BoundLLM, GenerationError, RateLimiter, Response, to_row
+from langchaint import BoundLLM, FatalError, GenerationError, RateLimiter, Response, to_row
 from langchaint.anthropic import anthropic_model
 from langchaint.openai import openai_model
 
@@ -90,11 +90,11 @@ async def generate_with_fallback(
 
     A fallback is app code because the app decides what counts as worth failing over.
     GenerationError covers the per-item terminal leaves;
-    AbortBatchError covers a misconfigured request retry cannot fix.
+    FatalError covers a misconfigured request retry cannot fix.
     """
     try:
         return await primary.generate_one(prompt)
-    except (GenerationError, AbortBatchError):
+    except (GenerationError, FatalError):
         return await secondary.generate_one(prompt)
 
 

@@ -36,11 +36,12 @@ import langchaint.tracing
 from langchaint import (
     LLM,
     AbandonedCall,
-    AbortBatchError,
     AssistantMessage,
+    BatchAbortedError,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchUnknownTool,
+    FatalError,
     GenerationError,
     ImagePart,
     JSONSchemaTool,
@@ -353,27 +354,27 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
     asyncio.run(scenario())
 
 
-def test_generate_one_abort_records_the_exception_and_ends_the_span() -> None:
-    """An AbortBatchError sets error status, records the exception, and still ends the span."""
+def test_generate_one_fatal_records_the_exception_and_ends_the_span() -> None:
+    """A FatalError sets error status, records the exception, and still ends the span."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send aborts, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[AbortBatchError("misconfigured")])
+        """Drive one generate_one whose send raises FatalError, then inspect the error span."""
+        adapter = _FakeAdapter(failures=[FatalError("misconfigured")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(FatalError):
             await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
-        # An abort carries no shared-field attributes; it is recorded as an exception event
+        # A FatalError carries no shared-field attributes; it is recorded as an exception event
         # plus the error.type classification every failing span kind takes.
         assert dict(span.attributes or {}) == {
             "gen_ai.operation.name": "chat",
-            "error.type": "AbortBatchError",
+            "error.type": "FatalError",
         }
         assert [event.name for event in span.events] == ["exception"]
 
@@ -511,17 +512,17 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
 
 
 def test_generate_many_abort_marks_the_batch_span_error() -> None:
-    """An AbortBatchError propagating from the delegated batch marks the one batch span error."""
+    """A BatchAbortedError propagating from the delegated batch marks the one batch span error."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch whose first item aborts, then inspect the batch span."""
-        adapter = _FakeAdapter(echo=True, failures=[AbortBatchError("misconfigured")])
+        """Serialize a two-item batch whose first item goes fatal, then inspect the batch span."""
+        adapter = _FakeAdapter(echo=True, failures=[FatalError("misconfigured")], hang_from_send=2)
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
         )
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(BatchAbortedError):
             await traced.bind(automatic_prompt_caching=True).generate_many([
                 [UserMessage(content="a")],
                 [UserMessage(content="b")],

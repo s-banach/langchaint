@@ -28,8 +28,8 @@ from pydantic import BaseModel
 
 from langchaint import (
     LLM,
-    AbortBatchError,
     AssistantMessage,
+    FatalError,
     ImagePart,
     InferenceParams,
     MaxCompletionTokensExceededError,
@@ -45,7 +45,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding, ErrorClass
+from langchaint.adapter import Binding, ErrorClassification
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
@@ -192,10 +192,10 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
     assert abs(cost - expected) < 1e-12
 
 
-def test_cost_raises_abort_when_one_hour_writes_lack_a_rate() -> None:
-    """A 1-hour write with no cache_write_1h rate is a configuration defect; the abort keeps the raw usage."""
+def test_cost_raises_fatal_when_one_hour_writes_lack_a_rate() -> None:
+    """A 1-hour write with no cache_write_1h rate is a configuration defect; the FatalError keeps the raw usage."""
     usage = _usage_with_cache_split()
-    with pytest.raises(AbortBatchError) as raised:
+    with pytest.raises(FatalError) as raised:
         _cost_in_usd(usage, _PRICING_NO_1H)
     assert raised.value.usage_raw is usage
 
@@ -218,7 +218,7 @@ def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
 
 
 def test_cost_breakdown_raises_value_error_when_one_hour_writes_lack_a_rate() -> None:
-    """The public reporting call surfaces the plain ValueError; AbortBatchError is generation-only."""
+    """The public reporting call surfaces the plain ValueError; FatalError is generation-only."""
     with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
         cost_breakdown(_usage_with_cache_split(), _PRICING_NO_1H)
 
@@ -543,7 +543,7 @@ def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -
     conversation = [
         ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
     ]
-    with pytest.raises(AbortBatchError):
+    with pytest.raises(FatalError):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
@@ -686,7 +686,7 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
 def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
     """An image media type outside the accepted set aborts the batch as a request defect."""
     message = UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))
-    with pytest.raises(AbortBatchError):
+    with pytest.raises(FatalError):
         _user_content_blocks(message)
 
 
@@ -975,18 +975,26 @@ def _connection_error() -> anthropic.APIConnectionError:
             anthropic.APITimeoutError(httpx.Request("POST", "https://api.anthropic.com")),
             "transient",
         ),
-        (_status_error(anthropic.BadRequestError, 400), "abort"),
-        (ValueError("boom"), "abort"),
+        (_status_error(anthropic.BadRequestError, 400), "fatal"),
+        (_status_error(anthropic.AuthenticationError, 401), "fatal"),
+        (_status_error(anthropic.PermissionDeniedError, 403), "fatal"),
+        (_status_error(anthropic.NotFoundError, 404), "fatal"),
+        (_status_error(anthropic.RequestTooLargeError, 413), "fatal"),
+        (_status_error(anthropic.UnprocessableEntityError, 422), "fatal"),
+        (_status_error(anthropic.ConflictError, 409), "unrecognized"),
+        (ValueError("boom"), "unrecognized"),
     ],
 )
-def test_classify_maps_each_sdk_exception_to_its_retry_class(
-    error: Exception, expected: ErrorClass
+def test_classify_maps_each_sdk_exception_to_its_classification(
+    error: Exception, expected: ErrorClassification
 ) -> None:
-    """Each SDK exception lands on the retry class the adapter's classify docstring names.
+    """Each SDK exception lands on the classification the adapter's classify docstring names.
 
     Each status code is the one the SDK raises that class for, read from anthropic 0.116.0.
     OverloadedError is anthropic's own overload signal and shares the rate_limit class with RateLimitError.
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
+    ConflictError and the non-SDK ValueError land on the unrecognized default,
+    which fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected
 
@@ -1110,7 +1118,7 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
             content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
         )
     ]
-    with pytest.raises(AbortBatchError, match="last part"):
+    with pytest.raises(FatalError, match="last part"):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )

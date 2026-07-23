@@ -8,9 +8,9 @@ The extraction is per-backend because only the raw SDK usage keeps the 5-minute 
 the neutral Usage collapses into one input_tokens_cache_write counter.
 
 This module imports no SDK and no error class: price raises the built-in ValueError,
-so the batch concept AbortBatchError stays out of the neutral core;
-only the anthropic adapter's generation path translates the ValueError into an AbortBatchError,
-where a shared pricing-table defect genuinely dooms a batch.
+so the generation-path concept FatalError stays out of the neutral core;
+only the anthropic adapter's generation path translates the ValueError into a FatalError,
+where a shared pricing-table defect genuinely dooms every call sharing the table.
 """
 
 from dataclasses import dataclass

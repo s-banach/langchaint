@@ -56,7 +56,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding, ErrorClass
+from langchaint.adapter import Binding, ErrorClassification
 from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.openai import OpenAIResponsesAdapter, ReasoningSummary, cost_breakdown
 from langchaint.openai.responses_adapter import (
@@ -1053,17 +1053,24 @@ def _connection_error() -> openai.APIConnectionError:
         (_status_error(openai.InternalServerError, 500), "transient"),
         (_connection_error(), "transient"),
         (openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")), "transient"),
-        (_status_error(openai.BadRequestError, 400), "abort"),
-        (ValueError("boom"), "abort"),
+        (_status_error(openai.BadRequestError, 400), "fatal"),
+        (_status_error(openai.AuthenticationError, 401), "fatal"),
+        (_status_error(openai.PermissionDeniedError, 403), "fatal"),
+        (_status_error(openai.NotFoundError, 404), "fatal"),
+        (_status_error(openai.UnprocessableEntityError, 422), "fatal"),
+        (_status_error(openai.ConflictError, 409), "unrecognized"),
+        (ValueError("boom"), "unrecognized"),
     ],
 )
-def test_classify_maps_each_sdk_exception_to_its_retry_class(
-    error: Exception, expected: ErrorClass
+def test_classify_maps_each_sdk_exception_to_its_classification(
+    error: Exception, expected: ErrorClassification
 ) -> None:
-    """Each SDK exception lands on the retry class the adapter's classify docstring names.
+    """Each SDK exception lands on the classification the adapter's classify docstring names.
 
     Each status code is the one the SDK raises that class for, read from openai 2.45.0.
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
+    ConflictError and the non-SDK ValueError land on the unrecognized default,
+    which fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected
 

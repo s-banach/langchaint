@@ -17,9 +17,10 @@ from langchaint import (
     LLM,
     ZERO_USAGE,
     AbandonedCall,
-    AbortBatchError,
     AssistantMessage,
+    BatchAbortedError,
     BoundLLM,
+    FatalError,
     GenerationError,
     MaxCompletionTokensExceededError,
     Message,
@@ -33,6 +34,7 @@ from langchaint import (
     TextPart,
     ToolCall,
     TransientError,
+    UnrecognizedError,
     Usage,
     UserMessage,
 )
@@ -43,7 +45,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClass,
+    ErrorClassification,
 )
 from langchaint.llm import UNCHANGED
 
@@ -322,7 +324,7 @@ class _FakeAdapter(Adapter):
         open_failures: Sequence[Exception] = (),
         echo: bool = False,
         stream: _FakeStream | None = None,
-        classify_result: ErrorClass = "abort",
+        classify_result: ErrorClassification = "unrecognized",
         send_seconds: float = 0.0,
         hang_from_open: int | None = None,
         hang_from_send: int | None = None,
@@ -366,8 +368,8 @@ class _FakeAdapter(Adapter):
         return bound
 
     @override
-    def classify(self, error: Exception) -> ErrorClass:
-        """Return the fixed verdict for unrecognized exceptions."""
+    def classify(self, error: Exception) -> ErrorClassification:
+        """Return the fixed verdict for every exception classify sees."""
         return self._classify_result
 
 
@@ -447,22 +449,64 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_abort_batch_error_raises_immediately_without_retry() -> None:
-    """An AbortBatchError from send is raised on the first attempt and never retried.
+def test_fatal_error_raises_immediately_without_retry() -> None:
+    """A FatalError from send is raised on the first attempt and never retried.
 
     classify returns "transient" here, so retrying is what the classifier asks for:
-    only the retry loop honoring AbortBatchError ahead of classification stops the second attempt.
+    only the retry loop honoring FatalError ahead of classification stops the second attempt.
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises AbortBatchError under a transient classify verdict."""
-        adapter = _FakeAdapter(failures=[AbortBatchError("nope")], classify_result="transient")
+        """Drive one generate_one whose send raises FatalError under a transient classify verdict."""
+        adapter = _FakeAdapter(failures=[FatalError("nope")], classify_result="transient")
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(FatalError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].send_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_fatal_error_after_transient_attempts_carries_their_records() -> None:
+    """A FatalError raised after transient attempts propagates enriched with their records.
+
+    The prior attempts' usage rides the error, so a billed 200 retried before the fatal
+    classification stays accounted for. Both arms enrich: the classify-fatal wrap and the
+    adapter-raised FatalError re-raise.
+    """
+
+    async def scenario() -> None:
+        """Settle one billed transient attempt, then hit each fatal arm in its own call."""
+        classified_adapter = _FakeAdapter(
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                ValueError("bad request"),
+            ],
+            classify_result="fatal",
+        )
+        bound_llm = LLM(classified_adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(FatalError) as classified:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        (billed_record,) = classified.value.attempt_records
+        assert billed_record.usage.cost_in_usd == 0.25
+        assert isinstance(classified.value.__cause__, ValueError)
+        raising_adapter = _FakeAdapter(
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                FatalError("raised by the adapter"),
+            ],
+        )
+        raising_bound_llm = LLM(raising_adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(FatalError) as raised:
+            await raising_bound_llm.generate_one([UserMessage(content="hi")])
+        (raised_billed_record,) = raised.value.attempt_records
+        assert raised_billed_record.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
 
@@ -541,18 +585,69 @@ def test_unrecognized_error_classified_transient_is_retried() -> None:
     asyncio.run(scenario())
 
 
-def test_unrecognized_error_classified_abort_raises() -> None:
-    """A plain exception classified abort raises AbortBatchError on the first attempt."""
+def test_exception_classified_fatal_raises_fatal_error() -> None:
+    """A plain exception classified fatal raises FatalError on the first attempt."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises a classify-abort exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="abort")
+        """Drive one generate_one whose send raises a classify-fatal exception."""
+        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="fatal")
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(FatalError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].send_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_exception_classified_unrecognized_fails_the_item_without_retry() -> None:
+    """A plain exception classified unrecognized raises UnrecognizedError on the first attempt.
+
+    UnrecognizedError is a GenerationError leaf, so in a batch it becomes the item's failure row
+    rather than aborting the siblings.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send raises a classify-unrecognized exception."""
+        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unrecognized")
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(UnrecognizedError) as unrecognized:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = unrecognized.value
+        assert isinstance(failure, GenerationError)
+        assert isinstance(failure.error, ValueError)
+        assert isinstance(failure.__cause__, ValueError)
+        assert failure.error_text == "unrecognized provider error: boom"
+        assert failure.stop_reason is None
+        assert failure.attempt_records == ()
+        assert failure.model == adapter.model
+        assert failure.provider_name == adapter.provider_name
+
+    asyncio.run(scenario())
+
+
+def test_unrecognized_error_becomes_the_items_failure_row_and_siblings_continue() -> None:
+    """A classify-unrecognized item comes back as its UnrecognizedError row; the sibling succeeds."""
+
+    async def scenario() -> None:
+        """Serialize a two-item batch (max_in_flight=1) whose first send is unrecognized."""
+        adapter = _FakeAdapter(
+            echo=True, failures=[ValueError("boom")], classify_result="unrecognized"
+        )
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many([
+            [UserMessage(content="a")],
+            [UserMessage(content="b")],
+        ])
+        first, second = results
+        assert isinstance(first, UnrecognizedError)
+        assert isinstance(second, Response)
+        assert second.output == "b"
 
     asyncio.run(scenario())
 
@@ -645,17 +740,17 @@ def test_generate_one_cancellation_with_nothing_settled_fabricates_no_usage() ->
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_generate_one_abort_appends_no_abandoned_call() -> None:
-    """An AbortBatchError propagates with nothing appended: it abandons no request."""
+def test_generate_one_fatal_appends_no_abandoned_call() -> None:
+    """A FatalError propagates with nothing appended: it abandons no request."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises a classify-abort exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="abort")
+        """Drive one generate_one whose send raises a classify-fatal exception."""
+        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="fatal")
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
         abandoned_call_log: list[AbandonedCall] = []
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(FatalError):
             await bound_llm.generate_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             )
@@ -859,16 +954,102 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
     asyncio.run(scenario())
 
 
-def test_generate_many_aborts_the_whole_batch_and_cancels_siblings() -> None:
-    """An AbortBatchError in one item raises out of the batch instead of becoming a row."""
+def test_generate_many_fatal_aborts_the_batch_with_every_slot_filled() -> None:
+    """A FatalError in one item raises BatchAbortedError whose slots cover every item.
+
+    The cancelled sibling, with no attempt settled, comes back as an AbandonedCall with no
+    attempt records; hang_from_send pins it in flight so the cancellation lands deterministically.
+    """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send aborts."""
-        adapter = _FakeAdapter(echo=True, failures=[AbortBatchError("misconfigured")])
+        """Serialize a two-item batch (max_in_flight=1) whose first send raises FatalError."""
+        adapter = _FakeAdapter(echo=True, failures=[FatalError("misconfigured")], hang_from_send=2)
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(BatchAbortedError) as aborted:
             await bound_llm.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
+        assert adapter.bound_adapters[0].send_count <= 2
+        first, second = aborted.value.outcomes
+        assert isinstance(first, FatalError)
+        assert aborted.value.fatal_error is first
+        assert isinstance(second, AbandonedCall)
+        assert second.attempt_records == ()
+        assert second.model == adapter.model
+        assert second.provider_name == adapter.provider_name
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_abort_keeps_the_cancelled_siblings_settled_usage() -> None:
+    """The abort's AbandonedCall slot carries the billed attempts the cancelled sibling settled.
+
+    One item settles a billed transient attempt and is cancelled during its backoff by the other
+    item's FatalError; without the controller-held records its paid usage would vanish with the
+    cancelled frames.
+    """
+
+    async def scenario() -> None:
+        """Serialize the sends (max_in_flight=1): a billed transient first, the fatal second.
+
+        hang_from_send pins any third send (the first item's retry racing the cancellation),
+        so that item always ends cancelled with exactly its one settled record.
+        """
+        adapter = _FakeAdapter(
+            echo=True,
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                FatalError("misconfigured"),
+            ],
+            hang_from_send=3,
+        )
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        with pytest.raises(BatchAbortedError) as aborted:
+            await bound_llm.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
+        outcomes = aborted.value.outcomes
+        assert len(outcomes) == 2
+        (fatal,) = [outcome for outcome in outcomes if isinstance(outcome, FatalError)]
+        assert aborted.value.fatal_error is fatal
+        (abandoned,) = [outcome for outcome in outcomes if isinstance(outcome, AbandonedCall)]
+        (billed_record,) = abandoned.attempt_records
+        assert billed_record.usage.cost_in_usd == 0.25
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_abort_keeps_the_settled_siblings_results() -> None:
+    """Slots of items that settled before the abort keep their Response or GenerationError."""
+
+    async def scenario() -> None:
+        """Serialize three items (max_in_flight=1): a refusal row, the fatal, a cancelled third.
+
+        hang_from_send pins the third item's send (racing the cancellation), so its slot is
+        always the AbandonedCall.
+        """
+        adapter = _FakeAdapter(
+            echo=True,
+            failures=[
+                RefusalError.for_rejected_200(
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
+                ),
+                FatalError("misconfigured"),
+            ],
+            hang_from_send=3,
+        )
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        with pytest.raises(BatchAbortedError) as aborted:
+            await bound_llm.generate_many([
+                [UserMessage(content="a")],
+                [UserMessage(content="b")],
+                [UserMessage(content="c")],
+            ])
+        first, second, third = aborted.value.outcomes
+        assert isinstance(first, RefusalError)
+        assert isinstance(second, FatalError)
+        assert aborted.value.fatal_error is second
+        assert isinstance(third, AbandonedCall)
+        assert third.attempt_records == ()
 
     asyncio.run(scenario())
 
@@ -925,20 +1106,68 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
     asyncio.run(scenario())
 
 
-def test_generate_many_warm_cache_abort_on_the_first_item_starts_no_sibling() -> None:
-    """An AbortBatchError from the warming item raises before any sibling sends."""
+def test_generate_many_warm_cache_fatal_on_the_first_item_starts_no_sibling() -> None:
+    """A FatalError from the warming item aborts before any sibling sends.
+
+    Every other slot is a never-started AbandonedCall with no attempt records.
+    """
 
     async def scenario() -> None:
-        """Abort the deterministic first send and count the sends that happened."""
-        adapter = _FakeAdapter(echo=True, failures=[AbortBatchError("misconfigured")])
+        """Fail the deterministic first send fatally and count the sends that happened."""
+        adapter = _FakeAdapter(echo=True, failures=[FatalError("misconfigured")])
         bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
-        with pytest.raises(AbortBatchError):
+        with pytest.raises(BatchAbortedError) as aborted:
             await bound_llm.generate_many(
                 [[UserMessage(content="a")], [UserMessage(content="b")]], warm_cache=True
             )
         assert adapter.bound_adapters[0].send_count == 1
+        first, second = aborted.value.outcomes
+        assert isinstance(first, FatalError)
+        assert aborted.value.fatal_error is first
+        assert isinstance(second, AbandonedCall)
+        assert second.attempt_records == ()
 
     asyncio.run(scenario())
+
+
+def test_generate_many_warm_cache_fatal_in_the_rest_keeps_the_first_items_slot() -> None:
+    """A fatal sibling after a settled warm first item reports every slot, the first included."""
+
+    async def scenario() -> None:
+        """Warm with a refusal row (which still admits the rest), then fail the second send fatally.
+
+        hang_from_send pins the third item's send (racing the cancellation), so its slot is
+        always the AbandonedCall.
+        """
+        adapter = _FakeAdapter(
+            echo=True,
+            failures=[
+                RefusalError.for_rejected_200(
+                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
+                ),
+                FatalError("misconfigured"),
+            ],
+            hang_from_send=3,
+        )
+        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        with pytest.raises(BatchAbortedError) as aborted:
+            await bound_llm.generate_many(
+                [
+                    [UserMessage(content="a")],
+                    [UserMessage(content="b")],
+                    [UserMessage(content="c")],
+                ],
+                warm_cache=True,
+            )
+        first, second, third = aborted.value.outcomes
+        assert isinstance(first, RefusalError)
+        assert isinstance(second, FatalError)
+        assert aborted.value.fatal_error is second
+        assert isinstance(third, AbandonedCall)
+        assert third.attempt_records == ()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
@@ -1351,6 +1580,46 @@ def test_stream_open_raising_a_generation_leaf_propagates_it_from_the_entry() ->
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_stream_open_classified_fatal_carries_the_prior_attempts_records() -> None:
+    """An open failure classified fatal raises FatalError from the entry with the prior transient record."""
+
+    async def scenario() -> None:
+        """Enter a handle whose first open fails transiently and whose second is classify-fatal."""
+        adapter = _FakeAdapter(
+            open_failures=[TransientError("conn refused"), ValueError("boom")],
+            classify_result="fatal",
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(FatalError) as fatal:
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
+        assert isinstance(fatal.value.__cause__, ValueError)
+        assert [str(record.error) for record in fatal.value.attempt_records] == ["conn refused"]
+
+    asyncio.run(scenario())
+
+
+def test_stream_open_classified_unrecognized_raises_the_items_failure() -> None:
+    """An open failure classified unrecognized raises UnrecognizedError from the entry, unretried."""
+
+    async def scenario() -> None:
+        """Enter a handle whose open raises a classify-unrecognized exception."""
+        adapter = _FakeAdapter(open_failures=[ValueError("boom")], classify_result="unrecognized")
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(UnrecognizedError) as unrecognized:
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
+        assert adapter.bound_adapters[0].open_count == 1
+        assert isinstance(unrecognized.value.error, ValueError)
+        assert unrecognized.value.error_text == "unrecognized provider error: boom"
 
     asyncio.run(scenario())
 

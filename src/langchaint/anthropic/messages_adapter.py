@@ -91,7 +91,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClass,
+    ErrorClassification,
     PricingTable,
     SpecificToolChoice,
     StreamItem,
@@ -99,7 +99,7 @@ from langchaint.adapter import (
     retry_after_seconds_from_headers,
 )
 from langchaint.exceptions import (
-    AbortBatchError,
+    FatalError,
     MaxCompletionTokensExceededError,
     RefusalError,
     StreamProtocolError,
@@ -185,13 +185,13 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
     """Convert one content Part to its wire block.
 
     Raises:
-        AbortBatchError: an ImagePart's media_type is outside the API's accepted set;
+        FatalError: an ImagePart's media_type is outside the API's accepted set;
             the same request would be rejected again.
     """
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
     if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
-        raise AbortBatchError(
+        raise FatalError(
             f"the Anthropic API accepts image media types "
             f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
         )
@@ -206,7 +206,7 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
 def _user_content_blocks(
     user_message: UserMessage,
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
-    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's AbortBatchError.
+    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's FatalError.
 
     The second element holds the blocks whose part sets cache_breakpoint, in content order;
     the caller applies the request-wide marker budget, so no marker is written here.
@@ -230,7 +230,7 @@ def _tool_result_content(
     """Convert one ToolMessage's content to the tool_result content field.
 
     A bare string passes through; a sequence of parts becomes wire text and image blocks,
-    an image part propagating _part_block's AbortBatchError.
+    an image part propagating _part_block's FatalError.
     """
     if isinstance(content, str):
         return content
@@ -286,9 +286,9 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     for the message's last part that is equivalent, because the block's span ends where that part ends.
 
     Raises:
-        AbortBatchError: a part other than the message's last sets cache_breakpoint;
+        FatalError: a part other than the message's last sets cache_breakpoint;
             the enclosing block's marker would silently move the boundary to the block's end,
-            and the same request would abort again.
+            and the same request would fail again.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -298,7 +298,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     if not marked_indexes:
         return False
     if marked_indexes != [len(tool_message.content) - 1]:
-        raise AbortBatchError(
+        raise FatalError(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
             "the marker goes on the enclosing tool_result block, whose span ends at the last part"
         )
@@ -325,7 +325,7 @@ def _wire_messages(
     computed once in _request; at 0, every mark goes unwritten.
 
     Raises:
-        AbortBatchError: an image part's media_type is outside the API's set (from _part_block),
+        FatalError: an image part's media_type is outside the API's set (from _part_block),
             or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking).
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
@@ -453,7 +453,7 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
     output_tokens_details is optional on the SDK Usage.
 
     Raises:
-        AbortBatchError: propagated from _cost_in_usd when the response reports 1-hour cache writes
+        FatalError: propagated from _cost_in_usd when the response reports 1-hour cache writes
             but the PricingTable has no cache_write_1h_usd_per_million_tokens.
     """
     output_tokens_details = usage.output_tokens_details
@@ -479,7 +479,7 @@ def cost_breakdown(usage_raw: anthropic.types.Usage, pricing: PricingTable) -> C
     Raises:
         ValueError: usage_raw reports 1-hour cache writes but pricing has no
             cache_write_1h_usd_per_million_tokens (propagated from price;
-            a standalone reporting call has no batch, so this is never AbortBatchError).
+            a standalone reporting call is not a generation, so this is never FatalError).
     """
     return price(counts=_priceable_counts(usage_raw), pricing=pricing)
 
@@ -513,14 +513,14 @@ def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
     so the stored Usage.cost_in_usd and a reported breakdown cannot disagree.
 
     Raises:
-        AbortBatchError: the response reports 1-hour cache writes but the PricingTable has no
+        FatalError: the response reports 1-hour cache writes but the PricingTable has no
             cache_write_1h_usd_per_million_tokens. A pricing-table defect dooms every sibling
             sharing it, so it aborts the batch, carrying the billed 200's raw usage as evidence.
     """
     try:
         return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
     except ValueError as exc:
-        raise AbortBatchError(str(exc), usage_raw=usage) from exc
+        raise FatalError(str(exc), usage_raw=usage) from exc
 
 
 def _adapter_result[OutputT](
@@ -529,7 +529,7 @@ def _adapter_result[OutputT](
     """Normalize one completed message around already-extracted output.
 
     Raises:
-        AbortBatchError: propagated from _normalized_usage when the response reports 1-hour cache writes
+        FatalError: propagated from _normalized_usage when the response reports 1-hour cache writes
             but the PricingTable has no cache_write_1h_usd_per_million_tokens.
     """
     return AdapterResult(
@@ -726,18 +726,34 @@ class AnthropicMessagesAdapter(Adapter):
         )
 
     @override
-    def classify(self, error: Exception) -> ErrorClass:
-        """Map the SDK exception to rate_limit, transient, or abort.
+    def classify(self, error: Exception) -> ErrorClassification:
+        """Map the SDK exception to rate_limit, transient, fatal, or unrecognized.
 
         RateLimitError (429) and OverloadedError (529) both mean further requests from this account
         fail the same way right now, so admission should pause account-wide.
-        Everything unrecognized is abort so bugs are not retried.
+        InternalServerError is every 5xx status the SDK maps no specific class to (verified against
+        anthropic 0.116.0, Bedrock clients included), so server-side trouble is retried.
+        The fatal classes are the request-is-wrong statuses (400, 401, 403, 404, 413, 422),
+        where every sibling sharing the configuration fails the same way.
+        Everything else is unrecognized: that item fails without a retry and the siblings continue.
         """
         if isinstance(error, (anthropic.RateLimitError, anthropic.OverloadedError)):
             return "rate_limit"
         if isinstance(error, (anthropic.InternalServerError, anthropic.APIConnectionError)):
             return "transient"
-        return "abort"
+        if isinstance(
+            error,
+            (
+                anthropic.BadRequestError,
+                anthropic.AuthenticationError,
+                anthropic.PermissionDeniedError,
+                anthropic.NotFoundError,
+                anthropic.RequestTooLargeError,
+                anthropic.UnprocessableEntityError,
+            ),
+        ):
+            return "fatal"
+        return "unrecognized"
 
     @override
     def retry_after_seconds(self, error: Exception) -> float | None:
@@ -885,7 +901,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
                 terminal per-item, not retried.
             TransientError: the turn completed but carried no parsed output for another reason,
                 which a later attempt may fix.
-            AbortBatchError: propagated from _normalized_usage when the response reports 1-hour cache writes
+            FatalError: propagated from _normalized_usage when the response reports 1-hour cache writes
                 but the PricingTable has no cache_write_1h_usd_per_million_tokens.
         """
         parsed_output = message.parsed_output

@@ -109,7 +109,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
-    ErrorClass,
+    ErrorClassification,
     PricingTable,
     SpecificToolChoice,
     StreamItem,
@@ -655,18 +655,33 @@ class OpenAIResponsesAdapter(Adapter):
         )
 
     @override
-    def classify(self, error: Exception) -> ErrorClass:
-        """Map the SDK exception to rate_limit, transient, or abort.
+    def classify(self, error: Exception) -> ErrorClassification:
+        """Map the SDK exception to rate_limit, transient, fatal, or unrecognized.
 
         RateLimitError (429) means further requests from this account fail the same way right now,
         so admission should pause account-wide.
-        Everything unrecognized is abort so bugs are not retried.
+        InternalServerError is every 5xx status (verified against openai 2.45.0),
+        so server-side trouble is retried.
+        The fatal classes are the request-is-wrong statuses (400, 401, 403, 404, 422),
+        where every sibling sharing the configuration fails the same way.
+        Everything else is unrecognized: that item fails without a retry and the siblings continue.
         """
         if isinstance(error, openai.RateLimitError):
             return "rate_limit"
         if isinstance(error, (openai.InternalServerError, openai.APIConnectionError)):
             return "transient"
-        return "abort"
+        if isinstance(
+            error,
+            (
+                openai.BadRequestError,
+                openai.AuthenticationError,
+                openai.PermissionDeniedError,
+                openai.NotFoundError,
+                openai.UnprocessableEntityError,
+            ),
+        ):
+            return "fatal"
+        return "unrecognized"
 
     @override
     def retry_after_seconds(self, error: Exception) -> float | None:

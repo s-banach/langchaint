@@ -1,7 +1,7 @@
 """The generate results: the success Response, the terminal GenerationError, and the AbandonedCall record.
 
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
-or a truncation at the token cap) raises or returns a GenerationError;
+a truncation at the token cap, or an unrecognized provider error) raises or returns a GenerationError;
 one a cancellation cuts off leaves an AbandonedCall on the caller's abandoned_call_log.
 The three carriers share the per-attempt history langchaint's retry loop produces,
 because the history survives only if the result carries it:

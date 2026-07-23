@@ -17,9 +17,10 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.exceptions import (
-    AbortBatchError,
     AttemptRecord,
+    BatchAbortedError,
     DispatchExceptionGroup,
+    FatalError,
     GenerationError,
     InvalidToolArgsError,
     MaxCompletionTokensExceededError,
@@ -27,6 +28,7 @@ from langchaint.exceptions import (
     RetriesExhaustedError,
     StreamProtocolError,
     TransientError,
+    UnrecognizedError,
 )
 from langchaint.inference_params import InferenceParams, ReasoningEffort
 from langchaint.llm import LLM, BoundLLM
@@ -73,9 +75,9 @@ __all__ = [
     "ZERO_USAGE",
     "AbandonedCall",
     "AbandonedCallLog",
-    "AbortBatchError",
     "AssistantMessage",
     "AttemptRecord",
+    "BatchAbortedError",
     "BoundLLM",
     "CaptureTool",
     "CostBreakdown",
@@ -87,6 +89,7 @@ __all__ = [
     "DispatchOutcome",
     "DispatchPrecomputed",
     "DispatchUnknownTool",
+    "FatalError",
     "GenerationError",
     "ImagePart",
     "InferenceParams",
@@ -123,6 +126,7 @@ __all__ = [
     "ToolSchema",
     "TransientError",
     "TurnElement",
+    "UnrecognizedError",
     "Usage",
     "UserMessage",
     "price",

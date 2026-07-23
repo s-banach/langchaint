@@ -27,13 +27,16 @@ from langchaint.messages import AssistantMessage, Message, StopReason, TextPart,
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
-type ErrorClass = Literal["rate_limit", "transient", "abort"]
-"""Whether a retry may fix the error, and whether it should pause everyone.
+type ErrorClassification = Literal["rate_limit", "transient", "unrecognized", "fatal"]
+"""Whether a retry may fix the error, and how far beyond the failing call it reaches.
 
+A string classification, not an exception class; the retry loop maps it onto one.
 "rate_limit" is transient and account-wide: the account or service refuses further requests
 right now, so RateLimiter pauses admission for everyone sharing it.
-"transient" is retried by the failing task alone; "abort" is not retried and cancels the batch
-(the retry loop raises AbortBatchError).
+"transient" is retried by the failing task alone.
+"unrecognized" is not retried and fails only its item (the retry loop raises UnrecognizedError).
+"fatal" is not retried and dooms every call sharing the configuration
+(the retry loop raises FatalError, which makes generate_many abort the batch).
 """
 
 
@@ -217,9 +220,9 @@ class BoundAdapter[OutputT](ABC):
         """Send one non-streaming request.
 
         Raises:
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify maps them to transient or abort.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
                 For defects the SDK reports as data rather than as an exception,
-                the adapter raises TransientError, AbortBatchError, or a GenerationError leaf directly,
+                the adapter raises TransientError, FatalError, or a GenerationError leaf directly,
                 and the retry loop honors those without classification.
         """
         ...
@@ -231,7 +234,7 @@ class BoundAdapter[OutputT](ABC):
         Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.
 
         Raises:
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify maps them to transient or abort.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
         """
         ...
 
@@ -335,10 +338,13 @@ class Adapter(ABC):
         ...
 
     @abstractmethod
-    def classify(self, error: Exception) -> ErrorClass:
+    def classify(self, error: Exception) -> ErrorClassification:
         """Classify an exception raised by send or open_stream.
 
-        Anything the adapter does not recognize must map to "abort" so bugs are not retried silently.
+        Anything the adapter does not recognize must map to "unrecognized",
+        which fails the one item without a retry, so bugs surface without being retried silently
+        and without killing the sibling items.
+        Reserve "fatal" for known-systematic errors, where every sibling would fail the same way.
         """
         ...
 

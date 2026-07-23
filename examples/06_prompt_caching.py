@@ -16,8 +16,8 @@ import asyncio
 from pydantic import ValidationError
 
 from langchaint import (
-    AbortBatchError,
     AssistantMessage,
+    FatalError,
     Message,
     TextPart,
     ToolCall,
@@ -135,7 +135,7 @@ async def provider_divergent_marks_are_rejected() -> None:
     so the mark would cache on one provider and silently vanish on the other.
     And a marked part in a ToolMessage must be the message's last part:
     anthropic's marker goes on the enclosing tool_result block, whose span ends at the last part,
-    so a mark anywhere else raises AbortBatchError instead of moving the cache boundary.
+    so a mark anywhere else raises FatalError instead of moving the cache boundary.
     Both raises happen before any request is sent, so this function costs nothing to run.
     """
     try:
@@ -157,7 +157,7 @@ async def provider_divergent_marks_are_rejected() -> None:
     bound = anthropic_model("claude-sonnet-5").bind(automatic_prompt_caching=False)
     try:
         await bound.generate_one(conversation)
-    except AbortBatchError as err:
+    except FatalError as err:
         print(f"generate_one rejected the non-last marked tool part: {err}")
 
 

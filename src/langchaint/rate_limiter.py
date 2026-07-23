@@ -3,8 +3,8 @@
 RateLimiter is the only place concurrency and retries are configured in langchaint.
 Its admission gates every request start on every path: first attempts, retries, batch items, and stream openings,
 so one budget covers the whole process.
-There is deliberately no requests_per_minute: an in-flight bound self-adjusts throughput along request duration
-(short cheap requests finish fast and run at a high rate, long token-heavy ones throttle it),
+There is deliberately no requests_per_minute: under a fixed in-flight bound, throughput follows request duration
+(short cheap requests finish fast and run at a high rate, long token-heavy ones slow it),
 while a client-side rate number models one dimension of the provider's multi-dimensional limit
 and goes stale with the account tier.
 

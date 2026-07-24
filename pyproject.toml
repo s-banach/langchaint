@@ -44,7 +44,7 @@ dev = [
     "opentelemetry-semantic-conventions>=0.64b0",
     "pytest>=9.0.2",
     "pyrefly>=1.2.0.dev2",
-    "ruff>=0.15.20",
+    "ruff>=0.16.0",
     "typos>=1.48.0",
 ]
 
@@ -94,7 +94,7 @@ lint.select = [
     # because an async generator has no context of its own: an asyncio.timeout then measures the
     # consumer's pace and cancels into the consumer's frame, and a current span is adopted by whatever
     # the consumer opens next. Preview-only, so selecting the ASYNC group alone does not enable it.
-    "ASYNC119",
+    "yield-in-context-manager-in-async-generator",
     "ANN",
     "BLE",
     "FBT",
@@ -124,8 +124,8 @@ lint.select = [
     "FURB",
     "RUF",
     "TRY",
-    "W505",  # doc-line-too-long, capped by pycodestyle.max-doc-length below
-    # Docstrings, selected as exact codes with no pydocstyle convention.
+    "doc-line-too-long",  # capped by pycodestyle.max-doc-length below
+    # Docstrings, selected individually with no pydocstyle convention.
     # A convention is an ignore-overlay whose removals the code satisfies
     # anyway, and the google convention ignores D401, which this project
     # enforces. Deliberately absent:
@@ -136,43 +136,43 @@ lint.select = [
     # (property-docstring-starts-with-verb), not opted into: D421 flags a
     # verb-first property docstring, which the imperative mood used
     # everywhere here (D401) would otherwise produce.
-    "D100",  # undocumented-public-module
-    "D101",  # undocumented-public-class
-    "D102",  # undocumented-public-method
-    "D103",  # undocumented-public-function
-    "D104",  # undocumented-public-package
-    "D105",  # undocumented-magic-method
-    "D106",  # undocumented-public-nested-class
-    "D107",  # undocumented-public-init
-    "D200",  # unnecessary-multiline-docstring
-    "D201",  # blank-line-before-function
-    "D202",  # blank-line-after-function
-    "D204",  # incorrect-blank-line-after-class
-    "D205",  # missing-blank-line-after-summary
-    "D206",  # docstring-tab-indentation
-    "D207",  # under-indentation
-    "D208",  # over-indentation
-    "D209",  # new-line-after-last-paragraph
-    "D210",  # surrounding-whitespace
-    "D211",  # blank-line-before-class
-    "D212",  # multi-line-summary-first-line
-    "D214",  # overindented-section
-    "D215",  # overindented-section-underline
-    "D300",  # triple-single-quotes
-    "D301",  # escape-sequence-in-docstring
-    "D400",  # missing-trailing-period
-    "D401",  # non-imperative-mood
-    "D402",  # signature-in-docstring
-    "D403",  # first-word-uncapitalized
-    "D404",  # docstring-starts-with-this
-    "D415",  # missing-terminal-punctuation
-    "D417",  # undocumented-param
-    "D418",  # overload-with-docstring
-    "D419",  # empty-docstring
+    "undocumented-public-module",
+    "undocumented-public-class",
+    "undocumented-public-method",
+    "undocumented-public-function",
+    "undocumented-public-package",
+    "undocumented-magic-method",
+    "undocumented-public-nested-class",
+    "undocumented-public-init",
+    "unnecessary-multiline-docstring",
+    "blank-line-before-function",
+    "blank-line-after-function",
+    "incorrect-blank-line-after-class",
+    "missing-blank-line-after-summary",
+    "docstring-tab-indentation",
+    "under-indentation",
+    "over-indentation",
+    "new-line-after-last-paragraph",
+    "surrounding-whitespace",
+    "blank-line-before-class",
+    "multi-line-summary-first-line",
+    "overindented-section",
+    "overindented-section-underline",
+    "triple-single-quotes",
+    "escape-sequence-in-docstring",
+    "missing-trailing-period",
+    "non-imperative-mood",
+    "signature-in-docstring",
+    "first-word-uncapitalized",
+    "docstring-starts-with-this",
+    "missing-terminal-punctuation",
+    "undocumented-param",
+    "overload-with-docstring",
+    "empty-docstring",
     # Preview docstring features
-    "DOC202",  # docstring documents a return that does not exist
-    "DOC402",  # missing "Yields" in docstring
-    "DOC403",  # docstring documents a yield that does not exist
+    "docstring-extraneous-returns",
+    "docstring-missing-yields",
+    "docstring-extraneous-yields",
     # DOC501 (raised exception missing) and DOC502 (documents an exception not
     # raised) are deliberately absent. Both resolve a raise only for the literal
     # `raise SomeError(...)` / `raise SomeError` shapes; they cannot see through
@@ -184,10 +184,13 @@ lint.select = [
     # function raises") checked in review instead.
 ]
 lint.ignore = [
-    "ANN401",
-    "SIM105",
-    "PLR2004",
-    "TRY003",
+    "any-type",
+    "suppressible-exception",
+    "magic-value-comparison",
+    "raise-vanilla-args",
+    # The bind/rebind signatures write `X | None | Unchanged` to keep the sentinel
+    # adjacent to its `= UNCHANGED` default; obeying the rule would bury it.
+    "none-not-at-end-of-union",
 ]
 
 # Docstrings and comments break lines at sentence boundaries, not at a column
@@ -198,26 +201,26 @@ lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
 
 # The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._request,
-# BoundLLM._bound_adapter); those accesses are the unit under test, so SLF001
-# (private-member-access) cannot be satisfied without exposing internals.
-# PLR0913 (too-many-arguments) is ignored because the fake adapters' constructors take one
+# BoundLLM._bound_adapter); those accesses are the unit under test, so private-member-access
+# cannot be satisfied without exposing internals.
+# too-many-arguments is ignored because the fake adapters' constructors take one
 # keyword per scripted behavior (a failure list, a hang point, a delay); grouping them into a
 # config object would relocate the count without shrinking it.
-lint.per-file-ignores."tests/*" = ["SLF001", "PLR0913"]
+lint.per-file-ignores."tests/*" = ["private-member-access", "too-many-arguments"]
 
 # The examples are standalone scripts run by path (python examples/01_basics.py),
-# deliberately not an importable package, so INP001 (implicit-namespace-package,
-# which would demand an examples/__init__.py) does not apply.
-lint.per-file-ignores."examples/*" = ["INP001"]
+# deliberately not an importable package, so implicit-namespace-package
+# (which would demand an examples/__init__.py) does not apply.
+lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 
 # examples/full_app/ holds the multi-agent example app whose README argues for its shape. Like the
-# numbered examples its modules are standalone scripts run by path, hence INP001. BLE001 (blind-except)
-# is ignored because catching bare Exception around a sub-run is deliberate: a narrower except
-# turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
+# numbered examples its modules are standalone scripts run by path, hence implicit-namespace-package.
+# blind-except is ignored because catching bare Exception around a sub-run is deliberate: a narrower
+# except turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
 # of a message the parent model can answer around. Each such except carries a comment stating
-# that. PLR0911 (too-many-return-statements) is ignored because the event renderer is one
+# that. too-many-return-statements is ignored because the event renderer is one
 # exhaustive match over the closed Event union, one return per arm; splitting it would
 # reintroduce an unreachable fallback arm.
-lint.per-file-ignores."examples/full_app/*" = ["INP001", "BLE001", "PLR0911"]
+lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
 
 [tool.typos.default.extend-words]

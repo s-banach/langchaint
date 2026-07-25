@@ -164,6 +164,27 @@ def test_normalized_usage_partitions_input_counters_and_prices() -> None:
     assert usage.cost_in_usd == (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
 
 
+def test_normalized_usage_counts_the_writes_it_bills_for() -> None:
+    """The cache-write counter reads the same source the cost does, so the two cannot disagree.
+
+    cache_creation_input_tokens and the cache_creation split are separate optional SDK fields with
+    no documented relationship, so a response carrying only the split would otherwise report a
+    cost covering 30 written tokens and a counter saying none were written.
+    """
+    usage = _normalized_usage(
+        at.Usage(
+            input_tokens=100,
+            output_tokens=0,
+            cache_creation=at.CacheCreation(
+                ephemeral_5m_input_tokens=10, ephemeral_1h_input_tokens=20
+            ),
+        ),
+        _PRICING,
+    )
+    assert usage.input_tokens_cache_write == 30
+    assert abs(usage.cost_in_usd - (100 * 3.0 + 10 * 3.75 + 20 * 6.0) / 1e6) < 1e-12
+
+
 def test_normalized_usage_treats_none_cache_counts_as_zero() -> None:
     """Absent cache counters normalize to zero, not None."""
     usage = _normalized_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)

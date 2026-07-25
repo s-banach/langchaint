@@ -5,10 +5,13 @@ Verified against anthropic 0.116.0:
   the SDK builds the JSON-schema output format and parses the response text.
 - `messages.stream(...)` returns a manager whose entered stream assembles deltas into a `ParsedMessage` snapshot;
   `get_final_message()` returns it.
-- `Usage.input_tokens` excludes cache reads and writes,
-  so the three langchaint counters map directly and no all-inclusive provider total exists to cross-check.
 - `Usage.cache_creation` splits cache writes into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`,
   which bill at different rates.
+
+`Usage.input_tokens` excludes cache reads and writes, so the three langchaint counters map directly
+and no all-inclusive provider total exists to cross-check. That one is verified by docs rather than
+by introspection: the SDK documents no relationship among the input counters,
+so `_normalized_usage` carries the page that does.
 
 Reasoning replay, verified by docs and live runs because it is request-time behavior SDK introspection cannot show:
 the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
@@ -29,6 +32,8 @@ the message's last would silently move the boundary to the block's end, so it is
 A system_prompt bound as parts renders one system block per part, marked parts carrying cache_control,
 so a breakpoint can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
 The API allows at most 4 cache_control markers per request.
+The SDK documents no such limit, so the source is the provider's prompt-caching page, read 2026-07-25:
+https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 The binding's own markers (marked system parts, the automatic frozen-prefix and last-message markers)
 spend slots first; a binding whose markers alone exceed the limit fails at bind with ValueError.
 The remainder is the per-request budget for marked message parts:
@@ -490,22 +495,33 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
 def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Usage:
     """Map the raw counters onto langchaint's disjoint partition and price them.
 
-    `usage.input_tokens` excludes cache reads and writes (verified against anthropic 0.116.0),
-    so it is exactly the uncached-input counter.
+    `usage.input_tokens` excludes cache reads and writes, so it is exactly the uncached-input counter.
+    The SDK documents no relationship among the input counters, so the source is the provider's
+    prompt-caching page, which gives the total as
+    cache_read_input_tokens + cache_creation_input_tokens + input_tokens, read 2026-07-25:
+    https://platform.claude.com/docs/en/build-with-claude/prompt-caching
     output_tokens_details is optional on the SDK Usage.
-    The cost is the same price() call the public cost_breakdown makes,
-    so the stored scalar and a reported breakdown cannot disagree.
+    Every priced counter here is read off the same _priceable_counts result the cost is priced from,
+    and cost_in_usd is the same price() call the public cost_breakdown makes,
+    so the counters, the stored scalar, and a reported breakdown cannot disagree.
+    That matters for the cache-write counter, which has two SDK sources: cache_creation_input_tokens
+    and the cache_creation 5-minute/1-hour split, each optional and neither documented in terms of
+    the other, so reading one here and the other for pricing could report a write the cost included
+    and the counter did not.
     """
     output_tokens_details = usage.output_tokens_details
+    counts = _priceable_counts(usage)
     return Usage(
-        input_tokens_cache_read=usage.cache_read_input_tokens or 0,
-        input_tokens_cache_write=usage.cache_creation_input_tokens or 0,
-        input_tokens_cache_none=usage.input_tokens,
-        output_tokens=usage.output_tokens,
+        input_tokens_cache_read=counts.input_tokens_cache_read,
+        input_tokens_cache_write=(
+            counts.input_tokens_cache_write + counts.input_tokens_cache_write_1h
+        ),
+        input_tokens_cache_none=counts.input_tokens_cache_none,
+        output_tokens=counts.output_tokens,
         output_tokens_reasoning=(
             output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
         ),
-        cost_in_usd=price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd,
+        cost_in_usd=price(counts=counts, pricing=pricing).total_cost_in_usd,
     )
 
 
@@ -524,8 +540,8 @@ def _priceable_counts(usage: anthropic.types.Usage) -> PriceableCounts:
 
     usage.cache_creation splits writes into 5-minute and 1-hour tokens; when it is absent,
     cache_creation_input_tokens bills entirely at the base cache_write_usd_per_million_tokens rate.
-    usage.input_tokens excludes cache reads and writes (verified against anthropic 0.116.0),
-    so it is exactly the uncached count.
+    usage.input_tokens excludes cache reads and writes, so it is exactly the uncached count;
+    _normalized_usage cites the page that states it.
     """
     input_tokens_cache_write = usage.cache_creation_input_tokens or 0
     input_tokens_cache_write_1h = 0

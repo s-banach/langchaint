@@ -440,8 +440,8 @@ class BoundLLM[OutputT]:
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
             UnrecognizedError: the adapter classified an attempt's error as unrecognized;
                 terminal for this item, without a retry.
-            RefusalError: the adapter reported a Refused attempt (the model refused on the structured
-                path); terminal for this item, without a retry.
+            RefusalError: the adapter reported a Refused attempt (no structured output: the model
+                refused or a provider filter blocked the turn); terminal for this item, without a retry.
             MaxCompletionTokensExceededError: the adapter reported a Truncated attempt (the structured
                 response hit the token cap); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.

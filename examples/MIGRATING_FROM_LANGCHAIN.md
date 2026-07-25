@@ -73,7 +73,7 @@ The runnable version, a `try`/`except GenerationError` over two bindings, is `ge
 ## Errors: success is a Response, failure is a GenerationError
 
 `generate_one` returns a `Response` on success and raises on a terminal outcome.
-`GenerationError` is the base of the five terminal per-item failures: `RetriesExhaustedError` (transient budget spent), `RefusalError` (the model refused on the structured path), `MaxCompletionTokensExceededError` (the structured response hit the token cap), `InvalidRequestError` (the provider or the adapter rejected this request), and `UnrecognizedError` (the adapter did not recognize the attempt's error, so it is not retried).
+`GenerationError` is the base of the five terminal per-item failures: `RetriesExhaustedError` (transient budget spent), `RefusalError` (no structured output: the model refused or a provider filter blocked the turn), `MaxCompletionTokensExceededError` (the structured response hit the token cap), `InvalidRequestError` (the provider or the adapter rejected this request), and `UnrecognizedError` (the adapter did not recognize the attempt's error, so it is not retried).
 Catch `GenerationError` to handle all five at once.
 In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_row` renders successes and failures to the same table.
 The runnable catch, one `try`/`except GenerationError` around a structured `generate_one`, is `catch_generation_error` in `05_rate_limiting_and_errors.py`.

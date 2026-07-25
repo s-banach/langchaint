@@ -6,7 +6,8 @@ to conversations[i]. So the call itself needs no try/except; the work is the loo
 which to_row renders to one table shape whether a slot succeeded or failed.
 
 The five GenerationError subclasses each name what happened: RetriesExhaustedError (the transient
-budget ran out), RefusalError (the model refused on the structured path), MaxCompletionTokensExceededError
+budget ran out), RefusalError (no structured output: the model refused or a provider filter
+blocked the turn), MaxCompletionTokensExceededError
 (the structured answer hit the token cap), InvalidRequestError (the request was rejected, by the
 provider or by the adapter before sending), and UnrecognizedError (the adapter could not name the
 provider's error).

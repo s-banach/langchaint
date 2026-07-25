@@ -12,23 +12,20 @@ Verified against openai 2.45.0:
   response and passes the `response.incomplete` and `response.failed` responses through as it built
   them. A terminal response that is not a `ParsedResponse` therefore parsed nothing, which is what
   the structured path classifies (refusal, token-cap truncation, or transient).
-- `usage.input_tokens` includes `input_tokens_details.cached_tokens` and `input_tokens_details.cache_write_tokens`,
-  so it is the provider-reported all-inclusive input total the Usage partition is checked against.
-  Cache writes bill starting with gpt-5.6, so the PricingTable's cache-write rate applies here too.
-- `prompt_cache_options` controls caching per request;
-  `{"mode": "explicit"}` with no explicit breakpoints disables it.
-  The adapter sends it only when the binding sets automatic_prompt_caching False and the
+- `prompt_cache_options` controls caching per request. Its own and its `mode` field's SDK docstrings
+  state the caching rules this adapter is built on: the parameter is supported on gpt-5.6 and later;
+  `{"mode": "explicit"}` with no explicit breakpoints disables caching;
+  implicit mode writes up to the latest three explicit breakpoints and explicit mode up to the
+  latest four, older marks staying readable for matching; and `ttl` takes "30m" as its only value,
+  so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
+  The adapter sends the parameter only when the binding sets automatic_prompt_caching False and the
   constructor's supports_prompt_cache_options is True; bound True,
   the provider's implicit caching is left in place and nothing is sent.
-  openai documents the parameter as gpt-5.6-and-later (openai 2.45.0), so a model that predates it
-  has no way to turn caching off and gets no caching parameter at all,
-  which keeps automatic_prompt_caching a binding parameter every model accepts.
-  `prompt_cache_options.ttl` takes "30m" as its only value,
-  so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
+  A model that predates the parameter therefore has no way to turn caching off and gets no caching
+  parameter at all, which keeps automatic_prompt_caching a binding parameter every model accepts.
 - A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
-  under either binding value: implicit mode writes up to the latest three explicit breakpoints,
-  explicit mode up to the latest four, and older marks are read-only for matching,
-  so the adapter sends every mark and caps nothing.
+  under either binding value, and the adapter sends every mark and caps nothing,
+  the per-request write limits above being the API's to apply.
   With automatic_prompt_caching False on a model taking `prompt_cache_options`,
   marked parts are what re-enables caching at exactly those boundaries.
 - The API stores responses server-side for later retrieval by default;
@@ -45,6 +42,16 @@ Verified against openai 2.45.0:
   `reasoning.effort` and `reasoning.summary` are assembled key by key so an unset one is omitted
   rather than sent as an explicit null.
 
+Cache writes bill starting with gpt-5.6, so the PricingTable's cache-write rate applies here too.
+That is a price rather than a wire fact, so it comes from the page the subpackage docstring cites,
+not from the SDK.
+
+`usage.input_tokens` includes `input_tokens_details.cached_tokens` and
+`input_tokens_details.cache_write_tokens`, so it is the provider-reported all-inclusive input total
+the Usage partition is checked against. That one is verified by docs rather than by introspection:
+the SDK documents no relationship among the input counters,
+so `_normalized_usage` carries the page that does.
+
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;
   a parts system_prompt travels as a developer-role input message first in every request's input,
@@ -59,7 +66,8 @@ Mapping decisions:
 - ImagePart becomes an `input_image` item with a data: URI and `detail="auto"`.
 - The API reports no finish reason; stop_reason is derived: a `ResponseOutputRefusal` content block means refusal,
   else any `function_call` output item means tool_use, otherwise status "completed" means end_turn,
-  status "incomplete" with reason "max_output_tokens" means max_tokens, and anything else is "other".
+  status "incomplete" means max_tokens or refusal by its reason ("max_output_tokens" or
+  "content_filter", the only two the SDK types), and anything else is "other".
 - A `ResponseOutputRefusal` content part becomes a TextPart, so the refusal the model wrote is the
   turn's text and replays as text. anthropic's ContentBlock union has no refusal member
   (anthropic 0.116.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
@@ -375,7 +383,12 @@ def _has_refusal(response: OpenAIResponse) -> bool:
 
 
 def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
-    """Derive the stop reason; the API reports no finish reason field."""
+    """Derive the stop reason; the API reports no finish reason field.
+
+    Status "incomplete" with reason "content_filter" is a refusal: the provider's filter blocked
+    the turn, so the structured path fails the item under RefusalError's no-retry policy instead
+    of spending the retry budget on the Unparsed arm.
+    """
     if _has_refusal(response):
         return "refusal"
     if any(item.type == "function_call" for item in response.output):
@@ -388,6 +401,11 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
             and response.incomplete_details.reason == "max_output_tokens"
         ):
             return "max_tokens"
+        case "incomplete" if (
+            response.incomplete_details is not None
+            and response.incomplete_details.reason == "content_filter"
+        ):
+            return "refusal"
         case _:
             return "other"
 
@@ -447,22 +465,27 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
 def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
     """Map the raw counters onto langchaint's disjoint partition and price them.
 
-    input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
-    so the uncached counter is the remainder after subtracting them.
+    input_tokens is the all-inclusive input total,
+    so the uncached counter is the remainder after subtracting cached and cache-write tokens.
+    The SDK documents no relationship among the input counters, so the source is the provider's
+    prompt-caching page, whose worked example reports 1920 cached tokens inside a 2006-token
+    prompt total, read 2026-07-25:
+    https://developers.openai.com/api/docs/guides/prompt-caching
     output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
-    The cost is the same price() call the public cost_breakdown makes,
-    so the stored scalar and a reported breakdown cannot disagree.
+    Every priced counter here is read off the same _priceable_counts result the cost is priced from,
+    and cost_in_usd is the same price() call the public cost_breakdown makes,
+    so the counters, the stored scalar, and a reported breakdown cannot disagree.
     """
-    details = usage.input_tokens_details
+    counts = _priceable_counts(usage)
     return Usage(
-        input_tokens_cache_read=details.cached_tokens,
-        input_tokens_cache_write=details.cache_write_tokens,
-        input_tokens_cache_none=(
-            usage.input_tokens - details.cached_tokens - details.cache_write_tokens
+        input_tokens_cache_read=counts.input_tokens_cache_read,
+        input_tokens_cache_write=(
+            counts.input_tokens_cache_write + counts.input_tokens_cache_write_1h
         ),
-        output_tokens=usage.output_tokens,
+        input_tokens_cache_none=counts.input_tokens_cache_none,
+        output_tokens=counts.output_tokens,
         output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
-        cost_in_usd=price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd,
+        cost_in_usd=price(counts=counts, pricing=pricing).total_cost_in_usd,
     )
 
 
@@ -480,8 +503,8 @@ def cost_breakdown(usage_raw: ResponseUsage, pricing: PricingTable) -> CostBreak
 def _priceable_counts(usage: ResponseUsage) -> PriceableCounts:
     """Split the raw counters into pricing categories.
 
-    usage.input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
-    so the uncached count is the remainder after subtracting them.
+    usage.input_tokens includes cached and cache-write tokens, so the uncached count is the
+    remainder after subtracting them; _normalized_usage cites the page that states it.
     OpenAI has no 1-hour write tier: every write lands in the base input_tokens_cache_write slot
     and input_tokens_cache_write_1h is always 0.
     """
@@ -787,8 +810,9 @@ class _BoundOpenAIText(BoundAdapter[str]):
         items hold whatever had been emitted rather than the turn; reporting that as a Response would
         present a fragment as the answer. The Unparsed carries this response's billing, so the
         attempt is paid for and the retry loop sends another.
-        An incomplete status is deliberately not this case: a turn cut off at the token cap is the
-        answer as far as it got, and stop_reason "max_tokens" is how the caller sees that.
+        An incomplete status is deliberately not this case: a turn cut off at the token cap or by a
+        content filter is the answer as far as it got, and stop_reason ("max_tokens" or "refusal")
+        is how the caller sees that.
         The text is the assistant turn's, not response.output_text: output_text concatenates the
         output_text content parts alone, so a refusal turn would come back with an empty output while
         the same Response's assistant_message carried the sentences the model wrote to refuse.
@@ -884,6 +908,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         that the run did not finish, so whatever items it emitted are a fragment, and a refusal part
         among them is no more the turn than a text part is. Testing the refusal first would make one
         response Refused here and Unparsed on the text binding, which reads the same status first.
+        A content-filtered response reaches the refusal arm through the stop reason, so it fails the
+        item once instead of being retried at full price for an outcome that will not change.
         """
         usage = (
             _normalized_usage(response.usage, pricing=self._adapter.pricing)

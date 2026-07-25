@@ -101,7 +101,7 @@ class GenerationError(_CallCarrier, Exception):
 
     The base for the five non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
-    RefusalError (the model refused on the structured path),
+    RefusalError (no structured output: the model refused or a provider filter blocked the turn),
     MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending), and
     UnrecognizedError (the adapter did not recognize the attempt's error).
@@ -195,9 +195,9 @@ class RetriesExhaustedError(GenerationError):
 
 
 class RefusalError(GenerationError):
-    """The model refused to produce structured output.
+    """No structured output: the model refused, or a provider content filter blocked the turn.
 
-    Fires only on the structured path, where the refusal left no instance to return;
+    Fires only on the structured path, where neither leaves an instance to return;
     the text path surfaces a refusal as a Response with stop_reason "refusal".
     Not retried, by policy:
     a refusal can flip under sampling,
@@ -214,7 +214,7 @@ class RefusalError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        return "the model refused to produce structured output"
+        return "no structured output: the model refused or a provider filter blocked the turn"
 
 
 class MaxCompletionTokensExceededError(GenerationError):

@@ -238,7 +238,10 @@ def test_to_row_refusal_reports_its_billing_and_reason() -> None:
     assert row["output"] is None
     assert row["stop_reason"] == "refusal"
     assert row["cost_in_usd"] == 0.5
-    assert row["error_text"] == "the model refused to produce structured output"
+    assert (
+        row["error_text"]
+        == "no structured output: the model refused or a provider filter blocked the turn"
+    )
     assert row["attempts"] == 1
     assert row["input_tokens_total"] == 10
     assert row["output_tokens"] == 7

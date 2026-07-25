@@ -269,14 +269,18 @@ def test_stop_reason_incomplete_for_max_output_tokens_is_max_tokens() -> None:
     assert _normalized_stop_reason(response) == "max_tokens"
 
 
-def test_stop_reason_other_statuses_are_other() -> None:
-    """Content-filter incompleteness and failure both derive other."""
-    content_filtered = _response(
+def test_stop_reason_incomplete_for_content_filter_is_refusal() -> None:
+    """Status incomplete with reason content_filter derives refusal."""
+    response = _response(
         usage=None,
         status="incomplete",
         incomplete_details=IncompleteDetails(reason="content_filter"),
     )
-    assert _normalized_stop_reason(content_filtered) == "other"
+    assert _normalized_stop_reason(response) == "refusal"
+
+
+def test_stop_reason_other_statuses_are_other() -> None:
+    """A failed status derives other."""
     assert _normalized_stop_reason(_response(usage=None, status="failed")) == "other"
 
 
@@ -1112,6 +1116,24 @@ def test_structured_bind_reports_truncated_on_a_max_output_tokens_incomplete() -
         )
     )
     assert isinstance(outcome, Truncated)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_refused_on_a_content_filter_incomplete() -> None:
+    """An incomplete response for content_filter is Refused, so the item fails once.
+
+    The Unparsed arm would send the same blocked request again for the whole retry budget
+    and bill for each attempt.
+    """
+    outcome = _structured_bound()._parsed_output(
+        _parsed_response(
+            None,
+            status="incomplete",
+            incomplete_details=IncompleteDetails(reason="content_filter"),
+            usage=_usage_with_cache(),
+        )
+    )
+    assert isinstance(outcome, Refused)
     assert outcome.usage.cost_in_usd > 0.0
 
 

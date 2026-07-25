@@ -44,8 +44,9 @@ class AttemptRecord:
     (a refusal or a truncation, which are not transient), and on a request the provider rejected;
     it holds the TransientError otherwise.
     usage is the attempt's billing (with cost_in_usd inside): the reported counts when the attempt reached a
-    billable 200 (a success, or a rejected 200), ZERO_USAGE for a transport failure or a rejected request,
-    neither of which billed anything.
+    billable 200 (a success, or a rejected 200), ZERO_USAGE for a transport failure or a rejected request.
+    A stream that dropped after delivering items was paid for what it delivered,
+    and no client-side channel reports the amount.
     usage_raw is the raw SDK usage object usage was normalized from.
     It is None when no usage came back: a transport failure, a rejected request, or an openai 200 reporting no usage.
     """

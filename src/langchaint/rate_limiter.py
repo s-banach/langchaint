@@ -159,10 +159,17 @@ class RateLimiter:
         so the reopening is ordered before the release that would otherwise admit the next probe.
         _paused_until is deliberately not reset here: the probe's own pause has already elapsed by the time it succeeds,
         and a fresh pause another task set while the probe ran must survive.
+
+        The probe identity is cleared with the recovery it served, rather than left for release to clear.
+        An admission can outlive the request that proved recovery by a long way: a stream registers its success at
+        the open and holds the same admission until it closes. Leaving the identity set means the next rate-limit
+        error finds a probe already in flight, so the probe gate closes on an admission nobody will release until
+        that stream ends, and every waiter on the limiter blocks with slots free.
         """
         if not (self._recovering and admission is self._probe_admission):
             return
         self._recovering = False
+        self._probe_admission = None
         self._wake_recovery_waiters()
 
     def register_transient_error(self, errors_from_attempts: Sequence[TransientError]) -> float:

@@ -274,6 +274,20 @@ class _HangingStream(_FakeStream):
         yield "unreachable"
 
 
+class _FailingCloseStream(_FakeStream):
+    """A stream whose close() raises, standing in for a provider teardown that fails."""
+
+    @override
+    async def close(self) -> None:
+        """Record the attempt, then raise.
+
+        Raises:
+            OSError: always.
+        """
+        self.closed = True
+        raise OSError("connection reset while closing")
+
+
 type _ScriptedSend = Exception | Refused | Truncated | Unparsed | NotSendable
 """One scripted send outcome: an exception the fake raises, or an arm it returns.
 
@@ -1337,6 +1351,69 @@ def test_stream_cancelled_inside_the_block_appends_one_abandoned_call() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
+def test_a_close_that_raises_still_returns_the_in_flight_slot() -> None:
+    """A failed teardown does not cost the shared budget a slot, and does not reach the caller.
+
+    An admission the close skips is gone for the process's life, so the limiter's capacity shrinks
+    by one on every such stream.
+    """
+
+    async def scenario() -> None:
+        """Leave the block early over a stream whose close raises, then check both slots are free."""
+        rate_limiter = _fast_rate_limiter(max_in_flight=2)
+        bound_llm = LLM(
+            _FakeAdapter(stream=_FailingCloseStream()), rate_limiter=rate_limiter
+        ).bind(automatic_prompt_caching=True)
+        # Leaving after one item keeps the admission held into __aexit__, so the close is the only
+        # path that can return it; exhausting the iterator releases it before the close is reached.
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            async for _item in handle:
+                break
+        admissions = [await rate_limiter.acquire() for _ in range(2)]
+        for admission in admissions:
+            rate_limiter.release(admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_an_abandoned_call_log_that_raises_does_not_replace_the_cancellation() -> None:
+    """A log whose append raises leaves the CancelledError to propagate as the task's outcome.
+
+    A task ending on any other exception is not cancelled, so asyncio.timeout would report the
+    log's error in place of TimeoutError and a TaskGroup's shutdown would see the substitution.
+    """
+
+    class _RaisingLog:
+        """An abandoned_call_log whose append fails, standing in for a defective application log."""
+
+        def append(self, _abandoned_call: AbandonedCall, /) -> None:
+            """Raise instead of recording.
+
+            Raises:
+                RuntimeError: always.
+            """
+            raise RuntimeError("the application's log is broken")
+
+    async def scenario() -> None:
+        """Time out a consumer suspended on a hanging stream whose abandonment cannot be recorded."""
+        bound_llm = LLM(
+            _FakeAdapter(stream=_HangingStream()), rate_limiter=_fast_rate_limiter()
+        ).bind(automatic_prompt_caching=True)
+
+        async def drain() -> None:
+            """Enter and iterate into the hang; the wait_for below cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=_RaisingLog()
+            ) as handle:
+                async for _item in handle:
+                    pass
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(drain(), timeout=0.05)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_stream_cancelled_during_the_open_appends_one_abandoned_call() -> None:
     """A cancellation landing in __aenter__ still records the abandonment.
 
@@ -1456,11 +1533,162 @@ def test_stream_cancelled_after_a_protocol_error_appends_the_abandoned_call() ->
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
+_MID_STREAM_RETRY_AFTER_SECONDS = 30.0
+"""The server-stated wait _StatesRetryAfterAdapter reports, under the limiter's 60-second cap so it passes through."""
+
+
+class _StatesRetryAfterAdapter(_FakeAdapter):
+    """A _FakeAdapter reporting a fixed server-stated wait on every failure it is asked about."""
+
+    @override
+    def retry_after_seconds(self, error: Exception) -> float | None:
+        """Report the fixed wait, whatever the failure."""
+        return _MID_STREAM_RETRY_AFTER_SECONDS
+
+
+def test_a_mid_stream_rate_limit_pauses_the_account() -> None:
+    """A rate limit that lands after the first item still pauses admission and reaches the caller.
+
+    This stream is past reopening, so nothing here retries; the pause protects every other caller
+    sharing the limiter, and dropping it because this one stream is finished would leave them all
+    sending into the limit. The raised TransientError carries the same verdict and the same
+    server-stated wait, so an application reading it sees the rate limit rather than an
+    unclassified failure.
+    """
+
+    async def scenario() -> None:
+        """Let the iteration fail after one item, then read the limiter's state and the error."""
+        rate_limiter = _fast_rate_limiter()
+        bound_llm = LLM(
+            _StatesRetryAfterAdapter(
+                stream=_FailsAfterFirstItemStream(), classify_result="rate_limit"
+            ),
+            rate_limiter=rate_limiter,
+        ).bind(automatic_prompt_caching=True)
+        before_monotonic_seconds = time.monotonic()
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(TransientError) as raised:
+                async for _item in handle:
+                    pass
+        assert raised.value.is_rate_limit
+        assert raised.value.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
+        assert rate_limiter._recovering
+        # A server-stated wait is followed un-jittered, so the pause is that wait from the failure.
+        assert (
+            rate_limiter._paused_until
+            >= before_monotonic_seconds + _MID_STREAM_RETRY_AFTER_SECONDS
+        )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+class _RaisesItsOwnTransientErrorStream(_FakeStream):
+    """A stream that yields one item and then raises a TransientError it classified itself.
+
+    Mirrors an adapter that reads the provider's rate-limit verdict and its retry-after header and
+    states both, rather than leaving the handle to ask the adapter about a bare exception.
+    """
+
+    def __init__(self) -> None:
+        """Hold the error to be raised, so a test can compare it by identity."""
+        super().__init__()
+        self.error = TransientError(
+            "rate limited mid-stream",
+            is_rate_limit=True,
+            retry_after_seconds=_MID_STREAM_RETRY_AFTER_SECONDS,
+        )
+
+    @override
+    async def items(self) -> AsyncIterator[StreamItem]:
+        """Yield one chunk, then raise the held TransientError.
+
+        Yields:
+            One text chunk, before the raise.
+
+        Raises:
+            TransientError: after the first yield, stating its own verdict and wait.
+        """
+        yield "a"
+        raise self.error
+
+
+def test_an_adapter_stated_mid_stream_transient_error_reaches_the_caller_unwrapped() -> None:
+    """An adapter that states the verdict itself keeps it, and does not become its own cause.
+
+    Wrapping it again would replace the adapter's own message, and raising the wrapper `from` the
+    same object would make the error its own __cause__.
+    """
+
+    async def scenario() -> None:
+        """Let the iteration fail after one item and read the error the caller catches."""
+        stream = _RaisesItsOwnTransientErrorStream()
+        bound_llm = LLM(
+            _FakeAdapter(stream=stream, classify_result="transient"),
+            rate_limiter=_fast_rate_limiter(),
+        ).bind(automatic_prompt_caching=True)
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(TransientError) as raised:
+                async for _item in handle:
+                    pass
+        assert raised.value is stream.error
+        assert raised.value.__cause__ is not raised.value
+        assert raised.value.is_rate_limit
+        assert raised.value.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+class _CloseRaisesBaseExceptionStream(_FakeStream):
+    """A stream whose close() raises a BaseException, which _close_adapter_stream does not catch."""
+
+    @override
+    async def close(self) -> None:
+        """Mark the stream closed, then raise past every Exception handler.
+
+        Raises:
+            KeyboardInterrupt: always, after recording that close ran.
+        """
+        self.closed = True
+        raise KeyboardInterrupt("interrupted during teardown")
+
+
+def test_a_close_raising_a_base_exception_still_appends_the_abandoned_call() -> None:
+    """The record survives a teardown that raises past every Exception handler.
+
+    __aexit__ closes before it appends, so that the record reports a returned slot and a closed
+    connection. Without the append in a finally, the one exception the close does not swallow
+    would take the cancelled stream's only account with it.
+    """
+
+    async def scenario() -> None:
+        """Cancel the block, then let the close raise on the way out."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(
+            _FakeAdapter(stream=_CloseRaisesBaseExceptionStream(), classify_result="transient"),
+            rate_limiter=_fast_rate_limiter(),
+        ).bind(automatic_prompt_caching=True)
+
+        async def consume() -> None:
+            """Hang inside the block; the wait_for cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ):
+                await asyncio.sleep(60)
+
+        with pytest.raises(KeyboardInterrupt):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.model == "fake-model"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call() -> None:
-    """A failure after the first item accounts for nothing, so a cancellation after one logs the call.
+    """A failure after the first item is no conclusion, so a cancellation after one logs the call.
 
     The TransientError names no model and carries no billing, so the record is the only account
-    of the stream that was opened.
+    of the stream that was opened. Its one settled attempt is the mid-stream failure, which bills
+    nothing, so usage_settled reads zero while the stream was paid for the item it delivered.
     """
 
     async def scenario() -> None:
@@ -1485,6 +1713,9 @@ def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call(
             await asyncio.wait_for(consume(), timeout=0.05)
         (abandoned_call,) = abandoned_call_log
         assert abandoned_call.model == "fake-model"
+        (record,) = abandoned_call.attempt_records
+        assert isinstance(record.error, TransientError)
+        assert abandoned_call.usage_settled == ZERO_USAGE
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

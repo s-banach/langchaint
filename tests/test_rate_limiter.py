@@ -172,6 +172,29 @@ def test_recovery_admits_one_probe_and_a_success_reopens_admission() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
+def test_a_success_frees_the_probe_role_before_the_probe_releases_its_slot() -> None:
+    """A later rate-limit error admits a new probe while the successful one still holds its slot.
+
+    A stream registers its success when the connection opens and keeps the same admission until it
+    closes, so the identity that proved recovery outlives that recovery by the stream's whole life.
+    Left set, it makes the next error's probe gate close on an admission nobody will release, and
+    every waiter blocks with slots free.
+    """
+
+    async def scenario() -> None:
+        """Recover once without releasing, then take a second rate-limit error."""
+        rate_limiter = RateLimiter(backoff_base_seconds=0.01)
+        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.01)])
+        long_lived_admission = await rate_limiter.acquire()
+        rate_limiter.register_success(long_lived_admission)
+        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.01)])
+        next_probe = await rate_limiter.acquire()
+        rate_limiter.release(next_probe)
+        rate_limiter.release(long_lived_admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_probe_released_without_success_admits_the_next_probe() -> None:
     """A probe that ends without a registered success hands the probe role to the next waiter."""
 

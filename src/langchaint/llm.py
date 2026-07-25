@@ -42,7 +42,7 @@ from langchaint.exceptions import (
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import Message, TextPart, UserMessage
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import AbandonedCall, AbandonedCallLog, Response
+from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
 from langchaint.usage import ZERO_USAGE
@@ -533,8 +533,7 @@ class BoundLLM[OutputT]:
         try:
             return await self._generate_with_retries(_as_conversation(conversation), ledger=ledger)
         except asyncio.CancelledError:
-            if abandoned_call_log is not None:
-                abandoned_call_log.append(AbandonedCall(call=ledger.freeze()))
+            _append_abandoned_call(abandoned_call_log, ledger.freeze())
             raise
 
     async def _generate_or_failure(

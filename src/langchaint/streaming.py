@@ -9,11 +9,14 @@ the handle owns retry, pacing, and accounting.
 Connection failures before the first yielded item are retried under the RateLimiter;
 after the first yielded item nothing is retried,
 because replaying items the caller already consumed would duplicate output.
+A transient failure the item iterator raises is recorded and fed back to the RateLimiter on both
+paths, so a rate limit paces the account whether or not the stream that hit it could still reopen.
 An open stream holds one RateLimiter in-flight slot from opening until the stream closes or exhausts,
 so long-lived streams count against max_in_flight for their whole life.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
@@ -45,10 +48,12 @@ from langchaint.exceptions import (
 )
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, RateLimiter
-from langchaint.response import AbandonedCall, AbandonedCallLog, Response
+from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
 from langchaint.usage import ZERO_USAGE
 
 type _State = Literal["unopened", "open", "finished"]
+
+_logger = logging.getLogger("langchaint.streaming")
 
 _UNOPENED_MESSAGE = "stream not open: enter the handle with `async with` before using it"
 _FINISHED_MESSAGE = "stream is finished: call stream_one again for a new one"
@@ -108,15 +113,14 @@ class StreamHandle[OutputT]:
             await self._open_stream_with_retries()
         except BaseException as exc:
             # __aexit__ does not run when __aenter__ raises, so finish and release here.
-            # _open_stream_with_retries returns the slot on every Exception path but not on a
-            # CancelledError, which is a BaseException: cancelling a suspended open would otherwise
-            # strand this admission for the process's life, and a stranded probe freezes the whole
-            # limiter's recovery, not just one slot. The abandonment is recorded here for the same
-            # reason: no other frame sees a cancellation that lands during the open.
+            # _open_stream_with_retries returns the slot on every path that raises, so this release
+            # covers only the case where it never acquired one; it is idempotent either way.
+            # The abandonment is recorded here because no other frame sees a cancellation that lands
+            # during the open.
             self._state = "finished"
+            self._release_slot()
             if isinstance(exc, asyncio.CancelledError):
                 self._append_abandoned_call()
-            self._release_slot()
             raise
         return self
 
@@ -134,11 +138,19 @@ class StreamHandle[OutputT]:
         A consumer that leaves the block early without an exception chose to walk away in live
         code, so only the cancellation, which destroys the frames that could have observed the
         stream, gets a record.
+
+        Raises:
+            BaseException: the adapter stream's close raised something that is not an Exception;
+                it propagates in place of whatever was unwinding the block.
         """
         self._state = "finished"
-        if isinstance(exc, asyncio.CancelledError):
-            self._append_abandoned_call()
-        await self._close_adapter_stream()
+        try:
+            await self._close_adapter_stream()
+        finally:
+            # The append runs after the close whatever the close does, so the record is written
+            # even when a BaseException comes out of it, which _close_adapter_stream does not catch.
+            if isinstance(exc, asyncio.CancelledError):
+                self._append_abandoned_call()
 
     def _append_abandoned_call(self) -> None:
         """Record the abandonment, unless no log was given or the conclusion accounted for the call.
@@ -151,13 +163,13 @@ class StreamHandle[OutputT]:
         A StreamProtocolError and a failure after the first item hand over neither, so a
         cancellation following one still gets a record: it is the only account of the stream that
         was opened.
-        The settled attempt records are only pre-first-item open failures (nothing is retried after
-        the first yielded item), so usage_settled is usually zero here and the record's value is
-        the count; the streaming request itself is the unobservable in-flight attempt.
+        Every settled record here is a failed attempt, whether an open that failed before the first
+        item or a failure after one, so usage_settled holds only what those failures carried and
+        what the stream billed for the items it already delivered is unobservable client-side.
         """
-        if self._abandoned_call_log is None or self._conclusion_carried_the_call:
+        if self._conclusion_carried_the_call:
             return
-        self._abandoned_call_log.append(AbandonedCall(call=self._ledger.freeze()))
+        _append_abandoned_call(self._abandoned_call_log, self._ledger.freeze())
 
     def _release_slot(self) -> None:
         if self._admission is not None:
@@ -165,31 +177,62 @@ class StreamHandle[OutputT]:
             self._admission = None
 
     async def _close_adapter_stream(self) -> None:
-        if self._adapter_stream is not None:
-            await self._adapter_stream.close()
-            self._adapter_stream = None
-            self._items = None
-        self._release_slot()
+        """Close the provider connection and return the in-flight slot, whatever the close does.
 
-    def _record_transient_error(self, exc: Exception) -> float:
-        """Record one pre-first-item transient failure and register it with the RateLimiter.
+        A close failure is logged rather than raised, because the request it belonged to has already
+        ended and the exception would only displace the Response or the error the caller came for.
+        The release sits in a finally rather than after the handler, so a BaseException out of the
+        close returns the slot too. Either way, an admission this method skips is gone from the
+        shared budget for the process's life.
+        The stream is dropped before the close is awaited, so a teardown that fails is attempted
+        once: __aexit__, which closes again after the paths that close mid-stream, finds nothing to
+        close.
+        """
+        adapter_stream = self._adapter_stream
+        self._adapter_stream = None
+        self._items = None
+        try:
+            if adapter_stream is not None:
+                await adapter_stream.close()
+        except Exception:
+            _logger.warning(
+                "closing the provider stream raised; the in-flight slot was returned",
+                exc_info=True,
+            )
+        finally:
+            self._release_slot()
+
+    def _transient_error(self, exc: Exception, message: str) -> TransientError:
+        """Wrap one attempt error as the TransientError that carries its retry directive.
+
+        An exception that already is a TransientError is its own wrapper, so an adapter that stated
+        retry_after_seconds and is_rate_limit itself keeps them; message is then unused, because
+        replacing the adapter's own text would lose what it said.
+        """
+        if isinstance(exc, TransientError):
+            return exc
+        wrapped = TransientError(
+            message,
+            retry_after_seconds=self._adapter.retry_after_seconds(exc),
+            is_rate_limit=self._adapter.classify(exc) == "rate_limit",
+        )
+        wrapped.__cause__ = exc
+        return wrapped
+
+    def _record_transient_error(self, wrapped: TransientError) -> float:
+        """Record one transient failure as an attempt and register it with the RateLimiter.
 
         Call while the failing attempt's admission is still held,
         so a rate-limit pause is in place before the release admits anyone else.
+        Every transient failure goes through here, whether or not the stream had already yielded
+        items: the pause a rate limit sets protects the whole account, so losing it because this one
+        stream is past reopening would leave every other caller sending into the limit.
 
         Returns:
             The backoff delay to sleep before the next open attempt, in seconds;
             register_transient_error draws it once so it equals any account-wide pause it set.
+            A caller that will not reopen ignores it.
         """
-        if isinstance(exc, TransientError):
-            wrapped = exc
-        else:
-            wrapped = TransientError(
-                str(exc),
-                retry_after_seconds=self._adapter.retry_after_seconds(exc),
-                is_rate_limit=self._adapter.classify(exc) == "rate_limit",
-            )
-            wrapped.__cause__ = exc
         self._ledger.record(error=wrapped, usage=wrapped.usage, usage_raw=wrapped.usage_raw)
         return self._rate_limiter.register_transient_error(
             _extract_transient_errors(self._ledger.attempt_records)
@@ -252,6 +295,7 @@ class StreamHandle[OutputT]:
         ending any recovery this handle's probe was serving,
         so a stream slow to first token cannot stall the shared account's admission.
         The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
+        Every failing path out of an attempt returns the admission, cancellation included.
 
         Raises:
             InvalidRequestError: the adapter reported the conversation as NotSendable, or the open
@@ -269,10 +313,16 @@ class StreamHandle[OutputT]:
                 if non_retriable is not None:
                     self._release_slot()
                     raise non_retriable from exc
-                delay_seconds = self._record_transient_error(exc)
+                delay_seconds = self._record_transient_error(self._transient_error(exc, str(exc)))
                 self._release_slot()
                 await self._backoff_or_exhaust(exc, delay_seconds)
                 continue
+            except BaseException:
+                # CancelledError is a BaseException the clause above does not catch. Releasing here
+                # returns the admission at the same point on every failing path, so no caller's
+                # unwind is what the shared budget depends on.
+                self._release_slot()
+                raise
             if isinstance(opened, NotSendable):
                 self._release_slot()
                 raise self._invalid_request_error(opened.reason, None)
@@ -288,7 +338,8 @@ class StreamHandle[OutputT]:
         and every such error but a cancellation is the call's conclusion, which final() replays.
 
         Raises:
-            TransientError: the stream failed after items were yielded.
+            TransientError: the stream failed after items were yielded; it carries the adapter's
+                verdict on that failure, so a rate limit reaches the caller as one.
             InvalidRequestError: the adapter reported a reopened conversation as NotSendable, or
                 classified an item or reopen error as a rejection of the request.
             UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
@@ -337,9 +388,17 @@ class StreamHandle[OutputT]:
                     await self._close_adapter_stream()
                     raise non_retriable from exc
                 if self._yielded_any:
+                    wrapped = self._transient_error(
+                        exc, f"stream failed after items were yielded: {exc}"
+                    )
+                    self._record_transient_error(wrapped)
                     await self._close_adapter_stream()
-                    raise TransientError(f"stream failed after items were yielded: {exc}") from exc
-                delay_seconds = self._record_transient_error(exc)
+                    if wrapped is exc:
+                        # The adapter raised the TransientError itself; `from exc` would make it its
+                        # own cause.
+                        raise
+                    raise wrapped from exc
+                delay_seconds = self._record_transient_error(self._transient_error(exc, str(exc)))
                 await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, delay_seconds)
                 await self._open_stream_with_retries()
@@ -347,8 +406,7 @@ class StreamHandle[OutputT]:
             except BaseException:
                 # CancelledError is a BaseException the clauses above do not catch.
                 # Cancelling an item pull in its own task leaves the block open, so waiting for __aexit__
-                # would strand this slot, and because a stranded probe leaves _probe_admission set it freezes
-                # the whole limiter's recovery, not just one slot. Return the slot, then let it propagate.
+                # would strand this slot. Return it, then let the cancellation propagate.
                 self._release_slot()
                 raise
             self._yielded_any = True

@@ -12,6 +12,7 @@ to_row flattens a Response or a GenerationError to one dict of scalars with the 
 so a mixed list of successes and failures converts directly to a table.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -24,6 +25,8 @@ from langchaint.usage import ZERO_USAGE, Usage
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_row emits."""
+
+_logger = logging.getLogger("langchaint.response")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -128,7 +131,8 @@ class AbandonedCall(_CallCarrier):
         total, and this value structurally lacks the in-flight attempt's share.
         Naming it usage for uniformity is rejected.
         Cancellation correlates with long requests, so the omitted attempt skews expensive.
-        On the stream path the settled records are only the opens that failed before the first item.
+        On the stream path every settled record is a failed attempt, a stream that dropped after
+        delivering items included.
         The value would then read near zero while the true spend is the whole stream.
         Uniformity would turn a loud AttributeError into a silent undercount.
         """
@@ -146,6 +150,27 @@ class AbandonedCallLog(Protocol):
 
     def append(self, abandoned_call: AbandonedCall, /) -> None:
         """Receive one record; called before the CancelledError re-raises."""
+
+
+def _append_abandoned_call(abandoned_call_log: AbandonedCallLog | None, call: CallRecord) -> None:
+    """Append one AbandonedCall when a log was given, without letting the append escape.
+
+    Every caller runs this while a cancellation unwinds, after it has returned the in-flight slot
+    and, on the stream path, closed the connection.
+    A log whose append raises is a defect in application code, but raising it here would replace the
+    CancelledError, and a task that ends on any other exception is not cancelled: asyncio.timeout
+    then reports that exception in place of TimeoutError, and a TaskGroup's shutdown sees a
+    substituted error. Delivering the cancellation is worth more than recording the abandonment, so
+    a failed append is logged and the CancelledError continues to propagate.
+    """
+    if abandoned_call_log is None:
+        return
+    try:
+        abandoned_call_log.append(AbandonedCall(call=call))
+    except Exception:
+        _logger.warning(
+            "abandoned_call_log.append raised; this call's record was lost", exc_info=True
+        )
 
 
 def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, RowValue]:

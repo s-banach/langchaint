@@ -1031,12 +1031,15 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
 
 
 def _status_error[ErrorT: openai.APIStatusError](
-    error_class: type[ErrorT], status_code: int
+    error_class: type[ErrorT],
+    status_code: int,
+    headers: dict[str, str] | None = None,
 ) -> ErrorT:
     """Build one of the SDK's status exceptions around a constructed httpx response."""
     response = httpx.Response(
         status_code,
         request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        headers=headers,
     )
     return error_class("boom", response=response, body=None)
 
@@ -1055,23 +1058,38 @@ def _connection_error() -> openai.APIConnectionError:
         (_status_error(openai.InternalServerError, 500), "transient"),
         (_connection_error(), "transient"),
         (openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")), "transient"),
-        (_status_error(openai.BadRequestError, 400), "fatal"),
-        (_status_error(openai.AuthenticationError, 401), "fatal"),
-        (_status_error(openai.PermissionDeniedError, 403), "fatal"),
-        (_status_error(openai.NotFoundError, 404), "fatal"),
-        (_status_error(openai.UnprocessableEntityError, 422), "fatal"),
-        (_status_error(openai.ConflictError, 409), "unrecognized"),
+        (_status_error(openai.ConflictError, 409), "transient"),
+        (_status_error(openai.BadRequestError, 400), "invalid_request"),
+        (_status_error(openai.AuthenticationError, 401), "invalid_request"),
+        (_status_error(openai.PermissionDeniedError, 403), "invalid_request"),
+        (_status_error(openai.NotFoundError, 404), "invalid_request"),
+        (_status_error(openai.UnprocessableEntityError, 422), "invalid_request"),
+        (_status_error(openai.APIStatusError, 413), "invalid_request"),
+        (_status_error(openai.APIStatusError, 408), "transient"),
+        (_status_error(openai.InternalServerError, 503), "transient"),
+        (_status_error(openai.APIStatusError, 302), "unrecognized"),
+        (_status_error(openai.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
+        (
+            _status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}),
+            "unrecognized",
+        ),
+        (_status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
+        (_status_error(openai.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
         (ValueError("boom"), "unrecognized"),
     ],
 )
 def test_classify_maps_each_sdk_exception_to_its_classification(
     error: Exception, expected: ErrorClassification
 ) -> None:
-    """Each SDK exception lands on the classification the adapter's classify docstring names.
+    """Each error lands on the classification the adapter's classify docstring names.
 
-    Each status code is the one the SDK raises that class for, read from openai 2.45.0.
+    Each status code is the one the SDK raises that class for, read from openai 2.45.0;
+    the bare APIStatusError rows are the statuses the SDK maps to no class of its own, 413 among
+    them, which is why the adapter reads the status rather than the exception class.
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
-    ConflictError and the non-SDK ValueError land on the unrecognized default,
+    x-should-retry overrides the status in both directions, except on a rate-limit status, which
+    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed.
+    A 3xx and the non-SDK ValueError land on the unrecognized default,
     which fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected

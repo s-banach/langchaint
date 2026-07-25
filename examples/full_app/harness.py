@@ -107,8 +107,8 @@ class ScriptedAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify every error as fatal so nothing silently retries in the example."""
-        return "fatal"
+        """Classify every error as unrecognized so nothing silently retries in the example."""
+        return "unrecognized"
 
 
 def _tag_of(binding: Binding) -> str:

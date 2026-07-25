@@ -114,6 +114,7 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
+    classification_from_response,
     retry_after_seconds_from_headers,
 )
 from langchaint.exceptions import (
@@ -139,6 +140,9 @@ from langchaint.messages import (
 from langchaint.pricing import CostBreakdown, PriceableCounts, price
 from langchaint.tools import ToolSchema
 from langchaint.usage import ZERO_USAGE, Usage
+
+_RATE_LIMIT_STATUSES = frozenset({429})
+"""The statuses saying the account or the service refuses further requests right now."""
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
@@ -648,32 +652,29 @@ class OpenAIResponsesAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to rate_limit, transient, fatal, or unrecognized.
+        """Map the SDK exception to rate_limit, transient, invalid_request, or unrecognized.
 
-        RateLimitError (429) means further requests from this account fail the same way right now,
-        so admission should pause account-wide.
-        InternalServerError is every 5xx status (verified against openai 2.45.0),
-        so server-side trouble is retried.
-        The fatal classes are the request-is-wrong statuses (400, 401, 403, 404, 422),
-        where every sibling sharing the configuration fails the same way.
-        Everything else is unrecognized: that item fails without a retry and the siblings continue.
+        A response's status decides, not the SDK exception class: _make_status_error returns a
+        specific subclass only for the statuses it lists and the bare APIStatusError for every
+        other one (verified against openai 2.45.0), so a class list would silently drop 413, which
+        openai maps to no class, and whatever status the provider adds next.
+        classification_from_response holds the shared rule; 429 is the only rate-limit status here,
+        openai having no counterpart to anthropic's 529.
+        503 is not added to match it: the SDK draws no line between it and any other 5xx,
+        and transient already retries it.
+
+        APIConnectionError, which APITimeoutError subclasses, carries no response and is transient.
+        Anything else the SDK raises is unrecognized, which fails this item without a retry.
         """
-        if isinstance(error, openai.RateLimitError):
-            return "rate_limit"
-        if isinstance(error, (openai.InternalServerError, openai.APIConnectionError)):
+        if isinstance(error, openai.APIConnectionError):
             return "transient"
-        if isinstance(
-            error,
-            (
-                openai.BadRequestError,
-                openai.AuthenticationError,
-                openai.PermissionDeniedError,
-                openai.NotFoundError,
-                openai.UnprocessableEntityError,
-            ),
-        ):
-            return "fatal"
-        return "unrecognized"
+        if not isinstance(error, openai.APIStatusError):
+            return "unrecognized"
+        return classification_from_response(
+            status_code=error.response.status_code,
+            headers=error.response.headers,
+            rate_limit_statuses=_RATE_LIMIT_STATUSES,
+        )
 
     @override
     def retry_after_seconds(self, error: Exception) -> float | None:

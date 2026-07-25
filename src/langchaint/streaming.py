@@ -22,8 +22,8 @@ from typing import Literal
 from langchaint.adapter import Adapter, AdapterStream, BoundAdapter, StreamItem
 from langchaint.exceptions import (
     AttemptRecord,
-    FatalError,
     GenerationError,
+    InvalidRequestError,
     RetriesExhaustedError,
     StreamProtocolError,
     TransientError,
@@ -80,9 +80,9 @@ class StreamHandle[OutputT]:
         """Open the request and return self.
 
         Raises:
-            FatalError: the adapter classified the open failure as fatal.
-            GenerationError: the adapter raised one of its leaves while opening,
-                or the open failure was classified unrecognized (an UnrecognizedError).
+            GenerationError: the adapter raised one of its leaves while opening, or the open failure
+                was classified as a rejection of the request (an InvalidRequestError) or as
+                unrecognized (an UnrecognizedError).
             RetriesExhaustedError: the opens spent the retry budget.
             RuntimeError: this handle was already entered; build a new one with stream_one.
         """
@@ -210,23 +210,19 @@ class StreamHandle[OutputT]:
             ) from exc
         await asyncio.sleep(delay_seconds)
 
-    def _non_retriable_or_none(self, exc: Exception) -> FatalError | GenerationError | None:
+    def _non_retriable_or_none(self, exc: Exception) -> GenerationError | None:
         """Map one attempt error to the non-retriable error to propagate, or None when transient."""
         if isinstance(exc, TransientError):
             return None
-        if isinstance(exc, FatalError):
-            exc.attempt_records = tuple(self._attempt_records)
-            return exc
+        if isinstance(exc, InvalidRequestError):
+            # Ahead of the GenerationError arm below, which returns its error unchanged: a
+            # before_send partial has none of the row-shape fields set, so it is rebuilt here.
+            return self._invalid_request_error(exc.reason, exc)
         if isinstance(exc, GenerationError):
             return exc
         classification = self._adapter.classify(exc)
-        if classification == "fatal":
-            fatal_error = FatalError(
-                f"fatal provider error: {exc}",
-                attempt_records=tuple(self._attempt_records),
-            )
-            fatal_error.__cause__ = exc
-            return fatal_error
+        if classification == "invalid_request":
+            return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
         if classification == "unrecognized":
             assert self._started_at_monotonic_seconds is not None
             unrecognized = UnrecognizedError(
@@ -239,6 +235,19 @@ class StreamHandle[OutputT]:
             unrecognized.__cause__ = exc
             return unrecognized
         return None
+
+    def _invalid_request_error(self, reason: str, cause: Exception) -> InvalidRequestError:
+        """Build the row-shaped rejection leaf for this handle, chained to cause."""
+        assert self._started_at_monotonic_seconds is not None
+        invalid_request = InvalidRequestError(
+            reason=reason,
+            attempt_records=tuple(self._attempt_records),
+            model=self._adapter.model,
+            provider_name=self._adapter.provider_name,
+            elapsed_seconds=time.monotonic() - self._started_at_monotonic_seconds,
+        )
+        invalid_request.__cause__ = cause
+        return invalid_request
 
     def __aiter__(self) -> "StreamHandle[OutputT]":
         """Return self; the handle is its own iterator."""
@@ -255,9 +264,9 @@ class StreamHandle[OutputT]:
         The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
 
         Raises:
-            FatalError: the adapter classified the failure as fatal.
-            GenerationError: the adapter raised one of its leaves directly,
-                or the failure was classified unrecognized (an UnrecognizedError).
+            GenerationError: the adapter raised one of its leaves directly, or the failure was
+                classified as a rejection of the request (an InvalidRequestError) or as unrecognized
+                (an UnrecognizedError).
             RetriesExhaustedError: the attempts spent the retry budget.
         """
         while self._adapter_stream is None:
@@ -287,7 +296,8 @@ class StreamHandle[OutputT]:
 
         Raises:
             TransientError: the stream failed after items were yielded.
-            FatalError: the adapter classified an item or reopen error as fatal.
+            InvalidRequestError: the adapter refused to reopen the request, or classified an item or
+                reopen error as a rejection of it.
             UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
@@ -357,7 +367,8 @@ class StreamHandle[OutputT]:
 
         Raises:
             StreamProtocolError: the provider's event stream ended without a terminal event.
-            FatalError: draining the stream hit an item or reopen error the adapter classified as fatal.
+            InvalidRequestError: draining the stream hit an item or reopen error the adapter
+                classified as a rejection of the request, or a reopen the adapter refused to send.
             UnrecognizedError: draining the stream hit an item or reopen error the adapter classified as unrecognized.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
             RefusalError: the structured parse found a refusal; enriched with this handle's attempt records.

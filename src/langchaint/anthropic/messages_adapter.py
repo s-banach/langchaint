@@ -25,7 +25,7 @@ it is unavailable on Bedrock, which this adapter also serves.
 A part with cache_breakpoint True adds a marker under either binding: on the part's own text or image block
 in a user message, and on the enclosing tool_result block for the last part of a ToolMessage
 (the API documents cache_control on the tool_result block itself; a marked part that is not
-the message's last would silently move the boundary to the block's end, so it aborts instead).
+the message's last would silently move the boundary to the block's end, so it is rejected instead).
 A system_prompt bound as parts renders one system block per part, marked parts carrying cache_control,
 so a breakpoint can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
 The API allows at most 4 cache_control markers per request.
@@ -96,10 +96,11 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
+    classification_from_response,
     retry_after_seconds_from_headers,
 )
 from langchaint.exceptions import (
-    FatalError,
+    InvalidRequestError,
     MaxCompletionTokensExceededError,
     RefusalError,
     StreamProtocolError,
@@ -139,6 +140,12 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
     "image/webp",
 )
 
+
+_RATE_LIMIT_STATUSES = frozenset({429, 529})
+"""The statuses saying the account or the service refuses further requests right now.
+
+529 is the SDK's overloaded status (anthropic 0.116.0), which pauses admission like a 429.
+"""
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
@@ -185,13 +192,13 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
     """Convert one content Part to its wire block.
 
     Raises:
-        FatalError: an ImagePart's media_type is outside the API's accepted set;
-            the same request would be rejected again.
+        InvalidRequestError: an ImagePart's media_type is outside the API's accepted set,
+            so the API would reject this request; the item fails its own row.
     """
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
     if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
-        raise FatalError(
+        raise InvalidRequestError.before_send(
             f"the Anthropic API accepts image media types "
             f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
         )
@@ -206,7 +213,7 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
 def _user_content_blocks(
     user_message: UserMessage,
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
-    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's FatalError.
+    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's InvalidRequestError.
 
     The second element holds the blocks whose part sets cache_breakpoint, in content order;
     the caller applies the request-wide marker budget, so no marker is written here.
@@ -230,7 +237,7 @@ def _tool_result_content(
     """Convert one ToolMessage's content to the tool_result content field.
 
     A bare string passes through; a sequence of parts becomes wire text and image blocks,
-    an image part propagating _part_block's FatalError.
+    an image part propagating _part_block's InvalidRequestError.
     """
     if isinstance(content, str):
         return content
@@ -286,9 +293,10 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     for the message's last part that is equivalent, because the block's span ends where that part ends.
 
     Raises:
-        FatalError: a part other than the message's last sets cache_breakpoint;
-            the enclosing block's marker would silently move the boundary to the block's end,
-            and the same request would fail again.
+        InvalidRequestError: a part other than the message's last sets cache_breakpoint.
+            The API accepts such a request, and the enclosing block's marker silently moves the
+            boundary to the block's end, so the wire form would not mean what the message says;
+            the adapter refuses to send it and the item fails its own row.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -298,7 +306,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     if not marked_indexes:
         return False
     if marked_indexes != [len(tool_message.content) - 1]:
-        raise FatalError(
+        raise InvalidRequestError.before_send(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
             "the marker goes on the enclosing tool_result block, whose span ends at the last part"
         )
@@ -325,7 +333,7 @@ def _wire_messages(
     computed once in _request; at 0, every mark goes unwritten.
 
     Raises:
-        FatalError: an image part's media_type is outside the API's set (from _part_block),
+        InvalidRequestError: an image part's media_type is outside the API's set (from _part_block),
             or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking).
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
@@ -699,33 +707,28 @@ class AnthropicMessagesAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to rate_limit, transient, fatal, or unrecognized.
+        """Map the SDK exception to rate_limit, transient, invalid_request, or unrecognized.
 
-        RateLimitError (429) and OverloadedError (529) both mean further requests from this account
-        fail the same way right now, so admission should pause account-wide.
-        InternalServerError is every 5xx status the SDK maps no specific class to (verified against
-        anthropic 0.116.0, Bedrock clients included), so server-side trouble is retried.
-        The fatal classes are the request-is-wrong statuses (400, 401, 403, 404, 413, 422),
-        where every sibling sharing the configuration fails the same way.
-        Everything else is unrecognized: that item fails without a retry and the siblings continue.
+        A response's status decides, not the SDK exception class: _make_status_error returns a
+        specific subclass only for the statuses it lists and the bare APIStatusError for every
+        other one (verified against anthropic 0.116.0, Bedrock clients included), so a class list
+        would silently drop whatever status the provider adds next.
+        classification_from_response holds the shared rule; 529 joins 429 as a rate limit here
+        because the SDK reserves it for an overloaded service.
+
+        APIConnectionError, which APITimeoutError subclasses, and RetryableError, the marker the
+        SDK's own retry policy honors from middleware, are transient.
+        Anything else the SDK raises is unrecognized, which fails this item without a retry.
         """
-        if isinstance(error, (anthropic.RateLimitError, anthropic.OverloadedError)):
-            return "rate_limit"
-        if isinstance(error, (anthropic.InternalServerError, anthropic.APIConnectionError)):
+        if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
             return "transient"
-        if isinstance(
-            error,
-            (
-                anthropic.BadRequestError,
-                anthropic.AuthenticationError,
-                anthropic.PermissionDeniedError,
-                anthropic.NotFoundError,
-                anthropic.RequestTooLargeError,
-                anthropic.UnprocessableEntityError,
-            ),
-        ):
-            return "fatal"
-        return "unrecognized"
+        if not isinstance(error, anthropic.APIStatusError):
+            return "unrecognized"
+        return classification_from_response(
+            status_code=error.response.status_code,
+            headers=error.response.headers,
+            rate_limit_statuses=_RATE_LIMIT_STATUSES,
+        )
 
     @override
     def retry_after_seconds(self, error: Exception) -> float | None:

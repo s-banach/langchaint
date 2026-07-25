@@ -16,7 +16,7 @@ each method is monomorphic in its output type, so no sentinel value has to imply
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
@@ -27,16 +27,18 @@ from langchaint.messages import AssistantMessage, Message, StopReason, TextPart,
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
-type ErrorClassification = Literal["rate_limit", "transient", "unrecognized", "fatal"]
-"""Whether a retry may fix the error, and how far beyond the failing call it reaches.
+type ErrorClassification = Literal["rate_limit", "transient", "invalid_request", "unrecognized"]
+"""Whether a retry may fix the error, and what to call it when it cannot.
 
 A string classification, not an exception class; the retry loop maps it onto one.
+Every classification fails at most its own item: none of them reaches a sibling.
 "rate_limit" is transient and account-wide: the account or service refuses further requests
 right now, so RateLimiter pauses admission for everyone sharing it.
 "transient" is retried by the failing task alone.
-"unrecognized" is not retried and fails only its item (the retry loop raises UnrecognizedError).
-"fatal" is not retried and dooms every call sharing the configuration
-(the retry loop raises FatalError, which makes generate_many abort the batch).
+"invalid_request" is not retried: the provider rejected this request, so sending it again
+would be rejected again (the retry loop raises InvalidRequestError).
+"unrecognized" is not retried either, and says the adapter cannot name the error
+(the retry loop raises UnrecognizedError).
 """
 
 
@@ -65,6 +67,52 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
             return None
         if retry_after_seconds > 0:
             return retry_after_seconds
+    return None
+
+
+def classification_from_response(
+    *, status_code: int, headers: Mapping[str, str], rate_limit_statuses: Collection[int]
+) -> ErrorClassification:
+    """Classify one error response by its status and its retry directive.
+
+    Both SDKs encode the same retry policy, which langchaint owns because it constructs its clients
+    with max_retries=0: the non-standard x-should-retry header decides when present, then 408
+    (request timeouts), 409 (lock timeouts), 429, and 500 and above retry, and nothing else does.
+    What that policy retries is retried here, and outside rate_limit_statuses what it declines is
+    named: a 4xx is this request's rejection, whoever issued it, and anything left is a status
+    langchaint has no account of.
+    A 5xx the provider declares final by sending x-should-retry: false lands there too:
+    the directive states the disposition, never what failed.
+
+    rate_limit_statuses is the provider's own set of "refusing further requests right now" statuses
+    (429 for both, plus anthropic's 529), classified ahead of the retry directive because that
+    directive speaks for the one request while the pause a rate limit triggers protects the shared
+    account. A rate-limit status is therefore classified rate_limit whatever the directive says,
+    so the account-wide pause is never lost to a verdict about the one request.
+    """
+    if status_code in rate_limit_statuses:
+        return "rate_limit"
+    should_retry = should_retry_from_headers(headers)
+    if should_retry:
+        return "transient"
+    if should_retry is None and (status_code in (408, 409) or status_code >= 500):
+        return "transient"
+    if 400 <= status_code < 500:
+        return "invalid_request"
+    return "unrecognized"
+
+
+def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
+    """Read the provider's own retry directive from response headers.
+
+    x-should-retry is non-standard and both SDK clients obey it ahead of every status rule.
+    None means the provider stated nothing and the status decides.
+    """
+    should_retry_header = headers.get("x-should-retry")
+    if should_retry_header == "true":
+        return True
+    if should_retry_header == "false":
+        return False
     return None
 
 
@@ -222,7 +270,8 @@ class BoundAdapter[OutputT](ABC):
         Raises:
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
                 For defects the SDK reports as data rather than as an exception,
-                the adapter raises TransientError, FatalError, or a GenerationError leaf directly,
+                and for a conversation the adapter refuses to put on the wire,
+                the adapter raises TransientError or a GenerationError leaf directly,
                 and the retry loop honors those without classification.
         """
         ...
@@ -341,10 +390,13 @@ class Adapter(ABC):
     def classify(self, error: Exception) -> ErrorClassification:
         """Classify an exception raised by send or open_stream.
 
-        Anything the adapter does not recognize must map to "unrecognized",
+        Every classification is per-item, because an error arriving during a request says nothing
+        about the sibling requests: a provider states a status, never whether the binding or this
+        one conversation caused it. A binding defect langchaint can detect raises at construction
+        or bind time instead, before any request is sent.
+        Anything the adapter cannot name must map to "unrecognized",
         which fails the one item without a retry, so bugs surface without being retried silently
         and without killing the sibling items.
-        Reserve "fatal" for known-systematic errors, where every sibling would fail the same way.
         """
         ...
 

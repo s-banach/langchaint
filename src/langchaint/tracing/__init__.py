@@ -678,8 +678,8 @@ def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
 
     error.type is the exception's class name, so the GenerationError leaves (RetriesExhaustedError,
-    RefusalError, MaxCompletionTokensExceededError) are groupable by kind rather than only by the
-    error_text message string.
+    RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnrecognizedError) are
+    groupable by kind rather than only by the error_text message string.
     """
     span.set_attribute("error.type", type(error).__name__)
     span.set_status(Status(StatusCode.ERROR, error.error_text))
@@ -689,8 +689,8 @@ def _record_other_exception(span: Span, exc: Exception) -> None:
     """Record a non-GenerationError exception, set error.type and error status; no shared-field attributes exist.
 
     error.type is the exception's class name, the convention's low-cardinality classification of how an operation
-    ended, which gives every span kind here a groupable failure signal (FatalError, StreamProtocolError,
-    a tool function's own exception) beside the message string record_exception carries.
+    ended, which gives every span kind here a groupable failure signal (StreamProtocolError, a tool
+    function's own exception) beside the message string record_exception carries.
     """
     span.record_exception(exc)
     span.set_attribute("error.type", type(exc).__name__)
@@ -954,9 +954,8 @@ class TracedBoundLLM[OutputT]:
 
         Raises:
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
-                a refusal, a truncation, or an unrecognized provider error); the span is attributed and closed first.
-            FatalError: the wrapped generate_one classified an error as fatal;
-                the span records the exception and closes first.
+                a refusal, a truncation, a rejected request, or an unrecognized provider error);
+                the span is attributed and closed first.
             asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
                 appended any AbandonedCall first, and the span ends.
         """
@@ -1013,13 +1012,13 @@ class TracedBoundLLM[OutputT]:
         No content attributes are set under any capture_message_content value:
         the span covers a batch with no single conversation and no single assistant turn,
         the same reason the mapper is not invoked here.
-        The span stays OK on mixed per-item results, which come back as rows,
-        and takes error status only when a BatchAbortedError propagates.
+        Every per-item outcome comes back as a row, so the span stays OK on mixed results and takes
+        error status only when the batch as a whole fails to run.
 
         Raises:
             TypeError: conversations is a bare str (the whole-batch guard, in the delegated method).
-            BatchAbortedError: one item raised FatalError; the delegated method cancels and awaits
-                the siblings and the span records the exception before re-raising.
+            Exception: an item raised something that is not a GenerationError, a defect in langchaint
+                itself; the span records it before re-raising.
         """
         span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.INTERNAL)
         try:
@@ -1160,8 +1159,9 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
-            Exception: the inner stream raised (a transient failure after items, a fatal or unrecognized
-                error, a protocol violation); the span records it, takes error status, and ends before the re-raise.
+            Exception: the inner stream raised (a transient failure after items, a rejected or
+                unrecognized request, a protocol violation); the span records it, takes error status,
+                and ends before the re-raise.
         """
         if self._span is None or self._span_ended:
             # Never entered, or the span already closed: the inner handle raises, and recording that
@@ -1236,9 +1236,8 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
-                on the structured path, retries exhausted while draining, or an unrecognized provider error);
-                the span is attributed and closed first.
-            FatalError: draining hit an error classified as fatal; the span records it and closes.
+                on the structured path, retries exhausted while draining, a rejected reopen, or an
+                unrecognized provider error); the span is attributed and closed first.
             StreamProtocolError: the provider's event stream ended without a terminal event;
                 the span records it and closes.
         """

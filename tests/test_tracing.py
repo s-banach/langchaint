@@ -37,13 +37,12 @@ from langchaint import (
     LLM,
     AbandonedCall,
     AssistantMessage,
-    BatchAbortedError,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchUnknownTool,
-    FatalError,
     GenerationError,
     ImagePart,
+    InvalidRequestError,
     JSONSchemaTool,
     MaxCompletionTokensExceededError,
     Message,
@@ -354,29 +353,32 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
     asyncio.run(scenario())
 
 
-def test_generate_one_fatal_records_the_exception_and_ends_the_span() -> None:
-    """A FatalError sets error status, records the exception, and still ends the span."""
+def test_generate_one_rejection_span_names_its_own_leaf_in_error_type() -> None:
+    """A rejected request takes error status under its own error.type, not the base class name.
+
+    error.type is the low-cardinality key a backend groups failures by, so a provider rejection and
+    an error langchaint could not name must not land in one bucket.
+    """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises FatalError, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[FatalError("misconfigured")])
+        """Drive one generate_one whose send is refused, then inspect the error span."""
+        adapter = _FakeAdapter(failures=[InvalidRequestError.before_send("misconfigured")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(FatalError):
+        with pytest.raises(InvalidRequestError):
             await traced.bind(automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
-        # A FatalError carries no shared-field attributes; it is recorded as an exception event
-        # plus the error.type classification every failing span kind takes.
-        assert dict(span.attributes or {}) == {
-            "gen_ai.operation.name": "chat",
-            "error.type": "FatalError",
-        }
-        assert [event.name for event in span.events] == ["exception"]
+        assert span.status.description == "misconfigured"
+        assert span.attributes is not None
+        assert span.attributes["error.type"] == "InvalidRequestError"
+        # Nothing was sent, so the usage attributes are the zeros of a call that never billed.
+        assert span.attributes["langchaint.cost_in_usd"] == 0.0
+        assert "gen_ai.response.finish_reasons" not in span.attributes
 
     asyncio.run(scenario())
 
@@ -511,25 +513,34 @@ def test_generate_many_matches_bound_llm_row_shapes() -> None:
     asyncio.run(scenario())
 
 
-def test_generate_many_abort_marks_the_batch_span_error() -> None:
-    """A BatchAbortedError propagating from the delegated batch marks the one batch span error."""
+def test_generate_many_failing_item_leaves_the_batch_span_ok() -> None:
+    """A failing item is a row, not a batch failure, so the one batch span stays OK.
+
+    Per-item detail is not on this span at all: a batch reader gets it from the returned rows.
+    """
 
     async def scenario() -> None:
-        """Serialize a two-item batch whose first item goes fatal, then inspect the batch span."""
-        adapter = _FakeAdapter(echo=True, failures=[FatalError("misconfigured")], hang_from_send=2)
+        """Serialize a two-item batch whose first item is refused, then inspect the batch span."""
+        adapter = _FakeAdapter(
+            echo=True, failures=[InvalidRequestError.before_send("misconfigured")]
+        )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
         )
-        with pytest.raises(BatchAbortedError):
-            await traced.bind(automatic_prompt_caching=True).generate_many([
-                [UserMessage(content="a")],
-                [UserMessage(content="b")],
-            ])
+        results = await traced.bind(automatic_prompt_caching=True).generate_many([
+            [UserMessage(content="a")],
+            [UserMessage(content="b")],
+        ])
+        first, second = results
+        assert isinstance(first, InvalidRequestError)
+        assert isinstance(second, Response)
         (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert [event.name for event in span.events] == ["exception"]
+        assert span.status.status_code == StatusCode.OK
+        assert span.events == ()
+        assert span.attributes is not None
+        assert span.attributes["langchaint.batch_item_count"] == 2
 
     asyncio.run(scenario())
 

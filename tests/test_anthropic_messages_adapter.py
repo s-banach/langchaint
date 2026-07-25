@@ -30,9 +30,9 @@ from pydantic import BaseModel
 from langchaint import (
     LLM,
     AssistantMessage,
-    FatalError,
     ImagePart,
     InferenceParams,
+    InvalidRequestError,
     MaxCompletionTokensExceededError,
     PricingTable,
     PydanticTool,
@@ -545,11 +545,11 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
 
 
 def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -> None:
-    """A tool_result image media type outside the accepted set aborts the batch as a request defect."""
+    """A tool_result image media type outside the accepted set fails this item as a rejected request."""
     conversation = [
         ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
     ]
-    with pytest.raises(FatalError):
+    with pytest.raises(InvalidRequestError):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
@@ -690,9 +690,9 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
 
 
 def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
-    """An image media type outside the accepted set aborts the batch as a request defect."""
+    """An image media type outside the accepted set fails this item as a rejected request."""
     message = UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))
-    with pytest.raises(FatalError):
+    with pytest.raises(InvalidRequestError):
         _user_content_blocks(message)
 
 
@@ -953,12 +953,15 @@ def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
 
 
 def _status_error[ErrorT: anthropic.APIStatusError](
-    error_class: type[ErrorT], status_code: int
+    error_class: type[ErrorT],
+    status_code: int,
+    headers: dict[str, str] | None = None,
 ) -> ErrorT:
     """Build one of the SDK's status exceptions around a constructed httpx response."""
     response = httpx.Response(
         status_code,
         request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        headers=headers,
     )
     return error_class("boom", response=response, body=None)
 
@@ -981,25 +984,42 @@ def _connection_error() -> anthropic.APIConnectionError:
             anthropic.APITimeoutError(httpx.Request("POST", "https://api.anthropic.com")),
             "transient",
         ),
-        (_status_error(anthropic.BadRequestError, 400), "fatal"),
-        (_status_error(anthropic.AuthenticationError, 401), "fatal"),
-        (_status_error(anthropic.PermissionDeniedError, 403), "fatal"),
-        (_status_error(anthropic.NotFoundError, 404), "fatal"),
-        (_status_error(anthropic.RequestTooLargeError, 413), "fatal"),
-        (_status_error(anthropic.UnprocessableEntityError, 422), "fatal"),
-        (_status_error(anthropic.ConflictError, 409), "unrecognized"),
+        (_status_error(anthropic.ConflictError, 409), "transient"),
+        (anthropic.RetryableError("middleware said retry"), "transient"),
+        (_status_error(anthropic.BadRequestError, 400), "invalid_request"),
+        (_status_error(anthropic.AuthenticationError, 401), "invalid_request"),
+        (_status_error(anthropic.PermissionDeniedError, 403), "invalid_request"),
+        (_status_error(anthropic.NotFoundError, 404), "invalid_request"),
+        (_status_error(anthropic.RequestTooLargeError, 413), "invalid_request"),
+        (_status_error(anthropic.UnprocessableEntityError, 422), "invalid_request"),
+        (_status_error(anthropic.APIStatusError, 402), "invalid_request"),
+        (_status_error(anthropic.APIStatusError, 408), "transient"),
+        (_status_error(anthropic.InternalServerError, 503), "transient"),
+        (_status_error(anthropic.APIStatusError, 302), "unrecognized"),
+        (_status_error(anthropic.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
+        (
+            _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"}),
+            "unrecognized",
+        ),
+        (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
+        (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
         (ValueError("boom"), "unrecognized"),
     ],
 )
 def test_classify_maps_each_sdk_exception_to_its_classification(
     error: Exception, expected: ErrorClassification
 ) -> None:
-    """Each SDK exception lands on the classification the adapter's classify docstring names.
+    """Each error lands on the classification the adapter's classify docstring names.
 
-    Each status code is the one the SDK raises that class for, read from anthropic 0.116.0.
+    Each status code is the one the SDK raises that class for, read from anthropic 0.116.0;
+    the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
+    which is why the adapter reads the status rather than the exception class.
     OverloadedError is anthropic's own overload signal and shares the rate_limit class with RateLimitError.
-    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
-    ConflictError and the non-SDK ValueError land on the unrecognized default,
+    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance,
+    and RetryableError carries no response at all.
+    x-should-retry overrides the status in both directions, except on a rate-limit status, which
+    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed.
+    A 3xx and the non-SDK ValueError land on the unrecognized default,
     which fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected
@@ -1117,14 +1137,14 @@ def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part()
 
 
 def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
-    """A marked part before the ToolMessage's last aborts instead of silently moving the boundary."""
+    """A marked part before the ToolMessage's last is rejected instead of silently moving the boundary."""
     conversation = [
         ToolMessage(
             tool_call_id="tu_1",
             content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
         )
     ]
-    with pytest.raises(FatalError, match="last part"):
+    with pytest.raises(InvalidRequestError, match="last part"):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )

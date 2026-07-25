@@ -21,9 +21,8 @@ from pydantic import BaseModel
 from langchaint.adapter import Adapter, Binding, BoundAdapter, ToolChoice
 from langchaint.exceptions import (
     AttemptRecord,
-    BatchAbortedError,
-    FatalError,
     GenerationError,
+    InvalidRequestError,
     RetriesExhaustedError,
     TransientError,
     UnrecognizedError,
@@ -375,9 +374,9 @@ class BoundLLM[OutputT]:
         cancellation that kills this frame leaves the settled attempts' records readable outside it.
         Appends happen only between awaits, so the list never holds a partial record.
 
-        TransientError, FatalError,
-        and the GenerationError leaves raised directly by the adapter are honored without classification;
-        a FatalError is re-raised enriched with the prior attempts' records.
+        TransientError and the GenerationError leaves raised directly by the adapter are honored
+        without classification: a TransientError is recorded and retried, and a leaf is re-raised
+        enriched with the prior attempts' records.
         Each attempt holds a RateLimiter slot for the request only;
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,
@@ -390,8 +389,8 @@ class BoundLLM[OutputT]:
         a transport failure's usage is ZERO_USAGE and usage_raw None.
 
         Raises:
-            FatalError: the adapter classified an attempt's error as fatal or raised FatalError itself;
-                enriched with the prior attempts' records.
+            InvalidRequestError: the adapter refused to send the request, or classified an attempt's
+                error as a rejection of it; terminal for this item, without a retry.
             UnrecognizedError: the adapter classified an attempt's error as unrecognized;
                 terminal for this item, without a retry.
             RefusalError: the model refused on the structured path;
@@ -408,9 +407,17 @@ class BoundLLM[OutputT]:
                 attempt_started_at_monotonic_seconds = time.monotonic()
                 try:
                     adapter_result = await self._bound_adapter.send(conversation)
-                except FatalError as exc:
-                    exc.attempt_records = tuple(attempt_records)
-                    raise
+                except InvalidRequestError as exc:
+                    # Ahead of the GenerationError arm below, which cannot handle this leaf: that
+                    # arm reads usage off the error and rebuilds it without a reason, while a
+                    # before_send partial carries no billing (nothing was sent) and requires one.
+                    raise InvalidRequestError(
+                        reason=exc.reason,
+                        attempt_records=tuple(attempt_records),
+                        model=self.adapter.model,
+                        provider_name=self.adapter.provider_name,
+                        elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
+                    ) from exc
                 except GenerationError as exc:
                     self.rate_limiter.register_success(admission)
                     attempt_records.append(
@@ -433,10 +440,13 @@ class BoundLLM[OutputT]:
                     error: TransientError = exc
                 except Exception as exc:
                     classification = self.adapter.classify(exc)
-                    if classification == "fatal":
-                        raise FatalError(
-                            f"fatal provider error: {exc}",
+                    if classification == "invalid_request":
+                        raise InvalidRequestError(
+                            reason=f"the provider rejected the request: {exc}",
                             attempt_records=tuple(attempt_records),
+                            model=self.adapter.model,
+                            provider_name=self.adapter.provider_name,
+                            elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
                         ) from exc
                     if classification == "unrecognized":
                         raise UnrecognizedError(
@@ -506,8 +516,8 @@ class BoundLLM[OutputT]:
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Every non-success outcome propagates: RetriesExhaustedError on transient exhaustion,
         RefusalError or MaxCompletionTokensExceededError on the structured path,
-        UnrecognizedError on an unrecognized classification, and FatalError on a fatal one;
-        all but FatalError share the GenerationError base a caller can catch at once.
+        InvalidRequestError on a rejected request, and UnrecognizedError on an unrecognized error;
+        all of them share the GenerationError base a caller can catch at once.
 
         abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's
         asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts this call off. The append is
@@ -537,22 +547,15 @@ class BoundLLM[OutputT]:
             raise
 
     async def _generate_or_failure(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        attempt_records: list[AttemptRecord] | None = None,
+        self, conversation: str | Sequence[Message]
     ) -> Response[OutputT] | GenerationError:
         """One batch item: the Response, or the GenerationError caught as the failure row.
 
-        attempt_records, when given, is the controller's per-item list appended to in place
-        (see _generate_with_retries); _gather_or_abort reads it to build the item's AbandonedCall
-        when an abort cancels the item.
-        A FatalError is not caught here, so it propagates out of the batch and cancels the siblings.
+        Every terminal per-item outcome is a GenerationError, so nothing a request produces
+        escapes into the gather and reaches a sibling.
         """
         try:
-            return await self._generate_with_retries(
-                _as_conversation(conversation), attempt_records=attempt_records
-            )
+            return await self._generate_with_retries(_as_conversation(conversation))
         except GenerationError as failure:
             return failure
 
@@ -567,13 +570,12 @@ class BoundLLM[OutputT]:
         Each conversation may be a bare str, shorthand for a conversation of one UserMessage holding that text.
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
-        Continues past items that end in a GenerationError (retries exhausted, a refusal, a truncation,
-        an unrecognized error); those come back as that error in their slot,
+        Every item ends in its own slot: a Response, or the GenerationError it failed with
+        (retries exhausted, a refusal, a truncation, a rejected request, an unrecognized error),
         which to_row renders to a failure row so the batch stays table-ready.
+        No item's failure reaches a sibling, so the returned list is always complete.
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.
-        A FatalError in any item aborts the batch: the siblings are cancelled and awaited,
-        and the raised BatchAbortedError carries every item's outcome, settled work included.
 
         warm_cache runs conversations[0] to completion before starting the rest,
         because a provider cache entry is readable only after the response that writes it begins,
@@ -584,98 +586,34 @@ class BoundLLM[OutputT]:
         a rejected 200 (a refusal, a truncation) wrote the prefix on the provider side,
         and after a transport failure the rest simply run against a cold cache; there is no second warmer.
         There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
-        A FatalError from the first item aborts before any sibling starts,
-        every other slot a never-started AbandonedCall.
 
         Raises:
-            BatchAbortedError: an item raised FatalError; outcomes is the complete order-aligned slot list.
             TypeError: conversations is a bare str (from _reject_bare_str_batch).
         """
         _reject_bare_str_batch(conversations)
-        # The slices also convert the SequenceNotStr protocol to the Sequence _gather_or_abort takes.
+        # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
         if warm_cache and conversations:
-            try:
-                first_result = await self._generate_or_failure(conversations[0])
-            except FatalError as fatal_error:
-                raise BatchAbortedError(
-                    outcomes=(
-                        fatal_error,
-                        *(self._abandoned_call(()) for _ in conversations[1:]),
-                    )
-                ) from fatal_error
-            try:
-                return [first_result, *await self._gather_or_abort(conversations[1:])]
-            except BatchAbortedError as batch_aborted:
-                batch_aborted.outcomes = (first_result, *batch_aborted.outcomes)
-                raise
-        return await self._gather_or_abort(conversations[0:])
+            first_result = await self._generate_or_failure(conversations[0])
+            return [first_result, *await self._gather(conversations[1:])]
+        return await self._gather(conversations[0:])
 
-    def _abandoned_call(self, attempt_records: tuple[AttemptRecord, ...]) -> AbandonedCall:
-        """Build the AbandonedCall slot of one item an abort cancelled or kept from starting."""
-        return AbandonedCall(
-            attempt_records=attempt_records,
-            model=self.adapter.model,
-            provider_name=self.adapter.provider_name,
-        )
-
-    def _outcome_slot(
-        self,
-        settled: Response[OutputT] | GenerationError | BaseException,
-        attempt_records: tuple[AttemptRecord, ...],
-    ) -> Response[OutputT] | GenerationError | FatalError | AbandonedCall:
-        """Map one awaited task's result or exception to its BatchAbortedError slot.
-
-        Raises:
-            BaseException: settled holds an exception that is none of the slot kinds,
-                a defect in langchaint itself; it outranks the abort report, so it propagates.
-        """
-        if isinstance(settled, asyncio.CancelledError):
-            return self._abandoned_call(attempt_records)
-        if isinstance(settled, BaseException) and not isinstance(
-            settled, (GenerationError, FatalError)
-        ):
-            raise settled
-        return settled
-
-    async def _gather_or_abort(
+    async def _gather(
         self, conversations: Sequence[str | Sequence[Message]]
     ) -> list[Response[OutputT] | GenerationError]:
-        """Run the items concurrently; return the settled list, or abort as one BatchAbortedError.
-
-        Each item's attempt-record list lives here, not in the item's frames, so a cancelled item's
-        settled attempts stay readable after the CancelledError unwinds it.
-        On the first FatalError the remaining tasks are cancelled and every task awaited, and the
-        abort raises from this single join point with every slot filled; no code before the join
-        holds the collection, so no termination path can discard it.
+        """Run the items concurrently and return the settled list, order-aligned.
 
         Raises:
-            BatchAbortedError: an item raised FatalError; outcomes is the complete order-aligned slot list.
-            asyncio.CancelledError: the caller cancelled generate_many; the items are cancelled and
-                the outcomes are lost with the frame (nothing fatal happened, so no BatchAbortedError).
+            asyncio.CancelledError: an outer scope cancelled generate_many; the items are cancelled
+                and their outcomes are lost with the frame.
+            BaseException: an item raised something that is not a GenerationError, a defect in
+                langchaint itself; the remaining tasks are cancelled and it propagates.
         """
-        item_attempt_records: list[list[AttemptRecord]] = [[] for _ in conversations]
         tasks = [
-            asyncio.create_task(
-                self._generate_or_failure(conversation, attempt_records=attempt_records)
-            )
-            for conversation, attempt_records in zip(
-                conversations, item_attempt_records, strict=True
-            )
+            asyncio.create_task(self._generate_or_failure(conversation))
+            for conversation in conversations
         ]
         try:
             return list(await asyncio.gather(*tasks))
-        except FatalError as fatal_error:
-            for task in tasks:
-                task.cancel()
-            settled_slots = await asyncio.gather(*tasks, return_exceptions=True)
-            raise BatchAbortedError(
-                outcomes=tuple(
-                    self._outcome_slot(settled, tuple(attempt_records))
-                    for settled, attempt_records in zip(
-                        settled_slots, item_attempt_records, strict=True
-                    )
-                )
-            ) from fatal_error
         except BaseException:
             for task in tasks:
                 task.cancel()

@@ -518,6 +518,31 @@ def test_generate_one_cancellation_appends_through_the_wrapper_and_ends_the_span
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
+def test_generate_many_cancellation_appends_through_the_wrapper_and_ends_the_span() -> None:
+    """The traced generate_many passes abandoned_call_log through; the cancelled batch span ends, status unset."""
+
+    async def scenario() -> None:
+        """Time out a traced batch whose sends hang, then read the log and the span."""
+        adapter = _FakeAdapter(hang_from_send=1)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await traced.bind(automatic_prompt_caching=True).generate_many(
+                    ["a", "b"], abandoned_call_log=abandoned_call_log
+                )
+        assert len(abandoned_call_log) == 2
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.UNSET
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
     """A recovered transient failure becomes one langchaint.attempt_failed event on the success span."""
 

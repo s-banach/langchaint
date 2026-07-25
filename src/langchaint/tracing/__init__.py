@@ -1104,11 +1104,12 @@ class TracedBoundLLM[OutputT]:
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
+        abandoned_call_log: AbandonedCallLog | None = None,
     ) -> list[Response[OutputT] | GenerationError]:
         """Order-aligned batch under one INTERNAL span; per-item detail lives in the returned rows.
 
-        warm_cache passes through to BoundLLM.generate_many, which documents it;
-        the span brackets the warming first item and the rest alike.
+        warm_cache and abandoned_call_log pass through to BoundLLM.generate_many, which documents
+        them; the span brackets the warming first item and the rest alike.
 
         Delegates to BoundLLM.generate_many rather than re-gathering into per-item child spans:
         generate_many is a bulk convenience (dataset passes, evals),
@@ -1136,12 +1137,16 @@ class TracedBoundLLM[OutputT]:
             TypeError: conversations is a bare str (the whole-batch guard, in the delegated method).
             Exception: an item raised something that is not a GenerationError, a defect in langchaint
                 itself; the span records it before re-raising.
+            asyncio.CancelledError: an outer scope cancelled the batch; the delegated generate_many
+                appended any AbandonedCall first, and the span ends.
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.INTERNAL)
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
             try:
-                results = await self._bound_llm.generate_many(conversations, warm_cache=warm_cache)
+                results = await self._bound_llm.generate_many(
+                    conversations, warm_cache=warm_cache, abandoned_call_log=abandoned_call_log
+                )
             except Exception as exc:
                 _record_other_exception(span, exc)
                 raise

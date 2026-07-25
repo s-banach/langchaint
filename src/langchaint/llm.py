@@ -537,17 +537,20 @@ class BoundLLM[OutputT]:
             raise
 
     async def _generate_or_failure(
-        self, conversation: str | Sequence[Message]
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None,
     ) -> Response[OutputT] | GenerationError:
         """One batch item: the Response, or the GenerationError caught as the failure row.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces
         escapes into the gather and reaches a sibling.
+        A cancellation is the one outcome that is not a row, so it runs through generate_one,
+        whose CancelledError handler appends this item's AbandonedCall before re-raising.
         """
         try:
-            return await self._generate_with_retries(
-                _as_conversation(conversation), ledger=self._new_ledger()
-            )
+            return await self.generate_one(conversation, abandoned_call_log=abandoned_call_log)
         except GenerationError as failure:
             return failure
 
@@ -556,6 +559,7 @@ class BoundLLM[OutputT]:
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
+        abandoned_call_log: AbandonedCallLog | None = None,
     ) -> list[Response[OutputT] | GenerationError]:
         """Order-aligned batch: result i belongs to conversations[i].
 
@@ -579,20 +583,56 @@ class BoundLLM[OutputT]:
         and after a transport failure the rest simply run against a cold cache; there is no second warmer.
         There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
 
+        abandoned_call_log, when given, receives one AbandonedCall for each item that had started
+        when a cancellation (a caller's asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts
+        the batch off; under warm_cache the items after the warming one have not started. An item
+        raising past the GenerationError arms discards the batch the same way, and every item that
+        did not itself raise is recorded. The returned list is lost with the frame on both paths, an
+        already-settled item's row with it, so the appends are the account of what the recorded
+        items spent.
+
         Raises:
             TypeError: conversations is a bare str (from _reject_bare_str_batch).
+            asyncio.CancelledError: an outer scope cancelled the batch; when abandoned_call_log is
+                given, each started item's AbandonedCall is appended first.
+            BaseException: an item raised something that is not a GenerationError, a defect in
+                langchaint itself; _gather cancels the remaining items and it propagates.
         """
         _reject_bare_str_batch(conversations)
         # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
         if warm_cache and conversations:
-            first_result = await self._generate_or_failure(conversations[0])
-            return [first_result, *await self._gather(conversations[1:])]
-        return await self._gather(conversations[0:])
+            first_result = await self._generate_or_failure(
+                conversations[0], abandoned_call_log=abandoned_call_log
+            )
+            try:
+                rest = await self._gather(conversations[1:], abandoned_call_log=abandoned_call_log)
+            except BaseException:
+                # The warming item settled in this frame rather than in a _gather task,
+                # so its record reaches the log here or not at all.
+                _append_abandoned_call(abandoned_call_log, first_result.call)
+                raise
+            return [first_result, *rest]
+        return await self._gather(conversations[0:], abandoned_call_log=abandoned_call_log)
 
     async def _gather(
-        self, conversations: Sequence[str | Sequence[Message]]
+        self,
+        conversations: Sequence[str | Sequence[Message]],
+        *,
+        abandoned_call_log: AbandonedCallLog | None,
     ) -> list[Response[OutputT] | GenerationError]:
         """Run the items concurrently and return the settled list, order-aligned.
+
+        Nothing leaves this frame on the raising path, so every item's history reaches
+        abandoned_call_log or is lost. An item still running appends its own record while it unwinds
+        its cancellation; an item that already settled cannot, so its record is appended here from
+        the task's result, which carries it whether the item ended in a Response or a
+        GenerationError.
+
+        The cancelled item tasks are awaited before those appends because gather returns here with
+        siblings still running on both arms: an item's non-GenerationError raise propagates
+        immediately, and a cancellation propagates as soon as the first item completes as cancelled.
+        Without the await a sibling's own append would land after the raise reached the caller, and
+        the task.exception() reads below would hit tasks that are not done.
 
         Raises:
             asyncio.CancelledError: an outer scope cancelled generate_many; the items are cancelled
@@ -601,7 +641,9 @@ class BoundLLM[OutputT]:
                 langchaint itself; the remaining tasks are cancelled and it propagates.
         """
         tasks = [
-            asyncio.create_task(self._generate_or_failure(conversation))
+            asyncio.create_task(
+                self._generate_or_failure(conversation, abandoned_call_log=abandoned_call_log)
+            )
             for conversation in conversations
         ]
         try:
@@ -609,6 +651,10 @@ class BoundLLM[OutputT]:
         except BaseException:
             for task in tasks:
                 task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tasks:
+                if not task.cancelled() and task.exception() is None:
+                    _append_abandoned_call(abandoned_call_log, task.result().call)
             raise
 
     def stream_one(

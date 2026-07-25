@@ -1191,6 +1191,126 @@ def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
     asyncio.run(scenario())
 
 
+def test_generate_many_cancellation_appends_one_abandoned_call_per_item() -> None:
+    """A deadline cancelling the batch leaves every item's settled usage in the log.
+
+    The returned list dies with the cancelled frame, so without the appends the whole batch's known
+    paid usage vanishes at once, one item's worth per item.
+    """
+
+    async def scenario() -> None:
+        """Settle the two scripted billed attempts, then hang the retries into the deadline."""
+        adapter = _FakeAdapter(
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+            ],
+            hang_from_send=3,
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await bound_llm.generate_many(
+                    [[UserMessage(content="a")], [UserMessage(content="b")]],
+                    abandoned_call_log=abandoned_call_log,
+                )
+        assert len(abandoned_call_log) == 2
+        # The two scripted failures settle before either retry hangs, whichever item sends first.
+        settled = sum(call.usage_settled.cost_in_usd for call in abandoned_call_log)
+        assert settled == 2 * _USAGE_BILLED.cost_in_usd
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+class _ClassifyRaisesAdapter(_FakeAdapter):
+    """A _FakeAdapter whose classify raises, so one item ends in something that is not a GenerationError."""
+
+    @override
+    def classify(self, error: Exception) -> ErrorClassification:
+        """Raise instead of classifying.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("classify defect")
+
+
+def test_generate_many_appends_the_abandoned_calls_of_items_a_sibling_defect_cancels() -> None:
+    """An item raising past the GenerationError arms leaves its siblings' settled usage in the log.
+
+    gather propagates that raise while the siblings are still running, so unless they are awaited
+    after being cancelled, their appends land after the raise has reached the caller and the log the
+    caller reads is missing their settled billing.
+    """
+
+    async def scenario() -> None:
+        """Settle one billed attempt on the first item, then raise past the arms on the second."""
+        adapter = _ClassifyRaisesAdapter(
+            failures=[
+                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                ValueError("defect"),
+            ],
+            send_seconds=0.02,
+            hang_from_send=4,
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        abandoned_call_log: list[AbandonedCall] = []
+        with pytest.raises(RuntimeError, match="classify defect"):
+            await bound_llm.generate_many(
+                [
+                    [UserMessage(content="a")],
+                    [UserMessage(content="b")],
+                    [UserMessage(content="c")],
+                ],
+                abandoned_call_log=abandoned_call_log,
+            )
+        # The first item settles its billed attempt and hangs on the retry, the second settles its
+        # refusal row, and the third raises; each of the two records one billed attempt.
+        assert len(abandoned_call_log) == 2
+        settled = sum(call.usage_settled.cost_in_usd for call in abandoned_call_log)
+        assert settled == 2 * _USAGE_BILLED.cost_in_usd
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_appends_the_abandoned_calls_of_the_items_that_already_settled() -> None:
+    """A cancelled batch accounts for the items that finished, not only the ones still running.
+
+    A settled item's row dies with the discarded result list, and in a batch cut off late those
+    rows are most of what the batch spent, so leaving them out understates it by the largest term.
+    Both branches are driven: without warm_cache every item settles in a _gather task,
+    with it the warming item settles in generate_many's own frame.
+    """
+
+    async def scenario() -> None:
+        """Let the first send succeed, hang the second, and cut the batch off on a deadline."""
+        for warm_cache in (False, True):
+            adapter = _FakeAdapter(hang_from_send=2)
+            bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+                automatic_prompt_caching=True
+            )
+            abandoned_call_log: list[AbandonedCall] = []
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await bound_llm.generate_many(
+                        [[UserMessage(content="a")], [UserMessage(content="b")]],
+                        warm_cache=warm_cache,
+                        abandoned_call_log=abandoned_call_log,
+                    )
+            assert len(abandoned_call_log) == 2
+            # The hanging item settled no attempt; the item that succeeded settled its one.
+            assert sorted(len(call.attempt_records) for call in abandoned_call_log) == [0, 1]
+            assert sum(call.usage_settled.output_tokens for call in abandoned_call_log) == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_bare_str_is_shorthand_for_one_user_message() -> None:
     """A bare str reaches the adapter as a conversation of one UserMessage."""
 

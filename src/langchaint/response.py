@@ -2,12 +2,14 @@
 
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
 a truncation at the token cap, or an unrecognized provider error) raises or returns a GenerationError;
-one a cancellation cuts off leaves an AbandonedCall on the caller's abandoned_call_log.
+one whose result never reaches the caller, cut off by a cancellation or discarded when a batch raises,
+leaves an AbandonedCall on the caller's abandoned_call_log.
 Each of the three carries the CallRecord its retry loop froze, because a call's history survives
 only if the result carries it: attempt_records is that history.
 On a Response every record but the last failed and the last succeeded;
 on a GenerationError the records describe the terminal outcome;
-on an AbandonedCall they cover the attempts that settled before the cancellation.
+on an AbandonedCall they cover the attempts that settled, with no record for an attempt still in
+flight when the call was cut off.
 to_row flattens a Response or a GenerationError to one dict of scalars with the same keys,
 so a mixed list of successes and failures converts directly to a table.
 """
@@ -105,16 +107,18 @@ class Response[OutputT](_CallCarrier):
 
 @dataclass(frozen=True, kw_only=True)
 class AbandonedCall(_CallCarrier):
-    """The record of one generate call a cancellation cut off, appended to the caller's log.
+    """The record of one generate call whose result never reached the caller, appended to its log.
 
     A cancelled call returns no value, and the CancelledError must propagate for the cancelling
     scope's teardown to run, so this record is the only carrier of the call's history:
     generate_one and stream_one append it to their abandoned_call_log before re-raising.
+    A batch item is abandoned on the same terms when generate_many raises past it, whether the item
+    was still running or had already settled its row into the list the raise discards.
     Its presence in the log is the count of abandoned calls.
 
-    call is this call's history, and its attempt_records cover only the attempts that settled
-    before the cancellation.
-    The in-flight attempt has no record: it may have completed and billed server-side,
+    call is this call's history. Where the call was cut off mid-attempt, its attempt_records cover
+    only the attempts that settled before that, and the in-flight attempt has no record:
+    it may have completed and billed server-side,
     so its cost is unobservable client-side and no usage is fabricated for it
     ("unbilled" would overclaim).
     Reconciliation closes the gap from the provider's side, which model and provider_name identify.
@@ -125,10 +129,10 @@ class AbandonedCall(_CallCarrier):
 
     @property
     def usage_settled(self) -> Usage:
-        """The folded paid total of the attempts that settled before the cancellation.
+        """The folded paid total of this call's settled attempts.
 
         Deliberately not named usage: on the other result carriers, usage is the call's whole paid
-        total, and this value structurally lacks the in-flight attempt's share.
+        total, and a call cut off mid-attempt lacks that attempt's share here.
         Naming it usage for uniformity is rejected.
         Cancellation correlates with long requests, so the omitted attempt skews expensive.
         On the stream path every settled record is a failed attempt, a stream that dropped after
@@ -140,7 +144,7 @@ class AbandonedCall(_CallCarrier):
 
 
 class AbandonedCallLog(Protocol):
-    """Where generate_one and stream_one append an AbandonedCall when a cancellation cuts a call off.
+    """Where generate_one, generate_many, and stream_one record a call whose result never reached the caller.
 
     append is the one required method, so a list[AbandonedCall] satisfies it, and so does an
     application's own log of turn records whose element union includes AbandonedCall; total spend is
@@ -149,19 +153,19 @@ class AbandonedCallLog(Protocol):
     """
 
     def append(self, abandoned_call: AbandonedCall, /) -> None:
-        """Receive one record; called before the CancelledError re-raises."""
+        """Receive one record."""
 
 
 def _append_abandoned_call(abandoned_call_log: AbandonedCallLog | None, call: CallRecord) -> None:
     """Append one AbandonedCall when a log was given, without letting the append escape.
 
-    Every caller runs this while a cancellation unwinds, after it has returned the in-flight slot
+    Every caller runs this while an exception unwinds, after it has returned the in-flight slot
     and, on the stream path, closed the connection.
-    A log whose append raises is a defect in application code, but raising it here would replace the
-    CancelledError, and a task that ends on any other exception is not cancelled: asyncio.timeout
-    then reports that exception in place of TimeoutError, and a TaskGroup's shutdown sees a
-    substituted error. Delivering the cancellation is worth more than recording the abandonment, so
-    a failed append is logged and the CancelledError continues to propagate.
+    A log whose append raises is a defect in application code, but raising it here would replace
+    that exception, and where the exception is a CancelledError the substitution costs more than the
+    lost record: a task that ends on any other exception is not cancelled, so asyncio.timeout reports
+    that exception in place of TimeoutError and a TaskGroup's shutdown sees a substituted error.
+    A failed append is logged and the exception already unwinding continues to propagate.
     """
     if abandoned_call_log is None:
         return

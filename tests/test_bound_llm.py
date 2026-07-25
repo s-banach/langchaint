@@ -521,7 +521,7 @@ def test_pre_send_rejection_raises_immediately_without_retry() -> None:
 
     classify returns "transient" here, and the arm never reaches it: a returned outcome is not an
     exception, so no classify verdict can turn this into a second attempt.
-    The leaf the loop builds carries the reason and the row-shape fields.
+    The InvalidRequestError the loop builds carries the reason and the row-shape fields.
     """
 
     async def scenario() -> None:
@@ -569,12 +569,12 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
     """An InvalidRequestError after transient attempts carries their records.
 
     The prior attempts' usage rides the error, so a billed 200 retried before the rejection stays
-    accounted for. The two routes to the leaf differ in what the failing attempt leaves: a rejection
+    accounted for. The two routes to the error differ in what the failing attempt leaves: a rejection
     classify names went out, so it gets a record, and a NotSendable outcome never did, so it does not.
     """
 
     async def scenario() -> None:
-        """Settle one billed transient attempt, then take each route to the leaf in its own call."""
+        """Settle one billed transient attempt, then take each route to the error in its own call."""
         classified_adapter = _FakeAdapter(
             failures=[
                 TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
@@ -720,7 +720,7 @@ def test_unrecognized_error_classified_transient_is_retried() -> None:
 def test_exception_classified_invalid_request_fails_the_item_without_retry() -> None:
     """A plain exception classified invalid_request raises InvalidRequestError on the first attempt.
 
-    InvalidRequestError is a GenerationError leaf, so in a batch it becomes the item's failure row
+    InvalidRequestError is a GenerationError, so in a batch it becomes the item's failure row
     rather than touching the siblings; the classified exception stays reachable as __cause__.
     """
 
@@ -742,7 +742,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
 def test_exception_classified_unrecognized_fails_the_item_without_retry() -> None:
     """A plain exception classified unrecognized raises UnrecognizedError on the first attempt.
 
-    UnrecognizedError is a GenerationError leaf, so in a batch it becomes the item's failure row
+    UnrecognizedError is a GenerationError, so in a batch it becomes the item's failure row
     and the siblings run on.
     """
 
@@ -1396,7 +1396,7 @@ def test_stream_completed_or_left_early_appends_no_abandoned_call() -> None:
 def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None:
     """A cancellation after final() raised its GenerationError appends nothing.
 
-    The refusal's leaf carried its usage to the caller, so an AbandonedCall here would
+    The RefusalError carried its usage to the caller, so an AbandonedCall here would
     double-count that spend and mislabel a concluded call as an in-flight abandonment.
     """
 
@@ -1488,10 +1488,10 @@ def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_cancelled_after_a_drain_leaf_appends_no_abandoned_call() -> None:
+def test_stream_cancelled_after_a_drain_failure_appends_no_abandoned_call() -> None:
     """A GenerationError raised while draining carries the call, so a cancellation logs nothing.
 
-    The leaf already handed the caller a CallRecord, so an AbandonedCall here would report the
+    The error already handed the caller a CallRecord, so an AbandonedCall here would report the
     same call twice.
     """
 
@@ -1603,12 +1603,12 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
 def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     """A structured refusal detected in the stream's final() surfaces as a row-shaped RefusalError.
 
-    The stream already yielded items to the caller, so the leaf is not retried;
-    final() records the one rejected 200 and raises the leaf carrying that record.
+    The stream already yielded items to the caller, so the error is not retried;
+    final() records the one rejected 200 and raises the RefusalError carrying that record.
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() refuses, then read the raised leaf."""
+        """Drain a stream whose final() refuses, then read the raised RefusalError."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -1735,7 +1735,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
 def test_stream_open_reported_not_sendable_reaches_the_caller_row_shaped() -> None:
     """An adapter that reports the conversation as NotSendable fails the item, row-shaped.
 
-    The handle builds the leaf, so a caller reading model or attempt_records off it succeeds.
+    The handle builds the InvalidRequestError, so a caller reading model or attempt_records off it succeeds.
     """
 
     async def scenario() -> None:

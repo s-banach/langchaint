@@ -9,7 +9,7 @@ so the output type flows from the SDK to the caller without reconstruction.
 
 Reporting model: an adapter reports one attempt; only the retry loop knows the call.
 So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
-constructs a `GenerationError` leaf, which is a verdict about a call it cannot see.
+constructs a `GenerationError`, which is a verdict about a call it cannot see.
 What no arm can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
 that propagate for `Adapter.classify` to sort.
 `AdapterStream.items` is the exception to the return contract, because an async iterator can only

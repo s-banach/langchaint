@@ -909,7 +909,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
 
         Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
         SDK usage object) so a rejected 200's cost is not lost. The stop reason chooses the arm and
-        is not carried on it: what a rejected 200's leaf reports is fixed by the leaf's class.
+        is not carried on it: what a rejected 200 reports is fixed by its GenerationError subclass.
         """
         parsed_output = message.parsed_output
         if parsed_output is None:

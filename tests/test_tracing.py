@@ -276,7 +276,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
 
 
 def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
-    """A refusal leaf yields an error span carrying the rejected 200's real token counts and cost."""
+    """A RefusalError yields an error span carrying the rejected 200's real token counts and cost."""
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports Refused, then inspect the error span."""
@@ -300,7 +300,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
 
 def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None:
-    """A truncation leaf yields an error span with the rejected 200's tokens and max_tokens finish."""
+    """A MaxCompletionTokensExceededError yields an error span with the rejected 200's tokens and max_tokens finish."""
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports Truncated, then inspect the error span."""
@@ -350,7 +350,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
     asyncio.run(scenario())
 
 
-def test_generate_one_rejection_span_names_its_own_leaf_in_error_type() -> None:
+def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None:
     """A rejected request takes error status under its own error.type, not the base class name.
 
     error.type is the low-cardinality key a backend groups failures by, so a provider rejection and

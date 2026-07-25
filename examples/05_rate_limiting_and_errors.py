@@ -3,7 +3,7 @@
 One RateLimiter owns retrying (max_attempts, backoff_base_seconds, backoff_max_seconds) and pacing (max_in_flight).
 It is stateful and shareable: pass one instance to every LLM hitting the same account and they share one budget,
 so a rate-limit error pauses admission for all of them until a request succeeds again.
-generate_one returns a Response on success and raises a GenerationError leaf on every terminal per-item
+generate_one returns a Response on success and raises a GenerationError on every terminal per-item
 outcome, retries exhausted and a rejected request alike.
 
 The LangChain map (RunnableRetry, InMemoryRateLimiter, with_fallbacks) lives in MIGRATING_FROM_LANGCHAIN.md.
@@ -89,7 +89,7 @@ async def generate_with_fallback(
     """Try the primary binding; on any terminal failure, fall back to the secondary.
 
     A fallback is app code because the app decides what counts as worth failing over.
-    GenerationError covers every per-item terminal leaf, so one except clause catches them all.
+    GenerationError is the base of every per-item terminal failure, so one except clause catches them all.
     """
     try:
         return await primary.generate_one(prompt)

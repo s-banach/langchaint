@@ -844,7 +844,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
 
         Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
         SDK usage object) so a rejected 200's cost is not lost.
-        No arm carries a stop reason: each leaf's class fixes it, and _normalized_stop_reason, used
+        No arm carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
         here only to detect the refusal, tests a function_call item ahead of the response status,
         which is right for what a Response reports and wrong for a truncated turn.
         """

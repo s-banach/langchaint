@@ -143,7 +143,7 @@ class StreamHandle[OutputT]:
     def _append_abandoned_call(self) -> None:
         """Record the abandonment, unless no log was given or the conclusion accounted for the call.
 
-        A Response and a GenerationError leaf each hand the caller this call's CallRecord, naming
+        A Response and a GenerationError each hand the caller this call's CallRecord, naming
         the model and the attempts to reconcile against, and the TransientError an Unparsed 200
         raises carries that 200's billing.
         Appending after one would report the same call twice and mislabel a concluded call as an
@@ -230,7 +230,7 @@ class StreamHandle[OutputT]:
         return None
 
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
-        """Build the row-shaped rejection leaf for this handle, chained to cause when there is one.
+        """Build the row-shaped InvalidRequestError for this handle, chained to cause when there is one.
 
         cause is None for a NotSendable outcome: the adapter reported that the conversation cannot be
         sent, and no exception was involved.
@@ -363,8 +363,8 @@ class StreamHandle[OutputT]:
         Without that store, a second call would append a second AttemptRecord for the one request made.
         A structured refusal or truncation is detected only here, when the SDK parses the assembled
         message: the adapter reports it as a Refused or Truncated outcome and this method builds the
-        leaf from it, without retrying (the stream already yielded items to the caller);
-        the leaf reaches the caller carrying the attempt records this handle built.
+        GenerationError from it, without retrying (the stream already yielded items to the caller);
+        it reaches the caller carrying the attempt records this handle built.
 
         Raises:
             StreamProtocolError: the provider's event stream ended without a terminal event.

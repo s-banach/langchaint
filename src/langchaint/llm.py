@@ -380,7 +380,7 @@ class BoundLLM[OutputT]:
     def _classified_error(
         self, exc: Exception, *, ledger: _CallLedger
     ) -> TransientError | GenerationError:
-        """Sort one attempt's exception into the error to retry or this item's terminal leaf.
+        """Sort one attempt's exception into the error to retry or this item's terminal failure.
 
         Reached only for exceptions, which by the adapter contract are attempts the adapter read no
         outcome from: what it did read it reports as an AttemptOutcome arm, which the loop matches
@@ -418,13 +418,13 @@ class BoundLLM[OutputT]:
         ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
         into as each attempt settles, so a cancellation that kills this frame leaves the settled
         attempts readable outside it; generate_one freezes it to build its AbandonedCall.
-        Every leaf and the Response are built from ledger.freeze(), the one site a call's
+        Every GenerationError and the Response are built from ledger.freeze(), the one site a call's
         elapsed_seconds is computed.
 
-        The adapter reports one attempt as an AttemptOutcome arm and never as a leaf, so this loop
-        matches the arm, records what the attempt billed, and constructs the item's leaf here, where
-        the attempts and the timing are known. Only an attempt the adapter read no outcome from
-        arrives as an exception, and Adapter.classify sorts those.
+        The adapter reports one attempt as an AttemptOutcome arm and never as a GenerationError, so
+        this loop matches the arm, records what the attempt billed, and constructs the item's
+        GenerationError here, where the attempts and the timing are known.
+        Only an attempt the adapter read no outcome from arrives as an exception, and Adapter.classify sorts those.
         Each attempt holds a RateLimiter slot for the request only;
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,

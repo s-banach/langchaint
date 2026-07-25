@@ -677,7 +677,7 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
 
-    error.type is the exception's class name, so the GenerationError leaves (RetriesExhaustedError,
+    error.type is the exception's class name, so the GenerationError subclasses (RetriesExhaustedError,
     RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnrecognizedError) are
     groupable by kind rather than only by the error_text message string.
     """

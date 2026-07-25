@@ -12,15 +12,15 @@ conversation caused it. A binding defect langchaint can detect raises at constru
 bind time instead, before any request is sent.
 
 TransientError is a per-attempt control signal.
-The GenerationError leaves are terminal per-item results a to_row failure row is built from:
+The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, InvalidRequestError,
 and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
 so the adapter reports them as AttemptOutcome arms where it reads the response.
-Every leaf is constructed by a retry loop, which is the only scope that knows a call's attempts and
-timing; an adapter reports one attempt and never a leaf.
+Every GenerationError is constructed by a retry loop, which is the only scope that knows a call's
+attempts and timing; an adapter reports one attempt and never a GenerationError.
 
 Three exceptions sit outside this axis, none of them a GenerationError.
 DispatchExceptionGroup and InvalidToolArgsError belong to the tool layer, not the generate loop.
@@ -122,7 +122,7 @@ class GenerationError(_CallCarrier, Exception):
 
     Only a retry loop constructs one of these, because only a loop knows the attempts and the timing,
     and every field is set in the constructor. An adapter reports what one attempt produced (an
-    AttemptOutcome arm) and never a leaf, so no leaf exists in a half-built state.
+    AttemptOutcome arm) and never a GenerationError, so none exists in a half-built state.
     """
 
     call: CallRecord
@@ -136,17 +136,17 @@ class GenerationError(_CallCarrier, Exception):
 
     @property
     def stop_reason(self) -> StopReason | None:
-        """None: no turn completed, which holds for every leaf but RefusalError and MaxCompletionTokensExceededError.
+        """None: no turn completed, true of every subclass but RefusalError and MaxCompletionTokensExceededError.
 
         Fixed by the class rather than taken as a constructor argument, because a raise site must
-        not choose a value the leaf's identity already fixes. Deriving it in to_row instead is
+        not choose a value the subclass already fixes. Deriving it in to_row instead is
         rejected: to_row and gen_ai_attributes both read it off Response | GenerationError, so each
-        would need an isinstance ladder over the leaves.
+        would need an isinstance ladder over the subclasses.
         """
         return None
 
     def _summary(self) -> str:
-        """Return the exception message; leaves override this with their own reason."""
+        """Return the exception message; each subclass overrides this with its own reason."""
         return "generation failed"
 
     @override

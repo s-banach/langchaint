@@ -45,7 +45,7 @@ async def structured_output() -> None:
     """Fix the output type to a model with bind(response_format=Model).
 
     The overload makes this a BoundLLM[Sentiment], so response.output is a Sentiment instance, already validated.
-    A refusal or a truncation on this structured path raises a GenerationError leaf rather than returning bad data;
+    A refusal or a truncation on this structured path raises a GenerationError rather than returning bad data;
     see 05_rate_limiting_and_errors.py for catching those.
     """
     llm = openai_model("gpt-5.6-terra")

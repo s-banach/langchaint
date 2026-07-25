@@ -490,7 +490,7 @@ class BoundLLM[OutputT]:
                         case Unparsed():
                             self.rate_limiter.register_success(admission)
                             error = TransientError(
-                                "structured response contained no parsed output",
+                                "response carried no usable output",
                                 usage=outcome.usage,
                                 usage_raw=outcome.usage_raw,
                             )

@@ -8,10 +8,10 @@ Verified against openai 2.45.0:
   or `response.failed` event's response;
   the adapter captures that response itself because the SDK's `get_final_response()`
   raises RuntimeError unless the terminal event is `response.completed`.
-  Only the `response.completed` event carries a `ParsedResponse`;
-  the other terminal responses are re-validated into one,
-  whose absent parsed output makes the structured path classify the empty parse (refusal,
-  token-cap truncation, or transient).
+  Only the `response.completed` event carries a `ParsedResponse`: the SDK parses that one event's
+  response and passes the `response.incomplete` and `response.failed` responses through as it built
+  them. A terminal response that is not a `ParsedResponse` therefore parsed nothing, which is what
+  the structured path classifies (refusal, token-cap truncation, or transient).
 - `usage.input_tokens` includes `input_tokens_details.cached_tokens` and `input_tokens_details.cache_write_tokens`,
   so it is the provider-reported all-inclusive input total the Usage partition is checked against.
   Cache writes bill starting with gpt-5.6, so the PricingTable's cache-write rate applies here too.
@@ -60,6 +60,15 @@ Mapping decisions:
 - The API reports no finish reason; stop_reason is derived: a `ResponseOutputRefusal` content block means refusal,
   else any `function_call` output item means tool_use, otherwise status "completed" means end_turn,
   status "incomplete" with reason "max_output_tokens" means max_tokens, and anything else is "other".
+- A `ResponseOutputRefusal` content part becomes a TextPart, so the refusal the model wrote is the
+  turn's text and replays as text. anthropic's ContentBlock union has no refusal member
+  (anthropic 0.116.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
+  mapping openai's part to a TextPart gives the two providers one neutral shape and leaves the stop
+  reason as the signal on both.
+- Status "failed" is the API reporting that the run did not finish (`response.error` names why), so
+  whatever it emitted is a fragment rather than the turn. Both bindings report it as Unparsed,
+  carrying that response's billing, and a structured binding does so whether or not the fragment
+  happened to parse.
 - Streaming yields the SDK's own delta strings unwrapped and each tool call once, complete,
   from its `response.output_item.done` event; argument fragments are never surfaced.
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
@@ -410,8 +419,9 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
 
     A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay,
     beside the readable text _reasoning_text extracts from it;
-    a message item becomes one TextPart per output_text content part it holds, in their order
-    (a refusal content part is not a TextPart and is not captured);
+    a message item becomes one TextPart per content part it holds, in their order, from an
+    output_text part and from a refusal part alike, because the sentences the model wrote to refuse
+    are the turn's text and a turn built without them replays as nothing;
     built-in tool call items are dropped (built-in tools are out of scope).
     """
     turn: list[TurnElement] = []
@@ -426,11 +436,11 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
         elif item.type == "function_call":
             turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
         elif item.type == "message":
-            turn.extend(
-                TextPart(text=content_part.text)
-                for content_part in item.content
-                if content_part.type == "output_text"
-            )
+            for content_part in item.content:
+                if content_part.type == "output_text":
+                    turn.append(TextPart(text=content_part.text))
+                elif content_part.type == "refusal":
+                    turn.append(TextPart(text=content_part.refusal))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -691,14 +701,12 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncResponseStream[Any],
         pricing: PricingTable,
-        output_from_response: Callable[
-            [ParsedResponse[Any]], OutputT | Refused | Truncated | Unparsed
-        ],
+        output_from_response: Callable[[OpenAIResponse], OutputT | Refused | Truncated | Unparsed],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
         self._output_from_response = output_from_response
-        self._terminal_response: ParsedResponse[Any] | OpenAIResponse | None = None
+        self._terminal_response: OpenAIResponse | None = None
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -738,26 +746,23 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
     async def final(self) -> ResponseOutcome[OutputT]:
         """Return what the captured terminal response produced.
 
-        Only response.completed carries a ParsedResponse;
-        an incomplete or failed terminal response is re-validated into one whose parsed output is absent,
-        so the structured output extractor classifies the empty parse (Refused, Truncated, or Unparsed)
-        while the text extractor returns the partial output_text.
+        The terminal response reaches the binding's extractor as the SDK built it, never
+        re-validated into another model: the SDK constructs a response leniently and tolerates an
+        output item type or an enum value it does not model, so validating that response against the
+        SDK's own strict model can raise pydantic's ValidationError over a response whose partial
+        output and billing the caller is owed. Passing it through is also what keeps the Response's
+        raw the SDK object by reference.
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so no terminal response was captured.
         """
         if self._terminal_response is None:
             raise StreamProtocolError("final() requires items() to be exhausted first")
-        parsed_response = (
-            self._terminal_response
-            if isinstance(self._terminal_response, ParsedResponse)
-            else ParsedResponse[None].model_validate(self._terminal_response.model_dump())
-        )
-        output = self._output_from_response(parsed_response)
+        output = self._output_from_response(self._terminal_response)
         if isinstance(output, Refused | Truncated | Unparsed):
             return output
         return _adapter_result(
-            response=parsed_response,
+            response=self._terminal_response,
             output=output,
             pricing=self._pricing,
         )
@@ -769,15 +774,42 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
 
 
 class _BoundOpenAIText(BoundAdapter[str]):
-    """Text-bound adapter: output is the concatenated output text."""
+    """Text-bound adapter: output is the concatenated text of the turn."""
 
     def __init__(self, *, adapter: OpenAIResponsesAdapter, request: _OpenAIRequest) -> None:
         self._adapter = adapter
         self._request = request
 
+    def _text_outcome(self, response: OpenAIResponse) -> str | Unparsed:
+        """Return the turn's text, or Unparsed when the API reported the run as failed.
+
+        A failed status means the run did not finish, and response.error names why, so the output
+        items hold whatever had been emitted rather than the turn; reporting that as a Response would
+        present a fragment as the answer. The Unparsed carries this response's billing, so the
+        attempt is paid for and the retry loop sends another.
+        An incomplete status is deliberately not this case: a turn cut off at the token cap is the
+        answer as far as it got, and stop_reason "max_tokens" is how the caller sees that.
+        The text is the assistant turn's, not response.output_text: output_text concatenates the
+        output_text content parts alone, so a refusal turn would come back with an empty output while
+        the same Response's assistant_message carried the sentences the model wrote to refuse.
+        """
+        if response.status == "failed":
+            return Unparsed(
+                usage=(
+                    _normalized_usage(response.usage, pricing=self._adapter.pricing)
+                    if response.usage
+                    else ZERO_USAGE
+                ),
+                usage_raw=response.usage,
+            )
+        return _assistant_message_from(response).text
+
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
-        """Send one non-streaming request via responses.create."""
+    async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[str]:
+        """Send one non-streaming request via responses.create.
+
+        A response the API reported as failed returns the Unparsed arm _text_outcome chose.
+        """
         response = await self._adapter.client.responses.create(
             model=self._request.model,
             instructions=self._request.instructions,
@@ -792,9 +824,12 @@ class _BoundOpenAIText(BoundAdapter[str]):
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
+        output = self._text_outcome(response)
+        if isinstance(output, Unparsed):
+            return output
         return _adapter_result(
             response=response,
-            output=response.output_text,
+            output=output,
             pricing=self._adapter.pricing,
         )
 
@@ -819,7 +854,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
         return _OpenAIStream(
             sdk_stream=sdk_stream,
             pricing=self._adapter.pricing,
-            output_from_response=lambda response: response.output_text,
+            output_from_response=self._text_outcome,
         )
 
 
@@ -837,40 +872,69 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         self._request = request
         self._response_format = response_format
 
-    def _parsed_output(
-        self, response: ParsedResponse[ModelT]
-    ) -> ModelT | Refused | Truncated | Unparsed:
-        """Extract the parsed instance, or report why the turn produced none.
+    def _no_instance(self, response: OpenAIResponse) -> Refused | Truncated | Unparsed:
+        """Report why the turn produced no instance.
 
         Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
         SDK usage object) so a rejected 200's cost is not lost.
         No arm carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
         here only to detect the refusal, tests a function_call item ahead of the response status,
         which is right for what a Response reports and wrong for a truncated turn.
+        A failed status is tested first, ahead of the refusal and the truncation: the API is reporting
+        that the run did not finish, so whatever items it emitted are a fragment, and a refusal part
+        among them is no more the turn than a text part is. Testing the refusal first would make one
+        response Refused here and Unparsed on the text binding, which reads the same status first.
         """
-        if response.output_parsed is None:
-            usage = (
-                _normalized_usage(response.usage, pricing=self._adapter.pricing)
-                if response.usage
-                else ZERO_USAGE
-            )
-            if _normalized_stop_reason(response) == "refusal":
-                return Refused(usage=usage, usage_raw=response.usage)
-            if (
-                response.status == "incomplete"
-                and response.incomplete_details is not None
-                and response.incomplete_details.reason == "max_output_tokens"
-            ):
-                return Truncated(usage=usage, usage_raw=response.usage)
+        usage = (
+            _normalized_usage(response.usage, pricing=self._adapter.pricing)
+            if response.usage
+            else ZERO_USAGE
+        )
+        if response.status == "failed":
             return Unparsed(usage=usage, usage_raw=response.usage)
+        if _normalized_stop_reason(response) == "refusal":
+            return Refused(usage=usage, usage_raw=response.usage)
+        if (
+            response.status == "incomplete"
+            and response.incomplete_details is not None
+            and response.incomplete_details.reason == "max_output_tokens"
+        ):
+            return Truncated(usage=usage, usage_raw=response.usage)
+        return Unparsed(usage=usage, usage_raw=response.usage)
+
+    def _parsed_output(
+        self, response: ParsedResponse[ModelT]
+    ) -> ModelT | Refused | Truncated | Unparsed:
+        """Extract the parsed instance, or report why there is no usable one.
+
+        A failed status is rejected even when the JSON parsed: the run did not finish, and
+        response.error names why, so an instance built from the fragment it had emitted would be
+        presented as the answer. _no_instance sends it to the Unparsed arm, so the attempt is paid
+        for and the retry loop sends another.
+        """
+        if response.status == "failed" or response.output_parsed is None:
+            return self._no_instance(response)
         return response.output_parsed
+
+    def _terminal_output(
+        self, response: OpenAIResponse
+    ) -> ModelT | Refused | Truncated | Unparsed:
+        """Extract the parsed instance from a stream's terminal response, or report why there is none.
+
+        Only a ParsedResponse holds a parsed instance, and the SDK builds one for the completed
+        response alone, so a terminal response of any other type parsed nothing and goes straight to
+        the rejecting arms.
+        """
+        if isinstance(response, ParsedResponse):
+            return self._parsed_output(response)
+        return self._no_instance(response)
 
     @override
     async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[ModelT]:
         """Send one non-streaming request via responses.parse.
 
-        A parse yielding no instance returns the Refused, Truncated, or Unparsed arm _parsed_output
-        chose. NotSendable never arrives: this adapter sends every conversation.
+        A parse yielding no usable instance returns the Refused, Truncated, or Unparsed arm
+        _parsed_output chose. NotSendable never arrives: this adapter sends every conversation.
         """
         response = await self._adapter.client.responses.parse(
             model=self._request.model,
@@ -918,5 +982,5 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         return _OpenAIStream(
             sdk_stream=sdk_stream,
             pricing=self._adapter.pricing,
-            output_from_response=self._parsed_output,
+            output_from_response=self._terminal_output,
         )

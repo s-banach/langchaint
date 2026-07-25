@@ -257,9 +257,9 @@ class Truncated:
 
 @dataclass(frozen=True, kw_only=True)
 class Unparsed:
-    """A completed 200 carrying no parsed instance, for a reason the stop reason does not name.
+    """A billable 200 that produced no usable output, for a reason the stop reason does not name.
 
-    The retry loop records the attempt and retries it, because a later attempt may parse.
+    The retry loop records the attempt and retries it, because a later attempt may produce output.
     A stream handle instead propagates it as a TransientError carrying this attempt's billing,
     because the stream already yielded items to the caller and is not reopened.
     """
@@ -314,7 +314,7 @@ class AdapterStream[OutputT](ABC):
         """Return what the assembled response produced, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
-        A structured parse yielding no instance is Refused, Truncated, or Unparsed rather than a raise,
+        A response the adapter reads and rejects is Refused, Truncated, or Unparsed rather than a raise,
         so the stream handle gets this attempt's billing and decides the item's fate itself.
         NotSendable cannot arrive here: the request is already open.
         """

@@ -15,6 +15,7 @@ import httpx
 import openai
 import pytest
 from openai import AsyncOpenAI
+from openai._models import construct_type_unchecked
 from openai.lib.streaming.responses import AsyncResponseStream, ResponseStreamEvent
 from openai.lib.streaming.responses import (
     ResponseTextDeltaEvent as AccumulatedResponseTextDeltaEvent,
@@ -227,16 +228,35 @@ def test_stop_reason_completed_is_end_turn() -> None:
     assert _normalized_stop_reason(_response(usage=None)) == "end_turn"
 
 
+_REFUSAL_MESSAGE_ITEM: dict[str, object] = {
+    "type": "message",
+    "id": "m1",
+    "role": "assistant",
+    "status": "completed",
+    "content": [{"type": "refusal", "refusal": "I can't help with that"}],
+}
+
+
 def test_stop_reason_refusal_block_is_refusal() -> None:
     """A refusal content block derives refusal, ahead of the status and tool-call checks."""
-    refusal_message: dict[str, object] = {
-        "type": "message",
-        "id": "m1",
-        "role": "assistant",
-        "status": "completed",
-        "content": [{"type": "refusal", "refusal": "I can't help with that"}],
-    }
-    assert _normalized_stop_reason(_response(usage=None, output=[refusal_message])) == "refusal"
+    assert (
+        _normalized_stop_reason(_response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])) == "refusal"
+    )
+
+
+def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
+    """A refusal content part becomes a TextPart, so the refused turn replays as the model wrote it.
+
+    Dropped instead, the turn holds no elements and sends nothing back, which reopens the
+    conversation at the point the model declined.
+    """
+    assistant_message = _assistant_message_from(
+        _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
+    )
+    assert assistant_message.turn == (TextPart(text="I can't help with that"),)
+    assert _assistant_items(assistant_message) == [
+        {"role": "assistant", "content": "I can't help with that"}
+    ]
 
 
 def test_stop_reason_incomplete_for_max_output_tokens_is_max_tokens() -> None:
@@ -673,11 +693,19 @@ class _FakeSDKStream(AsyncResponseStream[None]):
 
 
 def _stream(replay_events: Sequence[ResponseStreamEvent]) -> _OpenAIStream[str]:
-    """Build a text-content adapter stream over replayed events."""
+    """Build a text-content adapter stream over replayed events.
+
+    The extractor is the shipped _BoundOpenAIText one, so these tests pin what a text stream
+    reports for each terminal status.
+    """
+    adapter = _adapter()
+    text_bound = _BoundOpenAIText(
+        adapter=adapter, request=adapter._request(_binding(automatic_prompt_caching=True))
+    )
     return _OpenAIStream(
         sdk_stream=_FakeSDKStream(replay_events),
         pricing=_PRICING,
-        output_from_response=lambda response: response.output_text,
+        output_from_response=text_bound._text_outcome,
     )
 
 
@@ -833,21 +861,68 @@ def test_stream_final_turn_carries_reasoning() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_failed_terminal_is_terminal() -> None:
-    """A failed terminal is terminal: no StreamProtocolError, and final() reports other."""
+def test_stream_failed_terminal_is_terminal_and_unparsed() -> None:
+    """A failed terminal ends the stream without a StreamProtocolError, and final() reports Unparsed.
+
+    The API reported the run as not finished, so whatever text had accumulated is a fragment;
+    returning it as a Response would present that fragment as the turn. The Unparsed carries the
+    response's billing, so the attempt is paid for and the retry loop sends another.
+    """
 
     async def scenario() -> None:
         adapter_stream = _stream([
             ResponseFailedEvent(
                 type="response.failed",
-                response=_response(usage=None, status="failed"),
+                response=_response(usage=_usage_with_cache(), status="failed"),
                 sequence_number=1,
             ),
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == []
+        outcome = await adapter_stream.final()
+        assert isinstance(outcome, Unparsed)
+        assert outcome.usage.input_tokens_total == 1000
+
+    asyncio.run(scenario())
+
+
+def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() -> None:
+    """A terminal response holding an output item the strict model rejects still assembles.
+
+    The SDK builds a non-completed terminal response leniently, tolerating an item type it does not
+    model, so validating that response against the SDK's own strict model would raise
+    ValidationError and destroy a partial answer the caller has already been billed for.
+    """
+    unmodelled_item: dict[str, object] = {"type": "quantum_tool_call", "id": "q1"}
+    leniently_built = construct_type_unchecked(
+        type_=OpenAIResponse,
+        value={
+            "id": "r1",
+            "created_at": 0,
+            "model": "m",
+            "object": "response",
+            "output": [_TEXT_OUTPUT_ITEM, unmodelled_item],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": None,
+        },
+    )
+
+    async def scenario() -> None:
+        adapter_stream = _stream([
+            ResponseIncompleteEvent.construct(
+                type="response.incomplete", response=leniently_built, sequence_number=1
+            ),
+        ])
+        async for _item in adapter_stream.items():
+            pass
         result = _assert_result(await adapter_stream.final())
-        assert result.stop_reason == "other"
+        assert result.output == "hey"
+        assert result.stop_reason == "max_tokens"
+        assert result.raw is leniently_built
 
     asyncio.run(scenario())
 
@@ -931,6 +1006,90 @@ def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
     """A turn with no parsed output is Unparsed: a later attempt may still produce it."""
     outcome = _structured_bound()._parsed_output(_parsed_response(None))
     assert isinstance(outcome, Unparsed)
+
+
+def test_structured_stream_terminal_reports_truncation_from_a_plain_response() -> None:
+    """A structured stream's incomplete terminal is Truncated, read off a response with no parse.
+
+    The SDK parses only the completed event's response, so a terminal that stopped at the token cap
+    arrives as a plain Response. Handing it to _parsed_output would raise AttributeError on
+    output_parsed instead of reporting the truncation.
+    """
+    outcome = _structured_bound()._terminal_output(
+        _response(
+            usage=None,
+            status="incomplete",
+            incomplete_details=IncompleteDetails(reason="max_output_tokens"),
+        )
+    )
+    assert isinstance(outcome, Truncated)
+
+
+def test_structured_stream_terminal_reports_a_failed_run_as_unparsed() -> None:
+    """A structured stream's failed terminal is Unparsed, the same arm the text binding reports."""
+    outcome = _structured_bound()._terminal_output(_response(usage=None, status="failed"))
+    assert isinstance(outcome, Unparsed)
+
+
+def _text_bound() -> _BoundOpenAIText:
+    """Build a text-bound adapter over a keyless client; no request is sent."""
+    adapter = _adapter()
+    return _BoundOpenAIText(
+        adapter=adapter, request=adapter._request(_binding(automatic_prompt_caching=False))
+    )
+
+
+def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
+    """A refused turn's output is the text the model wrote, not the empty output_text.
+
+    The Response the caller reads then carries the same sentences in output and in
+    assistant_message.text, which is what a refusal under the anthropic adapter carries too.
+    """
+    response = _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
+    assert _text_bound()._text_outcome(response) == "I can't help with that"
+
+
+def test_text_bind_send_reports_a_failed_status_as_unparsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed status returns the Unparsed arm from send, carrying that run's billing."""
+    text_bound = _text_bound()
+
+    async def fake_create(**_request_kwargs: object) -> OpenAIResponse:
+        """Return a response the API reported as failed, with real usage on it."""
+        return _response(usage=_usage_with_cache(), status="failed")
+
+    monkeypatch.setattr(text_bound._adapter.client.responses, "create", fake_create)
+    outcome = asyncio.run(text_bound.send([UserMessage(content="q")]))
+    assert isinstance(outcome, Unparsed)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_unparsed_on_a_failed_status_that_parsed() -> None:
+    """A failed run is Unparsed even when its fragment parsed: the fragment is not the answer."""
+    outcome = _structured_bound()._parsed_output(
+        _parsed_response(
+            _StructuredReport(city="Paris", celsius=20), status="failed", usage=_usage_with_cache()
+        )
+    )
+    assert isinstance(outcome, Unparsed)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> None:
+    """A failed status wins over the refusal test, so one response does not split by binding.
+
+    Were the refusal tested first, the structured binding would report Refused (a terminal
+    RefusalError) for a response the text binding retries as Unparsed.
+    """
+    structured_outcome = _structured_bound()._parsed_output(
+        _parsed_response(None, refusal=True, status="failed", usage=_usage_with_cache())
+    )
+    assert isinstance(structured_outcome, Unparsed)
+    text_outcome = _text_bound()._text_outcome(
+        _response(usage=_usage_with_cache(), output=[_REFUSAL_MESSAGE_ITEM], status="failed")
+    )
+    assert isinstance(text_outcome, Unparsed)
 
 
 def test_structured_bind_reports_refused_on_a_refusal_block() -> None:

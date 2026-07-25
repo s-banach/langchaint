@@ -55,8 +55,7 @@ class TransientError(Exception):
     is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
     usage (carrying cost_in_usd) describes the attempt's billable completion when the failing attempt
-    was a completed 200 the adapter rejected downstream (a structured parse that returned no output,
-    which the adapter reports as an Unparsed outcome);
+    was a completed 200 the adapter rejected downstream (which the adapter reports as an Unparsed outcome);
     usage_raw is the raw SDK usage object usage was normalized from, held by reference.
     A transport failure (timeout, 5xx, connection or rate-limit error) billed nothing, so usage is ZERO_USAGE
     and usage_raw is None.

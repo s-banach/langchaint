@@ -10,6 +10,7 @@ because what each arm puts in the shared keys (output, error_text, stop_reason, 
 differs per arm and is what a mixed batch's table shows.
 """
 
+import math
 import time
 
 import pytest
@@ -183,6 +184,23 @@ def test_to_row_cost_is_the_paid_total_across_attempts() -> None:
     )
     assert row["cost_in_usd"] == pytest.approx(1.0)
     assert row["output_tokens"] == 14
+
+
+def test_to_row_carries_an_unpriced_cost_as_nan() -> None:
+    """A response the PricingTable could not price reaches the table as NaN, output intact."""
+    unpriced = Usage(
+        input_tokens_cache_read=2,
+        input_tokens_cache_write=3,
+        input_tokens_cache_none=5,
+        output_tokens=7,
+        output_tokens_reasoning=2,
+        cost_in_usd=float("nan"),
+    )
+    row = to_row(_response(output="hello", attempt_records=(_record(error=None, usage=unpriced),)))
+    assert row["output"] == "hello"
+    assert isinstance(row["cost_in_usd"], float)
+    assert math.isnan(row["cost_in_usd"])
+    assert row["output_tokens"] == 7
 
 
 def test_to_row_structured_output_becomes_json() -> None:

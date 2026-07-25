@@ -10,7 +10,7 @@ they are born together in each adapter's _normalized_usage, and one sum folds bo
 
 from collections.abc import Iterable
 
-from pydantic import ConfigDict, NonNegativeFloat, NonNegativeInt
+from pydantic import ConfigDict, NonNegativeInt
 
 from langchaint.checked_copy import CheckedCopyModel
 
@@ -40,7 +40,19 @@ class Usage(CheckedCopyModel):
     input_tokens_cache_none: NonNegativeInt
     output_tokens: NonNegativeInt
     output_tokens_reasoning: NonNegativeInt
-    cost_in_usd: NonNegativeFloat
+    cost_in_usd: float
+    """NaN when the response reported a token category the PricingTable cannot price
+    (1-hour cache writes with no cache_write_1h_usd_per_million_tokens).
+
+    Every sum containing it is NaN, and the test for it is math.isnan,
+    because nan > limit and nan < limit are both False.
+    It carries no non-negative constraint, unlike the counters: that constraint rejects NaN,
+    so an unpriceable response would fail validation and take its output down with it.
+    What the constraint would have caught is a negative rate in the caller's own PricingTable,
+    surfaced one response later as a field error naming neither the table nor the rate.
+    Validating the table's rates instead is rejected:
+    a negative price is the caller's own arithmetic, not a provider rule langchaint guards.
+    """
 
     @property
     def input_tokens_total(self) -> int:

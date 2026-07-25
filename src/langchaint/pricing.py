@@ -7,10 +7,8 @@ so a reported breakdown and the stored scalar cannot disagree.
 The extraction is per-backend because only the raw SDK usage keeps the 5-minute / 1-hour cache-write split
 the neutral Usage collapses into one input_tokens_cache_write counter.
 
-This module imports no SDK and no error class: price raises the built-in ValueError,
-so the generation-path concept FatalError stays out of the neutral core;
-only the anthropic adapter's generation path translates the ValueError into a FatalError,
-where a shared pricing-table defect genuinely dooms every call sharing the table.
+This module imports no SDK and no error class: a category the table cannot price costs NaN,
+so price has no failure to signal.
 """
 
 from dataclasses import dataclass
@@ -69,7 +67,7 @@ class CostBreakdown:
 
     @property
     def total_cost_in_usd(self) -> float:
-        """The whole request's cost."""
+        """The whole request's cost; NaN when the table could not price one of the categories."""
         return self.input_tokens_cost_in_usd + self.output_tokens_cost_in_usd
 
 
@@ -80,22 +78,22 @@ def price(counts: PriceableCounts, pricing: PricingTable) -> CostBreakdown:
     and sum to total_cost_in_usd exactly; that association differs from a fused single-division
     chain only at sub-ULP scale, immaterial once billing rounds to cents.
 
-    Raises:
-        ValueError: counts carry 1-hour cache writes but pricing has no
-            cache_write_1h_usd_per_million_tokens.
+    A category the table cannot price costs NaN: counts carrying 1-hour cache writes against a
+    table with no cache_write_1h_usd_per_million_tokens.
+    Raising instead would destroy the paid response the counts came from,
+    so the unknown travels as NaN in its own category and in every sum containing it,
+    and the counts stay readable for an application that prices the call itself.
     """
     input_tokens_cache_write_1h_cost_in_usd = 0.0
     if counts.input_tokens_cache_write_1h:
         if pricing.cache_write_1h_usd_per_million_tokens is None:
-            raise ValueError(
-                "the counts carry 1-hour cache writes but the PricingTable "
-                "has no cache_write_1h_usd_per_million_tokens"
+            input_tokens_cache_write_1h_cost_in_usd = float("nan")
+        else:
+            input_tokens_cache_write_1h_cost_in_usd = (
+                counts.input_tokens_cache_write_1h
+                * pricing.cache_write_1h_usd_per_million_tokens
+                / 1_000_000
             )
-        input_tokens_cache_write_1h_cost_in_usd = (
-            counts.input_tokens_cache_write_1h
-            * pricing.cache_write_1h_usd_per_million_tokens
-            / 1_000_000
-        )
     return CostBreakdown(
         counts=counts,
         input_tokens_cache_none_cost_in_usd=(

@@ -451,10 +451,8 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
     `usage.input_tokens` excludes cache reads and writes (verified against anthropic 0.116.0),
     so it is exactly the uncached-input counter.
     output_tokens_details is optional on the SDK Usage.
-
-    Raises:
-        FatalError: propagated from _cost_in_usd when the response reports 1-hour cache writes
-            but the PricingTable has no cache_write_1h_usd_per_million_tokens.
+    The cost is the same price() call the public cost_breakdown makes,
+    so the stored scalar and a reported breakdown cannot disagree.
     """
     output_tokens_details = usage.output_tokens_details
     return Usage(
@@ -465,7 +463,7 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
         output_tokens_reasoning=(
             output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
         ),
-        cost_in_usd=_cost_in_usd(usage=usage, pricing=pricing),
+        cost_in_usd=price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd,
     )
 
 
@@ -475,11 +473,6 @@ def cost_breakdown(usage_raw: anthropic.types.Usage, pricing: PricingTable) -> C
     The raw usage is consumed (not the neutral Usage) because only it keeps the 5-minute / 1-hour
     cache-write split the two rates need, and the arithmetic is the same price() call that produced
     the stored Usage.cost_in_usd for the same response, so total_cost_in_usd equals it.
-
-    Raises:
-        ValueError: usage_raw reports 1-hour cache writes but pricing has no
-            cache_write_1h_usd_per_million_tokens (propagated from price;
-            a standalone reporting call is not a generation, so this is never FatalError).
     """
     return price(counts=_priceable_counts(usage_raw), pricing=pricing)
 
@@ -506,32 +499,10 @@ def _priceable_counts(usage: anthropic.types.Usage) -> PriceableCounts:
     )
 
 
-def _cost_in_usd(usage: anthropic.types.Usage, pricing: PricingTable) -> float:
-    """Price the raw counts for the generation path, where a batch exists.
-
-    Shares price() and _priceable_counts with the public cost_breakdown,
-    so the stored Usage.cost_in_usd and a reported breakdown cannot disagree.
-
-    Raises:
-        FatalError: the response reports 1-hour cache writes but the PricingTable has no
-            cache_write_1h_usd_per_million_tokens. A pricing-table defect dooms every sibling
-            sharing it, so it aborts the batch, carrying the billed 200's raw usage as evidence.
-    """
-    try:
-        return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
-    except ValueError as exc:
-        raise FatalError(str(exc), usage_raw=usage) from exc
-
-
 def _adapter_result[OutputT](
     message: anthropic.types.Message, output: OutputT, pricing: PricingTable
 ) -> AdapterResult[OutputT]:
-    """Normalize one completed message around already-extracted output.
-
-    Raises:
-        FatalError: propagated from _normalized_usage when the response reports 1-hour cache writes
-            but the PricingTable has no cache_write_1h_usd_per_million_tokens.
-    """
+    """Normalize one completed message around already-extracted output."""
     return AdapterResult(
         output=output,
         assistant_message=_assistant_message_from(message),
@@ -600,8 +571,9 @@ class AnthropicMessagesAdapter(Adapter):
         Raises:
             ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens.
                 Every 1-hour marker this adapter would write produces 1-hour cache writes the table
-                cannot price, so the first cached response would abort its batch; failing here turns
-                that mid-batch abort into an immediate config error before any request is sent.
+                cannot price, so every response writing to the cache would report cost_in_usd as NaN;
+                failing here turns an unknown cost on paid responses into a config error
+                before any request is sent.
                 Also raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
         if cache_ttl == "1h" and pricing.cache_write_1h_usd_per_million_tokens is None:
@@ -901,8 +873,6 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
                 terminal per-item, not retried.
             TransientError: the turn completed but carried no parsed output for another reason,
                 which a later attempt may fix.
-            FatalError: propagated from _normalized_usage when the response reports 1-hour cache writes
-                but the PricingTable has no cache_write_1h_usd_per_million_tokens.
         """
         parsed_output = message.parsed_output
         if parsed_output is None:

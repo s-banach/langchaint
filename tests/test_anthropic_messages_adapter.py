@@ -8,6 +8,7 @@ and the precomputed request the binding determines.
 import asyncio
 import base64
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Sequence
 from typing import get_args, override
@@ -61,7 +62,6 @@ from langchaint.anthropic.messages_adapter import (
     _assistant_content_blocks,
     _assistant_message_from,
     _BoundAnthropicStructured,
-    _cost_in_usd,
     _normalized_stop_reason,
     _normalized_usage,
     _user_content_blocks,
@@ -147,7 +147,7 @@ def test_normalized_usage_partitions_input_counters_and_prices() -> None:
     assert usage.input_tokens_cache_write == 30
     assert usage.input_tokens_cache_none == 100
     assert usage.input_tokens_total == 330
-    assert usage.cost_in_usd == _cost_in_usd(_usage_with_cache_split(), _PRICING)
+    assert usage.cost_in_usd == (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
 
 
 def test_normalized_usage_treats_none_cache_counts_as_zero() -> None:
@@ -175,7 +175,7 @@ def test_normalized_usage_reads_reasoning_tokens_and_defaults_to_zero() -> None:
 
 def test_cost_splits_five_minute_and_one_hour_cache_writes() -> None:
     """The two cache-write tiers bill at their own rates from cache_creation."""
-    cost = _cost_in_usd(_usage_with_cache_split(), _PRICING)
+    cost = _normalized_usage(_usage_with_cache_split(), _PRICING).cost_in_usd
     expected = (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
     assert abs(cost - expected) < 1e-12
 
@@ -187,17 +187,20 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
         output_tokens=0,
         cache_creation_input_tokens=40,
     )
-    cost = _cost_in_usd(usage, _PRICING)
+    cost = _normalized_usage(usage, _PRICING).cost_in_usd
     expected = (100 * 3.0 + 40 * 3.75) / 1e6
     assert abs(cost - expected) < 1e-12
 
 
-def test_cost_raises_fatal_when_one_hour_writes_lack_a_rate() -> None:
-    """A 1-hour write with no cache_write_1h rate is a configuration defect; the FatalError keeps the raw usage."""
-    usage = _usage_with_cache_split()
-    with pytest.raises(FatalError) as raised:
-        _cost_in_usd(usage, _PRICING_NO_1H)
-    assert raised.value.usage_raw is usage
+def test_cost_is_nan_when_one_hour_writes_lack_a_rate() -> None:
+    """An unpriceable 1-hour write makes cost_in_usd NaN and leaves the counters intact.
+
+    The response was paid for, so the generation path keeps it and reports the cost as unknown.
+    """
+    usage = _normalized_usage(_usage_with_cache_split(), _PRICING_NO_1H)
+    assert math.isnan(usage.cost_in_usd)
+    assert usage.input_tokens_total == 330
+    assert usage.output_tokens == 50
 
 
 def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
@@ -217,10 +220,13 @@ def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
     assert breakdown.total_cost_in_usd == _normalized_usage(usage, _PRICING).cost_in_usd
 
 
-def test_cost_breakdown_raises_value_error_when_one_hour_writes_lack_a_rate() -> None:
-    """The public reporting call surfaces the plain ValueError; FatalError is generation-only."""
-    with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
-        cost_breakdown(_usage_with_cache_split(), _PRICING_NO_1H)
+def test_cost_breakdown_is_nan_only_in_the_unpriceable_category() -> None:
+    """The reporting call names which category went unpriced instead of failing whole."""
+    breakdown = cost_breakdown(_usage_with_cache_split(), _PRICING_NO_1H)
+    assert math.isnan(breakdown.input_tokens_cache_write_1h_cost_in_usd)
+    assert math.isnan(breakdown.total_cost_in_usd)
+    assert breakdown.input_tokens_cache_write_cost_in_usd == 10 * 3.75 / 1e6
+    assert breakdown.counts.input_tokens_cache_write_1h == 20
 
 
 def test_one_hour_ttl_requires_the_one_hour_rate_at_construction() -> None:

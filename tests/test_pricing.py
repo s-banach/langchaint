@@ -4,7 +4,7 @@ These import no SDK: price consumes already-split PriceableCounts,
 and the per-backend extraction from raw SDK usage is tested in the adapter test modules.
 """
 
-import pytest
+import math
 
 from langchaint import PriceableCounts, PricingTable, price
 
@@ -56,10 +56,14 @@ def test_price_parts_sum_to_the_derived_totals() -> None:
     )
 
 
-def test_price_raises_value_error_when_one_hour_writes_lack_a_rate() -> None:
-    """A 1-hour write count with no 1h rate is the plain built-in ValueError, no batch type."""
-    with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
-        price(counts=_COUNTS, pricing=_PRICING_NO_1H)
+def test_price_is_nan_for_one_hour_writes_with_no_rate() -> None:
+    """Only the unpriceable category is NaN; the others still price, and the totals carry it."""
+    breakdown = price(counts=_COUNTS, pricing=_PRICING_NO_1H)
+    assert math.isnan(breakdown.input_tokens_cache_write_1h_cost_in_usd)
+    assert breakdown.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
+    assert breakdown.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
+    assert math.isnan(breakdown.input_tokens_cost_in_usd)
+    assert math.isnan(breakdown.total_cost_in_usd)
 
 
 def test_price_needs_no_one_hour_rate_when_the_slot_is_zero() -> None:

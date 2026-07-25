@@ -1,9 +1,12 @@
 """Usage: the input partition, the non-negativity guard, and addition.
 
 The three input counters are a disjoint partition, so input_tokens_total is their sum.
-Every counter is non-negative by validation, which the openai adapter's subtraction relies on.
+Every counter is non-negative by validation, which the openai adapter's subtraction relies on;
+cost_in_usd carries no such constraint, because an unpriceable category stores NaN there.
 Usage is summable: __add__ folds counters and cost fieldwise, and Usage.sum_of / ZERO_USAGE total a batch.
 """
+
+import math
 
 import pytest
 from pydantic import ValidationError
@@ -48,10 +51,20 @@ def test_negative_counter_is_rejected() -> None:
         _usage(cache_read=900, cache_write=200, cache_none=-100, output=40)
 
 
-def test_negative_cost_is_rejected() -> None:
-    """cost_in_usd is non-negative by validation."""
-    with pytest.raises(ValidationError):
-        _usage(cost=-0.01)
+def test_nan_cost_is_stored() -> None:
+    """cost_in_usd carries no constraint, so an unpriceable response's NaN survives construction.
+
+    A non-negative constraint rejects NaN, which would fail the whole Usage
+    and take the paid response's output down with it.
+    """
+    assert math.isnan(_usage(output=40, cost=float("nan")).cost_in_usd)
+
+
+def test_a_sum_containing_a_nan_cost_is_nan() -> None:
+    """One unpriceable response makes the batch total NaN, not a silently low number."""
+    total = Usage.sum_of([_usage(output=40, cost=0.25), _usage(output=10, cost=float("nan"))])
+    assert math.isnan(total.cost_in_usd)
+    assert total.output_tokens == 50
 
 
 def test_add_is_fieldwise_including_cost_and_reasoning() -> None:

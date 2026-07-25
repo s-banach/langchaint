@@ -438,6 +438,8 @@ def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
     input_tokens includes cached and cache-write tokens (verified against openai 2.45.0),
     so the uncached counter is the remainder after subtracting them.
     output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
+    The cost is the same price() call the public cost_breakdown makes,
+    so the stored scalar and a reported breakdown cannot disagree.
     """
     details = usage.input_tokens_details
     return Usage(
@@ -448,7 +450,7 @@ def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
         ),
         output_tokens=usage.output_tokens,
         output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
-        cost_in_usd=_cost_in_usd(usage=usage, pricing=pricing),
+        cost_in_usd=price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd,
     )
 
 
@@ -458,7 +460,7 @@ def cost_breakdown(usage_raw: ResponseUsage, pricing: PricingTable) -> CostBreak
     The arithmetic is the same price() call that produced the stored Usage.cost_in_usd
     for the same response, so total_cost_in_usd equals it.
     OpenAI has one cache-write tier, priced at cache_write_usd_per_million_tokens,
-    so input_tokens_cache_write_1h is always 0 and price's missing-1h-rate ValueError cannot fire here.
+    so input_tokens_cache_write_1h is always 0 and no category here can go unpriced.
     """
     return price(counts=_priceable_counts(usage_raw), pricing=pricing)
 
@@ -481,16 +483,6 @@ def _priceable_counts(usage: ResponseUsage) -> PriceableCounts:
         input_tokens_cache_write_1h=0,
         output_tokens=usage.output_tokens,
     )
-
-
-def _cost_in_usd(usage: ResponseUsage, pricing: PricingTable) -> float:
-    """Price the raw counts through the same price() call cost_breakdown uses.
-
-    Sharing the one arithmetic path keeps the stored Usage.cost_in_usd and a reported breakdown
-    from disagreeing. _priceable_counts always fills input_tokens_cache_write_1h with 0,
-    so price's missing-1h-rate ValueError cannot fire and no translation to a batch error is needed.
-    """
-    return price(counts=_priceable_counts(usage), pricing=pricing).total_cost_in_usd
 
 
 def _adapter_result[OutputT](

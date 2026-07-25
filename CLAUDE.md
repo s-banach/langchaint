@@ -45,6 +45,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Admit a field to `Usage` only if it is a provider-invariant counter or the priced scalar absorbing provider-variant billing structure; keep provider-specific detail on the raw SDK usage beside it, and never let `usage` be `None` on a carrier.
 - Compute the cost breakdown on demand, never stored (a derived cost does not fold like a counter), routed through the same pricing call as the stored scalar so they cannot drift.
 - Scope `usage` as the paid total across every attempt, on success and on failure, folded from the attempt records, the one source of truth.
+- Price a category the rate table cannot price as NaN, never as an exception and never as zero: the response was paid for, so reporting an unknown cost must not destroy the output. `float | None` is rejected, because it makes every fold and every row branch on None for a condition a constructor check already prevents.
 - No separate Bedrock adapter: the existing adapters take the SDKs' bundled Bedrock clients, and there is no Converse adapter. Never fabricate a price or a model catalog: default pricing only from a carried rate table, require it where no table maps to the model id, and call a first-party list price on a rate-setting platform an estimate.
 - OpenAI support is the Responses API; a Chat Completions adapter is unbuilt, not rejected.
 - Yield from streams only `StreamItem = str | ToolCall`: no delta items, no usage or stop items (those live on the final response).

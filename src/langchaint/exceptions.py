@@ -134,27 +134,24 @@ class FatalError(Exception):
     the same way, so generate_many cancels the siblings and reports the abort as a BatchAbortedError;
     generate_one propagates this error itself.
     It is deliberately not a GenerationError: those are per-item rows, this kills every item.
-    Examples: bad credentials, an invalid request, an ImagePart media_type outside the API's set,
-    a response with 1-hour cache writes but no cache_write_1h_usd_per_million_tokens.
+    Examples: bad credentials, an invalid request, an ImagePart media_type outside the API's set.
     Adapters classify only known-systematic provider errors as "fatal";
     an unrecognized error becomes the per-item UnrecognizedError instead.
     attempt_records holds the raising call's prior transient attempts, so their usage survives the raise;
     adapter raise sites leave it empty and the retry loop fills it before propagating.
-    The fatal attempt itself has no record: __cause__ carries its exception where one exists, and
-    usage_raw is the raw SDK usage object when the fatal error fired after a billed 200
-    (the unpriced-1-hour-write case), None otherwise, so that one payload stays recoverable.
+    The fatal attempt itself has no record: every raise site is either before the request is sent
+    or on a provider exception the adapter cannot read billing from, so nothing billable is lost;
+    __cause__ carries that exception where one exists.
     """
 
     def __init__(
         self,
         message: str,
         *,
-        usage_raw: BaseModel | None = None,
         attempt_records: tuple[AttemptRecord, ...] = (),
     ) -> None:
-        """Store the billed-200 evidence and the prior attempts' records."""
+        """Store the prior attempts' records."""
         super().__init__(message)
-        self.usage_raw = usage_raw
         self.attempt_records = attempt_records
 
 

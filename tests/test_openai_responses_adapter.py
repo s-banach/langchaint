@@ -65,7 +65,6 @@ from langchaint.openai.responses_adapter import (
     _assistant_message_from,
     _BoundOpenAIStructured,
     _BoundOpenAIText,
-    _cost_in_usd,
     _normalized_stop_reason,
     _normalized_usage,
     _OpenAIStream,
@@ -145,7 +144,7 @@ def test_normalized_usage_subtracts_cache_from_input_tokens_and_prices() -> None
     assert usage.input_tokens_cache_write == 100
     assert usage.input_tokens_cache_none == 300
     assert usage.input_tokens_total == 1000
-    assert usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+    assert usage.cost_in_usd == (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
 
 
 def test_normalized_usage_reads_reasoning_tokens() -> None:
@@ -183,7 +182,7 @@ def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
 
 def test_cost_prices_each_cache_tier_and_the_remainder() -> None:
     """Cache reads, cache writes, the uncached remainder, and output each bill at their rate."""
-    cost = _cost_in_usd(_usage_with_cache(), _PRICING)
+    cost = _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
     expected = (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
     assert abs(cost - expected) < 1e-12
 
@@ -449,7 +448,7 @@ def test_adapter_result_normalizes_a_response_with_usage() -> None:
     result = _adapter_result(response=response, output="hey", pricing=_PRICING)
     assert result.output == "hey"
     assert result.usage.input_tokens_total == 1000
-    assert result.usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+    assert result.usage.cost_in_usd == _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
     assert result.usage_raw is response.usage
     assert result.stop_reason == "end_turn"
     assert result.raw is response
@@ -795,7 +794,10 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
         assert result.output == "hey"
         assert result.stop_reason == "end_turn"
         assert result.usage.input_tokens_total == 1000
-        assert result.usage.cost_in_usd == _cost_in_usd(_usage_with_cache(), _PRICING)
+        assert (
+            result.usage.cost_in_usd
+            == _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
+        )
 
     asyncio.run(scenario())
 

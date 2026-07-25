@@ -1294,8 +1294,9 @@ def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
 def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
     """A cancellation while the pre-first-item retry is reopening returns its slot.
 
-    The reopen runs inside __anext__'s transient-failure handler, which no sibling except clause covers,
-    so the release here is __aexit__'s: the block is still open, unlike a cancellation inside __aenter__.
+    The reopen runs inside _next_item's transient-failure handler, which no sibling except clause covers.
+    _open_stream_with_retries releases in its own BaseException handler, so the block's exit is not what
+    returns the slot.
     """
 
     async def scenario() -> None:

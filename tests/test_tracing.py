@@ -24,12 +24,12 @@ from typing import assert_type, override
 import jsonschema
 import pytest
 from opentelemetry import trace
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 from opentelemetry.semconv.attributes import error_attributes as error_semconv
-from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.trace import NonRecordingSpan, SpanKind, StatusCode
 from pydantic import BaseModel
 
 import langchaint.tracing
@@ -223,6 +223,119 @@ def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(_SchemaValidatingSpanProcessor(exporter))
     return tracer_provider.get_tracer("test"), exporter
+
+
+class _RaisingSpanProcessor(SpanProcessor):
+    """A SpanProcessor whose on_end raises.
+
+    Span.end calls on_end with no guard of its own, so this raise reaches whatever ended the span.
+    Raising here rather than from an exporter is what makes the raise observable: the bundled
+    SimpleSpanProcessor catches its exporter's failure and only logs.
+    """
+
+    @override
+    def on_end(self, span: ReadableSpan) -> None:
+        """Raise instead of exporting.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("span processor boom")
+
+
+def _raising_processor_tracer() -> trace.Tracer:
+    """Build a recording tracer whose every span end raises out of its processor."""
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(_RaisingSpanProcessor())
+    return tracer_provider.get_tracer("test")
+
+
+def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None:
+    """A broken SpanProcessor costs the telemetry, never the result the call returned.
+
+    Every entry point that owns a span is driven, because a guard added to one of them and missed on
+    another is the failure this asserts against: each ends its span on its own path.
+    """
+
+    async def scenario() -> None:
+        """Drive each span-owning entry point under a tracer whose span end raises."""
+        tracer = _raising_processor_tracer()
+        traced = TracedLLM(
+            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
+        )
+        bound = traced.bind(automatic_prompt_caching=True)
+
+        assert (await bound.generate_one("hi")).output == "hi"
+        (row,) = await bound.generate_many(["hi"])
+        assert isinstance(row, Response)
+        assert row.output == "hi"
+
+        async with bound.stream_one("hi") as stream:
+            items = [item async for item in stream if isinstance(item, str)]
+            assert (await stream.final()).output == "".join(items)
+
+        tool_manager = TracedToolManager(
+            [_echo_tool()], tracer=tracer, capture_message_content=False
+        )
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
+        )
+        assert isinstance(outcome, DispatchHandled)
+
+        with agent_span(
+            tracer, agent_name="specialist", agent_path="root/specialist", usage=lambda: _USAGE
+        ):
+            pass
+
+    asyncio.run(scenario())
+
+
+class _IsRecordingRaisesSpan(NonRecordingSpan):
+    """A span whose is_recording raises, standing in for a third-party Span implementation."""
+
+    def __init__(self) -> None:
+        super().__init__(trace.INVALID_SPAN_CONTEXT)
+
+    @override
+    def is_recording(self) -> bool:
+        """Raise instead of answering.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("is_recording boom")
+
+
+class _IsRecordingRaisesTracer(trace.NoOpTracer):
+    """A tracer handing out spans whose is_recording raises."""
+
+    @override
+    def start_span(self, name: str, *_args: object, **_kwargs: object) -> trace.Span:
+        """Return the span whose is_recording raises, ignoring every span argument."""
+        return _IsRecordingRaisesSpan()
+
+
+def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -> None:
+    """A span implementation that raises from is_recording costs the telemetry, never the error.
+
+    The read runs while the InvalidRequestError unwinds, so an unguarded one replaces the error the
+    caller came for with the span's RuntimeError.
+    capture_message_content is True so _apply_content_attributes reads the span at span start, not
+    only _apply_result_attributes as the InvalidRequestError unwinds.
+    """
+
+    async def scenario() -> None:
+        """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
+        adapter = _FakeAdapter(failures=[NotSendable(reason="misconfigured")])
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            tracer=_IsRecordingRaisesTracer(),
+            capture_message_content=True,
+        )
+        with pytest.raises(InvalidRequestError):
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+
+    asyncio.run(scenario())
 
 
 class _MidFailStream(_FakeStream):
@@ -1538,6 +1651,7 @@ def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() 
     (finished,) = exporter.get_finished_spans()
     assert finished.status.status_code == StatusCode.ERROR
     assert finished.attributes is not None
+    assert finished.attributes["error.type"] == "RuntimeError"
     assert finished.attributes["gen_ai.usage.input_tokens"] == 6
     assert finished.attributes["gen_ai.usage.output_tokens"] == 2
     assert finished.attributes["langchaint.cost_in_usd"] == pytest.approx(0.02)
@@ -1615,6 +1729,32 @@ def test_agent_span_logs_a_raising_usage_callable_instead_of_propagating(
     assert finished.status.status_code == StatusCode.ERROR
     assert finished.attributes is not None
     assert "gen_ai.usage.input_tokens" not in finished.attributes
+    assert finished.attributes["gen_ai.agent.name"] == "specialist"
+
+
+def test_agent_span_ends_even_when_the_exit_attribute_pass_raises_a_base_exception() -> None:
+    """A usage() that raises past the Exception guards still leaves the span ended.
+
+    The exit attributes are set in a finally of their own, inside the finally that ends the span,
+    so no failure of the attribute pass can leave the span open. A BaseException is the case the
+    per-callable guards do not cover, and an unended span is invisible to every exporter.
+    """
+    tracer, exporter = _in_memory_tracer()
+
+    def raising_usage() -> Usage:
+        raise KeyboardInterrupt
+
+    with (
+        pytest.raises(KeyboardInterrupt),
+        agent_span(
+            tracer, agent_name="specialist", agent_path="root/specialist", usage=raising_usage
+        ),
+    ):
+        pass
+    (finished,) = exporter.get_finished_spans()
+    assert finished.name == "invoke_agent specialist"
+    # The identity was set at span start, before usage() ran, so the interrupt does not discard it.
+    assert finished.attributes is not None
     assert finished.attributes["gen_ai.agent.name"] == "specialist"
 
 

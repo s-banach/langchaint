@@ -135,13 +135,16 @@ from langchaint.tools import (
 )
 from langchaint.usage import Usage
 
-type SpanAttributes = Mapping[str, str | bool | int | float | Sequence[str]]
-"""A span's attributes, keyed by name.
+type SpanAttributeValue = str | bool | int | float | Sequence[str]
+"""One span attribute's value.
 
-The value union is the subset of OTel's AttributeValue langchaint emits;
+The union is the subset of OTel's AttributeValue langchaint emits;
 the Sequence[str] arm exists because OTel attribute values include homogeneous string arrays
 and the GenAI convention's finish-reason key gen_ai.response.finish_reasons is one.
 """
+
+type SpanAttributes = Mapping[str, SpanAttributeValue]
+"""A span's attributes, keyed by name."""
 
 type AttributeMapper = Callable[[Response[object] | GenerationError], SpanAttributes]
 """Maps one generate result to its span attributes.
@@ -165,6 +168,90 @@ _EXECUTE_TOOL_OPERATION = "execute_tool"
 """The GenAI operation value for a tool execution (GenAiOperationNameValues.EXECUTE_TOOL)."""
 
 _logger = logging.getLogger("langchaint.tracing")
+
+
+@contextmanager
+def _guarding_telemetry_failures(what: str) -> Generator[None]:
+    """Log whatever the block raises instead of letting it out.
+
+    Every call that hands OTel something to record (an attribute, a status, an event, the end) is
+    caught and logged rather than propagated, because the caller's result is worth more than its
+    telemetry: a span implementation or a SpanProcessor's on_end that raises would otherwise turn a
+    paid Response into that exception, with the CallRecord and the usage gone. Several of those calls
+    also run while an exception unwinds, where a raise would replace the error the caller came for.
+    This is the shared form; the helpers that first invoke an application callable catch with their
+    own try/except so the log can name which callable failed.
+    Only Exception is caught, so a cancellation still reaches the caller.
+    """
+    try:
+        yield
+    except Exception:
+        _logger.warning("%s raised; this span's telemetry is incomplete", what, exc_info=True)
+
+
+def _is_recording(span: Span) -> bool:
+    """Read whether the span records, treating an Exception as not recording.
+
+    Every site that skips building attributes for a non-recording span asks through here, several of
+    them while an exception unwinds, where a raise would replace the error the caller came for.
+    Reading False on an Exception skips the attributes rather than the caller's result.
+    """
+    try:
+        return span.is_recording()
+    except Exception:
+        _logger.warning(
+            "reading whether the span records raised; treating it as not recording", exc_info=True
+        )
+        return False
+
+
+def _start_span(tracer: Tracer, name: str, *, kind: SpanKind) -> Span:
+    """Start one span, returning a non-recording span when the tracer itself raises.
+
+    Every later call on the returned span is guarded too, so the fallback needs only to be a Span;
+    a non-recording one makes each of them a no-op and the traced call runs untraced rather than
+    failing.
+    """
+    try:
+        return tracer.start_span(name, kind=kind)
+    except Exception:
+        _logger.warning(
+            "starting the %s span raised; this call runs untraced", name, exc_info=True
+        )
+        return trace.INVALID_SPAN
+
+
+def _end_span(span: Span) -> None:
+    """End one span, without letting the end reach the caller.
+
+    Span.end calls the processor's on_end with no guard of its own (opentelemetry-sdk 1.43.0), so a
+    SpanProcessor that raises there raises here: on the success path, where the exception would
+    displace the Response, and on the failure paths, where it would displace the error the caller
+    came for. The bundled SimpleSpanProcessor catches its exporter's failure itself, so the raise
+    this guards against comes from a processor an application installed.
+    """
+    with _guarding_telemetry_failures("ending the span"):
+        span.end()
+
+
+def _set_ok_status(span: Span) -> None:
+    """Mark one span successful, without letting the call reach the caller."""
+    with _guarding_telemetry_failures("setting the span status"):
+        span.set_status(Status(StatusCode.OK))
+
+
+def _set_span_attribute(span: Span, key: str, value: SpanAttributeValue) -> None:
+    """Set one attribute on a recording span, without letting the call reach the caller."""
+    with _guarding_telemetry_failures(f"setting {key}"):
+        if _is_recording(span):
+            span.set_attribute(key, value)
+
+
+def _set_span_attributes(span: Span, attributes: SpanAttributes) -> None:
+    """Set a mapping of attributes on a recording span, without letting the call reach the caller."""
+    with _guarding_telemetry_failures("setting the span attributes"):
+        if attributes and _is_recording(span):
+            span.set_attributes(attributes)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -282,31 +369,52 @@ def agent_span(
     For a usage key the overwrite happens only when usage() returns: a raising usage() leaves the
     usage attributes unset, so an extra claiming a gen_ai.usage.* key survives on that path.
 
-    A raise from usage() or extra_attributes() is caught and logged at warning level and never
+    An Exception from usage() or extra_attributes() is caught and logged at warning level and never
     propagated, the same guard the attribute mapper gets: the exit runs in a finally, where a raise
     would displace the exception already unwinding the loop, a CancelledError included.
+
+    The span is started and ended through this module's guarded helpers, and made current by
+    trace.use_span with its exception recording and status setting off, rather than by
+    tracer.start_as_current_span: that helper ends the span in a bare finally, so a SpanProcessor
+    whose on_end raised would come out of the application's `with agent_span(...)` block and take
+    the loop's result with it.
+    Recording the body's exception is this module's too, so an invoke_agent span carries the
+    error.type every other span here carries.
+    The end sits in its own finally outside the one that sets the exit attributes, so nothing the
+    attribute pass can raise, a BaseException out of usage() included, leaves the span unended.
 
     Yields:
         The started invoke_agent span, already the current span. A body that sets no attributes of its
         own can ignore it; the usage and extras are set from the callables at exit, not through it.
 
-    Raises: nothing of its own. An exception from the wrapped body propagates, and the span is closed
-    by start_as_current_span with an error status.
+    Raises: nothing of its own. An Exception from the wrapped body propagates, with error.type and
+    error status recorded on the span first. A BaseException propagates with neither recorded,
+    whether it came from the body or from usage() or extra_attributes();
+    the span is ended on every path.
     """
     identity: dict[str, str] = {
         "gen_ai.operation.name": "invoke_agent",
         "gen_ai.agent.name": agent_name,
         "langchaint.agent_path": agent_path,
     }
-    with tracer.start_as_current_span(
-        f"invoke_agent {agent_name}", kind=SpanKind.INTERNAL, attributes=identity
-    ) as span:
+    span = _start_span(tracer, f"invoke_agent {agent_name}", kind=SpanKind.INTERNAL)
+    _set_span_attributes(span, identity)
+    try:
         try:
-            yield span
+            with trace.use_span(
+                span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+            ):
+                try:
+                    yield span
+                except Exception as exc:
+                    _record_other_exception(span, exc)
+                    raise
         finally:
             _apply_agent_exit_attributes(
                 span, identity=identity, usage=usage, extra_attributes=extra_attributes
             )
+    finally:
+        _end_span(span)
 
 
 def _apply_agent_exit_attributes(
@@ -326,20 +434,25 @@ def _apply_agent_exit_attributes(
     Each callable runs under its own guard, so a raising usage() still leaves the extras set and a
     raising extra_attributes() still leaves the usage set; either is logged, never propagated, because
     this runs in agent_span's finally where a raise would displace the loop's own exception.
+    The set_attributes calls are guarded for the same reason.
     Skipped when the span is not recording, the OTel guard for not computing attributes a
     non-recording span discards.
     """
-    if not span.is_recording():
+    if not _is_recording(span):
         return
     if extra_attributes is not None:
         try:
-            span.set_attributes(extra_attributes())
+            attributes = extra_attributes()
         except Exception:
             _logger.warning(
                 "agent_span extra_attributes raised; leaving span attributes partial",
                 exc_info=True,
             )
-    span.set_attributes(identity)
+        else:
+            with _guarding_telemetry_failures("setting the agent_span extra attributes"):
+                span.set_attributes(attributes)
+    with _guarding_telemetry_failures("setting the agent_span identity attributes"):
+        span.set_attributes(identity)
     try:
         spent = usage()
     except Exception:
@@ -347,14 +460,15 @@ def _apply_agent_exit_attributes(
             "agent_span usage raised; leaving span usage attributes unset", exc_info=True
         )
         return
-    span.set_attributes({
-        "gen_ai.usage.input_tokens": spent.input_tokens_total,
-        "gen_ai.usage.output_tokens": spent.output_tokens,
-        "gen_ai.usage.reasoning.output_tokens": spent.output_tokens_reasoning,
-        "gen_ai.usage.cache_read.input_tokens": spent.input_tokens_cache_read,
-        "gen_ai.usage.cache_creation.input_tokens": spent.input_tokens_cache_write,
-        "langchaint.cost_in_usd": spent.cost_in_usd,
-    })
+    with _guarding_telemetry_failures("setting the agent_span usage attributes"):
+        span.set_attributes({
+            "gen_ai.usage.input_tokens": spent.input_tokens_total,
+            "gen_ai.usage.output_tokens": spent.output_tokens,
+            "gen_ai.usage.reasoning.output_tokens": spent.output_tokens_reasoning,
+            "gen_ai.usage.cache_read.input_tokens": spent.input_tokens_cache_read,
+            "gen_ai.usage.cache_creation.input_tokens": spent.input_tokens_cache_write,
+            "langchaint.cost_in_usd": spent.cost_in_usd,
+        })
 
 
 def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
@@ -612,7 +726,7 @@ def _apply_result_attributes(
     The events are caught under their own guard rather than the mapper's,
     so an error whose str() raises leaves the events partial and the mapper's attributes still set.
     """
-    if not span.is_recording():
+    if not _is_recording(span):
         return
     try:
         _record_attempt_failed_events(span, result)
@@ -623,7 +737,8 @@ def _apply_result_attributes(
     except Exception:
         _logger.warning("attribute_mapper raised; leaving span attributes partial", exc_info=True)
         return
-    span.set_attributes(attributes)
+    with _guarding_telemetry_failures("setting the mapper's attributes"):
+        span.set_attributes(attributes)
 
 
 def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -> None:
@@ -638,7 +753,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
     Building inside the is_recording guard is why the conversation is serialized here rather than earlier:
     an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
     """
-    if not span.is_recording():
+    if not _is_recording(span):
         return
     try:
         attributes = build()
@@ -647,7 +762,8 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
             "content capture raised; leaving span content attributes partial", exc_info=True
         )
         return
-    span.set_attributes(attributes)
+    with _guarding_telemetry_failures("setting the content attributes"):
+        span.set_attributes(attributes)
 
 
 def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> None:
@@ -658,8 +774,7 @@ def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> Non
     identity keys, set immediately after at span start, and a mapper's or a dispatch outcome's,
     set at completion.
     """
-    if extra_attributes and span.is_recording():
-        span.set_attributes(extra_attributes)
+    _set_span_attributes(span, extra_attributes)
 
 
 def _apply_operation_name(span: Span, operation_name: str) -> None:
@@ -670,8 +785,7 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
     Applied at span start, so it is present however the span ends, and after extra_attributes,
     so an application constant cannot displace a required attribute.
     """
-    if span.is_recording():
-        span.set_attribute("gen_ai.operation.name", operation_name)
+    _set_span_attribute(span, "gen_ai.operation.name", operation_name)
 
 
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
@@ -681,8 +795,9 @@ def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnrecognizedError) are
     groupable by kind rather than only by the error_text message string.
     """
-    span.set_attribute("error.type", type(error).__name__)
-    span.set_status(Status(StatusCode.ERROR, error.error_text))
+    _set_span_attribute(span, "error.type", type(error).__name__)
+    with _guarding_telemetry_failures("setting the error status"):
+        span.set_status(Status(StatusCode.ERROR, error.error_text))
 
 
 def _record_other_exception(span: Span, exc: Exception) -> None:
@@ -692,9 +807,11 @@ def _record_other_exception(span: Span, exc: Exception) -> None:
     ended, which gives every span kind here a groupable failure signal (StreamProtocolError, a tool
     function's own exception) beside the message string record_exception carries.
     """
-    span.record_exception(exc)
-    span.set_attribute("error.type", type(exc).__name__)
-    span.set_status(Status(StatusCode.ERROR, str(exc)))
+    with _guarding_telemetry_failures("recording the exception"):
+        span.record_exception(exc)
+    _set_span_attribute(span, "error.type", type(exc).__name__)
+    with _guarding_telemetry_failures("setting the error status"):
+        span.set_status(Status(StatusCode.ERROR, str(exc)))
 
 
 class TracedLLM:
@@ -959,7 +1076,7 @@ class TracedBoundLLM[OutputT]:
             asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
                 appended any AbandonedCall first, and the span ends.
         """
-        span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
+        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
             _apply_operation_name(span, _CHAT_OPERATION)
@@ -977,10 +1094,10 @@ class TracedBoundLLM[OutputT]:
                 raise
             _apply_result_attributes(span, response, self._span_config.attribute_mapper)
             self._apply_output_content(span, response)
-            span.set_status(Status(StatusCode.OK))
+            _set_ok_status(span)
             return response
         finally:
-            span.end()
+            _end_span(span)
 
     async def generate_many(
         self,
@@ -1020,7 +1137,7 @@ class TracedBoundLLM[OutputT]:
             Exception: an item raised something that is not a GenerationError, a defect in langchaint
                 itself; the span records it before re-raising.
         """
-        span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.INTERNAL)
+        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.INTERNAL)
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
             try:
@@ -1028,12 +1145,11 @@ class TracedBoundLLM[OutputT]:
             except Exception as exc:
                 _record_other_exception(span, exc)
                 raise
-            if span.is_recording():
-                span.set_attribute("langchaint.batch_item_count", len(results))
-            span.set_status(Status(StatusCode.OK))
+            _set_span_attribute(span, "langchaint.batch_item_count", len(results))
+            _set_ok_status(span)
             return results
         finally:
-            span.end()
+            _end_span(span)
 
     def stream_one(
         self,
@@ -1071,7 +1187,8 @@ class TracedStreamHandle[OutputT]:
     observing an iterator is unaffected).
     The span opens at __aenter__, where the request opens,
     records gen_ai.response.time_to_first_chunk at the first item,
-    takes error status on a failing or abandoned stream, and ends exactly once.
+    takes error status when the stream raises or its consuming block leaves with an exception,
+    and ends exactly once.
     Under capture_message_content the input content attributes are set when the span starts,
     and gen_ai.output.messages when final() returns a Response.
     """
@@ -1101,7 +1218,7 @@ class TracedStreamHandle[OutputT]:
         self._span_ended = False
         self._first_item_seen = False
 
-    def _start_span(self) -> Span:
+    def _start_span_once(self) -> Span:
         """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
 
         Called by __aenter__ alone, which raises on a second entry, so this runs at most once per handle.
@@ -1109,7 +1226,7 @@ class TracedStreamHandle[OutputT]:
         does no I/O by contract, so rendering there would serialize the conversation even for the
         non-recording spans an unconfigured application gets, which _apply_content_attributes skips.
         """
-        span = self._span_config.tracer.start_span(self._span_name, kind=SpanKind.CLIENT)
+        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         self._span = span
         _apply_extra_attributes(span, self._span_config.extra_attributes)
         _apply_operation_name(span, _CHAT_OPERATION)
@@ -1120,9 +1237,9 @@ class TracedStreamHandle[OutputT]:
         self._span_started_at_monotonic_seconds = time.monotonic()
         return span
 
-    def _end_span(self) -> None:
+    def _end_span_once(self) -> None:
         if self._span is not None and not self._span_ended:
-            self._span.end()
+            _end_span(self._span)
             self._span_ended = True
 
     def _mark_first_item(self, span: Span) -> None:
@@ -1140,8 +1257,9 @@ class TracedStreamHandle[OutputT]:
         if self._first_item_seen:
             return
         self._first_item_seen = True
-        if span.is_recording() and self._span_started_at_monotonic_seconds is not None:
-            span.set_attribute(
+        if self._span_started_at_monotonic_seconds is not None:
+            _set_span_attribute(
+                span,
                 "gen_ai.response.time_to_first_chunk",
                 time.monotonic() - self._span_started_at_monotonic_seconds,
             )
@@ -1174,10 +1292,10 @@ class TracedStreamHandle[OutputT]:
             raise
         except Exception as exc:
             _record_other_exception(span, exc)
-            self._end_span()
+            self._end_span_once()
             raise
         except BaseException:
-            self._end_span()
+            self._end_span_once()
             raise
         self._mark_first_item(span)
         return item
@@ -1195,15 +1313,15 @@ class TracedStreamHandle[OutputT]:
         """
         if self._span is not None:
             raise RuntimeError("stream already entered: call stream_one again for a new one")
-        span = self._start_span()
+        span = self._start_span_once()
         try:
             await self._stream_handle.__aenter__()
         except Exception as exc:
             _record_other_exception(span, exc)
-            self._end_span()
+            self._end_span_once()
             raise
         except BaseException:
-            self._end_span()
+            self._end_span_once()
             raise
         return self
 
@@ -1225,7 +1343,7 @@ class TracedStreamHandle[OutputT]:
             if self._span is not None and not self._span_ended:
                 if isinstance(exc, Exception):
                     _record_other_exception(self._span, exc)
-                self._end_span()
+                self._end_span_once()
 
     async def final(self) -> Response[OutputT]:
         """Drain the inner stream, attribute the span from the Response, and end the span.
@@ -1250,20 +1368,20 @@ class TracedStreamHandle[OutputT]:
         except GenerationError as exc:
             _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
             _set_generation_error_status(span, exc)
-            self._end_span()
+            self._end_span_once()
             raise
         except Exception as exc:
             _record_other_exception(span, exc)
-            self._end_span()
+            self._end_span_once()
             raise
         except BaseException:
-            self._end_span()
+            self._end_span_once()
             raise
         _apply_result_attributes(span, response, self._span_config.attribute_mapper)
         if self._span_config.capture_message_content:
             _apply_content_attributes(span, lambda: _output_content_attributes(response))
-        span.set_status(Status(StatusCode.OK))
-        self._end_span()
+        _set_ok_status(span)
+        self._end_span_once()
         return response
 
 
@@ -1396,22 +1514,25 @@ class TracedToolManager(ToolManager):
         The dispatch semantics are the base method's own; the override adds only the span.
         The span is current while the base dispatch runs, so a span the tool function starts nests under it.
         A function exception (a user-code defect) is recorded on the span, sets error status, and propagates.
-        trace.use_span ends the span exactly once on exit, with its exception recording and status setting off.
+        trace.use_span makes the span current with its exception recording and status setting off;
+        the finally ends it exactly once, through _end_span.
         This method records and sets status itself, from the table on the class.
         """
-        span = self._tracer.start_span(
-            f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
+        span = _start_span(
+            self._tracer, f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
         )
         with trace.use_span(
-            span, end_on_exit=True, record_exception=False, set_status_on_exception=False
+            span, end_on_exit=False, record_exception=False, set_status_on_exception=False
         ):
-            _apply_extra_attributes(span, self._extra_attributes)
-            if span.is_recording():
-                span.set_attributes({
-                    "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
-                    "gen_ai.tool.name": call.name,
-                    "gen_ai.tool.call.id": call.id,
-                })
+            try:
+                _apply_extra_attributes(span, self._extra_attributes)
+                with _guarding_telemetry_failures("setting the tool identity attributes"):
+                    if _is_recording(span):
+                        span.set_attributes({
+                            "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
+                            "gen_ai.tool.name": call.name,
+                            "gen_ai.tool.call.id": call.id,
+                        })
                 if self._capture_message_content:
                     _apply_content_attributes(
                         span,
@@ -1421,28 +1542,31 @@ class TracedToolManager(ToolManager):
                             )
                         },
                     )
-            try:
-                outcome = await super().dispatch(call)
-            except Exception as exc:
-                _record_other_exception(span, exc)
-                raise
-            error_type = _dispatch_error_type(outcome)
-            if span.is_recording() and error_type is not None:
-                span.set_attribute("error.type", error_type)
-            if self._capture_message_content:
-                _apply_content_attributes(
-                    span,
-                    lambda: {
-                        "gen_ai.tool.call.result": json.dumps(
-                            _tool_call_response_part(outcome.tool_message)
-                        )
-                    },
-                )
-            if error_type is None:
-                span.set_status(Status(StatusCode.OK))
-            else:
-                span.set_status(Status(StatusCode.ERROR, error_type))
-            return outcome
+                try:
+                    outcome = await super().dispatch(call)
+                except Exception as exc:
+                    _record_other_exception(span, exc)
+                    raise
+                error_type = _dispatch_error_type(outcome)
+                if error_type is not None:
+                    _set_span_attribute(span, "error.type", error_type)
+                if self._capture_message_content:
+                    _apply_content_attributes(
+                        span,
+                        lambda: {
+                            "gen_ai.tool.call.result": json.dumps(
+                                _tool_call_response_part(outcome.tool_message)
+                            )
+                        },
+                    )
+                if error_type is None:
+                    _set_ok_status(span)
+                else:
+                    with _guarding_telemetry_failures("setting the error status"):
+                        span.set_status(Status(StatusCode.ERROR, error_type))
+                return outcome
+            finally:
+                _end_span(span)
 
 
 __all__ = [

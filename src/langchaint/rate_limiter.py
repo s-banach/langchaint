@@ -51,7 +51,7 @@ class Admission:
 
 
 def _is_rate_limit_evidence(transient_error: TransientError) -> bool:
-    """Whether the error says the account or service is refusing further requests right now.
+    """Whether the error is evidence of a rate limit, by its classification or by a server-stated wait.
 
     A server-stated retry_after_seconds qualifies because a server that names a wait is throttling,
     whatever the status code.

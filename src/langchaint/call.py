@@ -69,8 +69,7 @@ class CallRecord:
     attempt_records holds the call's attempt records, in order.
     Two attempts have no record: the one an UnrecognizedError ends the call on, whose error the
     adapter could not read, and the one in flight when a cancellation cut the call off.
-    An InvalidRequestError reporting a conversation the adapter refused to send has none either,
-    because nothing went out.
+    An InvalidRequestError built from a NotSendable outcome has none either, because nothing went out.
     elapsed_seconds spans the call's start to the stamp it was frozen at, RateLimiter slot waits
     and backoff sleeps included;
     it is stored rather than folded from the records, because the records deliberately exclude those waits.

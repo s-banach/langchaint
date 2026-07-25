@@ -91,7 +91,7 @@ It runs `pyrefly check`, `ruff check`, `ruff format --check`, and `pytest` throu
 
 Trigger: releasing a version. Bump `version` in `pyproject.toml` and push to `main`. Never create a `v*` tag by hand: `.github/workflows/publish.yml` publishes to PyPI and cuts the tag, and its gate publishes only a version strictly above every existing `v*` tag, so a hand-made tag stops the release it was meant to mark.
 
-Pushing the bump to `main` is therefore the release act, and PyPI refuses a re-upload of a version that already exists. Confirm with the user before pushing a commit that changes `version`.
+Pushing the bump to `main` is therefore the release act, and PyPI does not accept a re-upload of a version that already exists. Confirm with the user before pushing a commit that changes `version`.
 
 # Commit Review
 

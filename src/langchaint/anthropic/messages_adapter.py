@@ -142,10 +142,7 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 
 
 _RATE_LIMIT_STATUSES = frozenset({429, 529})
-"""The statuses saying the account or the service refuses further requests right now.
-
-529 is the SDK's overloaded status (anthropic 0.116.0), which pauses admission like a 429.
-"""
+"""529 is the SDK's overloaded status (anthropic 0.116.0), which pauses admission like a 429."""
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
@@ -311,7 +308,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
         _NotSendableError: a part other than the message's last sets cache_breakpoint.
             The API accepts such a request, and the enclosing block's marker silently moves the
             boundary to the block's end, so the wire form would not mean what the message says;
-            the adapter refuses to send it and the item fails its own row.
+            the adapter reports the conversation NotSendable and the item fails its own row.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -593,7 +590,7 @@ class AnthropicMessagesAdapter(Adapter):
         "aws.bedrock" for either Bedrock client class.
         anthropic_model and anthropic_bedrock_model each pass the one value their client serves.
         Both Bedrock classes are in provider_name_by_client_class, so a value contradicting either
-        is refused by Adapter.__init__; an AsyncAnthropic takes the value its caller states, since
+        makes Adapter.__init__ raise; an AsyncAnthropic takes the value its caller states, since
         its base_url decides what it reaches.
 
         The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,

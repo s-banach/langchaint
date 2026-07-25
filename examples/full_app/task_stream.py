@@ -115,7 +115,7 @@ class LlmFailure:
 class ToolTurn:
     """One tool call answered within a turn; a turn with several calls appends several of these.
 
-    tool_message is the reply the model reads, budget refusals included. reported_usage is spend
+    tool_message is the reply the model reads, budget declines included. reported_usage is spend
     the tool reported through app_data, ZERO_USAGE when it reported none; a delegate call reports
     none, because its sub-run writes its own turn_log.
     """
@@ -409,8 +409,8 @@ class ReActAgent(AgentRun):
 
         Every call is announced before any dispatch starts, so a UI shows the whole fan-out at once
         rather than one call appearing per completion.
-        A call over config.max_tool_calls is refused through dispatch_many's precomputed argument,
-        so one dispatch_many call answers the whole batch, refusals slotted in call order.
+        A call over config.max_tool_calls is declined through dispatch_many's precomputed argument,
+        so one dispatch_many call answers the whole batch, declines slotted in call order.
 
         Raises:
             DispatchExceptionGroup: one or more tool functions raised. Its completed_outcomes are
@@ -436,7 +436,7 @@ class ReActAgent(AgentRun):
         # partway still spends the budget it used.
         self.tool_calls_made += len(affordable_ids)
 
-        def _refuse_over_budget(tool_call: ToolCall) -> ToolMessage | None:
+        def _decline_over_budget(tool_call: ToolCall) -> ToolMessage | None:
             if tool_call.id in affordable_ids:
                 return None
             return ToolMessage.error(
@@ -447,13 +447,13 @@ class ReActAgent(AgentRun):
 
         try:
             outcomes = await self.tool_manager.dispatch_many(
-                tool_calls, precomputed=_refuse_over_budget
+                tool_calls, precomputed=_decline_over_budget
             )
         except DispatchExceptionGroup as group:
             self._settle_outcomes(tool_calls, group.completed_outcomes)
             raise
         self._settle_outcomes(tool_calls, outcomes)
-        # Every call the model made gets a reply in its original order, refused ones included:
+        # Every call the model made gets a reply in its original order, declined ones included:
         # a provider rejects a turn whose tool calls are not all answered.
         for outcome in outcomes:
             self.conversation.append(outcome.tool_message)
@@ -469,7 +469,7 @@ class ReActAgent(AgentRun):
 
         app_data is read here, at its type.
         A Usage is spend the tool reported, carried only by DispatchHandled:
-        the invalid-args, unknown-tool, and budget-refused arms are calls that billed nothing,
+        the invalid-args, unknown-tool, and budget-declined arms are calls that billed nothing,
         and delegate reports None, because a sub-run wrote its own turn_log
         and folding a reported total would count the whole subtree twice.
         An approving CritiqueVerdict is what releases a self-correcting run to answer.

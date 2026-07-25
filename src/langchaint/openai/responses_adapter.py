@@ -141,7 +141,6 @@ from langchaint.tools import ToolSchema
 from langchaint.usage import ZERO_USAGE, Usage
 
 _RATE_LIMIT_STATUSES = frozenset({429})
-"""The statuses saying the account or the service refuses further requests right now."""
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
@@ -524,7 +523,8 @@ class OpenAIResponsesAdapter(Adapter):
     The two classes here each speak one platform's auth and URL scheme, so the class fixes the
     provider. A plain AsyncOpenAI does not: pointing its base_url at another vendor's
     OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached, all of them
-    gen_ai.provider.name values, so mapping AsyncOpenAI to "openai" would refuse every one of them.
+    gen_ai.provider.name values.
+    Mapping AsyncOpenAI to "openai" would make __init__ raise for every one of them.
     """
 
     def __init__(
@@ -553,7 +553,7 @@ class OpenAIResponsesAdapter(Adapter):
         "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI.
         openai_model passes "openai" and openai_bedrock_model "aws.bedrock".
         The two platform classes are in provider_name_by_client_class, so a value contradicting
-        either is refused by Adapter.__init__; an AsyncOpenAI takes the provider_name its caller
+        either makes Adapter.__init__ raise; an AsyncOpenAI takes the provider_name its caller
         states, since its base_url decides what it reaches.
 
         supports_prompt_cache_options says whether the model accepts the prompt_cache_options
@@ -870,7 +870,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         """Send one non-streaming request via responses.parse.
 
         A parse yielding no instance returns the Refused, Truncated, or Unparsed arm _parsed_output
-        chose. NotSendable never arrives: this adapter refuses no conversation.
+        chose. NotSendable never arrives: this adapter sends every conversation.
         """
         response = await self._adapter.client.responses.parse(
             model=self._request.model,

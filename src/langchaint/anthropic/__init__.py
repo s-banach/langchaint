@@ -195,7 +195,7 @@ def anthropic_model(
     Raises:
         ValueError: client is a Bedrock client, which does not reach the "anthropic" provider this
             constructor states (from Adapter.__init__; the narrowed client annotation already
-            refuses one at check time, since the Bedrock classes are siblings of AsyncAnthropic
+            excludes one at check time, since the Bedrock classes are siblings of AsyncAnthropic
             rather than subclasses),
             or cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens
             (from AnthropicMessagesAdapter.__init__; every ANTHROPIC_PRICING entry carries the

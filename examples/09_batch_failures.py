@@ -17,7 +17,7 @@ not guess which it was, because a provider states a status and never a cause. So
 and let whoever reads the log decide.
 
 Needs the anthropic package and ANTHROPIC_API_KEY: two of the three items are real calls, and the
-third is refused before anything is sent, so it costs nothing.
+remaining one is never sent, so it costs nothing.
 """
 
 import asyncio
@@ -35,9 +35,9 @@ from langchaint import (
 from langchaint.anthropic import anthropic_model
 
 # One row of the batch carries a scanned page as a TIFF. The adapter sends only image/gif,
-# image/jpeg, image/png, and image/webp, so it refuses this conversation and the item fails its own
-# row. The refusal happens before the bytes are base64-encoded, which is why the placeholder below
-# is enough to trigger it.
+# image/jpeg, image/png, and image/webp, so it reports this conversation NotSendable and the item
+# fails its own row. That happens before the bytes are base64-encoded, which is why the placeholder
+# below is enough to trigger it.
 _SCANNED_PAGE: list[Message] = [
     UserMessage(
         content=[
@@ -62,7 +62,7 @@ async def run_batch(
     Nothing here catches anything: the conversation carrying the TIFF settles into its own slot as an
     InvalidRequestError while the two real calls complete, so the list is as long as the input and
     to_row fills the same keys for every slot. A success leaves error_text None, a failure leaves
-    output None, and the refused item's attempts is 0 because no request went out.
+    output None, and the unsent item's attempts is 0 because no request went out.
     Usage.sum_of totals the spend over successes and failures alike, since every GenerationError
     carries the usage its attempts billed.
     """

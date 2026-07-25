@@ -60,7 +60,7 @@ the `TimeoutError` reaches the consumer.
 | `call_timeout` | one request outruns `per_call_timeout_seconds`; the run drops it and answers on the next turn |
 | `agent_timeout` | no single call trips the per-call limit, but cumulative time crosses `timeout_seconds` |
 | `app_timeout` | the whole-app deadline cuts both researchers off mid-request; the partial accounting survives |
-| `tool_budget` | `max_tool_calls=1` refuses the remaining calls and the model finishes with what it has |
+| `tool_budget` | `max_tool_calls=1` declines the remaining calls and the model finishes with what it has |
 | `unapproved_answer` | `synthesize` answers uncritiqued and the self-correction bounce sends it back |
 
 `test_task_stream_claims.py` asserts the claims the docstrings make, the two above all: the accounting

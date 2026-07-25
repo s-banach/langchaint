@@ -24,7 +24,7 @@ class AgentConfig:
     name is the last segment of the run's agent_path, minus the spawn index a tool-spawned run
     carries. The scripted adapter selects a script by the "[tag]" prefix of system_prompt;
     __post_init__ rejects a prefix that differs from name, so the tag cannot drift.
-    max_tool_calls is a budget across the whole run, not per turn: calls beyond it are refused with an
+    max_tool_calls is a budget across the whole run, not per turn: calls beyond it are declined with an
     is_error tool message the model reads and adapts to, rather than dropped or raised on,
     so the model gets a chance to finish with what it already has.
     self_correction_enabled sends every final answer back for critique until some critique has returned an

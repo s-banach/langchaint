@@ -1104,7 +1104,7 @@ class TracedStreamHandle[OutputT]:
     def _start_span(self) -> Span:
         """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
 
-        Called by __aenter__ alone, which refuses a second entry, so this runs at most once per handle.
+        Called by __aenter__ alone, which raises on a second entry, so this runs at most once per handle.
         The input content attributes are built here rather than in stream_one: stream_one opens no span and
         does no I/O by contract, so rendering there would serialize the conversation even for the
         non-recording spans an unconfigured application gets, which _apply_content_attributes skips.
@@ -1187,7 +1187,7 @@ class TracedStreamHandle[OutputT]:
 
         The span starts first so a failing open is recorded on it rather than escaping untraced.
         __aexit__ does not run when __aenter__ raises, so the span is ended here on that path.
-        A second entry is refused before the span is touched, so it cannot mark the first stream's span failed.
+        A second entry raises before the span is touched, so it cannot mark the first stream's span failed.
 
         Raises:
             RuntimeError: this handle was already entered; build a new one with stream_one.

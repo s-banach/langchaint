@@ -4,7 +4,7 @@ tool_choice="required" means a turn can never end in plain text, so the loop nee
 final_response is that tool, a CaptureTool: capture validates the arguments and returns the args_model instance.
 Two budgets bound a run, both owned by the loop.
 Spending max_turns rebinds tool_choice to SpecificToolChoice, so the provider forces a final_response call.
-Spending tool_budget_in_usd answers further non-final tool calls with a refusal ToolMessage telling the model to stop.
+Spending tool_budget_in_usd answers further non-final tool calls with a decline ToolMessage telling the model to stop.
 A tool reports its own cost by returning a Usage as app_data; the loop folds it into the run total.
 search reports a flat per-call fee that way, and delegate reports a whole sub-agent run's Usage the same way.
 Delegation therefore falls under the same cost rule as any billed tool.
@@ -114,7 +114,7 @@ async def run_agent[FinalT: BaseModel](
     Every turn calls tools, because bound froze tool_choice="required".
     A final_response call is answered by capture, and a valid capture completes the run.
     Every other call is dispatched, unless the tool-reported spend has reached tool_budget_in_usd.
-    A call over that budget is answered with a refusal ToolMessage the model reads and adapts to.
+    A call over that budget is answered with a decline ToolMessage the model reads and adapts to.
     Spending max_turns enters the forcing phase: tool_choice is rebound to SpecificToolChoice.
     The provider then forces final_response, and FORCED_TRIES turns remain to produce a valid call.
     An invalid final_response call carries its field-level corrections back to the model, which retries.
@@ -133,7 +133,7 @@ async def run_agent[FinalT: BaseModel](
     async def answer_calls(tool_calls: Sequence[ToolCall], *, forcing: bool) -> FinalT | None:
         """Answer every call of one turn in order; the last valid final_response capture wins.
 
-        In the forcing phase a non-final call is answered with a redirect refusal, so no over-budget work executes.
+        In the forcing phase a non-final call is answered with a redirect, so no over-budget work executes.
         Every tool_call therefore gets its ToolMessage, whichever branch answers it.
         """
         final_response: FinalT | None = None
@@ -147,8 +147,8 @@ async def run_agent[FinalT: BaseModel](
                 redirect = f"Call {final_response_tool.name}."
                 tool_message = ToolMessage.error(call, redirect)
             elif sum(usage.cost_in_usd for usage in tool_reported_usages) >= tool_budget_in_usd:
-                refusal = "Stop calling tools: the run's tool budget is spent."
-                tool_message = ToolMessage.error(call, refusal)
+                decline = "Stop calling tools: the run's tool budget is spent."
+                tool_message = ToolMessage.error(call, decline)
             else:
                 dispatch_outcome = await tool_manager.dispatch(call)
                 match dispatch_outcome:

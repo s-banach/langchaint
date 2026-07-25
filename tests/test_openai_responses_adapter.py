@@ -888,7 +888,7 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
 def _parsed_response(
     parsed: _StructuredReport | None,
     *,
-    refuse: bool = False,
+    refusal: bool = False,
     status: ResponseStatus = "completed",
     incomplete_details: IncompleteDetails | None = None,
     usage: ResponseUsage | None = None,
@@ -896,7 +896,7 @@ def _parsed_response(
     """Build the SDK parse result whose message carries the parsed instance, or a refusal block."""
     content = (
         [ResponseOutputRefusal(type="refusal", refusal="I can't help with that")]
-        if refuse
+        if refusal
         else [
             ParsedResponseOutputText[_StructuredReport](
                 type="output_text", text="{}", annotations=[], parsed=parsed
@@ -936,7 +936,7 @@ def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
 def test_structured_bind_reports_refused_on_a_refusal_block() -> None:
     """A response carrying a refusal content block is Refused, carrying its billing."""
     outcome = _structured_bound()._parsed_output(
-        _parsed_response(None, refuse=True, usage=_usage_with_cache())
+        _parsed_response(None, refusal=True, usage=_usage_with_cache())
     )
     assert isinstance(outcome, Refused)
     assert outcome.usage.cost_in_usd > 0.0

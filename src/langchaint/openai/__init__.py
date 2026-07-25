@@ -8,8 +8,8 @@ so switching models never changes an import; it constructs the Responses adapter
 client None constructs the native SDK client, which reads credentials from the environment.
 openai_model states provider_name="openai" for the adapter,
 and the adapter checks that pair against OpenAIResponsesAdapter.provider_name_by_client_class,
-which refuses AsyncBedrockOpenAI and AsyncAzureOpenAI:
-both subclass AsyncOpenAI, so the annotation cannot refuse them on its own.
+which makes Adapter.__init__ raise for AsyncBedrockOpenAI and AsyncAzureOpenAI:
+both subclass AsyncOpenAI, so the annotation cannot exclude them on its own.
 A base AsyncOpenAI is accepted whatever its base_url,
 so reaching an OpenAI-compatible endpoint through openai_model labels it "openai";
 a binding that should report the provider it actually reaches (groq and deepseek are gen_ai.provider.name values)

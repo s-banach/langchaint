@@ -704,7 +704,7 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
     """A structured refusal detected in the stream's final() ends the span with error status and tokens."""
 
     async def scenario() -> None:
-        """Drain a stream whose final() refuses and inspect the error span."""
+        """Drain a stream whose final() reports Refused and inspect the error span."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(

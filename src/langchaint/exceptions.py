@@ -52,8 +52,7 @@ class TransientError(Exception):
     retry_after_seconds is the server-stated wait parsed from the response's retry-after headers,
     when the provider sent one;
     RateLimiter honors it up to a 60-second cap and uses it to pause admission account-wide.
-    is_rate_limit marks errors saying the account or service refuses further requests right now
-    (Adapter.classify returned "rate_limit");
+    is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
     usage (carrying cost_in_usd) describes the attempt's billable completion when the failing attempt
     was a completed 200 the adapter rejected downstream (a structured parse that returned no output,

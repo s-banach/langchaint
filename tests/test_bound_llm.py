@@ -1065,10 +1065,10 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
 
 
 def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
-    """An item whose send refuses comes back as the RefusalError in its slot, siblings succeed."""
+    """An item whose send reports Refused comes back as the RefusalError in its slot, siblings succeed."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send refuses."""
+        """Serialize a two-item batch (max_in_flight=1) whose first send reports Refused."""
         adapter = _FakeAdapter(
             echo=True,
             failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
@@ -1096,7 +1096,7 @@ def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send is refused."""
+        """Serialize a two-item batch (max_in_flight=1) whose first send reports NotSendable."""
         adapter = _FakeAdapter(echo=True, failures=[NotSendable(reason="misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
@@ -1409,7 +1409,7 @@ def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None
         )
 
         async def consume() -> None:
-            """Let final() refuse, then sleep; the wait_for below cancels this inside the block."""
+            """Let final() report Refused, then sleep; the wait_for below cancels this inside the block."""
             async with bound_llm.stream_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
@@ -1539,7 +1539,7 @@ def test_stream_sends_one_request_when_final_follows_the_block() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_unentered_handle_refuses_to_open() -> None:
+def test_stream_unentered_handle_raises_instead_of_opening() -> None:
     """Iterating or draining a handle that was never entered raises rather than opening a request."""
 
     async def scenario() -> None:
@@ -1558,7 +1558,7 @@ def test_stream_unentered_handle_refuses_to_open() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_handle_refuses_a_second_entry() -> None:
+def test_stream_handle_raises_on_a_second_entry() -> None:
     """Re-entering a spent handle raises rather than opening a second request."""
 
     async def scenario() -> None:
@@ -1608,7 +1608,7 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() refuses, then read the raised RefusalError."""
+        """Drain a stream whose final() reports Refused, then read the raised RefusalError."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -1686,7 +1686,7 @@ def test_stream_retry_populates_attempt_records() -> None:
 
     async def scenario() -> None:
         """Open a stream whose first open_stream call fails, then drain it."""
-        adapter = _FakeAdapter(open_failures=[TransientError("conn refused")])
+        adapter = _FakeAdapter(open_failures=[TransientError("connection reset")])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -1695,7 +1695,7 @@ def test_stream_retry_populates_attempt_records() -> None:
         assert response.output == "ab"
         assert response.attempts == 2
         failed, succeeded = response.attempt_records
-        assert str(failed.error) == "conn refused"
+        assert str(failed.error) == "connection reset"
         assert succeeded.error is None
         assert (
             failed.started_at_monotonic_seconds
@@ -1713,7 +1713,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
     async def scenario() -> None:
         """Enter a handle whose first open fails transiently and whose second is rejected."""
         adapter = _FakeAdapter(
-            open_failures=[TransientError("conn refused"), ValueError("boom")],
+            open_failures=[TransientError("connection reset"), ValueError("boom")],
             classify_result="invalid_request",
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
@@ -1725,7 +1725,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
         assert isinstance(rejected.value.__cause__, ValueError)
         assert rejected.value.reason == "the provider rejected the request: boom"
         transient_record, rejected_record = rejected.value.attempt_records
-        assert str(transient_record.error) == "conn refused"
+        assert str(transient_record.error) == "connection reset"
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
 
@@ -1739,7 +1739,7 @@ def test_stream_open_reported_not_sendable_reaches_the_caller_row_shaped() -> No
     """
 
     async def scenario() -> None:
-        """Enter a handle whose open refuses to send."""
+        """Enter a handle whose open reports NotSendable."""
         adapter = _FakeAdapter(open_failures=[NotSendable(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True

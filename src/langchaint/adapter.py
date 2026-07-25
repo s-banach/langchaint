@@ -39,8 +39,7 @@ type ErrorClassification = Literal["rate_limit", "transient", "invalid_request",
 """Whether a retry may fix the error, and what to call it when it cannot.
 
 A string classification, not an exception class; the retry loop maps it onto one.
-"rate_limit" is transient and account-wide: the account or service refuses further requests
-right now, so RateLimiter pauses admission for everyone sharing it.
+"rate_limit" is transient and account-wide, so RateLimiter pauses admission for everyone sharing it.
 "transient" is retried by the failing task alone.
 "invalid_request" is not retried: the provider rejected this request, so sending it again
 would be rejected again (the retry loop raises InvalidRequestError).
@@ -91,7 +90,7 @@ def classification_from_response(
     A 5xx the provider declares final by sending x-should-retry: false lands there too:
     the directive states the disposition, never what failed.
 
-    rate_limit_statuses is the provider's own set of "refusing further requests right now" statuses
+    rate_limit_statuses is the provider's own set of rate-limit statuses
     (429 for both, plus anthropic's 529), classified ahead of the retry directive because that
     directive speaks for the one request while the pause a rate limit triggers protects the shared
     account. A rate-limit status is therefore classified rate_limit whatever the directive says,
@@ -271,7 +270,7 @@ class Unparsed:
 
 @dataclass(frozen=True, kw_only=True)
 class NotSendable:
-    """A conversation the adapter refuses to put on the wire; nothing was sent.
+    """A conversation the adapter will not put on the wire; nothing was sent.
 
     Raised by no one and billed by no one: the retry loop records no attempt and fails the item with
     an InvalidRequestError. reason states what cannot be sent, and becomes that error's message.
@@ -380,7 +379,8 @@ class Adapter(ABC):
     under that key, so a backend groups langchaint spans with any other instrumented client's.
     Whoever constructs the adapter states it, because the SDK client class does not determine it:
     one AsyncOpenAI carrying a base_url reaches any of several providers. For the client classes
-    langchaint does know, provider_name_by_client_class refuses a stated value contradicting them.
+    langchaint does know, Adapter.__init__ raises ValueError on a stated value contradicting
+    provider_name_by_client_class.
     When the company that trained the model and the platform serving it differ, the platform is the
     value: the convention states the attribute may differ from the actual model provider, and its
     worked example sets "aws.bedrock" for Bedrock spans (opentelemetry-semantic-conventions 0.64b0,
@@ -395,7 +395,7 @@ class Adapter(ABC):
     because a base client reaches whatever its base_url points at.
     Pointing an AsyncOpenAI at another vendor's OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached,
     all of them gen_ai.provider.name values,
-    so a base client in this map would refuse every one of them.
+    so a base client in this map would make __init__ raise for every one of them.
     A client matching nothing here takes the caller's value.
 
     Never enter a base client class: that invariant is what lets the lookup use isinstance.
@@ -423,7 +423,7 @@ class Adapter(ABC):
                 Such a request succeeds and bills normally
                 while every span it produces carries the wrong provider,
                 a defect nothing surfaces until telemetry is grouped by provider,
-                so it is refused before the first request.
+                so the constructor raises before the first request.
         """
         reached = next(
             (

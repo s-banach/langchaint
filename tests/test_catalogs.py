@@ -219,7 +219,7 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
         )
 
 
-def test_both_bedrock_constructors_refuse_a_region_beside_a_client() -> None:
+def test_both_bedrock_constructors_raise_on_a_region_beside_a_client() -> None:
     """A passed client carries its own region, so the aws_region beside it would be dropped.
 
     Silently, and every request would go to the client's region.
@@ -353,8 +353,8 @@ def test_each_constructor_states_a_convention_provider_name(
         ),
     ],
 )
-def test_openai_model_refuses_a_client_that_does_not_reach_openai(client: AsyncOpenAI) -> None:
-    """openai_model states provider_name="openai", so it refuses the clients that reach elsewhere.
+def test_openai_model_raises_on_a_client_that_does_not_reach_openai(client: AsyncOpenAI) -> None:
+    """openai_model states provider_name="openai", so it raises for the clients that reach elsewhere.
 
     Both classes subclass AsyncOpenAI, so the parameter annotation accepts them and only the
     adapter's provider_name_by_client_class check stops them; without it the adapter reports
@@ -372,10 +372,10 @@ def test_openai_model_refuses_a_client_that_does_not_reach_openai(client: AsyncO
         AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
     ],
 )
-def test_the_adapter_refuses_anthropic_over_a_bedrock_client(
+def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
 ) -> None:
-    """Both Bedrock client classes are mapped, so stating "anthropic" over either is refused.
+    """Both Bedrock client classes are mapped, so stating "anthropic" over either raises.
 
     Unlike the openai side, the annotations already stop this at the catalog constructors, since
     the Bedrock classes are siblings of AsyncAnthropic rather than subclasses. This covers the
@@ -391,7 +391,7 @@ def test_the_adapter_refuses_anthropic_over_a_bedrock_client(
         )
 
 
-def test_a_subclass_of_a_platform_client_is_refused_like_its_base() -> None:
+def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
     """Subclassing a platform client to add headers or auth is ordinary application code.
 
     provider_name_by_client_class holds no base client class, which is what lets the lookup use

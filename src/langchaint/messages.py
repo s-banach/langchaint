@@ -21,9 +21,9 @@ class TextPart(CheckedCopyModel):
     cache_breakpoint True marks the exact end of a reusable prompt prefix:
     everything from the start of the request through this part is the span the provider may cache.
     The adapters map it to anthropic's block-level cache_control and openai's part-level prompt_cache_breakpoint.
-    Only the latest marks are written, so a conversation that accrues one mark per turn keeps working
-    as it grows: each adapter's docstring states the per-request limit and whether the adapter or the
-    API is what applies it.
+    Only the latest marks become cache writes, so a conversation that accrues one mark per turn
+    keeps working as it grows: each adapter's docstring states the per-request write limit and
+    whether the adapter or the API is what applies it.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

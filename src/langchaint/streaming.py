@@ -415,12 +415,10 @@ class StreamHandle[OutputT]:
     async def final(self) -> Response[OutputT]:
         """Drain any remaining items silently and return the Response.
 
-        Idempotent once a conclusion exists: it is stored once, whether this method or a caller's
-        own iteration produced it, and every later call returns or raises it again without asking
-        the adapter stream anything.
+        Idempotent once a conclusion exists: the call's conclusion is stored once, whether this
+        method produced it, a caller's own iteration produced it, or the adapter stream raised it.
+        Every later call returns or raises it again without asking the adapter stream anything.
         Without that store, a second call would append a second AttemptRecord for the one request made.
-        A raise from the adapter stream's own final() stores no conclusion, so a later call asks it
-        again; no AttemptRecord is appended for either call, the append being what the store guards.
         A structured refusal or truncation is detected only here, when the SDK parses the assembled
         message: the adapter reports it as a Refused or Truncated outcome and this method builds the
         GenerationError from it, without retrying (the stream already yielded items to the caller);
@@ -455,8 +453,17 @@ class StreamHandle[OutputT]:
                 if self._ended_at_monotonic_seconds is None
                 else self._ended_at_monotonic_seconds
             )
-            outcome = await self._adapter_stream.final()
-            self._conclusion = self._conclude(outcome, ended_at_monotonic_seconds)
+            try:
+                outcome = await self._adapter_stream.final()
+                self._conclusion = self._conclude(outcome, ended_at_monotonic_seconds)
+            except BaseException as exc:
+                # A cancellation is not a conclusion, the same rule __anext__ applies:
+                # it destroys the frames that could have observed the call rather than ending it.
+                # _conclude is inside the try because three of its arms record the attempt first,
+                # so a raise past that record would let a second call record it again.
+                if isinstance(exc, Exception):
+                    self._conclusion = exc
+                raise
             # Every _conclude arm accounts for the call: three build their result off the frozen
             # CallRecord, and Unparsed puts the 200's billing on the TransientError it returns.
             self._conclusion_carried_the_call = True

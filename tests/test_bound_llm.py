@@ -181,6 +181,29 @@ class _UnparsedStream(_FakeStream):
         return Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
 
 
+class _FinalRaisesStream(_FakeStream):
+    """A stream that yields items normally but whose final() raises instead of reporting an outcome.
+
+    Mirrors an adapter whose assembly step failed, so this call reached no outcome at all.
+    Each call raises a fresh error, so a replayed one is identifiable by identity.
+    """
+
+    def __init__(self) -> None:
+        """Start with no final() call counted."""
+        super().__init__()
+        self.final_calls = 0
+
+    @override
+    async def final(self) -> ResponseOutcome[str]:
+        """Count the call and raise.
+
+        Raises:
+            RuntimeError: always.
+        """
+        self.final_calls += 1
+        raise RuntimeError("assembly failed")
+
+
 class _ProtocolErrorStream(_FakeStream):
     """A stream whose items() violates the stream contract immediately."""
 
@@ -2237,6 +2260,30 @@ def test_stream_final_replays_every_error_that_concluded_the_call(
                 await handle.final()
             assert handle._ledger.attempt_records == records_after_first
         assert second.value is first.value
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_final_replays_a_raise_from_the_adapter_stream() -> None:
+    """A raise from the adapter stream's final() concludes the call, so a second call replays it.
+
+    Without the store, a second call asks the adapter stream again,
+    re-running an assembly whose one request is already paid for.
+    """
+
+    async def scenario() -> None:
+        """Call final() twice on a stream whose own final() raises."""
+        stream = _FinalRaisesStream()
+        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(RuntimeError, match="assembly failed") as first:
+                await handle.final()
+            with pytest.raises(RuntimeError, match="assembly failed") as second:
+                await handle.final()
+        assert second.value is first.value
+        assert stream.final_calls == 1
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

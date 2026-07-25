@@ -75,7 +75,7 @@ The SDK clients are configured to never retry beneath langchaint, so attempt cou
 `cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part; the wire mechanics are in the adapter module docstrings.
 
 **Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ToolCall` items, with an idempotent `await handle.final()` returning the assembled `Response`.
+`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ToolCall` items, with `await handle.final()` returning the assembled `Response`.
 
 **Tools under one protocol.**
 `PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` (the structured exit for a `tool_choice="required"` loop) share the `Tool` protocol, so one `ToolManager` holds a mix and an application adds its own form by implementing `Tool`.

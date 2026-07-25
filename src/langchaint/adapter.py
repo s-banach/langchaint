@@ -161,6 +161,13 @@ class PricingTable:
     cache_write_1h_usd_per_million_tokens exists
     because Anthropic bills 5-minute and 1-hour cache writes at different rates;
     None means the adapter never sees 1-hour writes.
+
+    There is no service-tier axis: one table is one tier's rates, and every cost langchaint reports
+    assumes the response was served at the tier those rates are for. Both providers report the tier
+    they actually used (anthropic on Usage.service_tier, openai on Response.service_tier), and a
+    response served at another one prices here at these rates with no error, so an account on a
+    premium or discounted tier reads a cost that is wrong by that tier's multiplier.
+    Read the tier off the raw SDK object beside the Usage to detect it.
     """
 
     input_cache_none_usd_per_million_tokens: float
@@ -203,9 +210,9 @@ class Binding:
     so a conversation without marked parts caches nothing and pays no cache writes.
     Under either value, a part with cache_breakpoint True adds a breakpoint at exactly that boundary,
     so False plus marked parts is the fully user-specified caching configuration.
-    On openai, False requires a gpt-5.6 or later model:
-    the SDK documents prompt_cache_options as supported only there,
-    and the adapter sends it whenever False is bound, so an older model may reject the request.
+    On openai, False reaches the wire only through an adapter built with supports_prompt_cache_options True,
+    which openai documents as gpt-5.6 and later; on any other model the parameter is unsent
+    and the provider's implicit caching stays in place whatever this value says.
     Older openai models cache automatically with free writes, so False buys nothing on them; bind True.
     """
 

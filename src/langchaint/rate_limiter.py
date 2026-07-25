@@ -33,7 +33,7 @@ from contextlib import asynccontextmanager
 from langchaint.exceptions import TransientError
 
 _RETRY_AFTER_MAX_SECONDS = 60.0
-"""Cap on a server-stated retry-after, matching both SDK clients.
+"""Cap on a server-stated retry-after, at the boundary both SDK clients draw.
 
 An erroneous or hostile header (a wait of hours) must not stall the client indefinitely;
 past this cap the account-wide pause reopens to a single probe, which re-pauses if the quota is still exhausted.

@@ -415,10 +415,12 @@ class StreamHandle[OutputT]:
     async def final(self) -> Response[OutputT]:
         """Drain any remaining items silently and return the Response.
 
-        Idempotent: the call's conclusion is stored once, whether this method or a caller's own
-        iteration produced it.
-        Every later call returns or raises it again without asking the adapter stream anything.
+        Idempotent once a conclusion exists: it is stored once, whether this method or a caller's
+        own iteration produced it, and every later call returns or raises it again without asking
+        the adapter stream anything.
         Without that store, a second call would append a second AttemptRecord for the one request made.
+        A raise from the adapter stream's own final() stores no conclusion, so a later call asks it
+        again; no AttemptRecord is appended for either call, the append being what the store guards.
         A structured refusal or truncation is detected only here, when the SDK parses the assembled
         message: the adapter reports it as a Refused or Truncated outcome and this method builds the
         GenerationError from it, without retrying (the stream already yielded items to the caller);

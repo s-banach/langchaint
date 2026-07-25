@@ -211,8 +211,8 @@ class ToolSchema:
 class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     """One callable tool: explicit name, description, args_model, function.
 
-    validate_and_run, dispatch, and schema are the only readers of args_model and function:
-    inside these methods the type parameters are concrete, so the validated arguments flow into the function typed,
+    args_model and function are read only inside this class's own methods:
+    there the type parameters are concrete, so the validated arguments flow into the function typed,
     which no outside caller could reproduce (a heterogeneous tool collection erases ArgsT and AppDataT).
     AppDataT is the app_data type the function carries, defaulting to None;
     the checker solves it from the function's ToolOutputExplicit return,
@@ -233,6 +233,17 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
             args_schema=self.args_model.model_json_schema(),
         )
 
+    def _validated_args(self, args_json: str) -> ArgsT:
+        """Validate args_json against args_model.
+
+        Raises:
+            InvalidToolArgsError: args_json failed validation; model data the model can correct.
+        """
+        try:
+            return self.args_model.model_validate_json(args_json)
+        except ValidationError as exc:
+            raise InvalidToolArgsError(exc) from exc
+
     async def validate_and_run(self, args_json: str) -> ToolOutput[AppDataT]:
         """Validate args_json against args_model and run the function on it.
 
@@ -245,11 +256,7 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         Raises:
             InvalidToolArgsError: args_json failed validation; model data the model can correct.
         """
-        try:
-            args = self.args_model.model_validate_json(args_json)
-        except ValidationError as exc:
-            raise InvalidToolArgsError(exc) from exc
-        return await self.function(args)
+        return await self.function(self._validated_args(args_json))
 
     async def dispatch(
         self, call: ToolCall
@@ -264,12 +271,16 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         The returned DispatchHandled carries this tool's AppDataT,
         so the caller reads app_data at its concrete type with no isinstance.
         Every function exception propagates: it is a defect in user code.
+        The validation is bracketed alone, outside the call to the function, because an
+        InvalidToolArgsError the function itself raises is about some payload of its own, and
+        rendering it here would tell the model that these arguments were invalid, at paths that name
+        no field of args_model, after the function had already run and charged.
         """
         try:
-            result = await self.validate_and_run(call.args_json)
+            args = self._validated_args(call.args_json)
         except InvalidToolArgsError as error:
             return _invalid_args_outcome(call, _details_from_pydantic(error.validation_error))
-        return _handled_outcome(call, result)
+        return _handled_outcome(call, await self.function(args))
 
 
 @dataclass(frozen=True, kw_only=True)

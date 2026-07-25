@@ -507,6 +507,39 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
         asyncio.run(ToolManager([tool]).dispatch(call))
 
 
+def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
+    """A function that raises InvalidToolArgsError is a defect, not this call's argument failure.
+
+    The error is about a payload the function validated itself, so rendering it for the model would
+    report these arguments as invalid at paths naming no field of args_model, after the function had
+    already run and charged.
+    """
+
+    async def _nested_validation_function(args: _EchoArgs) -> str:
+        """Validate a payload of the function's own and fail on it.
+
+        Raises:
+            InvalidToolArgsError: always; the nested payload lacks the required text field.
+        """
+        try:
+            _EchoArgs.model_validate({"wrong": args.text})
+        except ValidationError as exc:
+            raise InvalidToolArgsError(exc) from exc
+        return "unreachable"
+
+    tool = PydanticTool(
+        name="nested",
+        description="Validates a payload of its own.",
+        args_model=_EchoArgs,
+        function=_nested_validation_function,
+    )
+    call = ToolCall(id="call1", name="nested", args_json='{"text": "tide"}')
+    with pytest.raises(InvalidToolArgsError):
+        asyncio.run(tool.dispatch(call))
+    with pytest.raises(InvalidToolArgsError):
+        asyncio.run(ToolManager([tool]).dispatch(call))
+
+
 def test_duplicate_tool_names_are_rejected() -> None:
     """Two tools sharing a name raise ValueError at construction."""
     with pytest.raises(ValueError, match="duplicate tool name"):

@@ -303,14 +303,11 @@ class UnrecognizedError(GenerationError):
 class InvalidToolArgsError(Exception):
     """A tool call's args_json failed validation against the tool's args_model.
 
-    Raised only from PydanticTool.validate_and_run's validation step, never from the function,
+    Raised only by PydanticTool._validated_args, never by langchaint from the function,
     so catching it cannot swallow a function defect.
     This is model data the model can correct:
     ToolManager.dispatch catches it and returns a DispatchInvalidToolArgs
     holding the neutral InvalidToolArgsDetail tuple and an is_error ToolMessage.
-    A tool function must not raise it:
-    dispatch's catch spans the whole validate_and_run call,
-    so a function raising it is classified as bad model args, not as a defect.
     """
 
     def __init__(self, validation_error: ValidationError) -> None:

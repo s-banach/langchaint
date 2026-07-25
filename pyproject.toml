@@ -63,8 +63,12 @@ project-includes = ["src", "tests", "examples", "scripts"]
 search-path = ["src", ".", "examples/full_app"]
 
 # Enabled above strict: redundant-cast enforces the "no cast" smell's
-# stale half (every finding is a deletable cast), and deprecated flags
-# stdlib/library deprecations before an upgrade breaks them.
+# stale half (every finding is a deletable cast), deprecated flags
+# stdlib/library deprecations before an upgrade breaks them, and
+# non-exhaustive-match catches a missing Literal or enum case.
+# non-exhaustive-match does not fire on class patterns over a union of
+# dataclasses, so it does not cover AttemptOutcome; every match on that
+# union carries assert_never instead.
 # explicit-any stays off: the remaining Any sites are deliberate
 # existential typing (overload implementations, SDK stream generics,
 # the heterogeneous Tool collection), and suppressions on deliberate
@@ -75,6 +79,7 @@ search-path = ["src", ".", "examples/full_app"]
 [tool.pyrefly.errors]
 redundant-cast = "error"
 deprecated = "error"
+non-exhaustive-match = "error"
 
 [tool.pytest.ini_options]
 # examples/full_app is in because its claims suite asserts what the app's docstrings say,
@@ -176,12 +181,11 @@ lint.select = [
     # DOC501 (raised exception missing) and DOC502 (documents an exception not
     # raised) are deliberately absent. Both resolve a raise only for the literal
     # `raise SomeError(...)` / `raise SomeError` shapes; they cannot see through
-    # `raise type(exc)(...)` (re-raising the same leaf class enriched) or
     # `raise Class.factory(...)` (they read the last attribute, `factory`, as the
-    # exception name), both of which langchaint uses. Under them a correctly
-    # documented raise reports as extraneous and a real raise reports as missing,
-    # so documenting raises is a CLAUDE.md convention (see "Document what a
-    # function raises") checked in review instead.
+    # exception name), which langchaint uses. Under them a correctly documented
+    # raise reports as extraneous and a real raise reports as missing, so
+    # documenting raises is a CLAUDE.md convention (see "Document what a function
+    # raises") checked in review instead.
 ]
 lint.ignore = [
     "any-type",

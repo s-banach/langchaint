@@ -44,11 +44,9 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
-    MaxCompletionTokensExceededError,
     PricingTable,
     ReasoningEffort,
     ReasoningTrace,
-    RefusalError,
     SpecificToolChoice,
     StreamItem,
     TextPart,
@@ -56,8 +54,16 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding, ErrorClassification
-from langchaint.exceptions import StreamProtocolError, TransientError
+from langchaint.adapter import (
+    AdapterResult,
+    Binding,
+    ErrorClassification,
+    Refused,
+    ResponseOutcome,
+    Truncated,
+    Unparsed,
+)
+from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import OpenAIResponsesAdapter, ReasoningSummary, cost_breakdown
 from langchaint.openai.responses_adapter import (
     _adapter_result,
@@ -101,6 +107,12 @@ _REASONING_OUTPUT_ITEM: dict[str, object] = {
     "summary": [],
     "encrypted_content": "enc-1",
 }
+
+
+def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
+    """Narrow a ResponseOutcome to its success arm, failing the test on any other arm."""
+    assert isinstance(outcome, AdapterResult)
+    return outcome
 
 
 def _usage_with_cache() -> ResponseUsage:
@@ -772,7 +784,7 @@ def test_stream_incomplete_terminal_still_assembles_final() -> None:
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == ["he"]
-        result = await adapter_stream.final()
+        result = _assert_result(await adapter_stream.final())
         assert result.output == "hey"
         assert result.stop_reason == "max_tokens"
         assert result.usage.input_tokens_total == 1000
@@ -790,7 +802,7 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == ["he"]
-        result = await adapter_stream.final()
+        result = _assert_result(await adapter_stream.final())
         assert result.output == "hey"
         assert result.stop_reason == "end_turn"
         assert result.usage.input_tokens_total == 1000
@@ -813,7 +825,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
         ])
         async for _item in adapter_stream.items():
             pass
-        result = await adapter_stream.final()
+        result = _assert_result(await adapter_stream.final())
         reasoning_trace = result.assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
         assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
@@ -834,7 +846,7 @@ def test_stream_failed_terminal_is_terminal() -> None:
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == []
-        result = await adapter_stream.final()
+        result = _assert_result(await adapter_stream.final())
         assert result.stop_reason == "other"
 
     asyncio.run(scenario())
@@ -915,36 +927,33 @@ def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
     assert _structured_bound()._parsed_output(_parsed_response(report)) == report
 
 
-def test_structured_bind_raises_transient_without_parsed_output() -> None:
-    """A turn with no parsed output is transient: a later attempt may still produce it."""
-    with pytest.raises(TransientError) as raised:
-        _structured_bound()._parsed_output(_parsed_response(None))
-    assert raised.value.stop_reason == "end_turn"
+def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
+    """A turn with no parsed output is Unparsed: a later attempt may still produce it."""
+    outcome = _structured_bound()._parsed_output(_parsed_response(None))
+    assert isinstance(outcome, Unparsed)
 
 
-def test_structured_bind_raises_refusal_on_a_refusal_block() -> None:
-    """A response carrying a refusal content block is the terminal refusal leaf, carrying its billing."""
-    with pytest.raises(RefusalError) as raised:
-        _structured_bound()._parsed_output(
-            _parsed_response(None, refuse=True, usage=_usage_with_cache())
+def test_structured_bind_reports_refused_on_a_refusal_block() -> None:
+    """A response carrying a refusal content block is Refused, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(
+        _parsed_response(None, refuse=True, usage=_usage_with_cache())
+    )
+    assert isinstance(outcome, Refused)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_truncated_on_a_max_output_tokens_incomplete() -> None:
+    """An incomplete response for max_output_tokens is Truncated, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(
+        _parsed_response(
+            None,
+            status="incomplete",
+            incomplete_details=IncompleteDetails(reason="max_output_tokens"),
+            usage=_usage_with_cache(),
         )
-    assert raised.value.stop_reason == "refusal"
-    assert raised.value.usage.cost_in_usd > 0.0
-
-
-def test_structured_bind_raises_truncation_on_a_max_output_tokens_incomplete() -> None:
-    """An incomplete response for max_output_tokens is the terminal truncation leaf."""
-    with pytest.raises(MaxCompletionTokensExceededError) as raised:
-        _structured_bound()._parsed_output(
-            _parsed_response(
-                None,
-                status="incomplete",
-                incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-                usage=_usage_with_cache(),
-            )
-        )
-    assert raised.value.stop_reason == "max_tokens"
-    assert raised.value.usage.cost_in_usd > 0.0
+    )
+    assert isinstance(outcome, Truncated)
+    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_every_request_carries_the_reasoning_include(

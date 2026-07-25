@@ -89,23 +89,23 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AttemptOutcome,
     Binding,
     BoundAdapter,
     ErrorClassification,
+    NotSendable,
     PricingTable,
+    Refused,
+    ResponseOutcome,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
+    Truncated,
+    Unparsed,
     classification_from_response,
     retry_after_seconds_from_headers,
 )
-from langchaint.exceptions import (
-    InvalidRequestError,
-    MaxCompletionTokensExceededError,
-    RefusalError,
-    StreamProtocolError,
-    TransientError,
-)
+from langchaint.exceptions import StreamProtocolError
 from langchaint.messages import (
     AssistantMessage,
     Message,
@@ -188,17 +188,32 @@ class _AnthropicRequest:
     of the API's 4-marker request limit for per-request marked parts."""
 
 
+class _NotSendableError(Exception):
+    """A conversation this adapter will not put on the wire, raised by a conversion helper.
+
+    Never leaves this module: _wire_messages_or_not_sendable turns it into the NotSendable arm that
+    send and open_stream return. It exists because the conversation is found unsendable several
+    frames below them, in per-part converters whose callers would each have to thread a union
+    outward otherwise.
+    """
+
+    def __init__(self, reason: str) -> None:
+        """Store what cannot be sent; it becomes the NotSendable reason."""
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
     """Convert one content Part to its wire block.
 
     Raises:
-        InvalidRequestError: an ImagePart's media_type is outside the API's accepted set,
+        _NotSendableError: an ImagePart's media_type is outside the API's accepted set,
             so the API would reject this request; the item fails its own row.
     """
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
     if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
-        raise InvalidRequestError.before_send(
+        raise _NotSendableError(
             f"the Anthropic API accepts image media types "
             f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
         )
@@ -213,7 +228,7 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
 def _user_content_blocks(
     user_message: UserMessage,
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
-    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's InvalidRequestError.
+    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's _NotSendableError.
 
     The second element holds the blocks whose part sets cache_breakpoint, in content order;
     the caller applies the request-wide marker budget, so no marker is written here.
@@ -237,7 +252,7 @@ def _tool_result_content(
     """Convert one ToolMessage's content to the tool_result content field.
 
     A bare string passes through; a sequence of parts becomes wire text and image blocks,
-    an image part propagating _part_block's InvalidRequestError.
+    an image part propagating _part_block's _NotSendableError.
     """
     if isinstance(content, str):
         return content
@@ -293,7 +308,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     for the message's last part that is equivalent, because the block's span ends where that part ends.
 
     Raises:
-        InvalidRequestError: a part other than the message's last sets cache_breakpoint.
+        _NotSendableError: a part other than the message's last sets cache_breakpoint.
             The API accepts such a request, and the enclosing block's marker silently moves the
             boundary to the block's end, so the wire form would not mean what the message says;
             the adapter refuses to send it and the item fails its own row.
@@ -306,7 +321,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
     if not marked_indexes:
         return False
     if marked_indexes != [len(tool_message.content) - 1]:
-        raise InvalidRequestError.before_send(
+        raise _NotSendableError(
             "cache_breakpoint on a ToolMessage part is honored only on the message's last part: "
             "the marker goes on the enclosing tool_result block, whose span ends at the last part"
         )
@@ -333,7 +348,7 @@ def _wire_messages(
     computed once in _request; at 0, every mark goes unwritten.
 
     Raises:
-        InvalidRequestError: an image part's media_type is outside the API's set (from _part_block),
+        _NotSendableError: an image part's media_type is outside the API's set (from _part_block),
             or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking).
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
@@ -376,6 +391,28 @@ def _wire_messages(
             if last_block["type"] != "thinking" and last_block["type"] != "redacted_thinking":
                 last_block["cache_control"] = _cache_control_param(cache_ttl)
     return [MessageParam(role=role, content=blocks) for role, blocks in wire]
+
+
+def _request_messages(
+    conversation: Sequence[Message], request: _AnthropicRequest
+) -> list[MessageParam] | NotSendable:
+    """Convert a conversation under this request's caching parameters, or report it unsendable.
+
+    The one place a _NotSendableError becomes an AttemptOutcome arm.
+    Every send and open_stream starts here and returns the NotSendable unchanged when it gets one.
+
+    Raises:
+        json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _wire_messages).
+    """
+    try:
+        return _wire_messages(
+            conversation,
+            automatic_prompt_caching=request.automatic_prompt_caching,
+            cache_ttl=request.cache_ttl,
+            message_mark_budget=request.message_mark_budget,
+        )
+    except _NotSendableError as not_sendable:
+        return NotSendable(reason=not_sendable.reason)
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
@@ -746,7 +783,9 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncMessageStream[Any],
         pricing: PricingTable,
-        output_from_message: Callable[[ParsedMessage[Any]], OutputT],
+        output_from_message: Callable[
+            [ParsedMessage[Any]], OutputT | Refused | Truncated | Unparsed
+        ],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
@@ -778,12 +817,13 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
             raise StreamProtocolError("stream ended without a stop reason")
 
     @override
-    async def final(self) -> AdapterResult[OutputT]:
-        """Return the SDK-assembled result after the stream ends."""
+    async def final(self) -> ResponseOutcome[OutputT]:
+        """Return what the SDK-assembled message produced, after the stream ends."""
         message = await self._sdk_stream.get_final_message()
-        return _adapter_result(
-            message=message, output=self._output_from_message(message), pricing=self._pricing
-        )
+        output = self._output_from_message(message)
+        if isinstance(output, Refused | Truncated | Unparsed):
+            return output
+        return _adapter_result(message=message, output=output, pricing=self._pricing)
 
     @override
     async def close(self) -> None:
@@ -799,8 +839,11 @@ class _BoundAnthropicText(BoundAdapter[str]):
         self._request = request
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str] | NotSendable:
         """Send one non-streaming request via messages.create."""
+        messages = _request_messages(conversation, self._request)
+        if isinstance(messages, NotSendable):
+            return messages
         message = await self._adapter.client.messages.create(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
@@ -810,12 +853,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
-            messages=_wire_messages(
-                conversation,
-                automatic_prompt_caching=self._request.automatic_prompt_caching,
-                cache_ttl=self._request.cache_ttl,
-                message_mark_budget=self._request.message_mark_budget,
-            ),
+            messages=messages,
         )
         return _adapter_result(
             message=message,
@@ -824,8 +862,13 @@ class _BoundAnthropicText(BoundAdapter[str]):
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
+    async def open_stream(
+        self, conversation: Sequence[Message]
+    ) -> AdapterStream[str] | NotSendable:
         """Open one streaming request; connection failures raise here."""
+        messages = _request_messages(conversation, self._request)
+        if isinstance(messages, NotSendable):
+            return messages
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
@@ -835,12 +878,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
-            messages=_wire_messages(
-                conversation,
-                automatic_prompt_caching=self._request.automatic_prompt_caching,
-                cache_ttl=self._request.cache_ttl,
-                message_mark_budget=self._request.message_mark_budget,
-            ),
+            messages=messages,
         )
         sdk_stream = await manager.__aenter__()
         return _AnthropicStream(
@@ -864,42 +902,31 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         self._request = request
         self._response_format = response_format
 
-    def _parsed_output(self, message: ParsedMessage[ModelT]) -> ModelT:
-        """Extract the parsed instance, or raise the error that classifies why the turn produced none.
+    def _parsed_output(
+        self, message: ParsedMessage[ModelT]
+    ) -> ModelT | Refused | Truncated | Unparsed:
+        """Extract the parsed instance, or report why the turn produced none.
 
-        Each raised error carries this attempt's billing (usage with cost_in_usd, usage_raw,
-        stop_reason) so a rejected 200's cost is not lost.
-
-        Raises:
-            RefusalError: the model refused (stop_reason "refusal"); terminal per-item, not retried.
-            MaxCompletionTokensExceededError: the response hit the token cap (stop_reason "max_tokens");
-                terminal per-item, not retried.
-            TransientError: the turn completed but carried no parsed output for another reason,
-                which a later attempt may fix.
+        Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
+        SDK usage object) so a rejected 200's cost is not lost. The stop reason chooses the arm and
+        is not carried on it: what a rejected 200's leaf reports is fixed by the leaf's class.
         """
         parsed_output = message.parsed_output
         if parsed_output is None:
             usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
-            stop_reason = _normalized_stop_reason(message.stop_reason)
             if message.stop_reason == "refusal":
-                raise RefusalError.for_rejected_200(
-                    usage=usage, usage_raw=message.usage, stop_reason=stop_reason
-                )
+                return Refused(usage=usage, usage_raw=message.usage)
             if message.stop_reason == "max_tokens":
-                raise MaxCompletionTokensExceededError.for_rejected_200(
-                    usage=usage, usage_raw=message.usage, stop_reason=stop_reason
-                )
-            raise TransientError(
-                "structured response contained no parsed output",
-                usage=usage,
-                usage_raw=message.usage,
-                stop_reason=stop_reason,
-            )
+                return Truncated(usage=usage, usage_raw=message.usage)
+            return Unparsed(usage=usage, usage_raw=message.usage)
         return parsed_output
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT]:
         """Send one non-streaming request via messages.parse."""
+        messages = _request_messages(conversation, self._request)
+        if isinstance(messages, NotSendable):
+            return messages
         message = await self._adapter.client.messages.parse(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
@@ -909,23 +936,26 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
-            messages=_wire_messages(
-                conversation,
-                automatic_prompt_caching=self._request.automatic_prompt_caching,
-                cache_ttl=self._request.cache_ttl,
-                message_mark_budget=self._request.message_mark_budget,
-            ),
+            messages=messages,
             output_format=self._response_format,
         )
+        output = self._parsed_output(message)
+        if isinstance(output, Refused | Truncated | Unparsed):
+            return output
         return _adapter_result(
             message=message,
-            output=self._parsed_output(message),
+            output=output,
             pricing=self._adapter.pricing,
         )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[ModelT]:
+    async def open_stream(
+        self, conversation: Sequence[Message]
+    ) -> AdapterStream[ModelT] | NotSendable:
         """Open one streaming request; connection failures raise here."""
+        messages = _request_messages(conversation, self._request)
+        if isinstance(messages, NotSendable):
+            return messages
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
@@ -935,12 +965,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
-            messages=_wire_messages(
-                conversation,
-                automatic_prompt_caching=self._request.automatic_prompt_caching,
-                cache_ttl=self._request.cache_ttl,
-                message_mark_budget=self._request.message_mark_budget,
-            ),
+            messages=messages,
             output_format=self._response_format,
         )
         sdk_stream = await manager.__aenter__()

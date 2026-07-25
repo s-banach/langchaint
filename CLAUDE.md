@@ -39,7 +39,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Generate only via binding: `bind` freezes everything that determines the cacheable prompt prefix; changing parameters is `rebind`, never a per-call override.
 - Never choose a billing-relevant configuration for the user: `automatic_prompt_caching` is a required keyword with no default (an unstated `False` is a billing choice as real as opting in), and any convenience on top of user-stated caching is opt-in and default-off. Honor user-placed `cache_breakpoint` marks under either binding value. A per-part TTL is rejected until someone asks.
 - Leave the tool loop to the application: ship no agent loop, and make a tool function return data, never a control-flow signal. No concurrency-limit parameter; no app-supplied validator parameter (a rule the schema cannot express lives in the tool function).
-- Keep one `RateLimiter` owning retrying and pacing: one instance is one shared budget for the account it guards, gating every request-start path. No `requests_per_minute`: under an in-flight bound, throughput follows request duration.
+- Keep one `RateLimiter` owning retrying and pacing: one instance is one shared budget for the account it guards, gating every request-start path. No `requests_per_minute`: under an in-flight bound, throughput follows request duration. No circuit breaker that stops admitting after N consecutive failures with no success: nobody has asked for it.
 - Wrap official SDK clients and delegate stream assembly and structured-output parsing to the SDK. Write no wire TypedDicts by hand.
 - Give the error taxonomy one axis, retry: retry a transient error and propagate the rest ("non-retriable" is a concept, not a class). Every non-transient error is one item's failure row, so a batch returns one outcome per conversation and no generate outcome leaves it as an exception; a rejected request and an unrecognized error alike fail their item and leave the siblings running. A binding defect langchaint can detect raises at construction or bind time, before any request; anything discovered during a request is one item's failure row. Classify a parse that returns no output as refusal, truncation, or transient, never silently-wrong data. A fatal class derived from the HTTP status, cancelling a batch's siblings, is rejected: a status cannot say whether the binding or the one conversation caused the rejection, since the SDKs expose status and exception class only, never the cause.
 - Admit a field to `Usage` only if it is a provider-invariant counter or the priced scalar absorbing provider-variant billing structure; keep provider-specific detail on the raw SDK usage beside it, and never let `usage` be `None` on a carrier.
@@ -70,6 +70,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `rate_limiter.py`: retrying and pacing.
 - `exceptions.py`: the error vocabulary.
 - `response.py`: the generate results and their flattening to one row shape.
+- `call.py`: the per-call history: one attempt's record, the frozen `CallRecord` every result carries, and the ledger the retry loops drive.
 - `streaming.py`: the stream handle.
 - `tools.py`: the tool forms, the `Tool` protocol, `ToolManager`, and the dispatch outcome types.
 - `messages.py`: the provider-neutral message tree and content parts.

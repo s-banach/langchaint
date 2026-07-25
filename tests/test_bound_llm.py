@@ -42,9 +42,15 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AttemptOutcome,
     Binding,
     BoundAdapter,
     ErrorClassification,
+    NotSendable,
+    Refused,
+    ResponseOutcome,
+    Truncated,
+    Unparsed,
 )
 from langchaint.llm import UNCHANGED
 
@@ -132,7 +138,7 @@ class _FakeStream(AdapterStream[str]):
         yield _FAKE_TOOL_CALL
 
     @override
-    async def final(self) -> AdapterResult[str]:
+    async def final(self) -> ResponseOutcome[str]:
         """Return the assembled result the SDK would produce."""
         return AdapterResult(
             output="ab",
@@ -152,19 +158,26 @@ class _RefusingStream(_FakeStream):
     """A stream that yields items normally but whose final() detects a structured refusal.
 
     Mirrors an adapter that parses the assembled message in AdapterStream.final() and finds a refusal,
-    raising the bare leaf carrying only the rejected 200's billing.
+    reporting the Refused arm carrying only the rejected 200's billing.
     """
 
     @override
-    async def final(self) -> AdapterResult[str]:
-        """Raise the adapter-side refusal leaf instead of assembling a result.
+    async def final(self) -> ResponseOutcome[str]:
+        """Report the refusal instead of assembling a result, carrying this attempt's billing."""
+        return Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
 
-        Raises:
-            RefusalError: always, carrying this attempt's billing.
-        """
-        raise RefusalError.for_rejected_200(
-            usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-        )
+
+class _UnparsedStream(_FakeStream):
+    """A stream that yields items normally but whose final() parses no instance.
+
+    Mirrors an adapter that parses the assembled message in AdapterStream.final() and gets nothing,
+    for a reason the stop reason does not name, reporting the Unparsed arm with the 200's billing.
+    """
+
+    @override
+    async def final(self) -> ResponseOutcome[str]:
+        """Report the missing parse instead of assembling a result, carrying this attempt's billing."""
+        return Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
 
 
 class _ProtocolErrorStream(_FakeStream):
@@ -182,6 +195,40 @@ class _ProtocolErrorStream(_FakeStream):
         """
         raise StreamProtocolError("stream ended without a stop event")
         yield "unreachable"
+
+
+class _UnnamedItemErrorStream(_FakeStream):
+    """A stream whose items() raises an exception the adapter cannot name, before the first item."""
+
+    @override
+    async def items(self) -> AsyncIterator[StreamItem]:
+        """Raise a plain exception before yielding anything.
+
+        Yields:
+            Nothing; the raise precedes the first yield.
+
+        Raises:
+            ValueError: always, before the first yield.
+        """
+        raise ValueError("boom")
+        yield "unreachable"
+
+
+class _FailsAfterFirstItemStream(_FakeStream):
+    """A stream that yields one item and then fails, past the point where reopening is allowed."""
+
+    @override
+    async def items(self) -> AsyncIterator[StreamItem]:
+        """Yield one chunk, then raise.
+
+        Yields:
+            One text chunk, before the raise.
+
+        Raises:
+            ValueError: after the first yield.
+        """
+        yield "a"
+        raise ValueError("dropped mid-stream")
 
 
 class _FailsBeforeFirstItemStream(_FakeStream):
@@ -226,14 +273,25 @@ class _HangingStream(_FakeStream):
         yield "unreachable"
 
 
+type _ScriptedSend = Exception | Refused | Truncated | Unparsed | NotSendable
+"""One scripted send outcome: an exception the fake raises, or an arm it returns.
+
+Both halves exist because the adapter contract splits that way: an attempt with no response to read
+is an exception for Adapter.classify, and everything the adapter did read is a returned arm.
+"""
+
+type _ScriptedOpen = Exception | NotSendable
+"""One scripted open_stream outcome; open_stream returns no response-shaped arm."""
+
+
 class _FakeBoundAdapter(BoundAdapter[str]):
     """A bound adapter whose send follows a scripted failure sequence."""
 
     def __init__(
         self,
         *,
-        failures: Sequence[Exception] = (),
-        open_failures: Sequence[Exception] = (),
+        failures: Sequence[_ScriptedSend] = (),
+        open_failures: Sequence[_ScriptedOpen] = (),
         echo: bool = False,
         stream: _FakeStream | None = None,
         send_seconds: float = 0.0,
@@ -262,8 +320,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         self.peak_in_flight = 0
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
-        """Raise the next scripted failure, else return a success result."""
+    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[str]:
+        """Raise or return the next scripted outcome, else return a success result."""
         self.send_count += 1
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -273,7 +331,10 @@ class _FakeBoundAdapter(BoundAdapter[str]):
             if self._send_seconds:
                 await asyncio.sleep(self._send_seconds)
             if self._failures:
-                raise self._failures.pop(0)
+                scripted = self._failures.pop(0)
+                if isinstance(scripted, Exception):
+                    raise scripted
+                return scripted
             first = conversation[0]
             content = (
                 first.content
@@ -285,13 +346,18 @@ class _FakeBoundAdapter(BoundAdapter[str]):
             self.in_flight -= 1
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
-        """Count the attempt, suspend or raise the next scripted open failure, else return the stored fake stream."""
+    async def open_stream(
+        self, conversation: Sequence[Message]
+    ) -> AdapterStream[str] | NotSendable:
+        """Count the attempt, suspend or take the next scripted open outcome, else return the stored fake stream."""
         self.open_count += 1
         if self._hang_from_open is not None and self.open_count >= self._hang_from_open:
             await asyncio.Event().wait()
         if self._open_failures:
-            raise self._open_failures.pop(0)
+            scripted = self._open_failures.pop(0)
+            if isinstance(scripted, Exception):
+                raise scripted
+            return scripted
         return self.stream
 
 
@@ -303,12 +369,14 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
     """
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT]:
         """Unreachable: response_format rebind tests do not generate."""
         raise NotImplementedError
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[ModelT]:
+    async def open_stream(
+        self, conversation: Sequence[Message]
+    ) -> AdapterStream[ModelT] | NotSendable:
         """Unreachable: response_format rebind tests do not stream."""
         raise NotImplementedError
 
@@ -319,8 +387,8 @@ class _FakeAdapter(Adapter):
     def __init__(
         self,
         *,
-        failures: Sequence[Exception] = (),
-        open_failures: Sequence[Exception] = (),
+        failures: Sequence[_ScriptedSend] = (),
+        open_failures: Sequence[_ScriptedOpen] = (),
         echo: bool = False,
         stream: _FakeStream | None = None,
         classify_result: ErrorClassification = "unrecognized",
@@ -449,19 +517,16 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
 
 def test_pre_send_rejection_raises_immediately_without_retry() -> None:
-    """An InvalidRequestError from send is raised on the first attempt and never retried.
+    """A NotSendable outcome fails the item on the first attempt and is never retried.
 
-    classify returns "transient" here, so retrying is what the classifier asks for:
-    only the retry loop honoring the leaf ahead of classification stops the second attempt.
-    The leaf reaches the caller row-shaped, its reason preserved: the adapter's before_send partial
-    has none of those fields, so the loop must rebuild it rather than re-raise it.
+    classify returns "transient" here, and the arm never reaches it: a returned outcome is not an
+    exception, so no classify verdict can turn this into a second attempt.
+    The leaf the loop builds carries the reason and the row-shape fields.
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send refuses under a transient classify verdict."""
-        adapter = _FakeAdapter(
-            failures=[InvalidRequestError.before_send("nope")], classify_result="transient"
-        )
+        """Drive one generate_one whose send reports NotSendable under a transient classify verdict."""
+        adapter = _FakeAdapter(failures=[NotSendable(reason="nope")], classify_result="transient")
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -479,19 +544,19 @@ def test_pre_send_rejection_raises_immediately_without_retry() -> None:
 
 
 def test_pre_send_rejection_registers_no_success_with_the_rate_limiter() -> None:
-    """A refused send is not a completed request, so it must not end the limiter's recovery.
+    """An unsendable conversation is not a completed request, so it must not end the recovery.
 
     A registered success would clear a rate-limit pause that no provider response lifted.
     """
 
     async def scenario() -> None:
-        """Put the limiter into recovery, then refuse a send while holding its probe slot."""
+        """Put the limiter into recovery, then report NotSendable while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
         rate_limiter.register_transient_error((
             TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
         ))
         assert rate_limiter._recovering
-        adapter = _FakeAdapter(failures=[InvalidRequestError.before_send("nope")])
+        adapter = _FakeAdapter(failures=[NotSendable(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         with pytest.raises(InvalidRequestError):
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -501,14 +566,15 @@ def test_pre_send_rejection_registers_no_success_with_the_rate_limiter() -> None
 
 
 def test_rejection_after_transient_attempts_carries_their_records() -> None:
-    """An InvalidRequestError after transient attempts propagates enriched with their records.
+    """An InvalidRequestError after transient attempts carries their records.
 
     The prior attempts' usage rides the error, so a billed 200 retried before the rejection stays
-    accounted for. Both arms enrich: the classified wrap and the adapter-raised leaf's rebuild.
+    accounted for. The two routes to the leaf differ in what the failing attempt leaves: a rejection
+    classify names went out, so it gets a record, and a NotSendable outcome never did, so it does not.
     """
 
     async def scenario() -> None:
-        """Settle one billed transient attempt, then hit each rejection arm in its own call."""
+        """Settle one billed transient attempt, then take each route to the leaf in its own call."""
         classified_adapter = _FakeAdapter(
             failures=[
                 TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
@@ -521,39 +587,36 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
         )
         with pytest.raises(InvalidRequestError) as classified:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (billed_record,) = classified.value.attempt_records
+        billed_record, rejected_record = classified.value.attempt_records
         assert billed_record.usage.cost_in_usd == 0.25
+        assert rejected_record.error is None
+        assert rejected_record.usage == ZERO_USAGE
+        assert rejected_record.usage_raw is None
         assert isinstance(classified.value.__cause__, ValueError)
-        raising_adapter = _FakeAdapter(
+        not_sendable_adapter = _FakeAdapter(
             failures=[
                 TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
-                InvalidRequestError.before_send("raised by the adapter"),
+                NotSendable(reason="reported by the adapter"),
             ],
         )
-        raising_bound_llm = LLM(raising_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        not_sendable_bound_llm = LLM(not_sendable_adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
-        with pytest.raises(InvalidRequestError) as raised:
-            await raising_bound_llm.generate_one([UserMessage(content="hi")])
-        (raised_billed_record,) = raised.value.attempt_records
-        assert raised_billed_record.usage.cost_in_usd == 0.25
-        assert raised.value.reason == "raised by the adapter"
+        with pytest.raises(InvalidRequestError) as not_sendable:
+            await not_sendable_bound_llm.generate_one([UserMessage(content="hi")])
+        (not_sendable_billed_record,) = not_sendable.value.attempt_records
+        assert not_sendable_billed_record.usage.cost_in_usd == 0.25
+        assert not_sendable.value.reason == "reported by the adapter"
 
     asyncio.run(scenario())
 
 
-def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
-    """A RefusalError from send is enriched with the attempt record and never retried."""
+def test_refused_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """A Refused outcome becomes a RefusalError carrying the attempt record, never retried."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises the adapter-side refusal leaf."""
-        adapter = _FakeAdapter(
-            failures=[
-                RefusalError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-                )
-            ]
-        )
+        """Drive one generate_one whose send reports the Refused arm."""
+        adapter = _FakeAdapter(failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -572,17 +635,13 @@ def test_refusal_leaf_from_send_raises_enriched_without_retry() -> None:
     asyncio.run(scenario())
 
 
-def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
-    """A MaxCompletionTokensExceededError from send is enriched and never retried."""
+def test_truncated_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """A Truncated outcome becomes a row-shaped MaxCompletionTokensExceededError, never retried."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send raises the adapter-side truncation leaf."""
+        """Drive one generate_one whose send reports the Truncated arm."""
         adapter = _FakeAdapter(
-            failures=[
-                MaxCompletionTokensExceededError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
-                )
-            ]
+            failures=[Truncated(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -594,6 +653,48 @@ def test_truncation_leaf_from_send_raises_enriched_without_retry() -> None:
         assert failure.attempts == 1
         assert failure.stop_reason == "max_tokens"
         assert failure.usage.cost_in_usd == 0.25
+
+    asyncio.run(scenario())
+
+
+def test_unparsed_outcome_from_send_is_retried_and_keeps_its_billing() -> None:
+    """An Unparsed outcome is retried, and the rejected 200's billing lands on its attempt record."""
+
+    async def scenario() -> None:
+        """Drive one generate_one whose first send reports Unparsed and whose second succeeds."""
+        adapter = _FakeAdapter(failures=[Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        response = await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 2
+        assert response.attempts == 2
+        rejected, succeeded = response.attempt_records
+        assert isinstance(rejected.error, TransientError)
+        assert rejected.usage.cost_in_usd == 0.25
+        assert succeeded.error is None
+
+    asyncio.run(scenario())
+
+
+def test_unparsed_outcome_ends_the_rate_limiter_recovery() -> None:
+    """An Unparsed 200 is a completed request, so it ends recovery like any other 200.
+
+    The provider served the request, which is what the recovery probe asks; that the adapter parsed
+    no instance from the response is the item's problem, not the account's quota's.
+    """
+
+    async def scenario() -> None:
+        """Put the limiter into recovery, then report Unparsed while holding its probe slot."""
+        rate_limiter = _fast_rate_limiter()
+        rate_limiter.register_transient_error((
+            TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
+        ))
+        assert rate_limiter._recovering
+        adapter = _FakeAdapter(failures=[Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        await bound_llm.generate_one([UserMessage(content="hi")])
+        assert not rate_limiter._recovering
 
     asyncio.run(scenario())
 
@@ -747,6 +848,7 @@ def test_generate_one_cancellation_appends_the_settled_attempts() -> None:
         assert len(abandoned_call.attempt_records) == 1
         assert abandoned_call.model == adapter.model
         assert abandoned_call.provider_name == adapter.provider_name
+        assert abandoned_call.elapsed_seconds > 0.0
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -969,11 +1071,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
         """Serialize a two-item batch (max_in_flight=1) whose first send refuses."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[
-                RefusalError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-                )
-            ],
+            failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
@@ -999,9 +1097,7 @@ def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -
 
     async def scenario() -> None:
         """Serialize a two-item batch (max_in_flight=1) whose first send is refused."""
-        adapter = _FakeAdapter(
-            echo=True, failures=[InvalidRequestError.before_send("misconfigured")]
-        )
+        adapter = _FakeAdapter(echo=True, failures=[NotSendable(reason="misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
@@ -1300,7 +1396,7 @@ def test_stream_completed_or_left_early_appends_no_abandoned_call() -> None:
 def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None:
     """A cancellation after final() raised its GenerationError appends nothing.
 
-    The refusal's enriched leaf carried its usage to the caller, so an AbandonedCall here would
+    The refusal's leaf carried its usage to the caller, so an AbandonedCall here would
     double-count that spend and mislabel a concluded call as an in-flight abandonment.
     """
 
@@ -1318,6 +1414,101 @@ def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
                 with pytest.raises(RefusalError):
+                    await handle.final()
+                await asyncio.sleep(60)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        assert abandoned_call_log == []
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_after_a_protocol_error_appends_the_abandoned_call() -> None:
+    """A StreamProtocolError accounts for nothing, so a cancellation after one still logs the call.
+
+    The record is the only account of the stream that was opened: the error carries no model,
+    no attempt records, and no usage.
+    """
+
+    async def scenario() -> None:
+        """Absorb the protocol error inside the block, then hang into the caller's deadline."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(
+            _FakeAdapter(stream=_ProtocolErrorStream()), rate_limiter=_fast_rate_limiter()
+        ).bind(automatic_prompt_caching=True)
+
+        async def consume() -> None:
+            """Let final() hit the protocol error, then sleep; the wait_for below cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                with pytest.raises(StreamProtocolError):
+                    await handle.final()
+                await asyncio.sleep(60)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.model == "fake-model"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call() -> None:
+    """A failure after the first item accounts for nothing, so a cancellation after one logs the call.
+
+    The TransientError names no model and carries no billing, so the record is the only account
+    of the stream that was opened.
+    """
+
+    async def scenario() -> None:
+        """Absorb the mid-stream failure inside the block, then hang into the caller's deadline."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(
+            _FakeAdapter(stream=_FailsAfterFirstItemStream(), classify_result="transient"),
+            rate_limiter=_fast_rate_limiter(),
+        ).bind(automatic_prompt_caching=True)
+
+        async def consume() -> None:
+            """Let the iteration fail after one item, then sleep; the wait_for cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                with pytest.raises(TransientError, match="after items were yielded"):
+                    async for _item in handle:
+                        pass
+                await asyncio.sleep(60)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        (abandoned_call,) = abandoned_call_log
+        assert abandoned_call.model == "fake-model"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_stream_cancelled_after_a_drain_leaf_appends_no_abandoned_call() -> None:
+    """A GenerationError raised while draining carries the call, so a cancellation logs nothing.
+
+    The leaf already handed the caller a CallRecord, so an AbandonedCall here would report the
+    same call twice.
+    """
+
+    async def scenario() -> None:
+        """Absorb an unrecognized item failure inside the block, then hang into the deadline."""
+        abandoned_call_log: list[AbandonedCall] = []
+        bound_llm = LLM(
+            _FakeAdapter(stream=_UnnamedItemErrorStream(), classify_result="unrecognized"),
+            rate_limiter=_fast_rate_limiter(),
+        ).bind(automatic_prompt_caching=True)
+
+        async def consume() -> None:
+            """Let final() hit the unrecognized failure, then sleep; the wait_for cancels this."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                with pytest.raises(UnrecognizedError):
                     await handle.final()
                 await asyncio.sleep(60)
 
@@ -1409,15 +1600,15 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_final_refusal_raises_enriched_without_retry() -> None:
-    """A structured refusal detected in the stream's final() surfaces as the enriched RefusalError.
+def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
+    """A structured refusal detected in the stream's final() surfaces as a row-shaped RefusalError.
 
     The stream already yielded items to the caller, so the leaf is not retried;
-    final() records the one rejected 200 and re-raises the leaf enriched with the handle's attempt records and billing.
+    final() records the one rejected 200 and raises the leaf carrying that record.
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() refuses, then read the enriched leaf."""
+        """Drain a stream whose final() refuses, then read the raised leaf."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -1435,6 +1626,59 @@ def test_stream_final_refusal_raises_enriched_without_retry() -> None:
         assert record.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
+
+
+def test_stream_final_unparsed_raises_transient_carrying_its_billing() -> None:
+    """An Unparsed outcome from the stream's final() propagates as a TransientError with the billing.
+
+    The stream already yielded items to the caller, so it is not reopened; the rejected 200's usage
+    reaches the caller on the error itself rather than on an attempt record.
+    """
+
+    async def scenario() -> None:
+        """Drain a stream whose final() parses no instance, then read the raised error."""
+        adapter = _FakeAdapter(stream=_UnparsedStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(TransientError) as unparsed:
+                await handle.final()
+        assert unparsed.value.usage.cost_in_usd == 0.25
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_stream_cancelled_after_absorbing_unparsed_appends_no_abandoned_call() -> None:
+    """A cancellation after final() raised its TransientError appends nothing.
+
+    The error carried the rejected 200's usage to the caller, so an AbandonedCall here would
+    double-count that spend and mislabel a concluded call as an in-flight abandonment.
+    """
+
+    async def scenario() -> None:
+        """Absorb an Unparsed from final() inside the block, then hang into the caller's deadline."""
+        abandoned_call_log: list[AbandonedCall] = []
+        adapter = _FakeAdapter(stream=_UnparsedStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+
+        async def consume() -> None:
+            """Let final() report Unparsed, then sleep; the wait_for below cancels inside the block."""
+            async with bound_llm.stream_one(
+                [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
+            ) as handle:
+                with pytest.raises(TransientError):
+                    await handle.final()
+                await asyncio.sleep(60)
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(consume(), timeout=0.05)
+        assert abandoned_call_log == []
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_stream_retry_populates_attempt_records() -> None:
@@ -1463,26 +1707,6 @@ def test_stream_retry_populates_attempt_records() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_open_raising_a_generation_leaf_propagates_it_from_the_entry() -> None:
-    """A GenerationError leaf raised by open_stream reaches the caller from the async with, unretried."""
-
-    async def scenario() -> None:
-        """Enter a handle whose open_stream raises a refusal leaf."""
-        leaf = RefusalError.for_rejected_200(
-            usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-        )
-        adapter = _FakeAdapter(open_failures=[leaf])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
-        with pytest.raises(RefusalError):
-            async with bound_llm.stream_one([UserMessage(content="hi")]):
-                pass
-        assert adapter.bound_adapters[0].open_count == 1
-
-    asyncio.run(scenario())
-
-
 def test_stream_open_classified_invalid_request_carries_the_prior_attempts_records() -> None:
     """A rejected open raises InvalidRequestError from the entry with the prior transient record."""
 
@@ -1500,21 +1724,23 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
                 pass
         assert isinstance(rejected.value.__cause__, ValueError)
         assert rejected.value.reason == "the provider rejected the request: boom"
-        assert [str(record.error) for record in rejected.value.attempt_records] == ["conn refused"]
+        transient_record, rejected_record = rejected.value.attempt_records
+        assert str(transient_record.error) == "conn refused"
+        assert rejected_record.error is None
+        assert rejected_record.usage == ZERO_USAGE
 
     asyncio.run(scenario())
 
 
-def test_stream_open_refused_before_send_reaches_the_caller_row_shaped() -> None:
-    """An adapter that refuses to open raises the leaf with its row-shape fields filled.
+def test_stream_open_reported_not_sendable_reaches_the_caller_row_shaped() -> None:
+    """An adapter that reports the conversation as NotSendable fails the item, row-shaped.
 
-    The before_send partial carries none of them, so the handle must rebuild it rather than
-    re-raise it; a caller reading model or attempt_records off the leaf would otherwise fail.
+    The handle builds the leaf, so a caller reading model or attempt_records off it succeeds.
     """
 
     async def scenario() -> None:
         """Enter a handle whose open refuses to send."""
-        adapter = _FakeAdapter(open_failures=[InvalidRequestError.before_send("nope")])
+        adapter = _FakeAdapter(open_failures=[NotSendable(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -1594,6 +1820,7 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
 
 def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
     """Idle time between draining the stream and calling final() lands in neither measurement."""
+    idle_seconds = 0.02
 
     async def scenario() -> None:
         """Drain the stream, idle, then call final()."""
@@ -1602,11 +1829,11 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
             async for _item in handle:
                 pass
             drained_at = time.monotonic()
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(idle_seconds)
             response = await handle.final()
         (record,) = response.attempt_records
         assert record.ended_at_monotonic_seconds <= drained_at
-        assert response.elapsed_seconds == record.elapsed_seconds
+        assert response.elapsed_seconds < idle_seconds
 
     asyncio.run(scenario())
 
@@ -1623,6 +1850,42 @@ def test_stream_final_is_idempotent() -> None:
         assert first is second
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected_error"),
+    [
+        (_RefusingStream(), RefusalError),
+        (_UnparsedStream(), TransientError),
+        (_ProtocolErrorStream(), StreamProtocolError),
+    ],
+    ids=["refusal", "unparsed", "protocol_error"],
+)
+def test_stream_final_replays_every_error_that_concluded_the_call(
+    stream: _FakeStream, expected_error: type[Exception]
+) -> None:
+    """A second final() raises the first call's error again and records no second attempt.
+
+    Covers both routes to a conclusion, the outcome final() reads and the error draining raises,
+    because either one re-run would ask the adapter stream again and bill the same request twice
+    in the attempt records.
+    """
+
+    async def scenario() -> None:
+        """Call final() twice on a stream whose call cannot end in a Response."""
+        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(expected_error) as first:
+                await handle.final()
+            records_after_first = handle._ledger.attempt_records
+            with pytest.raises(expected_error) as second:
+                await handle.final()
+            assert handle._ledger.attempt_records == records_after_first
+        assert second.value is first.value
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_stream_yields_items_in_order_with_complete_tool_call() -> None:

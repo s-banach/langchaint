@@ -32,12 +32,9 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
-    InvalidRequestError,
-    MaxCompletionTokensExceededError,
     PricingTable,
     PydanticTool,
     ReasoningTrace,
-    RefusalError,
     SpecificToolChoice,
     StreamItem,
     TextPart,
@@ -46,7 +43,16 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.adapter import Binding, ErrorClassification
+from langchaint.adapter import (
+    AdapterResult,
+    Binding,
+    ErrorClassification,
+    NotSendable,
+    Refused,
+    ResponseOutcome,
+    Truncated,
+    Unparsed,
+)
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
@@ -64,11 +70,12 @@ from langchaint.anthropic.messages_adapter import (
     _BoundAnthropicStructured,
     _normalized_stop_reason,
     _normalized_usage,
+    _NotSendableError,
     _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,
 )
-from langchaint.exceptions import StreamProtocolError, TransientError
+from langchaint.exceptions import StreamProtocolError
 from langchaint.tools import ToolSchema
 
 _PRICING = PricingTable(
@@ -78,12 +85,19 @@ _PRICING = PricingTable(
     cache_write_usd_per_million_tokens=3.75,
     cache_write_1h_usd_per_million_tokens=6.0,
 )
+
 _PRICING_NO_1H = PricingTable(
     input_cache_none_usd_per_million_tokens=3.0,
     output_usd_per_million_tokens=15.0,
     cache_read_usd_per_million_tokens=0.3,
     cache_write_usd_per_million_tokens=3.75,
 )
+
+
+def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
+    """Narrow a ResponseOutcome to its success arm, failing the test on any other arm."""
+    assert isinstance(outcome, AdapterResult)
+    return outcome
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -545,11 +559,11 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
 
 
 def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -> None:
-    """A tool_result image media type outside the accepted set fails this item as a rejected request."""
+    """A tool_result image media type outside the accepted set is not sendable."""
     conversation = [
         ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
     ]
-    with pytest.raises(InvalidRequestError):
+    with pytest.raises(_NotSendableError, match="image/tiff"):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
@@ -690,9 +704,9 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
 
 
 def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
-    """An image media type outside the accepted set fails this item as a rejected request."""
+    """An image media type outside the accepted set is not sendable."""
     message = UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))
-    with pytest.raises(InvalidRequestError):
+    with pytest.raises(_NotSendableError):
         _user_content_blocks(message)
 
 
@@ -826,7 +840,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
         adapter_stream = _anthropic_stream([], snapshot)
         async for _item in adapter_stream.items():
             pass
-        result = await adapter_stream.final()
+        result = _assert_result(await adapter_stream.final())
         reasoning_trace = result.assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
         assert reasoning_trace.reasoning == {
@@ -892,29 +906,26 @@ def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
     assert _structured_bound()._parsed_output(_parsed_message(report)) == report
 
 
-def test_structured_bind_raises_transient_without_parsed_output() -> None:
-    """A turn with no parsed output is transient: a later attempt may still produce it."""
-    with pytest.raises(TransientError) as raised:
-        _structured_bound()._parsed_output(_parsed_message(None))
-    # The rejected 200's billing rides on the transient error so the retry record is not zero.
-    assert raised.value.usage.cost_in_usd > 0.0
-    assert raised.value.stop_reason == "end_turn"
+def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
+    """A turn with no parsed output is Unparsed: a later attempt may still produce it."""
+    outcome = _structured_bound()._parsed_output(_parsed_message(None))
+    assert isinstance(outcome, Unparsed)
+    # The rejected 200's billing rides on the arm so the retry record is not zero.
+    assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_raises_refusal_on_a_refusal_stop_reason() -> None:
-    """A refusal stop_reason with no parsed output is the terminal refusal leaf, carrying its billing."""
-    with pytest.raises(RefusalError) as raised:
-        _structured_bound()._parsed_output(_parsed_message(None, stop_reason="refusal"))
-    assert raised.value.stop_reason == "refusal"
-    assert raised.value.usage.cost_in_usd > 0.0
+def test_structured_bind_reports_refused_on_a_refusal_stop_reason() -> None:
+    """A refusal stop_reason with no parsed output is Refused, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="refusal"))
+    assert isinstance(outcome, Refused)
+    assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_raises_truncation_on_a_max_tokens_stop_reason() -> None:
-    """A max_tokens stop_reason with no parsed output is the terminal truncation leaf."""
-    with pytest.raises(MaxCompletionTokensExceededError) as raised:
-        _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
-    assert raised.value.stop_reason == "max_tokens"
-    assert raised.value.usage.cost_in_usd > 0.0
+def test_structured_bind_reports_truncated_on_a_max_tokens_stop_reason() -> None:
+    """A max_tokens stop_reason with no parsed output is Truncated, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
+    assert isinstance(outcome, Truncated)
+    assert outcome.usage.cost_in_usd > 0.0
 
 
 def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
@@ -1144,10 +1155,25 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
             content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
         )
     ]
-    with pytest.raises(InvalidRequestError, match="last part"):
+    with pytest.raises(_NotSendableError, match="last part"):
         _wire_messages(
             conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
+
+
+def test_send_reports_an_unsendable_conversation_as_not_sendable() -> None:
+    """An unsendable conversation reaches send's caller as the NotSendable arm, with nothing sent.
+
+    The client holds no API key, so reaching the wire would fail rather than return this arm.
+    """
+
+    async def scenario() -> None:
+        conversation = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
+        outcome = await _structured_bound().send(conversation)
+        assert isinstance(outcome, NotSendable)
+        assert "image/tiff" in outcome.reason
+
+    asyncio.run(scenario())
 
 
 def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_caching() -> None:

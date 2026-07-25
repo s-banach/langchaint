@@ -12,17 +12,28 @@ so a rate-limit error pauses admission account-wide until a request succeeds aga
 """
 
 import asyncio
-import time
 from collections.abc import Iterator, Sequence
-from typing import Any, Protocol, SupportsIndex, overload
+from typing import Any, Protocol, SupportsIndex, assert_never, overload
 
 from pydantic import BaseModel
 
-from langchaint.adapter import Adapter, Binding, BoundAdapter, ToolChoice
+from langchaint.adapter import (
+    Adapter,
+    AdapterResult,
+    Binding,
+    BoundAdapter,
+    NotSendable,
+    Refused,
+    ToolChoice,
+    Truncated,
+    Unparsed,
+)
+from langchaint.call import _CallLedger
 from langchaint.exceptions import (
-    AttemptRecord,
     GenerationError,
     InvalidRequestError,
+    MaxCompletionTokensExceededError,
+    RefusalError,
     RetriesExhaustedError,
     TransientError,
     UnrecognizedError,
@@ -34,6 +45,7 @@ from langchaint.rate_limiter import RateLimiter
 from langchaint.response import AbandonedCall, AbandonedCallLog, Response
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
+from langchaint.usage import ZERO_USAGE
 
 
 class Unchanged:
@@ -361,149 +373,136 @@ class BoundLLM[OutputT]:
             rate_limiter=self.rate_limiter,
         )
 
+    def _new_ledger(self) -> _CallLedger:
+        """Open a ledger against this binding's adapter; the only place llm.py reads its identity."""
+        return _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
+
+    def _classified_error(
+        self, exc: Exception, *, ledger: _CallLedger
+    ) -> TransientError | GenerationError:
+        """Sort one attempt's exception into the error to retry or this item's terminal leaf.
+
+        Reached only for exceptions, which by the adapter contract are attempts the adapter read no
+        outcome from: what it did read it reports as an AttemptOutcome arm, which the loop matches
+        instead. The returned TransientError carries the adapter's retry-after reading and whether
+        the error was a rate limit, the two things the limiter needs to pace the next attempt;
+        every other return is terminal for this item, and the caller raises it.
+
+        StreamHandle carries its own copy of this mapping, and sharing the two through one module is rejected.
+        "The part the two retry loops agree on" describes a refactor, not a concept.
+        What they genuinely share is the ledger, and call.py holds it.
+        """
+        classification = self.adapter.classify(exc)
+        if classification == "invalid_request":
+            # Adapter.classify returns invalid_request only for a request the provider rejected,
+            # so it went out, and a rejection reports no usage, so ZERO_USAGE is what it billed.
+            ledger.record(error=None, usage=ZERO_USAGE, usage_raw=None)
+            return InvalidRequestError(
+                reason=f"the provider rejected the request: {exc}", call=ledger.freeze()
+            )
+        if classification == "unrecognized":
+            return UnrecognizedError(error=exc, call=ledger.freeze())
+        error = TransientError(
+            str(exc),
+            retry_after_seconds=self.adapter.retry_after_seconds(exc),
+            is_rate_limit=classification == "rate_limit",
+        )
+        error.__cause__ = exc
+        return error
+
     async def _generate_with_retries(
-        self,
-        conversation: Sequence[Message],
-        *,
-        attempt_records: list[AttemptRecord] | None = None,
+        self, conversation: Sequence[Message], *, ledger: _CallLedger
     ) -> Response[OutputT]:
         """Run the retry loop every generate method shares.
 
-        attempt_records, when given, is the caller's own empty list (the retry budget counts its
-        length), appended to in place as each attempt settles: generate_one passes one so a
-        cancellation that kills this frame leaves the settled attempts' records readable outside it.
-        Appends happen only between awaits, so the list never holds a partial record.
+        ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
+        into as each attempt settles, so a cancellation that kills this frame leaves the settled
+        attempts readable outside it; generate_one freezes it to build its AbandonedCall.
+        Every leaf and the Response are built from ledger.freeze(), the one site a call's
+        elapsed_seconds is computed.
 
-        TransientError and the GenerationError leaves raised directly by the adapter are honored
-        without classification: a TransientError is recorded and retried, and a leaf is re-raised
-        enriched with the prior attempts' records.
+        The adapter reports one attempt as an AttemptOutcome arm and never as a leaf, so this loop
+        matches the arm, records what the attempt billed, and constructs the item's leaf here, where
+        the attempts and the timing are known. Only an attempt the adapter read no outcome from
+        arrives as an exception, and Adapter.classify sorts those.
         Each attempt holds a RateLimiter slot for the request only;
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,
         so a rate-limit error pauses admission account-wide before anyone else is admitted and a completed request
-        (a success, or a refusal or truncation that reached a 200) ends recovery.
+        ends recovery. Every 200 counts as completed, including the three the adapter rejects:
+        the provider served the request, which is what the recovery probe asks.
         Every attempt is timed onto an AttemptRecord whose bracket is the send only,
         excluding the slot wait and the backoff sleep,
-        so a slow request is distinguishable from time spent rate limited;
-        a completed attempt's record carries its usage (with cost_in_usd) and usage_raw,
-        a transport failure's usage is ZERO_USAGE and usage_raw None.
+        so a slow request is distinguishable from time spent rate limited.
 
         Raises:
-            InvalidRequestError: the adapter refused to send the request, or classified an attempt's
-                error as a rejection of it; terminal for this item, without a retry.
+            InvalidRequestError: the adapter reported the conversation as NotSendable, or classified
+                an attempt's error as a rejection of the request; terminal for this item, without a retry.
             UnrecognizedError: the adapter classified an attempt's error as unrecognized;
                 terminal for this item, without a retry.
-            RefusalError: the model refused on the structured path;
-                the adapter's leaf is re-raised enriched with the attempt records, on the first attempt without a retry.
-            MaxCompletionTokensExceededError: the structured response hit the token cap;
-                re-raised enriched on the first attempt without a retry.
+            RefusalError: the adapter reported a Refused attempt (the model refused on the structured
+                path); terminal for this item, without a retry.
+            MaxCompletionTokensExceededError: the adapter reported a Truncated attempt (the structured
+                response hit the token cap); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
-        if attempt_records is None:
-            attempt_records = []
-        started_at_monotonic_seconds = time.monotonic()
-        while len(attempt_records) < self.rate_limiter.max_attempts:
+        ledger.start_call()
+        while ledger.attempts < self.rate_limiter.max_attempts:
             async with self.rate_limiter.slot() as admission:
-                attempt_started_at_monotonic_seconds = time.monotonic()
+                ledger.start_attempt()
                 try:
-                    adapter_result = await self._bound_adapter.send(conversation)
-                except InvalidRequestError as exc:
-                    # Ahead of the GenerationError arm below, which cannot handle this leaf: that
-                    # arm reads usage off the error and rebuilds it without a reason, while a
-                    # before_send partial carries no billing (nothing was sent) and requires one.
-                    raise InvalidRequestError(
-                        reason=exc.reason,
-                        attempt_records=tuple(attempt_records),
-                        model=self.adapter.model,
-                        provider_name=self.adapter.provider_name,
-                        elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                    ) from exc
-                except GenerationError as exc:
-                    self.rate_limiter.register_success(admission)
-                    attempt_records.append(
-                        AttemptRecord(
-                            started_at_monotonic_seconds=attempt_started_at_monotonic_seconds,
-                            ended_at_monotonic_seconds=time.monotonic(),
-                            error=None,
-                            usage=exc.usage,
-                            usage_raw=exc.usage_raw,
-                        )
-                    )
-                    raise type(exc)(
-                        attempt_records=tuple(attempt_records),
-                        model=self.adapter.model,
-                        provider_name=self.adapter.provider_name,
-                        elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                        stop_reason=exc.stop_reason,
-                    ) from exc
+                    outcome = await self._bound_adapter.send(conversation)
                 except TransientError as exc:
                     error: TransientError = exc
                 except Exception as exc:
-                    classification = self.adapter.classify(exc)
-                    if classification == "invalid_request":
-                        raise InvalidRequestError(
-                            reason=f"the provider rejected the request: {exc}",
-                            attempt_records=tuple(attempt_records),
-                            model=self.adapter.model,
-                            provider_name=self.adapter.provider_name,
-                            elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                        ) from exc
-                    if classification == "unrecognized":
-                        raise UnrecognizedError(
-                            error=exc,
-                            attempt_records=tuple(attempt_records),
-                            model=self.adapter.model,
-                            provider_name=self.adapter.provider_name,
-                            elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                        ) from exc
-                    error = TransientError(
-                        str(exc),
-                        retry_after_seconds=self.adapter.retry_after_seconds(exc),
-                        is_rate_limit=classification == "rate_limit",
-                    )
-                    error.__cause__ = exc
+                    classified = self._classified_error(exc, ledger=ledger)
+                    if not isinstance(classified, TransientError):
+                        raise classified from exc
+                    error = classified
                 else:
-                    self.rate_limiter.register_success(admission)
-                    attempt_records.append(
-                        AttemptRecord(
-                            started_at_monotonic_seconds=attempt_started_at_monotonic_seconds,
-                            ended_at_monotonic_seconds=time.monotonic(),
-                            error=None,
-                            usage=adapter_result.usage,
-                            usage_raw=adapter_result.usage_raw,
-                        )
-                    )
-                    return Response(
-                        output=adapter_result.output,
-                        model=self.adapter.model,
-                        provider_name=self.adapter.provider_name,
-                        attempt_records=tuple(attempt_records),
-                        elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-                        raw=adapter_result.raw,
-                        stop_reason=adapter_result.stop_reason,
-                        assistant_message=adapter_result.assistant_message,
-                    )
-                attempt_records.append(
-                    AttemptRecord(
-                        started_at_monotonic_seconds=attempt_started_at_monotonic_seconds,
-                        ended_at_monotonic_seconds=time.monotonic(),
-                        error=error,
-                        usage=error.usage,
-                        usage_raw=error.usage_raw,
-                    )
-                )
+                    match outcome:
+                        case AdapterResult():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            return Response(
+                                output=outcome.output,
+                                call=ledger.freeze(),
+                                raw=outcome.raw,
+                                stop_reason=outcome.stop_reason,
+                                assistant_message=outcome.assistant_message,
+                            )
+                        case Refused():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise RefusalError(call=ledger.freeze())
+                        case Truncated():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise MaxCompletionTokensExceededError(call=ledger.freeze())
+                        case NotSendable():
+                            raise InvalidRequestError(reason=outcome.reason, call=ledger.freeze())
+                        case Unparsed():
+                            self.rate_limiter.register_success(admission)
+                            error = TransientError(
+                                "structured response contained no parsed output",
+                                usage=outcome.usage,
+                                usage_raw=outcome.usage_raw,
+                            )
+                        case _ as unhandled:
+                            assert_never(unhandled)
+                ledger.record(error=error, usage=error.usage, usage_raw=error.usage_raw)
                 delay_seconds = self.rate_limiter.register_transient_error(
-                    _extract_transient_errors(attempt_records)
+                    _extract_transient_errors(ledger.attempt_records)
                 )
-            if len(attempt_records) < self.rate_limiter.max_attempts:
+            if ledger.attempts < self.rate_limiter.max_attempts:
                 await asyncio.sleep(delay_seconds)
-        raise RetriesExhaustedError(
-            attempt_records=tuple(attempt_records),
-            model=self.adapter.model,
-            provider_name=self.adapter.provider_name,
-            elapsed_seconds=time.monotonic() - started_at_monotonic_seconds,
-            stop_reason=None,
-        )
+        raise RetriesExhaustedError(call=ledger.freeze())
 
     async def generate_one(
         self,
@@ -530,20 +529,12 @@ class BoundLLM[OutputT]:
             asyncio.CancelledError: an outer scope cancelled this call; when abandoned_call_log is
                 given, the AbandonedCall is appended first.
         """
-        attempt_records: list[AttemptRecord] = []
+        ledger = self._new_ledger()
         try:
-            return await self._generate_with_retries(
-                _as_conversation(conversation), attempt_records=attempt_records
-            )
+            return await self._generate_with_retries(_as_conversation(conversation), ledger=ledger)
         except asyncio.CancelledError:
             if abandoned_call_log is not None:
-                abandoned_call_log.append(
-                    AbandonedCall(
-                        attempt_records=tuple(attempt_records),
-                        model=self.adapter.model,
-                        provider_name=self.adapter.provider_name,
-                    )
-                )
+                abandoned_call_log.append(AbandonedCall(call=ledger.freeze()))
             raise
 
     async def _generate_or_failure(
@@ -555,7 +546,9 @@ class BoundLLM[OutputT]:
         escapes into the gather and reaches a sibling.
         """
         try:
-            return await self._generate_with_retries(_as_conversation(conversation))
+            return await self._generate_with_retries(
+                _as_conversation(conversation), ledger=self._new_ledger()
+            )
         except GenerationError as failure:
             return failure
 

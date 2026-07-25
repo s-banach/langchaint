@@ -17,13 +17,26 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
-from typing import Literal
+from typing import Literal, assert_never
 
-from langchaint.adapter import Adapter, AdapterStream, BoundAdapter, StreamItem
+from langchaint.adapter import (
+    Adapter,
+    AdapterResult,
+    AdapterStream,
+    BoundAdapter,
+    NotSendable,
+    Refused,
+    ResponseOutcome,
+    StreamItem,
+    Truncated,
+    Unparsed,
+)
+from langchaint.call import _CallLedger
 from langchaint.exceptions import (
-    AttemptRecord,
     GenerationError,
     InvalidRequestError,
+    MaxCompletionTokensExceededError,
+    RefusalError,
     RetriesExhaustedError,
     StreamProtocolError,
     TransientError,
@@ -33,6 +46,7 @@ from langchaint.exceptions import (
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, RateLimiter
 from langchaint.response import AbandonedCall, AbandonedCallLog, Response
+from langchaint.usage import ZERO_USAGE
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -66,29 +80,30 @@ class StreamHandle[OutputT]:
         self._abandoned_call_log = abandoned_call_log
         self._adapter_stream: AdapterStream[OutputT] | None = None
         self._items: AsyncIterator[StreamItem] | None = None
-        self._attempt_records: list[AttemptRecord] = []
+        self._ledger = _CallLedger(model=adapter.model, provider_name=adapter.provider_name)
         self._admission: Admission | None = None
         self._yielded_any = False
-        self._attempt_started_at_monotonic_seconds: float | None = None
-        self._started_at_monotonic_seconds: float | None = None
         self._ended_at_monotonic_seconds: float | None = None
-        self._response: Response[OutputT] | None = None
-        self._final_concluded = False
+        self._conclusion: Response[OutputT] | Exception | None = None
+        """What concluded the call: the Response, or the error that ended it; None until it ends."""
+        self._conclusion_carried_the_call = False
+        """Whether that conclusion gave the caller an account of this call; see _append_abandoned_call."""
         self._state: _State = "unopened"
 
     async def __aenter__(self) -> "StreamHandle[OutputT]":
         """Open the request and return self.
 
         Raises:
-            GenerationError: the adapter raised one of its leaves while opening, or the open failure
-                was classified as a rejection of the request (an InvalidRequestError) or as
-                unrecognized (an UnrecognizedError).
+            InvalidRequestError: the adapter reported the conversation as NotSendable, or the open
+                failure was classified as a rejection of the request.
+            UnrecognizedError: the open failure was classified as unrecognized.
             RetriesExhaustedError: the opens spent the retry budget.
             RuntimeError: this handle was already entered; build a new one with stream_one.
         """
         if self._state != "unopened":
             raise RuntimeError(_ALREADY_ENTERED_MESSAGE)
         self._state = "open"
+        self._ledger.start_call()
         try:
             await self._open_stream_with_retries()
         except BaseException as exc:
@@ -114,11 +129,11 @@ class StreamHandle[OutputT]:
         """Close the underlying connection and finish the handle.
 
         A CancelledError exiting the block appends an AbandonedCall to the handle's
-        abandoned_call_log, when one was given and final() never concluded the call:
-        a Response and a raised GenerationError both reached the caller through final() carrying
-        their own usage, and a consumer that leaves the block early without an exception chose to
-        walk away in live code, so only the cancellation, which destroys the frames that could
-        have observed the stream, gets a record.
+        abandoned_call_log, when one was given and no conclusion gave the caller an account of the
+        call (_append_abandoned_call states which conclusions do).
+        A consumer that leaves the block early without an exception chose to walk away in live
+        code, so only the cancellation, which destroys the frames that could have observed the
+        stream, gets a record.
         """
         self._state = "finished"
         if isinstance(exc, asyncio.CancelledError):
@@ -126,24 +141,23 @@ class StreamHandle[OutputT]:
         await self._close_adapter_stream()
 
     def _append_abandoned_call(self) -> None:
-        """Record the abandonment, unless no log was given or final() already concluded the call.
+        """Record the abandonment, unless no log was given or the conclusion accounted for the call.
 
-        A call final() concluded is excluded on both exits: a Response and a raised GenerationError
-        each carry their own usage to the caller, so appending here would double-count it and
-        mislabel a concluded call as an in-flight abandonment.
+        A Response and a GenerationError leaf each hand the caller this call's CallRecord, naming
+        the model and the attempts to reconcile against, and the TransientError an Unparsed 200
+        raises carries that 200's billing.
+        Appending after one would report the same call twice and mislabel a concluded call as an
+        in-flight abandonment.
+        A StreamProtocolError and a failure after the first item hand over neither, so a
+        cancellation following one still gets a record: it is the only account of the stream that
+        was opened.
         The settled attempt records are only pre-first-item open failures (nothing is retried after
         the first yielded item), so usage_settled is usually zero here and the record's value is
         the count; the streaming request itself is the unobservable in-flight attempt.
         """
-        if self._abandoned_call_log is None or self._final_concluded:
+        if self._abandoned_call_log is None or self._conclusion_carried_the_call:
             return
-        self._abandoned_call_log.append(
-            AbandonedCall(
-                attempt_records=tuple(self._attempt_records),
-                model=self._adapter.model,
-                provider_name=self._adapter.provider_name,
-            )
-        )
+        self._abandoned_call_log.append(AbandonedCall(call=self._ledger.freeze()))
 
     def _release_slot(self) -> None:
         if self._admission is not None:
@@ -176,18 +190,9 @@ class StreamHandle[OutputT]:
                 is_rate_limit=self._adapter.classify(exc) == "rate_limit",
             )
             wrapped.__cause__ = exc
-        assert self._attempt_started_at_monotonic_seconds is not None
-        self._attempt_records.append(
-            AttemptRecord(
-                started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
-                ended_at_monotonic_seconds=time.monotonic(),
-                error=wrapped,
-                usage=wrapped.usage,
-                usage_raw=wrapped.usage_raw,
-            )
-        )
+        self._ledger.record(error=wrapped, usage=wrapped.usage, usage_raw=wrapped.usage_raw)
         return self._rate_limiter.register_transient_error(
-            _extract_transient_errors(self._attempt_records)
+            _extract_transient_errors(self._ledger.attempt_records)
         )
 
     async def _backoff_or_exhaust(self, exc: Exception, delay_seconds: float) -> None:
@@ -199,53 +204,38 @@ class StreamHandle[OutputT]:
         Raises:
             RetriesExhaustedError: the recorded failure spent the last attempt.
         """
-        if len(self._attempt_records) >= self._rate_limiter.max_attempts:
-            assert self._started_at_monotonic_seconds is not None
-            raise RetriesExhaustedError(
-                attempt_records=tuple(self._attempt_records),
-                model=self._adapter.model,
-                provider_name=self._adapter.provider_name,
-                elapsed_seconds=time.monotonic() - self._started_at_monotonic_seconds,
-                stop_reason=None,
-            ) from exc
+        if self._ledger.attempts >= self._rate_limiter.max_attempts:
+            raise RetriesExhaustedError(call=self._ledger.freeze()) from exc
         await asyncio.sleep(delay_seconds)
 
     def _non_retriable_or_none(self, exc: Exception) -> GenerationError | None:
-        """Map one attempt error to the non-retriable error to propagate, or None when transient."""
+        """Map one attempt error to the non-retriable error to propagate, or None when transient.
+
+        Reached only for exceptions, which by the adapter contract are attempts the adapter read no
+        outcome from: what it did read it reports as an AttemptOutcome arm, which this handle
+        matches instead.
+        """
         if isinstance(exc, TransientError):
             return None
-        if isinstance(exc, InvalidRequestError):
-            # Ahead of the GenerationError arm below, which returns its error unchanged: a
-            # before_send partial has none of the row-shape fields set, so it is rebuilt here.
-            return self._invalid_request_error(exc.reason, exc)
-        if isinstance(exc, GenerationError):
-            return exc
         classification = self._adapter.classify(exc)
         if classification == "invalid_request":
+            # Adapter.classify returns invalid_request only for a request the provider rejected,
+            # so it went out, and a rejection reports no usage, so ZERO_USAGE is what it billed.
+            self._ledger.record(error=None, usage=ZERO_USAGE, usage_raw=None)
             return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
         if classification == "unrecognized":
-            assert self._started_at_monotonic_seconds is not None
-            unrecognized = UnrecognizedError(
-                error=exc,
-                attempt_records=tuple(self._attempt_records),
-                model=self._adapter.model,
-                provider_name=self._adapter.provider_name,
-                elapsed_seconds=time.monotonic() - self._started_at_monotonic_seconds,
-            )
+            unrecognized = UnrecognizedError(error=exc, call=self._ledger.freeze())
             unrecognized.__cause__ = exc
             return unrecognized
         return None
 
-    def _invalid_request_error(self, reason: str, cause: Exception) -> InvalidRequestError:
-        """Build the row-shaped rejection leaf for this handle, chained to cause."""
-        assert self._started_at_monotonic_seconds is not None
-        invalid_request = InvalidRequestError(
-            reason=reason,
-            attempt_records=tuple(self._attempt_records),
-            model=self._adapter.model,
-            provider_name=self._adapter.provider_name,
-            elapsed_seconds=time.monotonic() - self._started_at_monotonic_seconds,
-        )
+    def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
+        """Build the row-shaped rejection leaf for this handle, chained to cause when there is one.
+
+        cause is None for a NotSendable outcome: the adapter reported that the conversation cannot be
+        sent, and no exception was involved.
+        """
+        invalid_request = InvalidRequestError(reason=reason, call=self._ledger.freeze())
         invalid_request.__cause__ = cause
         return invalid_request
 
@@ -264,18 +254,16 @@ class StreamHandle[OutputT]:
         The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
 
         Raises:
-            GenerationError: the adapter raised one of its leaves directly, or the failure was
-                classified as a rejection of the request (an InvalidRequestError) or as unrecognized
-                (an UnrecognizedError).
+            InvalidRequestError: the adapter reported the conversation as NotSendable, or the open
+                failure was classified as a rejection of the request.
+            UnrecognizedError: the open failure was classified as unrecognized.
             RetriesExhaustedError: the attempts spent the retry budget.
         """
         while self._adapter_stream is None:
             self._admission = await self._rate_limiter.acquire()
-            self._attempt_started_at_monotonic_seconds = time.monotonic()
-            if self._started_at_monotonic_seconds is None:
-                self._started_at_monotonic_seconds = self._attempt_started_at_monotonic_seconds
+            self._ledger.start_attempt()
             try:
-                self._adapter_stream = await self._bound_adapter.open_stream(self._conversation)
+                opened = await self._bound_adapter.open_stream(self._conversation)
             except Exception as exc:
                 non_retriable = self._non_retriable_or_none(exc)
                 if non_retriable is not None:
@@ -285,6 +273,10 @@ class StreamHandle[OutputT]:
                 self._release_slot()
                 await self._backoff_or_exhaust(exc, delay_seconds)
                 continue
+            if isinstance(opened, NotSendable):
+                self._release_slot()
+                raise self._invalid_request_error(opened.reason, None)
+            self._adapter_stream = opened
             self._items = self._adapter_stream.items()
             assert self._admission is not None
             self._rate_limiter.register_success(self._admission)
@@ -292,12 +284,13 @@ class StreamHandle[OutputT]:
     async def __anext__(self) -> StreamItem:
         """Return the next item.
 
-        Every error but StopAsyncIteration finishes the handle, so nothing later reopens the request.
+        Every error but StopAsyncIteration finishes the handle, so nothing later reopens the request,
+        and every such error but a cancellation is the call's conclusion, which final() replays.
 
         Raises:
             TransientError: the stream failed after items were yielded.
-            InvalidRequestError: the adapter refused to reopen the request, or classified an item or
-                reopen error as a rejection of it.
+            InvalidRequestError: the adapter reported a reopened conversation as NotSendable, or
+                classified an item or reopen error as a rejection of the request.
             UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
@@ -312,8 +305,13 @@ class StreamHandle[OutputT]:
             return await self._next_item()
         except StopAsyncIteration:
             raise
-        except BaseException:
+        except BaseException as exc:
             self._state = "finished"
+            if self._conclusion is None and isinstance(exc, Exception):
+                # A cancellation is not a conclusion: it destroys the frames that could have
+                # observed the call, which is what an AbandonedCall records instead.
+                self._conclusion = exc
+                self._conclusion_carried_the_call = isinstance(exc, GenerationError)
             raise
 
     async def _next_item(self) -> StreamItem:
@@ -359,79 +357,101 @@ class StreamHandle[OutputT]:
     async def final(self) -> Response[OutputT]:
         """Drain any remaining items silently and return the Response.
 
-        Idempotent: the assembled Response is cached on first completion.
-        A structured refusal or truncation is detected only here,
-        when the SDK parses the assembled message, so its GenerationError leaf surfaces from final() and is not retried
-        (the stream already yielded items to the caller);
-        the enriched leaf carries the attempt records this handle built.
+        Idempotent: the call's conclusion is stored once, whether this method or a caller's own
+        iteration produced it.
+        Every later call returns or raises it again without asking the adapter stream anything.
+        Without that store, a second call would append a second AttemptRecord for the one request made.
+        A structured refusal or truncation is detected only here, when the SDK parses the assembled
+        message: the adapter reports it as a Refused or Truncated outcome and this method builds the
+        leaf from it, without retrying (the stream already yielded items to the caller);
+        the leaf reaches the caller carrying the attempt records this handle built.
 
         Raises:
             StreamProtocolError: the provider's event stream ended without a terminal event.
             InvalidRequestError: draining the stream hit an item or reopen error the adapter
-                classified as a rejection of the request, or a reopen the adapter refused to send.
+                classified as a rejection of the request, or a reopened conversation the adapter
+                reported as NotSendable.
             UnrecognizedError: draining the stream hit an item or reopen error the adapter classified as unrecognized.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
-            RefusalError: the structured parse found a refusal; enriched with this handle's attempt records.
-            MaxCompletionTokensExceededError: the structured response hit the token cap; enriched likewise.
-            TransientError: the structured parse produced no instance for another reason; not retried,
-                because the stream already yielded items to the caller.
-            RuntimeError: the handle is unopened or finished.
+            RefusalError: the adapter reported the assembled response as Refused,
+                carrying this handle's attempt records.
+            MaxCompletionTokensExceededError: the adapter reported it as Truncated; likewise.
+            TransientError: the adapter reported it as Unparsed; not retried, because the stream
+                already yielded items to the caller. The error carries that 200's billing, the only
+                channel this outcome has.
+            RuntimeError: the handle is unopened, or it is finished with no conclusion stored
+                (drained to exhaustion, then left the block).
         """
-        if self._response is not None:
-            return self._response
-        if self._state != "open":
-            raise RuntimeError(
-                _UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE
-            )
-        async for _ in self:
-            pass
-        assert self._adapter_stream is not None
-        assert self._attempt_started_at_monotonic_seconds is not None
-        assert self._started_at_monotonic_seconds is not None
-        ended_at_monotonic_seconds = (
-            time.monotonic()
-            if self._ended_at_monotonic_seconds is None
-            else self._ended_at_monotonic_seconds
-        )
-        try:
-            adapter_result = await self._adapter_stream.final()
-        except GenerationError as exc:
-            self._attempt_records.append(
-                AttemptRecord(
-                    started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
-                    ended_at_monotonic_seconds=ended_at_monotonic_seconds,
-                    error=None,
-                    usage=exc.usage,
-                    usage_raw=exc.usage_raw,
+        if self._conclusion is None:
+            if self._state != "open":
+                raise RuntimeError(
+                    _UNOPENED_MESSAGE if self._state == "unopened" else _FINISHED_MESSAGE
                 )
+            async for _ in self:
+                pass
+            assert self._adapter_stream is not None
+            ended_at_monotonic_seconds = (
+                time.monotonic()
+                if self._ended_at_monotonic_seconds is None
+                else self._ended_at_monotonic_seconds
             )
-            self._final_concluded = True
-            raise type(exc)(
-                attempt_records=tuple(self._attempt_records),
-                model=self._adapter.model,
-                provider_name=self._adapter.provider_name,
-                elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
-                stop_reason=exc.stop_reason,
-            ) from exc
-        response = Response(
-            output=adapter_result.output,
-            model=self._adapter.model,
-            provider_name=self._adapter.provider_name,
-            attempt_records=(
-                *self._attempt_records,
-                AttemptRecord(
-                    started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
-                    ended_at_monotonic_seconds=ended_at_monotonic_seconds,
-                    error=None,
-                    usage=adapter_result.usage,
-                    usage_raw=adapter_result.usage_raw,
-                ),
-            ),
-            elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
-            raw=adapter_result.raw,
-            stop_reason=adapter_result.stop_reason,
-            assistant_message=adapter_result.assistant_message,
+            outcome = await self._adapter_stream.final()
+            self._conclusion = self._conclude(outcome, ended_at_monotonic_seconds)
+            # Every _conclude arm accounts for the call: three build their result off the frozen
+            # CallRecord, and Unparsed puts the 200's billing on the TransientError it returns.
+            self._conclusion_carried_the_call = True
+        if isinstance(self._conclusion, Response):
+            return self._conclusion
+        raise self._conclusion
+
+    def _conclude(
+        self, outcome: ResponseOutcome[OutputT], ended_at_monotonic_seconds: float
+    ) -> Response[OutputT] | GenerationError | TransientError:
+        """Build what this outcome concludes the call with: the Response, or the error to raise.
+
+        Returns the error rather than raising it, so no arm can conclude the call without being stored.
+        """
+        match outcome:
+            case AdapterResult():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return Response(
+                    output=outcome.output,
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                    raw=outcome.raw,
+                    stop_reason=outcome.stop_reason,
+                    assistant_message=outcome.assistant_message,
+                )
+            case Refused():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return RefusalError(call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds))
+            case Truncated():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return MaxCompletionTokensExceededError(
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                )
+            case Unparsed():
+                return TransientError(
+                    "structured response contained no parsed output",
+                    usage=outcome.usage,
+                    usage_raw=outcome.usage_raw,
+                )
+            case _ as unhandled:
+                assert_never(unhandled)
+
+    def _record_completed_attempt(
+        self,
+        outcome: AdapterResult[OutputT] | Refused | Truncated,
+        ended_at_monotonic_seconds: float,
+    ) -> None:
+        """Record the attempt that reached a billable 200, whatever the adapter made of it.
+
+        error is None on all three: the request itself succeeded, and what the adapter made of the
+        response is the item's outcome, not this attempt's failure.
+        An Unparsed's billing reaches the caller on its TransientError, so it gets no record.
+        """
+        self._ledger.record_ending_at(
+            ended_at_monotonic_seconds,
+            error=None,
+            usage=outcome.usage,
+            usage_raw=outcome.usage_raw,
         )
-        self._response = response
-        self._final_concluded = True
-        return response

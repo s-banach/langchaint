@@ -18,19 +18,24 @@ and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a refusal and a token-cap truncation are normal 200 responses that never reach classify,
-so the adapter detects them where it reads the response and raises the matching leaf directly.
+so the adapter reports them as AttemptOutcome arms where it reads the response.
+Every leaf is constructed by a retry loop, which is the only scope that knows a call's attempts and
+timing; an adapter reports one attempt and never a leaf.
 
-DispatchExceptionGroup sits outside this axis: it belongs to the tool layer, not the generate loop.
-ToolManager.dispatch_many raises it after every sibling dispatch settled,
-grouping the tool-function defects and carrying the settled calls' outcomes.
+Three exceptions sit outside this axis, none of them a GenerationError.
+DispatchExceptionGroup and InvalidToolArgsError belong to the tool layer, not the generate loop.
+ToolManager.dispatch_many raises the group after every sibling dispatch settled.
+It groups the tool-function defects and carries the settled calls' outcomes.
+PydanticTool.validate_and_run raises InvalidToolArgsError when a tool call's args fail validation.
+StreamProtocolError says a stream did not follow the event contract.
 """
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self, override
+from typing import TYPE_CHECKING, Literal, Self, override
 
 from pydantic import BaseModel, ValidationError
 
+from langchaint.call import AttemptRecord, CallRecord, _CallCarrier
 from langchaint.messages import StopReason
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -50,12 +55,12 @@ class TransientError(Exception):
     is_rate_limit marks errors saying the account or service refuses further requests right now
     (Adapter.classify returned "rate_limit");
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
-    usage (carrying cost_in_usd) and stop_reason describe the attempt's billable completion
-    when the failing attempt was a completed 200 the adapter rejected downstream
-    (a structured parse that returned no output);
+    usage (carrying cost_in_usd) describes the attempt's billable completion when the failing attempt
+    was a completed 200 the adapter rejected downstream (a structured parse that returned no output,
+    which the adapter reports as an Unparsed outcome);
     usage_raw is the raw SDK usage object usage was normalized from, held by reference.
     A transport failure (timeout, 5xx, connection or rate-limit error) billed nothing, so usage is ZERO_USAGE
-    and usage_raw is None; stop_reason is None too.
+    and usage_raw is None.
     The retry loop copies usage and usage_raw onto the attempt's AttemptRecord.
     """
 
@@ -67,7 +72,6 @@ class TransientError(Exception):
         is_rate_limit: bool = False,
         usage: Usage = ZERO_USAGE,
         usage_raw: BaseModel | None = None,
-        stop_reason: StopReason | None = None,
     ) -> None:
         """Store the server-stated wait, the rate-limit classification, and any attempt billing."""
         super().__init__(message)
@@ -75,41 +79,6 @@ class TransientError(Exception):
         self.is_rate_limit = is_rate_limit
         self.usage = usage
         self.usage_raw = usage_raw
-        self.stop_reason = stop_reason
-
-
-@dataclass(frozen=True, kw_only=True)
-class AttemptRecord:
-    """One request sent inside the retry loop, success or failure.
-
-    started_at_monotonic_seconds and ended_at_monotonic_seconds are raw time.monotonic() readings:
-    only differences are meaningful, and only within one process.
-    langchaint defines no time origin because it does not own the enclosing loop;
-    subtract whatever origin the caller holds (an agent-loop start, another record)
-    to place records on a shared timeline.
-    The bracket spans the request itself and excludes RateLimiter slot waits and backoff sleeps,
-    so a slow request is distinguishable from time spent rate limited;
-    the gap between consecutive records is that wait.
-    On a stream the succeeding record spans opening the stream to its exhaustion, because that is the whole request.
-    error is None on the attempt that succeeded and on a completed 200 rejected downstream
-    (a refusal or a truncation, which are not transient);
-    it holds the TransientError otherwise.
-    usage is the attempt's billing (with cost_in_usd inside): the reported counts when the attempt reached a
-    billable 200 (a success, or a rejected 200), ZERO_USAGE for a transport failure that billed nothing.
-    usage_raw is the raw SDK usage object usage was normalized from, or None when no wire payload existed
-    (a transport failure, or an openai 200 reporting no usage); it is the "did this attempt reach a 200" signal.
-    """
-
-    started_at_monotonic_seconds: float
-    ended_at_monotonic_seconds: float
-    error: TransientError | None
-    usage: Usage
-    usage_raw: BaseModel | None
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """The bracket's length."""
-        return self.ended_at_monotonic_seconds - self.started_at_monotonic_seconds
 
 
 def _extract_transient_errors(
@@ -129,7 +98,7 @@ def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
     )
 
 
-class GenerationError(Exception):
+class GenerationError(_CallCarrier, Exception):
     """A terminal per-item generate result that becomes a to_row failure row.
 
     The base for the five non-retriable per-item outcomes:
@@ -140,79 +109,58 @@ class GenerationError(Exception):
     UnrecognizedError (the adapter did not recognize the attempt's error).
     generate_one raises any of them;
     generate_many returns each in the slot of the item it belongs to,
-    so to_row renders a uniform failure row and siblings keep running.
+    so to_row renders a uniform failure row.
 
-    attempt_records holds one AttemptRecord per request sent;
-    model, provider_name, elapsed_seconds, and stop_reason mirror the fields a success Response carries
+    call is this call's history; model, provider_name, attempt_records, and elapsed_seconds read
+    off it, and with stop_reason they mirror the fields a success Response carries
     so to_row fills the same row shape from either.
     usage (carrying cost_in_usd) is the paid total summed from the records
     (a refusal or truncation reads its one completed attempt;
     a retry-exhausted item sums its records, near zero when they were transport failures);
     attempts and error_text are derived from the records too.
-    usage_raw is the raw SDK usage of the one rejected 200 on the partial leaf for_rejected_200 builds,
-    and None on the enriched re-raise, where a caller recovers each attempt's payload from attempt_records.
+    A caller recovers each attempt's raw provider usage payload from attempt_records.
 
-    An adapter raising a leaf cannot know the loop's prior attempts or timing, so it raises a partial:
-    for_rejected_200 for a completed 200 the adapter rejects, carrying that attempt's billing, and
-    InvalidRequestError.before_send for a request it refuses to send, carrying no billing at all.
-    The retry loop records the attempt where there is one, and re-raises the enriched leaf
-    via the normal constructor.
+    Only a retry loop constructs one of these, because only a loop knows the attempts and the timing,
+    and every field is set in the constructor. An adapter reports what one attempt produced (an
+    AttemptOutcome arm) and never a leaf, so no leaf exists in a half-built state.
     """
 
-    attempt_records: tuple[AttemptRecord, ...]
-    model: str
-    provider_name: str
-    elapsed_seconds: float
-    stop_reason: StopReason | None
+    call: CallRecord
     usage: Usage
-    usage_raw: BaseModel | None
 
-    def __init__(
-        self,
-        *,
-        attempt_records: tuple[AttemptRecord, ...],
-        model: str,
-        provider_name: str,
-        elapsed_seconds: float,
-        stop_reason: StopReason | None,
-    ) -> None:
-        """Fill the row-shape fields."""
-        self.attempt_records = attempt_records
-        self.model = model
-        self.provider_name = provider_name
-        self.elapsed_seconds = elapsed_seconds
-        self.stop_reason = stop_reason
-        self.usage = sum((record.usage for record in attempt_records), start=ZERO_USAGE)
-        self.usage_raw = None
-        super().__init__(self._summary())
+    def __init__(self, *, call: CallRecord) -> None:
+        """Store the call and fold the paid total from its records."""
+        super().__init__()
+        self.call = call
+        self.usage = Usage.sum_of(record.usage for record in call.attempt_records)
 
-    @classmethod
-    def for_rejected_200(
-        cls, *, usage: Usage, usage_raw: BaseModel | None, stop_reason: StopReason
-    ) -> Self:
-        """Adapter-side leaf carrying one rejected 200's billing, before the loop fills the row.
+    @property
+    def stop_reason(self) -> StopReason | None:
+        """None: no turn completed, which holds for every leaf but RefusalError and MaxCompletionTokensExceededError.
 
-        usage_raw is the raw SDK usage object, None only when the rejected 200 reported no usage
-        (an openai response whose usage field is None).
-        The retry loop catches it, records the attempt from usage and usage_raw,
-        and re-raises the enriched leaf through the normal constructor;
-        no caller ever sees this partial object,
-        so its row-shape fields (attempt_records, model, provider_name, elapsed_seconds) stay unset.
+        Fixed by the class rather than taken as a constructor argument, because a raise site must
+        not choose a value the leaf's identity already fixes. Deriving it in to_row instead is
+        rejected: to_row and gen_ai_attributes both read it off Response | GenerationError, so each
+        would need an isinstance ladder over the leaves.
         """
-        error = cls.__new__(cls)
-        error.usage = usage
-        error.usage_raw = usage_raw
-        error.stop_reason = stop_reason
-        Exception.__init__(error, cls._summary(error))
-        return error
+        return None
 
     def _summary(self) -> str:
         """Return the exception message; leaves override this with their own reason."""
         return "generation failed"
 
+    @override
+    def __str__(self) -> str:
+        """Render the reason, computed on demand so it never depends on when the fields were set."""
+        return self._summary()
+
     @property
     def attempts(self) -> int:
-        """Requests actually sent: one attempt record each."""
+        """Requests langchaint observed going out: one attempt record each.
+
+        Below the requests sent when the adapter could not read the last attempt's error, which is
+        the count an UnrecognizedError costs.
+        """
         return len(self.attempt_records)
 
     @property
@@ -227,7 +175,6 @@ class RetriesExhaustedError(GenerationError):
     generate_one raises it;
     generate_many returns it in the row where an item exhausted its retries,
     so the same object is both the raised failure and the failure row of a batch.
-    stop_reason is None: no attempt reached a completed turn to report one.
     errors_from_attempts is derived from attempt_records.
     """
 
@@ -259,8 +206,13 @@ class RefusalError(GenerationError):
     but retrying spends the full input tokens
     (cache-read rate when warm, never zero) on an expected-value bet langchaint does not take by default.
     An app whose economics differ overrides the adapter's _parsed_output.
-    stop_reason is "refusal".
     """
+
+    @property
+    @override
+    def stop_reason(self) -> Literal["refusal"]:
+        """The turn the provider completed and the adapter rejected ended in a refusal."""
+        return "refusal"
 
     @override
     def _summary(self) -> str:
@@ -275,8 +227,13 @@ class MaxCompletionTokensExceededError(GenerationError):
     the attempt already generated the full token cap,
     the most expensive possible response, and a resample under the same cap truncates again.
     The fix is a larger max_completion_tokens via rebind.
-    stop_reason is "max_tokens".
     """
+
+    @property
+    @override
+    def stop_reason(self) -> Literal["max_tokens"]:
+        """The turn the provider completed and the adapter rejected hit the token cap."""
+        return "max_tokens"
 
     @override
     def _summary(self) -> str:
@@ -288,53 +245,29 @@ class InvalidRequestError(GenerationError):
 
     Two sources, both meaning the request as sent (or as it would have been sent) is not acceptable:
     the provider's own rejection, which Adapter.classify returns "invalid_request" for, and the
-    adapter's refusal to send, raised through before_send when the conversation cannot be put on the
+    adapter reporting the conversation as a NotSendable outcome, because it cannot be put on the
     wire with the meaning the message states.
     Not retried: the same request would be rejected the same way.
 
+    The provider's rejection is every 4xx the retry policy declines, not only a rejected conversation.
+    A bad API key, a permission failure, and an unknown model id land here too.
+    A caller separating them reads status_code off __cause__, which holds the exception classify saw.
+    Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.116.0, openai 2.45.0).
+    __cause__ is None on the NotSendable source, where nothing went out.
+
     Behaviorally this is UnrecognizedError (one row, no retry); it is a separate class because
     Adapter.classify's contract is that "unrecognized" means the adapter could not name the error,
-    and a rejection it does name is not that. The split is what a reader of error_text and of the
-    tracing error.type sees: a provider verdict and a langchaint defect should not group together.
+    and a rejection it does name is not that.
 
     reason states what was rejected, and is the whole error message.
-    stop_reason is None: no turn completed.
     """
 
     reason: str
 
-    def __init__(
-        self,
-        *,
-        reason: str,
-        attempt_records: tuple[AttemptRecord, ...],
-        model: str,
-        provider_name: str,
-        elapsed_seconds: float,
-    ) -> None:
-        """Store the rejection, then fill the row-shape fields."""
+    def __init__(self, *, reason: str, call: CallRecord) -> None:
+        """Store the rejection, then the call."""
         self.reason = reason
-        super().__init__(
-            attempt_records=attempt_records,
-            model=model,
-            provider_name=provider_name,
-            elapsed_seconds=elapsed_seconds,
-            stop_reason=None,
-        )
-
-    @classmethod
-    def before_send(cls, reason: str) -> Self:
-        """Adapter-side leaf for a request the adapter refuses to send, before the loop fills the row.
-
-        Carries no billing, unlike for_rejected_200: nothing was sent, so there is no attempt to
-        record and no usage to preserve. The retry loop catches it, registers nothing with the
-        RateLimiter, and re-raises the enriched leaf through the normal constructor;
-        no caller ever sees this partial object, so its row-shape fields stay unset.
-        """
-        error = cls.__new__(cls)
-        error.reason = reason
-        Exception.__init__(error, cls._summary(error))
-        return error
+        super().__init__(call=call)
 
     @override
     def _summary(self) -> str:
@@ -342,40 +275,27 @@ class InvalidRequestError(GenerationError):
 
 
 class UnrecognizedError(GenerationError):
-    """A provider error the adapter cannot name; the item fails as a row, siblings continue.
+    """A provider error the adapter cannot name; the item fails as a row.
 
     Adapter.classify's default: not a known transient or rate-limit condition (which retry), and not
     a rejection of this request (which is InvalidRequestError), so the safe treatment is to fail this
-    item visibly and let the rest of the batch run.
+    item visibly.
     It covers both an error langchaint has no account of, which may be a defect (in langchaint, the
     SDK, or the provider), and one whose disposition is known while its identity is not: a server
     error the provider declares final by responding x-should-retry: false.
     Not retried: a defect must surface rather than be retried silently at billing expense,
     and a failure the provider calls final would not survive a retry either.
     error is the unrecognized exception, also chained as __cause__.
-    attempt_records covers the prior transient attempts; the unrecognized attempt itself has no
-    record, because its billing is unobservable through an exception the adapter cannot read.
-    stop_reason is None: no completed turn reported one.
+    attempt_records covers the prior attempts; the unrecognized attempt itself has no record,
+    because its billing is unobservable through an exception the adapter cannot read.
+    So both usage and attempts are short by that attempt: langchaint cannot say what it billed,
+    nor even that it reached the provider.
     """
 
-    def __init__(
-        self,
-        *,
-        error: Exception,
-        attempt_records: tuple[AttemptRecord, ...],
-        model: str,
-        provider_name: str,
-        elapsed_seconds: float,
-    ) -> None:
-        """Store the unrecognized exception, then fill the row-shape fields."""
+    def __init__(self, *, error: Exception, call: CallRecord) -> None:
+        """Store the unrecognized exception, then the call."""
         self.error = error
-        super().__init__(
-            attempt_records=attempt_records,
-            model=model,
-            provider_name=provider_name,
-            elapsed_seconds=elapsed_seconds,
-            stop_reason=None,
-        )
+        super().__init__(call=call)
 
     @override
     def _summary(self) -> str:

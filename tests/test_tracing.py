@@ -61,7 +61,14 @@ from langchaint import (
     UserMessage,
     to_row,
 )
-from langchaint.adapter import AdapterResult, Binding, BoundAdapter
+from langchaint.adapter import (
+    AdapterResult,
+    Binding,
+    BoundAdapter,
+    NotSendable,
+    Refused,
+    Truncated,
+)
 from langchaint.tracing import (
     AttributeMapper,
     SpanAttributes,
@@ -272,14 +279,8 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
     """A refusal leaf yields an error span carrying the rejected 200's real token counts and cost."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send refuses, then inspect the error span."""
-        adapter = _FakeAdapter(
-            failures=[
-                RefusalError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-                )
-            ]
-        )
+        """Drive one generate_one whose send reports Refused, then inspect the error span."""
+        adapter = _FakeAdapter(failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),
@@ -302,13 +303,9 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
     """A truncation leaf yields an error span with the rejected 200's tokens and max_tokens finish."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send truncates, then inspect the error span."""
+        """Drive one generate_one whose send reports Truncated, then inspect the error span."""
         adapter = _FakeAdapter(
-            failures=[
-                MaxCompletionTokensExceededError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="max_tokens"
-                )
-            ]
+            failures=[Truncated(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
@@ -361,8 +358,8 @@ def test_generate_one_rejection_span_names_its_own_leaf_in_error_type() -> None:
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send is refused, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[InvalidRequestError.before_send("misconfigured")])
+        """Drive one generate_one whose send reports NotSendable, then inspect the error span."""
+        adapter = _FakeAdapter(failures=[NotSendable(reason="misconfigured")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),
@@ -435,14 +432,10 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
     """A mixed batch emits exactly one OK INTERNAL span carrying the item count, no per-item spans."""
 
     async def scenario() -> None:
-        """Serialize a three-item batch whose first item refuses, then inspect the batch span."""
+        """Serialize a three-item batch whose first item is Refused, then inspect the batch span."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[
-                RefusalError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-                )
-            ],
+            failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
@@ -520,10 +513,8 @@ def test_generate_many_failing_item_leaves_the_batch_span_ok() -> None:
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch whose first item is refused, then inspect the batch span."""
-        adapter = _FakeAdapter(
-            echo=True, failures=[InvalidRequestError.before_send("misconfigured")]
-        )
+        """Serialize a two-item batch whose first item is not sendable, then inspect the batch span."""
+        adapter = _FakeAdapter(echo=True, failures=[NotSendable(reason="misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
@@ -2120,13 +2111,7 @@ def test_the_error_path_captures_input_and_no_output() -> None:
 
     async def scenario() -> None:
         """Drive a refusal under capture and inspect the error span."""
-        adapter = _FakeAdapter(
-            failures=[
-                RefusalError.for_rejected_200(
-                    usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE, stop_reason="refusal"
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),

@@ -3,13 +3,11 @@
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
 a truncation at the token cap, or an unrecognized provider error) raises or returns a GenerationError;
 one a cancellation cuts off leaves an AbandonedCall on the caller's abandoned_call_log.
-The three carriers share the per-attempt history langchaint's retry loop produces,
-because the history survives only if the result carries it:
-attempt_records is that history, one record per request sent.
+Each of the three carries the CallRecord its retry loop froze, because a call's history survives
+only if the result carries it: attempt_records is that history.
 On a Response every record but the last failed and the last succeeded;
 on a GenerationError the records describe the terminal outcome;
 on an AbandonedCall they cover the attempts that settled before the cancellation.
-attempts is derived from the records on Response and GenerationError.
 to_row flattens a Response or a GenerationError to one dict of scalars with the same keys,
 so a mixed list of successes and failures converts directly to a table.
 """
@@ -19,7 +17,8 @@ from typing import Protocol
 
 from pydantic import BaseModel
 
-from langchaint.exceptions import AttemptRecord, GenerationError
+from langchaint.call import CallRecord, _CallCarrier
+from langchaint.exceptions import GenerationError
 from langchaint.messages import AssistantMessage, StopReason, ToolCall
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -28,12 +27,13 @@ type RowValue = str | int | float | bool | None
 
 
 @dataclass(frozen=True, kw_only=True)
-class Response[OutputT]:
+class Response[OutputT](_CallCarrier):
     """One successful generate result.
 
     output is the assistant text, or the SDK-parsed response_format instance.
-    attempt_records holds one AttemptRecord per request sent, in order;
-    every record but the last failed and the last succeeded, and attempts is derived from the records.
+    call is this call's history: model, provider_name, attempt_records, and elapsed_seconds read off it.
+    attempts counts its records.
+    Every attempt record but the last failed and the last succeeded.
     assistant_message is the adapter-built turn exactly as the provider produced it,
     the whole ordered turn (reasoning, text, and tool calls in emission order),
     held by reference for appending to a conversation.
@@ -45,15 +45,11 @@ class Response[OutputT]:
     treat it read-only and raw.model_copy() before mutating.
     usage and usage_successful_attempt are two scopes, both folded from attempt_records (see their docstrings):
     usage is the paid total across every attempt, usage_successful_attempt the single kept answer's own.
-    elapsed_seconds spans first request to completion, RateLimiter slot waits and backoff waits included;
-    it is stored rather than derived from the records because the records deliberately exclude those waits.
     """
 
     output: OutputT
-    model: str
-    provider_name: str
-    attempt_records: tuple[AttemptRecord, ...]
-    elapsed_seconds: float
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    call: CallRecord
     raw: BaseModel
     stop_reason: StopReason
     assistant_message: AssistantMessage
@@ -73,7 +69,7 @@ class Response[OutputT]:
 
     @property
     def attempts(self) -> int:
-        """Requests actually sent: one attempt record each."""
+        """Requests langchaint observed going out: one attempt record each."""
         return len(self.attempt_records)
 
     @property
@@ -105,7 +101,7 @@ class Response[OutputT]:
 
 
 @dataclass(frozen=True, kw_only=True)
-class AbandonedCall:
+class AbandonedCall(_CallCarrier):
     """The record of one generate call a cancellation cut off, appended to the caller's log.
 
     A cancelled call returns no value, and the CancelledError must propagate for the cancelling
@@ -113,16 +109,16 @@ class AbandonedCall:
     generate_one and stream_one append it to their abandoned_call_log before re-raising.
     Its presence in the log is the count of abandoned calls.
 
-    attempt_records covers only the attempts that settled before the cancellation.
+    call is this call's history, and its attempt_records cover only the attempts that settled
+    before the cancellation.
     The in-flight attempt has no record: it may have completed and billed server-side,
     so its cost is unobservable client-side and no usage is fabricated for it
     ("unbilled" would overclaim).
     Reconciliation closes the gap from the provider's side, which model and provider_name identify.
     """
 
-    attempt_records: tuple[AttemptRecord, ...]
-    model: str
-    provider_name: str
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    call: CallRecord
 
     @property
     def usage_settled(self) -> Usage:
@@ -130,6 +126,11 @@ class AbandonedCall:
 
         Deliberately not named usage: on the other result carriers, usage is the call's whole paid
         total, and this value structurally lacks the in-flight attempt's share.
+        Naming it usage for uniformity is rejected.
+        Cancellation correlates with long requests, so the omitted attempt skews expensive.
+        On the stream path the settled records are only the opens that failed before the first item.
+        The value would then read near zero while the true spend is the whole stream.
+        Uniformity would turn a loud AttributeError into a silent undercount.
         """
         return sum((record.usage for record in self.attempt_records), start=ZERO_USAGE)
 

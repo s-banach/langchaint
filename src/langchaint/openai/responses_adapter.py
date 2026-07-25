@@ -111,18 +111,17 @@ from langchaint.adapter import (
     BoundAdapter,
     ErrorClassification,
     PricingTable,
+    Refused,
+    ResponseOutcome,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
+    Truncated,
+    Unparsed,
     classification_from_response,
     retry_after_seconds_from_headers,
 )
-from langchaint.exceptions import (
-    MaxCompletionTokensExceededError,
-    RefusalError,
-    StreamProtocolError,
-    TransientError,
-)
+from langchaint.exceptions import StreamProtocolError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
@@ -692,7 +691,9 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncResponseStream[Any],
         pricing: PricingTable,
-        output_from_response: Callable[[ParsedResponse[Any]], OutputT],
+        output_from_response: Callable[
+            [ParsedResponse[Any]], OutputT | Refused | Truncated | Unparsed
+        ],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
@@ -734,14 +735,13 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
             raise StreamProtocolError("stream ended without a terminal response")
 
     @override
-    async def final(self) -> AdapterResult[OutputT]:
-        """Return the result assembled from the captured terminal response.
+    async def final(self) -> ResponseOutcome[OutputT]:
+        """Return what the captured terminal response produced.
 
         Only response.completed carries a ParsedResponse;
         an incomplete or failed terminal response is re-validated into one whose parsed output is absent,
-        so the structured output extractor classifies the empty parse (a RefusalError,
-        a MaxCompletionTokensExceededError,
-        or a TransientError) while the text extractor returns the partial output_text.
+        so the structured output extractor classifies the empty parse (Refused, Truncated, or Unparsed)
+        while the text extractor returns the partial output_text.
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so no terminal response was captured.
@@ -753,9 +753,12 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
             if isinstance(self._terminal_response, ParsedResponse)
             else ParsedResponse[None].model_validate(self._terminal_response.model_dump())
         )
+        output = self._output_from_response(parsed_response)
+        if isinstance(output, Refused | Truncated | Unparsed):
+            return output
         return _adapter_result(
             response=parsed_response,
-            output=self._output_from_response(parsed_response),
+            output=output,
             pricing=self._pricing,
         )
 
@@ -834,18 +837,16 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         self._request = request
         self._response_format = response_format
 
-    def _parsed_output(self, response: ParsedResponse[ModelT]) -> ModelT:
-        """Extract the parsed instance, or raise the error that classifies why the turn produced none.
+    def _parsed_output(
+        self, response: ParsedResponse[ModelT]
+    ) -> ModelT | Refused | Truncated | Unparsed:
+        """Extract the parsed instance, or report why the turn produced none.
 
-        Each raised error carries this attempt's billing (usage with cost_in_usd, usage_raw,
-        stop_reason) so a rejected 200's cost is not lost.
-
-        Raises:
-            RefusalError: the response carried a ResponseOutputRefusal block; terminal per-item, not retried.
-            MaxCompletionTokensExceededError: the response was incomplete for max_output_tokens;
-                terminal per-item, not retried.
-            TransientError: the turn completed but carried no parsed output for another reason,
-                which a later attempt may fix.
+        Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
+        SDK usage object) so a rejected 200's cost is not lost.
+        No arm carries a stop reason: each leaf's class fixes it, and _normalized_stop_reason, used
+        here only to detect the refusal, tests a function_call item ahead of the response status,
+        which is right for what a Response reports and wrong for a truncated turn.
         """
         if response.output_parsed is None:
             usage = (
@@ -853,34 +854,23 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
                 if response.usage
                 else ZERO_USAGE
             )
-            stop_reason = _normalized_stop_reason(response)
-            if stop_reason == "refusal":
-                raise RefusalError.for_rejected_200(
-                    usage=usage, usage_raw=response.usage, stop_reason=stop_reason
-                )
+            if _normalized_stop_reason(response) == "refusal":
+                return Refused(usage=usage, usage_raw=response.usage)
             if (
                 response.status == "incomplete"
                 and response.incomplete_details is not None
                 and response.incomplete_details.reason == "max_output_tokens"
             ):
-                raise MaxCompletionTokensExceededError.for_rejected_200(
-                    usage=usage, usage_raw=response.usage, stop_reason=stop_reason
-                )
-            raise TransientError(
-                "structured response contained no parsed output",
-                usage=usage,
-                usage_raw=response.usage,
-                stop_reason=stop_reason,
-            )
+                return Truncated(usage=usage, usage_raw=response.usage)
+            return Unparsed(usage=usage, usage_raw=response.usage)
         return response.output_parsed
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[ModelT]:
         """Send one non-streaming request via responses.parse.
 
-        Raises:
-            RefusalError, MaxCompletionTokensExceededError, or TransientError: the parse yielded no instance;
-                propagated from _parsed_output, which names the condition for each.
+        A parse yielding no instance returns the Refused, Truncated, or Unparsed arm _parsed_output
+        chose. NotSendable never arrives: this adapter refuses no conversation.
         """
         response = await self._adapter.client.responses.parse(
             model=self._request.model,
@@ -897,9 +887,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             input=[*self._request.input_prefix, *_wire_input(conversation)],
             text_format=self._response_format,
         )
+        output = self._parsed_output(response)
+        if isinstance(output, Refused | Truncated | Unparsed):
+            return output
         return _adapter_result(
             response=response,
-            output=self._parsed_output(response),
+            output=output,
             pricing=self._adapter.pricing,
         )
 

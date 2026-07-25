@@ -128,7 +128,7 @@ class RateLimiter:
         """Return the in-flight slot admission holds; call exactly once, however the request ended.
 
         A probe released without a registered success did not prove recovery
-        (it failed, was cancelled, or raised fatally), so the next waiter becomes the probe.
+        (it failed, was cancelled, or raised a non-transient error), so the next waiter becomes the probe.
         """
         self._in_flight_slots.release()
         if admission is self._probe_admission:

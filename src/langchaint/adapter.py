@@ -7,6 +7,14 @@ Adapters delegate stream assembly and structured-output parsing to the SDK
 (`get_final_response` / `get_final_message`), which is generic in the response format,
 so the output type flows from the SDK to the caller without reconstruction.
 
+Reporting model: an adapter reports one attempt; only the retry loop knows the call.
+So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
+constructs a `GenerationError` leaf, which is a verdict about a call it cannot see.
+What no arm can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
+that propagate for `Adapter.classify` to sort.
+`AdapterStream.items` is the exception to the return contract, because an async iterator can only
+raise: a mid-stream failure reaches the stream handle as an exception and goes through `classify` too.
+
 Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
 (system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
 to precomputed SDK keyword arguments once;
@@ -31,7 +39,6 @@ type ErrorClassification = Literal["rate_limit", "transient", "invalid_request",
 """Whether a retry may fix the error, and what to call it when it cannot.
 
 A string classification, not an exception class; the retry loop maps it onto one.
-Every classification fails at most its own item: none of them reaches a sibling.
 "rate_limit" is transient and account-wide: the account or service refuses further requests
 right now, so RateLimiter pauses admission for everyone sharing it.
 "transient" is retried by the failing task alone.
@@ -226,6 +233,67 @@ class AdapterResult[OutputT]:
     raw: BaseModel
 
 
+@dataclass(frozen=True, kw_only=True)
+class Refused:
+    """A completed 200 whose structured parse found the model refusing.
+
+    The retry loop records the attempt and fails the item with a RefusalError, without retrying.
+    """
+
+    usage: Usage
+    usage_raw: BaseModel | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class Truncated:
+    """A completed 200 that reached the token cap before its JSON closed.
+
+    The retry loop records the attempt and fails the item with a MaxCompletionTokensExceededError,
+    without retrying.
+    """
+
+    usage: Usage
+    usage_raw: BaseModel | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class Unparsed:
+    """A completed 200 carrying no parsed instance, for a reason the stop reason does not name.
+
+    The retry loop records the attempt and retries it, because a later attempt may parse.
+    A stream handle instead propagates it as a TransientError carrying this attempt's billing,
+    because the stream already yielded items to the caller and is not reopened.
+    """
+
+    usage: Usage
+    usage_raw: BaseModel | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class NotSendable:
+    """A conversation the adapter refuses to put on the wire; nothing was sent.
+
+    Raised by no one and billed by no one: the retry loop records no attempt and fails the item with
+    an InvalidRequestError. reason states what cannot be sent, and becomes that error's message.
+    """
+
+    reason: str
+
+
+type ResponseOutcome[OutputT] = AdapterResult[OutputT] | Refused | Truncated | Unparsed
+"""What one completed 200 produced.
+
+Every arm but AdapterResult is a response the adapter read and rejected; all four reached a billable
+200, so each carries that attempt's usage (with cost_in_usd inside) and the raw SDK usage object it
+was normalized from, held by reference and None when the response reported no usage.
+The arms differ in what the retry loop does with them, which is why they are four types rather than
+one type carrying a reason: see each class.
+"""
+
+type AttemptOutcome[OutputT] = ResponseOutcome[OutputT] | NotSendable
+"""What one attempt produced, whether or not a request went out."""
+
+
 class AdapterStream[OutputT](ABC):
     """One open stream, backed by the SDK's stream manager.
 
@@ -243,10 +311,13 @@ class AdapterStream[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def final(self) -> AdapterResult[OutputT]:
-        """Return the SDK-assembled result after the stream ends.
+    async def final(self) -> ResponseOutcome[OutputT]:
+        """Return what the assembled response produced, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
+        A structured parse yielding no instance is Refused, Truncated, or Unparsed rather than a raise,
+        so the stream handle gets this attempt's billing and decides the item's fate itself.
+        NotSendable cannot arrive here: the request is already open.
         """
         ...
 
@@ -264,23 +335,26 @@ class BoundAdapter[OutputT](ABC):
     """
 
     @abstractmethod
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[OutputT]:
-        """Send one non-streaming request.
+    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[OutputT]:
+        """Send one non-streaming request and report what the attempt produced.
+
+        A response the adapter reads and rejects is a returned arm, never a raise, so the retry loop
+        records what the attempt billed before deciding the item's fate.
 
         Raises:
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
-                For defects the SDK reports as data rather than as an exception,
-                and for a conversation the adapter refuses to put on the wire,
-                the adapter raises TransientError or a GenerationError leaf directly,
-                and the retry loop honors those without classification.
+                They are the attempts this adapter read no outcome from.
         """
         ...
 
     @abstractmethod
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[OutputT]:
+    async def open_stream(
+        self, conversation: Sequence[Message]
+    ) -> AdapterStream[OutputT] | NotSendable:
         """Open one streaming request and return the live stream.
 
         Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.
+        A conversation the adapter will not put on the wire returns NotSendable instead, having opened nothing.
 
         Raises:
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
@@ -390,13 +464,15 @@ class Adapter(ABC):
     def classify(self, error: Exception) -> ErrorClassification:
         """Classify an exception raised by send or open_stream.
 
-        Every classification is per-item, because an error arriving during a request says nothing
-        about the sibling requests: a provider states a status, never whether the binding or this
-        one conversation caused it. A binding defect langchaint can detect raises at construction
-        or bind time instead, before any request is sent.
+        Every classification fails at most its own item.
+        A provider states a status, never whether the binding or this one conversation caused it.
+        A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
         Anything the adapter cannot name must map to "unrecognized",
-        which fails the one item without a retry, so bugs surface without being retried silently
-        and without killing the sibling items.
+        which fails the one item without a retry, so bugs surface without being retried silently.
+
+        Folding this into a request-failed AttemptOutcome arm is rejected.
+        items() yields StreamItem values only, so a mid-stream failure reaches the retry loop as a raise anyway.
+        The arm would give one event two channels.
         """
         ...
 

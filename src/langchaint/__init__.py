@@ -16,8 +16,8 @@ from langchaint.adapter import (
     StreamItem,
     ToolChoice,
 )
+from langchaint.call import AttemptRecord, CallRecord
 from langchaint.exceptions import (
-    AttemptRecord,
     DispatchExceptionGroup,
     GenerationError,
     InvalidRequestError,
@@ -77,6 +77,7 @@ __all__ = [
     "AssistantMessage",
     "AttemptRecord",
     "BoundLLM",
+    "CallRecord",
     "CaptureTool",
     "CostBreakdown",
     "DispatchCaptured",

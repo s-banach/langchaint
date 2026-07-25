@@ -20,6 +20,7 @@ from langchaint import (
     ZERO_USAGE,
     AssistantMessage,
     AttemptRecord,
+    CallRecord,
     MaxCompletionTokensExceededError,
     RefusalError,
     Response,
@@ -57,16 +58,23 @@ def _record(*, error: TransientError | None, usage: Usage = ZERO_USAGE) -> Attem
     )
 
 
+def _call(attempt_records: tuple[AttemptRecord, ...], *, elapsed_seconds: float) -> CallRecord:
+    """Build a CallRecord over the records under test; the identity fields are fixed filler."""
+    return CallRecord(
+        model="fake-model",
+        provider_name="fake",
+        attempt_records=attempt_records,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+
 def _response[OutputT](
     *, output: OutputT, attempt_records: tuple[AttemptRecord, ...]
 ) -> Response[OutputT]:
     """Build a Response with the fields under test; everything else is fixed filler."""
     return Response(
         output=output,
-        model="fake-model",
-        provider_name="fake",
-        attempt_records=attempt_records,
-        elapsed_seconds=1.5,
+        call=_call(attempt_records, elapsed_seconds=1.5),
         raw=_Raw(),
         stop_reason="end_turn",
         assistant_message=AssistantMessage(turn=(TextPart(text=str(output)),)),
@@ -75,13 +83,7 @@ def _response[OutputT](
 
 def _failure(*, attempt_records: tuple[AttemptRecord, ...]) -> RetriesExhaustedError:
     """Build a RetriesExhaustedError with the table fields set."""
-    return RetriesExhaustedError(
-        attempt_records=attempt_records,
-        model="fake-model",
-        provider_name="fake",
-        elapsed_seconds=2.5,
-        stop_reason=None,
-    )
+    return RetriesExhaustedError(call=_call(attempt_records, elapsed_seconds=2.5))
 
 
 def test_response_rejects_empty_attempt_records() -> None:
@@ -231,13 +233,7 @@ def test_to_row_failure_is_none_and_zero_with_the_error_chain() -> None:
 def test_to_row_refusal_reports_its_billing_and_reason() -> None:
     """A refusal row carries the rejected 200's cost and usage, not zeros, and stop_reason "refusal"."""
     row = to_row(
-        RefusalError(
-            attempt_records=(_record(error=None, usage=_USAGE),),
-            model="fake-model",
-            provider_name="fake",
-            elapsed_seconds=1.0,
-            stop_reason="refusal",
-        )
+        RefusalError(call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0))
     )
     assert row["output"] is None
     assert row["stop_reason"] == "refusal"
@@ -252,11 +248,7 @@ def test_to_row_truncation_reports_its_billing_and_reason() -> None:
     """A truncation row carries the rejected 200's cost and usage and stop_reason "max_tokens"."""
     row = to_row(
         MaxCompletionTokensExceededError(
-            attempt_records=(_record(error=None, usage=_USAGE),),
-            model="fake-model",
-            provider_name="fake",
-            elapsed_seconds=1.0,
-            stop_reason="max_tokens",
+            call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0)
         )
     )
     assert row["output"] is None

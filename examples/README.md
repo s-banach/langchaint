@@ -3,7 +3,7 @@
 Short, runnable examples of langchaint.
 Each file is a set of small async functions with a `__main__` guard; they read top to bottom and use real API calls, so running one needs the matching SDK installed and the provider's API key in the environment.
 The `openai` package and `OPENAI_API_KEY` cover the openai examples.
-`05_rate_limiting_and_errors.py`, `06_prompt_caching.py`, and `09_batch_and_error_postures.py` build anthropic models, so they need the `anthropic` package and `ANTHROPIC_API_KEY`.
+`05_rate_limiting_and_errors.py`, `06_prompt_caching.py`, and `09_batch_failures.py` build anthropic models, so they need the `anthropic` package and `ANTHROPIC_API_KEY`.
 `07_json_schema_tool_validation.py` needs no API key: it dispatches constructed `ToolCall`s with no provider involved.
 `full_app/` needs none either: its adapter is scripted and offline.
 Where a tool's specifics do not matter, the code uses a minimal tool (a canned weather lookup, a canned search) rather than a realistic one.
@@ -18,7 +18,7 @@ Where a tool's specifics do not matter, the code uses a minimal tool (a canned w
 | [`06_prompt_caching.py`](06_prompt_caching.py) | `cache_breakpoint` marks in the frozen prefix, the anthropic 4-marker budget and `cache_ttl`, openai's implicit/explicit modes, and the marks each provider rejects |
 | [`07_json_schema_tool_validation.py`](07_json_schema_tool_validation.py) | `JSONSchemaTool` argument validation: `dispatch` validates the arguments against `args_schema`, landing schema violations in the same `DispatchInvalidToolArgs` house message as the `PydanticTool` path |
 | [`08_required_choice_and_limits.py`](08_required_choice_and_limits.py) | the budgeted `tool_choice="required"` loop: a structured exit captured through a `CaptureTool`, `SpecificToolChoice` forcing that exit when `max_turns` is spent, a tool budget fed by `Usage` reported as `app_data`, and a whole sub-agent loop wrapped as one tool |
-| [`09_batch_and_error_postures.py`](09_batch_and_error_postures.py) | a batch whose middle item is rejected before it is sent: every slot settles, `to_row` renders all three, and the failure leaves split into what to re-run and what to change |
+| [`09_batch_failures.py`](09_batch_failures.py) | a batch whose middle item the adapter refuses to send: every slot settles, `to_row` renders all three, `Usage.sum_of` totals the spend over successes and failures, and the failed slots map back to the conversations to resubmit |
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | the call-for-call API map and what replaces the middleware layer |
 | [`full_app/`](full_app/README.md) | the reference architecture for a streaming multi-agent app: `AgentRun`, sub-agents as tools, three nested deadlines, and accounting that survives every failure |
 

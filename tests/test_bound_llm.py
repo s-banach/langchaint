@@ -53,6 +53,7 @@ from langchaint.adapter import (
     Unparsed,
 )
 from langchaint.llm import UNCHANGED
+from tests.helpers import uniform_returns_ceiling
 
 _PRICING = PricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -499,7 +500,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
     The full-jitter draw is pinned to its ceiling so the backoff gap is deterministic here.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
 
     async def scenario() -> None:
         """Recover from one failure under a visible 0.05s backoff."""
@@ -1963,7 +1964,7 @@ def test_backoff_sleep_does_not_hold_the_in_flight_slot(
     the moment the first retries, so the first is unfinished under either placement.
     The full-jitter draw is pinned to its ceiling so the backoff outlasts the second request deterministically.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
 
     async def scenario() -> None:
         """Interleave a retrying item with a clean one under one slot."""

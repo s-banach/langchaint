@@ -11,6 +11,7 @@ import pytest
 
 from langchaint import RateLimiter, TransientError
 from langchaint import rate_limiter as rate_limiter_module
+from tests.helpers import uniform_returns_ceiling
 
 
 def _rate_limit_error(*, retry_after_seconds: float | None = None) -> TransientError:
@@ -49,7 +50,7 @@ def test_rate_limit_error_without_retry_after_pauses_with_the_backoff_shape(
 
     The full-jitter draw is pinned to its ceiling so the pause length is deterministic here.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
 
     async def scenario() -> None:
         """Register a one-error chain under a visible backoff base, then time acquisition."""
@@ -91,7 +92,7 @@ def test_backoff_branch_ceiling_doubles_per_failure_and_caps(
     so the returned value is exactly the ceiling under test.
     A branch that used backoff_base_seconds without doubling would return 1.0 every step and fail at the second.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", lambda _low, high: high)
+    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
     rate_limiter = RateLimiter(backoff_base_seconds=1.0, backoff_max_seconds=6.0)
     errors_from_attempts: list[TransientError] = []
     for expected_ceiling in (1.0, 2.0, 4.0, 6.0, 6.0):

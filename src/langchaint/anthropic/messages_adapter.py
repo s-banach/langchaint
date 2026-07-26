@@ -40,7 +40,7 @@ The remainder is the per-request budget for marked message parts:
 the latest marks up to that budget are written and older ones left unwritten,
 mirroring openai's documented latest-N rule so a conversation that accrues one mark per turn keeps working.
 Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
-"1h" writes ttl "1h", whose writes bill at the PricingTable's cache_write_1h_usd_per_million_tokens).
+"1h" writes ttl "1h", whose writes bill at each table's cache_write_1h_usd_per_million_tokens).
 
 Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
@@ -99,7 +99,6 @@ from langchaint.adapter import (
     BoundAdapter,
     ErrorClassification,
     NotSendable,
-    PricingTable,
     Refused,
     ResponseOutcome,
     SpecificToolChoice,
@@ -123,7 +122,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import CostBreakdown, PriceableCounts, price
+from langchaint.pricing import category_cost
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
@@ -155,6 +154,101 @@ _CACHE_MARKER_REQUEST_LIMIT = 4
 type CacheTTL = Literal["5m", "1h"]
 """A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
 
+type AnthropicServiceTier = Literal["auto", "standard_only"]
+"""What a request may ask for (anthropic 0.116.0).
+
+"auto" is a ceiling, not a selector: the SDK documents the parameter as whether to use priority
+capacity if available or standard capacity, so no request value names priority.
+"standard_only" is the one value that pins a tier.
+"""
+
+type AnthropicPricedServiceTier = Literal["standard", "priority", "batch"]
+"""What a response reports having been served at (anthropic 0.116.0), and the pricing mapping's key.
+
+Disjoint from AnthropicServiceTier: the request and response vocabularies share no word, and the
+response field carries no precondition on the request, so the tier is read off each response.
+"""
+
+_STANDARD_TIER: AnthropicPricedServiceTier = "standard"
+
+
+@dataclass(frozen=True, kw_only=True)
+class AnthropicPricingTable:
+    """USD prices per one million tokens for one model at one Anthropic service tier.
+
+    Two cache-write rates, because Anthropic bills 5-minute and 1-hour writes differently and one
+    response can report tokens written at both TTLs. Both are required: a table that priced only the
+    TTL its adapter marks would price the other half of such a response at the wrong rate.
+    price() spends both and reports their sum as one cache-write cost, so what reaches Usage is
+    the neutral four categories.
+
+    input_cache_none_usd_per_million_tokens prices only the uncached input, the partition's
+    input_tokens_cache_none; cache reads and writes bill at their own rates.
+    """
+
+    input_cache_none_usd_per_million_tokens: float
+    output_usd_per_million_tokens: float
+    cache_read_usd_per_million_tokens: float
+    cache_write_5m_usd_per_million_tokens: float
+    cache_write_1h_usd_per_million_tokens: float
+
+    def price(
+        self,
+        *,
+        input_tokens_cache_read: int,
+        input_tokens_cache_write_5m: int,
+        input_tokens_cache_write_1h: int,
+        input_tokens_cache_none: int,
+        output_tokens: int,
+        output_tokens_reasoning: int,
+    ) -> Usage:
+        """Price one response's counters, the two cache-write TTLs each at their own rate.
+
+        The two write counts arrive apart and leave together: Usage.input_tokens_cache_write is
+        their sum, and input_tokens_cache_write_cost_in_usd is the sum of what each cost.
+
+        Raises:
+            pydantic.ValidationError: a counter is negative.
+        """
+        return Usage(
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write_5m + input_tokens_cache_write_1h,
+            input_tokens_cache_none=input_tokens_cache_none,
+            output_tokens=output_tokens,
+            output_tokens_reasoning=output_tokens_reasoning,
+            input_tokens_cache_read_cost_in_usd=category_cost(
+                input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+            ),
+            input_tokens_cache_write_cost_in_usd=(
+                category_cost(
+                    input_tokens_cache_write_5m, self.cache_write_5m_usd_per_million_tokens
+                )
+                + category_cost(
+                    input_tokens_cache_write_1h, self.cache_write_1h_usd_per_million_tokens
+                )
+            ),
+            input_tokens_cache_none_cost_in_usd=category_cost(
+                input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+            ),
+            output_tokens_cost_in_usd=category_cost(
+                output_tokens, self.output_usd_per_million_tokens
+            ),
+        )
+
+
+_UNPRICED = AnthropicPricingTable(
+    input_cache_none_usd_per_million_tokens=float("nan"),
+    output_usd_per_million_tokens=float("nan"),
+    cache_read_usd_per_million_tokens=float("nan"),
+    cache_write_5m_usd_per_million_tokens=float("nan"),
+    cache_write_1h_usd_per_million_tokens=float("nan"),
+)
+"""What prices a response reporting a service tier the adapter holds no table for.
+
+Every nonzero counter costs NaN and every zero counter costs zero, so the paid response survives
+carrying a cost that says it is unknown.
+"""
+
 
 def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
     """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
@@ -183,6 +277,7 @@ class _AnthropicRequest:
     tool_choice: ToolChoiceParam | Omit
     output_config: OutputConfigParam | Omit
     thinking: ThinkingConfigParam | Omit
+    service_tier: AnthropicServiceTier | Omit
     automatic_prompt_caching: bool
     cache_ttl: CacheTTL
     message_mark_budget: int
@@ -492,8 +587,11 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     return AssistantMessage(turn=tuple(turn))
 
 
-def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Usage:
-    """Map the raw counters onto langchaint's disjoint partition and price them.
+def _normalized_usage(
+    usage: anthropic.types.Usage,
+    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+) -> Usage:
+    """Map the raw counters onto langchaint's disjoint partition and price them at the served tier.
 
     `usage.input_tokens` excludes cache reads and writes, so it is exactly the uncached-input counter.
     The SDK documents no relationship among the input counters, so the source is the provider's
@@ -501,64 +599,38 @@ def _normalized_usage(usage: anthropic.types.Usage, pricing: PricingTable) -> Us
     cache_read_input_tokens + cache_creation_input_tokens + input_tokens, read 2026-07-25:
     https://platform.claude.com/docs/en/build-with-claude/prompt-caching
     output_tokens_details is optional on the SDK Usage.
-    Every priced counter here is read off the same _priceable_counts result the cost is priced from,
-    and cost_in_usd is the same price() call the public cost_breakdown makes,
-    so the counters, the stored scalar, and a reported breakdown cannot disagree.
-    That matters for the cache-write counter, which has two SDK sources: cache_creation_input_tokens
-    and the cache_creation 5-minute/1-hour split, each optional and neither documented in terms of
-    the other, so reading one here and the other for pricing could report a write the cost included
-    and the counter did not.
+
+    usage.cache_creation splits the writes into 5-minute and 1-hour tokens, and one response can
+    report both nonzero; when it is absent, cache_creation_input_tokens is read as 5-minute writes.
+    Reading the split here and the collapsed count elsewhere would report a write the cost included
+    and the counter did not, so both come off the same read and go into one price() call.
+
+    A response reporting no tier prices at the standard rates, which is what a Bedrock response
+    needs: the field is unlikely to be populated there and Anthropic's service tiers do not apply.
     """
     output_tokens_details = usage.output_tokens_details
-    counts = _priceable_counts(usage)
-    return Usage(
-        input_tokens_cache_read=counts.input_tokens_cache_read,
-        input_tokens_cache_write=(
-            counts.input_tokens_cache_write + counts.input_tokens_cache_write_1h
-        ),
-        input_tokens_cache_none=counts.input_tokens_cache_none,
-        output_tokens=counts.output_tokens,
+    input_tokens_cache_write_5m = usage.cache_creation_input_tokens or 0
+    input_tokens_cache_write_1h = 0
+    if usage.cache_creation is not None:
+        input_tokens_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens
+        input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
+    served_tier = usage.service_tier if usage.service_tier is not None else _STANDARD_TIER
+    return pricing.get(served_tier, _UNPRICED).price(
+        input_tokens_cache_read=usage.cache_read_input_tokens or 0,
+        input_tokens_cache_write_5m=input_tokens_cache_write_5m,
+        input_tokens_cache_write_1h=input_tokens_cache_write_1h,
+        input_tokens_cache_none=usage.input_tokens,
+        output_tokens=usage.output_tokens,
         output_tokens_reasoning=(
             output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
         ),
-        cost_in_usd=price(counts=counts, pricing=pricing).total_cost_in_usd,
-    )
-
-
-def cost_breakdown(usage_raw: anthropic.types.Usage, pricing: PricingTable) -> CostBreakdown:
-    """Exact per-category cost of one response, computed from its raw SDK usage.
-
-    The raw usage is consumed (not the neutral Usage) because only it keeps the 5-minute / 1-hour
-    cache-write split the two rates need, and the arithmetic is the same price() call that produced
-    the stored Usage.cost_in_usd for the same response, so total_cost_in_usd equals it.
-    """
-    return price(counts=_priceable_counts(usage_raw), pricing=pricing)
-
-
-def _priceable_counts(usage: anthropic.types.Usage) -> PriceableCounts:
-    """Split the raw counters into pricing categories, keeping the two cache-write tiers apart.
-
-    usage.cache_creation splits writes into 5-minute and 1-hour tokens; when it is absent,
-    cache_creation_input_tokens bills entirely at the base cache_write_usd_per_million_tokens rate.
-    usage.input_tokens excludes cache reads and writes, so it is exactly the uncached count;
-    _normalized_usage cites the page that states it.
-    """
-    input_tokens_cache_write = usage.cache_creation_input_tokens or 0
-    input_tokens_cache_write_1h = 0
-    if usage.cache_creation is not None:
-        input_tokens_cache_write = usage.cache_creation.ephemeral_5m_input_tokens
-        input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
-    return PriceableCounts(
-        input_tokens_cache_none=usage.input_tokens,
-        input_tokens_cache_read=usage.cache_read_input_tokens or 0,
-        input_tokens_cache_write=input_tokens_cache_write,
-        input_tokens_cache_write_1h=input_tokens_cache_write_1h,
-        output_tokens=usage.output_tokens,
     )
 
 
 def _adapter_result[OutputT](
-    message: anthropic.types.Message, output: OutputT, pricing: PricingTable
+    message: anthropic.types.Message,
+    output: OutputT,
+    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
 ) -> AdapterResult[OutputT]:
     """Normalize one completed message around already-extracted output."""
     return AdapterResult(
@@ -595,10 +667,11 @@ class AnthropicMessagesAdapter(Adapter):
         *,
         client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
         model: str,
-        pricing: PricingTable,
+        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
         provider_name: str,
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
+        service_tier: AnthropicServiceTier | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
@@ -620,31 +693,41 @@ class AnthropicMessagesAdapter(Adapter):
         cache_ttl applies uniformly to every cache_control marker this adapter writes,
         automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
         "1h" holds entries across longer gaps and writes bill 2x
-        (priced by the PricingTable's cache_write_1h_usd_per_million_tokens).
+        (priced by each table's cache_write_1h_usd_per_million_tokens).
         A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request:
         mixing is allowed but requires the 1h markers before the 5m markers.
         That ordering rule is docs-only, not SDK-introspectable, stated under "Mixing different TTLs" at
         https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
+        cache_ttl is taken here, not by LLM.bind, whose parameters are provider-neutral.
+        The openai Responses adapter has no TTL to configure, so no neutral parameter fits.
+        A different TTL is therefore a different adapter.
+
+        pricing holds one table per service tier this adapter can price, keyed by what a response
+        reports, and a response reporting a tier absent from it costs NaN. The "standard" key is
+        required because every response that reports no tier at all prices there.
+        service_tier is what the request asks for, None sending nothing. It cannot decide the price:
+        the request and response vocabularies are disjoint, and the tier the response reports is
+        what selects the table.
 
         Raises:
-            ValueError: cache_ttl is "1h" but pricing has no cache_write_1h_usd_per_million_tokens.
-                Every 1-hour marker this adapter would write produces 1-hour cache writes the table
-                cannot price, so every response writing to the cache would report cost_in_usd as NaN;
-                failing here turns an unknown cost on paid responses into a config error
-                before any request is sent.
+            ValueError: pricing has no "standard" key, which would price every response reporting
+                no tier, and every standard-tier response, as NaN, with nothing said until the cost
+                comes back unknown.
                 Also raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
-        if cache_ttl == "1h" and pricing.cache_write_1h_usd_per_million_tokens is None:
+        if _STANDARD_TIER not in pricing:
             raise ValueError(
-                f"cache_ttl='1h' for model {model!r} requires a PricingTable with "
-                f"cache_write_1h_usd_per_million_tokens, which prices the 2x 1-hour cache writes"
+                f"pricing for model {model!r} has no {_STANDARD_TIER!r} key; "
+                f"it prices every response that reports no service tier, so it is required"
             )
-        super().__init__(client=client, model=model, pricing=pricing, provider_name=provider_name)
+        super().__init__(client=client, model=model, provider_name=provider_name)
         # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
         # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
         self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
+        self.pricing = pricing
         self.default_max_completion_tokens = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl
+        self.service_tier: AnthropicServiceTier | None = service_tier
 
     def _request(self, binding: Binding) -> _AnthropicRequest:
         """Precompute the typed request fields the binding determines.
@@ -734,6 +817,7 @@ class AnthropicMessagesAdapter(Adapter):
             tool_choice=tool_choice,
             output_config=output_config,
             thinking=thinking,
+            service_tier=self.service_tier if self.service_tier is not None else omit,
             automatic_prompt_caching=binding.automatic_prompt_caching,
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
@@ -795,7 +879,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         self,
         *,
         sdk_stream: AsyncMessageStream[Any],
-        pricing: PricingTable,
+        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
         output_from_message: Callable[
             [ParsedMessage[Any]], OutputT | Refused | Truncated | Unparsed
         ],
@@ -866,6 +950,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
+            service_tier=self._request.service_tier,
             messages=messages,
         )
         return _adapter_result(
@@ -891,6 +976,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
+            service_tier=self._request.service_tier,
             messages=messages,
         )
         sdk_stream = await manager.__aenter__()
@@ -949,6 +1035,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
+            service_tier=self._request.service_tier,
             messages=messages,
             output_format=self._response_format,
         )
@@ -978,6 +1065,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             output_config=self._request.output_config,
             thinking=self._request.thinking,
+            service_tier=self._request.service_tier,
             messages=messages,
             output_format=self._response_format,
         )

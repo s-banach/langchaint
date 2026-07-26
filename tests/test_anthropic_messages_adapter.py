@@ -32,7 +32,6 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
-    PricingTable,
     PydanticTool,
     ReasoningTrace,
     SpecificToolChoice,
@@ -58,9 +57,10 @@ from langchaint.anthropic import (
     ANTHROPIC_PRICING,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
+    AnthropicPricedServiceTier,
+    AnthropicPricingTable,
     anthropic_bedrock_model,
     anthropic_model,
-    cost_breakdown,
 )
 from langchaint.anthropic.messages_adapter import (
     _adapter_result,
@@ -78,20 +78,25 @@ from langchaint.anthropic.messages_adapter import (
 from langchaint.exceptions import StreamProtocolError
 from langchaint.tools import ToolSchema
 
-_PRICING = PricingTable(
+_STANDARD_RATES = AnthropicPricingTable(
     input_cache_none_usd_per_million_tokens=3.0,
     output_usd_per_million_tokens=15.0,
     cache_read_usd_per_million_tokens=0.3,
-    cache_write_usd_per_million_tokens=3.75,
+    cache_write_5m_usd_per_million_tokens=3.75,
     cache_write_1h_usd_per_million_tokens=6.0,
 )
 
-_PRICING_NO_1H = PricingTable(
-    input_cache_none_usd_per_million_tokens=3.0,
-    output_usd_per_million_tokens=15.0,
-    cache_read_usd_per_million_tokens=0.3,
-    cache_write_usd_per_million_tokens=3.75,
+_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {"standard": _STANDARD_RATES}
+"""The standard tier alone, so a response reporting another tier prices NaN."""
+
+_PRIORITY_RATES = AnthropicPricingTable(
+    input_cache_none_usd_per_million_tokens=6.0,
+    output_usd_per_million_tokens=30.0,
+    cache_read_usd_per_million_tokens=0.6,
+    cache_write_5m_usd_per_million_tokens=7.5,
+    cache_write_1h_usd_per_million_tokens=12.0,
 )
+"""Twice the standard rates, so a tier-selection test reads as a doubling."""
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
@@ -227,71 +232,80 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
     assert abs(cost - expected) < 1e-12
 
 
-def test_cost_is_nan_when_one_hour_writes_lack_a_rate() -> None:
-    """An unpriceable 1-hour write makes cost_in_usd NaN and leaves the counters intact.
+def test_cost_is_nan_when_the_served_tier_has_no_table() -> None:
+    """A response served at a tier the adapter holds no table for keeps its counters and costs NaN.
 
     The response was paid for, so the generation path keeps it and reports the cost as unknown.
     """
-    usage = _normalized_usage(_usage_with_cache_split(), _PRICING_NO_1H)
-    assert math.isnan(usage.cost_in_usd)
-    assert usage.input_tokens_total == 330
-    assert usage.output_tokens == 50
+    usage = at.Usage(
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_input_tokens=200,
+        cache_creation_input_tokens=30,
+        service_tier="priority",
+    )
+    normalized = _normalized_usage(usage, _PRICING)
+    assert math.isnan(normalized.cost_in_usd)
+    assert math.isnan(normalized.output_tokens_cost_in_usd)
+    assert normalized.input_tokens_total == 330
+    assert normalized.output_tokens == 50
 
 
-def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
-    """Each category cost is its own product, and the total equals the stored Usage.cost_in_usd."""
-    usage = _usage_with_cache_split()
-    breakdown = cost_breakdown(usage, _PRICING)
-    assert breakdown.counts.input_tokens_cache_none == 100
-    assert breakdown.counts.input_tokens_cache_read == 200
-    assert breakdown.counts.input_tokens_cache_write == 10
-    assert breakdown.counts.input_tokens_cache_write_1h == 20
-    assert breakdown.counts.output_tokens == 50
-    assert breakdown.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
-    assert breakdown.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
-    assert breakdown.input_tokens_cache_write_cost_in_usd == 10 * 3.75 / 1e6
-    assert breakdown.input_tokens_cache_write_1h_cost_in_usd == 20 * 6.0 / 1e6
-    assert breakdown.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
-    assert breakdown.total_cost_in_usd == _normalized_usage(usage, _PRICING).cost_in_usd
+def test_the_reported_tier_selects_the_table() -> None:
+    """Priority rates price a priority response, standard rates a response reporting no tier."""
+    counters = {"input_tokens": 100, "output_tokens": 50}
+    pricing: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
+        "standard": _STANDARD_RATES,
+        "priority": _PRIORITY_RATES,
+    }
+    at_priority = _normalized_usage(at.Usage(**counters, service_tier="priority"), pricing)
+    at_standard = _normalized_usage(at.Usage(**counters, service_tier="standard"), pricing)
+    reporting_none = _normalized_usage(at.Usage(**counters), pricing)
+    assert at_priority.cost_in_usd == pytest.approx(2 * at_standard.cost_in_usd)
+    assert reporting_none.cost_in_usd == at_standard.cost_in_usd
 
 
-def test_cost_breakdown_is_nan_only_in_the_unpriceable_category() -> None:
-    """The reporting call names which category went unpriced instead of failing whole."""
-    breakdown = cost_breakdown(_usage_with_cache_split(), _PRICING_NO_1H)
-    assert math.isnan(breakdown.input_tokens_cache_write_1h_cost_in_usd)
-    assert math.isnan(breakdown.total_cost_in_usd)
-    assert breakdown.input_tokens_cache_write_cost_in_usd == 10 * 3.75 / 1e6
-    assert breakdown.counts.input_tokens_cache_write_1h == 20
+def test_the_categories_are_priced_apart() -> None:
+    """Each stored cost is its own category's product, and they sum to cost_in_usd."""
+    usage = _normalized_usage(_usage_with_cache_split(), _PRICING)
+    assert usage.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
+    assert usage.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
+    assert usage.input_tokens_cache_write_cost_in_usd == (10 * 3.75 + 20 * 6.0) / 1e6
+    assert usage.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
+    assert usage.cost_in_usd == pytest.approx(
+        (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
+    )
 
 
-def test_one_hour_ttl_requires_the_one_hour_rate_at_construction() -> None:
-    """cache_ttl "1h" with a table missing the 1h rate fails at model construction, naming the model."""
-    with pytest.raises(ValueError, match="claude-sonnet-5"):
+def test_pricing_without_the_standard_key_raises_at_construction() -> None:
+    """A pricing mapping missing "standard" fails before any request, naming the model."""
+    priority_only: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
+        "priority": _PRIORITY_RATES
+    }
+    with pytest.raises(ValueError, match=re.escape("'standard'")):
+        AnthropicMessagesAdapter(
+            client=AsyncAnthropic(api_key="test"),
+            model="claude-sonnet-5",
+            pricing=priority_only,
+            provider_name="anthropic",
+        )
+
+
+def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None:
+    """anthropic_model merges the caller's mapping over the catalog's standard-tier table."""
+    adapter = _anthropic_adapter_of(
         anthropic_model(
             "claude-sonnet-5",
             client=AsyncAnthropic(api_key="test"),
-            cache_ttl="1h",
-            pricing=_PRICING_NO_1H,
+            pricing={"priority": _PRIORITY_RATES},
         )
-    with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")):
-        anthropic_bedrock_model(
-            "anthropic.claude-sonnet-5",
-            aws_region="us-east-1",
-            cache_ttl="1h",
-            pricing=_PRICING_NO_1H,
-        )
-    with pytest.raises(ValueError, match="cache_write_1h_usd_per_million_tokens"):
-        AnthropicMessagesAdapter(
-            client=AsyncAnthropic(api_key="test"),
-            model="m",
-            pricing=_PRICING_NO_1H,
-            provider_name="anthropic",
-            cache_ttl="1h",
-        )
+    )
+    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-sonnet-5"]
+    assert adapter.pricing["priority"] is _PRIORITY_RATES
 
 
-def test_one_hour_ttl_constructs_with_a_one_hour_rate() -> None:
-    """The default ANTHROPIC_PRICING carries the 1h rate, and "5m" never needs it."""
+def test_cache_ttl_is_stored_on_the_adapter() -> None:
+    """Both constructors carry cache_ttl through to the adapter that writes the markers."""
     assert (
         _anthropic_adapter_of(
             anthropic_model(
@@ -307,17 +321,6 @@ def test_one_hour_ttl_constructs_with_a_one_hour_rate() -> None:
             )
         ).cache_ttl
         == "1h"
-    )
-    assert (
-        _anthropic_adapter_of(
-            anthropic_model(
-                "claude-sonnet-5",
-                client=AsyncAnthropic(api_key="test"),
-                cache_ttl="5m",
-                pricing=_PRICING_NO_1H,
-            )
-        ).cache_ttl
-        == "5m"
     )
 
 
@@ -697,6 +700,24 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         automatic_prompt_caching=False,
     )
     assert _adapter()._request(binding).temperature == 0.2
+
+
+def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
+    """A stated service_tier lands on the request; None leaves the omit sentinel.
+
+    The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
+    different request from omitting the key.
+    """
+    binding = _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
+    assert isinstance(_adapter()._request(binding).service_tier, anthropic.Omit)
+    stated = AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="anthropic",
+        service_tier="standard_only",
+    )
+    assert stated._request(binding).service_tier == "standard_only"
 
 
 def test_request_marks_the_system_block_only_when_caching() -> None:
@@ -1086,11 +1107,11 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
 
 
 def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
-    """The Bedrock default pricing is the same PricingTable object anthropic_model uses, not a copy."""
+    """The Bedrock standard-tier table is the same object anthropic_model uses, not a copy."""
     adapter = _anthropic_adapter_of(
         anthropic_bedrock_model("us.anthropic.claude-opus-4-6-v1", aws_region="us-east-1")
     )
-    assert adapter.pricing is ANTHROPIC_PRICING["claude-opus-4-6"]
+    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-6"]
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:

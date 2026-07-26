@@ -101,7 +101,6 @@ from openai.types.responses import (
     ResponseInputTextContentParam,
     ResponseInputTextParam,
     ResponseReasoningItem,
-    ResponseUsage,
     ToolChoiceFunctionParam,
 )
 from openai.types.responses import (
@@ -127,7 +126,6 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    PricingTable,
     Refused,
     ResponseOutcome,
     SpecificToolChoice,
@@ -153,7 +151,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import CostBreakdown, PriceableCounts, price
+from langchaint.pricing import UNPRICED, PricingTable
 from langchaint.tools import ToolSchema
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -164,6 +162,22 @@ type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionP
 
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
 """How much readable text to ask the API for, the values reasoning.summary takes."""
+
+type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority"]
+"""What a request may ask for, and what a response reports (openai 2.45.0 types both with this literal).
+
+The API documents the response value as the processing mode actually used and says it may differ
+from the value the request set, so the tier is read off each response rather than assumed.
+"""
+
+type OpenAIPricedServiceTier = Literal["default", "flex", "scale", "priority"]
+"""The pricing mapping's key: the tiers a caller can hold rates for.
+
+"auto" is excluded. It is in the response literal only because request and response share one type,
+and it names no processing mode, so it is not a tier anyone has a rate for.
+"""
+
+_DEFAULT_TIER: OpenAIPricedServiceTier = "default"
 
 
 def _wire_reasoning(
@@ -211,6 +225,7 @@ class _OpenAIRequest:
     tool_choice: _WireToolChoice | Omit
     parallel_tool_calls: bool | Omit
     prompt_cache_options: PromptCacheOptions | Omit
+    service_tier: OpenAIServiceTier | Omit
     include: list[ResponseIncludable]
 
 
@@ -462,8 +477,28 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     return AssistantMessage(turn=tuple(turn))
 
 
-def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
-    """Map the raw counters onto langchaint's disjoint partition and price them.
+def _priced_tier(service_tier: OpenAIServiceTier | None) -> OpenAIPricedServiceTier:
+    """Which rates a response asks for: what it reports, or the default tier when it names none.
+
+    "auto" is a request word that names no processing mode, and the API documents the response
+    field as the mode actually used, so a response carrying it says nothing about what served it.
+    It prices at the default key like a response reporting no tier at all, rather than as NaN:
+    the account was most likely on the default tier, and a number that may be wrong by a tier
+    multiplier beats destroying the cost of a call that was paid for.
+    """
+    if service_tier is None or service_tier == "auto":
+        return _DEFAULT_TIER
+    return service_tier
+
+
+def _normalized_usage(
+    response: OpenAIResponse, pricing: Mapping[OpenAIPricedServiceTier, PricingTable]
+) -> Usage:
+    """Map one response's raw counters onto langchaint's disjoint partition and price them.
+
+    The whole response is the argument, not its usage: the tier that selects the rates is on the
+    response and the counters are on the usage, and pricing one response's counters at another
+    response's tier is the mistake worth making impossible.
 
     input_tokens is the all-inclusive input total,
     so the uncached counter is the remainder after subtracting cached and cache-write tokens.
@@ -472,56 +507,28 @@ def _normalized_usage(usage: ResponseUsage, pricing: PricingTable) -> Usage:
     prompt total, read 2026-07-25:
     https://developers.openai.com/api/docs/guides/prompt-caching
     output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
-    Every priced counter here is read off the same _priceable_counts result the cost is priced from,
-    and cost_in_usd is the same price() call the public cost_breakdown makes,
-    so the counters, the stored scalar, and a reported breakdown cannot disagree.
+
+    A response with no usage at all prices to ZERO_USAGE, which is zero counters and zero cost.
     """
-    counts = _priceable_counts(usage)
-    return Usage(
-        input_tokens_cache_read=counts.input_tokens_cache_read,
-        input_tokens_cache_write=(
-            counts.input_tokens_cache_write + counts.input_tokens_cache_write_1h
-        ),
-        input_tokens_cache_none=counts.input_tokens_cache_none,
-        output_tokens=counts.output_tokens,
-        output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
-        cost_in_usd=price(counts=counts, pricing=pricing).total_cost_in_usd,
-    )
-
-
-def cost_breakdown(usage_raw: ResponseUsage, pricing: PricingTable) -> CostBreakdown:
-    """Exact per-category cost of one response, computed from its raw SDK usage.
-
-    The arithmetic is the same price() call that produced the stored Usage.cost_in_usd
-    for the same response, so total_cost_in_usd equals it.
-    OpenAI has one cache-write tier, priced at cache_write_usd_per_million_tokens,
-    so input_tokens_cache_write_1h is always 0 and no category here can go unpriced.
-    """
-    return price(counts=_priceable_counts(usage_raw), pricing=pricing)
-
-
-def _priceable_counts(usage: ResponseUsage) -> PriceableCounts:
-    """Split the raw counters into pricing categories.
-
-    usage.input_tokens includes cached and cache-write tokens, so the uncached count is the
-    remainder after subtracting them; _normalized_usage cites the page that states it.
-    OpenAI has no 1-hour write tier: every write lands in the base input_tokens_cache_write slot
-    and input_tokens_cache_write_1h is always 0.
-    """
+    usage = response.usage
+    if usage is None:
+        return ZERO_USAGE
     details = usage.input_tokens_details
-    return PriceableCounts(
+    return pricing.get(_priced_tier(response.service_tier), UNPRICED).price(
+        input_tokens_cache_read=details.cached_tokens,
+        input_tokens_cache_write=details.cache_write_tokens,
         input_tokens_cache_none=(
             usage.input_tokens - details.cached_tokens - details.cache_write_tokens
         ),
-        input_tokens_cache_read=details.cached_tokens,
-        input_tokens_cache_write=details.cache_write_tokens,
-        input_tokens_cache_write_1h=0,
         output_tokens=usage.output_tokens,
+        output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
     )
 
 
 def _adapter_result[OutputT](
-    response: OpenAIResponse, output: OutputT, pricing: PricingTable
+    response: OpenAIResponse,
+    output: OutputT,
+    pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
 ) -> AdapterResult[OutputT]:
     """Normalize one completed request around already-extracted output.
 
@@ -531,7 +538,7 @@ def _adapter_result[OutputT](
     return AdapterResult(
         output=output,
         assistant_message=_assistant_message_from(response),
-        usage=_normalized_usage(response.usage, pricing=pricing) if response.usage else ZERO_USAGE,
+        usage=_normalized_usage(response, pricing=pricing),
         usage_raw=response.usage,
         stop_reason=_normalized_stop_reason(response),
         raw=response,
@@ -565,10 +572,11 @@ class OpenAIResponsesAdapter(Adapter):
         *,
         client: AsyncOpenAI,
         model: str,
-        pricing: PricingTable,
+        pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
         provider_name: str,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
+        service_tier: OpenAIServiceTier | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
@@ -603,13 +611,30 @@ class OpenAIResponsesAdapter(Adapter):
         serves the platforms provider_name_by_client_class maps and every OpenAI-compatible
         endpoint a base AsyncOpenAI's base_url reaches.
 
+        pricing holds one table per service tier this adapter can price, keyed by what a response
+        reports, and a response served at a tier absent from it costs NaN. The "default" key is
+        required because every response reporting no tier, and every response reporting "auto",
+        prices there.
+        service_tier is what the request asks for, None sending nothing. It cannot decide the price:
+        the API documents the reported mode as possibly different from the requested one.
+
         Raises:
-            ValueError: raised by Adapter.__init__ when provider_name contradicts the client's class.
+            ValueError: pricing has no "default" key, which would price every response reporting no
+                tier, and every default-tier response, as NaN, with nothing said until the cost
+                comes back unknown.
+                Also raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
-        super().__init__(client=client, model=model, pricing=pricing, provider_name=provider_name)
+        if _DEFAULT_TIER not in pricing:
+            raise ValueError(
+                f"pricing for model {model!r} has no {_DEFAULT_TIER!r} key; "
+                f"it prices every response that reports no service tier, so it is required"
+            )
+        super().__init__(client=client, model=model, provider_name=provider_name)
         self.client = client.with_options(max_retries=0)
+        self.pricing = pricing
         self.supports_prompt_cache_options = supports_prompt_cache_options
         self.reasoning_summary = reasoning_summary
+        self.service_tier: OpenAIServiceTier | None = service_tier
 
     def _request(self, binding: Binding) -> _OpenAIRequest:
         """Precompute the typed request fields the binding determines.
@@ -663,6 +688,7 @@ class OpenAIResponsesAdapter(Adapter):
                 if self.supports_prompt_cache_options and not binding.automatic_prompt_caching
                 else omit
             ),
+            service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],
         )
 
@@ -723,7 +749,7 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
         self,
         *,
         sdk_stream: AsyncResponseStream[Any],
-        pricing: PricingTable,
+        pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
         output_from_response: Callable[[OpenAIResponse], OutputT | Refused | Truncated | Unparsed],
     ) -> None:
         self._sdk_stream = sdk_stream
@@ -819,11 +845,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
         """
         if response.status == "failed":
             return Unparsed(
-                usage=(
-                    _normalized_usage(response.usage, pricing=self._adapter.pricing)
-                    if response.usage
-                    else ZERO_USAGE
-                ),
+                usage=_normalized_usage(response, pricing=self._adapter.pricing),
                 usage_raw=response.usage,
             )
         return _assistant_message_from(response).text
@@ -844,6 +866,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            service_tier=self._request.service_tier,
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
@@ -870,6 +893,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            service_tier=self._request.service_tier,
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
@@ -911,11 +935,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         A content-filtered response reaches the refusal arm through the stop reason, so it fails the
         item once instead of being retried at full price for an outcome that will not change.
         """
-        usage = (
-            _normalized_usage(response.usage, pricing=self._adapter.pricing)
-            if response.usage
-            else ZERO_USAGE
-        )
+        usage = _normalized_usage(response, pricing=self._adapter.pricing)
         if response.status == "failed":
             return Unparsed(usage=usage, usage_raw=response.usage)
         if _normalized_stop_reason(response) == "refusal":
@@ -972,6 +992,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            service_tier=self._request.service_tier,
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
@@ -999,6 +1020,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             tool_choice=self._request.tool_choice,
             parallel_tool_calls=self._request.parallel_tool_calls,
             prompt_cache_options=self._request.prompt_cache_options,
+            service_tier=self._request.service_tier,
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],

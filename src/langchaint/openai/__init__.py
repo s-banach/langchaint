@@ -17,23 +17,25 @@ is OpenAIResponsesAdapter(client=..., provider_name="groq", ...) wrapped in an L
 openai_bedrock_model is the constructor for OpenAI models served by Bedrock;
 Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
 provider_name="azure.ai.openai", ...) wrapped in an LLM.
-openai_model's pricing None selects the model's public prices from OPENAI_PRICING;
-pass your own PricingTable to override, for example when your account bills at a custom rate.
+pricing is a mapping from the service tier a response reports to the PricingTable that prices it.
+openai_model merges it over the model's public default-tier prices from OPENAI_PRICING, so a caller
+adds a tier or replaces the default rates with a negotiated one and omitting it prices at the public
+rates. A response served at a tier the mapping does not hold costs NaN.
 openai_bedrock_model has no catalog to fall back on,
 so its pricing and supports_prompt_cache_options are required.
-cost_breakdown(usage_raw, pricing) reports the exact per-category cost of one response from its raw
-SDK usage, through the same arithmetic that produced the stored Usage.cost_in_usd.
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://developers.openai.com/api/docs/pricing.
 Prices are the one provider fact langchaint cannot verify by SDK introspection;
 re-check the page before relying on a table for billing.
+The catalog prices the default tier; a flex, scale, or priority account states its own rates.
 OpenAI has no 1-hour cache tier, and only the gpt-5.6 family bills cache writes;
 earlier models cache automatically with free writes, so their tables carry a zero cache-write rate.
 That family is also the one taking prompt_cache_options, listed in PROMPT_CACHE_OPTIONS_MODELS.
 The bare gpt-5.6 model identifier is an alias for gpt-5.6-sol; the catalog uses the explicit identifier.
 """
 
+from collections.abc import Mapping
 from typing import Literal
 
 try:
@@ -45,13 +47,14 @@ except ModuleNotFoundError as exc:
         "langchaint's openai backend requires the openai package; install openai."
     ) from exc
 
-from langchaint.adapter import PricingTable
 from langchaint.llm import LLM
 from langchaint.openai.responses_adapter import (
+    OpenAIPricedServiceTier,
     OpenAIResponsesAdapter,
+    OpenAIServiceTier,
     ReasoningSummary,
-    cost_breakdown,
 )
+from langchaint.pricing import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
 type OpenAIModelName = Literal[
@@ -138,14 +141,18 @@ def openai_model(
     model: OpenAIModelName,
     *,
     client: AsyncOpenAI | None = None,
-    pricing: PricingTable | None = None,
+    pricing: Mapping[OpenAIPricedServiceTier, PricingTable] | None = None,
     rate_limiter: RateLimiter | None = None,
     reasoning_summary: ReasoningSummary | None = None,
+    service_tier: OpenAIServiceTier | None = None,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on the Responses API.
 
     client None constructs AsyncOpenAI(), which reads OPENAI_API_KEY from the environment.
-    pricing None selects OPENAI_PRICING[model].
+    pricing holds one table per service tier, keyed by the tier a response reports, and is merged
+    over {"default": OPENAI_PRICING[model]}, so a caller adds a tier or replaces the default rates
+    with a negotiated one and omitting it prices at the public default rates.
+    A response served at a tier this mapping does not hold costs NaN.
     Whether the model takes prompt_cache_options comes from PROMPT_CACHE_OPTIONS_MODELS,
     whose docstring gives what a model outside it does with bind(automatic_prompt_caching=False).
     rate_limiter None means the RateLimiter defaults;
@@ -153,6 +160,10 @@ def openai_model(
     built in the same event loop as the LLMs, since one instance serves one loop.
     reasoning_summary asks the API for readable text, which arrives on each
     ReasoningTrace.text; None leaves the provider default in place.
+    service_tier is what the request asks for, None sending nothing; it is not what prices the
+    response, which is priced at the tier the response reports. Leaving it None on a project
+    configured for a non-default tier can be served at that tier, and priced at default rates if
+    the response reports none: state service_tier on such a project, or state its rates in pricing.
 
     Raises:
         ValueError: client is an AsyncBedrockOpenAI or AsyncAzureOpenAI, raised by the adapter.
@@ -165,10 +176,11 @@ def openai_model(
         OpenAIResponsesAdapter(
             client=client if client is not None else AsyncOpenAI(),
             model=model,
-            pricing=pricing if pricing is not None else OPENAI_PRICING[model],
+            pricing={"default": OPENAI_PRICING[model], **(pricing or {})},
             provider_name="openai",
             supports_prompt_cache_options=model in PROMPT_CACHE_OPTIONS_MODELS,
             reasoning_summary=reasoning_summary,
+            service_tier=service_tier,
         ),
         rate_limiter=rate_limiter,
     )
@@ -177,7 +189,7 @@ def openai_model(
 def openai_bedrock_model(
     model: str,
     *,
-    pricing: PricingTable,
+    pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
     supports_prompt_cache_options: bool,
     aws_region: str | None = None,
     client: AsyncBedrockOpenAI | None = None,
@@ -191,6 +203,10 @@ def openai_bedrock_model(
     rather than defaulted, because both asymmetries with anthropic_bedrock_model come from the same
     absence: langchaint carries no verified list of OpenAI's Bedrock model ids or their AWS rates,
     and prices are the one provider fact langchaint cannot verify by SDK introspection.
+    pricing needs its "default" key, which prices every response reporting no service tier, and a
+    Bedrock response is unlikely to report one.
+    There is no service_tier parameter: OpenAI's service tiers are its own platform's, and this
+    constructor reaches Bedrock, so there is no tier here for a request to ask for.
     supports_prompt_cache_options is required for the same absence of a catalog: it says whether
     the model takes the prompt_cache_options request parameter, which openai documents as
     gpt-5.6-and-later (openai 2.45.0), and no Bedrock id maps to that boundary here.
@@ -212,6 +228,9 @@ def openai_bedrock_model(
         ValueError: both client and aws_region are given. A passed client already carries its
             region, so the aws_region beside it would be dropped and every request would go to
             the client's region instead, silently.
+            OpenAIResponsesAdapter.__init__ raises it too when pricing has no "default" key,
+            which prices every response reporting no service tier; nothing merges one in here,
+            because no catalog maps a Bedrock model id.
     """
     if client is not None and aws_region is not None:
         raise ValueError(
@@ -234,9 +253,10 @@ __all__ = [
     "OPENAI_PRICING",
     "PROMPT_CACHE_OPTIONS_MODELS",
     "OpenAIModelName",
+    "OpenAIPricedServiceTier",
     "OpenAIResponsesAdapter",
+    "OpenAIServiceTier",
     "ReasoningSummary",
-    "cost_breakdown",
     "openai_bedrock_model",
     "openai_model",
 ]

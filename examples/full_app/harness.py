@@ -18,7 +18,6 @@ from langchaint import (
     LLM,
     AssistantMessage,
     Message,
-    PricingTable,
     RateLimiter,
     TextPart,
     ToolCall,
@@ -31,13 +30,6 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-)
-
-_PRICING = PricingTable(
-    input_cache_none_usd_per_million_tokens=2.5,
-    output_usd_per_million_tokens=10.0,
-    cache_read_usd_per_million_tokens=1.25,
-    cache_write_usd_per_million_tokens=3.125,
 )
 
 
@@ -57,9 +49,16 @@ _TURN_USAGE = Usage(
     input_tokens_cache_none=100,
     output_tokens=20,
     output_tokens_reasoning=0,
-    cost_in_usd=0.01,
+    input_tokens_cache_read_cost_in_usd=0.0,
+    input_tokens_cache_write_cost_in_usd=0.0,
+    input_tokens_cache_none_cost_in_usd=0.006,
+    output_tokens_cost_in_usd=0.004,
 )
-"""What one scripted turn bills, so a lost fold is visible as a round number of cents."""
+"""What one scripted turn bills, so a lost fold is visible as a round number of cents.
+
+The costs are stated, not priced from the counters.
+A real adapter prices what the provider reported; this one reports round numbers.
+"""
 
 
 @dataclass
@@ -90,7 +89,7 @@ class ScriptedAdapter(Adapter):
 
     def __init__(self, scripts: dict[str, list[Turn]]) -> None:
         """Store one Script per agent tag."""
-        super().__init__(client=None, model="fake-model", pricing=_PRICING, provider_name="fake")
+        super().__init__(client=None, model="fake-model", provider_name="fake")
         self.scripts = {tag: Script(turns=list(turns)) for tag, turns in scripts.items()}
 
     @override

@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from langchaint.call import CallRecord, _CallCarrier
 from langchaint.exceptions import GenerationError
 from langchaint.messages import AssistantMessage, StopReason, ToolCall
-from langchaint.usage import ZERO_USAGE, Usage
+from langchaint.usage import Usage
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_row emits."""
@@ -87,7 +87,7 @@ class Response[OutputT](_CallCarrier):
         so the two mean the same thing. Transport, 5xx, and rate-limit retries bill nothing (ZERO_USAGE),
         so when every failed attempt was one of those this equals usage_successful_attempt.
         """
-        return sum((record.usage for record in self.attempt_records), start=ZERO_USAGE)
+        return Usage.sum_of(record.usage for record in self.attempt_records)
 
     @property
     def usage_successful_attempt(self) -> Usage:
@@ -140,7 +140,7 @@ class AbandonedCall(_CallCarrier):
         The value would then read near zero while the true spend is the whole stream.
         Uniformity would turn a loud AttributeError into a silent undercount.
         """
-        return sum((record.usage for record in self.attempt_records), start=ZERO_USAGE)
+        return Usage.sum_of(record.usage for record in self.attempt_records)
 
 
 class AbandonedCallLog(Protocol):
@@ -182,11 +182,11 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
 
     A success and a failure fill the same keys, so a mixed list becomes one table:
     a failure's output is None and its error_text carries the failure reason a success leaves None.
-    The cost_in_usd and usage-counter columns are the call's paid totals across every attempt, uniform on
+    The cost and usage-counter columns are the call's paid totals across every attempt, uniform on
     success and failure rows (zero for a retry-exhausted item whose attempts billed nothing, the real values
     for a refusal or truncation, and above the single answer's tokens when a billed 200 was retried).
-    Usage counters are hoisted to top-level keys named exactly like the Usage fields;
-    model output is flattened to its JSON.
+    Usage counters and per-category costs are hoisted to top-level keys named exactly like the Usage
+    fields, with cost_in_usd their sum; model output is flattened to its JSON.
     """
     if isinstance(result, GenerationError):
         output_cell: str | None = None
@@ -209,9 +209,13 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         "elapsed_seconds": result.elapsed_seconds,
         "cost_in_usd": usage.cost_in_usd,
         "input_tokens_cache_read": usage.input_tokens_cache_read,
+        "input_tokens_cache_read_cost_in_usd": usage.input_tokens_cache_read_cost_in_usd,
         "input_tokens_cache_write": usage.input_tokens_cache_write,
+        "input_tokens_cache_write_cost_in_usd": usage.input_tokens_cache_write_cost_in_usd,
         "input_tokens_cache_none": usage.input_tokens_cache_none,
+        "input_tokens_cache_none_cost_in_usd": usage.input_tokens_cache_none_cost_in_usd,
         "input_tokens_total": usage.input_tokens_total,
         "output_tokens": usage.output_tokens,
+        "output_tokens_cost_in_usd": usage.output_tokens_cost_in_usd,
         "output_tokens_reasoning": usage.output_tokens_reasoning,
     }

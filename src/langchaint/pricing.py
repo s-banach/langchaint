@@ -1,116 +1,107 @@
-"""Neutral cost arithmetic: price already-split token counts against a PricingTable.
+"""The neutral rate table and the arithmetic that spends it.
 
-Every stored Usage.cost_in_usd is routed through price() by the backend adapters,
-and each backend's public cost_breakdown function (langchaint.anthropic.cost_breakdown,
-langchaint.openai.cost_breakdown) extracts PriceableCounts from the raw SDK usage and calls the same price(),
-so a reported breakdown and the stored scalar cannot disagree.
-The extraction is per-backend because only the raw SDK usage keeps the 5-minute / 1-hour cache-write split
-the neutral Usage collapses into one input_tokens_cache_write counter.
+A PricingTable is one model's rates at one service tier, one rate per priced category.
+price() multiplies each rate by its counter and returns the whole Usage, so a priced Usage has one
+constructor per rate shape and no per-category cost object exists between the two.
 
-This module imports no SDK and no error class: a category the table cannot price costs NaN,
-so price has no failure to signal.
+A provider that bills more finely than these four rates gets its own table with its own price()
+in its backend subpackage (AnthropicPricingTable, whose two cache-write rates cover the two TTLs).
+What crosses into Usage is the four priced categories, never a rate, so the extra structure is
+spent inside the adapter and no neutral type learns about it.
+
+This module imports no SDK and no error class: a category the caller supplied no rate for costs NaN,
+so an unpriced category needs no error.
 """
 
 from dataclasses import dataclass
 
-from langchaint.adapter import PricingTable
+from langchaint.usage import Usage
+
+
+def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
+    """One category's cost, zero for a zero counter whatever the rate.
+
+    The zero case is explicit because 0 * NaN is NaN, and an attempt that billed nothing in a
+    category must not make a total unknown when that category has no rate.
+    """
+    if not tokens:
+        return 0.0
+    return tokens * usd_per_million_tokens / 1_000_000
 
 
 @dataclass(frozen=True, kw_only=True)
-class PriceableCounts:
-    """Token counts split the way pricing needs, keeping the two cache-write rate tiers apart.
+class PricingTable:
+    """USD prices per one million tokens for one model at one service tier.
 
-    input_tokens_cache_write holds the tokens priced at cache_write_usd_per_million_tokens
-    (anthropic 5-minute writes and every openai write);
-    input_tokens_cache_write_1h holds the tokens priced at cache_write_1h_usd_per_million_tokens
-    (anthropic 1-hour writes only).
-    Their sum is the neutral Usage.input_tokens_cache_write, which collapses the tiers.
-    Reasoning tokens are not a field: they are the reasoning share of output_tokens,
-    billed at the same output rate, so they are already inside output_tokens and are not a separate cost line.
+    input_cache_none_usd_per_million_tokens prices only the uncached input, the partition's
+    input_tokens_cache_none; cache reads and writes bill at their own rates.
+    cache_write_usd_per_million_tokens applies to OpenAI too: OpenAI bills cache writes
+    (reported as input_tokens_details.cache_write_tokens) starting with gpt-5.6.
+
+    An adapter holds one table per service tier it can price and selects by the tier the response
+    reports, so a response served at a tier the caller supplied no table for costs NaN
+    rather than these rates.
     """
 
-    input_tokens_cache_none: int
-    input_tokens_cache_read: int
-    input_tokens_cache_write: int
-    input_tokens_cache_write_1h: int
-    output_tokens: int
+    input_cache_none_usd_per_million_tokens: float
+    output_usd_per_million_tokens: float
+    cache_read_usd_per_million_tokens: float
+    cache_write_usd_per_million_tokens: float
 
+    def price(
+        self,
+        *,
+        input_tokens_cache_read: int,
+        input_tokens_cache_write: int,
+        input_tokens_cache_none: int,
+        output_tokens: int,
+        output_tokens_reasoning: int,
+    ) -> Usage:
+        """Price one response's counters at these rates.
 
-@dataclass(frozen=True, kw_only=True)
-class CostBreakdown:
-    """Exact per-category cost for one request, plus the counts it priced.
+        The counters arrive as arguments rather than in a counts object,
+        which would exist only to be unpacked again one call later.
+        output_tokens_reasoning buys no cost, being the reasoning share of output_tokens and billed
+        at the output rate; it is a parameter because the returned Usage carries it.
 
-    total_cost_in_usd equals the Usage.cost_in_usd stored for the same request,
-    because the adapter routes the stored scalar through the same price() call.
-    counts is kept so an application can write its own caching counterfactual against
-    whatever baseline it chooses; langchaint ships only the per-category facts,
-    because a savings baseline (for example, repricing every cache token at the uncached rate)
-    is a billing opinion.
-    """
+        The total is the sum of the four category costs, so the parts are individually meaningful
+        and sum to cost_in_usd exactly; that association differs from a fused single-division chain
+        only at sub-ULP scale, immaterial once billing rounds to cents.
 
-    counts: PriceableCounts
-    input_tokens_cache_none_cost_in_usd: float
-    input_tokens_cache_read_cost_in_usd: float
-    input_tokens_cache_write_cost_in_usd: float
-    input_tokens_cache_write_1h_cost_in_usd: float
-    output_tokens_cost_in_usd: float
-
-    @property
-    def input_tokens_cost_in_usd(self) -> float:
-        """The input share of the total."""
-        return (
-            self.input_tokens_cache_none_cost_in_usd
-            + self.input_tokens_cache_read_cost_in_usd
-            + self.input_tokens_cache_write_cost_in_usd
-            + self.input_tokens_cache_write_1h_cost_in_usd
+        Raises:
+            pydantic.ValidationError: a counter is negative, which the openai adapter's subtraction
+                produces from a response over-reporting its cache counts.
+        """
+        return Usage(
+            input_tokens_cache_read=input_tokens_cache_read,
+            input_tokens_cache_write=input_tokens_cache_write,
+            input_tokens_cache_none=input_tokens_cache_none,
+            output_tokens=output_tokens,
+            output_tokens_reasoning=output_tokens_reasoning,
+            input_tokens_cache_read_cost_in_usd=category_cost(
+                input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+            ),
+            input_tokens_cache_write_cost_in_usd=category_cost(
+                input_tokens_cache_write, self.cache_write_usd_per_million_tokens
+            ),
+            input_tokens_cache_none_cost_in_usd=category_cost(
+                input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+            ),
+            output_tokens_cost_in_usd=category_cost(
+                output_tokens, self.output_usd_per_million_tokens
+            ),
         )
 
-    @property
-    def total_cost_in_usd(self) -> float:
-        """The whole request's cost; NaN when the table could not price one of the categories."""
-        return self.input_tokens_cost_in_usd + self.output_tokens_cost_in_usd
 
+UNPRICED = PricingTable(
+    input_cache_none_usd_per_million_tokens=float("nan"),
+    output_usd_per_million_tokens=float("nan"),
+    cache_read_usd_per_million_tokens=float("nan"),
+    cache_write_usd_per_million_tokens=float("nan"),
+)
+"""The table an adapter prices at when the response reports a service tier it holds no table for.
 
-def price(counts: PriceableCounts, pricing: PricingTable) -> CostBreakdown:
-    """Price already-split counts against a table.
-
-    The total is the sum of the per-category products, so the parts are individually meaningful
-    and sum to total_cost_in_usd exactly; that association differs from a fused single-division
-    chain only at sub-ULP scale, immaterial once billing rounds to cents.
-
-    A category the table cannot price costs NaN: counts carrying 1-hour cache writes against a
-    table with no cache_write_1h_usd_per_million_tokens.
-    Raising instead would destroy the paid response the counts came from,
-    so the unknown travels as NaN in its own category and in every sum containing it,
-    and the counts stay readable for an application that prices the call itself.
-    """
-    input_tokens_cache_write_1h_cost_in_usd = 0.0
-    if counts.input_tokens_cache_write_1h:
-        if pricing.cache_write_1h_usd_per_million_tokens is None:
-            input_tokens_cache_write_1h_cost_in_usd = float("nan")
-        else:
-            input_tokens_cache_write_1h_cost_in_usd = (
-                counts.input_tokens_cache_write_1h
-                * pricing.cache_write_1h_usd_per_million_tokens
-                / 1_000_000
-            )
-    return CostBreakdown(
-        counts=counts,
-        input_tokens_cache_none_cost_in_usd=(
-            counts.input_tokens_cache_none
-            * pricing.input_cache_none_usd_per_million_tokens
-            / 1_000_000
-        ),
-        input_tokens_cache_read_cost_in_usd=(
-            counts.input_tokens_cache_read * pricing.cache_read_usd_per_million_tokens / 1_000_000
-        ),
-        input_tokens_cache_write_cost_in_usd=(
-            counts.input_tokens_cache_write
-            * pricing.cache_write_usd_per_million_tokens
-            / 1_000_000
-        ),
-        input_tokens_cache_write_1h_cost_in_usd=input_tokens_cache_write_1h_cost_in_usd,
-        output_tokens_cost_in_usd=(
-            counts.output_tokens * pricing.output_usd_per_million_tokens / 1_000_000
-        ),
-    )
+Every nonzero counter costs NaN and every zero counter costs zero, so the response's own numbers
+survive and the cost says it is unknown. Pricing at some other tier's rates instead would report a
+number wrong by that tier's multiplier, and raising would destroy a response that was paid for.
+"""

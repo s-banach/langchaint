@@ -42,8 +42,12 @@ _USAGE = Usage(
     input_tokens_cache_none=5,
     output_tokens=7,
     output_tokens_reasoning=2,
-    cost_in_usd=0.5,
+    input_tokens_cache_read_cost_in_usd=0.1,
+    input_tokens_cache_write_cost_in_usd=0.1,
+    input_tokens_cache_none_cost_in_usd=0.1,
+    output_tokens_cost_in_usd=0.2,
 )
+"""One attempt's billing: four category costs summing to 0.5."""
 
 
 def _record(*, error: TransientError | None, usage: Usage = ZERO_USAGE) -> AttemptRecord:
@@ -165,11 +169,13 @@ def test_to_row_success_flattens_output_and_usage() -> None:
     assert row["output"] == "hello"
     assert row["error_text"] is None
     assert row["stop_reason"] == "end_turn"
-    assert row["cost_in_usd"] == 0.5
+    assert row["cost_in_usd"] == pytest.approx(0.5)
     assert row["attempts"] == 1
     assert row["input_tokens_cache_none"] == 5
+    assert row["input_tokens_cache_none_cost_in_usd"] == 0.1
     assert row["input_tokens_total"] == 10
     assert row["output_tokens"] == 7
+    assert row["output_tokens_cost_in_usd"] == 0.2
     assert row["output_tokens_reasoning"] == 2
 
 
@@ -196,12 +202,17 @@ def test_to_row_carries_an_unpriced_cost_as_nan() -> None:
         input_tokens_cache_none=5,
         output_tokens=7,
         output_tokens_reasoning=2,
-        cost_in_usd=float("nan"),
+        input_tokens_cache_read_cost_in_usd=float("nan"),
+        input_tokens_cache_write_cost_in_usd=float("nan"),
+        input_tokens_cache_none_cost_in_usd=float("nan"),
+        output_tokens_cost_in_usd=float("nan"),
     )
     row = to_row(_response(output="hello", attempt_records=(_record(error=None, usage=unpriced),)))
     assert row["output"] == "hello"
     assert isinstance(row["cost_in_usd"], float)
     assert math.isnan(row["cost_in_usd"])
+    assert isinstance(row["output_tokens_cost_in_usd"], float)
+    assert math.isnan(row["output_tokens_cost_in_usd"])
     assert row["output_tokens"] == 7
 
 
@@ -237,7 +248,7 @@ def test_to_row_refusal_reports_its_billing_and_reason() -> None:
     )
     assert row["output"] is None
     assert row["stop_reason"] == "refusal"
-    assert row["cost_in_usd"] == 0.5
+    assert row["cost_in_usd"] == pytest.approx(0.5)
     assert (
         row["error_text"]
         == "no structured output: the model refused or a provider filter blocked the turn"
@@ -256,7 +267,7 @@ def test_to_row_truncation_reports_its_billing_and_reason() -> None:
     )
     assert row["output"] is None
     assert row["stop_reason"] == "max_tokens"
-    assert row["cost_in_usd"] == 0.5
+    assert row["cost_in_usd"] == pytest.approx(0.5)
     assert (
         row["error_text"]
         == "the structured response reached max_completion_tokens before its JSON parsed"

@@ -150,34 +150,6 @@ OpenAI's allowed-tools subset form is deliberately unmapped: the binding already
 
 
 @dataclass(frozen=True, kw_only=True)
-class PricingTable:
-    """USD prices per one million tokens, supplied at adapter construction.
-
-    Cost is computed from raw provider counts because providers split counters the normalized Usage collapses.
-    input_cache_none_usd_per_million_tokens prices only the uncached input, the partition's input_tokens_cache_none;
-    cache reads and writes bill at their own rates.
-    cache_write_usd_per_million_tokens applies to OpenAI too: OpenAI bills cache writes
-    (reported as input_tokens_details.cache_write_tokens) starting with gpt-5.6.
-    cache_write_1h_usd_per_million_tokens exists
-    because Anthropic bills 5-minute and 1-hour cache writes at different rates;
-    None means the adapter never sees 1-hour writes.
-
-    There is no service-tier axis: one table is one tier's rates, and every cost langchaint reports
-    assumes the response was served at the tier those rates are for. Both providers report the tier
-    they actually used (anthropic on Usage.service_tier, openai on Response.service_tier), and a
-    response served at another one prices here at these rates with no error, so an account on a
-    premium or discounted tier reads a cost that is wrong by that tier's multiplier.
-    Read the tier off the raw SDK object beside the Usage to detect it.
-    """
-
-    input_cache_none_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    cache_write_usd_per_million_tokens: float
-    cache_write_1h_usd_per_million_tokens: float | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
 class Binding:
     """The frozen prefix of one BoundLLM, in langchaint terms only.
 
@@ -223,7 +195,8 @@ class AdapterResult[OutputT]:
 
     output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
     assistant_message is the full turn including tool calls, for appending to a conversation.
-    usage carries cost_in_usd, priced from raw provider counts against the adapter's PricingTable.
+    usage carries the per-category costs, priced from raw provider counts against the table the
+    adapter holds for the service tier the response reported.
     usage_raw is the raw SDK usage object usage was normalized from, held by reference (no dump, no copy),
     None when the response reported no usage; a caller recovers provider-specific counts from it.
     raw is the SDK's own response model, held by reference (no dump, no copy).
@@ -412,10 +385,8 @@ class Adapter(ABC):
     since both subclass it.
     """
 
-    def __init__(
-        self, *, client: object, model: str, pricing: PricingTable, provider_name: str
-    ) -> None:
-        """Check client against the stated provider_name, then store model, pricing, provider_name.
+    def __init__(self, *, client: object, model: str, provider_name: str) -> None:
+        """Check client against the stated provider_name, then store model and provider_name.
 
         client is checked here and not stored;
         each adapter stores its own with_options copy.
@@ -423,6 +394,11 @@ class Adapter(ABC):
         Moving the check into a base helper each adapter calls with its own precisely typed client is rejected:
         it makes the check opt-in, so an adapter whose author forgets the call is silently unguarded,
         which is the failure the check exists to prevent.
+
+        Rates are not stored here. Each provider's service tiers are its own words, so an adapter
+        holds a mapping from the tier its responses report to the table that prices that tier,
+        and no neutral shape spans the two key types. What the contract requires of an adapter is a
+        priced Usage, not that it hold a table at all.
 
         Raises:
             ValueError: client is an instance of a class in provider_name_by_client_class
@@ -446,7 +422,6 @@ class Adapter(ABC):
                 f"{type(client).__name__} reaches {reached!r}"
             )
         self.model = model
-        self.pricing = pricing
         self.provider_name = provider_name
 
     @abstractmethod

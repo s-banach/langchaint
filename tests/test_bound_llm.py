@@ -23,7 +23,6 @@ from langchaint import (
     InvalidRequestError,
     MaxCompletionTokensExceededError,
     Message,
-    PricingTable,
     RateLimiter,
     RefusalError,
     Response,
@@ -55,23 +54,20 @@ from langchaint.adapter import (
 from langchaint.llm import UNCHANGED
 from tests.helpers import uniform_returns_ceiling
 
-_PRICING = PricingTable(
-    input_cache_none_usd_per_million_tokens=2.5,
-    output_usd_per_million_tokens=10.0,
-    cache_read_usd_per_million_tokens=1.25,
-    cache_write_usd_per_million_tokens=3.125,
-)
 _USAGE = Usage(
     input_tokens_cache_read=0,
     input_tokens_cache_write=0,
     input_tokens_cache_none=1,
     output_tokens=1,
     output_tokens_reasoning=0,
-    cost_in_usd=0.0,
+    input_tokens_cache_read_cost_in_usd=0.0,
+    input_tokens_cache_write_cost_in_usd=0.0,
+    input_tokens_cache_none_cost_in_usd=0.0,
+    output_tokens_cost_in_usd=0.0,
 )
-_USAGE_BILLED = _USAGE.model_copy(update={"cost_in_usd": 0.25})
+_USAGE_BILLED = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.25})
 """The billing a rejected 200 (a refusal or truncation) carries."""
-_USAGE_STREAM = _USAGE.model_copy(update={"cost_in_usd": 0.001})
+_USAGE_STREAM = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.001})
 """The stream final()'s assembled usage, distinct so a stream cost is visible."""
 
 
@@ -437,7 +433,7 @@ class _FakeAdapter(Adapter):
         """Store how each freshly bound adapter behaves and the classify verdict."""
         # This adapter reaches no SDK, so it passes client=None, which matches no entry in the
         # base's empty provider_name_by_client_class, leaving the stated "fake" to stand.
-        super().__init__(client=None, model="fake-model", pricing=_PRICING, provider_name="fake")
+        super().__init__(client=None, model="fake-model", provider_name="fake")
         self._failures = failures
         self._open_failures = open_failures
         self._echo = echo

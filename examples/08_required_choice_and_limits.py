@@ -6,20 +6,20 @@ Two budgets bound a run, both owned by the loop.
 Spending max_turns rebinds tool_choice to SpecificToolChoice, so the provider forces a final_response call.
 Spending tool_budget_in_usd answers further non-final tool calls with a decline ToolMessage telling the model to stop.
 A tool reports its own cost by returning a Usage as app_data; the loop folds it into the run total.
-search reports a flat per-call fee that way, and delegate reports a whole sub-agent run's Usage the same way.
-Delegation therefore falls under the same cost rule as any billed tool.
+search reports a constant Usage standing in for a model call of its own, and delegate reports a
+whole sub-agent run's Usage the same way. Delegation therefore falls under the same cost rule as any billed tool.
 
 The LangChain call-for-call map lives in MIGRATING_FROM_LANGCHAIN.md; this file shows the langchaint calls themselves.
 """
 
 import asyncio
+import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from pydantic import BaseModel
 
 from langchaint import (
-    ZERO_USAGE,
     BoundLLM,
     CaptureTool,
     DispatchCaptured,
@@ -40,8 +40,18 @@ from langchaint.openai import openai_model
 FORCED_TRIES = 3
 """Turns the forcing phase gets to produce a valid final_response call before the run gives up."""
 
-SEARCH_FEE_IN_USD = 0.002
-"""The flat fee search reports per call; a search API bills per call, not per token."""
+SEARCH_USAGE = Usage(
+    input_tokens_cache_read=0,
+    input_tokens_cache_write=0,
+    input_tokens_cache_none=200,
+    output_tokens=40,
+    output_tokens_reasoning=0,
+    input_tokens_cache_read_cost_in_usd=0.0,
+    input_tokens_cache_write_cost_in_usd=0.0,
+    input_tokens_cache_none_cost_in_usd=0.0012,
+    output_tokens_cost_in_usd=0.0008,
+)
+"""What one search call spends, standing in for a model call of its own."""
 
 
 class SearchArgs(BaseModel):
@@ -51,15 +61,15 @@ class SearchArgs(BaseModel):
 
 
 async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
-    """Return a canned search result and report the call's flat fee as a Usage through app_data.
+    """Return a canned search result and report what the call spent as a Usage through app_data.
 
     content is what the model reads; the Usage rides to the loop, which folds it into the run total.
-    cost_in_usd is the Usage field that absorbs provider-variant billing structure.
-    A per-call fee is therefore a Usage with zero token counters and the fee in cost_in_usd.
+    A tool that calls a model of its own reports that call's Usage, which is what puts tool spend and
+    the agent's own turns under one budget.
     """
     return ToolOutputExplicit(
         content=f"Top result for {args.query!r}: langchaint is a provider-neutral LLM client library.",
-        app_data=ZERO_USAGE.model_copy(update={"cost_in_usd": SEARCH_FEE_IN_USD}),
+        app_data=SEARCH_USAGE,
     )
 
 
@@ -166,10 +176,10 @@ async def run_agent[FinalT: BaseModel](
         return await answer_calls(response.tool_calls, forcing=forcing)
 
     def completed(final_response: FinalT) -> RunResult[FinalT]:
-        generate_usage = Usage.sum_of(response.usage for response in responses)
+        generate_usages = (response.usage for response in responses)
         return RunResult(
             final_response=final_response,
-            usage=generate_usage + Usage.sum_of(tool_reported_usages),
+            usage=Usage.sum_of(itertools.chain(generate_usages, tool_reported_usages)),
         )
 
     for _ in range(max_turns):

@@ -1613,7 +1613,10 @@ def test_agent_span_carries_the_run_identity_and_summed_usage() -> None:
         input_tokens_cache_none=5,
         output_tokens=7,
         output_tokens_reasoning=4,
-        cost_in_usd=0.5,
+        input_tokens_cache_read_cost_in_usd=0.0,
+        input_tokens_cache_write_cost_in_usd=0.0,
+        input_tokens_cache_none_cost_in_usd=0.0,
+        output_tokens_cost_in_usd=0.5,
     )
     with agent_span(
         tracer,
@@ -1653,7 +1656,10 @@ def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() 
         input_tokens_cache_none=0,
         output_tokens=0,
         output_tokens_reasoning=0,
-        cost_in_usd=0.0,
+        input_tokens_cache_read_cost_in_usd=0.0,
+        input_tokens_cache_write_cost_in_usd=0.0,
+        input_tokens_cache_none_cost_in_usd=0.0,
+        output_tokens_cost_in_usd=0.0,
     )
     with (  # noqa: PT012
         pytest.raises(RuntimeError, match="loop gave up"),
@@ -1670,7 +1676,10 @@ def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() 
             input_tokens_cache_none=6,
             output_tokens=2,
             output_tokens_reasoning=0,
-            cost_in_usd=0.02,
+            input_tokens_cache_read_cost_in_usd=0.0,
+            input_tokens_cache_write_cost_in_usd=0.0,
+            input_tokens_cache_none_cost_in_usd=0.0,
+            output_tokens_cost_in_usd=0.02,
         )
         raise RuntimeError("loop gave up")
     (finished,) = exporter.get_finished_spans()
@@ -1696,7 +1705,10 @@ def test_agent_span_extra_attributes_cannot_displace_identity_or_usage_keys() ->
         input_tokens_cache_none=1,
         output_tokens=1,
         output_tokens_reasoning=0,
-        cost_in_usd=0.01,
+        input_tokens_cache_read_cost_in_usd=0.0,
+        input_tokens_cache_write_cost_in_usd=0.0,
+        input_tokens_cache_none_cost_in_usd=0.0,
+        output_tokens_cost_in_usd=0.01,
     )
     with agent_span(
         tracer,

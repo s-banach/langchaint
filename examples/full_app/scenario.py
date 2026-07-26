@@ -3,8 +3,8 @@
 The graph: research_climate and research_energy run concurrently, synthesize starts once both are done.
 research_climate delegates a question to a specialist sub-agent, so the tree is three levels deep.
 synthesize self-corrects: it drafts, calls critique, is told to revise, drafts again, is approved, answers.
-search reports a flat per-call fee through app_data, so a run's total includes tool spend as well as
-token spend. A sub-agent reports nothing that way: it records its own spend as it goes.
+search reports a constant Usage through app_data, standing in for a model call of its own, so a
+run's total includes what its tools spent. A sub-agent reports nothing that way: it records its own spend as it goes.
 
 Scripts are keyed by agent tag; a binding's system prompt starts with "[tag]" and the adapter reads it.
 Each named scenario perturbs one script to exercise one failure layer, leaving the rest of the graph intact.
@@ -14,10 +14,20 @@ from events import current_gui_emitter
 from harness import Turn, call
 from pydantic import BaseModel
 
-from langchaint import ZERO_USAGE, PydanticTool, ToolOutputExplicit, Usage
+from langchaint import PydanticTool, ToolOutputExplicit, Usage
 
-SEARCH_FEE_IN_USD = 0.002
-"""What one search call bills, distinct from a turn's 0.01 so a fold can be attributed."""
+SEARCH_USAGE = Usage(
+    input_tokens_cache_read=0,
+    input_tokens_cache_write=0,
+    input_tokens_cache_none=200,
+    output_tokens=40,
+    output_tokens_reasoning=0,
+    input_tokens_cache_read_cost_in_usd=0.0,
+    input_tokens_cache_write_cost_in_usd=0.0,
+    input_tokens_cache_none_cost_in_usd=0.0012,
+    output_tokens_cost_in_usd=0.0008,
+)
+"""What one search call bills, summing to 0.002, distinct from a turn's 0.01 so a fold can be attributed."""
 
 
 class SearchArgs(BaseModel):
@@ -39,10 +49,11 @@ class DelegateArgs(BaseModel):
 
 
 async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
-    """Return a canned result and report the call's flat fee as a Usage through app_data.
+    """Return a canned result and report what the call spent as a Usage through app_data.
 
     content is what the model reads; the Usage rides to the loop, which folds it into the run total.
-    A per-call fee is a Usage with zero token counters and the fee in cost_in_usd.
+    A tool that calls a model of its own reports that call's Usage, which is what makes the run total
+    cover tool spend as well as the agent's own turns.
 
     The progress report reaches the dispatching run's stream through current_gui_emitter, which is the
     one thing threading cannot do without a parameter on every tool: this function holds no handle on
@@ -57,7 +68,7 @@ async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
     )
     return ToolOutputExplicit(
         content=f"Top result for {args.query!r}: a paragraph of findings.",
-        app_data=ZERO_USAGE.model_copy(update={"cost_in_usd": SEARCH_FEE_IN_USD}),
+        app_data=SEARCH_USAGE,
     )
 
 

@@ -8,6 +8,8 @@ the zero-usage fallback when a response omits usage, and the precomputed request
 
 import asyncio
 import base64
+import math
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import override
 
@@ -65,7 +67,11 @@ from langchaint.adapter import (
     Unparsed,
 )
 from langchaint.exceptions import StreamProtocolError
-from langchaint.openai import OpenAIResponsesAdapter, ReasoningSummary, cost_breakdown
+from langchaint.openai import (
+    OpenAIPricedServiceTier,
+    OpenAIResponsesAdapter,
+    ReasoningSummary,
+)
 from langchaint.openai.responses_adapter import (
     _adapter_result,
     _assistant_items,
@@ -79,12 +85,23 @@ from langchaint.openai.responses_adapter import (
     _wire_tool_choice,
 )
 
-_PRICING = PricingTable(
+_DEFAULT_RATES = PricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
 )
+
+_PRICING: dict[OpenAIPricedServiceTier, PricingTable] = {"default": _DEFAULT_RATES}
+"""The default tier alone, so a response reporting another tier prices NaN."""
+
+_PRIORITY_RATES = PricingTable(
+    input_cache_none_usd_per_million_tokens=5.0,
+    output_usd_per_million_tokens=20.0,
+    cache_read_usd_per_million_tokens=2.5,
+    cache_write_usd_per_million_tokens=6.25,
+)
+"""Twice the default rates, so a tier-selection test reads as a doubling."""
 
 _TEXT_OUTPUT_ITEM: dict[str, object] = {
     "type": "message",
@@ -133,8 +150,9 @@ def _response(
     output: list[object] | None = None,
     status: str = "completed",
     incomplete_details: IncompleteDetails | None = None,
+    service_tier: str | None = None,
 ) -> OpenAIResponse:
-    """Build a response carrying the given usage, output items, and status."""
+    """Build a response carrying the given usage, output items, status, and reported tier."""
     return OpenAIResponse.model_validate({
         "id": "r1",
         "created_at": 0,
@@ -147,28 +165,33 @@ def _response(
         "status": status,
         "incomplete_details": incomplete_details,
         "usage": usage,
+        "service_tier": service_tier,
     })
 
 
 def test_normalized_usage_subtracts_cache_from_input_tokens_and_prices() -> None:
     """The uncached counter is input_tokens minus both cache counts, and the priced cost rides on it."""
-    usage = _normalized_usage(_usage_with_cache(), _PRICING)
+    usage = _normalized_usage(_response(usage=_usage_with_cache()), _PRICING)
     assert usage.input_tokens_cache_read == 600
     assert usage.input_tokens_cache_write == 100
     assert usage.input_tokens_cache_none == 300
     assert usage.input_tokens_total == 1000
-    assert usage.cost_in_usd == (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
+    assert usage.cost_in_usd == pytest.approx(
+        (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
+    )
 
 
 def test_normalized_usage_reads_reasoning_tokens() -> None:
     """output_tokens_reasoning reads the required reasoning_tokens counter."""
     usage = _normalized_usage(
-        ResponseUsage(
-            input_tokens=10,
-            input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
-            output_tokens=20,
-            output_tokens_details=OutputTokensDetails(reasoning_tokens=8),
-            total_tokens=30,
+        _response(
+            usage=ResponseUsage(
+                input_tokens=10,
+                input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+                output_tokens=20,
+                output_tokens_details=OutputTokensDetails(reasoning_tokens=8),
+                total_tokens=30,
+            )
         ),
         _PRICING,
     )
@@ -182,39 +205,70 @@ def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
     """
     with pytest.raises(ValidationError):
         _normalized_usage(
-            ResponseUsage(
-                input_tokens=1000,
-                input_tokens_details=InputTokensDetails(cached_tokens=900, cache_write_tokens=200),
-                output_tokens=40,
-                output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
-                total_tokens=1040,
+            _response(
+                usage=ResponseUsage(
+                    input_tokens=1000,
+                    input_tokens_details=InputTokensDetails(
+                        cached_tokens=900, cache_write_tokens=200
+                    ),
+                    output_tokens=40,
+                    output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+                    total_tokens=1040,
+                )
             ),
             _PRICING,
         )
 
 
-def test_cost_prices_each_cache_tier_and_the_remainder() -> None:
+def test_the_categories_are_priced_apart() -> None:
     """Cache reads, cache writes, the uncached remainder, and output each bill at their rate."""
-    cost = _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
-    expected = (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
-    assert abs(cost - expected) < 1e-12
+    usage = _normalized_usage(_response(usage=_usage_with_cache()), _PRICING)
+    assert usage.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
+    assert usage.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
+    assert usage.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
+    assert usage.output_tokens_cost_in_usd == 40 * 10.0 / 1e6
 
 
-def test_cost_breakdown_splits_categories_and_matches_the_stored_cost() -> None:
-    """Each category cost is its own product, the 1h slot is 0, and the total equals the stored cost."""
-    usage = _usage_with_cache()
-    breakdown = cost_breakdown(usage, _PRICING)
-    assert breakdown.counts.input_tokens_cache_none == 300
-    assert breakdown.counts.input_tokens_cache_read == 600
-    assert breakdown.counts.input_tokens_cache_write == 100
-    assert breakdown.counts.input_tokens_cache_write_1h == 0
-    assert breakdown.counts.output_tokens == 40
-    assert breakdown.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
-    assert breakdown.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
-    assert breakdown.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
-    assert breakdown.input_tokens_cache_write_1h_cost_in_usd == 0.0
-    assert breakdown.output_tokens_cost_in_usd == 40 * 10.0 / 1e6
-    assert breakdown.total_cost_in_usd == _normalized_usage(usage, _PRICING).cost_in_usd
+def test_the_reported_tier_selects_the_table() -> None:
+    """Priority rates price a priority response; "auto" and no tier both price at default."""
+    pricing: dict[OpenAIPricedServiceTier, PricingTable] = {
+        "default": _DEFAULT_RATES,
+        "priority": _PRIORITY_RATES,
+    }
+    at_priority = _normalized_usage(
+        _response(usage=_usage_with_cache(), service_tier="priority"), pricing
+    )
+    at_default = _normalized_usage(
+        _response(usage=_usage_with_cache(), service_tier="default"), pricing
+    )
+    reporting_auto = _normalized_usage(
+        _response(usage=_usage_with_cache(), service_tier="auto"), pricing
+    )
+    reporting_none = _normalized_usage(_response(usage=_usage_with_cache()), pricing)
+    assert at_priority.cost_in_usd == pytest.approx(2 * at_default.cost_in_usd)
+    assert reporting_auto.cost_in_usd == at_default.cost_in_usd
+    assert reporting_none.cost_in_usd == at_default.cost_in_usd
+
+
+def test_cost_is_nan_when_the_served_tier_has_no_table() -> None:
+    """A response served at a tier the adapter holds no table for keeps its counters and costs NaN."""
+    usage = _normalized_usage(_response(usage=_usage_with_cache(), service_tier="flex"), _PRICING)
+    assert math.isnan(usage.cost_in_usd)
+    assert usage.input_tokens_total == 1000
+    assert usage.output_tokens == 40
+
+
+def test_pricing_without_the_default_key_raises_at_construction() -> None:
+    """A pricing mapping missing "default" fails before any request, naming the model."""
+    priority_only: dict[OpenAIPricedServiceTier, PricingTable] = {"priority": _PRIORITY_RATES}
+    with pytest.raises(ValueError, match=re.escape("'default'")):
+        OpenAIResponsesAdapter(
+            client=AsyncOpenAI(api_key="test"),
+            model="gpt-5.6-terra",
+            pricing=priority_only,
+            provider_name="openai",
+            supports_prompt_cache_options=True,
+        )
 
 
 def test_stop_reason_is_tool_use_with_a_function_call_item() -> None:
@@ -484,7 +538,10 @@ def test_adapter_result_normalizes_a_response_with_usage() -> None:
     result = _adapter_result(response=response, output="hey", pricing=_PRICING)
     assert result.output == "hey"
     assert result.usage.input_tokens_total == 1000
-    assert result.usage.cost_in_usd == _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
+    assert (
+        result.usage.cost_in_usd
+        == _normalized_usage(_response(usage=_usage_with_cache()), _PRICING).cost_in_usd
+    )
     assert result.usage_raw is response.usage
     assert result.stop_reason == "end_turn"
     assert result.raw is response
@@ -651,6 +708,25 @@ def test_request_omits_prompt_cache_options_where_the_model_lacks_the_parameter(
     assert isinstance(disabled.prompt_cache_options, openai.Omit)
     enabled = adapter._request(_binding(automatic_prompt_caching=True))
     assert isinstance(enabled.prompt_cache_options, openai.Omit)
+
+
+def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
+    """A stated service_tier lands on the request; None leaves the omit sentinel.
+
+    The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
+    different request from omitting the key.
+    """
+    binding = _binding(automatic_prompt_caching=True)
+    assert isinstance(_adapter()._request(binding).service_tier, openai.Omit)
+    stated = OpenAIResponsesAdapter(
+        client=AsyncOpenAI(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="openai",
+        supports_prompt_cache_options=True,
+        service_tier="flex",
+    )
+    assert stated._request(binding).service_tier == "flex"
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
@@ -840,7 +916,7 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
         assert result.usage.input_tokens_total == 1000
         assert (
             result.usage.cost_in_usd
-            == _normalized_usage(_usage_with_cache(), _PRICING).cost_in_usd
+            == _normalized_usage(_response(usage=_usage_with_cache()), _PRICING).cost_in_usd
         )
 
     asyncio.run(scenario())

@@ -43,6 +43,7 @@ from langchaint.adapter import classification_from_response
 from langchaint.anthropic.messages_adapter import (
     _RATE_LIMIT_STATUSES as _ANTHROPIC_RATE_LIMIT_STATUSES,
 )
+from langchaint.anthropic.messages_adapter import AnthropicPricedServiceTier
 from langchaint.openai.responses_adapter import (
     _RATE_LIMIT_STATUSES as _OPENAI_RATE_LIMIT_STATUSES,
 )
@@ -167,14 +168,16 @@ def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
     )
 
 
-def test_anthropic_service_tier_has_a_batch_member_usage_does_not_carry() -> None:
-    """service_tier still names the billing tier langchaint's PricingTable has no axis for.
+def test_anthropic_service_tier_members_are_the_pricing_mapping_keys() -> None:
+    """The tier words a response can report are exactly AnthropicPricedServiceTier.
 
-    A response served at the batch tier prices at standard rates here, silently, because Usage
-    carries no tier and PricingTable takes none.
+    An adapter's pricing mapping is keyed by that alias, so a member the SDK adds and the alias
+    lacks would price NaN with no table a caller could supply for it.
     """
     annotation = _field_annotation(AnthropicUsage, "service_tier")
-    assert typing.get_args(typing.get_args(annotation)[0]) == ("standard", "priority", "batch")
+    reported = typing.get_args(typing.get_args(annotation)[0])
+    assert reported == typing.get_args(AnthropicPricedServiceTier.__value__)
+    assert reported == ("standard", "priority", "batch")
 
 
 _RETRY_GRID_STATUSES = (400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 529)

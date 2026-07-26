@@ -64,7 +64,7 @@ A bare `str` argument is shorthand for a conversation of one `UserMessage` holdi
 Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`, but both carry `usage`, the paid total across every attempt, and `to_row` flattens either to one row shape, so a mixed batch is one table.
 
 **Priced usage.**
-`Usage` partitions input tokens by cache outcome, counts reasoning output separately, and carries `cost_in_usd`, computed against a `PricingTable`; the raw SDK usage rides beside it.
+`Usage` partitions input tokens by cache outcome, counts reasoning output separately, and carries one cost per priced category, priced at the service tier the response reported; `cost_in_usd` is their sum and the raw SDK usage rides beside it.
 
 **One `RateLimiter` owning retrying and pacing.**
 One instance shared by several `LLM`s is one budget for the account they hit, gating every request start; a rate-limit error pauses admission for everyone sharing it.

@@ -114,7 +114,7 @@ async def anthropic_one_hour_ttl() -> None:
 
     The default "5m" omits the ttl key (the API default), and its writes bill 1.25x base input;
     "1h" holds entries across longer gaps and its writes bill 2x,
-    priced by the PricingTable's cache_write_1h_usd_per_million_tokens.
+    priced by the AnthropicPricingTable's cache_write_1h_usd_per_million_tokens.
     A per-part TTL is deliberately not exposed; mixing TTLs is two bindings on two adapters.
     """
     llm = anthropic_model("claude-sonnet-5", cache_ttl="1h")

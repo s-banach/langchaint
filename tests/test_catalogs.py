@@ -20,27 +20,43 @@ from langchaint.anthropic import (
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
     AnthropicModelName,
+    AnthropicPricedServiceTier,
+    AnthropicPricingTable,
     anthropic_bedrock_model,
     anthropic_model,
 )
 from langchaint.openai import (
     OPENAI_PRICING,
     OpenAIModelName,
+    OpenAIPricedServiceTier,
     OpenAIResponsesAdapter,
     openai_bedrock_model,
     openai_model,
 )
 
-_ARBITRARY_PRICING = PricingTable(
-    input_cache_none_usd_per_million_tokens=1.0,
-    output_usd_per_million_tokens=1.0,
-    cache_read_usd_per_million_tokens=1.0,
-    cache_write_usd_per_million_tokens=1.0,
-)
-"""Stands in wherever a constructor requires pricing but the assertion is about something else.
+_ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, PricingTable] = {
+    "default": PricingTable(
+        input_cache_none_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=1.0,
+        cache_read_usd_per_million_tokens=1.0,
+        cache_write_usd_per_million_tokens=1.0,
+    )
+}
+"""Stands in wherever an openai constructor requires pricing but the assertion is about something else.
 
-openai_bedrock_model has no catalog to default from, so its callers always supply a table.
+openai_bedrock_model has no catalog to default from, so its callers always supply a mapping.
 """
+
+_ARBITRARY_ANTHROPIC_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
+    "standard": AnthropicPricingTable(
+        input_cache_none_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=1.0,
+        cache_read_usd_per_million_tokens=1.0,
+        cache_write_5m_usd_per_million_tokens=1.0,
+        cache_write_1h_usd_per_million_tokens=1.0,
+    )
+}
+"""The anthropic counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
 
 @pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
@@ -50,7 +66,7 @@ def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> N
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
-    assert adapter.pricing is ANTHROPIC_PRICING[model]
+    assert adapter.pricing["standard"] is ANTHROPIC_PRICING[model]
 
 
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
@@ -60,7 +76,7 @@ def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
-    assert adapter.pricing is OPENAI_PRICING[model]
+    assert adapter.pricing["default"] is OPENAI_PRICING[model]
 
 
 _PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
@@ -130,7 +146,7 @@ def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported
             lambda: AnthropicMessagesAdapter(
                 client=AsyncAnthropic(api_key="offline", base_url="https://example.invalid"),
                 model="claude-sonnet-5",
-                pricing=_ARBITRARY_PRICING,
+                pricing=_ARBITRARY_ANTHROPIC_PRICING,
                 provider_name="groq",
             ),
             "groq",
@@ -244,21 +260,48 @@ def test_both_bedrock_constructors_raise_on_a_region_beside_a_client() -> None:
         )
 
 
-def test_pricing_override_replaces_the_default() -> None:
-    """A caller-supplied pricing table lands on the adapter unchanged."""
-    custom_pricing = PricingTable(
+def test_pricing_override_replaces_the_standard_rates() -> None:
+    """A caller-supplied "standard" table replaces the catalog's, and a caller's tier is added."""
+    custom_standard = AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=2.00,
         output_usd_per_million_tokens=10.00,
         cache_read_usd_per_million_tokens=0.20,
-        cache_write_usd_per_million_tokens=2.50,
+        cache_write_5m_usd_per_million_tokens=2.50,
         cache_write_1h_usd_per_million_tokens=4.00,
     )
-    llm = anthropic_model(
+    adapter = anthropic_model(
         "claude-sonnet-5",
         client=AsyncAnthropic(api_key="offline"),
-        pricing=custom_pricing,
-    )
-    assert llm.adapter.pricing is custom_pricing
+        pricing={"standard": custom_standard, "batch": custom_standard},
+    ).adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.pricing["standard"] is custom_standard
+    assert adapter.pricing["batch"] is custom_standard
+
+
+def test_service_tier_reaches_the_adapter_from_both_first_party_constructors() -> None:
+    """Each constructor forwards the tier its provider's requests can ask for; None forwards None.
+
+    Neither Bedrock constructor takes the parameter: the tiers are each provider's own platform's.
+    """
+    anthropic_adapter = anthropic_model(
+        "claude-sonnet-5", client=AsyncAnthropic(api_key="offline"), service_tier="standard_only"
+    ).adapter
+    assert isinstance(anthropic_adapter, AnthropicMessagesAdapter)
+    assert anthropic_adapter.service_tier == "standard_only"
+    anthropic_unstated = anthropic_model(
+        "claude-sonnet-5", client=AsyncAnthropic(api_key="offline")
+    ).adapter
+    assert isinstance(anthropic_unstated, AnthropicMessagesAdapter)
+    assert anthropic_unstated.service_tier is None
+    openai_adapter = openai_model(
+        "gpt-5.6-terra", client=AsyncOpenAI(api_key="offline"), service_tier="flex"
+    ).adapter
+    assert isinstance(openai_adapter, OpenAIResponsesAdapter)
+    assert openai_adapter.service_tier == "flex"
+    unstated = openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="offline")).adapter
+    assert isinstance(unstated, OpenAIResponsesAdapter)
+    assert unstated.service_tier is None
 
 
 def test_rate_limiter_lands_on_the_llm() -> None:
@@ -386,7 +429,7 @@ def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
         AnthropicMessagesAdapter(
             client=client,
             model="claude-sonnet-5",
-            pricing=_ARBITRARY_PRICING,
+            pricing=_ARBITRARY_ANTHROPIC_PRICING,
             provider_name="anthropic",
         )
 

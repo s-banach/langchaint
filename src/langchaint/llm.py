@@ -388,9 +388,7 @@ class BoundLLM[OutputT]:
         the error was a rate limit, the two things the limiter needs to pace the next attempt;
         every other return is terminal for this item, and the caller raises it.
 
-        StreamHandle carries its own copy of this mapping, and sharing the two through one module is rejected.
-        "The part the two retry loops agree on" describes a refactor, not a concept.
-        What they genuinely share is the ledger, and call.py holds it.
+        StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
         """
         classification = self.adapter.classify(exc)
         if classification == "invalid_request":

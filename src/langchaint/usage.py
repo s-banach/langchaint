@@ -1,7 +1,7 @@
 """Token accounting and the per-category costs that travel with it.
 
 The three input counters are a disjoint partition of all input tokens, so their sum is the total;
-a bare input_tokens field was rejected because Anthropic's field of that name excludes cache reads
+there is no bare input_tokens field, because Anthropic's field of that name excludes cache reads
 while OpenAI's equivalent includes them.
 
 The costs ride on Usage rather than beside it so the two can never desynchronize:
@@ -48,10 +48,8 @@ class Usage(CheckedCopyModel):
     it derives input_tokens_cache_none by subtracting the cache counters from usage.input_tokens,
     so a response over-reporting its cache counters would otherwise produce a silently negative remainder.
     The cost fields carry no such constraint: it rejects NaN, and an unpriceable response would fail
-    validation and take its output down with it. What the constraint would have caught is a negative
-    rate in the caller's own PricingTable, surfaced one response later as a field error naming
-    neither the table nor the rate. Validating the table's rates instead is rejected:
-    a negative price is the caller's own arithmetic, not a provider rule langchaint guards.
+    validation and take its output down with it. Nothing checks the rates in a caller's own
+    PricingTable either, so a negative rate arrives here as a negative cost.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

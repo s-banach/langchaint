@@ -391,9 +391,6 @@ class Adapter(ABC):
         client is checked here and not stored;
         each adapter stores its own with_options copy.
         Its object annotation is the price of checking every adapter in one place.
-        Moving the check into a base helper each adapter calls with its own precisely typed client is rejected:
-        it makes the check opt-in, so an adapter whose author forgets the call is silently unguarded,
-        which is the failure the check exists to prevent.
 
         Rates are not stored here. Each provider's service tiers are its own words, so an adapter
         holds a mapping from the tier its responses report to the table that prices that tier,
@@ -444,17 +441,13 @@ class Adapter(ABC):
 
     @abstractmethod
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify an exception raised by send or open_stream.
+        """Classify an exception raised by send, open_stream, or a stream's items().
 
         Every classification fails at most its own item.
         A provider states a status, never whether the binding or this one conversation caused it.
         A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
         Anything the adapter cannot name must map to "unrecognized",
         which fails the one item without a retry, so bugs surface without being retried silently.
-
-        Folding this into a request-failed AttemptOutcome arm is rejected.
-        items() yields StreamItem values only, so a mid-stream failure reaches the retry loop as a raise anyway.
-        The arm would give one event two channels.
         """
         ...
 

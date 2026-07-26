@@ -137,9 +137,9 @@ class GenerationError(_CallCarrier, Exception):
         """None: no turn completed, true of every subclass but RefusalError and MaxCompletionTokensExceededError.
 
         Fixed by the class rather than taken as a constructor argument, because a raise site must
-        not choose a value the subclass already fixes. Deriving it in to_row instead is
-        rejected: to_row and gen_ai_attributes both read it off Response | GenerationError, so each
-        would need an isinstance ladder over the subclasses.
+        not choose a value the subclass already fixes. to_row and gen_ai_attributes both read it
+        off Response | GenerationError, so this property is what spares each an isinstance ladder
+        over the subclasses.
         """
         return None
 

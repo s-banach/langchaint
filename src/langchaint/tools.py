@@ -650,6 +650,8 @@ class ToolManager:
         The concurrent counterpart of dispatch for the several tool calls of one assistant turn:
         every dispatched call starts at once,
         and each outcome sits at its call's index regardless of completion order.
+        There is no concurrency-limit parameter: what needs bounding is the resource a tool function touches,
+        not the number of calls in one turn, so the bound belongs in the function that touches it.
         precomputed lets the application answer some calls itself instead of dispatching them
         (a call over its call limit, a duplicate of one already run, a turn it is forcing to terminate):
         it is asked once per call,

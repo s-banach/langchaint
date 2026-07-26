@@ -133,7 +133,6 @@ class AbandonedCall(_CallCarrier):
 
         Deliberately not named usage: on the other result carriers, usage is the call's whole paid
         total, and a call cut off mid-attempt lacks that attempt's share here.
-        Naming it usage for uniformity is rejected.
         Cancellation correlates with long requests, so the omitted attempt skews expensive.
         On the stream path every settled record is a failed attempt, a stream that dropped after
         delivering items included.

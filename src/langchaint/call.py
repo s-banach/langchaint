@@ -100,10 +100,7 @@ class _CallCarrier:
 
     No attempts count is forwarded: Response and GenerationError each define their own, and AbandonedCall reports none.
 
-    Unpacking the record into flat fields on each carrier is rejected: forwarding already leaves
-    every public read unchanged, and flat fields make each carrier re-declare the same four names,
-    so the record stops being their one declaration and becomes a courier between two lines of a
-    retry loop.
+    CallRecord is the one declaration of the names it forwards, so a carrier adds none of them itself.
     """
 
     call: CallRecord

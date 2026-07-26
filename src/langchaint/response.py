@@ -48,6 +48,8 @@ class Response[OutputT](_CallCarrier):
     held by reference for appending to a conversation.
     Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
     and is the rewrap this field exists to prevent.
+    The last attempt record holds the same object, because the record is where every attempt's turn
+    goes and this one is the attempt that succeeded.
     raw is the SDK's own response model, held by reference (no dump, no copy; call raw.model_dump() for a dict);
     on streams it comes from the SDK-assembled final message.
     It is a live, mutable pydantic object shared with the adapter, so despite the frozen dataclass around it,

@@ -34,13 +34,24 @@ from langchaint.adapter import (
 
 
 class FakeRaw(BaseModel):
-    """Stands in for the SDK response model an adapter holds in raw."""
+    """Stands in for the SDK response model an adapter holds in raw.
 
-    id: str = "fake"
+    turn_index names the scripted turn this response came from, standing in for the fields a real
+    adapter reads the turn and the counters off.
+    """
+
+    turn_index: int
 
 
-class FakeRawUsage(BaseModel):
-    """Stands in for the SDK usage object an adapter holds in usage_raw."""
+def _turn_index(raw: BaseModel) -> int:
+    """Narrow a raw response to the scripted one and return the turn it came from.
+
+    Raises:
+        TypeError: raw is not a FakeRaw.
+    """
+    if not isinstance(raw, FakeRaw):
+        raise TypeError(f"expected a FakeRaw, got {type(raw).__name__}")
+    return raw.turn_index
 
 
 _TURN_USAGE = Usage(
@@ -126,8 +137,34 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         self._tag = tag
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
-        """Return the next scripted turn for this tag, after its delay.
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Report what one scripted turn bills, the same round numbers for every turn."""
+        return _TURN_USAGE
+
+    @override
+    def interpret(self, raw: BaseModel) -> AdapterResult[str]:
+        """Build the result the scripted turn this response names describes.
+
+        Raises:
+            TypeError: raw is not a FakeRaw.
+        """
+        turn = self._adapter.scripts[self._tag].turns[_turn_index(raw)]
+        if turn.tool_calls:
+            return AdapterResult(
+                output="",
+                assistant_message=AssistantMessage(turn=turn.tool_calls),
+                stop_reason="tool_use",
+            )
+        assert turn.text is not None
+        return AdapterResult(
+            output=turn.text,
+            assistant_message=AssistantMessage(turn=(TextPart(text=turn.text),)),
+            stop_reason="end_turn",
+        )
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> FakeRaw:
+        """Return a response naming the next scripted turn for this tag, after its delay.
 
         Raises:
             Exception: the turn's scripted error, whatever type it carries.
@@ -136,33 +173,17 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         script = self._adapter.scripts[self._tag]
         if script.sends >= len(script.turns):
             raise RuntimeError(f"script {self._tag!r} exhausted after {script.sends} turns")
-        turn = script.turns[script.sends]
+        turn_index = script.sends
+        turn = script.turns[turn_index]
         script.sends += 1
         if turn.delay_seconds:
             await asyncio.sleep(turn.delay_seconds)
         if turn.error is not None:
             raise turn.error
-        if turn.tool_calls:
-            return AdapterResult(
-                output="",
-                assistant_message=AssistantMessage(turn=turn.tool_calls),
-                usage=_TURN_USAGE,
-                usage_raw=FakeRawUsage(),
-                stop_reason="tool_use",
-                raw=FakeRaw(),
-            )
-        assert turn.text is not None
-        return AdapterResult(
-            output=turn.text,
-            assistant_message=AssistantMessage(turn=(TextPart(text=turn.text),)),
-            usage=_TURN_USAGE,
-            usage_raw=FakeRawUsage(),
-            stop_reason="end_turn",
-            raw=FakeRaw(),
-        )
+        return FakeRaw(turn_index=turn_index)
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
         """Reject a stream open: the example uses generate_one only."""
         raise NotImplementedError
 

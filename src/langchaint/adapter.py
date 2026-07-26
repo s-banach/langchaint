@@ -11,10 +11,15 @@ frame answers a rejection with a member carrying both.
 Reporting model: an adapter reports one attempt; only the retry loop knows the call.
 So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
 constructs a `GenerationError`, which is a verdict about a call it cannot see.
-What no arm can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
+What no member can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
 that propagate for `Adapter.classify` to sort.
 `AdapterStream.items` is the exception to the return contract, because an async iterator can only
 raise: a mid-stream failure reaches the stream handle as an exception and goes through `classify` too.
+
+Receipt before interpretation: `send` and `AdapterStream.final` hand back the SDK response object
+itself, and `usage_from_raw` and `interpret` read it in two separate calls the retry loop makes.
+The loop records the response and its price the moment it arrives, so a raise from `interpret` still
+leaves the attempt and what it billed on the call's record.
 
 Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
 (system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
@@ -194,6 +199,9 @@ class Binding:
 class AdapterResult[OutputT]:
     """One successful provider turn, normalized to langchaint terms.
 
+    Everything interpret read off the response, and nothing the response itself already holds: the
+    retry loop keeps the response it passed to interpret, and that is the one a Response carries.
+
     output is the assistant text (text bindings) or the response_format instance validated from the
     turn's text (structured bindings).
     A structured binding's output is None when the turn parsed no instance, which here means the model
@@ -201,38 +209,30 @@ class AdapterResult[OutputT]:
     A turn can both parse an instance and call tools, so tool_calls is what says whether a tool result
     is owed.
     assistant_message is the full turn including tool calls, for appending to a conversation.
-    usage carries the per-category costs, priced from raw provider counts against the table the
-    adapter holds for the service tier the response reported.
-    usage_raw is the raw SDK usage object usage was normalized from, held by reference (no dump, no copy),
-    None when the response reported no usage; a caller recovers provider-specific counts from it.
-    raw is the SDK's own response model, held by reference (no dump, no copy).
-    It is a live, mutable pydantic object, so despite the frozen dataclass around it,
-    treat it read-only and raw.model_copy() before mutating.
     """
 
     output: OutputT
     assistant_message: AssistantMessage
-    usage: Usage
-    usage_raw: BaseModel | None
     stop_reason: StopReason
-    raw: BaseModel
 
 
 @dataclass(frozen=True, kw_only=True)
 class NoOutput:
-    """The shared shape of a 200 that produced no output: what that attempt billed.
+    """The shared shape of a 200 that produced no output: the turn it produced instead.
 
-    Declares the billing fields once, and is the runtime test that narrows to NoOutputOutcome:
+    Declares assistant_message once, and is the runtime test that narrows to NoOutputOutcome:
     isinstance rejects a type alias, so an adapter helper whose result is an output value or a member
     tests against this base and annotates the members as NoOutputOutcome.
     Every subclass must be a member of that alias; that is what makes the test sound.
 
-    usage carries the per-category costs; usage_raw is the raw SDK usage object it was normalized
-    from, held by reference and None when the response reported no usage.
+    assistant_message is whatever turn the response carried, which every member has one of and none
+    of them can return as the output: the sentences a refusal wrote, the text a schema violation
+    rejected, the fragment a run that failed had emitted. The retry loop puts it on the attempt's
+    record, so what the request bought reaches the caller even where the item fails. A response
+    carrying no turn at all gives an empty one.
     """
 
-    usage: Usage
-    usage_raw: BaseModel | None
+    assistant_message: AssistantMessage
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -240,6 +240,10 @@ class Refusal(NoOutput):
     """A completed 200 whose structured parse found the model refusing.
 
     The retry loop records the attempt and fails the item with a RefusalError, without retrying.
+    Neither provider puts its explanation in one neutral place, so a caller wanting more than
+    assistant_message narrows the attempt's raw: anthropic reports it on Message.stop_details, and
+    openai in a refusal content part, which its other refusal condition
+    (incomplete_details.reason "content_filter") does not produce.
     """
 
 
@@ -370,11 +374,13 @@ type AttemptOutcome[OutputT] = ResponseOutcome[OutputT] | InvalidRequest
 """What one attempt produced, whether or not a request went out."""
 
 
-class AdapterStream[OutputT](ABC):
+class AdapterStream(ABC):
     """One open stream, backed by the SDK's stream manager.
 
     The adapter translates SDK events into StreamItem values as they pass through;
-    assembly and structured-output parsing stay in the SDK.
+    assembly stays in the SDK.
+    Carries no output type: the stream yields items and hands back the assembled response, and what
+    that response produced is BoundAdapter.interpret's answer on either request path.
     """
 
     @abstractmethod
@@ -387,13 +393,12 @@ class AdapterStream[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def final(self) -> ResponseOutcome[OutputT]:
-        """Return what the assembled response produced, after the stream ends.
+    async def final(self) -> BaseModel:
+        """Return the SDK response the stream's events assembled into, after the stream ends.
 
-        Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
-        A response that produced no output is a NoOutputOutcome member rather than a raise, so the
-        stream handle gets this attempt's billing and decides the item's fate itself.
-        InvalidRequest cannot arrive here: the request is already open.
+        Callable only after items() is exhausted; the adapter delegates assembly to the SDK stream manager.
+        Handing back the response rather than what it produced is what lets the stream handle record
+        the receipt before interpreting it, the same order the non-streaming path follows.
         """
         ...
 
@@ -411,11 +416,12 @@ class BoundAdapter[OutputT](ABC):
     """
 
     @abstractmethod
-    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[OutputT]:
-        """Send one non-streaming request and report what the attempt produced.
+    async def send(self, conversation: Sequence[Message]) -> BaseModel | InvalidRequest:
+        """Send one non-streaming request and return the SDK response object it got back.
 
-        A response that produced no output is a returned member, never a raise, so the retry loop
-        records what the attempt billed before deciding the item's fate.
+        Every 200 comes back this way, whatever it holds, so the retry loop records the response and
+        its price before anything is read off it.
+        A conversation the adapter will not put on the wire returns InvalidRequest, having sent nothing.
 
         Raises:
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
@@ -424,9 +430,38 @@ class BoundAdapter[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def open_stream(
-        self, conversation: Sequence[Message]
-    ) -> AdapterStream[OutputT] | InvalidRequest:
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Price one response's reported counters at the service tier that response reports.
+
+        Called on every response the moment it arrives, before interpret. No I/O.
+        A response reporting no counters at all prices to ZERO_USAGE.
+
+        Raises:
+            TypeError: raw is not the SDK response type this bound adapter produces, which is a
+                defect in langchaint rather than anything a provider did.
+        """
+        ...
+
+    @abstractmethod
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
+        """Read one SDK response as the turn it produced, or as the reason it produced none. No I/O.
+
+        Both request paths go through here, the streaming one on the response the SDK assembled from
+        the events, so one function per binding decides what a response means.
+        A response that produced no output is a returned member, never a raise, so the retry loop
+        decides the item's fate with the attempt already recorded.
+
+        raw is typed BaseModel rather than the SDK response type because BoundAdapter is what
+        BoundLLM holds, and the neutral core imports no SDK.
+
+        Raises:
+            TypeError: raw is not the SDK response type this bound adapter produces, which is a
+                defect in langchaint rather than anything a provider did.
+        """
+        ...
+
+    @abstractmethod
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
         """Open one streaming request and return the live stream.
 
         Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.

@@ -8,7 +8,8 @@ Together they pin the retry loop, rebind rebuild, batch ordering, and the stream
 import asyncio
 import time
 from collections.abc import AsyncIterator, Sequence
-from typing import assert_type, override
+from dataclasses import dataclass
+from typing import ClassVar, assert_type, override
 
 import pytest
 from pydantic import BaseModel
@@ -49,7 +50,6 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
-    AttemptOutcome,
     Binding,
     BoundAdapter,
     ContextWindowExceeded,
@@ -57,7 +57,6 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutputOutcome,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
@@ -109,16 +108,41 @@ def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
 
 
 class _FakeRawResponse(BaseModel):
-    """Stands in for the SDK response model a real adapter holds in raw."""
+    """Stands in for the SDK response model a real adapter holds in raw.
 
-    id: str = "fake-response"
+    Its id is what the fake bound adapter looks the scripted receipt up under, standing in for the
+    fields a real adapter reads the turn and the counters off.
+    """
+
+    id: str
 
 
-class _FakeRawUsage(BaseModel):
-    """Stands in for the SDK usage object a real adapter holds in usage_raw."""
+def _raw_id(raw: BaseModel) -> str:
+    """Narrow a raw response to the fake one and return its id.
+
+    Raises:
+        TypeError: raw is not a _FakeRawResponse, which the real adapters raise for the same reason.
+    """
+    if not isinstance(raw, _FakeRawResponse):
+        raise TypeError(f"expected a _FakeRawResponse, got {type(raw).__name__}")
+    return raw.id
 
 
-_FAKE_RAW_USAGE = _FakeRawUsage()
+@dataclass(frozen=True, kw_only=True)
+class _Receipt:
+    """One response the fake hands back: what interpret reads off it, and what it billed."""
+
+    outcome: ResponseOutcome[str]
+    usage: Usage
+
+
+def _billed(outcome: ResponseOutcome[str]) -> _Receipt:
+    """Script one 200 the provider billed, whatever interpret goes on to make of it."""
+    return _Receipt(outcome=outcome, usage=_USAGE_BILLED)
+
+
+_REJECTED_TURN = AssistantMessage(turn=(TextPart(text="what the rejected 200 carried"),))
+"""The turn a 200 that produced no output still carried, which every such member takes."""
 
 
 def _success_result(content: str) -> AdapterResult[str]:
@@ -126,22 +150,36 @@ def _success_result(content: str) -> AdapterResult[str]:
     return AdapterResult(
         output=content,
         assistant_message=AssistantMessage(turn=(TextPart(text=content),)),
-        usage=_USAGE,
-        usage_raw=_FAKE_RAW_USAGE,
         stop_reason="end_turn",
-        raw=_FakeRawResponse(),
     )
 
 
 _FAKE_TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": "tide"}')
 
 
-class _FakeStream(AdapterStream[str]):
-    """A fixed item sequence and a fixed assembled result."""
+class _FakeStream(AdapterStream):
+    """A fixed item sequence and a fixed assembled response.
+
+    final() hands back the response object, exactly as a real adapter's stream does; receipt() is
+    what the fake bound adapter registers for it, standing in for interpret and usage_from_raw
+    reading that response.
+    """
 
     def __init__(self) -> None:
         """Start unclosed; close records that it ran."""
         self.closed = False
+        self.raw = _FakeRawResponse(id="fake-final")
+
+    def receipt(self) -> _Receipt:
+        """Return the assembled result the SDK would produce, and what the stream billed."""
+        return _Receipt(
+            outcome=AdapterResult(
+                output="ab",
+                assistant_message=AssistantMessage(turn=(TextPart(text="ab"),)),
+                stop_reason="end_turn",
+            ),
+            usage=_USAGE_STREAM,
+        )
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -150,16 +188,9 @@ class _FakeStream(AdapterStream[str]):
         yield _FAKE_TOOL_CALL
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Return the assembled result the SDK would produce."""
-        return AdapterResult(
-            output="ab",
-            assistant_message=AssistantMessage(turn=(TextPart(text="ab"),)),
-            usage=_USAGE_STREAM,
-            usage_raw=_FAKE_RAW_USAGE,
-            stop_reason="end_turn",
-            raw=_FakeRawResponse(id="fake-final"),
-        )
+    async def final(self) -> BaseModel:
+        """Return the response the stream's events assembled into."""
+        return self.raw
 
     @override
     async def close(self) -> None:
@@ -167,16 +198,16 @@ class _FakeStream(AdapterStream[str]):
 
 
 class _RefusingStream(_FakeStream):
-    """A stream that yields items normally but whose final() detects a structured refusal.
+    """A stream that yields items normally but whose assembled response holds a refusal.
 
-    Mirrors an adapter that parses the assembled message in AdapterStream.final() and finds a refusal,
-    reporting the Refusal member carrying only that 200's billing.
+    Mirrors an adapter that reads the assembled message and finds a refusal, reporting the Refusal
+    member carrying the turn the model wrote to refuse.
     """
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Report the refusal instead of assembling a result, carrying this attempt's billing."""
-        return Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
+    def receipt(self) -> _Receipt:
+        """Report the refusal instead of a result, carrying this attempt's billing."""
+        return _billed(Refusal(assistant_message=_REJECTED_TURN))
 
 
 class _UnfinishedTurnStream(_FakeStream):
@@ -187,12 +218,13 @@ class _UnfinishedTurnStream(_FakeStream):
     """
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Report the unfinished turn instead of assembling a result, carrying this attempt's billing."""
-        return UnfinishedTurn(
-            reason="anthropic returned stop_reason 'pause_turn'",
-            usage=_USAGE_BILLED,
-            usage_raw=_FAKE_RAW_USAGE,
+    def receipt(self) -> _Receipt:
+        """Report the unfinished turn instead of a result, carrying this attempt's billing."""
+        return _billed(
+            UnfinishedTurn(
+                reason="anthropic returned stop_reason 'pause_turn'",
+                assistant_message=_REJECTED_TURN,
+            )
         )
 
 
@@ -206,22 +238,27 @@ _VALIDATION_ERROR_JSON = (
 class _SchemaViolationStream(_FakeStream):
     """A stream that yields items normally but whose assembled text the response_format rejects.
 
-    Mirrors an adapter that validates the assembled message in AdapterStream.final() and gets a
-    rejection, reporting SchemaViolation with what pydantic rejected.
+    Mirrors an adapter that validates the assembled message and gets a rejection, reporting
+    SchemaViolation with what pydantic rejected.
     """
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Report the rejection instead of assembling a result, carrying this attempt's billing."""
-        return SchemaViolation(
-            validation_error_json=_VALIDATION_ERROR_JSON,
-            usage=_USAGE_BILLED,
-            usage_raw=_FAKE_RAW_USAGE,
+    def receipt(self) -> _Receipt:
+        """Report the rejection instead of a result, carrying this attempt's billing."""
+        return _billed(
+            SchemaViolation(
+                validation_error_json=_VALIDATION_ERROR_JSON, assistant_message=_REJECTED_TURN
+            )
         )
 
 
 _PROVIDER_FAILURE_REASON = "The server had an error while processing your request."
 """A provider's own description of a failure, as openai puts it in a failed response's error."""
+
+_PROVIDER_FAILED_TRANSIENTLY = ProviderFailedTransiently(
+    reason=_PROVIDER_FAILURE_REASON, is_rate_limit=False, assistant_message=_REJECTED_TURN
+)
+"""One 200 whose body reports a failure a resend may get past, with no rate limit named."""
 
 
 class _ProviderFailedTransientlyStream(_FakeStream):
@@ -232,31 +269,28 @@ class _ProviderFailedTransientlyStream(_FakeStream):
     """
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Report the failure instead of assembling a result, carrying this attempt's billing."""
-        return ProviderFailedTransiently(
-            reason=_PROVIDER_FAILURE_REASON,
-            is_rate_limit=False,
-            usage=_USAGE_BILLED,
-            usage_raw=_FAKE_RAW_USAGE,
-        )
+    def receipt(self) -> _Receipt:
+        """Report the failure instead of a result, carrying this attempt's billing."""
+        return _billed(_PROVIDER_FAILED_TRANSIENTLY)
 
 
 class _ProviderFailedTerminallyStream(_FakeStream):
     """A stream whose assembled response reports a provider failure a resend would hit again."""
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
-        """Report the failure instead of assembling a result, carrying this attempt's billing."""
-        return ProviderFailedTerminally(
-            reason=_PROVIDER_FAILURE_REASON, usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE
+    def receipt(self) -> _Receipt:
+        """Report the failure instead of a result, carrying this attempt's billing."""
+        return _billed(
+            ProviderFailedTerminally(
+                reason=_PROVIDER_FAILURE_REASON, assistant_message=_REJECTED_TURN
+            )
         )
 
 
 class _FinalRaisesStream(_FakeStream):
-    """A stream that yields items normally but whose final() raises instead of reporting an outcome.
+    """A stream that yields items normally but whose final() raises instead of returning a response.
 
-    Mirrors an adapter whose assembly step failed, so this call reached no outcome at all.
+    Mirrors an adapter whose assembly step failed, so this call reached no response at all.
     Each call raises a fresh error, so a replayed one is identifiable by identity.
     """
 
@@ -266,7 +300,7 @@ class _FinalRaisesStream(_FakeStream):
         self.final_calls = 0
 
     @override
-    async def final(self) -> ResponseOutcome[str]:
+    async def final(self) -> BaseModel:
         """Count the call and raise.
 
         Raises:
@@ -383,11 +417,12 @@ class _FailingCloseStream(_FakeStream):
         raise OSError("connection reset while closing")
 
 
-type _ScriptedSend = Exception | NoOutputOutcome | InvalidRequest
-"""One scripted send outcome: an exception the fake raises, or an outcome it returns.
+type _ScriptedSend = Exception | _Receipt | InvalidRequest
+"""One scripted send: an exception the fake raises, a response it hands back, or a refusal to send.
 
-Both halves exist because the adapter contract splits that way: an attempt with no response to read
-is an exception for Adapter.classify, and everything the adapter did read is a returned outcome.
+The three exist because the adapter contract splits that way: an attempt with no response to read is
+an exception for Adapter.classify, a response is what send returns and interpret then reads, and a
+conversation the adapter will not put on the wire is InvalidRequest.
 """
 
 type _ScriptedOpen = Exception | InvalidRequest
@@ -416,6 +451,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         hang_from_open is the 1-based open_stream call from which every open suspends forever,
         so a cancellation lands on the open itself rather than on a later item pull.
         hang_from_send is the same for send, so a deadline fires while that attempt is in flight.
+        sent_raws collects the response objects send handed back, in order, so a test can assert the
+        caller got one of them and not a copy.
         """
         self._failures = list(failures)
         self._open_failures = list(open_failures)
@@ -424,14 +461,26 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         self._hang_from_open = hang_from_open
         self._hang_from_send = hang_from_send
         self.stream = stream if stream is not None else _FakeStream()
+        self._receipt_by_raw_id: dict[str, _Receipt] = {}
+        self.sent_raws: list[_FakeRawResponse] = []
         self.send_count = 0
         self.open_count = 0
         self.in_flight = 0
         self.peak_in_flight = 0
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[str]:
-        """Raise or return the next scripted outcome, else return a success result."""
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Return what the response under this raw was scripted to have billed."""
+        return self._receipt_by_raw_id[_raw_id(raw)].usage
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Return what the response under this raw was scripted to produce."""
+        return self._receipt_by_raw_id[_raw_id(raw)].outcome
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> BaseModel | InvalidRequest:
+        """Raise or return the next scripted send, else hand back a success response."""
         self.send_count += 1
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -440,25 +489,32 @@ class _FakeBoundAdapter(BoundAdapter[str]):
                 await asyncio.Event().wait()
             if self._send_seconds:
                 await asyncio.sleep(self._send_seconds)
+            raw = _FakeRawResponse(id=f"fake-response-{self.send_count}")
             if self._failures:
                 scripted = self._failures.pop(0)
                 if isinstance(scripted, Exception):
                     raise scripted
-                return scripted
+                if isinstance(scripted, InvalidRequest):
+                    return scripted
+                self._receipt_by_raw_id[raw.id] = scripted
+                self.sent_raws.append(raw)
+                return raw
             first = conversation[0]
             content = (
                 first.content
                 if self._echo and isinstance(first, UserMessage) and isinstance(first.content, str)
                 else "ok"
             )
-            return _success_result(content)
+            self._receipt_by_raw_id[raw.id] = _Receipt(
+                outcome=_success_result(content), usage=_USAGE
+            )
+            self.sent_raws.append(raw)
+            return raw
         finally:
             self.in_flight -= 1
 
     @override
-    async def open_stream(
-        self, conversation: Sequence[Message]
-    ) -> AdapterStream[str] | InvalidRequest:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
         """Count the attempt, suspend or take the next scripted open outcome, else return the stored fake stream."""
         self.open_count += 1
         if self._hang_from_open is not None and self.open_count >= self._hang_from_open:
@@ -468,6 +524,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
             if isinstance(scripted, Exception):
                 raise scripted
             return scripted
+        self._receipt_by_raw_id[self.stream.raw.id] = self.stream.receipt()
         return self.stream
 
 
@@ -479,20 +536,31 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
     """
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT]:
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
         """Unreachable: response_format rebind tests do not generate."""
         raise NotImplementedError
 
     @override
-    async def open_stream(
-        self, conversation: Sequence[Message]
-    ) -> AdapterStream[ModelT] | InvalidRequest:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
+        """Unreachable: response_format rebind tests do not generate."""
+        raise NotImplementedError
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> BaseModel | InvalidRequest:
+        """Unreachable: response_format rebind tests do not generate."""
+        raise NotImplementedError
+
+    @override
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
         """Unreachable: response_format rebind tests do not stream."""
         raise NotImplementedError
 
 
 class _FakeAdapter(Adapter):
     """An adapter whose bind_text hands out fake bound adapters."""
+
+    _bound_adapter_class: ClassVar[type[_FakeBoundAdapter]] = _FakeBoundAdapter
+    """The class bind_text hands out; a subclass names its own to vary what interpret does."""
 
     def __init__(
         self,
@@ -523,7 +591,7 @@ class _FakeAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        bound = _FakeBoundAdapter(
+        bound = self._bound_adapter_class(
             failures=self._failures,
             open_failures=self._open_failures,
             echo=self._echo,
@@ -550,8 +618,81 @@ class _FakeAdapter(Adapter):
         return self._classify_result
 
 
+class _InterpretRaisesBoundAdapter(_FakeBoundAdapter):
+    """A bound adapter whose interpret raises over a response send already handed back."""
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Raise instead of reading the response.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("interpretation failed")
+
+
+class _InterpretRaisesAdapter(_FakeAdapter):
+    """An adapter whose bound adapters price a response and then raise reading it."""
+
+    _bound_adapter_class = _InterpretRaisesBoundAdapter
+
+
+def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
+    """The attempt keeps the response it received and what that response billed, with no turn.
+
+    The 200 arrived and was paid for before interpret read it, so an exception from that read must
+    not take the attempt off the call: the record is the only account of what the item spent.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose interpret raises over the response send returned."""
+        bound_llm = LLM(_InterpretRaisesAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(UnrecognizedError) as unrecognized:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        (record,) = unrecognized.value.attempt_records
+        assert isinstance(record.raw, _FakeRawResponse)
+        assert record.usage == _USAGE
+        assert record.assistant_message is None
+        assert record.error is None
+        assert isinstance(unrecognized.value.__cause__, RuntimeError)
+
+    asyncio.run(scenario())
+
+
+def test_stream_final_records_the_response_before_interpreting_it() -> None:
+    """A raise from interpret leaves the assembled response and its billing on the attempt record.
+
+    The stream's one request is paid for by the time final() has a response, so an exception from
+    reading it must not erase what it billed.
+    """
+
+    async def scenario() -> None:
+        """Call final() on a stream whose interpret raises, then freeze the ledger it left."""
+        stream = _FakeStream()
+        bound_llm = LLM(
+            _InterpretRaisesAdapter(stream=stream), rate_limiter=_fast_rate_limiter()
+        ).bind(automatic_prompt_caching=True)
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(RuntimeError, match="interpretation failed"):
+                await handle.final()
+            (record,) = handle._ledger.freeze().attempt_records
+        assert record.raw is stream.raw
+        assert record.usage == _USAGE_STREAM
+        assert record.assistant_message is None
+        assert record.error is None
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def test_retry_recovers_after_a_transient_failure() -> None:
-    """One transient failure then success yields a two-attempt success Response."""
+    """One transient failure then success yields a two-attempt success Response.
+
+    The succeeding record carries the answer turn, and the failed one carries no turn at all.
+    The Response carries the object the succeeding send returned (identity, not equality): an equal
+    copy would silently introduce the per-request deep copy the no-rewrap rule bans.
+    """
 
     async def scenario() -> None:
         """Drive one generate_one through a single transient failure."""
@@ -567,7 +708,11 @@ def test_retry_recovers_after_a_transient_failure() -> None:
         assert adapter.bound_adapters[0].send_count == 2
         failed, succeeded = response.attempt_records
         assert str(failed.error) == "boom"
+        assert failed.assistant_message is None
         assert succeeded.error is None
+        assert succeeded.assistant_message == _success_result("ok").assistant_message
+        (succeeding_raw,) = adapter.bound_adapters[0].sent_raws
+        assert response.raw is succeeding_raw
         assert (
             failed.started_at_monotonic_seconds
             <= failed.ended_at_monotonic_seconds
@@ -689,7 +834,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
         """Settle one billed transient attempt, then take each route to the error in its own call."""
         classified_adapter = _FakeAdapter(
             failures=[
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                _billed(_PROVIDER_FAILED_TRANSIENTLY),
                 ValueError("bad request"),
             ],
             classify_result="invalid_request",
@@ -703,11 +848,11 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
         assert billed_record.usage.cost_in_usd == 0.25
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
-        assert rejected_record.usage_raw is None
+        assert rejected_record.raw is None
         assert isinstance(classified.value.__cause__, ValueError)
         invalid_request_adapter = _FakeAdapter(
             failures=[
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                _billed(_PROVIDER_FAILED_TRANSIENTLY),
                 InvalidRequest(reason="reported by the adapter"),
             ],
         )
@@ -724,11 +869,14 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
 
 
 def test_refusal_outcome_from_send_raises_row_shaped_without_retry() -> None:
-    """A Refusal outcome becomes a RefusalError carrying the attempt record, never retried."""
+    """A Refusal outcome becomes a RefusalError carrying the attempt record, never retried.
+
+    The record carries the turn the refusal arrived on and the response it was read from.
+    """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports the Refusal arm."""
-        adapter = _FakeAdapter(failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        """Drive one generate_one whose send reports the Refusal member."""
+        adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -743,6 +891,8 @@ def test_refusal_outcome_from_send_raises_row_shaped_without_retry() -> None:
         (record,) = failure.attempt_records
         assert record.error is None
         assert record.usage.cost_in_usd == 0.25
+        assert record.assistant_message == _REJECTED_TURN
+        assert record.raw is not None
 
     asyncio.run(scenario())
 
@@ -755,7 +905,7 @@ def test_max_completion_tokens_exceeded_outcome_from_send_raises_row_shaped_with
     async def scenario() -> None:
         """Drive one generate_one whose send reports the MaxCompletionTokensExceeded arm."""
         adapter = _FakeAdapter(
-            failures=[MaxCompletionTokensExceeded(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+            failures=[_billed(MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN))]
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -776,9 +926,7 @@ def test_empty_turn_outcome_from_send_raises_row_shaped_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports EmptyTurn."""
-        adapter = _FakeAdapter(
-            failures=[EmptyTurn(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
-        )
+        adapter = _FakeAdapter(failures=[_billed(EmptyTurn(assistant_message=_REJECTED_TURN))])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -806,10 +954,11 @@ def test_schema_violation_outcome_from_send_raises_row_shaped_without_retry() ->
         """Drive one generate_one whose send reports SchemaViolation."""
         adapter = _FakeAdapter(
             failures=[
-                SchemaViolation(
-                    validation_error_json=_VALIDATION_ERROR_JSON,
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
+                _billed(
+                    SchemaViolation(
+                        validation_error_json=_VALIDATION_ERROR_JSON,
+                        assistant_message=_REJECTED_TURN,
+                    )
                 )
             ]
         )
@@ -835,7 +984,7 @@ def test_context_window_exceeded_outcome_from_send_raises_row_shaped_without_ret
     async def scenario() -> None:
         """Drive one generate_one whose send reports ContextWindowExceeded."""
         adapter = _FakeAdapter(
-            failures=[ContextWindowExceeded(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+            failures=[_billed(ContextWindowExceeded(assistant_message=_REJECTED_TURN))]
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
@@ -862,10 +1011,11 @@ def test_unfinished_turn_outcome_from_send_raises_carrying_the_adapter_s_reason(
         """Drive one generate_one whose send reports UnfinishedTurn."""
         adapter = _FakeAdapter(
             failures=[
-                UnfinishedTurn(
-                    reason="anthropic returned stop_reason 'pause_turn'",
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
+                _billed(
+                    UnfinishedTurn(
+                        reason="anthropic returned stop_reason 'pause_turn'",
+                        assistant_message=_REJECTED_TURN,
+                    )
                 )
             ]
         )
@@ -887,16 +1037,7 @@ def test_provider_failed_transiently_from_send_is_retried_and_keeps_its_billing(
 
     async def scenario() -> None:
         """Drive one generate_one whose first send reports the failure and whose second succeeds."""
-        adapter = _FakeAdapter(
-            failures=[
-                ProviderFailedTransiently(
-                    reason=_PROVIDER_FAILURE_REASON,
-                    is_rate_limit=False,
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -926,16 +1067,7 @@ def test_provider_failed_transiently_ends_the_rate_limiter_recovery() -> None:
             TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
         ))
         assert rate_limiter._recovering
-        adapter = _FakeAdapter(
-            failures=[
-                ProviderFailedTransiently(
-                    reason=_PROVIDER_FAILURE_REASON,
-                    is_rate_limit=False,
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         await bound_llm.generate_one([UserMessage(content="hi")])
         assert not rate_limiter._recovering
@@ -955,11 +1087,12 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
         rate_limiter = _fast_rate_limiter(max_attempts=1)
         adapter = _FakeAdapter(
             failures=[
-                ProviderFailedTransiently(
-                    reason="Rate limit reached for gpt-5.6",
-                    is_rate_limit=True,
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
+                _billed(
+                    ProviderFailedTransiently(
+                        reason="Rate limit reached for gpt-5.6",
+                        is_rate_limit=True,
+                        assistant_message=_REJECTED_TURN,
+                    )
                 )
             ]
         )
@@ -985,10 +1118,10 @@ def test_provider_failed_terminally_from_send_raises_row_shaped_without_retry() 
         """Drive one generate_one whose send reports the terminal failure."""
         adapter = _FakeAdapter(
             failures=[
-                ProviderFailedTerminally(
-                    reason=_PROVIDER_FAILURE_REASON,
-                    usage=_USAGE_BILLED,
-                    usage_raw=_FAKE_RAW_USAGE,
+                _billed(
+                    ProviderFailedTerminally(
+                        reason=_PROVIDER_FAILURE_REASON, assistant_message=_REJECTED_TURN
+                    )
                 )
             ]
         )
@@ -1136,9 +1269,7 @@ def test_generate_one_cancellation_appends_the_settled_attempts() -> None:
     async def scenario() -> None:
         """Settle one billed transient attempt, then hang the retry into the caller's deadline."""
         adapter = _FakeAdapter(
-            failures=[
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
-            ],
+            failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)],
             hang_from_send=2,
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
@@ -1432,7 +1563,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
         """Serialize a two-item batch (max_in_flight=1) whose first send reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
+            failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
@@ -1548,8 +1679,8 @@ def test_generate_many_cancellation_appends_one_abandoned_call_per_item() -> Non
         """Settle the two scripted billed attempts, then hang the retries into the deadline."""
         adapter = _FakeAdapter(
             failures=[
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                _billed(_PROVIDER_FAILED_TRANSIENTLY),
+                _billed(_PROVIDER_FAILED_TRANSIENTLY),
             ],
             hang_from_send=3,
         )
@@ -1596,8 +1727,8 @@ def test_generate_many_appends_the_abandoned_calls_of_items_a_sibling_defect_can
         """Settle one billed attempt on the first item, then raise past the arms on the second."""
         adapter = _ClassifyRaisesAdapter(
             failures=[
-                TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
-                Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                _billed(_PROVIDER_FAILED_TRANSIENTLY),
+                _billed(Refusal(assistant_message=_REJECTED_TURN)),
                 ValueError("defect"),
             ],
             send_seconds=0.02,

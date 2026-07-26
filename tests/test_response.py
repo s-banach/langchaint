@@ -59,7 +59,8 @@ def _record(*, error: TransientError | None, usage: Usage = ZERO_USAGE) -> Attem
         ended_at_monotonic_seconds=now,
         error=error,
         usage=usage,
-        usage_raw=None,
+        assistant_message=None,
+        raw=None,
     )
 
 

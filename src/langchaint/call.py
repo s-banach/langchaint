@@ -13,11 +13,12 @@ vocabulary would run the wrong way.
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import BaseModel
 
-from langchaint.usage import Usage
+from langchaint.messages import AssistantMessage
+from langchaint.usage import ZERO_USAGE, Usage
 
 if TYPE_CHECKING:
     # Type-only: exceptions.py imports this module at runtime, because GenerationError derives
@@ -43,19 +44,27 @@ class AttemptRecord:
     error is None on the attempt that succeeded, on a 200 that produced no output and is not
     retried (a refusal, a truncation, a context-window overflow), and on a request the provider
     rejected; it holds the TransientError otherwise.
-    usage is the attempt's billing (with cost_in_usd inside): the reported counts when the attempt reached a
-    billable 200, whether or not it produced output, ZERO_USAGE for a transport failure or a rejected request.
+    usage is the attempt's billing (with cost_in_usd inside): the counts the response reported,
+    priced when it arrived and before it was interpreted, so a 200 is accounted for whatever
+    langchaint went on to make of it. ZERO_USAGE where no response arrived.
     A stream that dropped after delivering items was paid for what it delivered,
     and no client-side channel reports the amount.
-    usage_raw is the raw SDK usage object usage was normalized from.
-    It is None when no usage came back: a transport failure, a rejected request, or an openai 200 reporting no usage.
+    raw is the SDK's own response object, held by reference (no dump, no copy).
+    It is None exactly where no response arrived: a transport failure, an error status, or a request
+    the adapter would not send. It is a live, mutable pydantic object, so despite the frozen
+    dataclass around it, treat it read-only and raw.model_copy() before mutating.
+    assistant_message is the turn that response carried, whatever langchaint made of it: the answer
+    on the attempt that succeeded, and the refusal, the rejected text, or the fragment on a 200 that
+    produced no output. It is None where no response arrived, and None where one arrived and reading
+    it raised, because then no turn was ever built.
     """
 
     started_at_monotonic_seconds: float
     ended_at_monotonic_seconds: float
     error: "TransientError | None"
     usage: Usage
-    usage_raw: BaseModel | None
+    assistant_message: AssistantMessage | None
+    raw: BaseModel | None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -68,9 +77,10 @@ class CallRecord:
     """What one call did: every attempt it made, what served them, and how long it took.
 
     attempt_records holds the call's attempt records, in order.
-    Two attempts have no record: the one an UnrecognizedError ends the call on, whose error the
-    adapter could not read, and the one in flight when a cancellation cut the call off.
-    An InvalidRequestError built from a InvalidRequest outcome has none either, because nothing went out.
+    Two attempts have no record: the one in flight when a cancellation cut the call off, and the one
+    an UnrecognizedError ends the call on where the adapter could not read the error and no response
+    had arrived. An InvalidRequestError built from an InvalidRequest outcome has none either,
+    because nothing went out.
     elapsed_seconds spans the call's start to the stamp it was frozen at, RateLimiter slot waits
     and backoff sleeps included;
     it is stored rather than folded from the records, because the records deliberately exclude those waits.
@@ -126,6 +136,13 @@ class _CallCarrier:
         return self.call.elapsed_seconds
 
 
+class _StagedReceipt(NamedTuple):
+    """One arrived response and what it cost, held until the attempt around it closes."""
+
+    raw: BaseModel
+    usage: Usage
+
+
 class _CallLedger:
     """The mutable history one call accumulates; freeze() is its CallRecord.
 
@@ -133,6 +150,10 @@ class _CallLedger:
     a cancellation that unwinds the loop's frame: the ledger is the only channel that path has.
     Records are appended between awaits, so it never holds a partial one.
     freeze_ending_at is the one place a call's elapsed_seconds is computed.
+
+    An attempt is written in two steps, receipt then close: stage_receipt the moment a response
+    arrives, record or freeze once its fate is decided. Every attempt that received a response
+    appears in the records, whatever happens between those two steps.
     """
 
     def __init__(self, *, model: str, provider_name: str) -> None:
@@ -140,8 +161,17 @@ class _CallLedger:
         self._model = model
         self._provider_name = provider_name
         self._attempt_records: list[AttemptRecord] = []
+        self._staged_receipt: _StagedReceipt | None = None
         self._started_at_monotonic_seconds = time.monotonic()
         self._attempt_started_at_monotonic_seconds = self._started_at_monotonic_seconds
+
+    def stage_receipt(self, *, raw: BaseModel, usage: Usage) -> None:
+        """Hold the response that just arrived, and its price, against the attempt in flight.
+
+        Call before interpreting the response. The next record or freeze closes the attempt around
+        what is staged here, so no raise in between can lose the attempt or its billing.
+        """
+        self._staged_receipt = _StagedReceipt(raw=raw, usage=usage)
 
     def start_call(self) -> None:
         """Stamp the call's start as now, replacing the constructor's stamp.
@@ -167,31 +197,35 @@ class _CallLedger:
         return tuple(self._attempt_records)
 
     def record(
-        self, *, error: "TransientError | None", usage: Usage, usage_raw: BaseModel | None
+        self, *, error: "TransientError | None", assistant_message: AssistantMessage | None
     ) -> None:
         """Close the attempt started by the last start_attempt(), ending it now."""
-        self.record_ending_at(time.monotonic(), error=error, usage=usage, usage_raw=usage_raw)
+        self.record_ending_at(time.monotonic(), error=error, assistant_message=assistant_message)
 
     def record_ending_at(
         self,
         ended_at_monotonic_seconds: float,
         *,
         error: "TransientError | None",
-        usage: Usage,
-        usage_raw: BaseModel | None,
+        assistant_message: AssistantMessage | None,
     ) -> None:
         """Close the attempt started by the last start_attempt(), at a stamp taken earlier.
 
+        Merges the staged receipt with what reading it produced, and clears the stage. An attempt
+        that staged nothing closes with raw None and ZERO_USAGE, which is what no response means.
         A stream's attempt ends when its item iterator exhausts, several awaits before final() reads
-        the assembled outcome, so the stream path stamps the end itself.
+        the assembled response, so the stream path stamps the end itself.
         """
+        receipt = self._staged_receipt
+        self._staged_receipt = None
         self._attempt_records.append(
             AttemptRecord(
                 started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
                 ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                 error=error,
-                usage=usage,
-                usage_raw=usage_raw,
+                usage=receipt.usage if receipt is not None else ZERO_USAGE,
+                assistant_message=assistant_message,
+                raw=receipt.raw if receipt is not None else None,
             )
         )
 
@@ -202,9 +236,14 @@ class _CallLedger:
     def freeze_ending_at(self, ended_at_monotonic_seconds: float) -> CallRecord:
         """Return the call's history as of a stamp taken earlier.
 
+        A receipt still staged closes first, with no turn and no error: the response arrived and
+        whatever was going to read it did not finish, so the attempt and its billing are on the
+        record and nothing about the turn is invented.
         A stream's call ends when its item iterator exhausts; final() may be awaited any time after,
         and that gap is the caller's own work, not the call's.
         """
+        if self._staged_receipt is not None:
+            self.record_ending_at(ended_at_monotonic_seconds, error=None, assistant_message=None)
         return CallRecord(
             model=self._model,
             provider_name=self._provider_name,

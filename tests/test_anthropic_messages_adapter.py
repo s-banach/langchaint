@@ -48,15 +48,14 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.adapter import (
-    AdapterResult,
     Binding,
     ContextWindowExceeded,
     EmptyTurn,
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutputOutcome,
     Refusal,
-    ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
 )
@@ -105,12 +104,6 @@ _PRIORITY_RATES = AnthropicPricingTable(
     cache_write_1h_usd_per_million_tokens=12.0,
 )
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
-
-
-def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
-    """Narrow a ResponseOutcome to its success arm, failing the test on any other arm."""
-    assert isinstance(outcome, AdapterResult)
-    return outcome
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -370,14 +363,13 @@ def test_adapter_result_extracts_text_and_tool_use() -> None:
         type="message",
         usage=_usage_with_cache_split(),
     )
-    result = _adapter_result(message=message, output="hello world", pricing=_PRICING)
+    result = _adapter_result(message, "hello world", _assistant_message_from(message))
     assert result.output == "hello world"
     assert result.assistant_message.text == "hello world"
     tool_call = result.assistant_message.tool_calls[0]
     assert tool_call.name == "get_weather"
     assert json.loads(tool_call.args_json) == {"city": "Nairobi"}
     assert result.stop_reason == "tool_use"
-    assert result.raw is message
 
 
 def _message_with_content(content: list[at.ContentBlock]) -> at.Message:
@@ -819,13 +811,9 @@ def _message_snapshot(
 def _anthropic_stream(
     replay_events: Sequence[ParsedMessageStreamEvent],
     message_snapshot: ParsedMessage[None],
-) -> _AnthropicStream[str]:
-    """Build a text-content adapter stream over replayed events."""
-    return _AnthropicStream(
-        sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot),
-        pricing=_PRICING,
-        output_from_message=lambda _message: "",
-    )
+) -> _AnthropicStream:
+    """Build an adapter stream over replayed events."""
+    return _AnthropicStream(sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot))
 
 
 def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
@@ -895,8 +883,8 @@ def test_stream_final_turn_carries_reasoning() -> None:
         adapter_stream = _anthropic_stream([], snapshot)
         async for _item in adapter_stream.items():
             pass
-        result = _assert_result(await adapter_stream.final())
-        reasoning_trace = result.assistant_message.turn[0]
+        assistant_message = _assistant_message_from(await adapter_stream.final())
+        reasoning_trace = assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
         assert reasoning_trace.reasoning == {
             "type": "thinking",
@@ -935,6 +923,11 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     return _BoundAnthropicStructured(
         adapter=adapter, request=request, response_format=_StructuredReport
     )
+
+
+def _structured_parse(message: at.Message) -> _StructuredReport | None | NoOutputOutcome:
+    """Run the structured binding's parse over one message, with the turn that message carries."""
+    return _structured_bound()._parsed_output(message, _assistant_message_from(message))
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1009,111 +1002,88 @@ def test_both_structured_request_paths_send_the_output_config(
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's text block into the response_format."""
-    outcome = _structured_bound()._parsed_output(_structured_message(_REPORT_JSON))
+    outcome = _structured_parse(_structured_message(_REPORT_JSON))
     assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
     """An end_turn with no text block and no tool call is EmptyTurn: the model said nothing."""
-    outcome = _structured_bound()._parsed_output(_structured_message(None))
+    outcome = _structured_parse(_structured_message(None))
     assert isinstance(outcome, EmptyTurn)
-    # The 200's billing rides on the member so the attempt record is not zero.
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
-    """A finished turn whose text the response_format rejects is SchemaViolation, carrying its billing.
+    """A finished turn whose text the response_format rejects is SchemaViolation.
 
     validation_error_json names the rejected field, what rejected it, and the value, which is what
     tells a caller whether to change the model or the prompt.
     """
-    outcome = _structured_bound()._parsed_output(
-        _structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}')
-    )
+    outcome = _structured_parse(_structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}'))
     assert isinstance(outcome, SchemaViolation)
     rejections = json.loads(outcome.validation_error_json)
     assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
     assert rejections[0]["input"] == "SENTINEL"
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """A max_tokens turn whose JSON stopped mid-object is the truncation, not a schema violation.
 
-    This is the response the SDK's own parse raised on, losing the 200 and its billing; the member
-    carries both, and the item fails with MaxCompletionTokensExceededError.
+    This is the response the SDK's own parse raised on; reporting it as a member is what lets the
+    retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
     """
-    outcome = _structured_bound()._parsed_output(
-        _structured_message('{"city": "Nair', stop_reason="max_tokens")
-    )
+    outcome = _structured_parse(_structured_message('{"city": "Nair', stop_reason="max_tokens"))
     assert isinstance(outcome, MaxCompletionTokensExceeded)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_refusal_on_a_refusal_stop_reason() -> None:
-    """A refusal stop_reason with no instance is Refusal, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(_structured_message(None, stop_reason="refusal"))
+    """A refusal stop_reason with no instance is Refusal."""
+    outcome = _structured_parse(_structured_message(None, stop_reason="refusal"))
     assert isinstance(outcome, Refusal)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_stop_reason() -> (
     None
 ):
-    """A max_tokens stop_reason with no text is MaxCompletionTokensExceeded, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_message(None, stop_reason="max_tokens")
-    )
+    """A max_tokens stop_reason with no text is MaxCompletionTokensExceeded."""
+    outcome = _structured_parse(_structured_message(None, stop_reason="max_tokens"))
     assert isinstance(outcome, MaxCompletionTokensExceeded)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
     """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
-    assert (
-        _structured_bound()._parsed_output(_structured_message(None, stop_reason="tool_use"))
-        is None
-    )
+    assert _structured_parse(_structured_message(None, stop_reason="tool_use")) is None
 
 
 def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_as_none() -> None:
     """A tool_use turn whose text block is prose is the tool call, not a schema violation."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_message("let me look that up", stop_reason="tool_use")
-    )
+    outcome = _structured_parse(_structured_message("let me look that up", stop_reason="tool_use"))
     assert outcome is None
 
 
 def test_structured_bind_reports_context_window_exceeded_on_the_overflow_stop_reason() -> None:
     """model_context_window_exceeded is ContextWindowExceeded, not a resend of a request too long to serve."""
-    outcome = _structured_bound()._parsed_output(
+    outcome = _structured_parse(
         _structured_message(None, stop_reason="model_context_window_exceeded")
     )
     assert isinstance(outcome, ContextWindowExceeded)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
     """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_message(None, stop_reason="pause_turn")
-    )
+    outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
     assert isinstance(outcome, UnfinishedTurn)
     assert "pause_turn" in outcome.reason
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_a_null_stop_reason_as_unfinished() -> None:
     """A message with no stop reason is not a finished turn, so its content is not the answer."""
-    outcome = _structured_bound()._parsed_output(_structured_message(None, stop_reason=None))
+    outcome = _structured_parse(_structured_message(None, stop_reason=None))
     assert isinstance(outcome, UnfinishedTurn)
 
 
 def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation() -> None:
     """A paused turn whose text is not the instance is the pause, which langchaint cannot continue."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_message("partial thought", stop_reason="pause_turn")
-    )
+    outcome = _structured_parse(_structured_message("partial thought", stop_reason="pause_turn"))
     assert isinstance(outcome, UnfinishedTurn)
 
 

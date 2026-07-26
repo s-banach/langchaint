@@ -67,7 +67,7 @@ search-path = ["src", ".", "examples/full_app"]
 # stdlib/library deprecations before an upgrade breaks them, and
 # non-exhaustive-match catches a missing Literal or enum case.
 # non-exhaustive-match does not fire on class patterns over a union of
-# dataclasses, so it does not cover AttemptOutcome; every match on that
+# dataclasses, so it does not cover ResponseOutcome; every match on that
 # union carries assert_never instead.
 # explicit-any stays off: the remaining Any sites are deliberate
 # existential typing (overload implementations, SDK stream generics,
@@ -204,7 +204,7 @@ lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
 
-# The retry loops match AttemptOutcome one case per member, so these three counts track the union's
+# The retry loops match ResponseOutcome one case per member, so these three counts track the union's
 # size rather than any nesting.
 # The design rule that gives each outcome its own type is what sets that size, so capping the counts
 # at a default would be capping the union.

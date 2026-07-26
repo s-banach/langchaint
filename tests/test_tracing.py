@@ -18,7 +18,7 @@ import json
 import logging
 import pathlib
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping
 from typing import assert_type, override
 
 import jsonschema
@@ -45,7 +45,6 @@ from langchaint import (
     InvalidRequestError,
     JSONSchemaTool,
     MaxCompletionTokensExceededError,
-    Message,
     PydanticTool,
     ReasoningTrace,
     RefusalError,
@@ -68,6 +67,7 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     Refusal,
+    ResponseOutcome,
 )
 from langchaint.tracing import (
     AttributeMapper,
@@ -82,12 +82,11 @@ from langchaint.tracing import (
 from langchaint.usage import Usage
 from scripts import refresh_semconv_genai
 from tests.test_bound_llm import (
-    _FAKE_RAW_USAGE,
+    _REJECTED_TURN,
     _USAGE,
-    _USAGE_BILLED,
+    _billed,
     _FakeAdapter,
     _FakeBoundAdapter,
-    _FakeRawResponse,
     _FakeStream,
     _fast_rate_limiter,
     _RefusingStream,
@@ -393,7 +392,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports Refusal, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),
@@ -418,7 +417,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
     async def scenario() -> None:
         """Drive one generate_one whose send reports MaxCompletionTokensExceeded, then inspect the error span."""
         adapter = _FakeAdapter(
-            failures=[MaxCompletionTokensExceeded(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+            failures=[_billed(MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN))]
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
@@ -573,7 +572,7 @@ def test_generate_many_emits_one_internal_batch_span() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the batch span."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
+            failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         tracer, exporter = _in_memory_tracer()
@@ -1937,17 +1936,14 @@ class _ReasoningOnlyBoundAdapter(_FakeBoundAdapter):
     """A bound adapter whose success carries a turn of reasoning and nothing else."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Return a result whose assistant turn holds one ReasoningTrace and no text."""
         return AdapterResult(
             output="",
             assistant_message=AssistantMessage(
                 turn=(ReasoningTrace(reasoning={"signature": "opaque"}),)
             ),
-            usage=_USAGE,
-            usage_raw=_FAKE_RAW_USAGE,
             stop_reason="end_turn",
-            raw=_FakeRawResponse(),
         )
 
 
@@ -1963,7 +1959,7 @@ class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
     """A bound adapter whose success carries an empty-text trace beside an empty TextPart."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Return a result whose turn holds one empty-text ReasoningTrace and one empty TextPart."""
         return AdapterResult(
             output="",
@@ -1973,10 +1969,7 @@ class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
                     TextPart(text=""),
                 )
             ),
-            usage=_USAGE,
-            usage_raw=_FAKE_RAW_USAGE,
             stop_reason="end_turn",
-            raw=_FakeRawResponse(),
         )
 
 
@@ -1992,7 +1985,7 @@ class _ReasoningWithTextBoundAdapter(_FakeBoundAdapter):
     """A bound adapter whose success carries reasoning with readable text, then text."""
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Return a result whose turn holds one texted ReasoningTrace and one TextPart."""
         return AdapterResult(
             output="answer",
@@ -2002,10 +1995,7 @@ class _ReasoningWithTextBoundAdapter(_FakeBoundAdapter):
                     TextPart(text="answer"),
                 )
             ),
-            usage=_USAGE,
-            usage_raw=_FAKE_RAW_USAGE,
             stop_reason="end_turn",
-            raw=_FakeRawResponse(),
         )
 
 
@@ -2288,7 +2278,7 @@ def test_the_error_path_captures_input_and_no_output() -> None:
 
     async def scenario() -> None:
         """Drive a refusal under capture and inspect the error span."""
-        adapter = _FakeAdapter(failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, rate_limiter=_fast_rate_limiter()),

@@ -55,13 +55,12 @@ class TransientError(Exception):
     RateLimiter honors it up to a 60-second cap and uses it to pause admission account-wide.
     is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
-    usage (carrying cost_in_usd) describes the attempt's billable completion when the failing attempt
-    was a 200 whose body reported a provider failure a resend may get past
-    (which the adapter reports as a ProviderFailedTransiently outcome);
-    usage_raw is the raw SDK usage object usage was normalized from, held by reference.
-    A transport failure (timeout, 5xx, connection or rate-limit error) billed nothing, so usage is ZERO_USAGE
-    and usage_raw is None.
-    The retry loop copies usage and usage_raw onto the attempt's AttemptRecord.
+    usage (carrying cost_in_usd) and raw are set on one error only: the one a stream raises when the
+    response it assembled reported a provider failure a resend may get past. That stream concluded
+    without a CallRecord, so these two fields are its caller's whole account of what the 200 cost;
+    raw is the SDK response object, held by reference.
+    Everywhere else they are ZERO_USAGE and None, and the attempt's own record carries the billing,
+    staged when the response arrived.
     """
 
     def __init__(
@@ -71,14 +70,14 @@ class TransientError(Exception):
         retry_after_seconds: float | None = None,
         is_rate_limit: bool = False,
         usage: Usage = ZERO_USAGE,
-        usage_raw: BaseModel | None = None,
+        raw: BaseModel | None = None,
     ) -> None:
         """Store the server-stated wait, the rate-limit classification, and any attempt billing."""
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.is_rate_limit = is_rate_limit
         self.usage = usage
-        self.usage_raw = usage_raw
+        self.raw = raw
 
 
 def _extract_transient_errors(
@@ -124,7 +123,7 @@ class GenerationError(_CallCarrier, Exception):
     (a refusal or truncation reads its one completed attempt;
     a retry-exhausted item sums its records, near zero when they were transport failures);
     attempts and error_text are derived from the records too.
-    A caller recovers each attempt's raw provider usage payload from attempt_records.
+    A caller recovers each attempt's turn and its raw provider response from attempt_records.
 
     Only a retry loop constructs one of these, because only a loop knows the attempts and the timing,
     and every field is set in the constructor. An adapter reports what one attempt produced (an

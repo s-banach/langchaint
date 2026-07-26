@@ -22,6 +22,8 @@ from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
 from typing import Literal, assert_never
 
+from pydantic import BaseModel
+
 from langchaint.adapter import (
     Adapter,
     AdapterResult,
@@ -59,7 +61,7 @@ from langchaint.exceptions import (
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
-from langchaint.usage import ZERO_USAGE
+from langchaint.usage import Usage
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -93,7 +95,7 @@ class StreamHandle[OutputT]:
         self._conversation = conversation
         self._rate_limiter = rate_limiter
         self._abandoned_call_log = abandoned_call_log
-        self._adapter_stream: AdapterStream[OutputT] | None = None
+        self._adapter_stream: AdapterStream | None = None
         self._items: AsyncIterator[StreamItem] | None = None
         self._ledger = _CallLedger(model=adapter.model, provider_name=adapter.provider_name)
         self._admission: Admission | None = None
@@ -243,7 +245,7 @@ class StreamHandle[OutputT]:
             register_transient_error draws it once so it equals any account-wide pause it set.
             A caller that will not reopen ignores it.
         """
-        self._ledger.record(error=wrapped, usage=wrapped.usage, usage_raw=wrapped.usage_raw)
+        self._ledger.record(error=wrapped, assistant_message=None)
         return self._rate_limiter.register_transient_error(
             _extract_transient_errors(self._ledger.attempt_records)
         )
@@ -273,8 +275,8 @@ class StreamHandle[OutputT]:
         classification = self._adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out, and a rejection reports no usage, so ZERO_USAGE is what it billed.
-            self._ledger.record(error=None, usage=ZERO_USAGE, usage_raw=None)
+            # so it went out and gets a record. A rejection carries no response, so it billed nothing.
+            self._ledger.record(error=None, assistant_message=None)
             return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
         if classification == "unrecognized":
             unrecognized = UnrecognizedError(error=exc, call=self._ledger.freeze())
@@ -469,14 +471,23 @@ class StreamHandle[OutputT]:
                 else self._ended_at_monotonic_seconds
             )
             try:
-                outcome = await self._adapter_stream.final()
-                self._conclusion = self._conclude(outcome, ended_at_monotonic_seconds)
+                raw = await self._adapter_stream.final()
+                usage = self._bound_adapter.usage_from_raw(raw)
+                # Staged before interpret reads the response, so what the attempt billed is on the
+                # ledger from the moment it is known.
+                self._ledger.stage_receipt(raw=raw, usage=usage)
+                self._conclusion = self._conclude(
+                    self._bound_adapter.interpret(raw),
+                    raw=raw,
+                    usage=usage,
+                    ended_at_monotonic_seconds=ended_at_monotonic_seconds,
+                )
             except BaseException as exc:
                 # A cancellation is not a conclusion, the same rule __anext__ applies:
                 # it destroys the frames that could have observed the call rather than ending it.
-                # _conclude is inside the try because every case of it but ProviderFailedTransiently
-                # records the attempt first, so a raise past that record would let a second call
-                # record it again.
+                # The interpretation is inside the try because every _conclude case but
+                # ProviderFailedTransiently records the attempt first, so a raise past that record
+                # would let a second call record it again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                 raise
@@ -489,11 +500,18 @@ class StreamHandle[OutputT]:
         raise self._conclusion
 
     def _conclude(
-        self, outcome: ResponseOutcome[OutputT], ended_at_monotonic_seconds: float
+        self,
+        outcome: ResponseOutcome[OutputT],
+        *,
+        raw: BaseModel,
+        usage: Usage,
+        ended_at_monotonic_seconds: float,
     ) -> Response[OutputT] | GenerationError | TransientError:
         """Build what this outcome concludes the call with: the Response, or the error to raise.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
+        raw and usage are the terminal response and its price, which every case but
+        ProviderFailedTransiently reaches through the record staged from the same two values.
         """
         match outcome:
             case AdapterResult():
@@ -501,7 +519,7 @@ class StreamHandle[OutputT]:
                 return Response(
                     output=outcome.output,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    raw=outcome.raw,
+                    raw=raw,
                     stop_reason=outcome.stop_reason,
                     assistant_message=outcome.assistant_message,
                 )
@@ -543,10 +561,7 @@ class StreamHandle[OutputT]:
                 )
             case ProviderFailedTransiently():
                 return TransientError(
-                    outcome.reason,
-                    is_rate_limit=outcome.is_rate_limit,
-                    usage=outcome.usage,
-                    usage_raw=outcome.usage_raw,
+                    outcome.reason, is_rate_limit=outcome.is_rate_limit, usage=usage, raw=raw
                 )
             case _ as unhandled:
                 assert_never(unhandled)
@@ -573,6 +588,5 @@ class StreamHandle[OutputT]:
         self._ledger.record_ending_at(
             ended_at_monotonic_seconds,
             error=None,
-            usage=outcome.usage,
-            usage_raw=outcome.usage_raw,
+            assistant_message=outcome.assistant_message,
         )

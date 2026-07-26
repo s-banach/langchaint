@@ -61,6 +61,7 @@ from langchaint.adapter import (
     EmptyTurn,
     ErrorClassification,
     MaxCompletionTokensExceeded,
+    NoOutputOutcome,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
@@ -231,6 +232,14 @@ def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
             ),
             _PRICING,
         )
+
+
+def test_normalized_usage_falls_back_to_zero_without_usage() -> None:
+    """A response missing usage normalizes to zero counters and zero cost."""
+    usage = _normalized_usage(_response(usage=None), _PRICING)
+    assert usage.input_tokens_total == 0
+    assert usage.output_tokens == 0
+    assert usage.cost_in_usd == 0.0
 
 
 def test_the_categories_are_priced_apart() -> None:
@@ -541,32 +550,12 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     ]
 
 
-def test_adapter_result_normalizes_a_response_with_usage() -> None:
-    """A response with usage yields the normalized partition, cost, and stop reason.
-
-    raw must be the SDK response object itself (identity, not equality):
-    an equal copy would silently reintroduce the per-request deep copy the no-rewrap rule bans.
-    """
+def test_adapter_result_carries_the_output_and_the_mapped_stop_reason() -> None:
+    """The result carries the extracted output and the neutral stop reason the response maps to."""
     response = _response(usage=_usage_with_cache())
-    result = _adapter_result(response=response, output="hey", pricing=_PRICING)
+    result = _adapter_result(response, "hey", _assistant_message_from(response))
     assert result.output == "hey"
-    assert result.usage.input_tokens_total == 1000
-    assert (
-        result.usage.cost_in_usd
-        == _normalized_usage(_response(usage=_usage_with_cache()), _PRICING).cost_in_usd
-    )
-    assert result.usage_raw is response.usage
     assert result.stop_reason == "end_turn"
-    assert result.raw is response
-
-
-def test_adapter_result_falls_back_to_zero_usage_without_usage() -> None:
-    """A response missing usage normalizes to zero counters and zero cost."""
-    result = _adapter_result(response=_response(usage=None), output="hey", pricing=_PRICING)
-    assert result.usage.input_tokens_total == 0
-    assert result.usage.output_tokens == 0
-    assert result.usage.cost_in_usd == 0.0
-    assert result.usage_raw is None
 
 
 def test_wire_input_converts_each_message_kind() -> None:
@@ -785,21 +774,14 @@ class _FakeSDKStream(AsyncResponseStream[None]):
         return
 
 
-def _stream(replay_events: Sequence[ResponseStreamEvent]) -> _OpenAIStream[str]:
-    """Build a text-content adapter stream over replayed events.
+def _stream(replay_events: Sequence[ResponseStreamEvent]) -> _OpenAIStream:
+    """Build an adapter stream over replayed events."""
+    return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events))
 
-    The extractor is the shipped _BoundOpenAIText one, so these tests pin what a text stream
-    reports for each terminal status.
-    """
-    adapter = _adapter()
-    text_bound = _BoundOpenAIText(
-        adapter=adapter, request=adapter._request(_binding(automatic_prompt_caching=True))
-    )
-    return _OpenAIStream(
-        sdk_stream=_FakeSDKStream(replay_events),
-        pricing=_PRICING,
-        output_from_response=text_bound._text_outcome,
-    )
+
+async def _text_final(adapter_stream: _OpenAIStream) -> ResponseOutcome[str]:
+    """Read the stream's terminal response and interpret it as the shipped text binding does."""
+    return _text_bound().interpret(await adapter_stream.final())
 
 
 def _collected_items(replay_events: Sequence[ResponseStreamEvent]) -> list[StreamItem]:
@@ -905,10 +887,9 @@ def test_stream_incomplete_terminal_still_assembles_final() -> None:
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == ["he"]
-        result = _assert_result(await adapter_stream.final())
+        result = _assert_result(await _text_final(adapter_stream))
         assert result.output == "hey"
         assert result.stop_reason == "max_tokens"
-        assert result.usage.input_tokens_total == 1000
 
     asyncio.run(scenario())
 
@@ -923,14 +904,9 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == ["he"]
-        result = _assert_result(await adapter_stream.final())
+        result = _assert_result(await _text_final(adapter_stream))
         assert result.output == "hey"
         assert result.stop_reason == "end_turn"
-        assert result.usage.input_tokens_total == 1000
-        assert (
-            result.usage.cost_in_usd
-            == _normalized_usage(_response(usage=_usage_with_cache()), _PRICING).cost_in_usd
-        )
 
     asyncio.run(scenario())
 
@@ -946,7 +922,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
         ])
         async for _item in adapter_stream.items():
             pass
-        result = _assert_result(await adapter_stream.final())
+        result = _assert_result(await _text_final(adapter_stream))
         reasoning_trace = result.assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
         assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
@@ -955,11 +931,11 @@ def test_stream_final_turn_carries_reasoning() -> None:
 
 
 def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -> None:
-    """A failed terminal ends the stream without a StreamProtocolError, and final() reports the failure.
+    """A failed terminal ends the stream without a StreamProtocolError, and interpret reports the failure.
 
     The API reported the run as not finished, so whatever text had accumulated is a fragment;
-    returning it as a Response would present that fragment as the turn. The member carries the
-    response's billing, so the attempt is paid for.
+    returning it as a Response would present that fragment as the turn. final() hands back the
+    response the run billed for, which usage_from_raw prices.
     """
 
     async def scenario() -> None:
@@ -974,9 +950,9 @@ def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == []
-        outcome = await adapter_stream.final()
-        assert isinstance(outcome, ProviderFailedTransiently)
-        assert outcome.usage.input_tokens_total == 1000
+        raw = await adapter_stream.final()
+        assert isinstance(_text_bound().interpret(raw), ProviderFailedTransiently)
+        assert _text_bound().usage_from_raw(raw).input_tokens_total == 1000
 
     asyncio.run(scenario())
 
@@ -987,6 +963,8 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
     The SDK builds a non-completed terminal response leniently, tolerating an item type it does not
     model, so validating that response against the SDK's own strict model would raise
     ValidationError and destroy a partial answer the caller has already been billed for.
+    final() hands back that object itself (identity, not equality): an equal copy would silently
+    introduce the per-request deep copy the no-rewrap rule bans.
     """
     unmodelled_item: dict[str, object] = {"type": "quantum_tool_call", "id": "q1"}
     leniently_built = construct_type_unchecked(
@@ -1014,10 +992,10 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         ])
         async for _item in adapter_stream.items():
             pass
-        result = _assert_result(await adapter_stream.final())
+        assert await adapter_stream.final() is leniently_built
+        result = _assert_result(await _text_final(adapter_stream))
         assert result.output == "hey"
         assert result.stop_reason == "max_tokens"
-        assert result.raw is leniently_built
 
     asyncio.run(scenario())
 
@@ -1053,6 +1031,11 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
     return _BoundOpenAIStructured(
         adapter=adapter, request=request, response_format=_StructuredReport
     )
+
+
+def _structured_parse(response: OpenAIResponse) -> _StructuredReport | None | NoOutputOutcome:
+    """Run the structured binding's parse over one response, with the turn that response carries."""
+    return _structured_bound()._parsed_output(response, _assistant_message_from(response))
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1107,70 +1090,59 @@ def test_structured_bind_builds_the_schema_the_sdk_parse_helper_builds() -> None
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's output text into the response_format."""
-    outcome = _structured_bound()._parsed_output(_structured_response(_REPORT_JSON))
+    outcome = _structured_parse(_structured_response(_REPORT_JSON))
     assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
     """A completed response with no text part and no tool call is EmptyTurn."""
-    outcome = _structured_bound()._parsed_output(_structured_response(None))
+    outcome = _structured_parse(_structured_response(None))
     assert isinstance(outcome, EmptyTurn)
 
 
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
-    """A completed turn whose text the response_format rejects is SchemaViolation, carrying its billing.
+    """A completed turn whose text the response_format rejects is SchemaViolation.
 
     validation_error_json names the rejected field, what rejected it, and the value, which is what
     tells a caller whether to change the model or the prompt.
     """
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(
-            '{"city": "Nairobi", "celsius": "SENTINEL"}', usage=_usage_with_cache()
-        )
-    )
+    outcome = _structured_parse(_structured_response('{"city": "Nairobi", "celsius": "SENTINEL"}'))
     assert isinstance(outcome, SchemaViolation)
     rejections = json.loads(outcome.validation_error_json)
     assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
     assert rejections[0]["input"] == "SENTINEL"
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """An incomplete turn whose JSON stopped mid-object is the truncation, not a schema violation.
 
-    This is the response the SDK's own parse raised on, losing the 200 and its billing; the member
-    carries both, and the item fails with MaxCompletionTokensExceededError.
+    This is the response the SDK's own parse raised on; reporting it as a member is what lets the
+    retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
     """
-    outcome = _structured_bound()._parsed_output(
+    outcome = _structured_parse(
         _structured_response(
             '{"city": "Nair',
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-            usage=_usage_with_cache(),
         )
     )
     assert isinstance(outcome, MaxCompletionTokensExceeded)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
     """A completed turn whose output is a function call parses no instance and nothing went wrong."""
-    assert _structured_bound()._parsed_output(_structured_response(None, tool_call=True)) is None
+    assert _structured_parse(_structured_response(None, tool_call=True)) is None
 
 
 def test_structured_bind_reports_a_tool_call_turn_whose_text_is_not_the_instance_as_none() -> None:
     """A tool-call turn whose text is prose is the tool call, not a schema violation."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response("let me look that up", tool_call=True)
-    )
+    outcome = _structured_parse(_structured_response("let me look that up", tool_call=True))
     assert outcome is None
 
 
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
     """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(_REPORT_JSON, tool_call=True)
-    )
+    outcome = _structured_parse(_structured_response(_REPORT_JSON, tool_call=True))
     assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
 
@@ -1180,7 +1152,7 @@ def test_structured_stream_terminal_reports_max_completion_tokens_exceeded() -> 
     The stream sends no text_format, so its terminal response is a plain Response on every status and
     one function reads them all.
     """
-    outcome = _structured_bound()._parsed_output(
+    outcome = _structured_parse(
         _structured_response(
             None,
             status="incomplete",
@@ -1192,9 +1164,7 @@ def test_structured_stream_terminal_reports_max_completion_tokens_exceeded() -> 
 
 def test_structured_stream_terminal_reports_a_failed_run_as_the_provider_failure() -> None:
     """A structured stream's failed terminal takes the same member the text binding reports."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(None, status="failed", error=_SERVER_ERROR)
-    )
+    outcome = _structured_parse(_structured_response(None, status="failed", error=_SERVER_ERROR))
     assert isinstance(outcome, ProviderFailedTransiently)
 
 
@@ -1213,13 +1183,18 @@ def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
     assistant_message.text, which is what a refusal under the anthropic adapter carries too.
     """
     response = _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
-    assert _text_bound()._text_outcome(response) == "I can't help with that"
+    result = _assert_result(_text_bound().interpret(response))
+    assert result.output == "I can't help with that"
 
 
-def test_text_bind_send_reports_a_failed_status_as_the_provider_failure(
+def test_text_bind_send_hands_back_a_failed_status_for_interpret_to_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed status returns the failure member from send, carrying that run's billing."""
+    """A failed status comes back from send rather than raising, and interpret reports the failure member.
+
+    The API answers 200 with a body saying the run failed, so the response reaches the retry loop,
+    which records it and its price before interpret reads it.
+    """
     text_bound = _text_bound()
 
     async def fake_create(**_request_kwargs: object) -> OpenAIResponse:
@@ -1227,20 +1202,18 @@ def test_text_bind_send_reports_a_failed_status_as_the_provider_failure(
         return _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
 
     monkeypatch.setattr(text_bound._adapter.client.responses, "create", fake_create)
-    outcome = asyncio.run(text_bound.send([UserMessage(content="q")]))
-    assert isinstance(outcome, ProviderFailedTransiently)
-    assert outcome.usage.cost_in_usd > 0.0
+    raw = asyncio.run(text_bound.send([UserMessage(content="q")]))
+    assert isinstance(raw, OpenAIResponse)
+    assert isinstance(text_bound.interpret(raw), ProviderFailedTransiently)
+    assert text_bound.usage_from_raw(raw).cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_validates() -> None:
     """A failed run is the failure member even when its fragment validates: it is not the answer."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(
-            _REPORT_JSON, status="failed", usage=_usage_with_cache(), error=_SERVER_ERROR
-        )
+    outcome = _structured_parse(
+        _structured_response(_REPORT_JSON, status="failed", error=_SERVER_ERROR)
     )
     assert isinstance(outcome, ProviderFailedTransiently)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_a_failed_run_carrying_a_refusal_takes_the_failure_member_under_both_bindings() -> None:
@@ -1249,28 +1222,19 @@ def test_a_failed_run_carrying_a_refusal_takes_the_failure_member_under_both_bin
     Were the refusal tested first, the structured binding would report Refusal (a terminal
     RefusalError) for a response the text binding retries.
     """
-    structured_outcome = _structured_bound()._parsed_output(
-        _structured_response(
-            None, refusal=True, status="failed", usage=_usage_with_cache(), error=_SERVER_ERROR
-        )
+    structured_outcome = _structured_parse(
+        _structured_response(None, refusal=True, status="failed", error=_SERVER_ERROR)
     )
     assert isinstance(structured_outcome, ProviderFailedTransiently)
-    text_outcome = _text_bound()._text_outcome(
-        _response(
-            usage=_usage_with_cache(),
-            output=[_REFUSAL_MESSAGE_ITEM],
-            status="failed",
-            error=_SERVER_ERROR,
-        )
+    text_outcome = _text_bound().interpret(
+        _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM], status="failed", error=_SERVER_ERROR)
     )
     assert isinstance(text_outcome, ProviderFailedTransiently)
 
 
 def test_a_transient_error_code_carries_the_providers_message_and_no_rate_limit_flag() -> None:
     """A server_error is transient, and its reason is openai's message verbatim."""
-    outcome = _text_bound()._text_outcome(
-        _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
-    )
+    outcome = _text_bound().interpret(_response(usage=None, status="failed", error=_SERVER_ERROR))
     assert isinstance(outcome, ProviderFailedTransiently)
     assert outcome.reason == _SERVER_ERROR.message
     assert outcome.is_rate_limit is False
@@ -1278,9 +1242,9 @@ def test_a_transient_error_code_carries_the_providers_message_and_no_rate_limit_
 
 def test_a_rate_limit_error_code_sets_the_rate_limit_flag() -> None:
     """rate_limit_exceeded is transient and flags the rate limit, which paces every sharing task."""
-    outcome = _text_bound()._text_outcome(
+    outcome = _text_bound().interpret(
         _response(
-            usage=_usage_with_cache(),
+            usage=None,
             status="failed",
             error=ResponseError(code="rate_limit_exceeded", message="Rate limit reached."),
         )
@@ -1291,8 +1255,8 @@ def test_a_rate_limit_error_code_sets_the_rate_limit_flag() -> None:
 
 def test_a_terminal_error_code_carries_the_providers_message_without_retrying() -> None:
     """failed_to_download_image is terminal: the request names the image, so a resend fetches it again."""
-    outcome = _text_bound()._text_outcome(
-        _response(usage=_usage_with_cache(), status="failed", error=_IMAGE_DOWNLOAD_ERROR)
+    outcome = _text_bound().interpret(
+        _response(usage=None, status="failed", error=_IMAGE_DOWNLOAD_ERROR)
     )
     assert isinstance(outcome, ProviderFailedTerminally)
     assert outcome.reason == _IMAGE_DOWNLOAD_ERROR.message
@@ -1300,9 +1264,9 @@ def test_a_terminal_error_code_carries_the_providers_message_without_retrying() 
 
 def test_an_error_code_the_installed_sdk_does_not_name_is_terminal() -> None:
     """A code added after openai 2.45.0 fails the item once rather than spending the retry budget."""
-    outcome = _text_bound()._text_outcome(
+    outcome = _text_bound().interpret(
         _response(
-            usage=_usage_with_cache(),
+            usage=None,
             status="failed",
             error=ResponseError.construct(code="a_code_from_a_later_sdk", message="Something."),
         )
@@ -1313,43 +1277,36 @@ def test_an_error_code_the_installed_sdk_does_not_name_is_terminal() -> None:
 
 def test_a_failed_status_with_no_error_object_is_terminal() -> None:
     """A failed run naming nothing gives no ground to resend on, and says that in its reason."""
-    outcome = _text_bound()._text_outcome(_response(usage=_usage_with_cache(), status="failed"))
+    outcome = _text_bound().interpret(_response(usage=None, status="failed"))
     assert isinstance(outcome, ProviderFailedTerminally)
     assert outcome.reason == "openai reported status 'failed' and no error object"
 
 
 def test_a_run_that_stopped_short_of_a_turn_is_unfinished_turn_naming_the_status() -> None:
     """A cancelled run is neither a failure openai described nor a turn, so it names its status."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(None, status="cancelled", usage=_usage_with_cache())
-    )
+    outcome = _structured_parse(_structured_response(None, status="cancelled"))
     assert isinstance(outcome, UnfinishedTurn)
     assert outcome.reason == "openai returned status 'cancelled'"
 
 
 def test_structured_bind_reports_refusal_on_a_refusal_block() -> None:
-    """A response carrying a refusal content block is Refusal, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(
-        _structured_response(None, refusal=True, usage=_usage_with_cache())
-    )
+    """A response carrying a refusal content block is Refusal."""
+    outcome = _structured_parse(_structured_response(None, refusal=True))
     assert isinstance(outcome, Refusal)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_tokens_incomplete() -> (
     None
 ):
-    """An incomplete response for max_output_tokens is MaxCompletionTokensExceeded, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(
+    """An incomplete response for max_output_tokens is MaxCompletionTokensExceeded."""
+    outcome = _structured_parse(
         _structured_response(
             None,
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-            usage=_usage_with_cache(),
         )
     )
     assert isinstance(outcome, MaxCompletionTokensExceeded)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> None:
@@ -1358,16 +1315,14 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
     Retrying would send the same blocked request again for the whole retry budget
     and bill for each attempt.
     """
-    outcome = _structured_bound()._parsed_output(
+    outcome = _structured_parse(
         _structured_response(
             None,
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="content_filter"),
-            usage=_usage_with_cache(),
         )
     )
     assert isinstance(outcome, Refusal)
-    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_every_request_carries_the_reasoning_include(

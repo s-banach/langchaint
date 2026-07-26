@@ -68,7 +68,7 @@ def report_billing(response: Response[str]) -> None:
     the money the call spent; response.usage_successful_attempt is the single kept answer's own usage.
     The two diverge only when a billed 200 was retried (an empty structured parse retried as transient):
     a call whose only retries were transport, 5xx, or rate-limit failures bills nothing on them, so the two
-    are equal. attempt_records holds one record per request sent; usage_raw is the provider's own usage
+    are equal. attempt_records holds one record per request sent; raw is the provider's own response
     object (None for a transport failure), so provider-specific detail stays recoverable after any outcome.
     """
     paid_total = response.usage
@@ -78,9 +78,7 @@ def report_billing(response: Response[str]) -> None:
         f"kept answer: {kept_answer.cost_in_usd:.6f} USD (equal unless a billed 200 was retried)"
     )
     for index, record in enumerate(response.attempt_records):
-        print(
-            f"  attempt {index + 1}: usage_raw={'present' if record.usage_raw is not None else 'none'}"
-        )
+        print(f"  attempt {index + 1}: raw={'present' if record.raw is not None else 'none'}")
 
 
 async def generate_with_fallback(

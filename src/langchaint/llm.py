@@ -13,7 +13,7 @@ so a rate-limit error pauses admission account-wide until a request succeeds aga
 
 import asyncio
 from collections.abc import Iterator, Sequence
-from typing import Any, Protocol, SupportsIndex, assert_never, overload
+from typing import Any, NamedTuple, Protocol, SupportsIndex, assert_never, overload
 
 from pydantic import BaseModel
 
@@ -26,9 +26,11 @@ from langchaint.adapter import (
     EmptyTurn,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutput,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
+    ResponseOutcome,
     SchemaViolation,
     ToolChoice,
     UnfinishedTurn,
@@ -50,12 +52,11 @@ from langchaint.exceptions import (
     _extract_transient_errors,
 )
 from langchaint.inference_params import InferenceParams
-from langchaint.messages import Message, TextPart, UserMessage
-from langchaint.rate_limiter import RateLimiter
+from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
+from langchaint.rate_limiter import Admission, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
-from langchaint.usage import ZERO_USAGE
 
 
 class Unchanged:
@@ -196,6 +197,17 @@ class HasTools:
     Never instantiated; the counterpart of NoTools, whose docstring states what the pair is for.
     A structured binding marked this way types its output optional, None being the tool-call turn.
     """
+
+
+class _Interpretation[OutputT](NamedTuple):
+    """One arrived response and what interpret read off it.
+
+    The two travel together because the retry loop needs both: raw is what a Response carries, and
+    outcome is what decides the item's fate.
+    """
+
+    raw: BaseModel
+    outcome: ResponseOutcome[OutputT]
 
 
 class LLM:
@@ -530,8 +542,9 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         classification = self.adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out, and a rejection reports no usage, so ZERO_USAGE is what it billed.
-            ledger.record(error=None, usage=ZERO_USAGE, usage_raw=None)
+            # so it went out and gets a record. A rejection carries no response, so the record is
+            # ZERO_USAGE unless a receipt was staged, which is the exception raised while reading one.
+            ledger.record(error=None, assistant_message=None)
             return InvalidRequestError(
                 reason=f"the provider rejected the request: {exc}", call=ledger.freeze()
             )
@@ -545,6 +558,62 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         error.__cause__ = exc
         return error
 
+    def _record_completed_attempt(
+        self,
+        outcome: AdapterResult[OutputT | None] | NoOutput,
+        *,
+        admission: Admission,
+        ledger: _CallLedger,
+    ) -> None:
+        """Register the completed request with the limiter and close its attempt.
+
+        error is None on every member reaching here: the request succeeded, and what the adapter
+        made of the response is the item's outcome, not this attempt's failure.
+        Called while the attempt's slot is still held, so a completed request ends the limiter's
+        recovery before anyone else is admitted. Every 200 counts as completed, including one that
+        produced no output: the provider served the request, which is what the recovery probe asks.
+        """
+        self.rate_limiter.register_success(admission)
+        ledger.record(error=None, assistant_message=outcome.assistant_message)
+
+    def _record_transient_error(
+        self,
+        error: TransientError,
+        *,
+        assistant_message: AssistantMessage | None,
+        ledger: _CallLedger,
+    ) -> float:
+        """Close the failed attempt and register it with the limiter, while its slot is still held.
+
+        assistant_message is the turn a 200 the provider filled with a failure still carried, and
+        None where the attempt received no response.
+
+        Returns:
+            The backoff delay to sleep before the next attempt, in seconds;
+            register_transient_error draws it once so it equals any account-wide pause it set.
+        """
+        ledger.record(error=error, assistant_message=assistant_message)
+        return self.rate_limiter.register_transient_error(
+            _extract_transient_errors(ledger.attempt_records)
+        )
+
+    def _staged_interpretation(
+        self, sent: BaseModel | InvalidRequest, *, ledger: _CallLedger
+    ) -> _Interpretation[OutputT | None] | InvalidRequest:
+        """Record the receipt of an arrived response, then read what it produced.
+
+        Staging first is what makes the attempt and its billing survive a raise from interpret:
+        freeze closes a still-staged receipt, so the error that raise becomes carries the record.
+        An InvalidRequest passes through, having received nothing to record.
+
+        Raises:
+            Exception: whatever interpret raises, for Adapter.classify to sort.
+        """
+        if isinstance(sent, InvalidRequest):
+            return sent
+        ledger.stage_receipt(raw=sent, usage=self._bound_adapter.usage_from_raw(sent))
+        return _Interpretation(raw=sent, outcome=self._bound_adapter.interpret(sent))
+
     async def _generate_with_retries(
         self, conversation: Sequence[Message], *, ledger: _CallLedger
     ) -> Response[OutputT | None]:
@@ -556,10 +625,12 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         Every GenerationError and the Response are built from ledger.freeze(), the one site a call's
         elapsed_seconds is computed.
 
-        The adapter reports one attempt as an AttemptOutcome arm and never as a GenerationError, so
-        this loop matches the arm, records what the attempt billed, and constructs the item's
-        GenerationError here, where the attempts and the timing are known.
-        Only an attempt the adapter read no outcome from arrives as an exception, and Adapter.classify sorts those.
+        The adapter reports one attempt as an AttemptOutcome member and never as a GenerationError,
+        so this loop matches the member and constructs the item's GenerationError here, where the
+        attempts and the timing are known.
+        Each arrived response is staged on the ledger with its price before anything is read off it,
+        so an exception from that read still leaves the attempt and its billing on the record.
+        Every exception, whether the attempt reached a response or not, goes to Adapter.classify.
         Each attempt holds a RateLimiter slot for the request only;
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,
@@ -597,8 +668,11 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         while ledger.attempts < self.rate_limiter.max_attempts:
             async with self.rate_limiter.slot() as admission:
                 ledger.start_attempt()
+                assistant_message: AssistantMessage | None = None
                 try:
-                    outcome = await self._bound_adapter.send(conversation)
+                    interpreted = self._staged_interpretation(
+                        await self._bound_adapter.send(conversation), ledger=ledger
+                    )
                 except TransientError as exc:
                     error: TransientError = exc
                 except Exception as exc:
@@ -607,64 +681,57 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                         raise classified from exc
                     error = classified
                 else:
+                    if isinstance(interpreted, InvalidRequest):
+                        raise InvalidRequestError(reason=interpreted.reason, call=ledger.freeze())
+                    raw, outcome = interpreted
                     match outcome:
                         case AdapterResult():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             return Response(
                                 output=outcome.output,
                                 call=ledger.freeze(),
-                                raw=outcome.raw,
+                                raw=raw,
                                 stop_reason=outcome.stop_reason,
                                 assistant_message=outcome.assistant_message,
                             )
                         case Refusal():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise RefusalError(call=ledger.freeze())
                         case MaxCompletionTokensExceeded():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise MaxCompletionTokensExceededError(call=ledger.freeze())
                         case EmptyTurn():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise EmptyTurnError(call=ledger.freeze())
                         case SchemaViolation():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise SchemaViolationError(
                                 validation_error_json=outcome.validation_error_json,
                                 call=ledger.freeze(),
                             )
                         case ContextWindowExceeded():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise ContextWindowExceededError(call=ledger.freeze())
                         case UnfinishedTurn():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise UnfinishedTurnError(reason=outcome.reason, call=ledger.freeze())
-                        case InvalidRequest():
-                            raise InvalidRequestError(reason=outcome.reason, call=ledger.freeze())
                         case ProviderFailedTerminally():
-                            self.rate_limiter.register_success(admission)
-                            ledger.record(
-                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            self._record_completed_attempt(
+                                outcome, admission=admission, ledger=ledger
                             )
                             raise ProviderFailedTerminallyError(
                                 reason=outcome.reason, call=ledger.freeze()
@@ -672,16 +739,13 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                         case ProviderFailedTransiently():
                             self.rate_limiter.register_success(admission)
                             error = TransientError(
-                                outcome.reason,
-                                is_rate_limit=outcome.is_rate_limit,
-                                usage=outcome.usage,
-                                usage_raw=outcome.usage_raw,
+                                outcome.reason, is_rate_limit=outcome.is_rate_limit
                             )
+                            assistant_message = outcome.assistant_message
                         case _ as unhandled:
                             assert_never(unhandled)
-                ledger.record(error=error, usage=error.usage, usage_raw=error.usage_raw)
-                delay_seconds = self.rate_limiter.register_transient_error(
-                    _extract_transient_errors(ledger.attempt_records)
+                delay_seconds = self._record_transient_error(
+                    error, assistant_message=assistant_message, ledger=ledger
                 )
             if ledger.attempts < self.rate_limiter.max_attempts:
                 await asyncio.sleep(delay_seconds)

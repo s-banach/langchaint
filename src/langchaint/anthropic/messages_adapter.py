@@ -63,7 +63,7 @@ Mapping decisions:
 
 import base64
 import json
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, cast, override
 
@@ -99,7 +99,6 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
-    AttemptOutcome,
     Binding,
     BoundAdapter,
     ContextWindowExceeded,
@@ -571,9 +570,7 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
 
 
 def _unfinished_turn_or_none(
-    message: anthropic.types.Message,
-    *,
-    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    message: anthropic.types.Message, *, assistant_message: AssistantMessage
 ) -> UnfinishedTurn | None:
     """Report a 200 that is not a finished turn, or None when the turn finished.
 
@@ -596,9 +593,23 @@ def _unfinished_turn_or_none(
         return None
     return UnfinishedTurn(
         reason=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
-        usage=_normalized_usage(message.usage, pricing=pricing),
-        usage_raw=message.usage,
+        assistant_message=assistant_message,
     )
+
+
+def _as_message(raw: BaseModel) -> anthropic.types.Message:
+    """Narrow a raw response to the SDK message this adapter produces.
+
+    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
+    the neutral core imports no SDK. Every value reaching them came from this adapter's own send or
+    stream, so another type is a defect in langchaint and not a provider behavior.
+
+    Raises:
+        TypeError: raw is not an anthropic Message.
+    """
+    if not isinstance(raw, anthropic.types.Message):
+        raise TypeError(f"expected an anthropic Message, got {type(raw).__name__}")
+    return raw
 
 
 def _first_text_block_text(message: anthropic.types.Message) -> str | None:
@@ -684,18 +695,13 @@ def _normalized_usage(
 
 
 def _adapter_result[OutputT](
-    message: anthropic.types.Message,
-    output: OutputT,
-    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    message: anthropic.types.Message, output: OutputT, assistant_message: AssistantMessage
 ) -> AdapterResult[OutputT]:
-    """Normalize one completed message around already-extracted output."""
+    """Normalize one completed message around already-extracted output and its turn."""
     return AdapterResult(
         output=output,
-        assistant_message=_assistant_message_from(message),
-        usage=_normalized_usage(message.usage, pricing=pricing),
-        usage_raw=message.usage,
+        assistant_message=assistant_message,
         stop_reason=_normalized_stop_reason(message.stop_reason),
-        raw=message,
     )
 
 
@@ -928,19 +934,11 @@ class AnthropicMessagesAdapter(Adapter):
         return None
 
 
-class _AnthropicStream[OutputT](AdapterStream[OutputT]):
+class _AnthropicStream(AdapterStream):
     """One open Messages stream, backed by the SDK's AsyncMessageStream."""
 
-    def __init__(
-        self,
-        *,
-        sdk_stream: AsyncMessageStream[Any],
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
-        output_from_message: Callable[[anthropic.types.Message], OutputT | NoOutputOutcome],
-    ) -> None:
+    def __init__(self, *, sdk_stream: AsyncMessageStream[Any]) -> None:
         self._sdk_stream = sdk_stream
-        self._pricing = pricing
-        self._output_from_message = output_from_message
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -968,13 +966,9 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
             raise StreamProtocolError("stream ended without a stop reason")
 
     @override
-    async def final(self) -> ResponseOutcome[OutputT]:
-        """Return what the SDK-assembled message produced, after the stream ends."""
-        message = await self._sdk_stream.get_final_message()
-        output = self._output_from_message(message)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(message=message, output=output, pricing=self._pricing)
+    async def final(self) -> anthropic.types.Message:
+        """Return the message the SDK assembled from the stream's events, after the stream ends."""
+        return await self._sdk_stream.get_final_message()
 
     @override
     async def close(self) -> None:
@@ -990,12 +984,37 @@ class _BoundAnthropicText(BoundAdapter[str]):
         self._request = request
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str] | InvalidRequest:
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Price the message's counters at the tier it reports.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+        """
+        return _normalized_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
+
+    @override
+    def interpret(self, raw: BaseModel) -> AdapterResult[str]:
+        """Read the turn, whose concatenated text is this binding's output.
+
+        Every message a text binding receives is a result: a stop reason langchaint cannot continue
+        still carries the text the model wrote, and no schema stands between that text and the output.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+        """
+        message = _as_message(raw)
+        assistant_message = _assistant_message_from(message)
+        return _adapter_result(message, assistant_message.text, assistant_message)
+
+    @override
+    async def send(
+        self, conversation: Sequence[Message]
+    ) -> anthropic.types.Message | InvalidRequest:
         """Send one non-streaming request via messages.create."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
             return messages
-        message = await self._adapter.client.messages.create(
+        return await self._adapter.client.messages.create(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
             temperature=self._request.temperature,
@@ -1007,16 +1026,9 @@ class _BoundAnthropicText(BoundAdapter[str]):
             service_tier=self._request.service_tier,
             messages=messages,
         )
-        return _adapter_result(
-            message=message,
-            output=_assistant_message_from(message).text,
-            pricing=self._adapter.pricing,
-        )
 
     @override
-    async def open_stream(
-        self, conversation: Sequence[Message]
-    ) -> AdapterStream[str] | InvalidRequest:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
         """Open one streaming request; connection failures raise here."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
@@ -1034,11 +1046,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             messages=messages,
         )
         sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(
-            sdk_stream=sdk_stream,
-            pricing=self._adapter.pricing,
-            output_from_message=lambda message: _assistant_message_from(message).text,
-        )
+        return _AnthropicStream(sdk_stream=sdk_stream)
 
 
 class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
@@ -1070,12 +1078,14 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             else {**bound_output_config, "format": output_format}
         )
 
-    def _parsed_output(self, message: anthropic.types.Message) -> ModelT | None | NoOutputOutcome:
+    def _parsed_output(
+        self, message: anthropic.types.Message, assistant_message: AssistantMessage
+    ) -> ModelT | None | NoOutputOutcome:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
-        Validating here rather than in the SDK is what puts the message, its usage, and its text in
-        scope when the text is rejected: the member returned for a rejection carries this attempt's
-        billing, where a raise from inside the SDK carries none.
+        Validating here rather than in the SDK is what puts the message and its text in scope when
+        the text is rejected: the member returned for a rejection is one the retry loop can place
+        against the attempt it already recorded, where a raise from inside the SDK is not.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
         message carries, so a turn whose text is not the instance yields no instance without anything
@@ -1086,8 +1096,8 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         The stop reason is read before the rejection, so text the token cap cut mid-object is
         reported as the truncation and not as a violation of the schema it was closing.
 
-        Each NoOutputOutcome member carries this attempt's billing (usage with cost_in_usd inside, and
-        the raw SDK usage object) so a 200 that produced no output does not lose its cost.
+        Each member carries assistant_message, so the turn a rejected 200 did produce reaches the
+        caller on the failure.
         The stop reason chooses the member and is not carried on it: what such a 200 reports is fixed
         by its GenerationError subclass.
         """
@@ -1098,33 +1108,56 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
                 return self._output_type_adapter.validate_json(text)
             except ValidationError as rejection:
                 validation_error = rejection
-        unfinished_turn = _unfinished_turn_or_none(message, pricing=self._adapter.pricing)
+        unfinished_turn = _unfinished_turn_or_none(message, assistant_message=assistant_message)
         if unfinished_turn is not None:
             return unfinished_turn
         if message.stop_reason == "tool_use":
             return None
-        usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
         if message.stop_reason == "refusal":
-            return Refusal(usage=usage, usage_raw=message.usage)
+            return Refusal(assistant_message=assistant_message)
         if message.stop_reason == "max_tokens":
-            return MaxCompletionTokensExceeded(usage=usage, usage_raw=message.usage)
+            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if message.stop_reason == "model_context_window_exceeded":
-            return ContextWindowExceeded(usage=usage, usage_raw=message.usage)
+            return ContextWindowExceeded(assistant_message=assistant_message)
         if validation_error is not None:
             return SchemaViolation(
                 validation_error_json=validation_error.json(include_url=False),
-                usage=usage,
-                usage_raw=message.usage,
+                assistant_message=assistant_message,
             )
-        return EmptyTurn(usage=usage, usage_raw=message.usage)
+        return EmptyTurn(assistant_message=assistant_message)
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT | None]:
-        """Send one non-streaming request via messages.create, then validate the turn's text."""
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Price the message's counters at the tier it reports.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+        """
+        return _normalized_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+        """Validate the turn's text into the instance, or report why the message produced none.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+        """
+        message = _as_message(raw)
+        assistant_message = _assistant_message_from(message)
+        output = self._parsed_output(message, assistant_message)
+        if isinstance(output, NoOutput):
+            return output
+        return _adapter_result(message, output, assistant_message)
+
+    @override
+    async def send(
+        self, conversation: Sequence[Message]
+    ) -> anthropic.types.Message | InvalidRequest:
+        """Send one non-streaming request via messages.create."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
             return messages
-        message = await self._adapter.client.messages.create(
+        return await self._adapter.client.messages.create(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
             temperature=self._request.temperature,
@@ -1136,19 +1169,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             service_tier=self._request.service_tier,
             messages=messages,
         )
-        output = self._parsed_output(message)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(
-            message=message,
-            output=output,
-            pricing=self._adapter.pricing,
-        )
 
     @override
-    async def open_stream(
-        self, conversation: Sequence[Message]
-    ) -> AdapterStream[ModelT | None] | InvalidRequest:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
         """Open one streaming request; connection failures raise here."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
@@ -1166,8 +1189,4 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             messages=messages,
         )
         sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(
-            sdk_stream=sdk_stream,
-            pricing=self._adapter.pricing,
-            output_from_message=self._parsed_output,
-        )
+        return _AnthropicStream(sdk_stream=sdk_stream)

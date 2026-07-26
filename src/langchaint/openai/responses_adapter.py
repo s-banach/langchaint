@@ -84,7 +84,7 @@ Mapping decisions:
 """
 
 import base64
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
 
@@ -431,13 +431,12 @@ on every resend.
 
 
 def _provider_failure(
-    response: OpenAIResponse, *, usage: Usage
+    response: OpenAIResponse, *, assistant_message: AssistantMessage
 ) -> ProviderFailedTransiently | ProviderFailedTerminally:
     """Report a failed status as the member its error code's disposition selects.
 
     A failed status is the API saying no generation completed, so whatever output items the response
-    holds are a fragment rather than the turn. The response is billed, and both members take usage,
-    so the attempt is paid for either way.
+    holds are a fragment rather than the turn. Both members carry that fragment as their turn.
 
     reason is response.error.message verbatim, the only description of a condition langchaint does
     not model; a response reporting the failure with no error object at all gets langchaint's own
@@ -452,17 +451,15 @@ def _provider_failure(
     if error is None:
         return ProviderFailedTerminally(
             reason="openai reported status 'failed' and no error object",
-            usage=usage,
-            usage_raw=response.usage,
+            assistant_message=assistant_message,
         )
     if _DISPOSITION_BY_ERROR_CODE.get(error.code) == "transient":
         return ProviderFailedTransiently(
             reason=error.message,
             is_rate_limit=error.code == "rate_limit_exceeded",
-            usage=usage,
-            usage_raw=response.usage,
+            assistant_message=assistant_message,
         )
-    return ProviderFailedTerminally(reason=error.message, usage=usage, usage_raw=response.usage)
+    return ProviderFailedTerminally(reason=error.message, assistant_message=assistant_message)
 
 
 def _has_refusal(response: OpenAIResponse) -> bool:
@@ -472,6 +469,21 @@ def _has_refusal(response: OpenAIResponse) -> bool:
         if item.type == "message"
         for content_part in item.content
     )
+
+
+def _as_response(raw: BaseModel) -> OpenAIResponse:
+    """Narrow a raw response to the SDK response this adapter produces.
+
+    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
+    the neutral core imports no SDK. Every value reaching them came from this adapter's own send or
+    stream, so another type is a defect in langchaint and not a provider behavior.
+
+    Raises:
+        TypeError: raw is not an openai Response.
+    """
+    if not isinstance(raw, OpenAIResponse):
+        raise TypeError(f"expected an openai Response, got {type(raw).__name__}")
+    return raw
 
 
 def _first_output_text(response: OpenAIResponse) -> str | None:
@@ -618,22 +630,13 @@ def _normalized_usage(
 
 
 def _adapter_result[OutputT](
-    response: OpenAIResponse,
-    output: OutputT,
-    pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
+    response: OpenAIResponse, output: OutputT, assistant_message: AssistantMessage
 ) -> AdapterResult[OutputT]:
-    """Normalize one completed request around already-extracted output.
-
-    response.usage is typed optional; a response without it normalizes to ZERO_USAGE (zero cost) and
-    usage_raw None.
-    """
+    """Normalize one completed request around already-extracted output and its turn."""
     return AdapterResult(
         output=output,
-        assistant_message=_assistant_message_from(response),
-        usage=_normalized_usage(response, pricing=pricing),
-        usage_raw=response.usage,
+        assistant_message=assistant_message,
         stop_reason=_normalized_stop_reason(response),
-        raw=response,
     )
 
 
@@ -834,19 +837,11 @@ class OpenAIResponsesAdapter(Adapter):
         return None
 
 
-class _OpenAIStream[OutputT](AdapterStream[OutputT]):
+class _OpenAIStream(AdapterStream):
     """One open Responses stream, backed by the SDK's stream helper."""
 
-    def __init__(
-        self,
-        *,
-        sdk_stream: AsyncResponseStream[Any],
-        pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
-        output_from_response: Callable[[OpenAIResponse], OutputT | NoOutputOutcome],
-    ) -> None:
+    def __init__(self, *, sdk_stream: AsyncResponseStream[Any]) -> None:
         self._sdk_stream = sdk_stream
-        self._pricing = pricing
-        self._output_from_response = output_from_response
         self._terminal_response: OpenAIResponse | None = None
 
     @override
@@ -884,29 +879,20 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
             raise StreamProtocolError("stream ended without a terminal response")
 
     @override
-    async def final(self) -> ResponseOutcome[OutputT]:
-        """Return what the captured terminal response produced.
+    async def final(self) -> OpenAIResponse:
+        """Return the terminal event's response, exactly as the SDK built it.
 
-        The terminal response reaches the binding's extractor as the SDK built it, never
-        re-validated into another model: the SDK constructs a response leniently and tolerates an
-        output item type or an enum value it does not model, so validating that response against the
-        SDK's own strict model can raise pydantic's ValidationError over a response whose partial
-        output and billing the caller is owed. Passing it through is also what keeps the Response's
-        raw the SDK object by reference.
+        It is never re-validated into another model: the SDK constructs a response leniently and
+        tolerates an output item type or an enum value it does not model, so validating that
+        response against the SDK's own strict model can raise pydantic's ValidationError over a
+        response whose partial output and billing the caller is owed.
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so no terminal response was captured.
         """
         if self._terminal_response is None:
             raise StreamProtocolError("final() requires items() to be exhausted first")
-        output = self._output_from_response(self._terminal_response)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(
-            response=self._terminal_response,
-            output=output,
-            pricing=self._pricing,
-        )
+        return self._terminal_response
 
     @override
     async def close(self) -> None:
@@ -921,35 +907,42 @@ class _BoundOpenAIText(BoundAdapter[str]):
         self._adapter = adapter
         self._request = request
 
-    def _text_outcome(
-        self, response: OpenAIResponse
-    ) -> str | ProviderFailedTransiently | ProviderFailedTerminally:
-        """Return the turn's text, or the failure member when the API reported the run as failed.
+    @override
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Price the response's counters at the tier it reports.
+
+        Raises:
+            TypeError: raw is not an openai Response.
+        """
+        return _normalized_usage(_as_response(raw), pricing=self._adapter.pricing)
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
+        """Read the turn's text as this binding's output, or report the run openai says failed.
 
         A failed status means the run did not finish, and response.error names why, so the output
         items hold whatever had been emitted rather than the turn; reporting that as a Response would
-        present a fragment as the answer. _provider_failure states which member the error code picks
-        and what each carries.
+        present a fragment as the answer. _provider_failure states which member the error code picks.
         An incomplete status is deliberately not this case: a turn cut off at the token cap or by a
         content filter is the answer as far as it got, and stop_reason ("max_tokens" or "refusal")
         is how the caller sees that.
         The text is the assistant turn's, not response.output_text: output_text concatenates the
         output_text content parts alone, so a refusal turn would come back with an empty output while
         the same Response's assistant_message carried the sentences the model wrote to refuse.
+
+        Raises:
+            TypeError: raw is not an openai Response.
         """
+        response = _as_response(raw)
+        assistant_message = _assistant_message_from(response)
         if response.status == "failed":
-            return _provider_failure(
-                response, usage=_normalized_usage(response, pricing=self._adapter.pricing)
-            )
-        return _assistant_message_from(response).text
+            return _provider_failure(response, assistant_message=assistant_message)
+        return _adapter_result(response, assistant_message.text, assistant_message)
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[str]:
-        """Send one non-streaming request via responses.create.
-
-        A response the API reported as failed returns the failure member _text_outcome chose.
-        """
-        response = await self._adapter.client.responses.create(
+    async def send(self, conversation: Sequence[Message]) -> OpenAIResponse:
+        """Send one non-streaming request via responses.create."""
+        return await self._adapter.client.responses.create(
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
@@ -964,17 +957,9 @@ class _BoundOpenAIText(BoundAdapter[str]):
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
-        output = self._text_outcome(response)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(
-            response=response,
-            output=output,
-            pricing=self._adapter.pricing,
-        )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[str]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.responses.stream(
             model=self._request.model,
@@ -992,11 +977,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
             input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
         sdk_stream = await manager.__aenter__()
-        return _OpenAIStream(
-            sdk_stream=sdk_stream,
-            pricing=self._adapter.pricing,
-            output_from_response=self._text_outcome,
-        )
+        return _OpenAIStream(sdk_stream=sdk_stream)
 
 
 class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
@@ -1022,7 +1003,10 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         }
 
     def _no_instance(
-        self, response: OpenAIResponse, validation_error: ValidationError | None
+        self,
+        response: OpenAIResponse,
+        validation_error: ValidationError | None,
+        assistant_message: AssistantMessage,
     ) -> NoOutputOutcome:
         """Report why the turn produced no instance and no tool call.
 
@@ -1030,8 +1014,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         text to validate. On a completed turn the two answers are SchemaViolation and EmptyTurn;
         everywhere else the status names the failure and the rejection adds nothing.
 
-        Each NoOutputOutcome member carries this attempt's billing (usage with cost_in_usd inside, and
-        the raw SDK usage object) so a 200 that produced no output does not lose its cost.
+        Each member carries assistant_message, so the turn a rejected 200 did produce reaches the
+        caller on the failure.
         No member carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
         here only to detect the refusal, tests a function_call item ahead of the response status,
         which is right for what a Response reports and wrong for a truncated turn.
@@ -1047,42 +1031,40 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         Every remaining status is a run that stopped short of a turn, which is UnfinishedTurn
         naming the status.
         """
-        usage = _normalized_usage(response, pricing=self._adapter.pricing)
         if response.status == "failed":
-            return _provider_failure(response, usage=usage)
+            return _provider_failure(response, assistant_message=assistant_message)
         if _normalized_stop_reason(response) == "refusal":
-            return Refusal(usage=usage, usage_raw=response.usage)
+            return Refusal(assistant_message=assistant_message)
         if (
             response.status == "incomplete"
             and response.incomplete_details is not None
             and response.incomplete_details.reason == "max_output_tokens"
         ):
-            return MaxCompletionTokensExceeded(usage=usage, usage_raw=response.usage)
+            return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if response.status == "completed":
             if validation_error is not None:
                 return SchemaViolation(
                     validation_error_json=validation_error.json(include_url=False),
-                    usage=usage,
-                    usage_raw=response.usage,
+                    assistant_message=assistant_message,
                 )
-            return EmptyTurn(usage=usage, usage_raw=response.usage)
+            return EmptyTurn(assistant_message=assistant_message)
         return UnfinishedTurn(
             reason=f"openai returned status {response.status!r}",
-            usage=usage,
-            usage_raw=response.usage,
+            assistant_message=assistant_message,
         )
 
-    def _parsed_output(self, response: OpenAIResponse) -> ModelT | None | NoOutputOutcome:
+    def _parsed_output(
+        self, response: OpenAIResponse, assistant_message: AssistantMessage
+    ) -> ModelT | None | NoOutputOutcome:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
-        Validating here rather than in the SDK is what puts the response, its usage, and its text in
-        scope when the text is rejected: the member returned for a rejection carries this attempt's
-        billing, where a raise from inside the SDK carries none.
+        Validating here rather than in the SDK is what puts the response and its text in scope when
+        the text is rejected: the member returned for a rejection is one the retry loop can place
+        against the attempt it already recorded, where a raise from inside the SDK is not.
 
         A failed status is rejected even when the text validates: the run did not finish, and
         response.error names why, so an instance built from the fragment it had emitted would be
-        presented as the answer. _no_instance reports it as the failure member _provider_failure
-        chose, so the attempt is paid for either way.
+        presented as the answer. _no_instance reports it as the failure member _provider_failure chose.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
         message carries, so a turn whose text is not the instance yields no instance without anything
@@ -1098,16 +1080,38 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
                 validation_error = rejection
         if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
             return None
-        return self._no_instance(response, validation_error)
+        return self._no_instance(response, validation_error, assistant_message)
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[ModelT | None]:
-        """Send one non-streaming request via responses.create, then validate the turn's text.
+    def usage_from_raw(self, raw: BaseModel) -> Usage:
+        """Price the response's counters at the tier it reports.
 
-        A turn yielding neither an instance nor a tool call returns the NoOutputOutcome member
-        _parsed_output chose. InvalidRequest never arrives: this adapter sends every conversation.
+        Raises:
+            TypeError: raw is not an openai Response.
         """
-        response = await self._adapter.client.responses.create(
+        return _normalized_usage(_as_response(raw), pricing=self._adapter.pricing)
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
+        """Validate the turn's text into the instance, or report why the response produced none.
+
+        Raises:
+            TypeError: raw is not an openai Response.
+        """
+        response = _as_response(raw)
+        assistant_message = _assistant_message_from(response)
+        output = self._parsed_output(response, assistant_message)
+        if isinstance(output, NoOutput):
+            return output
+        return _adapter_result(response, output, assistant_message)
+
+    @override
+    async def send(self, conversation: Sequence[Message]) -> OpenAIResponse:
+        """Send one non-streaming request via responses.create.
+
+        The return type omits InvalidRequest: this adapter sends every conversation.
+        """
+        return await self._adapter.client.responses.create(
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
@@ -1123,17 +1127,9 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             input=[*self._request.input_prefix, *_wire_input(conversation)],
             text=self._text,
         )
-        output = self._parsed_output(response)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(
-            response=response,
-            output=output,
-            pricing=self._adapter.pricing,
-        )
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream[ModelT | None]:
+    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
         """Open one streaming request; connection failures raise here."""
         manager = self._adapter.client.responses.stream(
             model=self._request.model,
@@ -1152,8 +1148,4 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             text=self._text,
         )
         sdk_stream = await manager.__aenter__()
-        return _OpenAIStream(
-            sdk_stream=sdk_stream,
-            pricing=self._adapter.pricing,
-            output_from_response=self._parsed_output,
-        )
+        return _OpenAIStream(sdk_stream=sdk_stream)

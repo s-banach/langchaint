@@ -17,7 +17,12 @@ import anthropic
 import anthropic.types as at
 import httpx
 import pytest
-from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
+from anthropic import (
+    AsyncAnthropic,
+    AsyncAnthropicBedrock,
+    AsyncAnthropicBedrockMantle,
+    transform_schema,
+)
 from anthropic.lib.streaming import (
     AsyncMessageStream,
     ParsedContentBlockStopEvent,
@@ -25,7 +30,7 @@ from anthropic.lib.streaming import (
 )
 from anthropic.types import MessageParam, ParsedMessage
 from anthropic.types.parsed_message import ParsedTextBlock
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     LLM,
@@ -52,6 +57,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     UnfinishedTurn,
 )
 from langchaint.anthropic import (
@@ -931,16 +937,18 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     )
 
 
-def _parsed_message(
-    parsed_output: _StructuredReport | None,
+_REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
+"""Text that validates into _StructuredReport."""
+
+
+def _structured_message(
+    text: str | None,
     stop_reason: at.StopReason | None = "end_turn",
-) -> ParsedMessage[_StructuredReport]:
-    """Build the SDK parse result whose first text block carries the given parsed output."""
-    return ParsedMessage[_StructuredReport](
+) -> at.Message:
+    """Build a message whose first text block carries the given text; None gives no text block."""
+    return at.Message(
         id="msg_1",
-        content=[
-            ParsedTextBlock[_StructuredReport](type="text", text="{}", parsed_output=parsed_output)
-        ],
+        content=[at.TextBlock(type="text", text=text)] if text is not None else [],
         model="claude-sonnet-5",
         role="assistant",
         stop_reason=stop_reason,
@@ -949,23 +957,102 @@ def _parsed_message(
     )
 
 
-def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
-    """The structured bound adapter hands back the SDK-parsed response_format instance as content."""
-    report = _StructuredReport(city="Nairobi", celsius=25)
-    assert _structured_bound()._parsed_output(_parsed_message(report)) == report
+def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config() -> None:
+    """output_config carries the schema messages.parse(output_format=Model) would have sent, beside the bound effort.
+
+    The adapter sends the schema itself so it can validate the response text in its own frame; this
+    is what keeps the request unchanged by that move, the binding's own effort key included.
+    """
+    adapted_type: TypeAdapter[_StructuredReport] = TypeAdapter(_StructuredReport)
+    assert _structured_bound()._output_config == {
+        "effort": "high",
+        "format": {"schema": transform_schema(adapted_type.json_schema()), "type": "json_schema"},
+    }
 
 
-def test_structured_bind_reports_empty_turn_without_parsed_output() -> None:
-    """An end_turn with no parsed output and no tool call is EmptyTurn: the model said nothing."""
-    outcome = _structured_bound()._parsed_output(_parsed_message(None))
+def test_both_structured_request_paths_send_the_output_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send and open_stream both put the precomputed output_config on the request.
+
+    A path that sent the binding's own output_config instead would ask for no schema at all, and
+    every turn would come back as prose the response_format rejects, reported as the caller's model
+    being wrong rather than as the request that omitted its schema.
+    """
+    structured_bound = _structured_bound()
+    output_configs: list[object] = []
+
+    async def fake_create(**request_kwargs: object) -> at.Message:
+        output_configs.append(request_kwargs["output_config"])
+        return _structured_message(_REPORT_JSON)
+
+    class _FakeStreamManager:
+        async def __aenter__(self) -> _FakeSDKMessageStream:
+            return _FakeSDKMessageStream([], _message_snapshot("end_turn"))
+
+    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
+        output_configs.append(request_kwargs["output_config"])
+        return _FakeStreamManager()
+
+    messages_resource = structured_bound._adapter.client.messages
+    monkeypatch.setattr(messages_resource, "create", fake_create)
+    monkeypatch.setattr(messages_resource, "stream", fake_stream)
+
+    async def scenario() -> None:
+        conversation = [UserMessage(content="q")]
+        await structured_bound.send(conversation)
+        await structured_bound.open_stream(conversation)
+
+    asyncio.run(scenario())
+    assert output_configs == [structured_bound._output_config] * 2
+
+
+def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
+    """The structured bound adapter validates the turn's text block into the response_format."""
+    outcome = _structured_bound()._parsed_output(_structured_message(_REPORT_JSON))
+    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+
+
+def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
+    """An end_turn with no text block and no tool call is EmptyTurn: the model said nothing."""
+    outcome = _structured_bound()._parsed_output(_structured_message(None))
     assert isinstance(outcome, EmptyTurn)
     # The 200's billing rides on the member so the attempt record is not zero.
     assert outcome.usage.cost_in_usd > 0.0
 
 
+def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
+    """A finished turn whose text the response_format rejects is SchemaViolation, carrying its billing.
+
+    validation_error_json names the rejected field, what rejected it, and the value, which is what
+    tells a caller whether to change the model or the prompt.
+    """
+    outcome = _structured_bound()._parsed_output(
+        _structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}')
+    )
+    assert isinstance(outcome, SchemaViolation)
+    rejections = json.loads(outcome.validation_error_json)
+    assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
+    assert rejections[0]["input"] == "SENTINEL"
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
+    """A max_tokens turn whose JSON stopped mid-object is the truncation, not a schema violation.
+
+    This is the response the SDK's own parse raised on, losing the 200 and its billing; the member
+    carries both, and the item fails with MaxCompletionTokensExceededError.
+    """
+    outcome = _structured_bound()._parsed_output(
+        _structured_message('{"city": "Nair', stop_reason="max_tokens")
+    )
+    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
 def test_structured_bind_reports_refusal_on_a_refusal_stop_reason() -> None:
-    """A refusal stop_reason with no parsed output is Refusal, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="refusal"))
+    """A refusal stop_reason with no instance is Refusal, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(_structured_message(None, stop_reason="refusal"))
     assert isinstance(outcome, Refusal)
     assert outcome.usage.cost_in_usd > 0.0
 
@@ -973,8 +1060,10 @@ def test_structured_bind_reports_refusal_on_a_refusal_stop_reason() -> None:
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_stop_reason() -> (
     None
 ):
-    """A max_tokens stop_reason with no parsed output is MaxCompletionTokensExceeded, carrying its billing."""
-    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
+    """A max_tokens stop_reason with no text is MaxCompletionTokensExceeded, carrying its billing."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_message(None, stop_reason="max_tokens")
+    )
     assert isinstance(outcome, MaxCompletionTokensExceeded)
     assert outcome.usage.cost_in_usd > 0.0
 
@@ -982,14 +1071,23 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_
 def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
     """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
     assert (
-        _structured_bound()._parsed_output(_parsed_message(None, stop_reason="tool_use")) is None
+        _structured_bound()._parsed_output(_structured_message(None, stop_reason="tool_use"))
+        is None
     )
+
+
+def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_as_none() -> None:
+    """A tool_use turn whose text block is prose is the tool call, not a schema violation."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_message("let me look that up", stop_reason="tool_use")
+    )
+    assert outcome is None
 
 
 def test_structured_bind_reports_context_window_exceeded_on_the_overflow_stop_reason() -> None:
     """model_context_window_exceeded is ContextWindowExceeded, not a resend of a request too long to serve."""
     outcome = _structured_bound()._parsed_output(
-        _parsed_message(None, stop_reason="model_context_window_exceeded")
+        _structured_message(None, stop_reason="model_context_window_exceeded")
     )
     assert isinstance(outcome, ContextWindowExceeded)
     assert outcome.usage.cost_in_usd > 0.0
@@ -997,7 +1095,9 @@ def test_structured_bind_reports_context_window_exceeded_on_the_overflow_stop_re
 
 def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
     """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
-    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="pause_turn"))
+    outcome = _structured_bound()._parsed_output(
+        _structured_message(None, stop_reason="pause_turn")
+    )
     assert isinstance(outcome, UnfinishedTurn)
     assert "pause_turn" in outcome.reason
     assert outcome.usage.cost_in_usd > 0.0
@@ -1005,7 +1105,15 @@ def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_rea
 
 def test_structured_bind_reports_a_null_stop_reason_as_unfinished() -> None:
     """A message with no stop reason is not a finished turn, so its content is not the answer."""
-    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason=None))
+    outcome = _structured_bound()._parsed_output(_structured_message(None, stop_reason=None))
+    assert isinstance(outcome, UnfinishedTurn)
+
+
+def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation() -> None:
+    """A paused turn whose text is not the instance is the pause, which langchaint cannot continue."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_message("partial thought", stop_reason="pause_turn")
+    )
     assert isinstance(outcome, UnfinishedTurn)
 
 

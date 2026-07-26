@@ -1,17 +1,18 @@
 """Adapter for the OpenAI Responses API over the official SDK.
 
 Verified against openai 2.45.0:
-- `responses.parse(text_format=Model)` returns `ParsedResponse[Model]`;
-  `output_parsed` is the instance from the last message output.
+- A structured binding sends `text.format` built by `type_to_text_format_param(Model)`, the same
+  `text` parameter `responses.parse(text_format=Model)` builds, and validates the response text itself.
+  The SDK validates inside `parse`, and inside the stream on `response.output_text.done` while its
+  terminal response is still unset, so a rejection raised there reaches langchaint with neither the
+  response nor its billing attached.
+  `type_to_text_format_param` lives in `openai.lib._parsing._responses`, a private module, so an SDK
+  upgrade can move it; `tests/test_provider_facts.py` pins the import.
 - `responses.stream(...)` returns a manager whose entered stream yields typed events and assembles the response.
   Usage and status arrive on the terminal `response.completed`, `response.incomplete`,
   or `response.failed` event's response;
   the adapter captures that response itself because the SDK's `get_final_response()`
   raises RuntimeError unless the terminal event is `response.completed`.
-  Only the `response.completed` event carries a `ParsedResponse`: the SDK parses that one event's
-  response and passes the `response.incomplete` and `response.failed` responses through as it built
-  them. A terminal response that is not a `ParsedResponse` therefore parsed nothing, which is what
-  the structured path classifies (refusal, token-cap truncation, or transient).
 - `prompt_cache_options` controls caching per request. Its own and its `mode` field's SDK docstrings
   state the caching rules this adapter is built on: the parameter is supported on gpt-5.6 and later;
   `{"mode": "explicit"}` with no explicit breakpoints disables caching;
@@ -89,6 +90,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
 
 import openai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI, Omit, omit
+from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
@@ -101,12 +103,12 @@ from openai.types.responses import (
     ResponseInputTextContentParam,
     ResponseInputTextParam,
     ResponseReasoningItem,
+    ResponseTextConfigParam,
     ToolChoiceFunctionParam,
 )
 from openai.types.responses import (
     Response as OpenAIResponse,
 )
-from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response_create_params import PromptCacheOptions
 from openai.types.responses.response_input_param import (
     FunctionCallOutput,
@@ -114,7 +116,7 @@ from openai.types.responses.response_input_param import (
     ResponseInputItemParam,
 )
 from openai.types.shared_params.reasoning import Reasoning
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
     from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
@@ -132,6 +134,7 @@ from langchaint.adapter import (
     NoOutputOutcome,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
@@ -398,6 +401,21 @@ def _has_refusal(response: OpenAIResponse) -> bool:
         if item.type == "message"
         for content_part in item.content
     )
+
+
+def _first_output_text(response: OpenAIResponse) -> str | None:
+    """Return the text of the turn's first output_text content part, None when it holds none.
+
+    The part a structured turn's instance is validated from. Reading the first part matches what the
+    SDK's own parse yields for every response it does not raise on: it validates every output_text
+    part and returns the first instance, so a response whose first part is not the instance raises there.
+    """
+    for item in response.output:
+        if item.type == "message":
+            for content_part in item.content:
+                if content_part.type == "output_text":
+                    return content_part.text
+    return None
 
 
 def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
@@ -704,7 +722,7 @@ class OpenAIResponsesAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output parsed by the SDK; pure conversion, no I/O."""
+        """Bind for structured output validated into response_format; pure conversion, no I/O."""
         return _BoundOpenAIStructured(
             adapter=self,
             request=self._request(binding),
@@ -910,7 +928,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
 
 
 class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
-    """Structured-bound adapter: output is the SDK-parsed response_format instance."""
+    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
 
     def __init__(
         self,
@@ -919,12 +937,26 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         request: _OpenAIRequest,
         response_format: type[ModelT],
     ) -> None:
+        """Precompute the request's text parameter, the JSON-schema format this binding asks for.
+
+        The format is built by the same type_to_text_format_param call responses.parse makes, so the
+        request carries what passing text_format would have sent.
+        """
         self._adapter = adapter
         self._request = request
         self._response_format = response_format
+        self._text: ResponseTextConfigParam = {
+            "format": type_to_text_format_param(response_format)
+        }
 
-    def _no_instance(self, response: OpenAIResponse) -> NoOutputOutcome:
+    def _no_instance(
+        self, response: OpenAIResponse, validation_error: ValidationError | None
+    ) -> NoOutputOutcome:
         """Report why the turn produced no instance and no tool call.
+
+        validation_error is pydantic's rejection of the turn's text, None when the turn carried no
+        text to validate. On a completed turn the two answers are SchemaViolation and EmptyTurn;
+        everywhere else the status names the failure and the rejection adds nothing.
 
         Each NoOutputOutcome member carries this attempt's billing (usage with cost_in_usd inside, and
         the raw SDK usage object) so a 200 that produced no output does not lose its cost.
@@ -937,8 +969,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         response Refusal here and Unparsed on the text binding, which reads the same status first.
         A content-filtered response reaches Refusal through the stop reason, so it fails the
         item once instead of being retried at full price for an outcome that will not change.
-        EmptyTurn is tested on the completed status alone, so a status reporting that the run
-        never finished cannot be reported as a turn that finished and said nothing.
+        The completed status is what SchemaViolation and EmptyTurn are tested on, so a status
+        reporting that the run never finished cannot be reported as a turn that finished.
         """
         usage = _normalized_usage(response, pricing=self._adapter.pricing)
         if response.status == "failed":
@@ -952,49 +984,51 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         ):
             return MaxCompletionTokensExceeded(usage=usage, usage_raw=response.usage)
         if response.status == "completed":
+            if validation_error is not None:
+                return SchemaViolation(
+                    validation_error_json=validation_error.json(include_url=False),
+                    usage=usage,
+                    usage_raw=response.usage,
+                )
             return EmptyTurn(usage=usage, usage_raw=response.usage)
         return Unparsed(usage=usage, usage_raw=response.usage)
 
-    def _parsed_output(self, response: ParsedResponse[ModelT]) -> ModelT | None | NoOutputOutcome:
-        """Extract the parsed instance, report a tool-call turn as None, or report why neither exists.
+    def _parsed_output(self, response: OpenAIResponse) -> ModelT | None | NoOutputOutcome:
+        """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
-        A failed status is rejected even when the JSON parsed: the run did not finish, and
+        Validating here rather than in the SDK is what puts the response, its usage, and its text in
+        scope when the text is rejected: the member returned for a rejection carries this attempt's
+        billing, where a raise from inside the SDK carries none.
+
+        A failed status is rejected even when the text validates: the run did not finish, and
         response.error names why, so an instance built from the fragment it had emitted would be
         presented as the answer. _no_instance reports it as Unparsed, so the attempt is paid
         for and the retry loop sends another.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
-        message carries, so output_parsed is None without anything having gone wrong (openai 2.45.0).
-        The instance wins where a completed turn carries both, because a turn that produced the
-        instance answered the request whether or not it also called a tool.
+        message carries, so a turn whose text is not the instance yields no instance without anything
+        having gone wrong. The instance wins where a completed turn carries both, because a turn that
+        produced the instance answered the request whether or not it also called a tool.
         """
-        if response.status != "failed" and response.output_parsed is not None:
-            return response.output_parsed
+        validation_error: ValidationError | None = None
+        text = _first_output_text(response)
+        if response.status != "failed" and text is not None:
+            try:
+                return self._response_format.model_validate_json(text)
+            except ValidationError as rejection:
+                validation_error = rejection
         if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
             return None
-        return self._no_instance(response)
-
-    def _terminal_output(self, response: OpenAIResponse) -> ModelT | None | NoOutputOutcome:
-        """Extract the parsed instance from a stream's terminal response, or report why there is none.
-
-        Only a ParsedResponse holds a parsed instance, and the SDK builds one for the completed
-        response alone, so a terminal response of any other type parsed nothing. It can still be a
-        tool-call turn, which is a success carrying no instance, so both types take the same test.
-        """
-        if isinstance(response, ParsedResponse):
-            return self._parsed_output(response)
-        if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
-            return None
-        return self._no_instance(response)
+        return self._no_instance(response, validation_error)
 
     @override
     async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[ModelT | None]:
-        """Send one non-streaming request via responses.parse.
+        """Send one non-streaming request via responses.create, then validate the turn's text.
 
-        A parse yielding neither an instance nor a tool call returns the NoOutputOutcome member
+        A turn yielding neither an instance nor a tool call returns the NoOutputOutcome member
         _parsed_output chose. InvalidRequest never arrives: this adapter sends every conversation.
         """
-        response = await self._adapter.client.responses.parse(
+        response = await self._adapter.client.responses.create(
             model=self._request.model,
             instructions=self._request.instructions,
             max_output_tokens=self._request.max_output_tokens,
@@ -1008,7 +1042,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
-            text_format=self._response_format,
+            text=self._text,
         )
         output = self._parsed_output(response)
         if isinstance(output, NoOutput):
@@ -1036,11 +1070,11 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             include=self._request.include,
             store=False,
             input=[*self._request.input_prefix, *_wire_input(conversation)],
-            text_format=self._response_format,
+            text=self._text,
         )
         sdk_stream = await manager.__aenter__()
         return _OpenAIStream(
             sdk_stream=sdk_stream,
             pricing=self._adapter.pricing,
-            output_from_response=self._terminal_output,
+            output_from_response=self._parsed_output,
         )

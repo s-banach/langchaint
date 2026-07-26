@@ -31,6 +31,7 @@ from langchaint import (
     RefusalError,
     Response,
     RetriesExhaustedError,
+    SchemaViolationError,
     StreamItem,
     StreamProtocolError,
     TextPart,
@@ -58,6 +59,7 @@ from langchaint.adapter import (
     NoOutputOutcome,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     UnfinishedTurn,
     Unparsed,
 )
@@ -187,6 +189,30 @@ class _UnfinishedTurnStream(_FakeStream):
         """Report the unfinished turn instead of assembling a result, carrying this attempt's billing."""
         return UnfinishedTurn(
             reason="anthropic returned stop_reason 'pause_turn'",
+            usage=_USAGE_BILLED,
+            usage_raw=_FAKE_RAW_USAGE,
+        )
+
+
+_VALIDATION_ERROR_JSON = (
+    '[{"type":"value_error","loc":["celsius"],'
+    '"msg":"Value error, SENTINEL is not a temperature","input":"SENTINEL"}]'
+)
+"""A pydantic rejection whose msg embeds the rejected value, as a caller's field_validator writes it."""
+
+
+class _SchemaViolationStream(_FakeStream):
+    """A stream that yields items normally but whose assembled text the response_format rejects.
+
+    Mirrors an adapter that validates the assembled message in AdapterStream.final() and gets a
+    rejection, reporting SchemaViolation with what pydantic rejected.
+    """
+
+    @override
+    async def final(self) -> ResponseOutcome[str]:
+        """Report the rejection instead of assembling a result, carrying this attempt's billing."""
+        return SchemaViolation(
+            validation_error_json=_VALIDATION_ERROR_JSON,
             usage=_USAGE_BILLED,
             usage_raw=_FAKE_RAW_USAGE,
         )
@@ -740,6 +766,42 @@ def test_empty_turn_outcome_from_send_raises_row_shaped_without_retry() -> None:
         failure = empty_turn.value
         assert failure.attempts == 1
         assert failure.stop_reason == "end_turn"
+        assert failure.usage.cost_in_usd == 0.25
+
+    asyncio.run(scenario())
+
+
+def test_schema_violation_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """A SchemaViolation outcome fails the item, and pydantic's rejection travels on the error.
+
+    Never retried: the turn completed, so nothing about the attempt was transient.
+    error_text carries none of the rejection, whose msg embeds the value a caller's own validator
+    rejected; the tracing layer writes error_text into every span whatever capture_message_content
+    the caller chose.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send reports SchemaViolation."""
+        adapter = _FakeAdapter(
+            failures=[
+                SchemaViolation(
+                    validation_error_json=_VALIDATION_ERROR_JSON,
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(SchemaViolationError) as schema_violation:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = schema_violation.value
+        assert failure.attempts == 1
+        assert failure.stop_reason == "end_turn"
+        assert failure.validation_error_json == _VALIDATION_ERROR_JSON
+        assert "SENTINEL" not in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
@@ -2180,6 +2242,33 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
         failure = unfinished_turn.value
         assert failure.attempts == 1
         assert "pause_turn" in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
+        (record,) = failure.attempt_records
+        assert record.error is None
+
+    asyncio.run(scenario())
+
+
+def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
+    """A SchemaViolation from the stream's final() fails the call, carrying pydantic's rejection.
+
+    The stream loop builds this error separately from the generate loop, so the rejection must
+    survive the trip through both, and stay out of error_text on both.
+    """
+
+    async def scenario() -> None:
+        """Drain a stream whose final() reports SchemaViolation, then read the raised error."""
+        adapter = _FakeAdapter(stream=_SchemaViolationStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(SchemaViolationError) as schema_violation:
+                await handle.final()
+        failure = schema_violation.value
+        assert failure.attempts == 1
+        assert failure.validation_error_json == _VALIDATION_ERROR_JSON
+        assert "SENTINEL" not in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
         (record,) = failure.attempt_records
         assert record.error is None

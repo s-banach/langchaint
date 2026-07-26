@@ -8,6 +8,7 @@ the zero-usage fallback when a response omits usage, and the precomputed request
 
 import asyncio
 import base64
+import json
 import math
 import re
 from collections.abc import AsyncIterator, Sequence
@@ -18,6 +19,7 @@ import openai
 import pytest
 from openai import AsyncOpenAI
 from openai._models import construct_type_unchecked
+from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import AsyncResponseStream, ResponseStreamEvent
 from openai.lib.streaming.responses import (
     ResponseTextDeltaEvent as AccumulatedResponseTextDeltaEvent,
@@ -31,14 +33,9 @@ from openai.types.responses import (
     ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
-    ResponseOutputRefusal,
     ResponseUsage,
 )
-from openai.types.responses.parsed_response import (
-    ParsedResponse,
-    ParsedResponseOutputMessage,
-    ParsedResponseOutputText,
-)
+from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails, ResponseStatus
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel, ValidationError
@@ -65,6 +62,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     Unparsed,
 )
 from langchaint.exceptions import StreamProtocolError
@@ -1041,93 +1039,132 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
     )
 
 
-def _parsed_response(
-    parsed: _StructuredReport | None,
+_REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
+"""Text that validates into _StructuredReport."""
+
+
+def _structured_response(
+    text: str | None,
     *,
     refusal: bool = False,
     status: ResponseStatus = "completed",
     incomplete_details: IncompleteDetails | None = None,
     usage: ResponseUsage | None = None,
     tool_call: bool = False,
-) -> ParsedResponse[_StructuredReport]:
-    """Build the SDK parse result whose message carries the parsed instance, or a refusal block.
+) -> OpenAIResponse:
+    """Build a response whose message carries the given output text, or a refusal block.
 
+    text None gives a message with no content at all, the turn that carried nothing to validate;
+    refusal replaces the text part with a refusal part.
     tool_call appends a function_call output item, which is what makes the turn a tool call.
     """
-    content = (
-        [ResponseOutputRefusal(type="refusal", refusal="I can't help with that")]
-        if refusal
-        else [
-            ParsedResponseOutputText[_StructuredReport](
-                type="output_text", text="{}", annotations=[], parsed=parsed
-            )
-        ]
+    content: list[object] = []
+    if refusal:
+        content.append({"type": "refusal", "refusal": "I can't help with that"})
+    elif text is not None:
+        content.append({"type": "output_text", "text": text, "annotations": []})
+    message: dict[str, object] = {
+        "id": "m1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message",
+        "content": content,
+    }
+    return _response(
+        usage=usage,
+        output=[message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])],
+        status=status,
+        incomplete_details=incomplete_details,
     )
-    message = ParsedResponseOutputMessage[_StructuredReport](
-        id="m1", role="assistant", status="completed", type="message", content=content
-    )
-    return ParsedResponse[_StructuredReport].model_validate({
-        "id": "r1",
-        "created_at": 0,
-        "model": "m",
-        "object": "response",
-        "output": [message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])],
-        "parallel_tool_calls": True,
-        "tool_choice": "auto",
-        "tools": [],
-        "status": status,
-        "incomplete_details": incomplete_details,
-        "usage": usage,
-    })
 
 
-def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
-    """The structured bound adapter hands back the SDK-parsed response_format instance as content."""
-    report = _StructuredReport(city="Nairobi", celsius=25)
-    assert _structured_bound()._parsed_output(_parsed_response(report)) == report
+def test_structured_bind_builds_the_schema_the_sdk_parse_helper_builds() -> None:
+    """The text parameter equals what responses.parse(text_format=Model) would have sent.
+
+    The adapter sends the schema itself so it can validate the response text in its own frame; this
+    is what keeps the request unchanged by that move.
+    """
+    assert _structured_bound()._text == {"format": type_to_text_format_param(_StructuredReport)}
 
 
-def test_structured_bind_reports_empty_turn_without_parsed_output() -> None:
-    """A completed response with no parsed instance and no tool call is EmptyTurn."""
-    outcome = _structured_bound()._parsed_output(_parsed_response(None))
+def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
+    """The structured bound adapter validates the turn's output text into the response_format."""
+    outcome = _structured_bound()._parsed_output(_structured_response(_REPORT_JSON))
+    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+
+
+def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
+    """A completed response with no text part and no tool call is EmptyTurn."""
+    outcome = _structured_bound()._parsed_output(_structured_response(None))
     assert isinstance(outcome, EmptyTurn)
+
+
+def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
+    """A completed turn whose text the response_format rejects is SchemaViolation, carrying its billing.
+
+    validation_error_json names the rejected field, what rejected it, and the value, which is what
+    tells a caller whether to change the model or the prompt.
+    """
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(
+            '{"city": "Nairobi", "celsius": "SENTINEL"}', usage=_usage_with_cache()
+        )
+    )
+    assert isinstance(outcome, SchemaViolation)
+    rejections = json.loads(outcome.validation_error_json)
+    assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
+    assert rejections[0]["input"] == "SENTINEL"
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
+    """An incomplete turn whose JSON stopped mid-object is the truncation, not a schema violation.
+
+    This is the response the SDK's own parse raised on, losing the 200 and its billing; the member
+    carries both, and the item fails with MaxCompletionTokensExceededError.
+    """
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(
+            '{"city": "Nair',
+            status="incomplete",
+            incomplete_details=IncompleteDetails(reason="max_output_tokens"),
+            usage=_usage_with_cache(),
+        )
+    )
+    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.usage.cost_in_usd > 0.0
 
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
     """A completed turn whose output is a function call parses no instance and nothing went wrong."""
-    assert _structured_bound()._parsed_output(_parsed_response(None, tool_call=True)) is None
+    assert _structured_bound()._parsed_output(_structured_response(None, tool_call=True)) is None
 
 
-def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
-    """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
-    report = _StructuredReport(city="Nairobi", celsius=25)
-    assert _structured_bound()._parsed_output(_parsed_response(report, tool_call=True)) == report
-
-
-def test_structured_stream_terminal_reports_a_tool_call_turn_as_none() -> None:
-    """The SDK parses only the completed event, so a tool-call terminal arrives as a plain Response.
-
-    It is still a success carrying no instance, so _terminal_output must take the same test the
-    parsed path takes rather than sending every unparsed terminal to a NoOutputOutcome.
-    """
-    outcome = _structured_bound()._terminal_output(
-        _response(usage=None, output=[_FUNCTION_CALL_OUTPUT_ITEM])
+def test_structured_bind_reports_a_tool_call_turn_whose_text_is_not_the_instance_as_none() -> None:
+    """A tool-call turn whose text is prose is the tool call, not a schema violation."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_response("let me look that up", tool_call=True)
     )
     assert outcome is None
 
 
-def test_structured_stream_terminal_reports_max_completion_tokens_exceeded_from_a_plain_response() -> (
-    None
-):
-    """A structured stream's incomplete terminal is MaxCompletionTokensExceeded, read off a response with no parse.
+def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
+    """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(_REPORT_JSON, tool_call=True)
+    )
+    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
-    The SDK parses only the completed event's response, so a terminal that stopped at the token cap
-    arrives as a plain Response. Handing it to _parsed_output would raise AttributeError on
-    output_parsed instead of reporting the truncation.
+
+def test_structured_stream_terminal_reports_max_completion_tokens_exceeded() -> None:
+    """A structured stream's incomplete terminal is MaxCompletionTokensExceeded.
+
+    The stream sends no text_format, so its terminal response is a plain Response on every status and
+    one function reads them all.
     """
-    outcome = _structured_bound()._terminal_output(
-        _response(
-            usage=None,
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(
+            None,
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
         )
@@ -1137,7 +1174,7 @@ def test_structured_stream_terminal_reports_max_completion_tokens_exceeded_from_
 
 def test_structured_stream_terminal_reports_a_failed_run_as_unparsed() -> None:
     """A structured stream's failed terminal is Unparsed, the same arm the text binding reports."""
-    outcome = _structured_bound()._terminal_output(_response(usage=None, status="failed"))
+    outcome = _structured_bound()._parsed_output(_structured_response(None, status="failed"))
     assert isinstance(outcome, Unparsed)
 
 
@@ -1175,12 +1212,10 @@ def test_text_bind_send_reports_a_failed_status_as_unparsed(
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_unparsed_on_a_failed_status_that_parsed() -> None:
-    """A failed run is Unparsed even when its fragment parsed: the fragment is not the answer."""
+def test_structured_bind_reports_unparsed_on_a_failed_status_whose_text_validates() -> None:
+    """A failed run is Unparsed even when its fragment validates: the fragment is not the answer."""
     outcome = _structured_bound()._parsed_output(
-        _parsed_response(
-            _StructuredReport(city="Paris", celsius=20), status="failed", usage=_usage_with_cache()
-        )
+        _structured_response(_REPORT_JSON, status="failed", usage=_usage_with_cache())
     )
     assert isinstance(outcome, Unparsed)
     assert outcome.usage.cost_in_usd > 0.0
@@ -1193,7 +1228,7 @@ def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> No
     RefusalError) for a response the text binding retries as Unparsed.
     """
     structured_outcome = _structured_bound()._parsed_output(
-        _parsed_response(None, refusal=True, status="failed", usage=_usage_with_cache())
+        _structured_response(None, refusal=True, status="failed", usage=_usage_with_cache())
     )
     assert isinstance(structured_outcome, Unparsed)
     text_outcome = _text_bound()._text_outcome(
@@ -1205,7 +1240,7 @@ def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> No
 def test_structured_bind_reports_refusal_on_a_refusal_block() -> None:
     """A response carrying a refusal content block is Refusal, carrying its billing."""
     outcome = _structured_bound()._parsed_output(
-        _parsed_response(None, refusal=True, usage=_usage_with_cache())
+        _structured_response(None, refusal=True, usage=_usage_with_cache())
     )
     assert isinstance(outcome, Refusal)
     assert outcome.usage.cost_in_usd > 0.0
@@ -1216,7 +1251,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_
 ):
     """An incomplete response for max_output_tokens is MaxCompletionTokensExceeded, carrying its billing."""
     outcome = _structured_bound()._parsed_output(
-        _parsed_response(
+        _structured_response(
             None,
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
@@ -1234,7 +1269,7 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
     and bill for each attempt.
     """
     outcome = _structured_bound()._parsed_output(
-        _parsed_response(
+        _structured_response(
             None,
             status="incomplete",
             incomplete_details=IncompleteDetails(reason="content_filter"),
@@ -1248,7 +1283,7 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
 def test_every_request_carries_the_reasoning_include(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """create, parse, and stream (text and structured) all send include=["reasoning.encrypted_content"].
+    """Create and stream, on both bindings, all send include=["reasoning.encrypted_content"].
 
     The offline round-trip tests cannot catch a dropped include:
     the SDK documents include as what populates encrypted_content,
@@ -1262,10 +1297,6 @@ def test_every_request_carries_the_reasoning_include(
         includes.append(request_kwargs["include"])
         return _response(usage=None)
 
-    async def fake_parse(**request_kwargs: object) -> ParsedResponse[_StructuredReport]:
-        includes.append(request_kwargs["include"])
-        return _parsed_response(_StructuredReport(city="Nairobi", celsius=25))
-
     class _FakeStreamManager:
         async def __aenter__(self) -> _FakeSDKStream:
             return _FakeSDKStream([])
@@ -1275,7 +1306,6 @@ def test_every_request_carries_the_reasoning_include(
         return _FakeStreamManager()
 
     monkeypatch.setattr(adapter.client.responses, "create", fake_create)
-    monkeypatch.setattr(adapter.client.responses, "parse", fake_parse)
     monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
     text_bound = _BoundOpenAIText(adapter=adapter, request=request)
     structured_bound = _BoundOpenAIStructured(
@@ -1291,6 +1321,46 @@ def test_every_request_carries_the_reasoning_include(
 
     asyncio.run(scenario())
     assert includes == [["reasoning.encrypted_content"]] * 4
+
+
+def test_both_structured_request_paths_send_the_text_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send and open_stream both put the precomputed text parameter on the request.
+
+    A path that dropped it would ask for no schema at all, and every turn would come back as prose
+    the response_format rejects, reported as the caller's model being wrong rather than as the
+    request that omitted its schema.
+    """
+    adapter = _adapter()
+    request = adapter._request(_binding(automatic_prompt_caching=True))
+    texts: list[object] = []
+
+    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
+        texts.append(request_kwargs["text"])
+        return _response(usage=None)
+
+    class _FakeStreamManager:
+        async def __aenter__(self) -> _FakeSDKStream:
+            return _FakeSDKStream([])
+
+    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
+        texts.append(request_kwargs["text"])
+        return _FakeStreamManager()
+
+    monkeypatch.setattr(adapter.client.responses, "create", fake_create)
+    monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
+    structured_bound = _BoundOpenAIStructured(
+        adapter=adapter, request=request, response_format=_StructuredReport
+    )
+
+    async def scenario() -> None:
+        conversation = [UserMessage(content="q")]
+        await structured_bound.send(conversation)
+        await structured_bound.open_stream(conversation)
+
+    asyncio.run(scenario())
+    assert texts == [{"format": type_to_text_format_param(_StructuredReport)}] * 2
 
 
 def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:

@@ -4,7 +4,7 @@ A StreamHandle is three things at once: an async iterator of stream items (text 
 the source of the assembled Response via final(),
 and an async context manager whose entry opens the request and whose exit closes it.
 A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
-Assembly and structured-output parsing live in the SDK behind AdapterStream.final();
+Assembling the turn and reading what it produced live behind AdapterStream.final();
 the handle owns retry, pacing, and accounting.
 Connection failures before the first yielded item are retried under the RateLimiter;
 after the first yielded item nothing is retried,
@@ -33,6 +33,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     StreamItem,
     UnfinishedTurn,
     Unparsed,
@@ -46,6 +47,7 @@ from langchaint.exceptions import (
     MaxCompletionTokensExceededError,
     RefusalError,
     RetriesExhaustedError,
+    SchemaViolationError,
     StreamProtocolError,
     TransientError,
     UnfinishedTurnError,
@@ -425,7 +427,7 @@ class StreamHandle[OutputT]:
         method produced it, a caller's own iteration produced it, or the adapter stream raised it.
         Every later call returns or raises it again without asking the adapter stream anything.
         Without that store, a second call would append a second AttemptRecord for the one request made.
-        A 200 that produced no output is detected only here, when the SDK parses the assembled
+        A 200 that produced no output is detected only here, when the adapter reads the assembled
         message: the adapter reports which one it was and this method builds the GenerationError from
         it, without retrying (the stream already yielded items to the caller);
         it reaches the caller carrying the attempt records this handle built.
@@ -441,6 +443,7 @@ class StreamHandle[OutputT]:
                 carrying this handle's attempt records.
             MaxCompletionTokensExceededError: the adapter reported it as MaxCompletionTokensExceeded; likewise.
             EmptyTurnError: the adapter reported it as EmptyTurn; likewise.
+            SchemaViolationError: the adapter reported it as SchemaViolation; likewise.
             ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
             UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
             TransientError: the adapter reported it as Unparsed; not retried, because the stream
@@ -510,6 +513,12 @@ class StreamHandle[OutputT]:
                 return EmptyTurnError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
                 )
+            case SchemaViolation():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return SchemaViolationError(
+                    validation_error_json=outcome.validation_error_json,
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                )
             case ContextWindowExceeded():
                 self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return ContextWindowExceededError(
@@ -536,6 +545,7 @@ class StreamHandle[OutputT]:
         | Refusal
         | MaxCompletionTokensExceeded
         | EmptyTurn
+        | SchemaViolation
         | ContextWindowExceeded
         | UnfinishedTurn,
         ended_at_monotonic_seconds: float,

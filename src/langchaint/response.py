@@ -35,7 +35,7 @@ _logger = logging.getLogger("langchaint.response")
 class Response[OutputT](_CallCarrier):
     """One successful generate result.
 
-    output is the assistant text, or the SDK-parsed response_format instance.
+    output is the assistant text, or the response_format instance validated from the turn's text.
     It is None when the turn parsed no instance, which on a structured tool-bound binding means the model called tools.
     Only that binding types output optional, so no other caller has a None to handle.
     A turn can both parse an instance and call tools, setting output and tool_calls at once.

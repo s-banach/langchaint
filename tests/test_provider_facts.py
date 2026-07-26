@@ -27,6 +27,7 @@ from anthropic.types import Message as AnthropicMessage
 from anthropic.types import Usage as AnthropicUsage
 from anthropic.types.cache_creation import CacheCreation
 from anthropic.types.output_tokens_details import OutputTokensDetails as AnthropicOutputDetails
+from openai.lib._parsing._responses import type_to_text_format_param
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import (
     ResponseInputImageContentParam,
@@ -300,6 +301,19 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
         assert type(error) is error_class, status_code
     unlisted = client._make_status_error("boom", body=None, response=_response_with(451, {}))
     assert type(unlisted) is anthropic.APIStatusError
+
+
+def test_the_schema_builders_both_adapters_call_are_still_where_they_were() -> None:
+    """Both adapters build the structured request's schema themselves, with these two SDK calls.
+
+    Each adapter imports its own at module top, so an SDK that moves either breaks importing that
+    backend subpackage. Naming both here says which symbol moved, and openai's is the likelier to
+    move: it lives in openai.lib._parsing._responses, a private module.
+    Each adapter's own test file pins that its binding sends what these calls return.
+    """
+    assert "transform_schema" in anthropic.__all__
+    assert callable(anthropic.transform_schema)
+    assert callable(type_to_text_format_param)
 
 
 def test_the_cache_breakpoint_keys_both_adapters_write_still_exist() -> None:

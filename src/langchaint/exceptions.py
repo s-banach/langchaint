@@ -14,7 +14,8 @@ bind time instead, before any request is sent.
 TransientError is a per-attempt control signal.
 The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, EmptyTurnError,
-ContextWindowExceededError, UnfinishedTurnError, InvalidRequestError, and UnrecognizedError.
+SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError, InvalidRequestError, and
+UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
@@ -104,6 +105,8 @@ class GenerationError(_CallCarrier, Exception):
     RefusalError (no structured output: the model refused or a provider filter blocked the turn),
     MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed),
     EmptyTurnError (the model finished the turn and produced nothing),
+    SchemaViolationError (the model finished the turn and its text is not an instance of the
+    bound response_format),
     ContextWindowExceededError (the conversation overflowed the model's context window),
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending), and
@@ -137,10 +140,10 @@ class GenerationError(_CallCarrier, Exception):
 
     @property
     def stop_reason(self) -> StopReason | None:
-        """None: no turn completed. Four subclasses override it, because a turn did.
+        """None: no turn completed. Five subclasses override it, because a turn did.
 
-        RefusalError, MaxCompletionTokensExceededError, EmptyTurnError, and ContextWindowExceededError
-        each fix their own value; every other subclass inherits None.
+        RefusalError, MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError, and
+        ContextWindowExceededError each fix their own value; every other subclass inherits None.
 
         Fixed by the class rather than taken as a constructor argument, because a raise site must
         not choose a value the subclass already fixes. to_row and gen_ai_attributes both read it
@@ -263,6 +266,38 @@ class EmptyTurnError(GenerationError):
     @override
     def _summary(self) -> str:
         return "the model completed its turn without producing output"
+
+
+class SchemaViolationError(GenerationError):
+    """The model finished its turn and its text is not an instance of the bound response_format.
+
+    Fires only on the structured path; a text binding returns the same turn's text as its output.
+    Not retried: the turn completed on the terms it reports, so nothing about the attempt was
+    transient.
+    The fix is a model the schema can express, or validation moved out of the model and into the
+    caller's own code, where a rejected turn is data rather than a failed generation.
+
+    validation_error_json is pydantic's rejection as JSON, the rejected values included.
+    None of it is in the message: pydantic writes the caller's own validator text into each msg, so a
+    validator naming the value it rejected would put generated content in every span.
+    """
+
+    validation_error_json: str
+
+    def __init__(self, *, validation_error_json: str, call: CallRecord) -> None:
+        """Store what the validation rejected, then the call."""
+        self.validation_error_json = validation_error_json
+        super().__init__(call=call)
+
+    @property
+    @override
+    def stop_reason(self) -> Literal["end_turn"]:
+        """The provider completed the turn; what it wrote is not the bound model."""
+        return "end_turn"
+
+    @override
+    def _summary(self) -> str:
+        return "the turn's text is not an instance of the bound response_format"
 
 
 class ContextWindowExceededError(GenerationError):

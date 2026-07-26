@@ -27,6 +27,7 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     Refusal,
+    SchemaViolation,
     ToolChoice,
     UnfinishedTurn,
     Unparsed,
@@ -40,6 +41,7 @@ from langchaint.exceptions import (
     MaxCompletionTokensExceededError,
     RefusalError,
     RetriesExhaustedError,
+    SchemaViolationError,
     TransientError,
     UnfinishedTurnError,
     UnrecognizedError,
@@ -268,8 +270,8 @@ class LLM:
     ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
 
-        response_format=Model gives BoundLLM[Model] whose output is the SDK-parsed instance;
-        absent gives BoundLLM[str] whose output is the assistant text.
+        response_format=Model gives BoundLLM[Model] whose output is a validated Model.
+        Absent, bind gives BoundLLM[str] whose output is the assistant text.
         Passing a tool_manager gives the HasTools form, whose structured request methods type output
         as optional because a tool-call turn parses no instance; see BoundLLM.
         A caller holding a ToolManager | None gets the union of the two forms, whose request methods
@@ -577,6 +579,9 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                 response hit the token cap); terminal for this item, without a retry.
             EmptyTurnError: the adapter reported an EmptyTurn attempt (the model finished and produced
                 nothing); terminal for this item, without a retry.
+            SchemaViolationError: the adapter reported a SchemaViolation attempt (the model finished
+                and its text is not an instance of the bound response_format); terminal for this
+                item, without a retry.
             ContextWindowExceededError: the adapter reported a ContextWindowExceeded attempt;
                 terminal for this item, without a retry.
             UnfinishedTurnError: the adapter reported an UnfinishedTurn attempt (a 200 langchaint
@@ -628,6 +633,15 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                                 error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
                             )
                             raise EmptyTurnError(call=ledger.freeze())
+                        case SchemaViolation():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise SchemaViolationError(
+                                validation_error_json=outcome.validation_error_json,
+                                call=ledger.freeze(),
+                            )
                         case ContextWindowExceeded():
                             self.rate_limiter.register_success(admission)
                             ledger.record(
@@ -695,8 +709,8 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         Every non-success outcome propagates, all of them sharing the GenerationError base a caller
         can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
         rejected request, UnrecognizedError on an unrecognized error, and one of RefusalError,
-        MaxCompletionTokensExceededError, EmptyTurnError, ContextWindowExceededError, or
-        UnfinishedTurnError on a 200 that produced no output.
+        MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError,
+        ContextWindowExceededError, or UnfinishedTurnError on a 200 that produced no output.
         _generate_with_retries names the condition for each.
 
         abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's

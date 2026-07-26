@@ -3,9 +3,10 @@
 An adapter wraps one official SDK client and is the only place provider knowledge lives:
 converting the binding to SDK keyword arguments, sending, translating stream events, normalizing usage, computing cost,
 and classifying errors.
-Adapters delegate stream assembly and structured-output parsing to the SDK
-(`get_final_response` / `get_final_message`), which is generic in the response format,
-so the output type flows from the SDK to the caller without reconstruction.
+Adapters delegate stream assembly to the SDK and validate a structured response's text themselves:
+the SDKs validate inside the call that returns the response, where a rejection reaches the caller as
+an exception carrying neither the response nor its billing, and an adapter that validates in its own
+frame answers a rejection with a member carrying both.
 
 Reporting model: an adapter reports one attempt; only the retry loop knows the call.
 So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
@@ -193,7 +194,8 @@ class Binding:
 class AdapterResult[OutputT]:
     """One successful provider turn, normalized to langchaint terms.
 
-    output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
+    output is the assistant text (text bindings) or the response_format instance validated from the
+    turn's text (structured bindings).
     A structured binding's output is None when the turn parsed no instance, which here means the model
     called tools: the calls are on assistant_message, and no failure occurred.
     A turn can both parse an instance and call tools, so tool_calls is what says whether a tool result
@@ -248,6 +250,24 @@ class MaxCompletionTokensExceeded(NoOutput):
     The retry loop records the attempt and fails the item with a MaxCompletionTokensExceededError,
     without retrying.
     """
+
+
+@dataclass(frozen=True, kw_only=True)
+class SchemaViolation(NoOutput):
+    """A completed turn whose text is not an instance of the binding's response_format.
+
+    The retry loop records the attempt and fails the item with a SchemaViolationError, without
+    retrying: the turn completed, so nothing about the attempt was transient.
+
+    validation_error_json is ValidationError.json(include_url=False), which travels to the caller on
+    that error. Every field pydantic reports is in it, the rejected value included, because a caller
+    reading it is deciding whether to change the model or the prompt. That is also why no part of it
+    reaches SchemaViolationError's message: pydantic writes the caller's own validator text into each
+    msg, so a validator naming the value it rejected would put generated content in every span.
+    The URLs are dropped, pointing at pydantic's error documentation rather than at this rejection.
+    """
+
+    validation_error_json: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -309,6 +329,7 @@ type NoOutputOutcome = (
     | MaxCompletionTokensExceeded
     | ContextWindowExceeded
     | EmptyTurn
+    | SchemaViolation
     | UnfinishedTurn
     | Unparsed
 )

@@ -1,10 +1,14 @@
 """Adapter for the Anthropic Messages API over the official SDK.
 
 Verified against anthropic 0.120.0:
-- `messages.parse(output_format=Model)` returns `ParsedMessage[Model]` with a `parsed_output` property;
-  the SDK builds the JSON-schema output format and parses the response text.
-- `messages.stream(...)` returns a manager whose entered stream assembles deltas into a `ParsedMessage` snapshot;
-  `get_final_message()` returns it.
+- A structured binding sends `output_config.format` built as
+  `{"schema": transform_schema(TypeAdapter(Model).json_schema()), "type": "json_schema"}`,
+  the same `output_config` `messages.parse(output_format=Model)` builds, and validates the response
+  text itself. The SDK validates inside `parse` and inside the stream's `content_block_stop`
+  handling, one event before the final `output_tokens` and the cache counters arrive, so a rejection
+  raised there reaches langchaint with neither the message nor its billing attached.
+- `messages.stream(...)` returns a manager whose entered stream assembles deltas into a message
+  snapshot; `get_final_message()` returns it.
 - `Usage.cache_creation` splits cache writes into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`,
   which bill at different rates.
 
@@ -70,6 +74,7 @@ from anthropic import (
     AsyncAnthropicBedrockMantle,
     Omit,
     omit,
+    transform_schema,
 )
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
@@ -78,7 +83,6 @@ from anthropic.types import (
     ImageBlockParam,
     MessageParam,
     OutputConfigParam,
-    ParsedMessage,
     RedactedThinkingBlockParam,
     TextBlockParam,
     ThinkingBlockParam,
@@ -88,7 +92,8 @@ from anthropic.types import (
     ToolResultBlockParam,
     ToolUseBlockParam,
 )
-from pydantic import BaseModel
+from anthropic.types.json_output_format_param import JSONOutputFormatParam
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
     Adapter,
@@ -106,6 +111,7 @@ from langchaint.adapter import (
     NoOutputOutcome,
     Refusal,
     ResponseOutcome,
+    SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
@@ -595,6 +601,19 @@ def _unfinished_turn_or_none(
     )
 
 
+def _first_text_block_text(message: anthropic.types.Message) -> str | None:
+    """Return the text of the turn's first text block, None when the turn holds none.
+
+    The block a structured turn's instance is validated from. Reading the first block matches what
+    the SDK's own parse yields for every message it does not raise on: it validates every text block
+    and returns the first instance, so a message whose first block is not the instance raises there.
+    """
+    for block in message.content:
+        if block.type == "text":
+            return block.text
+    return None
+
+
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
     """Build the langchaint assistant turn from the SDK message, block order preserved.
 
@@ -869,7 +888,7 @@ class AnthropicMessagesAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output parsed by the SDK; pure conversion, no I/O."""
+        """Bind for structured output validated into response_format; pure conversion, no I/O."""
         return _BoundAnthropicStructured(
             adapter=self,
             request=self._request(binding),
@@ -917,7 +936,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncMessageStream[Any],
         pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
-        output_from_message: Callable[[ParsedMessage[Any]], OutputT | NoOutputOutcome],
+        output_from_message: Callable[[anthropic.types.Message], OutputT | NoOutputOutcome],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
@@ -1023,7 +1042,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
 
 
 class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
-    """Structured-bound adapter: output is the SDK-parsed response_format instance."""
+    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
 
     def __init__(
         self,
@@ -1032,28 +1051,53 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         request: _AnthropicRequest,
         response_format: type[ModelT],
     ) -> None:
+        """Precompute the request's output_config, the JSON-schema format merged into the binding's.
+
+        The format is built from the same transform_schema(TypeAdapter(...).json_schema()) call
+        messages.parse makes, so the request carries what passing output_format would have sent.
+        The merge is what keeps a reasoning effort the binding set: output_config carries both keys.
+        """
         self._adapter = adapter
         self._request = request
-        self._response_format = response_format
+        self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
+        output_format = JSONOutputFormatParam(
+            schema=transform_schema(self._output_type_adapter.json_schema()), type="json_schema"
+        )
+        bound_output_config = request.output_config
+        self._output_config: OutputConfigParam = (
+            {"format": output_format}
+            if isinstance(bound_output_config, Omit)
+            else {**bound_output_config, "format": output_format}
+        )
 
-    def _parsed_output(self, message: ParsedMessage[ModelT]) -> ModelT | None | NoOutputOutcome:
-        """Extract the parsed instance, report a tool-call turn as None, or report why neither exists.
+    def _parsed_output(self, message: anthropic.types.Message) -> ModelT | None | NoOutputOutcome:
+        """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
+
+        Validating here rather than in the SDK is what puts the message, its usage, and its text in
+        scope when the text is rejected: the member returned for a rejection carries this attempt's
+        billing, where a raise from inside the SDK carries none.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
-        message carries. parsed_output reads the instance out of text blocks, so a turn holding only
-        tool_use blocks leaves none without anything having gone wrong (anthropic 0.120.0).
+        message carries, so a turn whose text is not the instance yields no instance without anything
+        having gone wrong.
 
         Every other stop reason has a named member, and none of them is retried, because no stop reason
         states an error: the model finished on the terms it reports, so a resend is a fresh sample.
+        The stop reason is read before the rejection, so text the token cap cut mid-object is
+        reported as the truncation and not as a violation of the schema it was closing.
 
         Each NoOutputOutcome member carries this attempt's billing (usage with cost_in_usd inside, and
         the raw SDK usage object) so a 200 that produced no output does not lose its cost.
         The stop reason chooses the member and is not carried on it: what such a 200 reports is fixed
         by its GenerationError subclass.
         """
-        parsed_output = message.parsed_output
-        if parsed_output is not None:
-            return parsed_output
+        validation_error: ValidationError | None = None
+        text = _first_text_block_text(message)
+        if text is not None:
+            try:
+                return self._output_type_adapter.validate_json(text)
+            except ValidationError as rejection:
+                validation_error = rejection
         unfinished_turn = _unfinished_turn_or_none(message, pricing=self._adapter.pricing)
         if unfinished_turn is not None:
             return unfinished_turn
@@ -1066,26 +1110,31 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             return MaxCompletionTokensExceeded(usage=usage, usage_raw=message.usage)
         if message.stop_reason == "model_context_window_exceeded":
             return ContextWindowExceeded(usage=usage, usage_raw=message.usage)
+        if validation_error is not None:
+            return SchemaViolation(
+                validation_error_json=validation_error.json(include_url=False),
+                usage=usage,
+                usage_raw=message.usage,
+            )
         return EmptyTurn(usage=usage, usage_raw=message.usage)
 
     @override
     async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT | None]:
-        """Send one non-streaming request via messages.parse."""
+        """Send one non-streaming request via messages.create, then validate the turn's text."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
             return messages
-        message = await self._adapter.client.messages.parse(
+        message = await self._adapter.client.messages.create(
             model=self._request.model,
             max_tokens=self._request.max_tokens,
             temperature=self._request.temperature,
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
-            output_config=self._request.output_config,
+            output_config=self._output_config,
             thinking=self._request.thinking,
             service_tier=self._request.service_tier,
             messages=messages,
-            output_format=self._response_format,
         )
         output = self._parsed_output(message)
         if isinstance(output, NoOutput):
@@ -1111,11 +1160,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             system=self._request.system,
             tools=self._request.tools,
             tool_choice=self._request.tool_choice,
-            output_config=self._request.output_config,
+            output_config=self._output_config,
             thinking=self._request.thinking,
             service_tier=self._request.service_tier,
             messages=messages,
-            output_format=self._response_format,
         )
         sdk_stream = await manager.__aenter__()
         return _AnthropicStream(

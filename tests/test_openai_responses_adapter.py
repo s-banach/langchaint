@@ -37,6 +37,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails, ResponseStatus
+from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel, ValidationError
 
@@ -60,10 +61,12 @@ from langchaint.adapter import (
     EmptyTurn,
     ErrorClassification,
     MaxCompletionTokensExceeded,
+    ProviderFailedTerminally,
+    ProviderFailedTransiently,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
-    Unparsed,
+    UnfinishedTurn,
 )
 from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
@@ -143,6 +146,15 @@ def _usage_with_cache() -> ResponseUsage:
     )
 
 
+_SERVER_ERROR = ResponseError(code="server_error", message="The server had an error.")
+"""A failed response's error whose code the disposition table calls transient."""
+
+_IMAGE_DOWNLOAD_ERROR = ResponseError(
+    code="failed_to_download_image", message="Failed to download image from the URL."
+)
+"""A failed response's error whose code the disposition table calls terminal."""
+
+
 def _response(
     *,
     usage: ResponseUsage | None,
@@ -150,8 +162,9 @@ def _response(
     status: str = "completed",
     incomplete_details: IncompleteDetails | None = None,
     service_tier: str | None = None,
+    error: ResponseError | None = None,
 ) -> OpenAIResponse:
-    """Build a response carrying the given usage, output items, status, and reported tier."""
+    """Build a response carrying the given usage, output items, status, tier, and failure error."""
     return OpenAIResponse.model_validate({
         "id": "r1",
         "created_at": 0,
@@ -165,6 +178,7 @@ def _response(
         "incomplete_details": incomplete_details,
         "usage": usage,
         "service_tier": service_tier,
+        "error": error,
     })
 
 
@@ -940,26 +954,28 @@ def test_stream_final_turn_carries_reasoning() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_failed_terminal_is_terminal_and_unparsed() -> None:
-    """A failed terminal ends the stream without a StreamProtocolError, and final() reports Unparsed.
+def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -> None:
+    """A failed terminal ends the stream without a StreamProtocolError, and final() reports the failure.
 
     The API reported the run as not finished, so whatever text had accumulated is a fragment;
-    returning it as a Response would present that fragment as the turn. The Unparsed carries the
-    response's billing, so the attempt is paid for and the retry loop sends another.
+    returning it as a Response would present that fragment as the turn. The member carries the
+    response's billing, so the attempt is paid for.
     """
 
     async def scenario() -> None:
         adapter_stream = _stream([
             ResponseFailedEvent(
                 type="response.failed",
-                response=_response(usage=_usage_with_cache(), status="failed"),
+                response=_response(
+                    usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR
+                ),
                 sequence_number=1,
             ),
         ])
         translated = [item async for item in adapter_stream.items()]
         assert translated == []
         outcome = await adapter_stream.final()
-        assert isinstance(outcome, Unparsed)
+        assert isinstance(outcome, ProviderFailedTransiently)
         assert outcome.usage.input_tokens_total == 1000
 
     asyncio.run(scenario())
@@ -1051,6 +1067,7 @@ def _structured_response(
     incomplete_details: IncompleteDetails | None = None,
     usage: ResponseUsage | None = None,
     tool_call: bool = False,
+    error: ResponseError | None = None,
 ) -> OpenAIResponse:
     """Build a response whose message carries the given output text, or a refusal block.
 
@@ -1075,6 +1092,7 @@ def _structured_response(
         output=[message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])],
         status=status,
         incomplete_details=incomplete_details,
+        error=error,
     )
 
 
@@ -1172,10 +1190,12 @@ def test_structured_stream_terminal_reports_max_completion_tokens_exceeded() -> 
     assert isinstance(outcome, MaxCompletionTokensExceeded)
 
 
-def test_structured_stream_terminal_reports_a_failed_run_as_unparsed() -> None:
-    """A structured stream's failed terminal is Unparsed, the same arm the text binding reports."""
-    outcome = _structured_bound()._parsed_output(_structured_response(None, status="failed"))
-    assert isinstance(outcome, Unparsed)
+def test_structured_stream_terminal_reports_a_failed_run_as_the_provider_failure() -> None:
+    """A structured stream's failed terminal takes the same member the text binding reports."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(None, status="failed", error=_SERVER_ERROR)
+    )
+    assert isinstance(outcome, ProviderFailedTransiently)
 
 
 def _text_bound() -> _BoundOpenAIText:
@@ -1196,45 +1216,115 @@ def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
     assert _text_bound()._text_outcome(response) == "I can't help with that"
 
 
-def test_text_bind_send_reports_a_failed_status_as_unparsed(
+def test_text_bind_send_reports_a_failed_status_as_the_provider_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed status returns the Unparsed arm from send, carrying that run's billing."""
+    """A failed status returns the failure member from send, carrying that run's billing."""
     text_bound = _text_bound()
 
     async def fake_create(**_request_kwargs: object) -> OpenAIResponse:
         """Return a response the API reported as failed, with real usage on it."""
-        return _response(usage=_usage_with_cache(), status="failed")
+        return _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
 
     monkeypatch.setattr(text_bound._adapter.client.responses, "create", fake_create)
     outcome = asyncio.run(text_bound.send([UserMessage(content="q")]))
-    assert isinstance(outcome, Unparsed)
+    assert isinstance(outcome, ProviderFailedTransiently)
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_unparsed_on_a_failed_status_whose_text_validates() -> None:
-    """A failed run is Unparsed even when its fragment validates: the fragment is not the answer."""
+def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_validates() -> None:
+    """A failed run is the failure member even when its fragment validates: it is not the answer."""
     outcome = _structured_bound()._parsed_output(
-        _structured_response(_REPORT_JSON, status="failed", usage=_usage_with_cache())
+        _structured_response(
+            _REPORT_JSON, status="failed", usage=_usage_with_cache(), error=_SERVER_ERROR
+        )
     )
-    assert isinstance(outcome, Unparsed)
+    assert isinstance(outcome, ProviderFailedTransiently)
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> None:
+def test_a_failed_run_carrying_a_refusal_takes_the_failure_member_under_both_bindings() -> None:
     """A failed status wins over the refusal test, so one response does not split by binding.
 
     Were the refusal tested first, the structured binding would report Refusal (a terminal
-    RefusalError) for a response the text binding retries as Unparsed.
+    RefusalError) for a response the text binding retries.
     """
     structured_outcome = _structured_bound()._parsed_output(
-        _structured_response(None, refusal=True, status="failed", usage=_usage_with_cache())
+        _structured_response(
+            None, refusal=True, status="failed", usage=_usage_with_cache(), error=_SERVER_ERROR
+        )
     )
-    assert isinstance(structured_outcome, Unparsed)
+    assert isinstance(structured_outcome, ProviderFailedTransiently)
     text_outcome = _text_bound()._text_outcome(
-        _response(usage=_usage_with_cache(), output=[_REFUSAL_MESSAGE_ITEM], status="failed")
+        _response(
+            usage=_usage_with_cache(),
+            output=[_REFUSAL_MESSAGE_ITEM],
+            status="failed",
+            error=_SERVER_ERROR,
+        )
     )
-    assert isinstance(text_outcome, Unparsed)
+    assert isinstance(text_outcome, ProviderFailedTransiently)
+
+
+def test_a_transient_error_code_carries_the_providers_message_and_no_rate_limit_flag() -> None:
+    """A server_error is transient, and its reason is openai's message verbatim."""
+    outcome = _text_bound()._text_outcome(
+        _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
+    )
+    assert isinstance(outcome, ProviderFailedTransiently)
+    assert outcome.reason == _SERVER_ERROR.message
+    assert outcome.is_rate_limit is False
+
+
+def test_a_rate_limit_error_code_sets_the_rate_limit_flag() -> None:
+    """rate_limit_exceeded is transient and flags the rate limit, which paces every sharing task."""
+    outcome = _text_bound()._text_outcome(
+        _response(
+            usage=_usage_with_cache(),
+            status="failed",
+            error=ResponseError(code="rate_limit_exceeded", message="Rate limit reached."),
+        )
+    )
+    assert isinstance(outcome, ProviderFailedTransiently)
+    assert outcome.is_rate_limit is True
+
+
+def test_a_terminal_error_code_carries_the_providers_message_without_retrying() -> None:
+    """failed_to_download_image is terminal: the request names the image, so a resend fetches it again."""
+    outcome = _text_bound()._text_outcome(
+        _response(usage=_usage_with_cache(), status="failed", error=_IMAGE_DOWNLOAD_ERROR)
+    )
+    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.reason == _IMAGE_DOWNLOAD_ERROR.message
+
+
+def test_an_error_code_the_installed_sdk_does_not_name_is_terminal() -> None:
+    """A code added after openai 2.45.0 fails the item once rather than spending the retry budget."""
+    outcome = _text_bound()._text_outcome(
+        _response(
+            usage=_usage_with_cache(),
+            status="failed",
+            error=ResponseError.construct(code="a_code_from_a_later_sdk", message="Something."),
+        )
+    )
+    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.reason == "Something."
+
+
+def test_a_failed_status_with_no_error_object_is_terminal() -> None:
+    """A failed run naming nothing gives no ground to resend on, and says that in its reason."""
+    outcome = _text_bound()._text_outcome(_response(usage=_usage_with_cache(), status="failed"))
+    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.reason == "openai reported status 'failed' and no error object"
+
+
+def test_a_run_that_stopped_short_of_a_turn_is_unfinished_turn_naming_the_status() -> None:
+    """A cancelled run is neither a failure openai described nor a turn, so it names its status."""
+    outcome = _structured_bound()._parsed_output(
+        _structured_response(None, status="cancelled", usage=_usage_with_cache())
+    )
+    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.reason == "openai returned status 'cancelled'"
 
 
 def test_structured_bind_reports_refusal_on_a_refusal_block() -> None:
@@ -1265,7 +1355,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_
 def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> None:
     """An incomplete response for content_filter is Refusal, so the item fails once.
 
-    The Unparsed arm would send the same blocked request again for the whole retry budget
+    Retrying would send the same blocked request again for the whole retry budget
     and bill for each attempt.
     """
     outcome = _structured_bound()._parsed_output(

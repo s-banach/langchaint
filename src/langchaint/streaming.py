@@ -31,12 +31,13 @@ from langchaint.adapter import (
     EmptyTurn,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    ProviderFailedTerminally,
+    ProviderFailedTransiently,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
     StreamItem,
     UnfinishedTurn,
-    Unparsed,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
@@ -45,6 +46,7 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
+    ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
     SchemaViolationError,
@@ -164,8 +166,8 @@ class StreamHandle[OutputT]:
         """Record the abandonment, unless no log was given or the conclusion accounted for the call.
 
         A Response and a GenerationError each hand the caller this call's CallRecord, naming
-        the model and the attempts to reconcile against, and the TransientError an Unparsed 200
-        raises carries that 200's billing.
+        the model and the attempts to reconcile against, and the TransientError a
+        ProviderFailedTransiently 200 raises carries that 200's billing.
         Appending after one would report the same call twice and mislabel a concluded call as an
         in-flight abandonment.
         A StreamProtocolError and a failure after the first item hand over neither, so a
@@ -446,9 +448,10 @@ class StreamHandle[OutputT]:
             SchemaViolationError: the adapter reported it as SchemaViolation; likewise.
             ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
             UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
-            TransientError: the adapter reported it as Unparsed; not retried, because the stream
-                already yielded items to the caller. The error carries that 200's billing, the only
-                channel this outcome has.
+            ProviderFailedTerminallyError: the adapter reported it as ProviderFailedTerminally; likewise.
+            TransientError: the adapter reported it as ProviderFailedTransiently; not retried,
+                because the stream already yielded items to the caller. The error carries that 200's
+                billing, the only channel this outcome has.
             RuntimeError: the handle is unopened, or it is finished with no conclusion stored
                 (drained to exhaustion, then left the block).
         """
@@ -471,13 +474,15 @@ class StreamHandle[OutputT]:
             except BaseException as exc:
                 # A cancellation is not a conclusion, the same rule __anext__ applies:
                 # it destroys the frames that could have observed the call rather than ending it.
-                # _conclude is inside the try because every case of it but Unparsed records the
-                # attempt first, so a raise past that record would let a second call record it again.
+                # _conclude is inside the try because every case of it but ProviderFailedTransiently
+                # records the attempt first, so a raise past that record would let a second call
+                # record it again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                 raise
-            # Every _conclude case accounts for the call: every one but Unparsed builds its result
-            # off the frozen CallRecord, and Unparsed puts the 200's billing on the TransientError.
+            # Every _conclude case accounts for the call: every one but ProviderFailedTransiently
+            # builds its result off the frozen CallRecord, and that one puts the 200's billing on the
+            # TransientError.
             self._conclusion_carried_the_call = True
         if isinstance(self._conclusion, Response):
             return self._conclusion
@@ -530,9 +535,16 @@ class StreamHandle[OutputT]:
                     reason=outcome.reason,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                 )
-            case Unparsed():
+            case ProviderFailedTerminally():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return ProviderFailedTerminallyError(
+                    reason=outcome.reason,
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                )
+            case ProviderFailedTransiently():
                 return TransientError(
-                    "response carried no usable output",
+                    outcome.reason,
+                    is_rate_limit=outcome.is_rate_limit,
                     usage=outcome.usage,
                     usage_raw=outcome.usage_raw,
                 )
@@ -547,14 +559,16 @@ class StreamHandle[OutputT]:
         | EmptyTurn
         | SchemaViolation
         | ContextWindowExceeded
-        | UnfinishedTurn,
+        | UnfinishedTurn
+        | ProviderFailedTerminally,
         ended_at_monotonic_seconds: float,
     ) -> None:
         """Record the attempt that reached a billable 200, whatever the adapter made of it.
 
         error is None on every member here: the request itself succeeded, and what the adapter made of
         the response is the item's outcome, not this attempt's failure.
-        An Unparsed's billing reaches the caller on its TransientError, so it gets no record.
+        A ProviderFailedTransiently's billing reaches the caller on its TransientError, so it gets
+        no record.
         """
         self._ledger.record_ending_at(
             ended_at_monotonic_seconds,

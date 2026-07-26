@@ -26,11 +26,12 @@ from langchaint.adapter import (
     EmptyTurn,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    ProviderFailedTerminally,
+    ProviderFailedTransiently,
     Refusal,
     SchemaViolation,
     ToolChoice,
     UnfinishedTurn,
-    Unparsed,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
@@ -39,6 +40,7 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
+    ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
     SchemaViolationError,
@@ -586,6 +588,9 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                 terminal for this item, without a retry.
             UnfinishedTurnError: the adapter reported an UnfinishedTurn attempt (a 200 langchaint
                 cannot continue); terminal for this item, without a retry.
+            ProviderFailedTerminallyError: the adapter reported a ProviderFailedTerminally attempt
+                (the 200's body reports that generating the response failed, for a reason a resend
+                would hit again); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
         ledger.start_call()
@@ -656,10 +661,19 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                             raise UnfinishedTurnError(reason=outcome.reason, call=ledger.freeze())
                         case InvalidRequest():
                             raise InvalidRequestError(reason=outcome.reason, call=ledger.freeze())
-                        case Unparsed():
+                        case ProviderFailedTerminally():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise ProviderFailedTerminallyError(
+                                reason=outcome.reason, call=ledger.freeze()
+                            )
+                        case ProviderFailedTransiently():
                             self.rate_limiter.register_success(admission)
                             error = TransientError(
-                                "response carried no usable output",
+                                outcome.reason,
+                                is_rate_limit=outcome.is_rate_limit,
                                 usage=outcome.usage,
                                 usage_raw=outcome.usage_raw,
                             )
@@ -710,7 +724,8 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
         rejected request, UnrecognizedError on an unrecognized error, and one of RefusalError,
         MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError,
-        ContextWindowExceededError, or UnfinishedTurnError on a 200 that produced no output.
+        ContextWindowExceededError, UnfinishedTurnError, or ProviderFailedTerminallyError on a 200
+        that produced no output.
         _generate_with_retries names the condition for each.
 
         abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's

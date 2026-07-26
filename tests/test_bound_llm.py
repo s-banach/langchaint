@@ -27,6 +27,7 @@ from langchaint import (
     MaxCompletionTokensExceededError,
     Message,
     NoTools,
+    ProviderFailedTerminallyError,
     RateLimiter,
     RefusalError,
     Response,
@@ -57,11 +58,12 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutputOutcome,
+    ProviderFailedTerminally,
+    ProviderFailedTransiently,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
-    Unparsed,
 )
 from langchaint.llm import UNCHANGED
 from langchaint.streaming import StreamHandle
@@ -218,17 +220,37 @@ class _SchemaViolationStream(_FakeStream):
         )
 
 
-class _UnparsedStream(_FakeStream):
-    """A stream that yields items normally but whose final() parses no instance.
+_PROVIDER_FAILURE_REASON = "The server had an error while processing your request."
+"""A provider's own description of a failure, as openai puts it in a failed response's error."""
 
-    Mirrors an adapter that parses the assembled message in AdapterStream.final() and gets nothing,
-    for a reason the stop reason does not name, reporting Unparsed with the 200's billing.
+
+class _ProviderFailedTransientlyStream(_FakeStream):
+    """A stream whose assembled response reports a provider failure a resend may get past.
+
+    Mirrors an adapter reading the assembled response in AdapterStream.final() and finding a body
+    that reports the run failed, reporting ProviderFailedTransiently with the 200's billing.
     """
 
     @override
     async def final(self) -> ResponseOutcome[str]:
-        """Report the missing parse instead of assembling a result, carrying this attempt's billing."""
-        return Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
+        """Report the failure instead of assembling a result, carrying this attempt's billing."""
+        return ProviderFailedTransiently(
+            reason=_PROVIDER_FAILURE_REASON,
+            is_rate_limit=False,
+            usage=_USAGE_BILLED,
+            usage_raw=_FAKE_RAW_USAGE,
+        )
+
+
+class _ProviderFailedTerminallyStream(_FakeStream):
+    """A stream whose assembled response reports a provider failure a resend would hit again."""
+
+    @override
+    async def final(self) -> ResponseOutcome[str]:
+        """Report the failure instead of assembling a result, carrying this attempt's billing."""
+        return ProviderFailedTerminally(
+            reason=_PROVIDER_FAILURE_REASON, usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE
+        )
 
 
 class _FinalRaisesStream(_FakeStream):
@@ -860,12 +882,21 @@ def test_unfinished_turn_outcome_from_send_raises_carrying_the_adapter_s_reason(
     asyncio.run(scenario())
 
 
-def test_unparsed_outcome_from_send_is_retried_and_keeps_its_billing() -> None:
-    """An Unparsed outcome is retried, and that 200's billing lands on its attempt record."""
+def test_provider_failed_transiently_from_send_is_retried_and_keeps_its_billing() -> None:
+    """The outcome is retried, that 200's billing lands on its record, and the reason on its error."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose first send reports Unparsed and whose second succeeds."""
-        adapter = _FakeAdapter(failures=[Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        """Drive one generate_one whose first send reports the failure and whose second succeeds."""
+        adapter = _FakeAdapter(
+            failures=[
+                ProviderFailedTransiently(
+                    reason=_PROVIDER_FAILURE_REASON,
+                    is_rate_limit=False,
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -874,30 +905,104 @@ def test_unparsed_outcome_from_send_is_retried_and_keeps_its_billing() -> None:
         assert response.attempts == 2
         rejected, succeeded = response.attempt_records
         assert isinstance(rejected.error, TransientError)
+        assert str(rejected.error) == _PROVIDER_FAILURE_REASON
         assert rejected.usage.cost_in_usd == 0.25
         assert succeeded.error is None
 
     asyncio.run(scenario())
 
 
-def test_unparsed_outcome_ends_the_rate_limiter_recovery() -> None:
-    """An Unparsed 200 is a completed request, so it ends recovery like any other 200.
+def test_provider_failed_transiently_ends_the_rate_limiter_recovery() -> None:
+    """A failed 200 is a completed request, so it ends recovery like any other 200.
 
-    The provider served the request, which is what the recovery probe asks; that the adapter parsed
-    no instance from the response is the item's problem, not the account's quota's.
+    The provider served the request, which is what the recovery probe asks; that its body reports a
+    failure is the item's problem, not the account's quota's.
     """
 
     async def scenario() -> None:
-        """Put the limiter into recovery, then report Unparsed while holding its probe slot."""
+        """Put the limiter into recovery, then report the failure while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
         rate_limiter.register_transient_error((
             TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
         ))
         assert rate_limiter._recovering
-        adapter = _FakeAdapter(failures=[Unparsed(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        adapter = _FakeAdapter(
+            failures=[
+                ProviderFailedTransiently(
+                    reason=_PROVIDER_FAILURE_REASON,
+                    is_rate_limit=False,
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         await bound_llm.generate_one([UserMessage(content="hi")])
         assert not rate_limiter._recovering
+
+    asyncio.run(scenario())
+
+
+def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admission() -> None:
+    """A failure the provider named a rate limit puts the shared limiter into recovery.
+
+    The flag is the only thing distinguishing this 200 from any other failed one, and it has to
+    reach the RateLimiter for a rate limit reported inside a 200 to pace the account at all.
+    """
+
+    async def scenario() -> None:
+        """Spend the whole budget on rate-limited failures, so recovery is still in force at the end."""
+        rate_limiter = _fast_rate_limiter(max_attempts=1)
+        adapter = _FakeAdapter(
+            failures=[
+                ProviderFailedTransiently(
+                    reason="Rate limit reached for gpt-5.6",
+                    is_rate_limit=True,
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
+        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        with pytest.raises(RetriesExhaustedError) as exhausted:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        (record,) = exhausted.value.attempt_records
+        assert isinstance(record.error, TransientError)
+        assert record.error.is_rate_limit
+        assert rate_limiter._recovering
+
+    asyncio.run(scenario())
+
+
+def test_provider_failed_terminally_from_send_raises_row_shaped_without_retry() -> None:
+    """A terminal provider failure fails the item once, with the provider's own text as the reason.
+
+    Never retried: what the body names is a property of the request, so the retry budget would buy
+    the same body at full price each time.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send reports the terminal failure."""
+        adapter = _FakeAdapter(
+            failures=[
+                ProviderFailedTerminally(
+                    reason=_PROVIDER_FAILURE_REASON,
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(ProviderFailedTerminallyError) as provider_failure:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = provider_failure.value
+        assert failure.attempts == 1
+        assert failure.stop_reason is None
+        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
 
@@ -2276,29 +2381,52 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_final_unparsed_raises_transient_carrying_its_billing() -> None:
-    """An Unparsed outcome from the stream's final() propagates as a TransientError with the billing.
+def test_stream_final_provider_failed_transiently_raises_transient_carrying_its_billing() -> None:
+    """The outcome propagates as a TransientError carrying the provider's reason and the billing.
 
     The stream already yielded items to the caller, so it is not reopened; that 200's usage
     reaches the caller on the error itself rather than on an attempt record.
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() parses no instance, then read the raised error."""
-        adapter = _FakeAdapter(stream=_UnparsedStream())
+        """Drain a stream whose final() reports the failure, then read the raised error."""
+        adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(TransientError) as unparsed:
+            with pytest.raises(TransientError) as provider_failure:
                 await handle.final()
-        assert unparsed.value.usage.cost_in_usd == 0.25
+        assert str(provider_failure.value) == _PROVIDER_FAILURE_REASON
+        assert provider_failure.value.usage.cost_in_usd == 0.25
         assert adapter.bound_adapters[0].open_count == 1
 
     asyncio.run(scenario())
 
 
-def test_stream_cancelled_after_absorbing_unparsed_appends_no_abandoned_call() -> None:
+def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_reason() -> None:
+    """The outcome fails the call once, and the provider's own text is the error's message."""
+
+    async def scenario() -> None:
+        """Drain a stream whose final() reports the terminal failure, then read the raised error."""
+        adapter = _FakeAdapter(stream=_ProviderFailedTerminallyStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(ProviderFailedTerminallyError) as provider_failure:
+                await handle.final()
+        failure = provider_failure.value
+        assert failure.attempts == 1
+        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
+        (record,) = failure.attempt_records
+        assert record.error is None
+
+    asyncio.run(scenario())
+
+
+def test_stream_cancelled_after_absorbing_a_provider_failure_appends_no_abandoned_call() -> None:
     """A cancellation after final() raised its TransientError appends nothing.
 
     The error carried that 200's usage to the caller, so an AbandonedCall here would
@@ -2306,15 +2434,15 @@ def test_stream_cancelled_after_absorbing_unparsed_appends_no_abandoned_call() -
     """
 
     async def scenario() -> None:
-        """Absorb an Unparsed from final() inside the block, then hang into the caller's deadline."""
+        """Absorb the failure from final() inside the block, then hang into the caller's deadline."""
         abandoned_call_log: list[AbandonedCall] = []
-        adapter = _FakeAdapter(stream=_UnparsedStream())
+        adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
 
         async def consume() -> None:
-            """Let final() report Unparsed, then sleep; the wait_for below cancels inside the block."""
+            """Let final() report the failure, then sleep; the wait_for below cancels in the block."""
             async with bound_llm.stream_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
@@ -2504,10 +2632,10 @@ def test_stream_final_is_idempotent() -> None:
     ("stream", "expected_error"),
     [
         (_RefusingStream(), RefusalError),
-        (_UnparsedStream(), TransientError),
+        (_ProviderFailedTransientlyStream(), TransientError),
         (_ProtocolErrorStream(), StreamProtocolError),
     ],
-    ids=["refusal", "unparsed", "protocol_error"],
+    ids=["refusal", "provider_failed_transiently", "protocol_error"],
 )
 def test_stream_final_replays_every_error_that_concluded_the_call(
     stream: _FakeStream, expected_error: type[Exception]

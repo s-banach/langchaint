@@ -37,6 +37,7 @@ from openai.types.responses import (
     ResponseUsage,
 )
 from openai.types.responses.response import IncompleteDetails
+from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel
 
@@ -45,6 +46,7 @@ from langchaint.anthropic.messages_adapter import (
     _RATE_LIMIT_STATUSES as _ANTHROPIC_RATE_LIMIT_STATUSES,
 )
 from langchaint.anthropic.messages_adapter import AnthropicPricedServiceTier
+from langchaint.openai.responses_adapter import _DISPOSITION_BY_ERROR_CODE
 from langchaint.openai.responses_adapter import (
     _RATE_LIMIT_STATUSES as _OPENAI_RATE_LIMIT_STATUSES,
 )
@@ -168,6 +170,39 @@ def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
         "max_output_tokens",
         "content_filter",
     )
+
+
+def test_openai_error_codes_are_the_set_the_disposition_table_dispositions() -> None:
+    """ResponseError.code members, and the table that says which of them a resend may get past.
+
+    A code openai adds and the table lacks is reported as ProviderFailedTerminally, so the item
+    fails once at the cost of one attempt rather than being retried; this test is what says whether
+    that fallback was reached by a genuinely new code or by a member the table forgot.
+    """
+    annotation = _field_annotation(ResponseError, "code")
+    codes = typing.get_args(annotation)
+    assert codes == (
+        "server_error",
+        "rate_limit_exceeded",
+        "invalid_prompt",
+        "bio_policy",
+        "vector_store_timeout",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_base64_image",
+        "invalid_image_url",
+        "image_too_large",
+        "image_too_small",
+        "image_parse_error",
+        "image_content_policy_violation",
+        "invalid_image_mode",
+        "image_file_too_large",
+        "unsupported_image_media_type",
+        "empty_image_file",
+        "failed_to_download_image",
+        "image_file_not_found",
+    )
+    assert set(_DISPOSITION_BY_ERROR_CODE) == set(codes)
 
 
 def test_anthropic_service_tier_members_are_the_pricing_mapping_keys() -> None:

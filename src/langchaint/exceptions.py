@@ -14,8 +14,8 @@ bind time instead, before any request is sent.
 TransientError is a per-attempt control signal.
 The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, EmptyTurnError,
-SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError, InvalidRequestError, and
-UnrecognizedError.
+SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError, ProviderFailedTerminallyError,
+InvalidRequestError, and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
@@ -56,7 +56,8 @@ class TransientError(Exception):
     is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
     usage (carrying cost_in_usd) describes the attempt's billable completion when the failing attempt
-    was a completed 200 the adapter rejected downstream (which the adapter reports as an Unparsed outcome);
+    was a 200 whose body reported a provider failure a resend may get past
+    (which the adapter reports as a ProviderFailedTransiently outcome);
     usage_raw is the raw SDK usage object usage was normalized from, held by reference.
     A transport failure (timeout, 5xx, connection or rate-limit error) billed nothing, so usage is ZERO_USAGE
     and usage_raw is None.
@@ -109,6 +110,7 @@ class GenerationError(_CallCarrier, Exception):
     bound response_format),
     ContextWindowExceededError (the conversation overflowed the model's context window),
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
+    ProviderFailedTerminallyError (the 200's body reports that generating the response failed),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending), and
     UnrecognizedError (the adapter did not recognize the attempt's error).
     generate_one raises any of them;
@@ -339,6 +341,30 @@ class UnfinishedTurnError(GenerationError):
     @override
     def _summary(self) -> str:
         return self.reason
+
+
+class ProviderFailedTerminallyError(GenerationError):
+    """The provider returned a 200 whose body reports that generating the response failed.
+
+    A 200 the provider bills and fills with a failure rather than a turn. Whatever the body names is
+    a property of the request, so the item fails once instead of buying the same body for the whole
+    retry budget.
+
+    reason is the provider's own description of the failure, carried unabridged in the message after
+    a prefix naming what failed.
+    stop_reason is None: no turn completed.
+    """
+
+    reason: str
+
+    def __init__(self, *, reason: str, call: CallRecord) -> None:
+        """Store what the provider reported, then the call."""
+        self.reason = reason
+        super().__init__(call=call)
+
+    @override
+    def _summary(self) -> str:
+        return f"the provider reported that generating the response failed: {self.reason}"
 
 
 class InvalidRequestError(GenerationError):

@@ -75,9 +75,9 @@ Mapping decisions:
   mapping openai's part to a TextPart gives the two providers one neutral shape and leaves the stop
   reason as the signal on both.
 - Status "failed" is the API reporting that the run did not finish (`response.error` names why), so
-  whatever it emitted is a fragment rather than the turn. Both bindings report it as Unparsed,
-  carrying that response's billing, and a structured binding does so whether or not the fragment
-  happened to parse.
+  whatever it emitted is a fragment rather than the turn. Both bindings report it as the member
+  `_provider_failure` picks off `response.error.code`, carrying that response's billing, and a
+  structured binding does so whether or not the fragment happened to validate.
 - Streaming yields the SDK's own delta strings unwrapped and each tool call once, complete,
   from its `response.output_item.done` event; argument fragments are never surfaced.
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
@@ -132,13 +132,15 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     NoOutput,
     NoOutputOutcome,
+    ProviderFailedTerminally,
+    ProviderFailedTransiently,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    Unparsed,
+    UnfinishedTurn,
     classification_from_response,
     retry_after_seconds_from_headers,
 )
@@ -394,6 +396,75 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]
     ]
 
 
+type _FailureDisposition = Literal["transient", "terminal"]
+
+_DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
+    "server_error": "transient",
+    "rate_limit_exceeded": "transient",
+    "vector_store_timeout": "transient",
+    "invalid_prompt": "terminal",
+    "bio_policy": "terminal",
+    "invalid_image": "terminal",
+    "invalid_image_format": "terminal",
+    "invalid_base64_image": "terminal",
+    "invalid_image_url": "terminal",
+    "image_too_large": "terminal",
+    "image_too_small": "terminal",
+    "image_parse_error": "terminal",
+    "image_content_policy_violation": "terminal",
+    "invalid_image_mode": "terminal",
+    "image_file_too_large": "terminal",
+    "unsupported_image_media_type": "terminal",
+    "empty_image_file": "terminal",
+    "failed_to_download_image": "terminal",
+    "image_file_not_found": "terminal",
+}
+"""Whether a resend may get past the failure each ResponseError.code names (openai 2.45.0).
+
+Every member of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
+unknown-code path below is reached only by a code newer than the installed SDK.
+The three transient codes are read off their names: the SDK documents none of the codes, and these
+three name a condition of the moment while every other names a property of the request.
+failed_to_download_image is terminal for that reason: a URL the caller got wrong fails identically
+on every resend.
+"""
+
+
+def _provider_failure(
+    response: OpenAIResponse, *, usage: Usage
+) -> ProviderFailedTransiently | ProviderFailedTerminally:
+    """Report a failed status as the member its error code's disposition selects.
+
+    A failed status is the API saying no generation completed, so whatever output items the response
+    holds are a fragment rather than the turn. The response is billed, and both members take usage,
+    so the attempt is paid for either way.
+
+    reason is response.error.message verbatim, the only description of a condition langchaint does
+    not model; a response reporting the failure with no error object at all gets langchaint's own
+    sentence, which says exactly that.
+    An error code outside the table is terminal: retrying is what spends the budget, so a code nobody
+    classified fails the item rather than being resent at full price.
+    rate_limit_exceeded sets is_rate_limit, which the retry loop's TransientError carries to the
+    RateLimiter, pausing admission the way a 429 status does. Neither member carries a server-stated
+    wait, so that pause runs for the jittered backoff.
+    """
+    error = response.error
+    if error is None:
+        return ProviderFailedTerminally(
+            reason="openai reported status 'failed' and no error object",
+            usage=usage,
+            usage_raw=response.usage,
+        )
+    if _DISPOSITION_BY_ERROR_CODE.get(error.code) == "transient":
+        return ProviderFailedTransiently(
+            reason=error.message,
+            is_rate_limit=error.code == "rate_limit_exceeded",
+            usage=usage,
+            usage_raw=response.usage,
+        )
+    return ProviderFailedTerminally(reason=error.message, usage=usage, usage_raw=response.usage)
+
+
 def _has_refusal(response: OpenAIResponse) -> bool:
     return any(
         content_part.type == "refusal"
@@ -423,7 +494,7 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
 
     Status "incomplete" with reason "content_filter" is a refusal: the provider's filter blocked
     the turn, so the structured path fails the item under RefusalError's no-retry policy instead
-    of spending the retry budget on the Unparsed arm.
+    of spending the retry budget resending a request the filter blocks every time.
     """
     if _has_refusal(response):
         return "refusal"
@@ -850,13 +921,15 @@ class _BoundOpenAIText(BoundAdapter[str]):
         self._adapter = adapter
         self._request = request
 
-    def _text_outcome(self, response: OpenAIResponse) -> str | Unparsed:
-        """Return the turn's text, or Unparsed when the API reported the run as failed.
+    def _text_outcome(
+        self, response: OpenAIResponse
+    ) -> str | ProviderFailedTransiently | ProviderFailedTerminally:
+        """Return the turn's text, or the failure member when the API reported the run as failed.
 
         A failed status means the run did not finish, and response.error names why, so the output
         items hold whatever had been emitted rather than the turn; reporting that as a Response would
-        present a fragment as the answer. The Unparsed carries this response's billing, so the
-        attempt is paid for and the retry loop sends another.
+        present a fragment as the answer. _provider_failure states which member the error code picks
+        and what each carries.
         An incomplete status is deliberately not this case: a turn cut off at the token cap or by a
         content filter is the answer as far as it got, and stop_reason ("max_tokens" or "refusal")
         is how the caller sees that.
@@ -865,9 +938,8 @@ class _BoundOpenAIText(BoundAdapter[str]):
         the same Response's assistant_message carried the sentences the model wrote to refuse.
         """
         if response.status == "failed":
-            return Unparsed(
-                usage=_normalized_usage(response, pricing=self._adapter.pricing),
-                usage_raw=response.usage,
+            return _provider_failure(
+                response, usage=_normalized_usage(response, pricing=self._adapter.pricing)
             )
         return _assistant_message_from(response).text
 
@@ -875,7 +947,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
     async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[str]:
         """Send one non-streaming request via responses.create.
 
-        A response the API reported as failed returns the Unparsed arm _text_outcome chose.
+        A response the API reported as failed returns the failure member _text_outcome chose.
         """
         response = await self._adapter.client.responses.create(
             model=self._request.model,
@@ -893,7 +965,7 @@ class _BoundOpenAIText(BoundAdapter[str]):
             input=[*self._request.input_prefix, *_wire_input(conversation)],
         )
         output = self._text_outcome(response)
-        if isinstance(output, Unparsed):
+        if isinstance(output, NoOutput):
             return output
         return _adapter_result(
             response=response,
@@ -966,15 +1038,18 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         A failed status is tested first, ahead of the refusal and the truncation: the API is reporting
         that the run did not finish, so whatever items it emitted are a fragment, and a refusal part
         among them is no more the turn than a text part is. Testing the refusal first would make one
-        response Refusal here and Unparsed on the text binding, which reads the same status first.
+        response Refusal here and a provider failure on the text binding, which reads the same
+        status first.
         A content-filtered response reaches Refusal through the stop reason, so it fails the
         item once instead of being retried at full price for an outcome that will not change.
         The completed status is what SchemaViolation and EmptyTurn are tested on, so a status
         reporting that the run never finished cannot be reported as a turn that finished.
+        Every remaining status is a run that stopped short of a turn, which is UnfinishedTurn
+        naming the status.
         """
         usage = _normalized_usage(response, pricing=self._adapter.pricing)
         if response.status == "failed":
-            return Unparsed(usage=usage, usage_raw=response.usage)
+            return _provider_failure(response, usage=usage)
         if _normalized_stop_reason(response) == "refusal":
             return Refusal(usage=usage, usage_raw=response.usage)
         if (
@@ -991,7 +1066,11 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
                     usage_raw=response.usage,
                 )
             return EmptyTurn(usage=usage, usage_raw=response.usage)
-        return Unparsed(usage=usage, usage_raw=response.usage)
+        return UnfinishedTurn(
+            reason=f"openai returned status {response.status!r}",
+            usage=usage,
+            usage_raw=response.usage,
+        )
 
     def _parsed_output(self, response: OpenAIResponse) -> ModelT | None | NoOutputOutcome:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
@@ -1002,8 +1081,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
 
         A failed status is rejected even when the text validates: the run did not finish, and
         response.error names why, so an instance built from the fragment it had emitted would be
-        presented as the answer. _no_instance reports it as Unparsed, so the attempt is paid
-        for and the retry loop sends another.
+        presented as the answer. _no_instance reports it as the failure member _provider_failure
+        chose, so the attempt is paid for either way.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
         message carries, so a turn whose text is not the instance yields no instance without anything

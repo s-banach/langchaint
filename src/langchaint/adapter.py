@@ -271,13 +271,32 @@ class SchemaViolation(NoOutput):
 
 
 @dataclass(frozen=True, kw_only=True)
-class Unparsed(NoOutput):
-    """A billable 200 that produced no usable output, for a reason the stop reason does not name.
+class ProviderFailedTransiently(NoOutput):
+    """A billable 200 whose body reports a provider-side failure a resend may get past.
 
-    The retry loop records the attempt and retries it, because a later attempt may produce output.
-    A stream handle instead propagates it as a TransientError carrying this attempt's billing,
-    because the stream already yielded items to the caller and is not reopened.
+    The retry loop records the attempt and sends another, carrying reason as that attempt's
+    TransientError text. A stream handle instead propagates that TransientError, because the stream
+    already yielded items to the caller and is not reopened.
+    reason is the provider's own description of the failure.
+    is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it to
+    the RateLimiter, which pauses admission for every task sharing it, exactly as a 429 status does.
     """
+
+    reason: str
+    is_rate_limit: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProviderFailedTerminally(NoOutput):
+    """A billable 200 whose body reports a provider-side failure a resend would hit again.
+
+    The retry loop records the attempt and fails the item with a ProviderFailedTerminallyError,
+    without retrying: what the body names is a property of the request, so the retry budget would buy
+    the same body at full price each time.
+    reason is the provider's own description of the failure, and travels to the caller on that error.
+    """
+
+    reason: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -329,9 +348,10 @@ type NoOutputOutcome = (
     | MaxCompletionTokensExceeded
     | ContextWindowExceeded
     | EmptyTurn
+    | ProviderFailedTerminally
+    | ProviderFailedTransiently
     | SchemaViolation
     | UnfinishedTurn
-    | Unparsed
 )
 """Every outcome of a billable 200 that produced no output.
 

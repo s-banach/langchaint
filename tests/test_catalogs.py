@@ -215,7 +215,7 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
     """A custom httpx client passed to anthropic_bedrock_model reaches the stored adapter client.
 
     The two Bedrock client classes override copy() without reusing the existing transport (anthropic
-    0.116.0), so a plain with_options(max_retries=0) drops it; the adapter re-feeds it, so a caller's
+    0.120.0), so a plain with_options(max_retries=0) drops it; the adapter re-feeds it, so a caller's
     loaded certs reach the wire. This asserts the injected client survives that copy, not a fresh default.
     """
     http_client = httpx.AsyncClient()
@@ -242,7 +242,7 @@ def test_both_bedrock_constructors_raise_on_a_region_beside_a_client() -> None:
     Both constructors raise rather than rewrite a client the caller built, and rewriting is not
     uniformly available anyway: AsyncAnthropicBedrockMantle.copy(aws_region=...) sets the attribute
     and leaves base_url pointing at the original region, while AsyncBedrockOpenAI.copy recomputes it
-    (anthropic 0.116.0, openai 2.45.0).
+    (anthropic 0.120.0, openai 2.45.0).
     """
     with pytest.raises(ValueError, match="aws_region="):
         anthropic_bedrock_model(

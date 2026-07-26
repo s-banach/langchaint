@@ -4,7 +4,7 @@ Both SDKs' response models are pydantic models configured extra="allow", so a re
 field arrives as an extra rather than as an error: the adapters keep reading the name they were
 written for, get None or a default, and every other test in this suite keeps passing on the stale
 literal. Nothing else here can fail on that drift, which is what these tests are for. They capture
-no defect present at the version they were written against (anthropic 0.116.0, openai 2.45.0).
+no defect present at the version they were written against (anthropic 0.120.0, openai 2.45.0).
 
 The literal-set assertions compare against written-out sets rather than against a subset check, so a
 value the provider adds also fails.
@@ -143,6 +143,7 @@ def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
         "tool_use",
         "pause_turn",
         "refusal",
+        "model_context_window_exceeded",
     )
 
 

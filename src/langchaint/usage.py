@@ -41,7 +41,7 @@ class Usage(CheckedCopyModel):
 
     Server-side tool use has no counter and no cost here. langchaint drops those blocks as out of
     scope, so a provider bill including them exceeds cost_in_usd. anthropic reports its own count on
-    the raw SDK usage beside this object (Usage.server_tool_use, anthropic 0.116.0);
+    the raw SDK usage beside this object (Usage.server_tool_use, anthropic 0.120.0);
     openai's ResponseUsage carries none.
 
     Every counter is non-negative by validation, which the openai adapter relies on:

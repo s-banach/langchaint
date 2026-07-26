@@ -1,6 +1,6 @@
 """Adapter for the Anthropic Messages API over the official SDK.
 
-Verified against anthropic 0.116.0:
+Verified against anthropic 0.120.0:
 - `messages.parse(output_format=Model)` returns `ParsedMessage[Model]` with a `parsed_output` property;
   the SDK builds the JSON-schema output format and parses the response text.
 - `messages.stream(...)` returns a manager whose entered stream assembles deltas into a `ParsedMessage` snapshot;
@@ -146,7 +146,7 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 
 
 _RATE_LIMIT_STATUSES = frozenset({429, 529})
-"""529 is the SDK's overloaded status (anthropic 0.116.0), which pauses admission like a 429."""
+"""529 is the SDK's overloaded status (anthropic 0.120.0), which pauses admission like a 429."""
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
@@ -155,7 +155,7 @@ type CacheTTL = Literal["5m", "1h"]
 """A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
 
 type AnthropicServiceTier = Literal["auto", "standard_only"]
-"""What a request may ask for (anthropic 0.116.0).
+"""What a request may ask for (anthropic 0.120.0).
 
 "auto" is a ceiling, not a selector: the SDK documents the parameter as whether to use priority
 capacity if available or standard capacity, so no request value names priority.
@@ -163,7 +163,7 @@ capacity if available or standard capacity, so no request value names priority.
 """
 
 type AnthropicPricedServiceTier = Literal["standard", "priority", "batch"]
-"""What a response reports having been served at (anthropic 0.116.0), and the pricing mapping's key.
+"""What a response reports having been served at (anthropic 0.120.0), and the pricing mapping's key.
 
 Disjoint from AnthropicServiceTier: the request and response vocabularies share no word, and the
 response field carries no precondition on the request, so the tier is read off each response.
@@ -687,7 +687,7 @@ class AnthropicMessagesAdapter(Adapter):
         so the SDK must never retry beneath it.
         The copy re-feeds client._client (the caller's httpx.AsyncClient) explicitly:
         the two Bedrock client classes override copy() without the "http_client or self._client" reuse the
-        base AsyncAnthropic.copy has (anthropic 0.116.0), so a plain with_options rebuilds a fresh default
+        base AsyncAnthropic.copy has (anthropic 0.120.0), so a plain with_options rebuilds a fresh default
         transport and drops a custom transport (loaded certs, proxy). Passing it back keeps it; the value is
         the SDK client's own httpx client, re-entering the same SDK's copy, so the private read is known-true.
         cache_ttl applies uniformly to every cache_control marker this adapter writes,
@@ -845,7 +845,7 @@ class AnthropicMessagesAdapter(Adapter):
 
         A response's status decides, not the SDK exception class: _make_status_error returns a
         specific subclass only for the statuses it lists and the bare APIStatusError for every
-        other one (verified against anthropic 0.116.0, Bedrock clients included), so a class list
+        other one (verified against anthropic 0.120.0, Bedrock clients included), so a class list
         would silently drop whatever status the provider adds next.
         classification_from_response holds the shared rule; 529 joins 429 as a rate limit here
         because the SDK reserves it for an overloaded service.

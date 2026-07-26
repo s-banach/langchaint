@@ -117,4 +117,4 @@ Module docstrings are the spec of record for mechanics; `CLAUDE.md` holds the de
 
 Run `scripts/CI.sh`; everything it runs must pass with zero errors.
 The tests are offline and need no API keys.
-Provider behavior claims are verified by introspection against anthropic 0.116.0 and openai 2.45.0.
+Provider behavior claims are verified by introspection against anthropic 0.120.0 and openai 2.45.0.

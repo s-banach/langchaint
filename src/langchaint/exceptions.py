@@ -250,7 +250,7 @@ class InvalidRequestError(GenerationError):
     The provider's rejection is every 4xx the retry policy declines, not only a rejected conversation.
     A bad API key, a permission failure, and an unknown model id land here too.
     A caller separating them reads status_code off __cause__, which holds the exception classify saw.
-    Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.116.0, openai 2.45.0).
+    Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.120.0, openai 2.45.0).
     __cause__ is None on the NotSendable source, where nothing went out.
 
     Behaviorally this is UnrecognizedError (one row, no retry); it is a separate class because

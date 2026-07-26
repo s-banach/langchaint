@@ -12,7 +12,7 @@ from typing import Literal
 
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 """Reasoning effort tiers,
-the union of both providers' vocabularies (verified against anthropic 0.116.0 / openai 2.45.0:
+the union of both providers' vocabularies (verified against anthropic 0.120.0 / openai 2.45.0:
 openai accepts all seven, anthropic "low" through "max").
 Each adapter passes the value through as given (anthropic as output_config.effort with adaptive thinking,
 openai as reasoning_effort); a value or model the provider rejects surfaces as the provider's own error,

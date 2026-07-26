@@ -10,7 +10,7 @@ anthropic_bedrock_model is the Bedrock sibling: it takes the Bedrock wire model 
 (AnthropicBedrockModelName) and sends it verbatim, so the id in application code, on the wire,
 and in traces is one string; the id's Bedrock API (which of two client classes) and default
 pricing come from ANTHROPIC_BEDROCK, so the application never names the client class.
-Both Bedrock client classes construct offline from aws_region alone (anthropic 0.116.0),
+Both Bedrock client classes construct offline from aws_region alone (anthropic 0.120.0),
 so building a model object needs no AWS credentials.
 pricing is a mapping from the service tier a response reports to the AnthropicPricingTable that
 prices it, merged over the model's public standard-tier prices from ANTHROPIC_PRICING, so a caller

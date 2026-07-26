@@ -70,7 +70,7 @@ Mapping decisions:
   "content_filter", the only two the SDK types), and anything else is "other".
 - A `ResponseOutputRefusal` content part becomes a TextPart, so the refusal the model wrote is the
   turn's text and replays as text. anthropic's ContentBlock union has no refusal member
-  (anthropic 0.116.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
+  (anthropic 0.120.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
   mapping openai's part to a TextPart gives the two providers one neutral shape and leaves the stop
   reason as the signal on both.
 - Status "failed" is the API reporting that the run did not finish (`response.error` names why), so

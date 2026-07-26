@@ -1064,7 +1064,7 @@ def test_classify_maps_each_sdk_exception_to_its_classification(
 ) -> None:
     """Each error lands on the classification the adapter's classify docstring names.
 
-    Each status code is the one the SDK raises that class for, read from anthropic 0.116.0;
+    Each status code is the one the SDK raises that class for, read from anthropic 0.120.0;
     the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
     which is why the adapter reads the status rather than the exception class.
     OverloadedError is anthropic's own overload signal and shares the rate_limit class with RateLimitError.

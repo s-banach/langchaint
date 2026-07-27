@@ -135,10 +135,33 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     return None
 
 
-type StreamItem = str | ToolCall
-"""What a stream yields: text chunks and completed tool calls.
+REASONING_PART_SEPARATOR = "\n\n"
+"""What an adapter puts between two reasoning parts a provider breaks structurally.
 
-Text chunks are the provider SDK's own strings, passed through without a wrapper class or copy.
+Providers delimit the parts of a turn's reasoning by structure, not by text: neither the boundary
+nor any whitespace for it arrives on the wire. One constant keeps the two adapters from separating
+parts differently.
+"""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReasoningDelta:
+    """A chunk of the model's readable reasoning.
+
+    text is literal characters to append: a consumer concatenates the deltas and renders the result.
+    An adapter supplies REASONING_PART_SEPARATOR as its own delta at each part boundary,
+    so the concatenation reads as prose rather than running two parts together.
+    """
+
+    text: str
+
+
+type StreamItem = str | ReasoningDelta | ToolCall
+"""What a stream yields: answer text chunks, reasoning text deltas, and completed tool calls.
+
+Answer text chunks are the provider SDK's own strings, passed through without a wrapper class or copy.
+Reasoning is wrapped because it is the turn's second kind of text and a bare string could not be told from the answer;
+a consumer routes the two to different places.
 Each tool call is yielded once, complete, when its block closes;
 there are no tool-call delta items because a consumer cannot act on partial argument JSON,
 and both SDKs accumulate the arguments and hand over the finished call.
@@ -394,7 +417,7 @@ class AdapterStream(ABC):
 
     @abstractmethod
     def items(self) -> AsyncIterator[StreamItem]:
-        """Yield text chunks and completed tool calls in arrival order.
+        """Yield answer text chunks, reasoning text deltas, and completed tool calls in arrival order.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.

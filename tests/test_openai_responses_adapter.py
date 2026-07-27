@@ -33,6 +33,10 @@ from openai.types.responses import (
     ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningSummaryTextDoneEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
     ResponseUsage,
 )
 from openai.types.responses.parsed_response import ParsedResponse
@@ -46,6 +50,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     PricingTable,
+    ReasoningDelta,
     ReasoningEffort,
     ReasoningTrace,
     SpecificToolChoice,
@@ -819,6 +824,67 @@ def _completed_event(
     )
 
 
+def _summary_delta_event(
+    delta: str, summary_index: int, sequence_number: int
+) -> ResponseReasoningSummaryTextDeltaEvent:
+    """Build one summary-text delta event, belonging to the numbered summary part."""
+    return ResponseReasoningSummaryTextDeltaEvent(
+        type="response.reasoning_summary_text.delta",
+        delta=delta,
+        item_id="r1",
+        output_index=0,
+        summary_index=summary_index,
+        sequence_number=sequence_number,
+    )
+
+
+def _summary_done_event(
+    text: str, summary_index: int, sequence_number: int
+) -> ResponseReasoningSummaryTextDoneEvent:
+    """Build the done event closing the numbered summary part."""
+    return ResponseReasoningSummaryTextDoneEvent(
+        type="response.reasoning_summary_text.done",
+        text=text,
+        item_id="r1",
+        output_index=0,
+        summary_index=summary_index,
+        sequence_number=sequence_number,
+    )
+
+
+def _reasoning_text_delta_event(
+    delta: str, content_index: int, sequence_number: int
+) -> ResponseReasoningTextDeltaEvent:
+    """Build one reasoning-text delta event, belonging to the numbered content part."""
+    return ResponseReasoningTextDeltaEvent(
+        type="response.reasoning_text.delta",
+        delta=delta,
+        content_index=content_index,
+        item_id="r1",
+        output_index=0,
+        sequence_number=sequence_number,
+    )
+
+
+def _reasoning_text_done_event(
+    text: str, content_index: int, sequence_number: int
+) -> ResponseReasoningTextDoneEvent:
+    """Build the done event closing the numbered content part."""
+    return ResponseReasoningTextDoneEvent(
+        type="response.reasoning_text.done",
+        text=text,
+        content_index=content_index,
+        item_id="r1",
+        output_index=0,
+        sequence_number=sequence_number,
+    )
+
+
+def _streamed_reasoning(translated: Sequence[StreamItem]) -> str:
+    """Concatenate the reasoning deltas, as an application rendering them as flowing text would."""
+    return "".join(item.text for item in translated if isinstance(item, ReasoningDelta))
+
+
 def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
     """Text deltas pass through in order as the SDK's own strings; nothing follows them."""
     translated = _collected_items([
@@ -827,6 +893,155 @@ def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
         _completed_event(_response(usage=_usage_with_cache()), 3),
     ])
     assert translated == ["he", "y"]
+
+
+def test_stream_yields_both_reasoning_channels_as_reasoning_deltas() -> None:
+    """Summary deltas and reasoning-text deltas both become ReasoningDelta; answer text stays a bare string.
+
+    Which channel a model fills is request-time behavior, so the adapter forwards whichever arrives.
+    """
+    translated = _collected_items([
+        _summary_delta_event("weighing", 0, 1),
+        _reasoning_text_delta_event("deciding", 0, 2),
+        _text_delta_event("hey", 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert translated == [ReasoningDelta(text="weighing"), ReasoningDelta(text="deciding"), "hey"]
+
+
+def test_a_summary_part_boundary_streams_the_separator_the_assembled_trace_uses() -> None:
+    """A part's done event puts a blank line before the next part's first delta.
+
+    The API breaks between two parts structurally and never sends it as text, so deltas concatenated
+    without it run the parts together.
+
+    One scenario drives both surfaces: the deltas spell out the two parts, and the terminal response
+    carries the reasoning item holding those same parts, as a stream's completed event does. What an
+    application prints while the stream runs then has to match the trace it holds once it ends.
+    """
+    parts = ("First, water evaporates.", "Then it condenses.")
+    adapter_stream = _stream([
+        _summary_delta_event("First, water ", 0, 1),
+        _summary_delta_event("evaporates.", 0, 2),
+        _summary_done_event(parts[0], 0, 3),
+        _summary_delta_event("Then it ", 1, 4),
+        _summary_delta_event("condenses.", 1, 5),
+        _summary_done_event(parts[1], 1, 6),
+        _completed_event(
+            _response(usage=_usage_with_cache(), output=[_reasoning_item(summary=parts)]), 7
+        ),
+    ])
+
+    async def scenario() -> tuple[str, AssistantMessage]:
+        streamed = _streamed_reasoning([item async for item in adapter_stream.items()])
+        return streamed, _assistant_message_from(await adapter_stream.final())
+
+    streamed, assistant_message = asyncio.run(scenario())
+    trace = assistant_message.turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert streamed == trace.text == "First, water evaporates.\n\nThen it condenses."
+
+
+def test_deltas_within_one_summary_part_stream_with_nothing_between_them() -> None:
+    """Only a done event separates; the deltas of one part concatenate into that part's text."""
+    translated = _collected_items([
+        _summary_delta_event("weigh", 0, 1),
+        _summary_delta_event("ing it", 0, 2),
+        _completed_event(_response(usage=_usage_with_cache()), 3),
+    ])
+    assert _streamed_reasoning(translated) == "weighing it"
+
+
+def test_the_reasoning_text_channel_separates_its_parts_the_same_way() -> None:
+    """The content channel's own done event drives the separator, as the summary channel's does."""
+    translated = _collected_items([
+        _reasoning_text_delta_event("First.", 0, 1),
+        _reasoning_text_done_event("First.", 0, 2),
+        _reasoning_text_delta_event("Then.", 1, 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert _streamed_reasoning(translated) == "First.\n\nThen."
+
+
+def test_a_pending_separator_crosses_from_one_reasoning_channel_to_the_other() -> None:
+    """A summary part's done event separates it from a content delta, the next reasoning text.
+
+    The pending separator belongs to the stream, not to the channel that armed it.
+    """
+    translated = _collected_items([
+        _summary_delta_event("First.", 0, 1),
+        _summary_done_event("First.", 0, 2),
+        _reasoning_text_delta_event("Then.", 0, 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert _streamed_reasoning(translated) == "First.\n\nThen."
+
+
+def test_a_done_event_before_any_delta_streams_no_leading_separator() -> None:
+    """A part that streamed no text arms nothing, so the reasoning never opens on a blank line.
+
+    A summary part holding no text is dropped from the assembled trace, and the stream owes the
+    same: a separator falls between two reasoning deltas or not at all.
+    """
+    translated = _collected_items([
+        _summary_done_event("", 0, 1),
+        _summary_delta_event("thought it over", 1, 2),
+        _completed_event(_response(usage=_usage_with_cache()), 3),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over")]
+
+
+def test_a_delta_carrying_no_characters_is_dropped_rather_than_streamed() -> None:
+    """An empty delta is not text: it yields no item and leaves the next part unseparated.
+
+    Counting it as text would open the reasoning on a blank line, since the part it belongs to
+    contributes nothing for a separator to follow.
+    """
+    translated = _collected_items([
+        _summary_delta_event("", 0, 1),
+        _summary_done_event("", 0, 2),
+        _summary_delta_event("thought it over", 1, 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over")]
+
+
+def test_an_empty_delta_does_not_consume_the_pending_separator() -> None:
+    """The dropped delta leaves the separator pending, so the reasoning never trails a blank line."""
+    translated = _collected_items([
+        _summary_delta_event("thought it over", 0, 1),
+        _summary_done_event("thought it over", 0, 2),
+        _summary_delta_event("", 1, 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over")]
+
+
+def test_an_empty_delta_keeps_the_separator_for_the_next_delta_that_carries_text() -> None:
+    """The separator armed before a dropped delta still falls before the next part's text."""
+    translated = _collected_items([
+        _summary_delta_event("First.", 0, 1),
+        _summary_done_event("First.", 0, 2),
+        _summary_delta_event("", 1, 3),
+        _summary_delta_event("Then.", 1, 4),
+        _completed_event(_response(usage=_usage_with_cache()), 5),
+    ])
+    assert _streamed_reasoning(translated) == "First.\n\nThen."
+
+
+def test_a_done_event_with_no_delta_after_it_streams_no_trailing_separator() -> None:
+    """The separator precedes the next reasoning delta, so a last part contributes none.
+
+    Answer text following the done event is untouched: only a reasoning delta consumes a pending
+    separator.
+    """
+    translated = _collected_items([
+        _summary_delta_event("thought it over", 0, 1),
+        _summary_done_event("thought it over", 0, 2),
+        _text_delta_event("hey", 3),
+        _completed_event(_response(usage=_usage_with_cache()), 4),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over"), "hey"]
 
 
 def test_stream_yields_one_complete_tool_call_and_ignores_message_items() -> None:

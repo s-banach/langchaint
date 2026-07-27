@@ -11,6 +11,7 @@ schema() returns, are on __all__: both appear in signatures application code wri
 """
 
 from langchaint.adapter import (
+    ReasoningDelta,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
@@ -113,6 +114,7 @@ __all__ = [
     "ProviderFailedTerminallyError",
     "PydanticTool",
     "RateLimiter",
+    "ReasoningDelta",
     "ReasoningEffort",
     "ReasoningTrace",
     "RefusalError",

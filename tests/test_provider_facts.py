@@ -15,6 +15,7 @@ import openai
 import pytest
 from anthropic.types import (
     ImageBlockParam,
+    RawContentBlockDeltaEvent,
     TextBlockParam,
     ToolParam,
     ToolResultBlockParam,
@@ -31,6 +32,7 @@ from openai.types.responses import (
     ResponseInputImageParam,
     ResponseInputTextContentParam,
     ResponseInputTextParam,
+    ResponseStreamEvent,
     ResponseUsage,
 )
 from openai.types.responses.response import IncompleteDetails
@@ -57,6 +59,21 @@ def _field_annotation(model: type[BaseModel], name: str) -> object:
     """
     assert name in model.model_fields, f"{model.__name__} lost the field {name}"
     return model.model_fields[name].annotation
+
+
+def _type_literals_of_union(annotation: object) -> set[str]:
+    """Collect the value of each member's `type` field literal, over a union or an Annotated one.
+
+    Both SDKs discriminate their event unions on a `type` field holding a one-value Literal, which
+    is the string the adapters branch on.
+
+    Raises:
+        AssertionError: a member has no `type` field.
+    """
+    members = typing.get_args(annotation)
+    if typing.get_origin(annotation) is typing.Annotated:
+        members = typing.get_args(members[0])
+    return {typing.get_args(_field_annotation(member, "type"))[0] for member in members}
 
 
 def _is_required(model: type[BaseModel], name: str) -> bool:
@@ -315,6 +332,28 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
         assert type(error) is error_class, status_code
     unlisted = client._make_status_error("boom", body=None, response=_response_with(451, {}))
     assert type(unlisted) is anthropic.APIStatusError
+
+
+def test_anthropic_content_block_deltas_carry_the_two_kinds_of_text_the_stream_yields() -> None:
+    """The stream branches on these two delta types; a rename drops that text from the stream unnoticed."""
+    members = _type_literals_of_union(_field_annotation(RawContentBlockDeltaEvent, "delta"))
+    assert "text_delta" in members
+    assert "thinking_delta" in members
+
+
+def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches_on() -> None:
+    """The stream branches on these five event types; a rename changes what it yields unnoticed.
+
+    Reasoning arrives on two independent channels the adapter forwards without choosing between them.
+    A renamed delta type drops that text from the stream; a renamed done type drops every separator
+    between reasoning parts, leaving them concatenated into one run.
+    """
+    members = _type_literals_of_union(ResponseStreamEvent)
+    assert "response.output_text.delta" in members
+    assert "response.reasoning_summary_text.delta" in members
+    assert "response.reasoning_text.delta" in members
+    assert "response.reasoning_summary_text.done" in members
+    assert "response.reasoning_text.done" in members
 
 
 def test_the_schema_builders_both_adapters_call_are_still_where_they_were() -> None:

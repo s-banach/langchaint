@@ -75,7 +75,7 @@ The SDK clients are configured to never retry beneath langchaint, so attempt cou
 `cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part; the wire mechanics are in the adapter module docstrings.
 
 **Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ToolCall` items, with `await handle.final()` returning the assembled `Response`.
+`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCall` items, with `await handle.final()` returning the assembled `Response`.
 
 **Tools under one protocol.**
 `PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` (the structured exit for a `tool_choice="required"` loop) share the `Tool` protocol, so one `ToolManager` holds a mix and an application adds its own form by implementing `Tool`.
@@ -98,7 +98,7 @@ Deliberate absences, each with its reason recorded in `CLAUDE.md` or a module do
 - No Converse adapter for Bedrock: the adapters take the SDKs' bundled Bedrock clients.
 - No provider-parameter passthrough dict: an unmapped provider parameter is reached by subclassing the concrete adapter.
 - No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, and invalid inputs are sent so the provider's own error surfaces.
-- No delta, usage, or stop items in a stream: a stream yields `str | ToolCall`, and `usage` and `stop_reason` live on `final()`'s `Response`.
+- No partial tool-call arguments, usage, or stop reason in a stream: a tool call is yielded once complete, and `usage` and `stop_reason` live on `final()`'s `Response`.
 - No document or PDF part: convert before sending, rasterizing pages to `ImagePart` or extracting the text layer to `TextPart`.
 
 A Chat Completions adapter, and with it third-party compatible servers such as vLLM and Ollama, is not built yet; OpenAI support is the Responses API.

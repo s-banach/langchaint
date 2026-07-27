@@ -1,8 +1,11 @@
 """Streaming: a handle that is an item iterator, a Response source, and a context manager.
 
 stream_one returns a StreamHandle without doing any I/O; entering it with async with opens the request.
-Iterating yields StreamItem = str | ToolCall and nothing else: text chunks are the SDK's own strings passed through,
-and each ToolCall is yielded once, complete, when its block closes (there are no partial-argument delta items).
+Iterating yields StreamItem = str | ReasoningDelta | ToolCall and nothing else.
+Answer text chunks are the SDK's own strings passed through;
+the model's readable reasoning is wrapped in a ReasoningDelta so it can go somewhere else,
+here stderr while the answer goes to stdout, two destinations a shell redirects independently.
+Each ToolCall is yielded once, complete, when its block closes (there are no partial-argument delta items).
 await handle.final() drains the rest silently and returns the assembled Response,
 where usage, cost, and stop_reason live.
 The handle is unusable outside its async with block, which closes the connection and bounds the requests it can send.
@@ -11,6 +14,7 @@ The LangChain call-for-call map (stream, astream, astream_events) lives in MIGRA
 """
 
 import asyncio
+import sys
 
 from pydantic import BaseModel
 
@@ -19,6 +23,7 @@ from langchaint import (
     HasTools,
     Message,
     PydanticTool,
+    ReasoningDelta,
     ToolCall,
     ToolManager,
     UserMessage,
@@ -27,19 +32,23 @@ from langchaint.openai import openai_model
 
 
 async def stream_text() -> None:
-    """Print text as it arrives, then read usage off the final Response.
+    """Print the answer to stdout and the reasoning to stderr as they arrive, then read usage off the final Response.
 
     The request opens at the async with, which also guarantees the connection closes.
+    reasoning_summary is what asks openai for the readable reasoning the stderr branch prints.
     """
-    bound = openai_model("gpt-5.6-terra").bind(
+    bound = openai_model("gpt-5.6-terra", reasoning_summary="auto").bind(
         system_prompt="Answer in a short paragraph.",
         automatic_prompt_caching=False,
     )
     handle = bound.stream_one("Describe the water cycle.")
     async with handle:
         async for item in handle:
-            if isinstance(item, str):
-                print(item, end="", flush=True)
+            match item:
+                case str():
+                    print(item, end="", flush=True)
+                case ReasoningDelta():
+                    print(item.text, end="", flush=True, file=sys.stderr)
         response = await handle.final()
     print()
     print(f"{response.usage.output_tokens} output tokens, {response.usage.cost_in_usd:.6f} USD")
@@ -63,10 +72,13 @@ async def stream_agent(
         handle = bound.stream_one(conversation)
         async with handle:
             async for item in handle:
-                if isinstance(item, str):
-                    print(item, end="", flush=True)
-                elif isinstance(item, ToolCall):
-                    print(f"\n[calling {item.name}]")
+                match item:
+                    case str():
+                        print(item, end="", flush=True)
+                    case ReasoningDelta():
+                        print(item.text, end="", flush=True, file=sys.stderr)
+                    case ToolCall():
+                        print(f"\n[calling {item.name}]")
             response = await handle.final()
         conversation.append(response.assistant_message)
         if not response.tool_calls:
@@ -101,7 +113,7 @@ async def main() -> None:
     await stream_text()
     print()
     tool_manager = ToolManager([weather_tool])
-    bound = openai_model("gpt-5.6-terra").bind(
+    bound = openai_model("gpt-5.6-terra", reasoning_summary="auto").bind(
         system_prompt="Use tools to answer questions about the weather.",
         tool_manager=tool_manager,
         automatic_prompt_caching=True,

@@ -15,7 +15,7 @@ This guide gives the call-for-call map, then explains what replaces the middlewa
 | `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([PydanticTool(...)]))` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
 | `model.batch([...])`, `model.abatch([...])` | `bound.generate_many([...])`, returns `list[Response \| GenerationError]` |
-| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)`, iterate `str \| ToolCall`, `await handle.final()` for the `Response` |
+| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)`, iterate `str \| ReasoningDelta \| ToolCall`, `await handle.final()` for the `Response` |
 | `astream_events(...)` to catch tool calls | the same `stream_one` iterator yields each completed `ToolCall` |
 | `create_react_agent(...)`, `AgentExecutor` | own the loop over `generate_one` and `ToolManager.dispatch` (see `02_tool_loop.py`) |
 | a tool returning `Command(goto=/update=)` | not supported by design; a tool returns data, the app routes between turns |

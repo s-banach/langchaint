@@ -38,6 +38,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     PydanticTool,
+    ReasoningDelta,
     ReasoningTrace,
     SpecificToolChoice,
     StreamItem,
@@ -48,6 +49,7 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.adapter import (
+    REASONING_PART_SEPARATOR,
     Binding,
     ContextWindowExceeded,
     EmptyTurn,
@@ -828,6 +830,41 @@ def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
     )
 
 
+def _thinking_delta_event(thinking: str, index: int) -> at.RawContentBlockDeltaEvent:
+    """Build one thinking-delta event, belonging to the numbered thinking block."""
+    return at.RawContentBlockDeltaEvent(
+        type="content_block_delta",
+        index=index,
+        delta=at.ThinkingDelta(type="thinking_delta", thinking=thinking),
+    )
+
+
+def _thinking_block_stop_event(thinking: str, index: int) -> ParsedContentBlockStopEvent:
+    """Build the stop event closing the numbered thinking block."""
+    return ParsedContentBlockStopEvent(
+        type="content_block_stop",
+        index=index,
+        content_block=at.ThinkingBlock(
+            type="thinking", thinking=thinking, signature=f"sig-{index}"
+        ),
+    )
+
+
+def _streamed_reasoning(translated: Sequence[StreamItem]) -> str:
+    """Concatenate the reasoning deltas, as an application rendering them as flowing text would."""
+    return "".join(item.text for item in translated if isinstance(item, ReasoningDelta))
+
+
+def _collected_items(replay_events: Sequence[ParsedMessageStreamEvent]) -> list[StreamItem]:
+    """Drain the translated items into a list."""
+
+    async def scenario() -> list[StreamItem]:
+        adapter_stream = _anthropic_stream(replay_events, _message_snapshot("end_turn"))
+        return [item async for item in adapter_stream.items()]
+
+    return asyncio.run(scenario())
+
+
 def test_stream_yields_bare_text_and_one_complete_tool_call() -> None:
     """Text deltas pass through as the SDK's own strings.
 
@@ -870,6 +907,125 @@ def test_stream_yields_bare_text_and_one_complete_tool_call() -> None:
         "y",
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
     ]
+
+
+def test_stream_yields_a_thinking_delta_as_a_reasoning_delta() -> None:
+    """A thinking delta is wrapped in ReasoningDelta while answer text stays a bare string."""
+    thinking_delta_event = at.RawContentBlockDeltaEvent(
+        type="content_block_delta",
+        index=0,
+        delta=at.ThinkingDelta(type="thinking_delta", thinking="checking"),
+    )
+
+    async def scenario() -> list[StreamItem]:
+        adapter_stream = _anthropic_stream(
+            [thinking_delta_event, _text_delta_event("hey", 1)],
+            _message_snapshot("end_turn"),
+        )
+        return [item async for item in adapter_stream.items()]
+
+    assert asyncio.run(scenario()) == [ReasoningDelta(text="checking"), "hey"]
+
+
+def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
+    """A block's stop event puts a blank line before the next block's first delta.
+
+    A turn's reasoning arrives as one or more thinking blocks, and the break between two of them is
+    a block boundary the API never sends as text, so deltas concatenated without it run the two
+    blocks together.
+    """
+    translated = _collected_items([
+        _thinking_delta_event("First, water ", 0),
+        _thinking_delta_event("evaporates.", 0),
+        _thinking_block_stop_event("First, water evaporates.", 0),
+        _thinking_delta_event("Then it condenses.", 1),
+        _thinking_block_stop_event("Then it condenses.", 1),
+    ])
+    assert _streamed_reasoning(translated) == "First, water evaporates.\n\nThen it condenses."
+
+
+def test_deltas_within_one_thinking_block_stream_with_nothing_between_them() -> None:
+    """Only a block stop separates; the deltas of one block concatenate into that block's text."""
+    translated = _collected_items([
+        _thinking_delta_event("weigh", 0),
+        _thinking_delta_event("ing it", 0),
+    ])
+    assert _streamed_reasoning(translated) == "weighing it"
+
+
+def test_a_block_stop_with_no_delta_after_it_streams_no_trailing_separator() -> None:
+    """The separator precedes the next thinking delta, so a last block contributes none.
+
+    Answer text following the block stop is untouched: only a thinking delta consumes a pending
+    separator.
+    """
+    translated = _collected_items([
+        _thinking_delta_event("thought it over", 0),
+        _thinking_block_stop_event("thought it over", 0),
+        _text_delta_event("hey", 1),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over"), "hey"]
+
+
+def test_a_thinking_delta_carrying_no_characters_is_dropped_rather_than_streamed() -> None:
+    """An empty delta is not text: it yields no item and leaves the next block unseparated."""
+    translated = _collected_items([
+        _thinking_delta_event("", 0),
+        _thinking_block_stop_event("", 0),
+        _thinking_delta_event("thought it over", 1),
+    ])
+    assert translated == [ReasoningDelta(text="thought it over")]
+
+
+def test_an_empty_thinking_delta_keeps_the_separator_for_the_next_delta_with_text() -> None:
+    """The separator armed before a dropped delta still falls before the next block's text."""
+    translated = _collected_items([
+        _thinking_delta_event("First.", 0),
+        _thinking_block_stop_event("First.", 0),
+        _thinking_delta_event("", 1),
+        _thinking_delta_event("Then.", 1),
+    ])
+    assert _streamed_reasoning(translated) == "First.\n\nThen."
+
+
+def test_a_redacted_thinking_block_streams_no_text_and_no_extra_blank_line() -> None:
+    """A redacted block yields no delta of its own and does not double the blank line around it."""
+    redacted_stop = ParsedContentBlockStopEvent(
+        type="content_block_stop",
+        index=1,
+        content_block=at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
+    )
+    translated = _collected_items([
+        _thinking_delta_event("First.", 0),
+        _thinking_block_stop_event("First.", 0),
+        redacted_stop,
+        _thinking_delta_event("Then.", 2),
+    ])
+    assert translated == [
+        ReasoningDelta(text="First."),
+        ReasoningDelta(text=REASONING_PART_SEPARATOR),
+        ReasoningDelta(text="Then."),
+    ]
+
+
+def test_a_redacted_block_after_a_thinking_block_with_no_text_arms_no_separator() -> None:
+    """A redacted block does not separate what its neighbors left unseparated.
+
+    The preceding block streamed nothing, so no reasoning text precedes the redacted one and the
+    stream opens on the next block's own text.
+    """
+    redacted_stop = ParsedContentBlockStopEvent(
+        type="content_block_stop",
+        index=1,
+        content_block=at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
+    )
+    translated = _collected_items([
+        _thinking_delta_event("", 0),
+        _thinking_block_stop_event("", 0),
+        redacted_stop,
+        _thinking_delta_event("Then.", 2),
+    ])
+    assert translated == [ReasoningDelta(text="Then.")]
 
 
 def test_stream_final_turn_carries_reasoning() -> None:

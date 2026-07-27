@@ -12,7 +12,7 @@ Where a tool's specifics do not matter, the code uses a minimal tool (a canned w
 | --- | --- |
 | [`01_basics.py`](01_basics.py) | construct a model, `bind`, `generate_one`, structured output via `response_format`, `rebind`, and `generate_many` + `to_row` |
 | [`02_tool_loop.py`](02_tool_loop.py) | the ReAct loop over `generate_one` and `ToolManager.dispatch`, the three dispatch outcomes, `app_data`, and an approval gate as an optional argument to the same loop |
-| [`03_streaming.py`](03_streaming.py) | `stream_one`, the `str \| ToolCall` iterator, `final()` for usage and cost, and the streaming tool loop |
+| [`03_streaming.py`](03_streaming.py) | `stream_one`, the `str \| ReasoningDelta \| ToolCall` iterator, `final()` for usage and cost, and the streaming tool loop |
 | [`04_tracing.py`](04_tracing.py) | OTel telemetry with `TracedLLM` and a span exporter |
 | [`05_rate_limiting_and_errors.py`](05_rate_limiting_and_errors.py) | one shared `RateLimiter` across an openai and an anthropic model, catching a `GenerationError`, and a try/except fallback |
 | [`06_prompt_caching.py`](06_prompt_caching.py) | `cache_breakpoint` marks in the frozen prefix, the anthropic 4-marker budget and `cache_ttl`, openai's implicit/explicit modes, and the marks each provider rejects |

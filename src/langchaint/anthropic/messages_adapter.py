@@ -96,6 +96,7 @@ from anthropic.types.json_output_format_param import JSONOutputFormatParam
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
+    REASONING_PART_SEPARATOR,
     Adapter,
     AdapterResult,
     AdapterStream,
@@ -108,6 +109,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     NoOutput,
     NoOutputOutcome,
+    ReasoningDelta,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
@@ -950,9 +952,19 @@ class _AnthropicStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate the SDK stream into text chunks and completed tool calls.
+        """Translate the SDK stream into answer text chunks, reasoning text deltas, and completed tool calls.
 
         A tool call is built from the SDK-accumulated block exactly like the non-streaming path.
+
+        A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
+        is a block boundary, never text. That boundary reaches the caller as a
+        REASONING_PART_SEPARATOR delta before the next block's first delta, so a caller
+        concatenating ReasoningDelta text gets those breaks as characters.
+        A block holding no text is not a block: a delta carrying no characters is dropped, and a
+        separator falls only between two blocks that streamed text, so the reasoning never opens or
+        ends on a blank line and never doubles one.
+        A redacted_thinking block streams no delta, so it contributes no reasoning text and does not
+        change the separation of the blocks around it.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.
@@ -960,17 +972,28 @@ class _AnthropicStream(AdapterStream):
         Raises:
             StreamProtocolError: the stream ended without a stop reason.
         """
+        reasoning_delta_yielded = False
+        separator_pending = False
         async for event in self._sdk_stream:
             self._snapshot_started = True
             if event.type == "content_block_delta":
                 if event.delta.type == "text_delta":
                     yield event.delta.text
-            elif event.type == "content_block_stop" and event.content_block.type == "tool_use":
-                yield ToolCall(
-                    id=event.content_block.id,
-                    name=event.content_block.name,
-                    args_json=json.dumps(event.content_block.input),
-                )
+                elif event.delta.type == "thinking_delta" and event.delta.thinking:
+                    if separator_pending:
+                        separator_pending = False
+                        yield ReasoningDelta(text=REASONING_PART_SEPARATOR)
+                    reasoning_delta_yielded = True
+                    yield ReasoningDelta(text=event.delta.thinking)
+            elif event.type == "content_block_stop":
+                if event.content_block.type == "tool_use":
+                    yield ToolCall(
+                        id=event.content_block.id,
+                        name=event.content_block.name,
+                        args_json=json.dumps(event.content_block.input),
+                    )
+                elif event.content_block.type == "thinking":
+                    separator_pending = reasoning_delta_yielded
         if self._sdk_stream.current_message_snapshot.stop_reason is None:
             raise StreamProtocolError("stream ended without a stop reason")
 

@@ -78,8 +78,9 @@ Mapping decisions:
   whatever it emitted is a fragment rather than the turn. Both bindings report it as the member
   `_provider_failure` picks off `response.error.code`, carrying that response's billing, and a
   structured binding does so whether or not the fragment happened to validate.
-- Streaming yields the SDK's own delta strings unwrapped and each tool call once, complete,
-  from its `response.output_item.done` event; argument fragments are never surfaced.
+- Streaming yields the SDK's own answer delta strings unwrapped, each reasoning delta in a ReasoningDelta,
+  and each tool call once, complete, from its `response.output_item.done` event;
+  argument fragments are never surfaced.
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
 
@@ -122,6 +123,7 @@ if TYPE_CHECKING:
     from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
 
 from langchaint.adapter import (
+    REASONING_PART_SEPARATOR,
     Adapter,
     AdapterResult,
     AdapterStream,
@@ -134,6 +136,7 @@ from langchaint.adapter import (
     NoOutputOutcome,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
+    ReasoningDelta,
     Refusal,
     ResponseOutcome,
     SchemaViolation,
@@ -547,8 +550,8 @@ def _reasoning_text(item: ResponseReasoningItem) -> str | None:
     Empty parts are dropped before the join, so an item whose parts are all empty yields None
     rather than the separator alone; text-free stays the single condition text is None.
     """
-    summary = "\n\n".join(part.text for part in item.summary if part.text)
-    content = "\n\n".join(part.text for part in item.content or () if part.text)
+    summary = REASONING_PART_SEPARATOR.join(part.text for part in item.summary if part.text)
+    content = REASONING_PART_SEPARATOR.join(part.text for part in item.content or () if part.text)
     return summary or content or None
 
 
@@ -847,20 +850,53 @@ class _OpenAIStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate the SDK stream into text chunks and completed tool calls.
+        """Translate the SDK stream into answer text chunks, reasoning text deltas, and completed tool calls.
 
         The terminal event's response is kept for final(), which must not call the SDK's get_final_response():
         that raises RuntimeError unless the terminal event is response.completed.
 
+        Reasoning arrives on two independent event types and both are forwarded:
+        summary deltas, which the constructor's reasoning_summary asks for,
+        and reasoning text deltas from a model that fills the reasoning item's content.
+        A stream yielding no ReasoningDelta is a model returning no readable reasoning.
+
+        Reasoning text arrives in parts, and the API breaks between two parts structurally, never
+        as text: each part ends with its own done event instead. That done event puts a
+        REASONING_PART_SEPARATOR delta before the next part's first delta, so a caller
+        concatenating ReasoningDelta text gets those breaks as characters.
+        A part holding no text is not a part: a delta carrying no characters is dropped, and a
+        separator falls only between two parts that streamed text, so the reasoning never opens or
+        ends on a blank line and never doubles one. That is the rule _reasoning_text applies when it
+        drops empty parts before joining.
+        A pending separator is scoped to neither one item nor one channel: whichever reasoning delta
+        comes next consumes it.
+
         Yields:
-            Stream items; SDK events langchaint does not model (reasoning, built-in tool activity) are dropped.
+            Stream items; SDK events langchaint does not model (built-in tool activity) are dropped.
 
         Raises:
             StreamProtocolError: the stream ended without a terminal response.
         """
+        reasoning_delta_yielded = False
+        separator_pending = False
         async for sdk_event in self._sdk_stream:
             if sdk_event.type == "response.output_text.delta":
                 yield sdk_event.delta
+            elif sdk_event.type in (
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            ):
+                if sdk_event.delta:
+                    if separator_pending:
+                        separator_pending = False
+                        yield ReasoningDelta(text=REASONING_PART_SEPARATOR)
+                    reasoning_delta_yielded = True
+                    yield ReasoningDelta(text=sdk_event.delta)
+            elif sdk_event.type in (
+                "response.reasoning_summary_text.done",
+                "response.reasoning_text.done",
+            ):
+                separator_pending = reasoning_delta_yielded
             elif (
                 sdk_event.type == "response.output_item.done"
                 and sdk_event.item.type == "function_call"

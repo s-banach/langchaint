@@ -11,6 +11,8 @@ after the first yielded item nothing is retried,
 because replaying items the caller already consumed would duplicate output.
 A transient failure the item iterator raises is recorded and fed back to the RateLimiter on both
 paths, so a rate limit paces the account whether or not the stream that hit it could still reopen.
+A transient failure past the first item ends the call as RetryUnavailableError, as does one the
+assembled response reports.
 An open stream holds one RateLimiter in-flight slot from opening until the stream closes or exhausts,
 so long-lived streams count against max_in_flight for their whole life.
 """
@@ -51,6 +53,7 @@ from langchaint.exceptions import (
     ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
+    RetryUnavailableError,
     SchemaViolationError,
     StreamProtocolError,
     TransientError,
@@ -61,7 +64,6 @@ from langchaint.exceptions import (
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
-from langchaint.usage import Usage
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -77,7 +79,11 @@ class StreamHandle[OutputT]:
 
     Iterate for items as they arrive; await final() at any point in the block to drain silently and get the Response.
     The request opens on entry, so open failures surface there rather than at the first item.
-    A transient failure after the first yielded item propagates as TransientError; retry by calling stream_one again.
+
+    max_attempts bounds one phase only: reaching the first item. Past it nothing is retried,
+    whatever the budget still holds: a transient failure an item pull raises, and one the assembled
+    response reports, each end the call as RetryUnavailableError. Reopening is the application's to
+    do, by calling stream_one again.
     """
 
     def __init__(
@@ -168,16 +174,14 @@ class StreamHandle[OutputT]:
         """Record the abandonment, unless no log was given or the conclusion accounted for the call.
 
         A Response and a GenerationError each hand the caller this call's CallRecord, naming
-        the model and the attempts to reconcile against, and the TransientError a
-        ProviderFailedTransiently 200 raises carries that 200's billing.
+        the model and the attempts to reconcile against.
         Appending after one would report the same call twice and mislabel a concluded call as an
         in-flight abandonment.
-        A StreamProtocolError and a failure after the first item hand over neither, so a
-        cancellation following one still gets a record: it is the only account of the stream that
-        was opened.
-        Every settled record here is a failed attempt, whether an open that failed before the first
-        item or a failure after one, so usage_settled holds only what those failures carried and
-        what the stream billed for the items it already delivered is unobservable client-side.
+        A StreamProtocolError hands over neither, so a cancellation following one still gets a
+        record: it is the only account of the stream that was opened.
+        Every settled record here is an open that failed before the first item, so usage_settled
+        holds only what those failures carried, and what the stream billed for the items it already
+        delivered is unobservable client-side.
         """
         if self._conclusion_carried_the_call:
             return
@@ -236,9 +240,9 @@ class StreamHandle[OutputT]:
 
         Called while the failing attempt's admission is still held;
         register_transient_error raises RuntimeError for one already released.
-        Every transient failure goes through here, whether or not the stream had already yielded
-        items: the pause a rate limit sets protects the whole account, so losing it because this one
-        stream is past reopening would leave every other caller sending into the limit.
+        A failure this stream cannot retry still registers, because the pause a rate limit sets
+        protects the whole account: losing it because this one stream is past reopening would leave
+        every other caller sending into the limit.
 
         Returns:
             The Backoff to sleep before the next open attempt;
@@ -351,8 +355,8 @@ class StreamHandle[OutputT]:
         and every such error but a cancellation is the call's conclusion, which final() replays.
 
         Raises:
-            TransientError: the stream failed after items were yielded; it carries the adapter's
-                verdict on that failure, so a rate limit reaches the caller as one.
+            RetryUnavailableError: the stream failed after items were yielded, so no retry was
+                available; __cause__ is the adapter's verdict on that failure.
             InvalidRequestError: the adapter reported a reopened conversation as InvalidRequest, or
                 classified an item or reopen error as a rejection of the request.
             UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
@@ -406,11 +410,7 @@ class StreamHandle[OutputT]:
                     )
                     self._record_transient_error(wrapped)
                     await self._close_adapter_stream()
-                    if wrapped is exc:
-                        # The adapter raised the TransientError itself; `from exc` would make it its
-                        # own cause.
-                        raise
-                    raise wrapped from exc
+                    raise RetryUnavailableError(call=self._ledger.freeze()) from wrapped
                 backoff = self._record_transient_error(self._transient_error(exc, str(exc)))
                 await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, backoff)
@@ -434,7 +434,7 @@ class StreamHandle[OutputT]:
         Without that store, a second call would append a second AttemptRecord for the one request made.
         A 200 that produced no output is detected only here, when the adapter reads the assembled
         message: the adapter reports which one it was and this method builds the GenerationError from
-        it, without retrying (the stream already yielded items to the caller);
+        it, without retrying;
         it reaches the caller carrying the attempt records this handle built.
 
         Raises:
@@ -452,9 +452,9 @@ class StreamHandle[OutputT]:
             ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
             UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
             ProviderFailedTerminallyError: the adapter reported it as ProviderFailedTerminally; likewise.
-            TransientError: the adapter reported it as ProviderFailedTransiently; not retried,
-                because the stream already yielded items to the caller. The error carries that 200's
-                billing, the only channel this outcome has.
+            RetryUnavailableError: the adapter reported the assembled response as
+                ProviderFailedTransiently; that response ends the stream, so no retry was available.
+                That 200's billing and turn are on its attempt record.
             RuntimeError: the handle is unopened, or it is finished with no conclusion stored
                 (drained to exhaustion, then left the block).
         """
@@ -473,28 +473,24 @@ class StreamHandle[OutputT]:
             )
             try:
                 raw = await self._adapter_stream.final()
-                usage = self._bound_adapter.usage_from_raw(raw)
                 # Staged before interpret reads the response, so what the attempt billed is on the
                 # ledger from the moment it is known.
-                self._ledger.stage_receipt(raw=raw, usage=usage)
+                self._ledger.stage_receipt(raw=raw, usage=self._bound_adapter.usage_from_raw(raw))
                 self._conclusion = self._conclude(
                     self._bound_adapter.interpret(raw),
                     raw=raw,
-                    usage=usage,
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                 )
             except BaseException as exc:
                 # A cancellation is not a conclusion, the same rule __anext__ applies:
                 # it destroys the frames that could have observed the call rather than ending it.
-                # The interpretation is inside the try because every _conclude case but
-                # ProviderFailedTransiently records the attempt first, so a raise past that record
-                # would let a second call record it again.
+                # The interpretation is inside the try because every _conclude case records the
+                # attempt first, so a raise past that record would let a second call record it again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                 raise
-            # Every _conclude case accounts for the call: every one but ProviderFailedTransiently
-            # builds its result off the frozen CallRecord, and that one puts the 200's billing on the
-            # TransientError.
+            # Every _conclude case builds its result off the frozen CallRecord, so the caller has an
+            # account of the call whichever one it was.
             self._conclusion_carried_the_call = True
         if isinstance(self._conclusion, Response):
             return self._conclusion
@@ -505,14 +501,14 @@ class StreamHandle[OutputT]:
         outcome: ResponseOutcome[OutputT],
         *,
         raw: BaseModel,
-        usage: Usage,
         ended_at_monotonic_seconds: float,
-    ) -> Response[OutputT] | GenerationError | TransientError:
+    ) -> Response[OutputT] | GenerationError:
         """Build what this outcome concludes the call with: the Response, or the error to raise.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
-        raw and usage are the terminal response and its price, which every case but
-        ProviderFailedTransiently reaches through the record staged from the same two values.
+        Every case closes the staged receipt into this attempt's record first, so the call it freezes
+        into the result holds the terminal response and what it billed.
+        raw is that response, which only a success carries onward.
         """
         match outcome:
             case AdapterResult():
@@ -561,9 +557,17 @@ class StreamHandle[OutputT]:
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                 )
             case ProviderFailedTransiently():
-                return TransientError(
-                    outcome.reason, is_rate_limit=outcome.is_rate_limit, usage=usage, raw=raw
+                failure = TransientError(outcome.reason, is_rate_limit=outcome.is_rate_limit)
+                self._ledger.record_ending_at(
+                    ended_at_monotonic_seconds,
+                    error=failure,
+                    assistant_message=outcome.assistant_message,
                 )
+                retry_unavailable = RetryUnavailableError(
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                )
+                retry_unavailable.__cause__ = failure
+                return retry_unavailable
             case _ as unhandled:
                 assert_never(unhandled)
 
@@ -583,8 +587,8 @@ class StreamHandle[OutputT]:
 
         error is None on every member here: the request itself succeeded, and what the adapter made of
         the response is the item's outcome, not this attempt's failure.
-        A ProviderFailedTransiently's billing reaches the caller on its TransientError, so it gets
-        no record.
+        ProviderFailedTransiently is the one member _conclude records itself, because its record
+        carries the TransientError the failure was classified as.
         """
         self._ledger.record_ending_at(
             ended_at_monotonic_seconds,

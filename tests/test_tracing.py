@@ -50,6 +50,7 @@ from langchaint import (
     RefusalError,
     Response,
     RetriesExhaustedError,
+    RetryUnavailableError,
     StreamItem,
     TextPart,
     ToolCall,
@@ -810,8 +811,13 @@ def test_stream_never_entered_emits_no_span() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_failing_mid_iteration_ends_its_span_with_error_status() -> None:
-    """A stream that raises after its first item ends the span with error status."""
+def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
+    """A stream that raises after its first item ends the span the way final()'s failures do.
+
+    The failure concludes the call as a RetryUnavailableError, so the span carries that class in
+    error.type and one attempt_failed event, and records no exception event: which method the
+    failure surfaced from must not change the span a class produces.
+    """
 
     async def _drain(traced: TracedLLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
@@ -828,11 +834,42 @@ def test_stream_failing_mid_iteration_ends_its_span_with_error_status() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(TransientError):
+        with pytest.raises(RetryUnavailableError):
             await _drain(traced)
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
-        assert [event.name for event in span.events] == ["exception"]
+        assert span.attributes is not None
+        assert span.attributes["error.type"] == "RetryUnavailableError"
+        assert [event.name for event in span.events] == ["langchaint.attempt_failed"]
+
+    asyncio.run(scenario())
+
+
+def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes() -> None:
+    """Retries exhausted while opening ends the span the way a failure read from final() does.
+
+    __aenter__ raises a GenerationError like any other, so its span carries error.type and the
+    call's attributes rather than a bare exception event; which method raised must not decide that.
+    """
+
+    async def scenario() -> None:
+        """Enter a stream whose every open fails, and inspect the span it left."""
+        adapter = _FakeAdapter(open_failures=[TransientError("connection reset")] * 4)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        with pytest.raises(RetriesExhaustedError):
+            async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
+                pass
+        (span,) = exporter.get_finished_spans()
+        assert span.status.status_code == StatusCode.ERROR
+        assert span.attributes is not None
+        assert span.attributes["error.type"] == "RetriesExhaustedError"
+        assert span.attributes["langchaint.attempts"] == 2
+        assert [event.name for event in span.events] == ["langchaint.attempt_failed"] * 2
 
     asyncio.run(scenario())
 

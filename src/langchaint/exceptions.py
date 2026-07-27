@@ -11,11 +11,12 @@ an item's own rejection: a provider states a status, never whether the binding o
 conversation caused it. A binding defect langchaint can detect raises at construction or
 bind time instead, before any request is sent.
 
-TransientError is a per-attempt control signal.
+TransientError is a per-attempt control signal between an adapter and a retry loop, raised to no
+application: a loop that cannot retry one reports it as RetryUnavailableError, carrying the call.
 The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
-RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, EmptyTurnError,
-SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError, ProviderFailedTerminallyError,
-InvalidRequestError, and UnrecognizedError.
+RetriesExhaustedError, RetryUnavailableError, RefusalError, MaxCompletionTokensExceededError,
+EmptyTurnError, SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError,
+ProviderFailedTerminallyError, InvalidRequestError, and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
@@ -34,11 +35,11 @@ StreamProtocolError says a stream did not follow the event contract.
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal, Self, override
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from langchaint.call import AttemptRecord, CallRecord, _CallCarrier
 from langchaint.messages import StopReason
-from langchaint.usage import ZERO_USAGE, Usage
+from langchaint.usage import Usage
 
 if TYPE_CHECKING:
     # Type-only: tools.py imports this module at runtime, so importing the dispatch outcome types
@@ -55,12 +56,8 @@ class TransientError(Exception):
     RateLimiter honors it up to a 60-second cap and uses it to pause admission account-wide.
     is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
     RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
-    usage (carrying cost_in_usd) and raw are set on one error only: the one a stream raises when the
-    response it assembled reported a provider failure a resend may get past. That stream concluded
-    without a CallRecord, so these two fields are its caller's whole account of what the 200 cost;
-    raw is the SDK response object, held by reference.
-    Everywhere else they are ZERO_USAGE and None, and the attempt's own record carries the billing,
-    staged when the response arrived.
+    No billing fields: the attempt that reached a billable 200 is recorded carrying this error, so
+    what it cost and the response it was read from are on that AttemptRecord.
     """
 
     def __init__(
@@ -69,15 +66,11 @@ class TransientError(Exception):
         *,
         retry_after_seconds: float | None = None,
         is_rate_limit: bool = False,
-        usage: Usage = ZERO_USAGE,
-        raw: BaseModel | None = None,
     ) -> None:
-        """Store the server-stated wait, the rate-limit classification, and any attempt billing."""
+        """Store the server-stated wait and the rate-limit classification."""
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.is_rate_limit = is_rate_limit
-        self.usage = usage
-        self.raw = raw
 
 
 def _extract_transient_errors(
@@ -102,6 +95,8 @@ class GenerationError(_CallCarrier, Exception):
 
     The base for the non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
+    RetryUnavailableError (a transient failure on a stream, which retries only failures raised
+    before its first item),
     RefusalError (no structured output: the model refused or a provider filter blocked the turn),
     MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed),
     EmptyTurnError (the model finished the turn and produced nothing),
@@ -202,6 +197,26 @@ class RetriesExhaustedError(GenerationError):
     def error_text(self) -> str:
         """The folded failure chain, one entry per attempt."""
         return _join_error_text(self.attempt_records)
+
+
+class RetryUnavailableError(GenerationError):
+    """A transient failure a retry may have fixed, on a call where no retry was available.
+
+    Raised only inside a stream_one block, on the two transient failures a stream does not retry:
+    one an item pull raised after the caller already held part of the turn, and one the assembled
+    response reported, which arrives when the stream is already over. Either ends the call whatever
+    the retry budget still holds. A stream that failed before its first item is reopened instead,
+    under that budget. Reopen after this error by calling stream_one again with the same conversation.
+
+    The failure itself is the TransientError on the last attempt record, and is __cause__ as well:
+    it carries the adapter's own message, retry_after_seconds, and is_rate_limit.
+    """
+
+    @override
+    def _summary(self) -> str:
+        errors = _extract_transient_errors(self.attempt_records)
+        last = str(errors[-1]) if errors else "no attempts recorded"
+        return f"no retry was available for a transient failure: {last}"
 
 
 class RefusalError(GenerationError):

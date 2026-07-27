@@ -33,6 +33,7 @@ from langchaint import (
     RefusalError,
     Response,
     RetriesExhaustedError,
+    RetryUnavailableError,
     SchemaViolationError,
     StreamItem,
     StreamProtocolError,
@@ -272,6 +273,20 @@ class _ProviderFailedTransientlyStream(_FakeStream):
     def receipt(self) -> _Receipt:
         """Report the failure instead of a result, carrying this attempt's billing."""
         return _billed(_PROVIDER_FAILED_TRANSIENTLY)
+
+
+class _YieldsNothingThenFailsTransientlyStream(_ProviderFailedTransientlyStream):
+    """A stream whose run failed before emitting anything, so it yields no item at all."""
+
+    @override
+    async def items(self) -> AsyncIterator[StreamItem]:
+        """Emit no item at all, so the failure is visible only in the assembled response.
+
+        Yields:
+            Nothing: the unreachable yield below is what makes this an async generator.
+        """
+        return
+        yield  # pragma: no cover
 
 
 class _ProviderFailedTerminallyStream(_FakeStream):
@@ -2156,8 +2171,8 @@ def test_a_mid_stream_rate_limit_pauses_the_account() -> None:
 
     This stream is past reopening, so nothing here retries; the pause protects every other caller
     sharing the limiter, and dropping it because this one stream is finished would leave them all
-    sending into the limit. The raised TransientError carries the same verdict and the same
-    server-stated wait, so an application reading it sees the rate limit rather than an
+    sending into the limit. The RetryUnavailableError's __cause__ carries the same verdict and the
+    same server-stated wait, so an application reading it sees the rate limit rather than an
     unclassified failure.
     """
 
@@ -2172,11 +2187,13 @@ def test_a_mid_stream_rate_limit_pauses_the_account() -> None:
         ).bind(automatic_prompt_caching=True)
         before_monotonic_seconds = time.monotonic()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(TransientError) as raised:
+            with pytest.raises(RetryUnavailableError) as raised:
                 async for _item in handle:
                     pass
-        assert raised.value.is_rate_limit
-        assert raised.value.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
+        cause = raised.value.__cause__
+        assert isinstance(cause, TransientError)
+        assert cause.is_rate_limit
+        assert cause.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
         assert rate_limiter._recovering
         # A server-stated wait is followed un-jittered, so the pause is that wait from the failure.
         assert (
@@ -2217,11 +2234,10 @@ class _RaisesItsOwnTransientErrorStream(_FakeStream):
         raise self.error
 
 
-def test_an_adapter_stated_mid_stream_transient_error_reaches_the_caller_unwrapped() -> None:
-    """An adapter that states the verdict itself keeps it, and does not become its own cause.
+def test_an_adapter_stated_mid_stream_transient_error_becomes_the_cause_unwrapped() -> None:
+    """An adapter that states the verdict itself has that very object as __cause__.
 
-    Wrapping it again would replace the adapter's own message, and raising the wrapper `from` the
-    same object would make the error its own __cause__.
+    Wrapping it again would replace the adapter's own message with the handle's.
     """
 
     async def scenario() -> None:
@@ -2232,13 +2248,12 @@ def test_an_adapter_stated_mid_stream_transient_error_reaches_the_caller_unwrapp
             rate_limiter=_fast_rate_limiter(),
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(TransientError) as raised:
+            with pytest.raises(RetryUnavailableError) as raised:
                 async for _item in handle:
                     pass
-        assert raised.value is stream.error
-        assert raised.value.__cause__ is not raised.value
-        assert raised.value.is_rate_limit
-        assert raised.value.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
+        assert raised.value.__cause__ is stream.error
+        assert stream.error.is_rate_limit
+        assert stream.error.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2288,12 +2303,11 @@ def test_a_close_raising_a_base_exception_still_appends_the_abandoned_call() -> 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call() -> None:
-    """A failure after the first item is no conclusion, so a cancellation after one logs the call.
+def test_stream_cancelled_after_a_mid_stream_failure_appends_no_abandoned_call() -> None:
+    """A failure after the first item concludes the call, so a cancellation after one logs nothing.
 
-    The TransientError names no model and carries no billing, so the record is the only account
-    of the stream that was opened. Its one settled attempt is the mid-stream failure, which bills
-    nothing, so usage_settled reads zero while the stream was paid for the item it delivered.
+    RetryUnavailableError hands the caller this call's CallRecord, so an AbandonedCall would report
+    the same call twice and mislabel a concluded call as an in-flight abandonment.
     """
 
     async def scenario() -> None:
@@ -2309,18 +2323,17 @@ def test_stream_cancelled_after_a_mid_stream_failure_appends_the_abandoned_call(
             async with bound_llm.stream_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
-                with pytest.raises(TransientError, match="after items were yielded"):
+                with pytest.raises(RetryUnavailableError) as raised:
                     async for _item in handle:
                         pass
+                (record,) = raised.value.attempt_records
+                assert isinstance(record.error, TransientError)
+                assert "after items were yielded" in str(record.error)
                 await asyncio.sleep(60)
 
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(consume(), timeout=0.05)
-        (abandoned_call,) = abandoned_call_log
-        assert abandoned_call.model == "fake-model"
-        (record,) = abandoned_call.attempt_records
-        assert isinstance(record.error, TransientError)
-        assert abandoned_call.usage_settled == ZERO_USAGE
+        assert abandoned_call_log == []
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2440,7 +2453,6 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
 def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     """A structured refusal detected in the stream's final() surfaces as a row-shaped RefusalError.
 
-    The stream already yielded items to the caller, so the error is not retried;
     final() records the one 200 that produced no output and raises the RefusalError carrying that record.
     """
 
@@ -2518,11 +2530,12 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_final_provider_failed_transiently_raises_transient_carrying_its_billing() -> None:
-    """The outcome propagates as a TransientError carrying the provider's reason and the billing.
+def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unavailable() -> None:
+    """The outcome fails the item with RetryUnavailableError carrying the call, without reopening.
 
-    The stream already yielded items to the caller, so it is not reopened; that 200's usage
-    reaches the caller on the error itself rather than on an attempt record.
+    The outcome is read from the assembled response, so that stream is over and none is opened in
+    its place. That 200's billing and the fragment it carried are on its attempt record, beside the
+    TransientError the failure was classified as, which is also __cause__.
     """
 
     async def scenario() -> None:
@@ -2532,10 +2545,40 @@ def test_stream_final_provider_failed_transiently_raises_transient_carrying_its_
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(TransientError) as provider_failure:
+            with pytest.raises(RetryUnavailableError) as retry_unavailable:
                 await handle.final()
-        assert str(provider_failure.value) == _PROVIDER_FAILURE_REASON
-        assert provider_failure.value.usage.cost_in_usd == 0.25
+        failure = retry_unavailable.value
+        assert failure.attempts == 1
+        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
+        (record,) = failure.attempt_records
+        assert str(record.error) == _PROVIDER_FAILURE_REASON
+        assert record.assistant_message == _REJECTED_TURN
+        assert record.raw is not None
+        assert failure.__cause__ is record.error
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_stream_that_yielded_nothing_still_fails_transiently_without_reopening() -> None:
+    """A stream that emitted no item and then reports the failure spends one attempt, not the budget.
+
+    The retry budget is untouched and the stream is not reopened: the outcome is read from the
+    assembled response, which arrives when the stream is over, whether or not it yielded anything.
+    """
+
+    async def scenario() -> None:
+        """Drain a stream that yields nothing, then read what final() raises."""
+        adapter = _FakeAdapter(stream=_YieldsNothingThenFailsTransientlyStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=3)).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            assert [item async for item in handle] == []
+            with pytest.raises(RetryUnavailableError) as retry_unavailable:
+                await handle.final()
+        assert retry_unavailable.value.attempts == 1
         assert adapter.bound_adapters[0].open_count == 1
 
     asyncio.run(scenario())
@@ -2564,10 +2607,10 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
 
 
 def test_stream_cancelled_after_absorbing_a_provider_failure_appends_no_abandoned_call() -> None:
-    """A cancellation after final() raised its TransientError appends nothing.
+    """A cancellation after final() raised its RetryUnavailableError appends nothing.
 
-    The error carried that 200's usage to the caller, so an AbandonedCall here would
-    double-count that spend and mislabel a concluded call as an in-flight abandonment.
+    That error carried the call, whose record holds the 200's billing, so an AbandonedCall here
+    would double-count that spend and mislabel a concluded call as an in-flight abandonment.
     """
 
     async def scenario() -> None:
@@ -2583,7 +2626,7 @@ def test_stream_cancelled_after_absorbing_a_provider_failure_appends_no_abandone
             async with bound_llm.stream_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
-                with pytest.raises(TransientError):
+                with pytest.raises(RetryUnavailableError):
                     await handle.final()
                 await asyncio.sleep(60)
 
@@ -2769,7 +2812,7 @@ def test_stream_final_is_idempotent() -> None:
     ("stream", "expected_error"),
     [
         (_RefusingStream(), RefusalError),
-        (_ProviderFailedTransientlyStream(), TransientError),
+        (_ProviderFailedTransientlyStream(), RetryUnavailableError),
         (_ProtocolErrorStream(), StreamProtocolError),
     ],
     ids=["refusal", "provider_failed_transiently", "protocol_error"],

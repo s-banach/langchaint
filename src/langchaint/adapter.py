@@ -279,11 +279,13 @@ class ProviderFailedTransiently(NoOutput):
     """A billable 200 whose body reports a provider-side failure a resend may get past.
 
     The retry loop records the attempt and sends another, carrying reason as that attempt's
-    TransientError text. A stream handle instead propagates that TransientError, because the stream
-    already yielded items to the caller and is not reopened.
+    TransientError text. A stream handle records the same attempt and fails the item with
+    RetryUnavailableError: this outcome is read from the assembled response, so that stream is over
+    and the handle opens no other.
     reason is the provider's own description of the failure.
     is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it to
     the RateLimiter, which pauses admission for every task sharing it, exactly as a 429 status does.
+    A stream sets no such pause, so a sibling task learns of the limit from its own next request.
     """
 
     reason: str

@@ -803,17 +803,33 @@ def _set_generation_error_status(span: Span, error: GenerationError) -> None:
 
 
 def _record_other_exception(span: Span, exc: Exception) -> None:
-    """Record a non-GenerationError exception, set error.type and error status; no shared-field attributes exist.
+    """Record the exception as a span event, set error.type from its class, and set error status.
 
     error.type is the exception's class name, the convention's low-cardinality classification of how an operation
     ended, which gives every span kind here a groupable failure signal (StreamProtocolError, a tool
     function's own exception) beside the message string record_exception carries.
+    Sets no shared-field attributes: this records the exception itself, not a call's result.
     """
     with _guarding_telemetry_failures("recording the exception"):
         span.record_exception(exc)
     _set_span_attribute(span, "error.type", type(exc).__name__)
     with _guarding_telemetry_failures("setting the error status"):
         span.set_status(Status(StatusCode.ERROR, str(exc)))
+
+
+def _record_stream_conclusion(span: Span, exc: Exception, mapper: AttributeMapper) -> None:
+    """Record the exception that concluded a stream, attributing the span by what it is.
+
+    A GenerationError is that call's result, so the span takes the same result attributes and
+    status a Response would give it; anything else is an exception the span only records.
+    One recorder for every method that can conclude a stream, so the same class produces the same
+    span whether the failure surfaced from the open, an item pull, or final().
+    """
+    if isinstance(exc, GenerationError):
+        _apply_result_attributes(span, exc, mapper)
+        _set_generation_error_status(span, exc)
+        return
+    _record_other_exception(span, exc)
 
 
 class TracedLLM:
@@ -1456,9 +1472,9 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
-            Exception: the inner stream raised (a transient failure after items, a rejected or
-                unrecognized request, a protocol violation); the span records it, takes error status,
-                and ends before the re-raise.
+            Exception: the inner stream raised (a transient failure past the first item, a rejected
+                or unrecognized request, a protocol violation); the span is attributed by what the
+                exception is, takes error status, and ends before the re-raise.
         """
         if self._span is None or self._span_ended:
             # Never entered, or the span already closed: the inner handle raises, and recording that
@@ -1470,7 +1486,7 @@ class TracedStreamHandle[OutputT]:
         except StopAsyncIteration:
             raise
         except Exception as exc:
-            _record_other_exception(span, exc)
+            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
             self._end_span_once()
             raise
         except BaseException:
@@ -1488,7 +1504,8 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             RuntimeError: this handle was already entered; build a new one with stream_one.
-            Exception: the inner handle failed to open; the span records it, takes error status, and ends.
+            Exception: the inner handle failed to open; the span is attributed by what the exception
+                is, takes error status, and ends.
         """
         if self._span is not None:
             raise RuntimeError("stream already entered: call stream_one again for a new one")
@@ -1496,7 +1513,7 @@ class TracedStreamHandle[OutputT]:
         try:
             await self._stream_handle.__aenter__()
         except Exception as exc:
-            _record_other_exception(span, exc)
+            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
             self._end_span_once()
             raise
         except BaseException:
@@ -1544,13 +1561,8 @@ class TracedStreamHandle[OutputT]:
         span = self._span
         try:
             response = await self._stream_handle.final()
-        except GenerationError as exc:
-            _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
-            _set_generation_error_status(span, exc)
-            self._end_span_once()
-            raise
         except Exception as exc:
-            _record_other_exception(span, exc)
+            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
             self._end_span_once()
             raise
         except BaseException:

@@ -403,6 +403,7 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
     "rate_limit_exceeded": "transient",
     "vector_store_timeout": "transient",
     "invalid_prompt": "terminal",
+    "data_residency_mismatch": "terminal",
     "bio_policy": "terminal",
     "invalid_image": "terminal",
     "invalid_image_format": "terminal",
@@ -419,7 +420,7 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
     "failed_to_download_image": "terminal",
     "image_file_not_found": "terminal",
 }
-"""Whether a resend may get past the failure each ResponseError.code names (openai 2.45.0).
+"""Whether a resend may get past the failure each ResponseError.code names (openai 2.48.0).
 
 Every member of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
 unknown-code path below is reached only by a code newer than the installed SDK.

@@ -5,9 +5,6 @@ field arrives as an extra rather than as an error: the adapters keep reading the
 written for, get None or a default, and every other test in this suite keeps passing on the stale
 literal. Nothing else here can fail on that drift, which is what these tests are for. They capture
 no defect present at the version they were written against (anthropic 0.120.0, openai 2.45.0).
-
-The literal-set assertions compare against written-out sets rather than against a subset check, so a
-value the provider adds also fails.
 """
 
 import typing
@@ -172,37 +169,19 @@ def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
     )
 
 
-def test_openai_error_codes_are_the_set_the_disposition_table_dispositions() -> None:
-    """ResponseError.code members, and the table that says which of them a resend may get past.
+def test_every_openai_error_code_has_a_disposition() -> None:
+    """Every ResponseError.code member is a key of the table saying whether a resend may get past it.
 
     A code openai adds and the table lacks is reported as ProviderFailedTerminally, so the item
     fails once at the cost of one attempt rather than being retried; this test is what says whether
     that fallback was reached by a genuinely new code or by a member the table forgot.
+    The check is one-directional because langchaint supports a range of openai versions: the table
+    keeps a code an older SDK in that range does not declare, which costs a dict entry that cannot
+    be reached and nothing else.
     """
     annotation = _field_annotation(ResponseError, "code")
-    codes = typing.get_args(annotation)
-    assert codes == (
-        "server_error",
-        "rate_limit_exceeded",
-        "invalid_prompt",
-        "bio_policy",
-        "vector_store_timeout",
-        "invalid_image",
-        "invalid_image_format",
-        "invalid_base64_image",
-        "invalid_image_url",
-        "image_too_large",
-        "image_too_small",
-        "image_parse_error",
-        "image_content_policy_violation",
-        "invalid_image_mode",
-        "image_file_too_large",
-        "unsupported_image_media_type",
-        "empty_image_file",
-        "failed_to_download_image",
-        "image_file_not_found",
-    )
-    assert set(_DISPOSITION_BY_ERROR_CODE) == set(codes)
+    codes = set(typing.get_args(annotation))
+    assert codes <= set(_DISPOSITION_BY_ERROR_CODE)
 
 
 def test_anthropic_service_tier_members_are_the_pricing_mapping_keys() -> None:

@@ -809,9 +809,12 @@ def test_pre_send_rejection_registers_no_success_with_the_rate_limiter() -> None
     async def scenario() -> None:
         """Put the limiter into recovery, then report InvalidRequest while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
-        rate_limiter.register_transient_error((
-            TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
-        ))
+        failing_admission = await rate_limiter.acquire()
+        rate_limiter.register_transient_error(
+            failing_admission,
+            (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
+        )
+        rate_limiter.release(failing_admission)
         assert rate_limiter._recovering
         adapter = _FakeAdapter(failures=[InvalidRequest(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
@@ -1063,9 +1066,12 @@ def test_provider_failed_transiently_ends_the_rate_limiter_recovery() -> None:
     async def scenario() -> None:
         """Put the limiter into recovery, then report the failure while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
-        rate_limiter.register_transient_error((
-            TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
-        ))
+        failing_admission = await rate_limiter.acquire()
+        rate_limiter.register_transient_error(
+            failing_admission,
+            (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
+        )
+        rate_limiter.release(failing_admission)
         assert rate_limiter._recovering
         adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)

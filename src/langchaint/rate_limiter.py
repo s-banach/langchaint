@@ -47,7 +47,52 @@ class Admission:
     the limiter compares it by identity to know when the recovery probe has finished.
     """
 
-    __slots__ = ()
+    __slots__ = ("limiter",)
+
+    limiter: "RateLimiter | None"
+    """The RateLimiter whose in-flight slot this admission holds; None once released.
+
+    Written by acquire and release only. Every RateLimiter method taking an admission
+    raises RuntimeError when this is not that limiter, so a released, double-released,
+    or foreign admission fails loudly instead of corrupting the slot count.
+    """
+
+    def __init__(self, limiter: "RateLimiter") -> None:
+        """Bind the admission to the limiter granting it; called by RateLimiter.acquire only."""
+        self.limiter = limiter
+
+
+class Backoff:
+    """One failure's backoff delay, drawn once so the sleep and any account-wide pause agree.
+
+    Returned by RateLimiter.register_transient_error. A caller that will retry awaits sleep()
+    after releasing the failing attempt's admission; a caller that will not retry drops the
+    object, and any account-wide pause set with it still stands.
+    """
+
+    __slots__ = ("_admission", "delay_seconds")
+
+    delay_seconds: float
+    """The drawn delay sleep() waits, in seconds; public for callers that report the wait."""
+
+    def __init__(self, delay_seconds: float, admission: Admission) -> None:
+        """Store the drawn delay and the failing attempt's admission; built by register_transient_error only."""
+        self.delay_seconds = delay_seconds
+        self._admission = admission
+
+    async def sleep(self) -> None:
+        """Sleep the drawn delay; call after the failing attempt's admission is released.
+
+        Raises:
+            RuntimeError: the admission still holds its in-flight slot, so this sleep would
+                hold capacity idle for the whole wait; release the admission first.
+        """
+        if self._admission.limiter is not None:
+            raise RuntimeError(
+                "backoff slept while the failing attempt's admission still holds its slot; "
+                "release the admission before sleeping"
+            )
+        await asyncio.sleep(self.delay_seconds)
 
 
 def _is_rate_limit_evidence(transient_error: TransientError) -> bool:
@@ -92,6 +137,18 @@ class RateLimiter:
         self._recovery_changed = asyncio.Event()
         """Wakes probe-gate waiters; replaced on each wake so late waiters do not see a stale set."""
 
+    def _require_held(self, admission: Admission) -> None:
+        """Raise unless admission currently holds one of this limiter's in-flight slots.
+
+        Raises:
+            RuntimeError: admission was already released, or was acquired from a different RateLimiter.
+        """
+        if admission.limiter is not self:
+            raise RuntimeError(
+                "admission does not hold a slot on this RateLimiter: "
+                "it was already released, or was acquired from a different RateLimiter"
+            )
+
     def _wake_recovery_waiters(self) -> None:
         self._recovery_changed.set()
         self._recovery_changed = asyncio.Event()
@@ -119,7 +176,7 @@ class RateLimiter:
             if time.monotonic() < self._paused_until or self._is_probe_gate_closed():
                 self._in_flight_slots.release()
                 continue
-            admission = Admission()
+            admission = Admission(self)
             if self._recovering:
                 self._probe_admission = admission
             return admission
@@ -129,7 +186,13 @@ class RateLimiter:
 
         A probe released without a registered success did not prove recovery
         (it failed, was cancelled, or raised a non-transient error), so the next waiter becomes the probe.
+
+        Raises:
+            RuntimeError: admission does not hold a slot on this limiter
+                (already released, or acquired from a different RateLimiter).
         """
+        self._require_held(admission)
+        admission.limiter = None
         self._in_flight_slots.release()
         if admission is self._probe_admission:
             self._probe_admission = None
@@ -141,6 +204,9 @@ class RateLimiter:
 
         Yields:
             The Admission for this slot; pass it to register_success so recovery ends only when this slot is the probe.
+
+        Raises:
+            RuntimeError: the block released the admission itself, so the exit's release finds no held slot.
         """
         admission = await self.acquire()
         try:
@@ -165,36 +231,48 @@ class RateLimiter:
         the open and holds the same admission until it closes. Leaving the identity set means the next rate-limit
         error finds a probe already in flight, so the probe gate closes on an admission nobody will release until
         that stream ends, and every waiter on the limiter blocks with slots free.
+
+        Raises:
+            RuntimeError: admission does not hold a slot on this limiter
+                (already released, or acquired from a different RateLimiter).
         """
+        self._require_held(admission)
         if not (self._recovering and admission is self._probe_admission):
             return
         self._recovering = False
         self._probe_admission = None
         self._wake_recovery_waiters()
 
-    def register_transient_error(self, errors_from_attempts: Sequence[TransientError]) -> float:
+    def register_transient_error(
+        self, admission: Admission, errors_from_attempts: Sequence[TransientError]
+    ) -> Backoff:
         """Feed one task's failure chain back so admission can react account-wide.
 
-        Call while still holding the failing request's slot,
-        so the pause is in place before the release admits anyone else;
-        the caller's backoff sleep stays outside the slot.
+        admission is the failing request's still-held admission: requiring it here puts the pause
+        in place before the release admits anyone else, and the returned Backoff refuses to sleep
+        until that release, so the wait never holds a slot.
         Only the chain's last error is the new failure; the earlier entries shape the pause length.
         Only a rate-limit error pauses admission account-wide,
         because a timeout or 5xx says nothing about the account's quota;
         an existing later pause is never shortened.
 
         Returns:
-            The backoff delay the caller must sleep before its own retry, in seconds.
-            The delay is drawn once here, so the returned value is exactly the account-wide pause length:
+            The Backoff for the failing task's own retry; a task that will not retry drops it.
+            Its delay is drawn once here, so it is exactly the account-wide pause length:
             the pause and the failing task's retry expire together,
             which makes the waking task the natural recovery probe.
-            A non-rate-limit transient sets no pause but still returns its backoff so the failing task can sleep it.
+            A non-rate-limit transient sets no pause but still carries its backoff for the failing task to sleep.
+
+        Raises:
+            RuntimeError: admission does not hold a slot on this limiter
+                (already released, or acquired from a different RateLimiter).
         """
+        self._require_held(admission)
         delay_seconds = self.delay_seconds(errors_from_attempts)
         if _is_rate_limit_evidence(errors_from_attempts[-1]):
             self._recovering = True
             self._paused_until = max(self._paused_until, time.monotonic() + delay_seconds)
-        return delay_seconds
+        return Backoff(delay_seconds, admission)
 
     def delay_seconds(self, errors_from_attempts: Sequence[TransientError]) -> float:
         """Delay before the next attempt after the given failure chain.
@@ -204,7 +282,7 @@ class RateLimiter:
         the _RETRY_AFTER_MAX_SECONDS cap keeps an erroneous or hostile header from stalling the client indefinitely.
         The backoff branch is AWS full jitter and draws once per call,
         so callers that need the pause and the retry sleep to agree must call once and share the value;
-        register_transient_error does exactly that and returns it.
+        register_transient_error does exactly that, carrying the one draw on the Backoff it returns.
         """
         last = errors_from_attempts[-1]
         if last.retry_after_seconds is not None:

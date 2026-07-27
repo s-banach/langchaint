@@ -5,7 +5,7 @@ __all__ re-exports only the SDK-free application surface.
 The backend constructors, their price catalogs, and the adapters stay in their subpackages:
 re-exporting them here would force import langchaint through both SDKs.
 The adapter-author contract stays in langchaint.adapter.
-Internal helpers (Admission, SequenceNotStr) are importable but off __all__.
+Internal helpers (Admission, Backoff, SequenceNotStr) are importable but off __all__.
 Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
 schema() returns, are on __all__: both appear in signatures application code writes against.
 """

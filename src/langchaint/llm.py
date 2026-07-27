@@ -53,7 +53,7 @@ from langchaint.exceptions import (
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
-from langchaint.rate_limiter import Admission, RateLimiter
+from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
@@ -580,21 +580,24 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         self,
         error: TransientError,
         *,
+        admission: Admission,
         assistant_message: AssistantMessage | None,
         ledger: _CallLedger,
-    ) -> float:
+    ) -> Backoff:
         """Close the failed attempt and register it with the limiter, while its slot is still held.
 
+        admission is the failing attempt's still-held admission;
+        register_transient_error raises RuntimeError for one already released.
         assistant_message is the turn a 200 the provider filled with a failure still carried, and
         None where the attempt received no response.
 
         Returns:
-            The backoff delay to sleep before the next attempt, in seconds;
-            register_transient_error draws it once so it equals any account-wide pause it set.
+            The Backoff to sleep before the next attempt;
+            its delay is drawn once, so it equals any account-wide pause it set.
         """
         ledger.record(error=error, assistant_message=assistant_message)
         return self.rate_limiter.register_transient_error(
-            _extract_transient_errors(ledger.attempt_records)
+            admission, _extract_transient_errors(ledger.attempt_records)
         )
 
     def _staged_interpretation(
@@ -744,11 +747,14 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                             assistant_message = outcome.assistant_message
                         case _ as unhandled:
                             assert_never(unhandled)
-                delay_seconds = self._record_transient_error(
-                    error, assistant_message=assistant_message, ledger=ledger
+                backoff = self._record_transient_error(
+                    error,
+                    admission=admission,
+                    assistant_message=assistant_message,
+                    ledger=ledger,
                 )
             if ledger.attempts < self.rate_limiter.max_attempts:
-                await asyncio.sleep(delay_seconds)
+                await backoff.sleep()
         raise RetriesExhaustedError(call=ledger.freeze())
 
     @overload

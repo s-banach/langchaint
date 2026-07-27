@@ -21,13 +21,25 @@ def _rate_limit_error(*, retry_after_seconds: float | None = None) -> TransientE
     )
 
 
+async def _register_failure(
+    rate_limiter: RateLimiter, errors_from_attempts: list[TransientError]
+) -> None:
+    """Acquire one admission, register errors_from_attempts as its failure, and release it.
+
+    Call only while admission is open: an existing pause would make the acquire wait it out.
+    """
+    failing_admission = await rate_limiter.acquire()
+    rate_limiter.register_transient_error(failing_admission, errors_from_attempts)
+    rate_limiter.release(failing_admission)
+
+
 def test_retry_after_pauses_admission() -> None:
     """A rate-limit error with retry_after_seconds pauses acquire until that moment."""
 
     async def scenario() -> None:
         """Register the error, then time one slot acquisition."""
         rate_limiter = RateLimiter()
-        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.05)])
+        await _register_failure(rate_limiter, [_rate_limit_error(retry_after_seconds=0.05)])
         started_at = time.monotonic()
         async with rate_limiter.slot():
             pass
@@ -55,7 +67,7 @@ def test_rate_limit_error_without_retry_after_pauses_with_the_backoff_shape(
     async def scenario() -> None:
         """Register a one-error chain under a visible backoff base, then time acquisition."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.05)
-        rate_limiter.register_transient_error([_rate_limit_error()])
+        await _register_failure(rate_limiter, [_rate_limit_error()])
         started_at = time.monotonic()
         async with rate_limiter.slot():
             pass
@@ -100,10 +112,10 @@ def test_backoff_branch_ceiling_doubles_per_failure_and_caps(
         assert rate_limiter.delay_seconds(errors_from_attempts) == expected_ceiling
 
 
-def test_backoff_draw_is_shared_by_the_pause_and_the_return(
+def test_backoff_draw_is_shared_by_the_pause_and_the_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """register_transient_error draws the jittered backoff once and returns that same pause length."""
+    """register_transient_error draws the jittered backoff once; the Backoff carries that same pause length."""
     draws: list[tuple[float, float]] = []
 
     def spy_uniform(low: float, high: float) -> float:
@@ -112,14 +124,21 @@ def test_backoff_draw_is_shared_by_the_pause_and_the_return(
         return 0.037
 
     monkeypatch.setattr(rate_limiter_module.random, "uniform", spy_uniform)
-    rate_limiter = RateLimiter(backoff_base_seconds=0.05)
-    before = time.monotonic()
-    returned = rate_limiter.register_transient_error([_rate_limit_error()])
-    # One draw for this failure, not two, over [0, backoff_base_seconds].
-    assert draws == [(0.0, 0.05)]
-    assert returned == 0.037
-    # The returned backoff equals the account-wide pause offset it set, from the one draw.
-    assert abs((rate_limiter._paused_until - before) - returned) < 0.005
+
+    async def scenario() -> None:
+        """Register one failure and compare the Backoff's delay with the pause it set."""
+        rate_limiter = RateLimiter(backoff_base_seconds=0.05)
+        failing_admission = await rate_limiter.acquire()
+        before = time.monotonic()
+        backoff = rate_limiter.register_transient_error(failing_admission, [_rate_limit_error()])
+        # One draw for this failure, not two, over [0, backoff_base_seconds].
+        assert draws == [(0.0, 0.05)]
+        assert backoff.delay_seconds == 0.037
+        # The Backoff's delay equals the account-wide pause offset it set, from the one draw.
+        assert abs((rate_limiter._paused_until - before) - backoff.delay_seconds) < 0.005
+        rate_limiter.release(failing_admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_error_without_rate_limit_evidence_sets_no_admission_pause() -> None:
@@ -128,7 +147,7 @@ def test_error_without_rate_limit_evidence_sets_no_admission_pause() -> None:
     async def scenario() -> None:
         """Register a plain transient error, then time one slot acquisition."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.05)
-        rate_limiter.register_transient_error([TransientError("boom")])
+        await _register_failure(rate_limiter, [TransientError("boom")])
         started_at = time.monotonic()
         async with rate_limiter.slot():
             pass
@@ -143,8 +162,16 @@ def test_pause_is_never_shortened() -> None:
     async def scenario() -> None:
         """Register a long pause, then a short one, then time acquisition."""
         rate_limiter = RateLimiter()
-        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.08)])
-        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.001)])
+        first_failing = await rate_limiter.acquire()
+        second_failing = await rate_limiter.acquire()
+        rate_limiter.register_transient_error(
+            first_failing, [_rate_limit_error(retry_after_seconds=0.08)]
+        )
+        rate_limiter.register_transient_error(
+            second_failing, [_rate_limit_error(retry_after_seconds=0.001)]
+        )
+        rate_limiter.release(first_failing)
+        rate_limiter.release(second_failing)
         started_at = time.monotonic()
         async with rate_limiter.slot():
             pass
@@ -159,7 +186,7 @@ def test_recovery_admits_one_probe_and_a_success_reopens_admission() -> None:
     async def scenario() -> None:
         """Race three acquires against a recovering limiter, then register the success."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
-        rate_limiter.register_transient_error([_rate_limit_error()])
+        await _register_failure(rate_limiter, [_rate_limit_error()])
         tasks = [asyncio.create_task(rate_limiter.acquire()) for _ in range(3)]
         await asyncio.sleep(0.05)
         assert sum(task.done() for task in tasks) == 1
@@ -184,10 +211,12 @@ def test_a_success_frees_the_probe_role_before_the_probe_releases_its_slot() -> 
     async def scenario() -> None:
         """Recover once without releasing, then take a second rate-limit error."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
-        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.01)])
+        await _register_failure(rate_limiter, [_rate_limit_error(retry_after_seconds=0.01)])
         long_lived_admission = await rate_limiter.acquire()
         rate_limiter.register_success(long_lived_admission)
-        rate_limiter.register_transient_error([_rate_limit_error(retry_after_seconds=0.01)])
+        rate_limiter.register_transient_error(
+            long_lived_admission, [_rate_limit_error(retry_after_seconds=0.01)]
+        )
         next_probe = await rate_limiter.acquire()
         rate_limiter.release(next_probe)
         rate_limiter.release(long_lived_admission)
@@ -201,7 +230,7 @@ def test_probe_released_without_success_admits_the_next_probe() -> None:
     async def scenario() -> None:
         """Let the first probe die unregistered and count who is admitted."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
-        rate_limiter.register_transient_error([_rate_limit_error()])
+        await _register_failure(rate_limiter, [_rate_limit_error()])
         tasks = [asyncio.create_task(rate_limiter.acquire()) for _ in range(3)]
         await asyncio.sleep(0.05)
         first_probe = next(task for task in tasks if task.done())
@@ -226,7 +255,9 @@ def test_non_probe_success_does_not_end_recovery() -> None:
         """Succeed a pre-incident request during recovery, then confirm admission stays probe-only."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
         pre_incident = await rate_limiter.acquire()
-        rate_limiter.register_transient_error([_rate_limit_error()])
+        failing_admission = await rate_limiter.acquire()
+        rate_limiter.register_transient_error(failing_admission, [_rate_limit_error()])
+        rate_limiter.release(failing_admission)
         # The pre-incident request was admitted in the open state, so it is not the probe;
         # its success must be a no-op that leaves the one-probe gate closed.
         rate_limiter.register_success(pre_incident)
@@ -249,17 +280,83 @@ def test_probe_rate_limit_failure_pauses_admission_again() -> None:
         """Fail the probe with a fresh rate-limit error and time the next admission."""
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
         first_chain = [_rate_limit_error()]
-        rate_limiter.register_transient_error(first_chain)
+        await _register_failure(rate_limiter, first_chain)
         probe_admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-        rate_limiter.register_transient_error([
-            *first_chain,
-            _rate_limit_error(retry_after_seconds=0.05),
-        ])
+        rate_limiter.register_transient_error(
+            probe_admission,
+            [
+                *first_chain,
+                _rate_limit_error(retry_after_seconds=0.05),
+            ],
+        )
         rate_limiter.release(probe_admission)
         started_at = time.monotonic()
         async with rate_limiter.slot():
             pass
         assert time.monotonic() - started_at >= 0.04
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_a_released_admission_is_rejected_everywhere() -> None:
+    """Release, register_success, and register_transient_error all raise on a released admission."""
+
+    async def scenario() -> None:
+        """Release once, confirm every admission-taking method raises, then recount the slots."""
+        rate_limiter = RateLimiter(max_in_flight=1)
+        admission = await rate_limiter.acquire()
+        rate_limiter.release(admission)
+        with pytest.raises(RuntimeError, match="already released"):
+            rate_limiter.release(admission)
+        with pytest.raises(RuntimeError, match="already released"):
+            rate_limiter.register_success(admission)
+        with pytest.raises(RuntimeError, match="already released"):
+            rate_limiter.register_transient_error(
+                admission, [_rate_limit_error(retry_after_seconds=30.0)]
+            )
+        # The rejected calls must have mutated nothing: the immediate acquire pins that the
+        # rejected register_transient_error set no pause (a mutation would pause for the full
+        # 30.0s retry-after, past every timeout here), and the blocked second acquire pins
+        # that the rejected release freed no slot beyond the one slot that exists.
+        held = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
+        blocked_acquire = asyncio.create_task(rate_limiter.acquire())
+        await asyncio.sleep(0.01)
+        assert not blocked_acquire.done()
+        rate_limiter.release(held)
+        rate_limiter.release(await asyncio.wait_for(blocked_acquire, timeout=1.0))
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_an_admission_from_another_limiter_is_rejected() -> None:
+    """An admission acquired from one limiter does not pass on another, so slot counts cannot mix."""
+
+    async def scenario() -> None:
+        """Acquire on one limiter, present the admission to another."""
+        holding_limiter = RateLimiter()
+        other_limiter = RateLimiter()
+        admission = await holding_limiter.acquire()
+        with pytest.raises(RuntimeError, match="different RateLimiter"):
+            other_limiter.release(admission)
+        holding_limiter.release(admission)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_backoff_refuses_to_sleep_while_the_admission_holds_its_slot() -> None:
+    """Backoff.sleep raises while the failing admission is held and sleeps only after its release."""
+
+    async def scenario() -> None:
+        """Register a failure, sleep once too early and once correctly."""
+        rate_limiter = RateLimiter(backoff_base_seconds=0.001)
+        failing_admission = await rate_limiter.acquire()
+        backoff = rate_limiter.register_transient_error(
+            failing_admission, [TransientError("boom")]
+        )
+        with pytest.raises(RuntimeError, match="release the admission before sleeping"):
+            await backoff.sleep()
+        rate_limiter.release(failing_admission)
+        await backoff.sleep()
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

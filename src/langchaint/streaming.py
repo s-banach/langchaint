@@ -59,7 +59,7 @@ from langchaint.exceptions import (
     _extract_transient_errors,
 )
 from langchaint.messages import Message
-from langchaint.rate_limiter import Admission, RateLimiter
+from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
 from langchaint.usage import Usage
 
@@ -231,29 +231,30 @@ class StreamHandle[OutputT]:
         wrapped.__cause__ = exc
         return wrapped
 
-    def _record_transient_error(self, wrapped: TransientError) -> float:
+    def _record_transient_error(self, wrapped: TransientError) -> Backoff:
         """Record one transient failure as an attempt and register it with the RateLimiter.
 
-        Call while the failing attempt's admission is still held,
-        so a rate-limit pause is in place before the release admits anyone else.
+        Called while the failing attempt's admission is still held;
+        register_transient_error raises RuntimeError for one already released.
         Every transient failure goes through here, whether or not the stream had already yielded
         items: the pause a rate limit sets protects the whole account, so losing it because this one
         stream is past reopening would leave every other caller sending into the limit.
 
         Returns:
-            The backoff delay to sleep before the next open attempt, in seconds;
-            register_transient_error draws it once so it equals any account-wide pause it set.
-            A caller that will not reopen ignores it.
+            The Backoff to sleep before the next open attempt;
+            its delay is drawn once, so it equals any account-wide pause it set.
+            A caller that will not reopen drops it.
         """
         self._ledger.record(error=wrapped, assistant_message=None)
+        assert self._admission is not None
         return self._rate_limiter.register_transient_error(
-            _extract_transient_errors(self._ledger.attempt_records)
+            self._admission, _extract_transient_errors(self._ledger.attempt_records)
         )
 
-    async def _backoff_or_exhaust(self, exc: Exception, delay_seconds: float) -> None:
+    async def _backoff_or_exhaust(self, exc: Exception, backoff: Backoff) -> None:
         """Back off before the next open attempt; call after the failed attempt's release.
 
-        delay_seconds is the value _record_transient_error returned for this failure,
+        backoff is the value _record_transient_error returned for this failure,
         so the sleep matches the account-wide pause the same draw set.
 
         Raises:
@@ -261,7 +262,7 @@ class StreamHandle[OutputT]:
         """
         if self._ledger.attempts >= self._rate_limiter.max_attempts:
             raise RetriesExhaustedError(call=self._ledger.freeze()) from exc
-        await asyncio.sleep(delay_seconds)
+        await backoff.sleep()
 
     def _non_retriable_or_none(self, exc: Exception) -> GenerationError | None:
         """Map one attempt error to the non-retriable error to propagate, or None when transient.
@@ -325,9 +326,9 @@ class StreamHandle[OutputT]:
                 if non_retriable is not None:
                     self._release_slot()
                     raise non_retriable from exc
-                delay_seconds = self._record_transient_error(self._transient_error(exc, str(exc)))
+                backoff = self._record_transient_error(self._transient_error(exc, str(exc)))
                 self._release_slot()
-                await self._backoff_or_exhaust(exc, delay_seconds)
+                await self._backoff_or_exhaust(exc, backoff)
                 continue
             except BaseException:
                 # CancelledError is a BaseException the clause above does not catch. Releasing here
@@ -410,9 +411,9 @@ class StreamHandle[OutputT]:
                         # own cause.
                         raise
                     raise wrapped from exc
-                delay_seconds = self._record_transient_error(self._transient_error(exc, str(exc)))
+                backoff = self._record_transient_error(self._transient_error(exc, str(exc)))
                 await self._close_adapter_stream()
-                await self._backoff_or_exhaust(exc, delay_seconds)
+                await self._backoff_or_exhaust(exc, backoff)
                 await self._open_stream_with_retries()
                 continue
             except BaseException:

@@ -46,10 +46,10 @@ from langchaint.adapter import (
     AdapterResult,
     Binding,
     ErrorClassification,
-    NotSendable,
-    Refused,
+    InvalidRequest,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
-    Truncated,
     Unparsed,
 )
 from langchaint.anthropic import (
@@ -956,17 +956,19 @@ def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_refused_on_a_refusal_stop_reason() -> None:
-    """A refusal stop_reason with no parsed output is Refused, carrying its billing."""
+def test_structured_bind_reports_refusal_on_a_refusal_stop_reason() -> None:
+    """A refusal stop_reason with no parsed output is Refusal, carrying its billing."""
     outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="refusal"))
-    assert isinstance(outcome, Refused)
+    assert isinstance(outcome, Refusal)
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_truncated_on_a_max_tokens_stop_reason() -> None:
-    """A max_tokens stop_reason with no parsed output is Truncated, carrying its billing."""
+def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_stop_reason() -> (
+    None
+):
+    """A max_tokens stop_reason with no parsed output is MaxCompletionTokensExceeded, carrying its billing."""
     outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
-    assert isinstance(outcome, Truncated)
+    assert isinstance(outcome, MaxCompletionTokensExceeded)
     assert outcome.usage.cost_in_usd > 0.0
 
 
@@ -1203,8 +1205,8 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
         )
 
 
-def test_send_reports_an_unsendable_conversation_as_not_sendable() -> None:
-    """An unsendable conversation reaches send's caller as the NotSendable arm, with nothing sent.
+def test_send_reports_an_unsendable_conversation_as_invalid_request() -> None:
+    """An unsendable conversation reaches send's caller as the InvalidRequest arm, with nothing sent.
 
     The client holds no API key, so reaching the wire would fail rather than return this arm.
     """
@@ -1212,7 +1214,7 @@ def test_send_reports_an_unsendable_conversation_as_not_sendable() -> None:
     async def scenario() -> None:
         conversation = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
         outcome = await _structured_bound().send(conversation)
-        assert isinstance(outcome, NotSendable)
+        assert isinstance(outcome, InvalidRequest)
         assert "image/tiff" in outcome.reason
 
     asyncio.run(scenario())

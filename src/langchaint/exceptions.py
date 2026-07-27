@@ -243,7 +243,7 @@ class InvalidRequestError(GenerationError):
 
     Two sources, both meaning the request as sent (or as it would have been sent) is not acceptable:
     the provider's own rejection, which Adapter.classify returns "invalid_request" for, and the
-    adapter reporting the conversation as a NotSendable outcome, because it cannot be put on the
+    adapter reporting the conversation as a InvalidRequest outcome, because it cannot be put on the
     wire with the meaning the message states.
     Not retried: the same request would be rejected the same way.
 
@@ -251,7 +251,7 @@ class InvalidRequestError(GenerationError):
     A bad API key, a permission failure, and an unknown model id land here too.
     A caller separating them reads status_code off __cause__, which holds the exception classify saw.
     Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.120.0, openai 2.45.0).
-    __cause__ is None on the NotSendable source, where nothing went out.
+    __cause__ is None on the InvalidRequest source, where nothing went out.
 
     Behaviorally this is UnrecognizedError (one row, no retry); it is a separate class because
     Adapter.classify's contract is that "unrecognized" means the adapter could not name the error,

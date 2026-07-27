@@ -61,9 +61,9 @@ from langchaint.adapter import (
     AdapterResult,
     Binding,
     ErrorClassification,
-    Refused,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
-    Truncated,
     Unparsed,
 )
 from langchaint.exceptions import StreamProtocolError
@@ -1088,8 +1088,10 @@ def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
     assert isinstance(outcome, Unparsed)
 
 
-def test_structured_stream_terminal_reports_truncation_from_a_plain_response() -> None:
-    """A structured stream's incomplete terminal is Truncated, read off a response with no parse.
+def test_structured_stream_terminal_reports_max_completion_tokens_exceeded_from_a_plain_response() -> (
+    None
+):
+    """A structured stream's incomplete terminal is MaxCompletionTokensExceeded, read off a response with no parse.
 
     The SDK parses only the completed event's response, so a terminal that stopped at the token cap
     arrives as a plain Response. Handing it to _parsed_output would raise AttributeError on
@@ -1102,7 +1104,7 @@ def test_structured_stream_terminal_reports_truncation_from_a_plain_response() -
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
         )
     )
-    assert isinstance(outcome, Truncated)
+    assert isinstance(outcome, MaxCompletionTokensExceeded)
 
 
 def test_structured_stream_terminal_reports_a_failed_run_as_unparsed() -> None:
@@ -1159,7 +1161,7 @@ def test_structured_bind_reports_unparsed_on_a_failed_status_that_parsed() -> No
 def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> None:
     """A failed status wins over the refusal test, so one response does not split by binding.
 
-    Were the refusal tested first, the structured binding would report Refused (a terminal
+    Were the refusal tested first, the structured binding would report Refusal (a terminal
     RefusalError) for a response the text binding retries as Unparsed.
     """
     structured_outcome = _structured_bound()._parsed_output(
@@ -1172,17 +1174,19 @@ def test_a_failed_run_carrying_a_refusal_is_unparsed_under_both_bindings() -> No
     assert isinstance(text_outcome, Unparsed)
 
 
-def test_structured_bind_reports_refused_on_a_refusal_block() -> None:
-    """A response carrying a refusal content block is Refused, carrying its billing."""
+def test_structured_bind_reports_refusal_on_a_refusal_block() -> None:
+    """A response carrying a refusal content block is Refusal, carrying its billing."""
     outcome = _structured_bound()._parsed_output(
         _parsed_response(None, refusal=True, usage=_usage_with_cache())
     )
-    assert isinstance(outcome, Refused)
+    assert isinstance(outcome, Refusal)
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_truncated_on_a_max_output_tokens_incomplete() -> None:
-    """An incomplete response for max_output_tokens is Truncated, carrying its billing."""
+def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_tokens_incomplete() -> (
+    None
+):
+    """An incomplete response for max_output_tokens is MaxCompletionTokensExceeded, carrying its billing."""
     outcome = _structured_bound()._parsed_output(
         _parsed_response(
             None,
@@ -1191,12 +1195,12 @@ def test_structured_bind_reports_truncated_on_a_max_output_tokens_incomplete() -
             usage=_usage_with_cache(),
         )
     )
-    assert isinstance(outcome, Truncated)
+    assert isinstance(outcome, MaxCompletionTokensExceeded)
     assert outcome.usage.cost_in_usd > 0.0
 
 
-def test_structured_bind_reports_refused_on_a_content_filter_incomplete() -> None:
-    """An incomplete response for content_filter is Refused, so the item fails once.
+def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> None:
+    """An incomplete response for content_filter is Refusal, so the item fails once.
 
     The Unparsed arm would send the same blocked request again for the whole retry budget
     and bill for each attempt.
@@ -1209,7 +1213,7 @@ def test_structured_bind_reports_refused_on_a_content_filter_incomplete() -> Non
             usage=_usage_with_cache(),
         )
     )
-    assert isinstance(outcome, Refused)
+    assert isinstance(outcome, Refusal)
     assert outcome.usage.cost_in_usd > 0.0
 
 

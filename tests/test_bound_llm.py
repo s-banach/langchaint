@@ -45,10 +45,10 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    NotSendable,
-    Refused,
+    InvalidRequest,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
-    Truncated,
     Unparsed,
 )
 from langchaint.llm import UNCHANGED
@@ -155,13 +155,13 @@ class _RefusingStream(_FakeStream):
     """A stream that yields items normally but whose final() detects a structured refusal.
 
     Mirrors an adapter that parses the assembled message in AdapterStream.final() and finds a refusal,
-    reporting the Refused arm carrying only the rejected 200's billing.
+    reporting the Refusal arm carrying only the rejected 200's billing.
     """
 
     @override
     async def final(self) -> ResponseOutcome[str]:
         """Report the refusal instead of assembling a result, carrying this attempt's billing."""
-        return Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
+        return Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
 
 
 class _UnparsedStream(_FakeStream):
@@ -307,14 +307,14 @@ class _FailingCloseStream(_FakeStream):
         raise OSError("connection reset while closing")
 
 
-type _ScriptedSend = Exception | Refused | Truncated | Unparsed | NotSendable
+type _ScriptedSend = Exception | Refusal | MaxCompletionTokensExceeded | Unparsed | InvalidRequest
 """One scripted send outcome: an exception the fake raises, or an arm it returns.
 
 Both halves exist because the adapter contract splits that way: an attempt with no response to read
 is an exception for Adapter.classify, and everything the adapter did read is a returned arm.
 """
 
-type _ScriptedOpen = Exception | NotSendable
+type _ScriptedOpen = Exception | InvalidRequest
 """One scripted open_stream outcome; open_stream returns no response-shaped arm."""
 
 
@@ -382,7 +382,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
     @override
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[str] | NotSendable:
+    ) -> AdapterStream[str] | InvalidRequest:
         """Count the attempt, suspend or take the next scripted open outcome, else return the stored fake stream."""
         self.open_count += 1
         if self._hang_from_open is not None and self.open_count >= self._hang_from_open:
@@ -410,7 +410,7 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
     @override
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[ModelT] | NotSendable:
+    ) -> AdapterStream[ModelT] | InvalidRequest:
         """Unreachable: response_format rebind tests do not stream."""
         raise NotImplementedError
 
@@ -551,7 +551,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
 
 def test_pre_send_rejection_raises_immediately_without_retry() -> None:
-    """A NotSendable outcome fails the item on the first attempt and is never retried.
+    """A InvalidRequest outcome fails the item on the first attempt and is never retried.
 
     classify returns "transient" here, and the arm never reaches it: a returned outcome is not an
     exception, so no classify verdict can turn this into a second attempt.
@@ -559,8 +559,10 @@ def test_pre_send_rejection_raises_immediately_without_retry() -> None:
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports NotSendable under a transient classify verdict."""
-        adapter = _FakeAdapter(failures=[NotSendable(reason="nope")], classify_result="transient")
+        """Drive one generate_one whose send reports InvalidRequest under a transient classify verdict."""
+        adapter = _FakeAdapter(
+            failures=[InvalidRequest(reason="nope")], classify_result="transient"
+        )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
@@ -584,13 +586,13 @@ def test_pre_send_rejection_registers_no_success_with_the_rate_limiter() -> None
     """
 
     async def scenario() -> None:
-        """Put the limiter into recovery, then report NotSendable while holding its probe slot."""
+        """Put the limiter into recovery, then report InvalidRequest while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
         rate_limiter.register_transient_error((
             TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),
         ))
         assert rate_limiter._recovering
-        adapter = _FakeAdapter(failures=[NotSendable(reason="nope")])
+        adapter = _FakeAdapter(failures=[InvalidRequest(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         with pytest.raises(InvalidRequestError):
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -604,7 +606,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
 
     The prior attempts' usage rides the error, so a billed 200 retried before the rejection stays
     accounted for. The two routes to the error differ in what the failing attempt leaves: a rejection
-    classify names went out, so it gets a record, and a NotSendable outcome never did, so it does not.
+    classify names went out, so it gets a record, and a InvalidRequest outcome never did, so it does not.
     """
 
     async def scenario() -> None:
@@ -627,37 +629,37 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
         assert rejected_record.usage == ZERO_USAGE
         assert rejected_record.usage_raw is None
         assert isinstance(classified.value.__cause__, ValueError)
-        not_sendable_adapter = _FakeAdapter(
+        invalid_request_adapter = _FakeAdapter(
             failures=[
                 TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
-                NotSendable(reason="reported by the adapter"),
+                InvalidRequest(reason="reported by the adapter"),
             ],
         )
-        not_sendable_bound_llm = LLM(not_sendable_adapter, rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
-        with pytest.raises(InvalidRequestError) as not_sendable:
-            await not_sendable_bound_llm.generate_one([UserMessage(content="hi")])
-        (not_sendable_billed_record,) = not_sendable.value.attempt_records
-        assert not_sendable_billed_record.usage.cost_in_usd == 0.25
-        assert not_sendable.value.reason == "reported by the adapter"
+        invalid_request_bound_llm = LLM(
+            invalid_request_adapter, rate_limiter=_fast_rate_limiter()
+        ).bind(automatic_prompt_caching=True)
+        with pytest.raises(InvalidRequestError) as invalid_request:
+            await invalid_request_bound_llm.generate_one([UserMessage(content="hi")])
+        (invalid_request_billed_record,) = invalid_request.value.attempt_records
+        assert invalid_request_billed_record.usage.cost_in_usd == 0.25
+        assert invalid_request.value.reason == "reported by the adapter"
 
     asyncio.run(scenario())
 
 
-def test_refused_outcome_from_send_raises_row_shaped_without_retry() -> None:
-    """A Refused outcome becomes a RefusalError carrying the attempt record, never retried."""
+def test_refusal_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """A Refusal outcome becomes a RefusalError carrying the attempt record, never retried."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports the Refused arm."""
-        adapter = _FakeAdapter(failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
+        """Drive one generate_one whose send reports the Refusal arm."""
+        adapter = _FakeAdapter(failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
-        with pytest.raises(RefusalError) as refused:
+        with pytest.raises(RefusalError) as refusal:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].send_count == 1
-        failure = refused.value
+        failure = refusal.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
         assert failure.usage.cost_in_usd == 0.25
@@ -669,21 +671,23 @@ def test_refused_outcome_from_send_raises_row_shaped_without_retry() -> None:
     asyncio.run(scenario())
 
 
-def test_truncated_outcome_from_send_raises_row_shaped_without_retry() -> None:
-    """A Truncated outcome becomes a row-shaped MaxCompletionTokensExceededError, never retried."""
+def test_max_completion_tokens_exceeded_outcome_from_send_raises_row_shaped_without_retry() -> (
+    None
+):
+    """A MaxCompletionTokensExceeded outcome becomes a row-shaped MaxCompletionTokensExceededError, never retried."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports the Truncated arm."""
+        """Drive one generate_one whose send reports the MaxCompletionTokensExceeded arm."""
         adapter = _FakeAdapter(
-            failures=[Truncated(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+            failures=[MaxCompletionTokensExceeded(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
         )
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
-        with pytest.raises(MaxCompletionTokensExceededError) as truncated:
+        with pytest.raises(MaxCompletionTokensExceededError) as max_completion_tokens_exceeded:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].send_count == 1
-        failure = truncated.value
+        failure = max_completion_tokens_exceeded.value
         assert failure.attempts == 1
         assert failure.stop_reason == "max_tokens"
         assert failure.usage.cost_in_usd == 0.25
@@ -1099,13 +1103,13 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
 
 
 def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
-    """An item whose send reports Refused comes back as the RefusalError in its slot, siblings succeed."""
+    """An item whose send reports Refusal comes back as the RefusalError in its slot, siblings succeed."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send reports Refused."""
+        """Serialize a two-item batch (max_in_flight=1) whose first send reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
+            failures=[Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)],
         )
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
@@ -1130,8 +1134,8 @@ def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send reports NotSendable."""
-        adapter = _FakeAdapter(echo=True, failures=[NotSendable(reason="misconfigured")])
+        """Serialize a two-item batch (max_in_flight=1) whose first send reports InvalidRequest."""
+        adapter = _FakeAdapter(echo=True, failures=[InvalidRequest(reason="misconfigured")])
         rate_limiter = _fast_rate_limiter(max_in_flight=1)
         bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
@@ -1270,7 +1274,7 @@ def test_generate_many_appends_the_abandoned_calls_of_items_a_sibling_defect_can
         adapter = _ClassifyRaisesAdapter(
             failures=[
                 TransientError("billed 200", usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
-                Refused(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
+                Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE),
                 ValueError("defect"),
             ],
             send_seconds=0.02,
@@ -1627,7 +1631,7 @@ def test_stream_cancelled_after_final_raised_appends_no_abandoned_call() -> None
         )
 
         async def consume() -> None:
-            """Let final() report Refused, then sleep; the wait_for below cancels this inside the block."""
+            """Let final() report Refusal, then sleep; the wait_for below cancels this inside the block."""
             async with bound_llm.stream_one(
                 [UserMessage(content="hi")], abandoned_call_log=abandoned_call_log
             ) as handle:
@@ -1980,15 +1984,15 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() reports Refused, then read the raised RefusalError."""
+        """Drain a stream whose final() reports Refusal, then read the raised RefusalError."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RefusalError) as refused:
+            with pytest.raises(RefusalError) as refusal:
                 await handle.final()
-        failure = refused.value
+        failure = refusal.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
         assert failure.usage.cost_in_usd == 0.25
@@ -2104,15 +2108,15 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
     asyncio.run(scenario())
 
 
-def test_stream_open_reported_not_sendable_reaches_the_caller_row_shaped() -> None:
-    """An adapter that reports the conversation as NotSendable fails the item, row-shaped.
+def test_stream_open_reported_invalid_request_reaches_the_caller_row_shaped() -> None:
+    """An adapter that reports the conversation as InvalidRequest fails the item, row-shaped.
 
     The handle builds the InvalidRequestError, so a caller reading model or attempt_records off it succeeds.
     """
 
     async def scenario() -> None:
-        """Enter a handle whose open reports NotSendable."""
-        adapter = _FakeAdapter(open_failures=[NotSendable(reason="nope")])
+        """Enter a handle whose open reports InvalidRequest."""
+        adapter = _FakeAdapter(open_failures=[InvalidRequest(reason="nope")])
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
             automatic_prompt_caching=True
         )

@@ -98,13 +98,13 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    NotSendable,
-    Refused,
+    InvalidRequest,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    Truncated,
     Unparsed,
     classification_from_response,
     retry_after_seconds_from_headers,
@@ -288,14 +288,14 @@ class _AnthropicRequest:
 class _NotSendableError(Exception):
     """A conversation this adapter will not put on the wire, raised by a conversion helper.
 
-    Never leaves this module: _wire_messages_or_not_sendable turns it into the NotSendable arm that
+    Never leaves this module: _request_messages turns it into the InvalidRequest arm that
     send and open_stream return. It exists because the conversation is found unsendable several
     frames below them, in per-part converters whose callers would each have to thread a union
     outward otherwise.
     """
 
     def __init__(self, reason: str) -> None:
-        """Store what cannot be sent; it becomes the NotSendable reason."""
+        """Store what cannot be sent; it becomes the InvalidRequest reason."""
         super().__init__(reason)
         self.reason = reason
 
@@ -408,7 +408,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
         _NotSendableError: a part other than the message's last sets cache_breakpoint.
             The API accepts such a request, and the enclosing block's marker silently moves the
             boundary to the block's end, so the wire form would not mean what the message says;
-            the adapter reports the conversation NotSendable and the item fails its own row.
+            the adapter reports the conversation InvalidRequest and the item fails its own row.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -492,11 +492,11 @@ def _wire_messages(
 
 def _request_messages(
     conversation: Sequence[Message], request: _AnthropicRequest
-) -> list[MessageParam] | NotSendable:
+) -> list[MessageParam] | InvalidRequest:
     """Convert a conversation under this request's caching parameters, or report it unsendable.
 
     The one place a _NotSendableError becomes an AttemptOutcome arm.
-    Every send and open_stream starts here and returns the NotSendable unchanged when it gets one.
+    Every send and open_stream starts here and returns the InvalidRequest unchanged when it gets one.
 
     Raises:
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _wire_messages).
@@ -509,7 +509,7 @@ def _request_messages(
             message_mark_budget=request.message_mark_budget,
         )
     except _NotSendableError as not_sendable:
-        return NotSendable(reason=not_sendable.reason)
+        return InvalidRequest(reason=not_sendable.reason)
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
@@ -881,7 +881,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         sdk_stream: AsyncMessageStream[Any],
         pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
         output_from_message: Callable[
-            [ParsedMessage[Any]], OutputT | Refused | Truncated | Unparsed
+            [ParsedMessage[Any]], OutputT | Refusal | MaxCompletionTokensExceeded | Unparsed
         ],
     ) -> None:
         self._sdk_stream = sdk_stream
@@ -918,7 +918,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         """Return what the SDK-assembled message produced, after the stream ends."""
         message = await self._sdk_stream.get_final_message()
         output = self._output_from_message(message)
-        if isinstance(output, Refused | Truncated | Unparsed):
+        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
             return output
         return _adapter_result(message=message, output=output, pricing=self._pricing)
 
@@ -936,10 +936,10 @@ class _BoundAnthropicText(BoundAdapter[str]):
         self._request = request
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str] | NotSendable:
+    async def send(self, conversation: Sequence[Message]) -> AdapterResult[str] | InvalidRequest:
         """Send one non-streaming request via messages.create."""
         messages = _request_messages(conversation, self._request)
-        if isinstance(messages, NotSendable):
+        if isinstance(messages, InvalidRequest):
             return messages
         message = await self._adapter.client.messages.create(
             model=self._request.model,
@@ -962,10 +962,10 @@ class _BoundAnthropicText(BoundAdapter[str]):
     @override
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[str] | NotSendable:
+    ) -> AdapterStream[str] | InvalidRequest:
         """Open one streaming request; connection failures raise here."""
         messages = _request_messages(conversation, self._request)
-        if isinstance(messages, NotSendable):
+        if isinstance(messages, InvalidRequest):
             return messages
         manager = self._adapter.client.messages.stream(
             model=self._request.model,
@@ -1003,7 +1003,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
 
     def _parsed_output(
         self, message: ParsedMessage[ModelT]
-    ) -> ModelT | Refused | Truncated | Unparsed:
+    ) -> ModelT | Refusal | MaxCompletionTokensExceeded | Unparsed:
         """Extract the parsed instance, or report why the turn produced none.
 
         Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
@@ -1014,9 +1014,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         if parsed_output is None:
             usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
             if message.stop_reason == "refusal":
-                return Refused(usage=usage, usage_raw=message.usage)
+                return Refusal(usage=usage, usage_raw=message.usage)
             if message.stop_reason == "max_tokens":
-                return Truncated(usage=usage, usage_raw=message.usage)
+                return MaxCompletionTokensExceeded(usage=usage, usage_raw=message.usage)
             return Unparsed(usage=usage, usage_raw=message.usage)
         return parsed_output
 
@@ -1024,7 +1024,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
     async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT]:
         """Send one non-streaming request via messages.parse."""
         messages = _request_messages(conversation, self._request)
-        if isinstance(messages, NotSendable):
+        if isinstance(messages, InvalidRequest):
             return messages
         message = await self._adapter.client.messages.parse(
             model=self._request.model,
@@ -1040,7 +1040,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             output_format=self._response_format,
         )
         output = self._parsed_output(message)
-        if isinstance(output, Refused | Truncated | Unparsed):
+        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
             return output
         return _adapter_result(
             message=message,
@@ -1051,10 +1051,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
     @override
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[ModelT] | NotSendable:
+    ) -> AdapterStream[ModelT] | InvalidRequest:
         """Open one streaming request; connection failures raise here."""
         messages = _request_messages(conversation, self._request)
-        if isinstance(messages, NotSendable):
+        if isinstance(messages, InvalidRequest):
             return messages
         manager = self._adapter.client.messages.stream(
             model=self._request.model,

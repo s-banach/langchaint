@@ -213,7 +213,7 @@ class AdapterResult[OutputT]:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Refused:
+class Refusal:
     """A completed 200 whose structured parse found the model refusing.
 
     The retry loop records the attempt and fails the item with a RefusalError, without retrying.
@@ -224,7 +224,7 @@ class Refused:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Truncated:
+class MaxCompletionTokensExceeded:
     """A completed 200 that reached the token cap before its JSON closed.
 
     The retry loop records the attempt and fails the item with a MaxCompletionTokensExceededError,
@@ -249,7 +249,7 @@ class Unparsed:
 
 
 @dataclass(frozen=True, kw_only=True)
-class NotSendable:
+class InvalidRequest:
     """A conversation the adapter will not put on the wire; nothing was sent.
 
     Raised by no one and billed by no one: the retry loop records no attempt and fails the item with
@@ -259,7 +259,9 @@ class NotSendable:
     reason: str
 
 
-type ResponseOutcome[OutputT] = AdapterResult[OutputT] | Refused | Truncated | Unparsed
+type ResponseOutcome[OutputT] = (
+    AdapterResult[OutputT] | Refusal | MaxCompletionTokensExceeded | Unparsed
+)
 """What one completed 200 produced.
 
 Every arm but AdapterResult is a response the adapter read and rejected; all four reached a billable
@@ -269,7 +271,7 @@ The arms differ in what the retry loop does with them, which is why they are fou
 one type carrying a reason: see each class.
 """
 
-type AttemptOutcome[OutputT] = ResponseOutcome[OutputT] | NotSendable
+type AttemptOutcome[OutputT] = ResponseOutcome[OutputT] | InvalidRequest
 """What one attempt produced, whether or not a request went out."""
 
 
@@ -294,9 +296,9 @@ class AdapterStream[OutputT](ABC):
         """Return what the assembled response produced, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
-        A response the adapter reads and rejects is Refused, Truncated, or Unparsed rather than a raise,
-        so the stream handle gets this attempt's billing and decides the item's fate itself.
-        NotSendable cannot arrive here: the request is already open.
+        A response the adapter reads and rejects is Refusal, MaxCompletionTokensExceeded, or Unparsed
+        rather than a raise, so the stream handle gets this attempt's billing and decides the item's fate itself.
+        InvalidRequest cannot arrive here: the request is already open.
         """
         ...
 
@@ -329,11 +331,11 @@ class BoundAdapter[OutputT](ABC):
     @abstractmethod
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[OutputT] | NotSendable:
+    ) -> AdapterStream[OutputT] | InvalidRequest:
         """Open one streaming request and return the live stream.
 
         Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.
-        A conversation the adapter will not put on the wire returns NotSendable instead, having opened nothing.
+        A conversation the adapter will not put on the wire returns InvalidRequest instead, having opened nothing.
 
         Raises:
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.

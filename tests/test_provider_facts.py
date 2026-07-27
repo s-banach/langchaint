@@ -161,7 +161,7 @@ def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
 
 
 def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
-    """max_output_tokens is Truncated and content_filter is not; a third member would fall through."""
+    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not; a third member would fall through."""
     annotation = _field_annotation(IncompleteDetails, "reason")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "max_output_tokens",

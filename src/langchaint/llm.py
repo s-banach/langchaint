@@ -22,10 +22,10 @@ from langchaint.adapter import (
     AdapterResult,
     Binding,
     BoundAdapter,
-    NotSendable,
-    Refused,
+    InvalidRequest,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ToolChoice,
-    Truncated,
     Unparsed,
 )
 from langchaint.call import _CallLedger
@@ -434,13 +434,13 @@ class BoundLLM[OutputT]:
         so a slow request is distinguishable from time spent rate limited.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation as NotSendable, or classified
+            InvalidRequestError: the adapter reported the conversation as InvalidRequest, or classified
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
             UnrecognizedError: the adapter classified an attempt's error as unrecognized;
                 terminal for this item, without a retry.
-            RefusalError: the adapter reported a Refused attempt (no structured output: the model
+            RefusalError: the adapter reported a Refusal attempt (no structured output: the model
                 refused or a provider filter blocked the turn); terminal for this item, without a retry.
-            MaxCompletionTokensExceededError: the adapter reported a Truncated attempt (the structured
+            MaxCompletionTokensExceededError: the adapter reported a MaxCompletionTokensExceeded attempt (the structured
                 response hit the token cap); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
@@ -471,19 +471,19 @@ class BoundLLM[OutputT]:
                                 stop_reason=outcome.stop_reason,
                                 assistant_message=outcome.assistant_message,
                             )
-                        case Refused():
+                        case Refusal():
                             self.rate_limiter.register_success(admission)
                             ledger.record(
                                 error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
                             )
                             raise RefusalError(call=ledger.freeze())
-                        case Truncated():
+                        case MaxCompletionTokensExceeded():
                             self.rate_limiter.register_success(admission)
                             ledger.record(
                                 error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
                             )
                             raise MaxCompletionTokensExceededError(call=ledger.freeze())
-                        case NotSendable():
+                        case InvalidRequest():
                             raise InvalidRequestError(reason=outcome.reason, call=ledger.freeze())
                         case Unparsed():
                             self.rate_limiter.register_success(admission)

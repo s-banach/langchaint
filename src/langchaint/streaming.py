@@ -27,11 +27,11 @@ from langchaint.adapter import (
     AdapterResult,
     AdapterStream,
     BoundAdapter,
-    NotSendable,
-    Refused,
+    InvalidRequest,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
     StreamItem,
-    Truncated,
     Unparsed,
 )
 from langchaint.call import _CallLedger
@@ -99,7 +99,7 @@ class StreamHandle[OutputT]:
         """Open the request and return self.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation as NotSendable, or the open
+            InvalidRequestError: the adapter reported the conversation as InvalidRequest, or the open
                 failure was classified as a rejection of the request.
             UnrecognizedError: the open failure was classified as unrecognized.
             RetriesExhaustedError: the opens spent the retry budget.
@@ -275,7 +275,7 @@ class StreamHandle[OutputT]:
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
         """Build the row-shaped InvalidRequestError for this handle, chained to cause when there is one.
 
-        cause is None for a NotSendable outcome: the adapter reported that the conversation cannot be
+        cause is None for a InvalidRequest outcome: the adapter reported that the conversation cannot be
         sent, and no exception was involved.
         """
         invalid_request = InvalidRequestError(reason=reason, call=self._ledger.freeze())
@@ -298,7 +298,7 @@ class StreamHandle[OutputT]:
         Every failing path out of an attempt returns the admission, cancellation included.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation as NotSendable, or the open
+            InvalidRequestError: the adapter reported the conversation as InvalidRequest, or the open
                 failure was classified as a rejection of the request.
             UnrecognizedError: the open failure was classified as unrecognized.
             RetriesExhaustedError: the attempts spent the retry budget.
@@ -323,7 +323,7 @@ class StreamHandle[OutputT]:
                 # unwind is what the shared budget depends on.
                 self._release_slot()
                 raise
-            if isinstance(opened, NotSendable):
+            if isinstance(opened, InvalidRequest):
                 self._release_slot()
                 raise self._invalid_request_error(opened.reason, None)
             self._adapter_stream = opened
@@ -340,7 +340,7 @@ class StreamHandle[OutputT]:
         Raises:
             TransientError: the stream failed after items were yielded; it carries the adapter's
                 verdict on that failure, so a rate limit reaches the caller as one.
-            InvalidRequestError: the adapter reported a reopened conversation as NotSendable, or
+            InvalidRequestError: the adapter reported a reopened conversation as InvalidRequest, or
                 classified an item or reopen error as a rejection of the request.
             UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget.
@@ -420,7 +420,7 @@ class StreamHandle[OutputT]:
         Every later call returns or raises it again without asking the adapter stream anything.
         Without that store, a second call would append a second AttemptRecord for the one request made.
         A structured refusal or truncation is detected only here, when the SDK parses the assembled
-        message: the adapter reports it as a Refused or Truncated outcome and this method builds the
+        message: the adapter reports it as a Refusal or MaxCompletionTokensExceeded outcome and this method builds the
         GenerationError from it, without retrying (the stream already yielded items to the caller);
         it reaches the caller carrying the attempt records this handle built.
 
@@ -428,12 +428,12 @@ class StreamHandle[OutputT]:
             StreamProtocolError: the provider's event stream ended without a terminal event.
             InvalidRequestError: draining the stream hit an item or reopen error the adapter
                 classified as a rejection of the request, or a reopened conversation the adapter
-                reported as NotSendable.
+                reported as InvalidRequest.
             UnrecognizedError: draining the stream hit an item or reopen error the adapter classified as unrecognized.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
-            RefusalError: the adapter reported the assembled response as Refused,
+            RefusalError: the adapter reported the assembled response as Refusal,
                 carrying this handle's attempt records.
-            MaxCompletionTokensExceededError: the adapter reported it as Truncated; likewise.
+            MaxCompletionTokensExceededError: the adapter reported it as MaxCompletionTokensExceeded; likewise.
             TransientError: the adapter reported it as Unparsed; not retried, because the stream
                 already yielded items to the caller. The error carries that 200's billing, the only
                 channel this outcome has.
@@ -488,10 +488,10 @@ class StreamHandle[OutputT]:
                     stop_reason=outcome.stop_reason,
                     assistant_message=outcome.assistant_message,
                 )
-            case Refused():
+            case Refusal():
                 self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return RefusalError(call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds))
-            case Truncated():
+            case MaxCompletionTokensExceeded():
                 self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return MaxCompletionTokensExceededError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
@@ -507,7 +507,7 @@ class StreamHandle[OutputT]:
 
     def _record_completed_attempt(
         self,
-        outcome: AdapterResult[OutputT] | Refused | Truncated,
+        outcome: AdapterResult[OutputT] | Refusal | MaxCompletionTokensExceeded,
         ended_at_monotonic_seconds: float,
     ) -> None:
         """Record the attempt that reached a billable 200, whatever the adapter made of it.

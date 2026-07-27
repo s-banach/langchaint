@@ -126,12 +126,12 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    Refused,
+    MaxCompletionTokensExceeded,
+    Refusal,
     ResponseOutcome,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    Truncated,
     Unparsed,
     classification_from_response,
     retry_after_seconds_from_headers,
@@ -750,7 +750,9 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncResponseStream[Any],
         pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
-        output_from_response: Callable[[OpenAIResponse], OutputT | Refused | Truncated | Unparsed],
+        output_from_response: Callable[
+            [OpenAIResponse], OutputT | Refusal | MaxCompletionTokensExceeded | Unparsed
+        ],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
@@ -808,7 +810,7 @@ class _OpenAIStream[OutputT](AdapterStream[OutputT]):
         if self._terminal_response is None:
             raise StreamProtocolError("final() requires items() to be exhausted first")
         output = self._output_from_response(self._terminal_response)
-        if isinstance(output, Refused | Truncated | Unparsed):
+        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
             return output
         return _adapter_result(
             response=self._terminal_response,
@@ -920,7 +922,9 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         self._request = request
         self._response_format = response_format
 
-    def _no_instance(self, response: OpenAIResponse) -> Refused | Truncated | Unparsed:
+    def _no_instance(
+        self, response: OpenAIResponse
+    ) -> Refusal | MaxCompletionTokensExceeded | Unparsed:
         """Report why the turn produced no instance.
 
         Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
@@ -931,7 +935,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         A failed status is tested first, ahead of the refusal and the truncation: the API is reporting
         that the run did not finish, so whatever items it emitted are a fragment, and a refusal part
         among them is no more the turn than a text part is. Testing the refusal first would make one
-        response Refused here and Unparsed on the text binding, which reads the same status first.
+        response Refusal here and Unparsed on the text binding, which reads the same status first.
         A content-filtered response reaches the refusal arm through the stop reason, so it fails the
         item once instead of being retried at full price for an outcome that will not change.
         """
@@ -939,18 +943,18 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         if response.status == "failed":
             return Unparsed(usage=usage, usage_raw=response.usage)
         if _normalized_stop_reason(response) == "refusal":
-            return Refused(usage=usage, usage_raw=response.usage)
+            return Refusal(usage=usage, usage_raw=response.usage)
         if (
             response.status == "incomplete"
             and response.incomplete_details is not None
             and response.incomplete_details.reason == "max_output_tokens"
         ):
-            return Truncated(usage=usage, usage_raw=response.usage)
+            return MaxCompletionTokensExceeded(usage=usage, usage_raw=response.usage)
         return Unparsed(usage=usage, usage_raw=response.usage)
 
     def _parsed_output(
         self, response: ParsedResponse[ModelT]
-    ) -> ModelT | Refused | Truncated | Unparsed:
+    ) -> ModelT | Refusal | MaxCompletionTokensExceeded | Unparsed:
         """Extract the parsed instance, or report why there is no usable one.
 
         A failed status is rejected even when the JSON parsed: the run did not finish, and
@@ -964,7 +968,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
 
     def _terminal_output(
         self, response: OpenAIResponse
-    ) -> ModelT | Refused | Truncated | Unparsed:
+    ) -> ModelT | Refusal | MaxCompletionTokensExceeded | Unparsed:
         """Extract the parsed instance from a stream's terminal response, or report why there is none.
 
         Only a ParsedResponse holds a parsed instance, and the SDK builds one for the completed
@@ -979,8 +983,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
     async def send(self, conversation: Sequence[Message]) -> ResponseOutcome[ModelT]:
         """Send one non-streaming request via responses.parse.
 
-        A parse yielding no usable instance returns the Refused, Truncated, or Unparsed arm
-        _parsed_output chose. NotSendable never arrives: this adapter sends every conversation.
+        A parse yielding no usable instance returns the Refusal, MaxCompletionTokensExceeded, or Unparsed arm
+        _parsed_output chose. InvalidRequest never arrives: this adapter sends every conversation.
         """
         response = await self._adapter.client.responses.parse(
             model=self._request.model,
@@ -999,7 +1003,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             text_format=self._response_format,
         )
         output = self._parsed_output(response)
-        if isinstance(output, Refused | Truncated | Unparsed):
+        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
             return output
         return _adapter_result(
             response=response,

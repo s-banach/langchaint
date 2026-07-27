@@ -36,7 +36,7 @@ from langchaint import (
 from langchaint.anthropic import anthropic_model
 
 # One row of the batch carries a scanned page as a TIFF. The adapter sends only image/gif,
-# image/jpeg, image/png, and image/webp, so it reports this conversation NotSendable and the item
+# image/jpeg, image/png, and image/webp, so it reports this conversation InvalidRequest and the item
 # fails its own row. That happens before the bytes are base64-encoded, which is why the placeholder
 # below is enough to trigger it.
 _SCANNED_PAGE: list[Message] = [

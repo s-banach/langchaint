@@ -36,6 +36,10 @@ class Response[OutputT](_CallCarrier):
     """One successful generate result.
 
     output is the assistant text, or the SDK-parsed response_format instance.
+    It is None when the turn parsed no instance, which on a structured tool-bound binding means the model called tools.
+    Only that binding types output optional, so no other caller has a None to handle.
+    A turn can both parse an instance and call tools, setting output and tool_calls at once.
+    tool_calls is therefore what says whether this turn owes the model a tool result.
     call is this call's history: model, provider_name, attempt_records, and elapsed_seconds read off it.
     attempts counts its records.
     Every attempt record but the last failed and the last succeeded.
@@ -181,9 +185,12 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
 
     A success and a failure fill the same keys, so a mixed list becomes one table:
     a failure's output is None and its error_text carries the failure reason a success leaves None.
+    A success whose output is None writes None too, that being the tool-call turn of a structured
+    tool-bound binding; stop_reason "tool_use" is what tells the two None cells apart.
     The cost and usage-counter columns are the call's paid totals across every attempt, uniform on
-    success and failure rows (zero for a retry-exhausted item whose attempts billed nothing, the real values
-    for a refusal or truncation, and above the single answer's tokens when a billed 200 was retried).
+    success and failure rows (zero for a retry-exhausted item whose attempts billed nothing, the real
+    values for a 200 that produced no output, and above the single answer's tokens when a billed 200
+    was retried).
     Usage counters and per-category costs are hoisted to top-level keys named exactly like the Usage
     fields, with cost_in_usd their sum; model output is flattened to its JSON.
     """
@@ -194,7 +201,12 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         usage = result.usage
     else:
         output = result.output
-        output_cell = output.model_dump_json() if isinstance(output, BaseModel) else str(output)
+        if output is None:
+            output_cell = None
+        elif isinstance(output, BaseModel):
+            output_cell = output.model_dump_json()
+        else:
+            output_cell = str(output)
         error_text = None
         stop_reason = result.stop_reason
         usage = result.usage

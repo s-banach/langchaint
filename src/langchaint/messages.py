@@ -232,7 +232,12 @@ never from which member's fields happen to match,
 so callers can persist a conversation as JSON and re-validate it with a TypeAdapter.
 """
 
-type StopReason = Literal["end_turn", "tool_use", "max_tokens", "refusal", "other"]
+type StopReason = Literal[
+    "end_turn", "tool_use", "max_tokens", "refusal", "context_window_exceeded", "other"
+]
 """Provider stop reasons normalized to one vocabulary;
 adapters map unrecognized provider values to "other" so a new provider value cannot break callers.
+context_window_exceeded carries no provider prefix because this vocabulary is langchaint's own;
+it earns a member rather than "other" because it names a terminal condition a caller acts on,
+by shortening the conversation or moving to a model with a larger window.
 """

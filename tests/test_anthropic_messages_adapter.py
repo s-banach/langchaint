@@ -45,12 +45,14 @@ from langchaint import (
 from langchaint.adapter import (
     AdapterResult,
     Binding,
+    ContextWindowExceeded,
+    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
-    Unparsed,
+    UnfinishedTurn,
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
@@ -331,12 +333,17 @@ def test_cache_ttl_is_stored_on_the_adapter() -> None:
         ("tool_use", "tool_use"),
         ("max_tokens", "max_tokens"),
         ("refusal", "refusal"),
+        ("model_context_window_exceeded", "context_window_exceeded"),
         ("pause_turn", "other"),
         (None, "other"),
     ],
 )
 def test_stop_reason_mapping(raw: str | None, expected: str) -> None:
-    """Recognized stop reasons pass through; everything else becomes other."""
+    """Recognized stop reasons map to their neutral name; everything else becomes other.
+
+    The overflow is the one that is renamed rather than passed through, and it must not fall to
+    "other": on a text binding, stop_reason is the only signal the caller gets for it.
+    """
     assert _normalized_stop_reason(raw) == expected
 
 
@@ -926,7 +933,7 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
 
 def _parsed_message(
     parsed_output: _StructuredReport | None,
-    stop_reason: at.StopReason = "end_turn",
+    stop_reason: at.StopReason | None = "end_turn",
 ) -> ParsedMessage[_StructuredReport]:
     """Build the SDK parse result whose first text block carries the given parsed output."""
     return ParsedMessage[_StructuredReport](
@@ -948,11 +955,11 @@ def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
     assert _structured_bound()._parsed_output(_parsed_message(report)) == report
 
 
-def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
-    """A turn with no parsed output is Unparsed: a later attempt may still produce it."""
+def test_structured_bind_reports_empty_turn_without_parsed_output() -> None:
+    """An end_turn with no parsed output and no tool call is EmptyTurn: the model said nothing."""
     outcome = _structured_bound()._parsed_output(_parsed_message(None))
-    assert isinstance(outcome, Unparsed)
-    # The rejected 200's billing rides on the arm so the retry record is not zero.
+    assert isinstance(outcome, EmptyTurn)
+    # The 200's billing rides on the member so the attempt record is not zero.
     assert outcome.usage.cost_in_usd > 0.0
 
 
@@ -970,6 +977,36 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_
     outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="max_tokens"))
     assert isinstance(outcome, MaxCompletionTokensExceeded)
     assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
+    """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
+    assert (
+        _structured_bound()._parsed_output(_parsed_message(None, stop_reason="tool_use")) is None
+    )
+
+
+def test_structured_bind_reports_context_window_exceeded_on_the_overflow_stop_reason() -> None:
+    """model_context_window_exceeded is ContextWindowExceeded, not a resend of a request too long to serve."""
+    outcome = _structured_bound()._parsed_output(
+        _parsed_message(None, stop_reason="model_context_window_exceeded")
+    )
+    assert isinstance(outcome, ContextWindowExceeded)
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
+    """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
+    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason="pause_turn"))
+    assert isinstance(outcome, UnfinishedTurn)
+    assert "pause_turn" in outcome.reason
+    assert outcome.usage.cost_in_usd > 0.0
+
+
+def test_structured_bind_reports_a_null_stop_reason_as_unfinished() -> None:
+    """A message with no stop reason is not a finished turn, so its content is not the answer."""
+    outcome = _structured_bound()._parsed_output(_parsed_message(None, stop_reason=None))
+    assert isinstance(outcome, UnfinishedTurn)
 
 
 def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:

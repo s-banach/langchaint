@@ -14,7 +14,15 @@ import asyncio
 
 from pydantic import BaseModel
 
-from langchaint import BoundLLM, Message, PydanticTool, ToolCall, ToolManager, UserMessage
+from langchaint import (
+    BoundLLM,
+    HasTools,
+    Message,
+    PydanticTool,
+    ToolCall,
+    ToolManager,
+    UserMessage,
+)
 from langchaint.openai import openai_model
 
 
@@ -38,7 +46,7 @@ async def stream_text() -> None:
 
 
 async def stream_agent(
-    bound: BoundLLM[str], tool_manager: ToolManager, prompt: str, max_turns: int = 10
+    bound: BoundLLM[str, HasTools], tool_manager: ToolManager, prompt: str, max_turns: int = 10
 ) -> str:
     """Run the streaming ReAct loop: print text live, dispatch the completed tool calls between turns.
 

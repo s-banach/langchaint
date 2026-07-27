@@ -204,6 +204,14 @@ lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
 
+# The retry loops match AttemptOutcome one case per member, so these three counts track the union's
+# size rather than any nesting.
+# The design rule that gives each outcome its own type is what sets that size, so capping the counts
+# at a default would be capping the union.
+lint.pylint.max-returns = 10
+lint.pylint.max-branches = 18
+lint.pylint.max-statements = 60
+
 # The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._request,
 # BoundLLM._bound_adapter); those accesses are the unit under test, so private-member-access
 # cannot be satisfied without exposing internals.

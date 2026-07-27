@@ -97,15 +97,19 @@ from langchaint.adapter import (
     AttemptOutcome,
     Binding,
     BoundAdapter,
+    ContextWindowExceeded,
+    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutput,
+    NoOutputOutcome,
     Refusal,
     ResponseOutcome,
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    Unparsed,
+    UnfinishedTurn,
     classification_from_response,
     retry_after_seconds_from_headers,
 )
@@ -555,7 +559,40 @@ def _wire_tools(
 def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
     if stop_reason in ("end_turn", "tool_use", "max_tokens", "refusal"):
         return stop_reason
+    if stop_reason == "model_context_window_exceeded":
+        return "context_window_exceeded"
     return "other"
+
+
+def _unfinished_turn_or_none(
+    message: anthropic.types.Message,
+    *,
+    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+) -> UnfinishedTurn | None:
+    """Report a 200 that is not a finished turn, or None when the turn finished.
+
+    Continuing an unfinished turn means sending its content back for the provider to resume, which
+    this adapter does not do, so returning that content as the result would be silently wrong data.
+    Two known cases reach this. "pause_turn" pauses a turn for the caller to continue, which the API
+    emits for server-side tool execution this adapter never requests. A null stop reason is the
+    in-progress state of a message that is not finished. A stop reason outside the SDK's literal
+    lands here too, because a value this adapter cannot place is one it cannot call finished.
+    """
+    stop_reason = message.stop_reason
+    if stop_reason in (
+        "end_turn",
+        "tool_use",
+        "max_tokens",
+        "refusal",
+        "stop_sequence",
+        "model_context_window_exceeded",
+    ):
+        return None
+    return UnfinishedTurn(
+        reason=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
+        usage=_normalized_usage(message.usage, pricing=pricing),
+        usage_raw=message.usage,
+    )
 
 
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
@@ -831,7 +868,7 @@ class AnthropicMessagesAdapter(Adapter):
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
+    ) -> BoundAdapter[ModelT | None]:
         """Bind for structured output parsed by the SDK; pure conversion, no I/O."""
         return _BoundAnthropicStructured(
             adapter=self,
@@ -880,9 +917,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         *,
         sdk_stream: AsyncMessageStream[Any],
         pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
-        output_from_message: Callable[
-            [ParsedMessage[Any]], OutputT | Refusal | MaxCompletionTokensExceeded | Unparsed
-        ],
+        output_from_message: Callable[[ParsedMessage[Any]], OutputT | NoOutputOutcome],
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
@@ -918,7 +953,7 @@ class _AnthropicStream[OutputT](AdapterStream[OutputT]):
         """Return what the SDK-assembled message produced, after the stream ends."""
         message = await self._sdk_stream.get_final_message()
         output = self._output_from_message(message)
-        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
+        if isinstance(output, NoOutput):
             return output
         return _adapter_result(message=message, output=output, pricing=self._pricing)
 
@@ -987,7 +1022,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
         )
 
 
-class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
+class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
     """Structured-bound adapter: output is the SDK-parsed response_format instance."""
 
     def __init__(
@@ -1001,27 +1036,40 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
         self._request = request
         self._response_format = response_format
 
-    def _parsed_output(
-        self, message: ParsedMessage[ModelT]
-    ) -> ModelT | Refusal | MaxCompletionTokensExceeded | Unparsed:
-        """Extract the parsed instance, or report why the turn produced none.
+    def _parsed_output(self, message: ParsedMessage[ModelT]) -> ModelT | None | NoOutputOutcome:
+        """Extract the parsed instance, report a tool-call turn as None, or report why neither exists.
 
-        Each rejecting arm carries this attempt's billing (usage with cost_in_usd inside, and the raw
-        SDK usage object) so a rejected 200's cost is not lost. The stop reason chooses the arm and
-        is not carried on it: what a rejected 200 reports is fixed by its GenerationError subclass.
+        None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
+        message carries. parsed_output reads the instance out of text blocks, so a turn holding only
+        tool_use blocks leaves none without anything having gone wrong (anthropic 0.120.0).
+
+        Every other stop reason has a named member, and none of them is retried, because no stop reason
+        states an error: the model finished on the terms it reports, so a resend is a fresh sample.
+
+        Each NoOutputOutcome member carries this attempt's billing (usage with cost_in_usd inside, and
+        the raw SDK usage object) so a 200 that produced no output does not lose its cost.
+        The stop reason chooses the member and is not carried on it: what such a 200 reports is fixed
+        by its GenerationError subclass.
         """
         parsed_output = message.parsed_output
-        if parsed_output is None:
-            usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
-            if message.stop_reason == "refusal":
-                return Refusal(usage=usage, usage_raw=message.usage)
-            if message.stop_reason == "max_tokens":
-                return MaxCompletionTokensExceeded(usage=usage, usage_raw=message.usage)
-            return Unparsed(usage=usage, usage_raw=message.usage)
-        return parsed_output
+        if parsed_output is not None:
+            return parsed_output
+        unfinished_turn = _unfinished_turn_or_none(message, pricing=self._adapter.pricing)
+        if unfinished_turn is not None:
+            return unfinished_turn
+        if message.stop_reason == "tool_use":
+            return None
+        usage = _normalized_usage(message.usage, pricing=self._adapter.pricing)
+        if message.stop_reason == "refusal":
+            return Refusal(usage=usage, usage_raw=message.usage)
+        if message.stop_reason == "max_tokens":
+            return MaxCompletionTokensExceeded(usage=usage, usage_raw=message.usage)
+        if message.stop_reason == "model_context_window_exceeded":
+            return ContextWindowExceeded(usage=usage, usage_raw=message.usage)
+        return EmptyTurn(usage=usage, usage_raw=message.usage)
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT]:
+    async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[ModelT | None]:
         """Send one non-streaming request via messages.parse."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):
@@ -1040,7 +1088,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
             output_format=self._response_format,
         )
         output = self._parsed_output(message)
-        if isinstance(output, Refusal | MaxCompletionTokensExceeded | Unparsed):
+        if isinstance(output, NoOutput):
             return output
         return _adapter_result(
             message=message,
@@ -1051,7 +1099,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT]):
     @override
     async def open_stream(
         self, conversation: Sequence[Message]
-    ) -> AdapterStream[ModelT] | InvalidRequest:
+    ) -> AdapterStream[ModelT | None] | InvalidRequest:
         """Open one streaming request; connection failures raise here."""
         messages = _request_messages(conversation, self._request)
         if isinstance(messages, InvalidRequest):

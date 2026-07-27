@@ -60,6 +60,7 @@ from langchaint import (
 from langchaint.adapter import (
     AdapterResult,
     Binding,
+    EmptyTurn,
     ErrorClassification,
     MaxCompletionTokensExceeded,
     Refusal,
@@ -1047,8 +1048,12 @@ def _parsed_response(
     status: ResponseStatus = "completed",
     incomplete_details: IncompleteDetails | None = None,
     usage: ResponseUsage | None = None,
+    tool_call: bool = False,
 ) -> ParsedResponse[_StructuredReport]:
-    """Build the SDK parse result whose message carries the parsed instance, or a refusal block."""
+    """Build the SDK parse result whose message carries the parsed instance, or a refusal block.
+
+    tool_call appends a function_call output item, which is what makes the turn a tool call.
+    """
     content = (
         [ResponseOutputRefusal(type="refusal", refusal="I can't help with that")]
         if refusal
@@ -1061,19 +1066,19 @@ def _parsed_response(
     message = ParsedResponseOutputMessage[_StructuredReport](
         id="m1", role="assistant", status="completed", type="message", content=content
     )
-    return ParsedResponse[_StructuredReport](
-        id="r1",
-        created_at=0,
-        model="m",
-        object="response",
-        output=[message],
-        parallel_tool_calls=True,
-        tool_choice="auto",
-        tools=[],
-        status=status,
-        incomplete_details=incomplete_details,
-        usage=usage,
-    )
+    return ParsedResponse[_StructuredReport].model_validate({
+        "id": "r1",
+        "created_at": 0,
+        "model": "m",
+        "object": "response",
+        "output": [message, *([_FUNCTION_CALL_OUTPUT_ITEM] if tool_call else [])],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "status": status,
+        "incomplete_details": incomplete_details,
+        "usage": usage,
+    })
 
 
 def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
@@ -1082,10 +1087,33 @@ def test_structured_bind_returns_the_sdk_parsed_instance() -> None:
     assert _structured_bound()._parsed_output(_parsed_response(report)) == report
 
 
-def test_structured_bind_reports_unparsed_without_parsed_output() -> None:
-    """A turn with no parsed output is Unparsed: a later attempt may still produce it."""
+def test_structured_bind_reports_empty_turn_without_parsed_output() -> None:
+    """A completed response with no parsed instance and no tool call is EmptyTurn."""
     outcome = _structured_bound()._parsed_output(_parsed_response(None))
-    assert isinstance(outcome, Unparsed)
+    assert isinstance(outcome, EmptyTurn)
+
+
+def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
+    """A completed turn whose output is a function call parses no instance and nothing went wrong."""
+    assert _structured_bound()._parsed_output(_parsed_response(None, tool_call=True)) is None
+
+
+def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
+    """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
+    report = _StructuredReport(city="Nairobi", celsius=25)
+    assert _structured_bound()._parsed_output(_parsed_response(report, tool_call=True)) == report
+
+
+def test_structured_stream_terminal_reports_a_tool_call_turn_as_none() -> None:
+    """The SDK parses only the completed event, so a tool-call terminal arrives as a plain Response.
+
+    It is still a success carrying no instance, so _terminal_output must take the same test the
+    parsed path takes rather than sending every unparsed terminal to a NoOutputOutcome.
+    """
+    outcome = _structured_bound()._terminal_output(
+        _response(usage=None, output=[_FUNCTION_CALL_OUTPUT_ITEM])
+    )
+    assert outcome is None
 
 
 def test_structured_stream_terminal_reports_max_completion_tokens_exceeded_from_a_plain_response() -> (

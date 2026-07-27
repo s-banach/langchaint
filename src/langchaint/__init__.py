@@ -17,7 +17,9 @@ from langchaint.adapter import (
 )
 from langchaint.call import AttemptRecord, CallRecord
 from langchaint.exceptions import (
+    ContextWindowExceededError,
     DispatchExceptionGroup,
+    EmptyTurnError,
     GenerationError,
     InvalidRequestError,
     InvalidToolArgsError,
@@ -26,10 +28,11 @@ from langchaint.exceptions import (
     RetriesExhaustedError,
     StreamProtocolError,
     TransientError,
+    UnfinishedTurnError,
     UnrecognizedError,
 )
 from langchaint.inference_params import InferenceParams, ReasoningEffort
-from langchaint.llm import LLM, BoundLLM
+from langchaint.llm import LLM, BoundLLM, HasTools, NoTools
 from langchaint.messages import (
     AssistantMessage,
     ImagePart,
@@ -78,6 +81,7 @@ __all__ = [
     "BoundLLM",
     "CallRecord",
     "CaptureTool",
+    "ContextWindowExceededError",
     "DispatchCaptured",
     "DispatchExceptionGroup",
     "DispatchHandled",
@@ -86,7 +90,9 @@ __all__ = [
     "DispatchOutcome",
     "DispatchPrecomputed",
     "DispatchUnknownTool",
+    "EmptyTurnError",
     "GenerationError",
+    "HasTools",
     "ImagePart",
     "InferenceParams",
     "InvalidRequestError",
@@ -96,6 +102,7 @@ __all__ = [
     "MaxCompletionTokensExceededError",
     "Message",
     "MessageContent",
+    "NoTools",
     "Part",
     "PricingTable",
     "PydanticTool",
@@ -122,6 +129,7 @@ __all__ = [
     "ToolSchema",
     "TransientError",
     "TurnElement",
+    "UnfinishedTurnError",
     "UnrecognizedError",
     "Usage",
     "UserMessage",

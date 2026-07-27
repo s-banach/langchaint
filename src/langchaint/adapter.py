@@ -194,6 +194,10 @@ class AdapterResult[OutputT]:
     """One successful provider turn, normalized to langchaint terms.
 
     output is the assistant text (text bindings) or the SDK-parsed response_format instance (structured bindings).
+    A structured binding's output is None when the turn parsed no instance, which here means the model
+    called tools: the calls are on assistant_message, and no failure occurred.
+    A turn can both parse an instance and call tools, so tool_calls is what says whether a tool result
+    is owed.
     assistant_message is the full turn including tool calls, for appending to a conversation.
     usage carries the per-category costs, priced from raw provider counts against the table the
     adapter holds for the service tier the response reported.
@@ -213,10 +217,16 @@ class AdapterResult[OutputT]:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Refusal:
-    """A completed 200 whose structured parse found the model refusing.
+class NoOutput:
+    """The shared shape of a 200 that produced no output: what that attempt billed.
 
-    The retry loop records the attempt and fails the item with a RefusalError, without retrying.
+    Declares the billing fields once, and is the runtime test that narrows to NoOutputOutcome:
+    isinstance rejects a type alias, so an adapter helper whose result is an output value or a member
+    tests against this base and annotates the members as NoOutputOutcome.
+    Every subclass must be a member of that alias; that is what makes the test sound.
+
+    usage carries the per-category costs; usage_raw is the raw SDK usage object it was normalized
+    from, held by reference and None when the response reported no usage.
     """
 
     usage: Usage
@@ -224,19 +234,24 @@ class Refusal:
 
 
 @dataclass(frozen=True, kw_only=True)
-class MaxCompletionTokensExceeded:
+class Refusal(NoOutput):
+    """A completed 200 whose structured parse found the model refusing.
+
+    The retry loop records the attempt and fails the item with a RefusalError, without retrying.
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaxCompletionTokensExceeded(NoOutput):
     """A completed 200 that reached the token cap before its JSON closed.
 
     The retry loop records the attempt and fails the item with a MaxCompletionTokensExceededError,
     without retrying.
     """
 
-    usage: Usage
-    usage_raw: BaseModel | None
-
 
 @dataclass(frozen=True, kw_only=True)
-class Unparsed:
+class Unparsed(NoOutput):
     """A billable 200 that produced no usable output, for a reason the stop reason does not name.
 
     The retry loop records the attempt and retries it, because a later attempt may produce output.
@@ -244,8 +259,38 @@ class Unparsed:
     because the stream already yielded items to the caller and is not reopened.
     """
 
-    usage: Usage
-    usage_raw: BaseModel | None
+
+@dataclass(frozen=True, kw_only=True)
+class EmptyTurn(NoOutput):
+    """A completed turn that produced no instance and no tool call.
+
+    The retry loop records the attempt and fails the item with an EmptyTurnError, without retrying:
+    the model finished on its own terms and emitted nothing a structured binding can return, so a
+    resend is a fresh sample charged to a budget that means error recovery.
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class ContextWindowExceeded(NoOutput):
+    """A 200 reporting that the conversation overflowed the model's context window.
+
+    The retry loop records the attempt and fails the item with a ContextWindowExceededError, without
+    retrying: the same conversation overflows identically every time.
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnfinishedTurn(NoOutput):
+    """A 200 that is not a finished turn, so its content is not the answer.
+
+    Continuing such a turn means sending its content back for the provider to resume, which langchaint
+    has no code for, so presenting the partial content as the answer would be silently wrong data.
+    The retry loop records the attempt and fails the item with an UnfinishedTurnError.
+    reason states what the provider reported, naming the provider's own word, and becomes that error's
+    message.
+    """
+
+    reason: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -259,17 +304,26 @@ class InvalidRequest:
     reason: str
 
 
-type ResponseOutcome[OutputT] = (
-    AdapterResult[OutputT] | Refusal | MaxCompletionTokensExceeded | Unparsed
+type NoOutputOutcome = (
+    Refusal
+    | MaxCompletionTokensExceeded
+    | ContextWindowExceeded
+    | EmptyTurn
+    | UnfinishedTurn
+    | Unparsed
 )
-"""What one completed 200 produced.
+"""Every outcome of a billable 200 that produced no output.
 
-Every arm but AdapterResult is a response the adapter read and rejected; all four reached a billable
-200, so each carries that attempt's usage (with cost_in_usd inside) and the raw SDK usage object it
-was normalized from, held by reference and None when the response reported no usage.
-The arms differ in what the retry loop does with them, which is why they are four types rather than
-one type carrying a reason: see each class.
+The type an adapter helper returns beside its output value, tested at runtime with
+isinstance(x, NoOutput). Spelled as the concrete members rather than as NoOutput so that a match over
+it, or over ResponseOutcome, is provably exhaustive: a member added here without a match case in each
+retry loop is a type error rather than a silent fall-through.
+The members differ in what the retry loop does with them, which is why they are separate types rather
+than one type carrying a reason: see each class.
 """
+
+type ResponseOutcome[OutputT] = AdapterResult[OutputT] | NoOutputOutcome
+"""What one completed 200 produced: the turn, or the reason it yielded no output."""
 
 type AttemptOutcome[OutputT] = ResponseOutcome[OutputT] | InvalidRequest
 """What one attempt produced, whether or not a request went out."""
@@ -296,8 +350,8 @@ class AdapterStream[OutputT](ABC):
         """Return what the assembled response produced, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly and parsing to the SDK stream manager.
-        A response the adapter reads and rejects is Refusal, MaxCompletionTokensExceeded, or Unparsed
-        rather than a raise, so the stream handle gets this attempt's billing and decides the item's fate itself.
+        A response that produced no output is a NoOutputOutcome member rather than a raise, so the
+        stream handle gets this attempt's billing and decides the item's fate itself.
         InvalidRequest cannot arrive here: the request is already open.
         """
         ...
@@ -319,7 +373,7 @@ class BoundAdapter[OutputT](ABC):
     async def send(self, conversation: Sequence[Message]) -> AttemptOutcome[OutputT]:
         """Send one non-streaming request and report what the attempt produced.
 
-        A response the adapter reads and rejects is a returned arm, never a raise, so the retry loop
+        A response that produced no output is a returned member, never a raise, so the retry loop
         records what the attempt billed before deciding the item's fate.
 
         Raises:
@@ -434,8 +488,12 @@ class Adapter(ABC):
     @abstractmethod
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
-    ) -> BoundAdapter[ModelT]:
-        """Bind for structured output parsed by the SDK into response_format.
+    ) -> BoundAdapter[ModelT | None]:
+        """Bind for structured output parsed into response_format.
+
+        The output type admits None because a turn holding tool calls parses to no instance while
+        being a success: the tool calls are the turn. Both SDKs type their parsed instance Optional
+        for the same reason. Every other turn that yields no instance is a NoOutputOutcome member.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
         """

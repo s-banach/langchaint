@@ -389,7 +389,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
 
 
 def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
-    """A RefusalError yields an error span carrying the rejected 200's real token counts and cost."""
+    """A RefusalError yields an error span carrying the 200's real token counts and cost."""
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports Refusal, then inspect the error span."""
@@ -413,7 +413,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
 
 def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None:
-    """A MaxCompletionTokensExceededError yields an error span with the rejected 200's tokens and max_tokens finish."""
+    """A MaxCompletionTokensExceededError yields an error span with the 200's tokens and max_tokens finish."""
 
     async def scenario() -> None:
         """Drive one generate_one whose send reports MaxCompletionTokensExceeded, then inspect the error span."""

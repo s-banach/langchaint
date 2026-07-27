@@ -13,12 +13,12 @@ bind time instead, before any request is sent.
 
 TransientError is a per-attempt control signal.
 The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
-RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, InvalidRequestError,
-and UnrecognizedError.
+RetriesExhaustedError, RefusalError, MaxCompletionTokensExceededError, EmptyTurnError,
+ContextWindowExceededError, UnfinishedTurnError, InvalidRequestError, and UnrecognizedError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
-a refusal and a token-cap truncation are normal 200 responses that never reach classify,
-so the adapter reports them as AttemptOutcome arms where it reads the response.
+a 200 that produced no output is a normal response that never reaches classify,
+so the adapter reports it as an AttemptOutcome member where it reads the response.
 Every GenerationError is constructed by a retry loop, which is the only scope that knows a call's
 attempts and timing; an adapter reports one attempt and never a GenerationError.
 
@@ -99,10 +99,13 @@ def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
 class GenerationError(_CallCarrier, Exception):
     """A terminal per-item generate result that becomes a to_row failure row.
 
-    The base for the five non-retriable per-item outcomes:
+    The base for the non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
     RefusalError (no structured output: the model refused or a provider filter blocked the turn),
     MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed),
+    EmptyTurnError (the model finished the turn and produced nothing),
+    ContextWindowExceededError (the conversation overflowed the model's context window),
+    UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending), and
     UnrecognizedError (the adapter did not recognize the attempt's error).
     generate_one raises any of them;
@@ -134,7 +137,10 @@ class GenerationError(_CallCarrier, Exception):
 
     @property
     def stop_reason(self) -> StopReason | None:
-        """None: no turn completed, true of every subclass but RefusalError and MaxCompletionTokensExceededError.
+        """None: no turn completed. Four subclasses override it, because a turn did.
+
+        RefusalError, MaxCompletionTokensExceededError, EmptyTurnError, and ContextWindowExceededError
+        each fix their own value; every other subclass inherits None.
 
         Fixed by the class rather than taken as a constructor argument, because a raise site must
         not choose a value the subclass already fixes. to_row and gen_ai_attributes both read it
@@ -238,6 +244,68 @@ class MaxCompletionTokensExceededError(GenerationError):
         return "the structured response reached max_completion_tokens before its JSON parsed"
 
 
+class EmptyTurnError(GenerationError):
+    """The model finished its turn and produced no instance and no tool call.
+
+    Fires only on the structured path; a text binding returns "" for the same turn.
+    Not retried: the model stopped on its own terms, so a resend is a fresh sample rather than a
+    recovery, and it bills the full input again.
+    A turn that spent its budget on reasoning and emitted no text lands here, and what it generated
+    is on the attempt record.
+    """
+
+    @property
+    @override
+    def stop_reason(self) -> Literal["end_turn"]:
+        """The provider completed the turn; it was empty of anything the binding could return."""
+        return "end_turn"
+
+    @override
+    def _summary(self) -> str:
+        return "the model completed its turn without producing output"
+
+
+class ContextWindowExceededError(GenerationError):
+    """The conversation overflowed the model's context window.
+
+    Not retried: the same conversation overflows identically on every attempt.
+    The fix is a shorter conversation or a model with a larger window.
+    """
+
+    @property
+    @override
+    def stop_reason(self) -> Literal["context_window_exceeded"]:
+        """The provider reported the overflow as the turn's stop reason."""
+        return "context_window_exceeded"
+
+    @override
+    def _summary(self) -> str:
+        return "the conversation exceeded the model's context window"
+
+
+class UnfinishedTurnError(GenerationError):
+    """The provider returned a 200 that is not a finished turn, so its content is not the answer.
+
+    Continuing such a turn means sending its content back for the provider to resume, which langchaint
+    has no code for. Returning the partial content as the answer would be silently wrong data, so the
+    item fails instead.
+    Not retried: nothing about the next attempt makes langchaint able to continue the turn.
+
+    reason names what the provider reported, in the provider's own word, and is the whole message.
+    """
+
+    reason: str
+
+    def __init__(self, *, reason: str, call: CallRecord) -> None:
+        """Store what the provider reported, then the call."""
+        self.reason = reason
+        super().__init__(call=call)
+
+    @override
+    def _summary(self) -> str:
+        return self.reason
+
+
 class InvalidRequestError(GenerationError):
     """The provider or the adapter rejected this one request; the item fails as a row.
 
@@ -329,7 +397,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     a call answered through dispatch_many's precomputed argument included as its DispatchPrecomputed,
     each naming its call via tool_message.tool_call_id,
     so app_data a completed sibling produced (a billing record for money the tool spent) survives the raise,
-    the same principle as GenerationError preserving a rejected 200's billing on attempt_records.
+    the same principle as GenerationError preserving on attempt_records what a 200 with no output billed.
     The grouped exceptions are user-code defects, dispatch's exceptions-propagate rule extended to a batch,
     ordered by tool_calls position; the ExceptionGroup base keeps every traceback in the report
     and supports except* handling.

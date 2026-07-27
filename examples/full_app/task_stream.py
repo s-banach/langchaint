@@ -74,6 +74,7 @@ from langchaint import (
     DispatchHandled,
     DispatchManyOutcome,
     GenerationError,
+    HasTools,
     Message,
     PydanticTool,
     Response,
@@ -297,7 +298,7 @@ class ReActAgent(AgentRun):
         tracer: Tracer,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
-        bound: TracedBoundLLM[str],
+        bound: TracedBoundLLM[str, HasTools],
         tool_manager: ToolManager,
         prompt: str,
     ) -> None:

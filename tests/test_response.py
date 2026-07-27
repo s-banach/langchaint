@@ -25,6 +25,7 @@ from langchaint import (
     RefusalError,
     Response,
     RetriesExhaustedError,
+    StopReason,
     TextPart,
     TransientError,
     Usage,
@@ -73,14 +74,17 @@ def _call(attempt_records: tuple[AttemptRecord, ...], *, elapsed_seconds: float)
 
 
 def _response[OutputT](
-    *, output: OutputT, attempt_records: tuple[AttemptRecord, ...]
+    *,
+    output: OutputT,
+    attempt_records: tuple[AttemptRecord, ...],
+    stop_reason: StopReason = "end_turn",
 ) -> Response[OutputT]:
     """Build a Response with the fields under test; everything else is fixed filler."""
     return Response(
         output=output,
         call=_call(attempt_records, elapsed_seconds=1.5),
         raw=_Raw(),
-        stop_reason="end_turn",
+        stop_reason=stop_reason,
         assistant_message=AssistantMessage(turn=(TextPart(text=str(output)),)),
     )
 
@@ -222,6 +226,24 @@ def test_to_row_structured_output_becomes_json() -> None:
     assert row["output"] == _USAGE.model_dump_json()
 
 
+def test_to_row_writes_a_tool_call_success_as_a_null_output_with_no_error_text() -> None:
+    """A structured tool-bound binding's tool-call turn is a success whose output cell is None.
+
+    str(None) would write the string "None" into a column readers scan for real output, and the
+    error_text and stop_reason cells are what tell this row from the failure row beside it.
+    """
+    row = to_row(
+        _response(
+            output=None,
+            attempt_records=(_record(error=None, usage=_USAGE),),
+            stop_reason="tool_use",
+        )
+    )
+    assert row["output"] is None
+    assert row["error_text"] is None
+    assert row["stop_reason"] == "tool_use"
+
+
 def test_to_row_failure_is_none_and_zero_with_the_error_chain() -> None:
     """A failure row nulls output and stop_reason, zeroes cost and usage, and carries error_text."""
     row = to_row(
@@ -242,7 +264,7 @@ def test_to_row_failure_is_none_and_zero_with_the_error_chain() -> None:
 
 
 def test_to_row_refusal_reports_its_billing_and_reason() -> None:
-    """A refusal row carries the rejected 200's cost and usage, not zeros, and stop_reason "refusal"."""
+    """A refusal row carries the 200's cost and usage, not zeros, and stop_reason "refusal"."""
     row = to_row(
         RefusalError(call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0))
     )
@@ -259,7 +281,7 @@ def test_to_row_refusal_reports_its_billing_and_reason() -> None:
 
 
 def test_to_row_truncation_reports_its_billing_and_reason() -> None:
-    """A truncation row carries the rejected 200's cost and usage and stop_reason "max_tokens"."""
+    """A truncation row carries the 200's cost and usage and stop_reason "max_tokens"."""
     row = to_row(
         MaxCompletionTokensExceededError(
             call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0)

@@ -27,15 +27,20 @@ from langchaint.adapter import (
     AdapterResult,
     AdapterStream,
     BoundAdapter,
+    ContextWindowExceeded,
+    EmptyTurn,
     InvalidRequest,
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
     StreamItem,
+    UnfinishedTurn,
     Unparsed,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
+    ContextWindowExceededError,
+    EmptyTurnError,
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
@@ -43,6 +48,7 @@ from langchaint.exceptions import (
     RetriesExhaustedError,
     StreamProtocolError,
     TransientError,
+    UnfinishedTurnError,
     UnrecognizedError,
     _extract_transient_errors,
 )
@@ -419,9 +425,9 @@ class StreamHandle[OutputT]:
         method produced it, a caller's own iteration produced it, or the adapter stream raised it.
         Every later call returns or raises it again without asking the adapter stream anything.
         Without that store, a second call would append a second AttemptRecord for the one request made.
-        A structured refusal or truncation is detected only here, when the SDK parses the assembled
-        message: the adapter reports it as a Refusal or MaxCompletionTokensExceeded outcome and this method builds the
-        GenerationError from it, without retrying (the stream already yielded items to the caller);
+        A 200 that produced no output is detected only here, when the SDK parses the assembled
+        message: the adapter reports which one it was and this method builds the GenerationError from
+        it, without retrying (the stream already yielded items to the caller);
         it reaches the caller carrying the attempt records this handle built.
 
         Raises:
@@ -434,6 +440,9 @@ class StreamHandle[OutputT]:
             RefusalError: the adapter reported the assembled response as Refusal,
                 carrying this handle's attempt records.
             MaxCompletionTokensExceededError: the adapter reported it as MaxCompletionTokensExceeded; likewise.
+            EmptyTurnError: the adapter reported it as EmptyTurn; likewise.
+            ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
+            UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
             TransientError: the adapter reported it as Unparsed; not retried, because the stream
                 already yielded items to the caller. The error carries that 200's billing, the only
                 channel this outcome has.
@@ -459,13 +468,13 @@ class StreamHandle[OutputT]:
             except BaseException as exc:
                 # A cancellation is not a conclusion, the same rule __anext__ applies:
                 # it destroys the frames that could have observed the call rather than ending it.
-                # _conclude is inside the try because three of its arms record the attempt first,
-                # so a raise past that record would let a second call record it again.
+                # _conclude is inside the try because every case of it but Unparsed records the
+                # attempt first, so a raise past that record would let a second call record it again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                 raise
-            # Every _conclude arm accounts for the call: three build their result off the frozen
-            # CallRecord, and Unparsed puts the 200's billing on the TransientError it returns.
+            # Every _conclude case accounts for the call: every one but Unparsed builds its result
+            # off the frozen CallRecord, and Unparsed puts the 200's billing on the TransientError.
             self._conclusion_carried_the_call = True
         if isinstance(self._conclusion, Response):
             return self._conclusion
@@ -476,7 +485,7 @@ class StreamHandle[OutputT]:
     ) -> Response[OutputT] | GenerationError | TransientError:
         """Build what this outcome concludes the call with: the Response, or the error to raise.
 
-        Returns the error rather than raising it, so no arm can conclude the call without being stored.
+        Returns the error rather than raising it, so no case can conclude the call without being stored.
         """
         match outcome:
             case AdapterResult():
@@ -496,6 +505,22 @@ class StreamHandle[OutputT]:
                 return MaxCompletionTokensExceededError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
                 )
+            case EmptyTurn():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return EmptyTurnError(
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                )
+            case ContextWindowExceeded():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return ContextWindowExceededError(
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                )
+            case UnfinishedTurn():
+                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
+                return UnfinishedTurnError(
+                    reason=outcome.reason,
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                )
             case Unparsed():
                 return TransientError(
                     "response carried no usable output",
@@ -507,13 +532,18 @@ class StreamHandle[OutputT]:
 
     def _record_completed_attempt(
         self,
-        outcome: AdapterResult[OutputT] | Refusal | MaxCompletionTokensExceeded,
+        outcome: AdapterResult[OutputT]
+        | Refusal
+        | MaxCompletionTokensExceeded
+        | EmptyTurn
+        | ContextWindowExceeded
+        | UnfinishedTurn,
         ended_at_monotonic_seconds: float,
     ) -> None:
         """Record the attempt that reached a billable 200, whatever the adapter made of it.
 
-        error is None on all three: the request itself succeeded, and what the adapter made of the
-        response is the item's outcome, not this attempt's failure.
+        error is None on every member here: the request itself succeeded, and what the adapter made of
+        the response is the item's outcome, not this attempt's failure.
         An Unparsed's billing reaches the caller on its TransientError, so it gets no record.
         """
         self._ledger.record_ending_at(

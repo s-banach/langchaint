@@ -22,20 +22,26 @@ from langchaint.adapter import (
     AdapterResult,
     Binding,
     BoundAdapter,
+    ContextWindowExceeded,
+    EmptyTurn,
     InvalidRequest,
     MaxCompletionTokensExceeded,
     Refusal,
     ToolChoice,
+    UnfinishedTurn,
     Unparsed,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
+    ContextWindowExceededError,
+    EmptyTurnError,
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
     RefusalError,
     RetriesExhaustedError,
     TransientError,
+    UnfinishedTurnError,
     UnrecognizedError,
     _extract_transient_errors,
 )
@@ -171,6 +177,23 @@ def _bind_adapter(
     return adapter.bind_structured(binding, response_format)
 
 
+class NoTools:
+    """Type-level marker: a binding that bound no ToolManager, so no turn can be a tool call.
+
+    Never instantiated. It and HasTools are the two values of BoundLLM's second type parameter,
+    which is what lets the request methods type output as the instance itself rather than as
+    optional: a binding that cannot receive a tool call always produces the output it was bound for.
+    """
+
+
+class HasTools:
+    """Type-level marker: a binding that bound a ToolManager, so a turn may be a tool call.
+
+    Never instantiated; the counterpart of NoTools, whose docstring states what the pair is for.
+    A structured binding marked this way types its output optional, None being the tool-call turn.
+    """
+
+
 class LLM:
     """The un-bound client; holds what is shared across bindings."""
 
@@ -189,25 +212,49 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager | None = ...,
+        tool_manager: ToolManager,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[ModelT]": ...
+    ) -> "BoundLLM[ModelT, HasTools]": ...
+    @overload
+    def bind[ModelT: BaseModel](
+        self,
+        *,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_manager: None = ...,
+        response_format: type[ModelT],
+        inference_params: InferenceParams | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        automatic_prompt_caching: bool,
+    ) -> "BoundLLM[ModelT, NoTools]": ...
     @overload
     def bind(
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager | None = ...,
+        tool_manager: ToolManager,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[str]": ...
+    ) -> "BoundLLM[str, HasTools]": ...
+    @overload
+    def bind(
+        self,
+        *,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_manager: None = ...,
+        response_format: None = ...,
+        inference_params: InferenceParams | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        automatic_prompt_caching: bool,
+    ) -> "BoundLLM[str, NoTools]": ...
     def bind(
         self,
         *,
@@ -218,11 +265,15 @@ class LLM:
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[Any]":
+    ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
 
         response_format=Model gives BoundLLM[Model] whose output is the SDK-parsed instance;
         absent gives BoundLLM[str] whose output is the assistant text.
+        Passing a tool_manager gives the HasTools form, whose structured request methods type output
+        as optional because a tool-call turn parses no instance; see BoundLLM.
+        A caller holding a ToolManager | None gets the union of the two forms, whose request methods
+        return the optional type, which is what a caller who does not know can act on.
         automatic_prompt_caching has no default: caching changes billing,
         so langchaint never chooses a caching configuration for the caller.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
@@ -247,8 +298,16 @@ class LLM:
         )
 
 
-class BoundLLM[OutputT]:
+class BoundLLM[OutputT, ToolsT = NoTools]:
     """One frozen prefix plus the request methods; constructed by LLM.bind.
+
+    OutputT is what the binding asks the model for: str, or the response_format instance.
+    ToolsT is NoTools or HasTools, and says whether a tool_manager was bound. It is what the request
+    methods overload on: a structured HasTools binding types its output OutputT | None, None being
+    the tool-call turn, and every other combination types it OutputT. Keeping the None out of OutputT
+    is what lets rebind add and remove a tool_manager and get the output type right both ways.
+    The parameter defaults to NoTools, so BoundLLM[Model] annotates the common binding and a
+    tool-bound one names both, BoundLLM[Model, HasTools].
 
     tool_manager is kept for tool dispatch (the manual tool loop reads it);
     the provider only ever sees the converted schemas inside the binding.
@@ -258,7 +317,7 @@ class BoundLLM[OutputT]:
         self,
         *,
         adapter: Adapter,
-        bound_adapter: BoundAdapter[OutputT],
+        bound_adapter: BoundAdapter[OutputT | None],
         response_format: type[OutputT] | None,
         binding: Binding,
         tool_manager: ToolManager | None,
@@ -277,37 +336,109 @@ class BoundLLM[OutputT]:
         self,
         *,
         response_format: type[NewModelT],
+        tool_manager: ToolManager,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT]": ...
+    ) -> "BoundLLM[NewModelT, HasTools]": ...
+    @overload
+    def rebind[NewModelT: BaseModel](
+        self,
+        *,
+        response_format: type[NewModelT],
+        tool_manager: None,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[NewModelT, NoTools]": ...
+    @overload
+    def rebind[NewModelT: BaseModel](
+        self: "BoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: type[NewModelT],
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[NewModelT, ToolsT]": ...
     @overload
     def rebind(
         self,
         *,
         response_format: None,
+        tool_manager: ToolManager,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[str]": ...
+    ) -> "BoundLLM[str, HasTools]": ...
     @overload
     def rebind(
         self,
         *,
-        response_format: Unchanged = ...,
+        response_format: None,
+        tool_manager: None,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[OutputT]": ...
+    ) -> "BoundLLM[str, NoTools]": ...
+    @overload
+    def rebind(
+        self: "BoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: None,
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[str, ToolsT]": ...
+    @overload
+    def rebind(
+        self: "BoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: ToolManager,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[OutputT, HasTools]": ...
+    @overload
+    def rebind(
+        self: "BoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: None,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[OutputT, NoTools]": ...
+    @overload
+    def rebind(
+        self: "BoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "BoundLLM[OutputT, ToolsT]": ...
     def rebind(
         self,
         *,
@@ -318,11 +449,13 @@ class BoundLLM[OutputT]:
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
-    ) -> "BoundLLM[Any]":
+    ) -> "BoundLLM[Any, Any]":
         """Replace bound fields; a left-out field keeps its current value.
 
-        response_format is the one field whose change alters the static output type,
-        so it drives the overload return type.
+        response_format and tool_manager are the two fields whose change alters the static output
+        type, so they drive the overload return type: the first sets OutputT, the second sets ToolsT,
+        and leaving either out keeps what this binding has. Every combination is exact, including
+        dropping a tool_manager, which is what returns a structured binding to a non-optional output.
         Replace semantics: a passed inference_params replaces the bound one whole, never field-wise.
         Every rebind converts the binding to SDK keyword arguments again, a pure conversion with no I/O.
         Whether a rebind preserves the provider's prompt cache is provider-specific and partly undocumented
@@ -410,7 +543,7 @@ class BoundLLM[OutputT]:
 
     async def _generate_with_retries(
         self, conversation: Sequence[Message], *, ledger: _CallLedger
-    ) -> Response[OutputT]:
+    ) -> Response[OutputT | None]:
         """Run the retry loop every generate method shares.
 
         ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
@@ -427,7 +560,7 @@ class BoundLLM[OutputT]:
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,
         so a rate-limit error pauses admission account-wide before anyone else is admitted and a completed request
-        ends recovery. Every 200 counts as completed, including the three the adapter rejects:
+        ends recovery. Every 200 counts as completed, including one that produced no output:
         the provider served the request, which is what the recovery probe asks.
         Every attempt is timed onto an AttemptRecord whose bracket is the send only,
         excluding the slot wait and the backoff sleep,
@@ -442,6 +575,12 @@ class BoundLLM[OutputT]:
                 refused or a provider filter blocked the turn); terminal for this item, without a retry.
             MaxCompletionTokensExceededError: the adapter reported a MaxCompletionTokensExceeded attempt (the structured
                 response hit the token cap); terminal for this item, without a retry.
+            EmptyTurnError: the adapter reported an EmptyTurn attempt (the model finished and produced
+                nothing); terminal for this item, without a retry.
+            ContextWindowExceededError: the adapter reported a ContextWindowExceeded attempt;
+                terminal for this item, without a retry.
+            UnfinishedTurnError: the adapter reported an UnfinishedTurn attempt (a 200 langchaint
+                cannot continue); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
         """
         ledger.start_call()
@@ -483,6 +622,24 @@ class BoundLLM[OutputT]:
                                 error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
                             )
                             raise MaxCompletionTokensExceededError(call=ledger.freeze())
+                        case EmptyTurn():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise EmptyTurnError(call=ledger.freeze())
+                        case ContextWindowExceeded():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise ContextWindowExceededError(call=ledger.freeze())
+                        case UnfinishedTurn():
+                            self.rate_limiter.register_success(admission)
+                            ledger.record(
+                                error=None, usage=outcome.usage, usage_raw=outcome.usage_raw
+                            )
+                            raise UnfinishedTurnError(reason=outcome.reason, call=ledger.freeze())
                         case InvalidRequest():
                             raise InvalidRequestError(reason=outcome.reason, call=ledger.freeze())
                         case Unparsed():
@@ -502,19 +659,45 @@ class BoundLLM[OutputT]:
                 await asyncio.sleep(delay_seconds)
         raise RetriesExhaustedError(call=ledger.freeze())
 
+    @overload
+    async def generate_one(
+        self: "BoundLLM[str, ToolsT]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[str]: ...
+    @overload
+    async def generate_one(
+        self: "BoundLLM[OutputT, HasTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[OutputT | None]: ...
+    @overload
+    async def generate_one(
+        self: "BoundLLM[OutputT, NoTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[OutputT]: ...
     async def generate_one(
         self,
         conversation: str | Sequence[Message],
         *,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> Response[OutputT]:
+    ) -> Response[Any]:
         """Generate one response under the retry loop.
 
+        output is None only on a structured tool-bound binding, where the turn parsed no instance;
+        the overloads type it away everywhere else, a text turn's output being "" and not None.
+        Response.output states what a None means and what to branch on for a pending tool call.
         A bare str is shorthand for a conversation of one UserMessage holding that text.
-        Every non-success outcome propagates: RetriesExhaustedError on transient exhaustion,
-        RefusalError or MaxCompletionTokensExceededError on the structured path,
-        InvalidRequestError on a rejected request, and UnrecognizedError on an unrecognized error;
-        all of them share the GenerationError base a caller can catch at once.
+        Every non-success outcome propagates, all of them sharing the GenerationError base a caller
+        can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
+        rejected request, UnrecognizedError on an unrecognized error, and one of RefusalError,
+        MaxCompletionTokensExceededError, EmptyTurnError, ContextWindowExceededError, or
+        UnfinishedTurnError on a 200 that produced no output.
+        _generate_with_retries names the condition for each.
 
         abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's
         asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts this call off. The append is
@@ -526,6 +709,27 @@ class BoundLLM[OutputT]:
         Raises:
             asyncio.CancelledError: an outer scope cancelled this call; when abandoned_call_log is
                 given, the AbandonedCall is appended first.
+        """
+        return await self._generate_one_any_binding(
+            conversation, abandoned_call_log=abandoned_call_log
+        )
+
+    async def _generate_one_any_binding(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None,
+    ) -> Response[OutputT | None]:
+        """Run one call, appending its AbandonedCall if a cancellation cuts the call off.
+
+        What generate_one does, at the widest output type, callable from a frame whose binding is not
+        statically concrete: generate_one's overloads are keyed on the binding, so they match no
+        generic self. The batch path and the tracing wrapper reach the request through here.
+
+        Raises:
+            GenerationError: whatever _generate_with_retries failed the item with.
+            asyncio.CancelledError: an outer scope cancelled this call; the AbandonedCall is
+                appended first when abandoned_call_log is given.
         """
         ledger = self._new_ledger()
         try:
@@ -539,34 +743,62 @@ class BoundLLM[OutputT]:
         conversation: str | Sequence[Message],
         *,
         abandoned_call_log: AbandonedCallLog | None,
-    ) -> Response[OutputT] | GenerationError:
+    ) -> Response[OutputT | None] | GenerationError:
         """One batch item: the Response, or the GenerationError caught as the failure row.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces
         escapes into the gather and reaches a sibling.
-        A cancellation is the one outcome that is not a row, so it runs through generate_one,
-        whose CancelledError handler appends this item's AbandonedCall before re-raising.
+        A cancellation is the one outcome that is not a row, so it runs through
+        _generate_one_any_binding, whose CancelledError handler appends this item's AbandonedCall
+        before re-raising.
         """
         try:
-            return await self.generate_one(conversation, abandoned_call_log=abandoned_call_log)
+            return await self._generate_one_any_binding(
+                conversation, abandoned_call_log=abandoned_call_log
+            )
         except GenerationError as failure:
             return failure
 
+    @overload
+    async def generate_many(
+        self: "BoundLLM[str, ToolsT]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[str] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "BoundLLM[OutputT, HasTools]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[OutputT | None] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "BoundLLM[OutputT, NoTools]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> list[Response[OutputT] | GenerationError]:
+    ) -> list[Response[Any] | GenerationError]:
         """Order-aligned batch: result i belongs to conversations[i].
 
+        A Response's output is typed the way generate_one types it, per binding.
         Each conversation may be a bare str, shorthand for a conversation of one UserMessage holding that text.
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
         Every item ends in its own slot: a Response, or the GenerationError it failed with
-        (retries exhausted, a refusal, a truncation, a rejected request, an unrecognized error),
-        which to_row renders to a failure row so the batch stays table-ready.
+        (retries exhausted, a rejected request, an unrecognized error, or a 200 that produced no
+        output), which to_row renders to a failure row so the batch stays table-ready.
         No item's failure reaches a sibling, so the returned list is always complete.
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.
@@ -577,7 +809,7 @@ class BoundLLM[OutputT]:
         It costs one item of serial latency and warms unconditionally,
         whether or not the binding places any cache marker.
         A first item ending in a GenerationError still admits the rest:
-        a rejected 200 (a refusal, a truncation) wrote the prefix on the provider side,
+        a 200 that produced no output (a refusal, a truncation) wrote the prefix on the provider side,
         and after a transport failure the rest simply run against a cold cache; there is no second warmer.
         There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
 
@@ -595,6 +827,26 @@ class BoundLLM[OutputT]:
                 given, each started item's AbandonedCall is appended first.
             BaseException: an item raised something that is not a GenerationError, a defect in
                 langchaint itself; _gather cancels the remaining items and it propagates.
+        """
+        return await self._generate_many_any_binding(
+            conversations, warm_cache=warm_cache, abandoned_call_log=abandoned_call_log
+        )
+
+    async def _generate_many_any_binding(
+        self,
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool,
+        abandoned_call_log: AbandonedCallLog | None,
+    ) -> list[Response[OutputT | None] | GenerationError]:
+        """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
+
+        Raises:
+            TypeError: conversations is a bare str (from _reject_bare_str_batch).
+            asyncio.CancelledError: an outer scope cancelled the batch; when abandoned_call_log is
+                given, each started item's AbandonedCall is appended first.
+            BaseException: an item raised something that is not a GenerationError; _gather cancels
+                the remaining items and it propagates.
         """
         _reject_bare_str_batch(conversations)
         # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
@@ -617,7 +869,7 @@ class BoundLLM[OutputT]:
         conversations: Sequence[str | Sequence[Message]],
         *,
         abandoned_call_log: AbandonedCallLog | None,
-    ) -> list[Response[OutputT] | GenerationError]:
+    ) -> list[Response[OutputT | None] | GenerationError]:
         """Run the items concurrently and return the settled list, order-aligned.
 
         Nothing leaves this frame on the raising path, so every item's history reaches
@@ -655,18 +907,49 @@ class BoundLLM[OutputT]:
                     _append_abandoned_call(abandoned_call_log, task.result().call)
             raise
 
+    @overload
+    def stream_one(
+        self: "BoundLLM[str, ToolsT]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> StreamHandle[str]: ...
+    @overload
+    def stream_one(
+        self: "BoundLLM[OutputT, HasTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> StreamHandle[OutputT | None]: ...
+    @overload
+    def stream_one(
+        self: "BoundLLM[OutputT, NoTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> StreamHandle[OutputT]: ...
     def stream_one(
         self,
         conversation: str | Sequence[Message],
         *,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> StreamHandle[OutputT]:
+    ) -> StreamHandle[Any]:
         """Build the stream handle; entering it with `async with` opens the request.
 
+        The handle's final() Response types output the way generate_one types it, per binding.
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Sync because nothing suspends until the handle is entered;
         see StreamHandle for the retry, close, and abandoned_call_log contracts.
         """
+        return self._stream_one_any_binding(conversation, abandoned_call_log=abandoned_call_log)
+
+    def _stream_one_any_binding(
+        self,
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None,
+    ) -> StreamHandle[OutputT | None]:
+        """Build the handle at the widest output type; _generate_one_any_binding says why."""
         return StreamHandle(
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,

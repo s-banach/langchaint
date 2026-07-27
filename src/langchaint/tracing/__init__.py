@@ -108,6 +108,8 @@ from langchaint.llm import (
     LLM,
     UNCHANGED,
     BoundLLM,
+    HasTools,
+    NoTools,
     SequenceNotStr,
     Unchanged,
 )
@@ -278,9 +280,9 @@ _CONVENTION_FINISH_REASONS: Mapping[StopReason, str] = {
 }
 """The StopReason values with an exact counterpart in the convention's finish-reason vocabulary.
 
-refusal and other are absent deliberately and pass through unmapped:
+refusal, context_window_exceeded, and other are absent deliberately and pass through unmapped:
 the convention's content_filter means a provider filter blocked content, not a model declining,
-and no value corresponds to other.
+and no value corresponds to a context-window overflow or to other.
 The convention's enum is open (the output schema types the field as the enum or a string),
 so passing a value through keeps the emitted set honest rather than forcing a wrong member.
 """
@@ -875,25 +877,49 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager | None = ...,
+        tool_manager: ToolManager,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[ModelT]": ...
+    ) -> "TracedBoundLLM[ModelT, HasTools]": ...
+    @overload
+    def bind[ModelT: BaseModel](
+        self,
+        *,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_manager: None = ...,
+        response_format: type[ModelT],
+        inference_params: InferenceParams | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        automatic_prompt_caching: bool,
+    ) -> "TracedBoundLLM[ModelT, NoTools]": ...
     @overload
     def bind(
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager | None = ...,
+        tool_manager: ToolManager,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[str]": ...
+    ) -> "TracedBoundLLM[str, HasTools]": ...
+    @overload
+    def bind(
+        self,
+        *,
+        system_prompt: str | Sequence[TextPart] | None = ...,
+        tool_manager: None = ...,
+        response_format: None = ...,
+        inference_params: InferenceParams | None = ...,
+        tool_choice: ToolChoice = ...,
+        parallel_tool_calls: bool = ...,
+        automatic_prompt_caching: bool,
+    ) -> "TracedBoundLLM[str, NoTools]": ...
     def bind(
         self,
         *,
@@ -904,11 +930,11 @@ class TracedLLM:
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[Any]":
+    ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
-        The overloads re-declare LLM.bind's response_format split
-        so a bound structured model gives TracedBoundLLM[Model] and an absent one gives TracedBoundLLM[str].
+        The overloads re-declare LLM.bind's response_format and tool_manager splits, so each binding
+        gets the output type and the tool marker LLM.bind gives it.
         """
         return TracedBoundLLM(
             bound_llm=self._llm.bind(
@@ -924,7 +950,7 @@ class TracedLLM:
         )
 
 
-class TracedBoundLLM[OutputT]:
+class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     """Wraps a BoundLLM so every generate call opens a span.
 
     generate_one opens one CLIENT span (one outbound call);
@@ -937,7 +963,7 @@ class TracedBoundLLM[OutputT]:
     RateLimiter slot waits and backoff included), so the span's own duration already carries it.
     """
 
-    def __init__(self, *, bound_llm: BoundLLM[OutputT], span_config: _SpanConfig) -> None:
+    def __init__(self, *, bound_llm: BoundLLM[OutputT, ToolsT], span_config: _SpanConfig) -> None:
         """Store the wrapped BoundLLM and the span configuration; compute the span name once.
 
         span_config is TracedLLM's, unchanged; TracedLLM documents what each of its values means.
@@ -957,7 +983,7 @@ class TracedBoundLLM[OutputT]:
                 span, lambda: _input_content_attributes(self._bound_llm.binding, conversation)
             )
 
-    def _apply_output_content(self, span: Span, response: Response[OutputT]) -> None:
+    def _apply_output_content(self, span: Span, response: Response[OutputT | None]) -> None:
         """Set gen_ai.output.messages from a successful Response, when capture is on and the span is recording."""
         if self._span_config.capture_message_content:
             _apply_content_attributes(span, lambda: _output_content_attributes(response))
@@ -992,37 +1018,109 @@ class TracedBoundLLM[OutputT]:
         self,
         *,
         response_format: type[NewModelT],
+        tool_manager: ToolManager,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT]": ...
+    ) -> "TracedBoundLLM[NewModelT, HasTools]": ...
+    @overload
+    def rebind[NewModelT: BaseModel](
+        self,
+        *,
+        response_format: type[NewModelT],
+        tool_manager: None,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[NewModelT, NoTools]": ...
+    @overload
+    def rebind[NewModelT: BaseModel](
+        self: "TracedBoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: type[NewModelT],
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[NewModelT, ToolsT]": ...
     @overload
     def rebind(
         self,
         *,
         response_format: None,
+        tool_manager: ToolManager,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[str]": ...
+    ) -> "TracedBoundLLM[str, HasTools]": ...
     @overload
     def rebind(
         self,
         *,
-        response_format: Unchanged = ...,
+        response_format: None,
+        tool_manager: None,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_manager: ToolManager | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT]": ...
+    ) -> "TracedBoundLLM[str, NoTools]": ...
+    @overload
+    def rebind(
+        self: "TracedBoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: None,
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[str, ToolsT]": ...
+    @overload
+    def rebind(
+        self: "TracedBoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: ToolManager,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[OutputT, HasTools]": ...
+    @overload
+    def rebind(
+        self: "TracedBoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: None,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[OutputT, NoTools]": ...
+    @overload
+    def rebind(
+        self: "TracedBoundLLM[OutputT, ToolsT]",
+        *,
+        response_format: Unchanged = ...,
+        tool_manager: Unchanged = ...,
+        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
+        tool_choice: ToolChoice | Unchanged = ...,
+        parallel_tool_calls: bool | Unchanged = ...,
+        inference_params: InferenceParams | Unchanged = ...,
+        automatic_prompt_caching: bool | Unchanged = ...,
+    ) -> "TracedBoundLLM[OutputT, ToolsT]": ...
     def rebind(
         self,
         *,
@@ -1033,13 +1131,13 @@ class TracedBoundLLM[OutputT]:
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
-    ) -> "TracedBoundLLM[Any]":
+    ) -> "TracedBoundLLM[Any, Any]":
         """Mirror BoundLLM.rebind and re-wrap the plain BoundLLM in a TracedBoundLLM.
 
         rebind is mirrored so a rebound object stays traced;
         a traced object whose rebind returned an untraced one would silently drop tracing,
         the worst failure mode available here.
-        The three overloads re-declare BoundLLM.rebind's response_format split.
+        The overloads re-declare BoundLLM.rebind's response_format and tool_manager splits.
         """
         return TracedBoundLLM(
             bound_llm=self._bound_llm.rebind(
@@ -1054,13 +1152,36 @@ class TracedBoundLLM[OutputT]:
             span_config=self._span_config,
         )
 
+    @overload
+    async def generate_one(
+        self: "TracedBoundLLM[str, ToolsT]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[str]: ...
+    @overload
+    async def generate_one(
+        self: "TracedBoundLLM[OutputT, HasTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[OutputT | None]: ...
+    @overload
+    async def generate_one(
+        self: "TracedBoundLLM[OutputT, NoTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> Response[OutputT]: ...
     async def generate_one(
         self,
         conversation: str | Sequence[Message],
         *,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> Response[OutputT]:
+    ) -> Response[Any]:
         """Open a span around the whole generate_one call, delegate, attribute, and end the span.
+
+        The overloads mirror BoundLLM.generate_one's, so output is typed per binding.
 
         The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
         Under capture_message_content the input attributes are set at span start, so they are present on the
@@ -1082,7 +1203,9 @@ class TracedBoundLLM[OutputT]:
             _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, conversation)
             try:
-                response = await self._bound_llm.generate_one(
+                # The un-overloaded entry point, because this frame's binding is generic and
+                # generate_one's overloads are keyed on a concrete one. Same request, widest type.
+                response = await self._bound_llm._generate_one_any_binding(  # noqa: SLF001
                     conversation, abandoned_call_log=abandoned_call_log
                 )
             except GenerationError as exc:
@@ -1099,14 +1222,40 @@ class TracedBoundLLM[OutputT]:
         finally:
             _end_span(span)
 
+    @overload
+    async def generate_many(
+        self: "TracedBoundLLM[str, ToolsT]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[str] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "TracedBoundLLM[OutputT, HasTools]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[OutputT | None] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "TracedBoundLLM[OutputT, NoTools]",
+        conversations: SequenceNotStr[str | Sequence[Message]],
+        *,
+        warm_cache: bool = ...,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> list[Response[OutputT] | GenerationError]:
+    ) -> list[Response[Any] | GenerationError]:
         """Order-aligned batch under one INTERNAL span; per-item detail lives in the returned rows.
+
+        The overloads mirror BoundLLM.generate_many's, so each row's output is typed per binding.
 
         warm_cache and abandoned_call_log pass through to BoundLLM.generate_many, which documents
         them; the span brackets the warming first item and the rest alike.
@@ -1144,7 +1293,8 @@ class TracedBoundLLM[OutputT]:
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
             try:
-                results = await self._bound_llm.generate_many(
+                # The un-overloaded entry point; generate_one above says why.
+                results = await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
                     conversations, warm_cache=warm_cache, abandoned_call_log=abandoned_call_log
                 )
             except Exception as exc:
@@ -1156,13 +1306,36 @@ class TracedBoundLLM[OutputT]:
         finally:
             _end_span(span)
 
+    @overload
+    def stream_one(
+        self: "TracedBoundLLM[str, ToolsT]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> "TracedStreamHandle[str]": ...
+    @overload
+    def stream_one(
+        self: "TracedBoundLLM[OutputT, HasTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> "TracedStreamHandle[OutputT | None]": ...
+    @overload
+    def stream_one(
+        self: "TracedBoundLLM[OutputT, NoTools]",
+        conversation: str | Sequence[Message],
+        *,
+        abandoned_call_log: AbandonedCallLog | None = ...,
+    ) -> "TracedStreamHandle[OutputT]": ...
     def stream_one(
         self,
         conversation: str | Sequence[Message],
         *,
         abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> "TracedStreamHandle[OutputT]":
+    ) -> "TracedStreamHandle[Any]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
+
+        The overloads mirror BoundLLM.stream_one's, so output is typed per binding.
 
         The span opens when the handle is entered, matching StreamHandle's own contract that
         the request opens there.
@@ -1174,7 +1347,8 @@ class TracedBoundLLM[OutputT]:
         The cost is that the handle holds the conversation for the stream's whole life.
         """
         return TracedStreamHandle(
-            stream_handle=self._bound_llm.stream_one(
+            # The un-overloaded entry point; generate_one says why.
+            stream_handle=self._bound_llm._stream_one_any_binding(  # noqa: SLF001
                 conversation, abandoned_call_log=abandoned_call_log
             ),
             span_config=self._span_config,

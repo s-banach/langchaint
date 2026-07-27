@@ -18,6 +18,7 @@ from langchaint import (
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchUnknownTool,
+    HasTools,
     Message,
     PydanticTool,
     ToolCall,
@@ -55,7 +56,7 @@ weather_tool = PydanticTool(
 
 
 async def run_agent(
-    bound: BoundLLM[str],
+    bound: BoundLLM[str, HasTools],
     tool_manager: ToolManager,
     prompt: str,
     approve: Callable[[ToolCall], bool] | None = None,

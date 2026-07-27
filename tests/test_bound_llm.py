@@ -19,10 +19,14 @@ from langchaint import (
     AbandonedCall,
     AssistantMessage,
     BoundLLM,
+    ContextWindowExceededError,
+    EmptyTurnError,
     GenerationError,
+    HasTools,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
     Message,
+    NoTools,
     RateLimiter,
     RefusalError,
     Response,
@@ -31,7 +35,9 @@ from langchaint import (
     StreamProtocolError,
     TextPart,
     ToolCall,
+    ToolManager,
     TransientError,
+    UnfinishedTurnError,
     UnrecognizedError,
     Usage,
     UserMessage,
@@ -44,14 +50,19 @@ from langchaint.adapter import (
     AttemptOutcome,
     Binding,
     BoundAdapter,
+    ContextWindowExceeded,
+    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutputOutcome,
     Refusal,
     ResponseOutcome,
+    UnfinishedTurn,
     Unparsed,
 )
 from langchaint.llm import UNCHANGED
+from langchaint.streaming import StreamHandle
 from tests.helpers import uniform_returns_ceiling
 
 _USAGE = Usage(
@@ -66,7 +77,7 @@ _USAGE = Usage(
     output_tokens_cost_in_usd=0.0,
 )
 _USAGE_BILLED = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.25})
-"""The billing a rejected 200 (a refusal or truncation) carries."""
+"""The billing a 200 that produced no output (a refusal or truncation) carries."""
 _USAGE_STREAM = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.001})
 """The stream final()'s assembled usage, distinct so a stream cost is visible."""
 
@@ -155,7 +166,7 @@ class _RefusingStream(_FakeStream):
     """A stream that yields items normally but whose final() detects a structured refusal.
 
     Mirrors an adapter that parses the assembled message in AdapterStream.final() and finds a refusal,
-    reporting the Refusal arm carrying only the rejected 200's billing.
+    reporting the Refusal member carrying only that 200's billing.
     """
 
     @override
@@ -164,11 +175,28 @@ class _RefusingStream(_FakeStream):
         return Refusal(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)
 
 
+class _UnfinishedTurnStream(_FakeStream):
+    """A stream that yields items normally but whose assembled message is not a finished turn.
+
+    Mirrors an adapter that reads a stop reason it cannot call finished, reporting UnfinishedTurn
+    with the reason naming the provider's own word.
+    """
+
+    @override
+    async def final(self) -> ResponseOutcome[str]:
+        """Report the unfinished turn instead of assembling a result, carrying this attempt's billing."""
+        return UnfinishedTurn(
+            reason="anthropic returned stop_reason 'pause_turn'",
+            usage=_USAGE_BILLED,
+            usage_raw=_FAKE_RAW_USAGE,
+        )
+
+
 class _UnparsedStream(_FakeStream):
     """A stream that yields items normally but whose final() parses no instance.
 
     Mirrors an adapter that parses the assembled message in AdapterStream.final() and gets nothing,
-    for a reason the stop reason does not name, reporting the Unparsed arm with the 200's billing.
+    for a reason the stop reason does not name, reporting Unparsed with the 200's billing.
     """
 
     @override
@@ -307,15 +335,15 @@ class _FailingCloseStream(_FakeStream):
         raise OSError("connection reset while closing")
 
 
-type _ScriptedSend = Exception | Refusal | MaxCompletionTokensExceeded | Unparsed | InvalidRequest
-"""One scripted send outcome: an exception the fake raises, or an arm it returns.
+type _ScriptedSend = Exception | NoOutputOutcome | InvalidRequest
+"""One scripted send outcome: an exception the fake raises, or an outcome it returns.
 
 Both halves exist because the adapter contract splits that way: an attempt with no response to read
-is an exception for Adapter.classify, and everything the adapter did read is a returned arm.
+is an exception for Adapter.classify, and everything the adapter did read is a returned outcome.
 """
 
 type _ScriptedOpen = Exception | InvalidRequest
-"""One scripted open_stream outcome; open_stream returns no response-shaped arm."""
+"""One scripted open_stream outcome; open_stream returns no response-shaped outcome."""
 
 
 class _FakeBoundAdapter(BoundAdapter[str]):
@@ -695,8 +723,83 @@ def test_max_completion_tokens_exceeded_outcome_from_send_raises_row_shaped_with
     asyncio.run(scenario())
 
 
+def test_empty_turn_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """An EmptyTurn outcome becomes an EmptyTurnError, never retried: the model finished and said nothing."""
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send reports EmptyTurn."""
+        adapter = _FakeAdapter(
+            failures=[EmptyTurn(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(EmptyTurnError) as empty_turn:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = empty_turn.value
+        assert failure.attempts == 1
+        assert failure.stop_reason == "end_turn"
+        assert failure.usage.cost_in_usd == 0.25
+
+    asyncio.run(scenario())
+
+
+def test_context_window_exceeded_outcome_from_send_raises_row_shaped_without_retry() -> None:
+    """A ContextWindowExceeded outcome fails the item: a request too long to serve stays too long."""
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send reports ContextWindowExceeded."""
+        adapter = _FakeAdapter(
+            failures=[ContextWindowExceeded(usage=_USAGE_BILLED, usage_raw=_FAKE_RAW_USAGE)]
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(ContextWindowExceededError) as context_window_exceeded:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = context_window_exceeded.value
+        assert failure.attempts == 1
+        assert failure.stop_reason == "context_window_exceeded"
+        assert failure.usage.cost_in_usd == 0.25
+
+    asyncio.run(scenario())
+
+
+def test_unfinished_turn_outcome_from_send_raises_carrying_the_adapter_s_reason() -> None:
+    """An UnfinishedTurn outcome fails the item, and the adapter's reason reaches error_text.
+
+    The reason is the only description of a 200 langchaint does not model, so the error must carry
+    it rather than a constant of its own.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose send reports UnfinishedTurn."""
+        adapter = _FakeAdapter(
+            failures=[
+                UnfinishedTurn(
+                    reason="anthropic returned stop_reason 'pause_turn'",
+                    usage=_USAGE_BILLED,
+                    usage_raw=_FAKE_RAW_USAGE,
+                )
+            ]
+        )
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(UnfinishedTurnError) as unfinished_turn:
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].send_count == 1
+        failure = unfinished_turn.value
+        assert "pause_turn" in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
+
+    asyncio.run(scenario())
+
+
 def test_unparsed_outcome_from_send_is_retried_and_keeps_its_billing() -> None:
-    """An Unparsed outcome is retried, and the rejected 200's billing lands on its attempt record."""
+    """An Unparsed outcome is retried, and that 200's billing lands on its attempt record."""
 
     async def scenario() -> None:
         """Drive one generate_one whose first send reports Unparsed and whose second succeeds."""
@@ -1008,6 +1111,59 @@ def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_str
     assert_type(rebound, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 2
     assert rebound._bound_adapter is not structured._bound_adapter
+
+
+def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> None:
+    """Pin every binding's static output type, the thing a caller writes `if output is None` against.
+
+    output is optional on one binding only: structured plus a ToolManager, whose turn may be the tool
+    calls. A text binding never types it optional, a tool-call turn's text being "" and not None.
+    Every transition is exact, so dropping the ToolManager drops the None with it.
+    """
+    llm = LLM(_FakeAdapter())
+    tool_manager = ToolManager([])
+
+    text = llm.bind(automatic_prompt_caching=True)
+    assert_type(text, BoundLLM[str, NoTools])
+    text_with_tools = llm.bind(tool_manager=tool_manager, automatic_prompt_caching=True)
+    assert_type(text_with_tools, BoundLLM[str, HasTools])
+    structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
+    assert_type(structured, BoundLLM[_Answer, NoTools])
+    structured_with_tools = llm.bind(
+        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+    )
+    assert_type(structured_with_tools, BoundLLM[_Answer, HasTools])
+
+    # BoundLLM[X] is BoundLLM[X, NoTools]: the PEP 696 default keeps the common annotation short.
+    assert_type(structured, BoundLLM[_Answer])
+
+    assert_type(structured.rebind(tool_manager=tool_manager), BoundLLM[_Answer, HasTools])
+    assert_type(structured_with_tools.rebind(tool_manager=None), BoundLLM[_Answer, NoTools])
+    assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, HasTools])
+    assert_type(structured_with_tools.rebind(response_format=None), BoundLLM[str, HasTools])
+    assert_type(structured_with_tools.rebind(system_prompt="s"), BoundLLM[_Answer, HasTools])
+
+
+async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) -> None:
+    """Pin the return types the ToolsT overloads produce, which is what the parameter is for.
+
+    Never called: pyrefly checks this body, and the assertions are about types alone. Running it
+    would need a structured fake that sends, which _FakeStructuredBoundAdapter deliberately is not.
+    """
+    structured_with_tools = llm.bind(
+        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+    )
+    assert_type(await structured_with_tools.generate_one("hi"), Response[_Answer | None])
+    assert_type(structured_with_tools.stream_one("hi"), StreamHandle[_Answer | None])
+    assert_type(
+        await structured_with_tools.generate_many(["hi"]),
+        list[Response[_Answer | None] | GenerationError],
+    )
+    structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
+    assert_type(await structured.generate_one("hi"), Response[_Answer])
+    text_with_tools = llm.bind(tool_manager=tool_manager, automatic_prompt_caching=True)
+    assert_type(await text_with_tools.generate_one("hi"), Response[str])
+    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
 
 
 def test_response_format_is_a_public_field_bind_and_rebind_carry_it() -> None:
@@ -1359,14 +1515,15 @@ def test_generate_many_rejects_a_bare_str_batch() -> None:
     async def scenario() -> None:
         """Pass a bare str where generate_many expects the batch.
 
-        The suppressed pyrefly error is SequenceNotStr statically rejecting the bare str;
-        the suppression doubles as a canary, since pyrefly reports it as unused
-        if typeshed drift ever makes str satisfy SequenceNotStr and the static rejection lapses.
+        The suppressed pyrefly error is SequenceNotStr statically rejecting the bare str, which
+        leaves generate_many's overloads with nothing to match; the suppression doubles as a canary,
+        since pyrefly reports it as unused if typeshed drift ever makes str satisfy SequenceNotStr
+        and the static rejection lapses.
         """
         adapter = _FakeAdapter(echo=True)
         bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
         with pytest.raises(TypeError, match="bare str"):
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore[no-matching-overload]
             await bound_llm.generate_many("hi")
         assert adapter.bound_adapters[0].send_count == 0
 
@@ -1980,7 +2137,7 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     """A structured refusal detected in the stream's final() surfaces as a row-shaped RefusalError.
 
     The stream already yielded items to the caller, so the error is not retried;
-    final() records the one rejected 200 and raises the RefusalError carrying that record.
+    final() records the one 200 that produced no output and raises the RefusalError carrying that record.
     """
 
     async def scenario() -> None:
@@ -2004,10 +2161,36 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     asyncio.run(scenario())
 
 
+def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> None:
+    """An UnfinishedTurn from the stream's final() fails the call, carrying the adapter's reason.
+
+    The stream loop builds this error separately from the generate loop, and it is the one member
+    with a field of its own, so the reason must survive the trip through both.
+    """
+
+    async def scenario() -> None:
+        """Drain a stream whose final() reports UnfinishedTurn, then read the raised error."""
+        adapter = _FakeAdapter(stream=_UnfinishedTurnStream())
+        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+            automatic_prompt_caching=True
+        )
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(UnfinishedTurnError) as unfinished_turn:
+                await handle.final()
+        failure = unfinished_turn.value
+        assert failure.attempts == 1
+        assert "pause_turn" in failure.error_text
+        assert failure.usage.cost_in_usd == 0.25
+        (record,) = failure.attempt_records
+        assert record.error is None
+
+    asyncio.run(scenario())
+
+
 def test_stream_final_unparsed_raises_transient_carrying_its_billing() -> None:
     """An Unparsed outcome from the stream's final() propagates as a TransientError with the billing.
 
-    The stream already yielded items to the caller, so it is not reopened; the rejected 200's usage
+    The stream already yielded items to the caller, so it is not reopened; that 200's usage
     reaches the caller on the error itself rather than on an attempt record.
     """
 
@@ -2029,7 +2212,7 @@ def test_stream_final_unparsed_raises_transient_carrying_its_billing() -> None:
 def test_stream_cancelled_after_absorbing_unparsed_appends_no_abandoned_call() -> None:
     """A cancellation after final() raised its TransientError appends nothing.
 
-    The error carried the rejected 200's usage to the caller, so an AbandonedCall here would
+    The error carried that 200's usage to the caller, so an AbandonedCall here would
     double-count that spend and mislabel a concluded call as an in-flight abandonment.
     """
 

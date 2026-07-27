@@ -24,6 +24,7 @@ from langchaint import (
     CaptureTool,
     DispatchCaptured,
     DispatchHandled,
+    HasTools,
     Message,
     PydanticTool,
     Response,
@@ -111,7 +112,7 @@ class RunResult[FinalT: BaseModel]:
 
 
 async def run_agent[FinalT: BaseModel](
-    bound: BoundLLM[str],
+    bound: BoundLLM[str, HasTools],
     tool_manager: ToolManager,
     final_response_tool: CaptureTool[FinalT],
     prompt: str,
@@ -168,7 +169,7 @@ async def run_agent[FinalT: BaseModel](
             conversation.append(tool_message)
         return final_response
 
-    async def take_turn(turn_bound: BoundLLM[str], *, forcing: bool) -> FinalT | None:
+    async def take_turn(turn_bound: BoundLLM[str, HasTools], *, forcing: bool) -> FinalT | None:
         """GenerationError propagates from generate_one."""
         response = await turn_bound.generate_one(conversation)
         responses.append(response)

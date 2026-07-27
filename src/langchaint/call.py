@@ -40,11 +40,11 @@ class AttemptRecord:
     so a slow request is distinguishable from time spent rate limited;
     the gap between consecutive records is that wait.
     On a stream the succeeding record spans opening the stream to its exhaustion, because that is the whole request.
-    error is None on the attempt that succeeded, on a completed 200 rejected downstream
-    (a refusal or a truncation, which are not transient), and on a request the provider rejected;
-    it holds the TransientError otherwise.
+    error is None on the attempt that succeeded, on a 200 that produced no output and is not
+    retried (a refusal, a truncation, a context-window overflow), and on a request the provider
+    rejected; it holds the TransientError otherwise.
     usage is the attempt's billing (with cost_in_usd inside): the reported counts when the attempt reached a
-    billable 200 (a success, or a rejected 200), ZERO_USAGE for a transport failure or a rejected request.
+    billable 200, whether or not it produced output, ZERO_USAGE for a transport failure or a rejected request.
     A stream that dropped after delivering items was paid for what it delivered,
     and no client-side channel reports the amount.
     usage_raw is the raw SDK usage object usage was normalized from.

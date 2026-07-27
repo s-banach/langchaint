@@ -195,7 +195,11 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
     was retried).
     Usage counters and per-category costs are hoisted to top-level keys named exactly like the Usage
     fields, with cost_in_usd their sum; model output is flattened to its JSON.
+    assistant_message_json is the generated turn on either kind of result, None where no attempt
+    produced one, so a failure row shows what the provider generated the same way a success row does.
+    It is not the output cell: output means the parsed result, which a failure has none of.
     """
+    assistant_message = result.assistant_message
     if isinstance(result, GenerationError):
         output_cell: str | None = None
         error_text: str | None = result.error_text
@@ -214,6 +218,9 @@ def to_row[OutputT](result: Response[OutputT] | GenerationError) -> dict[str, Ro
         usage = result.usage
     return {
         "output": output_cell,
+        "assistant_message_json": (
+            None if assistant_message is None else assistant_message.model_dump_json()
+        ),
         "error_text": error_text,
         "stop_reason": stop_reason,
         "model": result.model,

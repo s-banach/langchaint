@@ -114,6 +114,7 @@ from langchaint.llm import (
     Unchanged,
 )
 from langchaint.messages import (
+    AssistantMessage,
     Message,
     Part,
     ReasoningTrace,
@@ -285,6 +286,15 @@ the convention's content_filter means a provider filter blocked content, not a m
 and no value corresponds to a context-window overflow or to other.
 The convention's enum is open (the output schema types the field as the enum or a string),
 so passing a value through keeps the emitted set honest rather than forcing a wrong member.
+"""
+
+
+_NO_COMPLETED_TURN_FINISH_REASON = "error"
+"""What gen_ai.output.messages reports for a turn whose result states no stop reason.
+
+The convention's enum member for a generation that failed, which is what a turn on a failure the
+provider never finished is. gen_ai.response.finish_reasons omits itself instead, being an optional
+top-level attribute; the per-message field is required, so a turn recorded from a failure needs a value.
 """
 
 
@@ -677,22 +687,49 @@ def _input_content_attributes(
 
 
 def _output_content_attributes(
-    response: Response[object],
+    assistant_message: AssistantMessage, stop_reason: StopReason | None
 ) -> dict[str, str | bool | int | float | Sequence[str]]:
-    """Build gen_ai.output.messages from a successful Response.
+    """Build gen_ai.output.messages from one assistant turn.
 
-    Only Response carries an assistant turn, so a failed call records the input attributes and no output key;
-    there is no assistant turn to record.
+    One function for the success and the failure paths, so one turn renders the same whichever reported it.
+    One key holding one message, because several assistant messages under a key the convention uses
+    for one turn would render as a multi-message answer.
+    A result with no stop_reason (no completed turn) reports finish_reason "error", a member of the
+    convention's own enum, because the schema requires the field on every element.
     """
     return {
         "gen_ai.output.messages": json.dumps([
             {
                 "role": "assistant",
-                "parts": _turn_parts(response.assistant_message.turn),
-                "finish_reason": _finish_reason(response.stop_reason),
+                "parts": _turn_parts(assistant_message.turn),
+                "finish_reason": (
+                    _NO_COMPLETED_TURN_FINISH_REASON
+                    if stop_reason is None
+                    else _finish_reason(stop_reason)
+                ),
             }
         ])
     }
+
+
+def _apply_output_content(
+    span: Span, result: Response[object] | GenerationError, span_config: _SpanConfig
+) -> None:
+    """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
+
+    A GenerationError reports the turn of the last attempt that produced one, so a failure the provider
+    generated content for carries it; the key is omitted entirely when no attempt produced a turn.
+    Per-attempt detail stays on the langchaint.attempt_failed events, which carry no content.
+    """
+    if not span_config.capture_message_content:
+        return
+    assistant_message = result.assistant_message
+    if assistant_message is None:
+        return
+    stop_reason = result.stop_reason
+    _apply_content_attributes(
+        span, lambda: _output_content_attributes(assistant_message, stop_reason)
+    )
 
 
 def _record_attempt_failed_events(span: Span, result: Response[object] | GenerationError) -> None:
@@ -817,16 +854,17 @@ def _record_other_exception(span: Span, exc: Exception) -> None:
         span.set_status(Status(StatusCode.ERROR, str(exc)))
 
 
-def _record_stream_conclusion(span: Span, exc: Exception, mapper: AttributeMapper) -> None:
+def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConfig) -> None:
     """Record the exception that concluded a stream, attributing the span by what it is.
 
-    A GenerationError is that call's result, so the span takes the same result attributes and
-    status a Response would give it; anything else is an exception the span only records.
+    A GenerationError is that call's result, so the span takes the same result attributes, content,
+    and status a Response would give it; anything else is an exception the span only records.
     One recorder for every method that can conclude a stream, so the same class produces the same
     span whether the failure surfaced from the open, an item pull, or final().
     """
     if isinstance(exc, GenerationError):
-        _apply_result_attributes(span, exc, mapper)
+        _apply_result_attributes(span, exc, span_config.attribute_mapper)
+        _apply_output_content(span, exc, span_config)
         _set_generation_error_status(span, exc)
         return
     _record_other_exception(span, exc)
@@ -998,11 +1036,6 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
             _apply_content_attributes(
                 span, lambda: _input_content_attributes(self._bound_llm.binding, conversation)
             )
-
-    def _apply_output_content(self, span: Span, response: Response[OutputT | None]) -> None:
-        """Set gen_ai.output.messages from a successful Response, when capture is on and the span is recording."""
-        if self._span_config.capture_message_content:
-            _apply_content_attributes(span, lambda: _output_content_attributes(response))
 
     @property
     def adapter(self) -> Adapter:
@@ -1201,8 +1234,8 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
         The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
         Under capture_message_content the input attributes are set at span start, so they are present on the
-        failing paths too; gen_ai.output.messages is set only on success, GenerationError carrying no
-        assistant turn to record.
+        failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
+        a GenerationError's last recorded one included.
         abandoned_call_log passes through to the delegated generate_one, which documents it;
         the CancelledError it re-raises propagates here and the span ends with no status set.
 
@@ -1226,13 +1259,14 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
                 )
             except GenerationError as exc:
                 _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
+                _apply_output_content(span, exc, self._span_config)
                 _set_generation_error_status(span, exc)
                 raise
             except Exception as exc:
                 _record_other_exception(span, exc)
                 raise
             _apply_result_attributes(span, response, self._span_config.attribute_mapper)
-            self._apply_output_content(span, response)
+            _apply_output_content(span, response, self._span_config)
             _set_ok_status(span)
             return response
         finally:
@@ -1385,7 +1419,8 @@ class TracedStreamHandle[OutputT]:
     takes error status when the stream raises or its consuming block leaves with an exception,
     and ends exactly once.
     Under capture_message_content the input content attributes are set when the span starts,
-    and gen_ai.output.messages when final() returns a Response.
+    and gen_ai.output.messages when the call concludes carrying a turn, whether final() returned
+    a Response or any of the three methods raised a GenerationError.
     """
 
     def __init__(
@@ -1486,7 +1521,7 @@ class TracedStreamHandle[OutputT]:
         except StopAsyncIteration:
             raise
         except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
+            _record_stream_conclusion(span, exc, self._span_config)
             self._end_span_once()
             raise
         except BaseException:
@@ -1513,7 +1548,7 @@ class TracedStreamHandle[OutputT]:
         try:
             await self._stream_handle.__aenter__()
         except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
+            _record_stream_conclusion(span, exc, self._span_config)
             self._end_span_once()
             raise
         except BaseException:
@@ -1562,15 +1597,14 @@ class TracedStreamHandle[OutputT]:
         try:
             response = await self._stream_handle.final()
         except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config.attribute_mapper)
+            _record_stream_conclusion(span, exc, self._span_config)
             self._end_span_once()
             raise
         except BaseException:
             self._end_span_once()
             raise
         _apply_result_attributes(span, response, self._span_config.attribute_mapper)
-        if self._span_config.capture_message_content:
-            _apply_content_attributes(span, lambda: _output_content_attributes(response))
+        _apply_output_content(span, response, self._span_config)
         _set_ok_status(span)
         self._end_span_once()
         return response

@@ -58,6 +58,7 @@ from langchaint import (
     ToolMessage,
     ToolOutputExplicit,
     TransientError,
+    UnfinishedTurnError,
     UserMessage,
     to_row,
 )
@@ -69,6 +70,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     Refusal,
     ResponseOutcome,
+    UnfinishedTurn,
 )
 from langchaint.tracing import (
     AttributeMapper,
@@ -2310,8 +2312,8 @@ def test_system_prompt_parts_become_one_instruction_element_each() -> None:
     asyncio.run(scenario())
 
 
-def test_the_error_path_captures_input_and_no_output() -> None:
-    """A failed call keeps the input attributes set at span start and emits no output messages."""
+def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> None:
+    """A failed call keeps the input attributes set at span start and emits the turn it recorded."""
 
     async def scenario() -> None:
         """Drive a refusal under capture and inspect the error span."""
@@ -2330,8 +2332,32 @@ def test_the_error_path_captures_input_and_no_output() -> None:
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
         assert "gen_ai.system_instructions" in span.attributes
-        assert "gen_ai.output.messages" not in span.attributes
         assert span.attributes["error.type"] == "RefusalError"
+        (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
+        assert message["role"] == "assistant"
+        assert message["finish_reason"] == "refusal"
+
+    asyncio.run(scenario())
+
+
+def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
+    """The output key is omitted when no attempt reached a 200, there being no turn to record."""
+
+    async def scenario() -> None:
+        """Exhaust the retry budget on transport failures and inspect the error span."""
+        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            tracer=tracer,
+            capture_message_content=True,
+        )
+        with pytest.raises(RetriesExhaustedError):
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert "gen_ai.input.messages" in span.attributes
+        assert "gen_ai.output.messages" not in span.attributes
 
     asyncio.run(scenario())
 
@@ -2707,5 +2733,95 @@ def test_tool_span_captures_the_result_on_both_arms_where_no_tool_ran() -> None:
                 "id": call.id,
                 "response": [{"type": "text", "content": expected.tool_message.content}],
             }
+
+    asyncio.run(scenario())
+
+
+_CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"
+"""The generated text the content-rule test traces through every reporting channel."""
+
+
+@pytest.mark.parametrize("capture_message_content", [False, True])
+def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
+    *, capture_message_content: bool
+) -> None:
+    """A rejected 200's turn reaches the span as gen_ai.output.messages under capture, and nowhere else.
+
+    The failure spends two attempts, so the per-attempt event loop runs over a record holding the turn;
+    a single-attempt case would leave the most exposed site unexercised.
+    The False run pins that no unconditional site leaks the turn, the True run that the one gated
+    emission is the only route it takes.
+    error_text and __str__ carry the reason only under either value, because the tracing layer writes
+    both into spans whatever the caller configured; the turn reaches the caller off the error and
+    off its row instead.
+    """
+    turn = AssistantMessage(turn=(TextPart(text=_CONTENT_SENTINEL),))
+
+    async def scenario() -> None:
+        """Fail one attempt transiently, reject the next 200, and inspect every channel."""
+        adapter = _FakeAdapter(
+            failures=[
+                TransientError("the first attempt failed"),
+                _billed(Refusal(assistant_message=turn)),
+            ]
+        )
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=3)),
+            tracer=tracer,
+            capture_message_content=capture_message_content,
+        )
+        with pytest.raises(RefusalError) as raised:
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+
+        error = raised.value
+        assert error.attempts == 2
+        assert _CONTENT_SENTINEL not in error.error_text
+        assert _CONTENT_SENTINEL not in str(error)
+        assert error.assistant_message == turn
+        assert _CONTENT_SENTINEL in str(to_row(error)["assistant_message_json"])
+
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        carrying = {
+            key for key, value in span.attributes.items() if _CONTENT_SENTINEL in str(value)
+        }
+        assert carrying == ({"gen_ai.output.messages"} if capture_message_content else set())
+        for event in span.events:
+            assert event.attributes is not None
+            assert not any(_CONTENT_SENTINEL in str(value) for value in event.attributes.values())
+        assert _CONTENT_SENTINEL not in str(span.status.description)
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reason() -> None:
+    """finish_reason is required on every output message, so a failure with no stop reason says "error".
+
+    An UnfinishedTurn carries the turn the 200 held and its error fixes no stop_reason, which is the
+    one combination that reaches the fallback. The tracer validates the payload against the vendored
+    schema on span end, so an omitted or off-enum value fails here.
+    """
+
+    async def scenario() -> None:
+        """Drive an unfinished turn under capture and read the finish reason back off the span."""
+        adapter = _FakeAdapter(
+            failures=[
+                _billed(UnfinishedTurn(assistant_message=_REJECTED_TURN, reason="in_progress"))
+            ]
+        )
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            tracer=tracer,
+            capture_message_content=True,
+        )
+        with pytest.raises(UnfinishedTurnError) as raised:
+            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        assert raised.value.stop_reason is None
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
+        assert message["finish_reason"] == "error"
 
     asyncio.run(scenario())

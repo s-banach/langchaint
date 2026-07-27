@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Literal, Self, override
 from pydantic import ValidationError
 
 from langchaint.call import AttemptRecord, CallRecord, _CallCarrier
-from langchaint.messages import StopReason
+from langchaint.messages import AssistantMessage, StopReason
 from langchaint.usage import Usage
 
 if TYPE_CHECKING:
@@ -156,6 +156,22 @@ class GenerationError(_CallCarrier, Exception):
     def __str__(self) -> str:
         """Render the reason, computed on demand so it never depends on when the fields were set."""
         return self._summary()
+
+    @property
+    def assistant_message(self) -> AssistantMessage | None:
+        """The turn of the last attempt that produced one, None where no attempt did.
+
+        Every attempt that reached a billable 200 records the turn it carried, so a failure the
+        provider generated content for reaches that content here, and a call whose attempts all
+        failed before a 200 has none.
+        It is the field a success Response carries under the same name, so to_row and the tracing
+        layer read one name off either.
+        Content, so it stays off error_text and __str__.
+        """
+        for record in reversed(self.attempt_records):
+            if record.assistant_message is not None:
+                return record.assistant_message
+        return None
 
     @property
     def attempts(self) -> int:

@@ -17,6 +17,8 @@ openai accepts all seven, anthropic "low" through "max").
 Each adapter passes the value through as given (anthropic as output_config.effort with adaptive thinking,
 openai as reasoning_effort); a value or model the provider rejects surfaces as the provider's own error,
 per the provider-side-rules design rule, because the valid model-times-value combinations are too many to mirror.
+To send a tier this Literal lacks, suppress the type error on the InferenceParams(...) call:
+no runtime validation reads the value, so it reaches the wire as given.
 """
 
 

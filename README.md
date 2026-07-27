@@ -99,6 +99,7 @@ Deliberate absences, each with its reason recorded in `CLAUDE.md` or a module do
 - No provider-parameter passthrough dict: an unmapped provider parameter is reached by subclassing the concrete adapter.
 - No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, and invalid inputs are sent so the provider's own error surfaces.
 - No delta, usage, or stop items in a stream: a stream yields `str | ToolCall`, and `usage` and `stop_reason` live on `final()`'s `Response`.
+- No document or PDF part: convert before sending, rasterizing pages to `ImagePart` or extracting the text layer to `TextPart`.
 
 A Chat Completions adapter, and with it third-party compatible servers such as vLLM and Ollama, is not built yet; OpenAI support is the Responses API.
 

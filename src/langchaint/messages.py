@@ -46,6 +46,12 @@ class ImagePart(CheckedCopyModel):
 
 
 type Part = TextPart | ImagePart
+"""One element of a message body.
+
+Send a document by converting it first: rasterize its pages to ImagePart, or extract its text layer to TextPart.
+The application owns that conversion,
+so it picks the resolution, which pages to send, and the text extractor, and can measure what each choice costs.
+"""
 
 type MessageContent = str | Sequence[Part]
 """A model-facing message body (text and images the model reads).

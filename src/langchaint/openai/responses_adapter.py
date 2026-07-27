@@ -536,23 +536,24 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
     """Join a reasoning item's readable text, None when it holds none.
 
-    The text arrives as summary parts, several per item: the SDK types summary as a list, and the
-    stream carries one summary_index per part, each accumulating its own text deltas, so a part is a
-    separately delimited unit and the parts join on a blank line rather than concatenating into one run.
+    The text arrives in parts, several per item: the SDK types summary and content as lists, and the
+    stream carries one summary_index or content_index per part, each accumulating its own text
+    deltas, so a part is a separately delimited unit and the parts join on a blank line rather than
+    concatenating into one run.
     Asking for a summary is what the constructor's reasoning_summary does.
 
-    summary wins over content where both hold text, because summary is the list the request asks for.
-    content is read at all because the SDK models it as a list of reasoning_text elements and ships
-    delta and done events for it; which of the two a given model fills is request-time behavior SDK
-    introspection cannot show, so the adapter reads both.
-    Reading only summary would drop returned text into an unreportable None.
+    content wins over summary where both hold text: the SDK types a content element reasoning_text
+    and a summary element summary_text (openai 2.48.0), so content is the reasoning a model wrote and
+    summary is a rendering of it.
+    Which of the two a given model fills is request-time behavior SDK introspection cannot show, so
+    the adapter reads both; reading only one would drop returned text into an unreportable None.
 
     Empty parts are dropped before the join, so an item whose parts are all empty yields None
     rather than the separator alone; text-free stays the single condition text is None.
     """
     summary = REASONING_PART_SEPARATOR.join(part.text for part in item.summary if part.text)
     content = REASONING_PART_SEPARATOR.join(part.text for part in item.content or () if part.text)
-    return summary or content or None
+    return content or summary or None
 
 
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
@@ -683,9 +684,10 @@ class OpenAIResponsesAdapter(Adapter):
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
 
-        reasoning_summary asks the API for readable text, which arrives on each
-        ReasoningTrace.text and on the traced conversation; None sends no summary field and leaves
-        the provider default in place. A model may return no summary even when one is requested.
+        reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text and the
+        traced conversation where the reasoning item carries no reasoning text of its own;
+        None sends no summary field and leaves the provider default in place.
+        A model may return no summary even when one is requested.
         It is a constructor parameter rather than an InferenceParams field because InferenceParams
         is neutral and anthropic has no reasoning summary of its own.
 

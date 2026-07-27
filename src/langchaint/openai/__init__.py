@@ -158,8 +158,9 @@ def openai_model(
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
-    reasoning_summary asks the API for readable text, which arrives on each
-    ReasoningTrace.text; None leaves the provider default in place.
+    reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
+    where the reasoning item carries no reasoning text of its own;
+    None leaves the provider default in place.
     service_tier is what the request asks for, None sending nothing; it is not what prices the
     response, which is priced at the tier the response reports. Leaving it None on a project
     configured for a non-default tier can be served at that tier, and priced at default rates if
@@ -221,8 +222,9 @@ def openai_bedrock_model(
     rate_limiter None means the RateLimiter defaults;
     pass one shared instance across models on the same account to share its budget,
     built in the same event loop as the LLMs, since one instance serves one loop.
-    reasoning_summary asks the API for readable text, which arrives on each
-    ReasoningTrace.text; None leaves the provider default in place.
+    reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
+    where the reasoning item carries no reasoning text of its own;
+    None leaves the provider default in place.
 
     Raises:
         ValueError: both client and aws_region are given. A passed client already carries its

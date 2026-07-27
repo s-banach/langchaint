@@ -451,10 +451,10 @@ def test_several_summary_parts_join_on_a_blank_line() -> None:
     assert trace.text == "**Reading the question**\n\nFirst.\n\n**Answering**\n\nThen."
 
 
-def test_summary_wins_over_content_when_both_hold_text() -> None:
-    """Both lists populated take the summary, the one the request asks for.
+def test_content_wins_over_the_summary_when_both_hold_text() -> None:
+    """Both lists populated take the content, the reasoning the summary is a rendering of.
 
-    Reading content first, or concatenating the two, passes every other case here,
+    Reading the summary first, or concatenating the two, passes every other case here,
     so this is what pins the precedence.
     """
     response = _response(
@@ -463,11 +463,26 @@ def test_summary_wins_over_content_when_both_hold_text() -> None:
     )
     trace = _assistant_message_from(response).turn[0]
     assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "the summary"
+    assert trace.text == "the content"
+
+
+def test_a_content_list_holding_no_text_leaves_the_summary() -> None:
+    """A present content list whose parts are empty is not text, so the summary supplies it.
+
+    Branching on whether the content list is present, rather than on the text it joins to,
+    passes every other case here and drops the summary into an unreportable None.
+    """
+    response = _response(
+        usage=None,
+        output=[_reasoning_item(summary=("thought it over",), content=("",))],
+    )
+    trace = _assistant_message_from(response).turn[0]
+    assert isinstance(trace, ReasoningTrace)
+    assert trace.text == "thought it over"
 
 
 def test_content_supplies_the_text_when_the_summary_is_empty() -> None:
-    """An empty summary falls back to the content parts rather than dropping returned text."""
+    """An empty summary leaves the content parts, whose text reaches the trace."""
     response = _response(usage=None, output=[_reasoning_item(content=("worked it out",))])
     trace = _assistant_message_from(response).turn[0]
     assert isinstance(trace, ReasoningTrace)

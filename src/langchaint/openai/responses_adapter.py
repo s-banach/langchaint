@@ -805,7 +805,7 @@ class OpenAIResponsesAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to rate_limit, transient, invalid_request, or unrecognized.
+        """Map the SDK exception to one of the five ErrorClassification members.
 
         A response's status decides, not the SDK exception class: _make_status_error returns a
         specific subclass only for the statuses it lists and the bare APIStatusError for every
@@ -817,12 +817,12 @@ class OpenAIResponsesAdapter(Adapter):
         and transient already retries it.
 
         APIConnectionError, which APITimeoutError subclasses, carries no response and is transient.
-        Anything else the SDK raises is unrecognized, which fails this item without a retry.
+        Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, openai.APIConnectionError):
             return "transient"
         if not isinstance(error, openai.APIStatusError):
-            return "unrecognized"
+            return "unknown_exception"
         return classification_from_response(
             status_code=error.response.status_code,
             headers=error.response.headers,
@@ -893,6 +893,16 @@ class _OpenAIStream(AdapterStream):
         if self._terminal_response is None:
             raise StreamProtocolError("final() requires items() to be exhausted first")
         return self._terminal_response
+
+    @override
+    def usage_reported(self) -> Usage | None:
+        """None: openai reports usage only on the terminal response, so an open stream has none.
+
+        The SDK's stream state accumulates the response's output items and no counters
+        (openai 2.45.0), and ResponseUsage arrives on the response the completed event carries,
+        which is exactly the event a stream that ends early never receives.
+        """
+        return None
 
     @override
     async def close(self) -> None:

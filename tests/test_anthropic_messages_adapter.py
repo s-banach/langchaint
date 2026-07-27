@@ -84,6 +84,7 @@ from langchaint.anthropic.messages_adapter import (
 )
 from langchaint.exceptions import StreamProtocolError
 from langchaint.tools import ToolSchema
+from langchaint.usage import Usage
 
 _STANDARD_RATES = AnthropicPricingTable(
     input_cache_none_usd_per_million_tokens=3.0,
@@ -813,7 +814,9 @@ def _anthropic_stream(
     message_snapshot: ParsedMessage[None],
 ) -> _AnthropicStream:
     """Build an adapter stream over replayed events."""
-    return _AnthropicStream(sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot))
+    return _AnthropicStream(
+        sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot), pricing=_PRICING
+    )
 
 
 def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
@@ -1165,15 +1168,19 @@ def _connection_error() -> anthropic.APIConnectionError:
         (_status_error(anthropic.APIStatusError, 402), "invalid_request"),
         (_status_error(anthropic.APIStatusError, 408), "transient"),
         (_status_error(anthropic.InternalServerError, 503), "transient"),
-        (_status_error(anthropic.APIStatusError, 302), "unrecognized"),
+        (_status_error(anthropic.APIStatusError, 302), "unknown_exception"),
         (_status_error(anthropic.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
         (
+            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "false"}),
+            "invalid_request",
+        ),
+        (
             _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"}),
-            "unrecognized",
+            "declared_final",
         ),
         (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
         (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
-        (ValueError("boom"), "unrecognized"),
+        (ValueError("boom"), "unknown_exception"),
     ],
 )
 def test_classify_maps_each_sdk_exception_to_its_classification(
@@ -1188,9 +1195,10 @@ def test_classify_maps_each_sdk_exception_to_its_classification(
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance,
     and RetryableError carries no response at all.
     x-should-retry overrides the status in both directions, except on a rate-limit status, which
-    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed.
-    A 3xx and the non-SDK ValueError land on the unrecognized default,
-    which fails the one item without a retry.
+    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed,
+    and on a 4xx marked final, which keeps the rejection name.
+    A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the provider
+    marked final lands on declared_final; each fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected
 
@@ -1519,3 +1527,27 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
         _adapter()._request(
             _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
         )
+
+
+def test_usage_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
+    """The running snapshot is readable only once an event has been accumulated.
+
+    The SDK builds the snapshot from message_start and asserts on a read before that, so the
+    adapter reports None until its first pull and prices the snapshot from then on.
+    The snapshot carries input_tokens and output_tokens as required fields, so a mid-stream read
+    always prices something.
+    """
+
+    async def scenario() -> tuple[Usage | None, Usage | None]:
+        """Read the running usage before pulling anything, then after one item."""
+        adapter_stream = _anthropic_stream(
+            [_text_delta_event("he", 0)], _message_snapshot("end_turn")
+        )
+        before = adapter_stream.usage_reported()
+        items = adapter_stream.items()
+        await anext(items)
+        return before, adapter_stream.usage_reported()
+
+    before, after = asyncio.run(scenario())
+    assert before is None
+    assert after == _normalized_usage(at.Usage(input_tokens=1, output_tokens=1), _PRICING)

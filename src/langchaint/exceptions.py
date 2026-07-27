@@ -16,7 +16,8 @@ application: a loop that cannot retry one reports it as RetryUnavailableError, c
 The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
 RetriesExhaustedError, RetryUnavailableError, RefusalError, MaxCompletionTokensExceededError,
 EmptyTurnError, SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError,
-ProviderFailedTerminallyError, InvalidRequestError, and UnrecognizedError.
+ProviderFailedTerminallyError, InvalidRequestError, ProviderDeclaredFinalError, and
+UnknownExceptionError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
@@ -105,8 +106,9 @@ class GenerationError(_CallCarrier, Exception):
     ContextWindowExceededError (the conversation overflowed the model's context window),
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     ProviderFailedTerminallyError (the 200's body reports that generating the response failed),
-    InvalidRequestError (the request was rejected, by the provider or by the adapter before sending), and
-    UnrecognizedError (the adapter did not recognize the attempt's error).
+    InvalidRequestError (the request was rejected, by the provider or by the adapter before sending),
+    ProviderDeclaredFinalError (the provider answered with an error and declared it final), and
+    UnknownExceptionError (the adapter could not place the attempt's exception).
     generate_one raises any of them;
     generate_many returns each in the slot of the item it belongs to,
     so to_row renders a uniform failure row.
@@ -177,8 +179,8 @@ class GenerationError(_CallCarrier, Exception):
     def attempts(self) -> int:
         """Requests langchaint observed going out: one attempt record each.
 
-        Below the requests sent when the adapter could not read the last attempt's error, which is
-        the count an UnrecognizedError costs.
+        Below the requests sent when the adapter could not place the last attempt's exception and no
+        response had arrived, which is the count an UnknownExceptionError costs.
         """
         return len(self.attempt_records)
 
@@ -412,9 +414,9 @@ class InvalidRequestError(GenerationError):
     Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.120.0, openai 2.45.0).
     __cause__ is None on the InvalidRequest source, where nothing went out.
 
-    Behaviorally this is UnrecognizedError (one row, no retry); it is a separate class because
-    Adapter.classify's contract is that "unrecognized" means the adapter could not name the error,
-    and a rejection it does name is not that.
+    Behaviorally this is UnknownExceptionError (one row, no retry); it is a separate class because
+    Adapter.classify's contract is that "unknown_exception" means the adapter could not place the
+    exception, and a rejection it does place is not that.
 
     reason states what was rejected, and is the whole error message.
     """
@@ -431,32 +433,53 @@ class InvalidRequestError(GenerationError):
         return self.reason
 
 
-class UnrecognizedError(GenerationError):
-    """A provider error the adapter cannot name; the item fails as a row.
+class ProviderDeclaredFinalError(GenerationError):
+    """The provider answered with an error and declared it final; the item fails as a row.
 
-    Adapter.classify's default: not a known transient or rate-limit condition (which retry), and not
-    a rejection of this request (which is InvalidRequestError), so the safe treatment is to fail this
-    item visibly.
-    It covers both an error langchaint has no account of, which may be a defect (in langchaint, the
-    SDK, or the provider), and one whose disposition is known while its identity is not: a server
-    error the provider declares final by responding x-should-retry: false.
-    Not retried: a defect must surface rather than be retried silently at billing expense,
-    and a failure the provider calls final would not survive a retry either.
-    error is the unrecognized exception, also chained as __cause__.
-    attempt_records covers the prior attempts; the unrecognized attempt itself has no record,
-    because its billing is unobservable through an exception the adapter cannot read.
-    So both usage and attempts are short by that attempt: langchaint cannot say what it billed,
-    nor even that it reached the provider.
+    The provider sent x-should-retry: false, which states the disposition and never what failed,
+    so the provider's own message is the only description of the condition.
+    Not retried: a resend would fail the same way, and the provider said so.
+    error is the SDK exception carrying that message, also chained as __cause__.
+    The attempt has a record: the request reached the provider, which answered.
     """
 
+    error: Exception
+
     def __init__(self, *, error: Exception, call: CallRecord) -> None:
-        """Store the unrecognized exception, then the call."""
+        """Store the provider's exception, then the call."""
         self.error = error
         super().__init__(call=call)
 
     @override
     def _summary(self) -> str:
-        return f"unrecognized provider error: {self.error}"
+        return f"the provider declared this error final: {self.error}"
+
+
+class UnknownExceptionError(GenerationError):
+    """An exception the adapter could not place; the item fails as a row.
+
+    Adapter.classify's default: not a known transient or rate-limit condition (which retry), not a
+    rejection of this request (which is InvalidRequestError), and not an error the provider declared
+    final (which is ProviderDeclaredFinalError), so the safe treatment is to fail this item visibly.
+    It may be a defect, in langchaint, the SDK, or the provider.
+    Not retried: a defect must surface rather than be retried silently at billing expense.
+    error is the exception classify could not place, also chained as __cause__.
+    The attempt it ends has a record wherever langchaint can account for it: a response had arrived
+    and staged its receipt, or an open stream had reported what the provider billed.
+    Where nothing arrived, both usage and attempts are short by that attempt: langchaint cannot say
+    what it billed, nor even that it reached the provider.
+    """
+
+    error: Exception
+
+    def __init__(self, *, error: Exception, call: CallRecord) -> None:
+        """Store the unplaceable exception, then the call."""
+        self.error = error
+        super().__init__(call=call)
+
+    @override
+    def _summary(self) -> str:
+        return f"langchaint could not place this exception: {self.error}"
 
 
 class InvalidToolArgsError(Exception):

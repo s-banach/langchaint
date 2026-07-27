@@ -41,7 +41,9 @@ from langchaint.messages import AssistantMessage, Message, StopReason, TextPart,
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
-type ErrorClassification = Literal["rate_limit", "transient", "invalid_request", "unrecognized"]
+type ErrorClassification = Literal[
+    "rate_limit", "transient", "invalid_request", "declared_final", "unknown_exception"
+]
 """Whether a retry may fix the error, and what to call it when it cannot.
 
 A string classification, not an exception class; the retry loop maps it onto one.
@@ -49,8 +51,10 @@ A string classification, not an exception class; the retry loop maps it onto one
 "transient" is retried by the failing task alone.
 "invalid_request" is not retried: the provider rejected this request, so sending it again
 would be rejected again (the retry loop raises InvalidRequestError).
-"unrecognized" is not retried either, and says the adapter cannot name the error
-(the retry loop raises UnrecognizedError).
+"declared_final" is not retried: the provider answered with an error and declared it final, so a
+resend would fail the same way (the retry loop raises ProviderDeclaredFinalError).
+"unknown_exception" is not retried either, and says the adapter could not place the exception at all
+(the retry loop raises UnknownExceptionError).
 """
 
 
@@ -91,10 +95,11 @@ def classification_from_response(
     with max_retries=0: the non-standard x-should-retry header decides when present, then 408
     (request timeouts), 409 (lock timeouts), 429, and 500 and above retry, and nothing else does.
     What that policy retries is retried here, and outside rate_limit_statuses what it declines is
-    named: a 4xx is this request's rejection, whoever issued it, and anything left is a status
-    langchaint has no account of.
-    A 5xx the provider declares final by sending x-should-retry: false lands there too:
-    the directive states the disposition, never what failed.
+    named: a 4xx is this request's rejection, whoever issued it, a status the provider declared
+    final is declared_final, and anything left is a status langchaint has no account of.
+    The 4xx test comes before the declared_final test, so a rejected request the directive marked
+    final keeps the rejection name. declared_final states a disposition and never what failed,
+    because that is all the directive says.
 
     rate_limit_statuses is the provider's own set of rate-limit statuses
     (429 for both, plus anthropic's 529), classified ahead of the retry directive because that
@@ -111,7 +116,9 @@ def classification_from_response(
         return "transient"
     if 400 <= status_code < 500:
         return "invalid_request"
-    return "unrecognized"
+    if should_retry is False:
+        return "declared_final"
+    return "unknown_exception"
 
 
 def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
@@ -405,6 +412,17 @@ class AdapterStream(ABC):
         ...
 
     @abstractmethod
+    def usage_reported(self) -> Usage | None:
+        """Price what the provider has reported on this stream, or None where the SDK reports nothing yet.
+
+        A counter the provider sends late is missing from it, so a caller that can still reach the
+        assembled response must read that instead. The callers are the two that cannot: a cancelled
+        stream, and one that broke before reaching its terminal event.
+        Callable at any point in the stream's life, including before its first item. No I/O.
+        """
+        ...
+
+    @abstractmethod
     async def close(self) -> None:
         """Close the underlying connection; idempotent."""
         ...
@@ -584,7 +602,7 @@ class Adapter(ABC):
         Every classification fails at most its own item.
         A provider states a status, never whether the binding or this one conversation caused it.
         A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
-        Anything the adapter cannot name must map to "unrecognized",
+        Anything the adapter cannot place must map to "unknown_exception",
         which fails the one item without a retry, so bugs surface without being retried silently.
         """
         ...

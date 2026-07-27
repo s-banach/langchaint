@@ -42,13 +42,14 @@ class AttemptRecord:
     the gap between consecutive records is that wait.
     On a stream the succeeding record spans opening the stream to its exhaustion, because that is the whole request.
     error is None on the attempt that succeeded, on a 200 that produced no output and is not
-    retried (a refusal, a truncation, a context-window overflow), and on a request the provider
-    rejected; it holds the TransientError otherwise.
-    usage is the attempt's billing (with cost_in_usd inside): the counts the response reported,
-    priced when it arrived and before it was interpreted, so a 200 is accounted for whatever
-    langchaint went on to make of it. ZERO_USAGE where no response arrived.
-    A stream that dropped after delivering items was paid for what it delivered,
-    and no client-side channel reports the amount.
+    retried (a refusal, a truncation, a context-window overflow), on a request the provider
+    rejected, on an error response the provider declared final, and on an attempt ended by an
+    exception the adapter could not place; it holds the TransientError otherwise.
+    usage is the attempt's billing (with cost_in_usd inside): the counts the provider reported,
+    priced when they arrived and before the response was interpreted, so a 200 is accounted for
+    whatever langchaint went on to make of it. ZERO_USAGE where the provider reported nothing.
+    A stream that dropped carries what the provider had reported by then, which a counter the
+    provider sends late is missing from.
     raw is the SDK's own response object, held by reference (no dump, no copy).
     It is None exactly where no response arrived: a transport failure, an error status, or a request
     the adapter would not send. It is a live, mutable pydantic object, so despite the frozen
@@ -78,8 +79,8 @@ class CallRecord:
 
     attempt_records holds the call's attempt records, in order.
     Two attempts have no record: the one in flight when a cancellation cut the call off, and the one
-    an UnrecognizedError ends the call on where the adapter could not read the error and no response
-    had arrived. An InvalidRequestError built from an InvalidRequest outcome has none either,
+    an UnknownExceptionError ends the call on where the adapter could not place the exception and no
+    response had arrived. An InvalidRequestError built from an InvalidRequest outcome has none either,
     because nothing went out.
     elapsed_seconds spans the call's start to the stamp it was frozen at, RateLimiter slot waits
     and backoff sleeps included;
@@ -197,10 +198,16 @@ class _CallLedger:
         return tuple(self._attempt_records)
 
     def record(
-        self, *, error: "TransientError | None", assistant_message: AssistantMessage | None
+        self,
+        *,
+        error: "TransientError | None",
+        assistant_message: AssistantMessage | None,
+        usage: Usage = ZERO_USAGE,
     ) -> None:
         """Close the attempt started by the last start_attempt(), ending it now."""
-        self.record_ending_at(time.monotonic(), error=error, assistant_message=assistant_message)
+        self.record_ending_at(
+            time.monotonic(), error=error, assistant_message=assistant_message, usage=usage
+        )
 
     def record_ending_at(
         self,
@@ -208,11 +215,15 @@ class _CallLedger:
         *,
         error: "TransientError | None",
         assistant_message: AssistantMessage | None,
+        usage: Usage = ZERO_USAGE,
     ) -> None:
         """Close the attempt started by the last start_attempt(), at a stamp taken earlier.
 
-        Merges the staged receipt with what reading it produced, and clears the stage. An attempt
-        that staged nothing closes with raw None and ZERO_USAGE, which is what no response means.
+        Merges the staged receipt with what reading it produced, and clears the stage.
+        usage is what the provider reported for an attempt that staged no receipt, which a stream
+        that broke mid-turn has: it reports counters as it goes and assembles no response to stage.
+        A staged receipt's own usage takes precedence, being the provider's report of the whole
+        response, and the two never arrive together.
         A stream's attempt ends when its item iterator exhausts, several awaits before final() reads
         the assembled response, so the stream path stamps the end itself.
         """
@@ -223,7 +234,7 @@ class _CallLedger:
                 started_at_monotonic_seconds=self._attempt_started_at_monotonic_seconds,
                 ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                 error=error,
-                usage=receipt.usage if receipt is not None else ZERO_USAGE,
+                usage=receipt.usage if receipt is not None else usage,
                 assistant_message=assistant_message,
                 raw=receipt.raw if receipt is not None else None,
             )

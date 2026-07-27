@@ -42,7 +42,7 @@ langchaint ships no loop, so there is nothing to splice into: each hook is plain
 | human-in-the-loop / interrupts | check `call.name` (or a tool's `app_data`) between turns and decide; a declined call is an is_error `ToolMessage` you append (see `run_agent`'s `approve` gate) |
 | summarization / message trimming | edit the `conversation` list you hold before the next turn |
 | structured-output middleware | `bind(response_format=Model)`; a refusal or truncation raises a `GenerationError` you catch |
-| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, equal to `usage` unless a billed 200 was retried. Or `to_row(result)` for a table. |
+| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, smaller than `usage` wherever a failed attempt billed. Or `to_row(result)` for a table. |
 
 The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full conversation in scope.
 
@@ -73,7 +73,7 @@ The runnable version, a `try`/`except GenerationError` over two bindings, is `ge
 ## Errors: success is a Response, failure is a GenerationError
 
 `generate_one` returns a `Response` on success and raises on a terminal outcome.
-`GenerationError` is the base of the five terminal per-item failures: `RetriesExhaustedError` (transient budget spent), `RefusalError` (no structured output: the model refused or a provider filter blocked the turn), `MaxCompletionTokensExceededError` (the structured response hit the token cap), `InvalidRequestError` (the provider or the adapter rejected this request), and `UnrecognizedError` (the adapter did not recognize the attempt's error, so it is not retried).
-Catch `GenerationError` to handle all five at once.
+`GenerationError` is the base of every terminal per-item failure: `RetriesExhaustedError` (transient budget spent), `RefusalError` (no structured output: the model refused or a provider filter blocked the turn), `MaxCompletionTokensExceededError` (the structured response hit the token cap), and `InvalidRequestError` (the provider or the adapter rejected this request) among them.
+Catch `GenerationError` to handle them all at once.
 In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_row` renders successes and failures to the same table.
 The runnable catch, one `try`/`except GenerationError` around a structured `generate_one`, is `catch_generation_error` in `05_rate_limiting_and_errors.py`.

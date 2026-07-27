@@ -24,6 +24,7 @@ from langchaint.exceptions import (
     InvalidRequestError,
     InvalidToolArgsError,
     MaxCompletionTokensExceededError,
+    ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
@@ -32,7 +33,7 @@ from langchaint.exceptions import (
     StreamProtocolError,
     TransientError,
     UnfinishedTurnError,
-    UnrecognizedError,
+    UnknownExceptionError,
 )
 from langchaint.inference_params import InferenceParams, ReasoningEffort
 from langchaint.llm import LLM, BoundLLM, HasTools, NoTools
@@ -108,6 +109,7 @@ __all__ = [
     "NoTools",
     "Part",
     "PricingTable",
+    "ProviderDeclaredFinalError",
     "ProviderFailedTerminallyError",
     "PydanticTool",
     "RateLimiter",
@@ -136,7 +138,7 @@ __all__ = [
     "TransientError",
     "TurnElement",
     "UnfinishedTurnError",
-    "UnrecognizedError",
+    "UnknownExceptionError",
     "Usage",
     "UserMessage",
     "to_row",

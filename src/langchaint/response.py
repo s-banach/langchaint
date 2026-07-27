@@ -1,7 +1,7 @@
 """The generate results: the success Response, the terminal GenerationError, and the AbandonedCall record.
 
 A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
-a truncation at the token cap, or an unrecognized provider error) raises or returns a GenerationError;
+a truncation at the token cap, or a provider error langchaint does not retry) raises or returns a GenerationError;
 one whose result never reaches the caller, cut off by a cancellation or discarded when a batch raises,
 leaves an AbandonedCall on the caller's abandoned_call_log.
 Each of the three carries the CallRecord its retry loop froze, because a call's history survives
@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from langchaint.call import CallRecord, _CallCarrier
 from langchaint.exceptions import GenerationError
 from langchaint.messages import AssistantMessage, StopReason, ToolCall
-from langchaint.usage import Usage
+from langchaint.usage import ZERO_USAGE, Usage
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_row emits."""
@@ -90,8 +90,7 @@ class Response[OutputT](_CallCarrier):
         A call that retried a billed 200 (an empty structured parse retried as transient) counts every such
         attempt, so this can exceed the tokens of the single answer in output; usage_successful_attempt is
         that single answer's own usage. This is the same paid-total scope as GenerationError.usage,
-        so the two mean the same thing. Transport, 5xx, and rate-limit retries bill nothing (ZERO_USAGE),
-        so when every failed attempt was one of those this equals usage_successful_attempt.
+        so the two mean the same thing.
         """
         return Usage.sum_of(record.usage for record in self.attempt_records)
 
@@ -100,8 +99,7 @@ class Response[OutputT](_CallCarrier):
         """The single kept answer's own usage, the one matching output, assistant_message, and raw.usage.
 
         The last attempt record is the success (__post_init__ enforces it), so this reads it directly.
-        It equals usage in the common case where no failed attempt billed (every retry was a transport,
-        5xx, or rate-limit failure); it is smaller than usage only when a billed 200 was retried.
+        It equals usage where no failed attempt billed, and is smaller where one did.
         """
         return self.attempt_records[-1].usage
 
@@ -124,26 +122,31 @@ class AbandonedCall(_CallCarrier):
 
     call is this call's history. Where the call was cut off mid-attempt, its attempt_records cover
     only the attempts that settled before that, and the in-flight attempt has no record:
-    it may have completed and billed server-side,
-    so its cost is unobservable client-side and no usage is fabricated for it
-    ("unbilled" would overclaim).
+    whatever it billed beyond what usage_in_flight states is unobservable client-side
+    and none of it is fabricated ("unbilled" would overclaim).
     Reconciliation closes the gap from the provider's side, which model and provider_name identify.
+
+    usage_in_flight is what the provider had reported for the cut-off attempt by the time the call
+    was cut off, and is ZERO_USAGE wherever it had reported nothing, which is true of every
+    non-stream call. A counter the provider sends late is missing from it.
+    The two usage fields are disjoint and add, so total spend is at least
+    usage_settled + usage_in_flight, with no branch to write.
     """
 
     # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
     call: CallRecord
+    usage_in_flight: Usage
 
     @property
     def usage_settled(self) -> Usage:
         """The folded paid total of this call's settled attempts.
 
         Deliberately not named usage: on the other result carriers, usage is the call's whole paid
-        total, and a call cut off mid-attempt lacks that attempt's share here.
-        Cancellation correlates with long requests, so the omitted attempt skews expensive.
-        On the stream path every settled record is a failed attempt, a stream that dropped after
-        delivering items included.
-        The value would then read near zero while the true spend is the whole stream.
-        Uniformity would turn a loud AttributeError into a silent undercount.
+        total, and a call cut off mid-attempt lacks that attempt's share here, which
+        usage_in_flight carries instead.
+        Cancellation correlates with long requests, so the omitted attempt skews expensive, and
+        answering to the name the whole-total carriers use would turn a loud AttributeError into a
+        silent undercount.
         """
         return Usage.sum_of(record.usage for record in self.attempt_records)
 
@@ -161,9 +164,15 @@ class AbandonedCallLog(Protocol):
         """Receive one record."""
 
 
-def _append_abandoned_call(abandoned_call_log: AbandonedCallLog | None, call: CallRecord) -> None:
+def _append_abandoned_call(
+    abandoned_call_log: AbandonedCallLog | None,
+    call: CallRecord,
+    usage_in_flight: Usage = ZERO_USAGE,
+) -> None:
     """Append one AbandonedCall when a log was given, without letting the append escape.
 
+    usage_in_flight defaults to ZERO_USAGE, which is what a caller with no channel for
+    observing an in-flight attempt states; only an open stream has one.
     Every caller runs this while an exception unwinds, after it has returned the in-flight slot
     and, on the stream path, closed the connection.
     A log whose append raises is a defect in application code, but raising it here would replace
@@ -175,7 +184,7 @@ def _append_abandoned_call(abandoned_call_log: AbandonedCallLog | None, call: Ca
     if abandoned_call_log is None:
         return
     try:
-        abandoned_call_log.append(AbandonedCall(call=call))
+        abandoned_call_log.append(AbandonedCall(call=call, usage_in_flight=usage_in_flight))
     except Exception:
         _logger.warning(
             "abandoned_call_log.append raised; this call's record was lost", exc_info=True

@@ -831,7 +831,7 @@ def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
 
     error.type is the exception's class name, so the GenerationError subclasses (RetriesExhaustedError,
-    RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnrecognizedError) are
+    RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnknownExceptionError) are
     groupable by kind rather than only by the error_text message string.
     """
     _set_span_attribute(span, "error.type", type(error).__name__)
@@ -1241,8 +1241,8 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
         Raises:
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
-                a refusal, a truncation, a rejected request, or an unrecognized provider error);
-                the span is attributed and closed first.
+                a refusal, a truncation, a rejected request, or a provider error langchaint does not
+                retry); the span is attributed and closed first.
             asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
                 appended any AbandonedCall first, and the span ends.
         """
@@ -1508,7 +1508,7 @@ class TracedStreamHandle[OutputT]:
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
             Exception: the inner stream raised (a transient failure past the first item, a rejected
-                or unrecognized request, a protocol violation); the span is attributed by what the
+                request, an error langchaint does not retry, a protocol violation); the span is attributed by what the
                 exception is, takes error status, and ends before the re-raise.
         """
         if self._span is None or self._span_ended:
@@ -1585,8 +1585,8 @@ class TracedStreamHandle[OutputT]:
 
         Raises:
             GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
-                on the structured path, retries exhausted while draining, a rejected reopen, or an
-                unrecognized provider error); the span is attributed and closed first.
+                on the structured path, retries exhausted while draining, a rejected reopen, or a
+                provider error langchaint does not retry); the span is attributed and closed first.
             StreamProtocolError: the provider's event stream ended without a terminal event;
                 the span records it and closes.
         """

@@ -50,6 +50,7 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
+    ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
@@ -58,12 +59,13 @@ from langchaint.exceptions import (
     StreamProtocolError,
     TransientError,
     UnfinishedTurnError,
-    UnrecognizedError,
+    UnknownExceptionError,
     _extract_transient_errors,
 )
 from langchaint.messages import Message
 from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
+from langchaint.usage import ZERO_USAGE, Usage
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -119,7 +121,8 @@ class StreamHandle[OutputT]:
         Raises:
             InvalidRequestError: the adapter reported the conversation as InvalidRequest, or the open
                 failure was classified as a rejection of the request.
-            UnrecognizedError: the open failure was classified as unrecognized.
+            ProviderDeclaredFinalError: the provider declared the open failure final.
+            UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the opens spent the retry budget.
             RuntimeError: this handle was already entered; build a new one with stream_one.
         """
@@ -138,7 +141,7 @@ class StreamHandle[OutputT]:
             self._state = "finished"
             self._release_slot()
             if isinstance(exc, asyncio.CancelledError):
-                self._append_abandoned_call()
+                self._append_abandoned_call(self._usage_reported())
             raise
         return self
 
@@ -162,15 +165,31 @@ class StreamHandle[OutputT]:
                 it propagates in place of whatever was unwinding the block.
         """
         self._state = "finished"
+        # Read before the close, which drops the stream that reports it.
+        usage_in_flight = (
+            self._usage_reported() if isinstance(exc, asyncio.CancelledError) else ZERO_USAGE
+        )
         try:
             await self._close_adapter_stream()
         finally:
             # The append runs after the close whatever the close does, so the record is written
             # even when a BaseException comes out of it, which _close_adapter_stream does not catch.
             if isinstance(exc, asyncio.CancelledError):
-                self._append_abandoned_call()
+                self._append_abandoned_call(usage_in_flight)
 
-    def _append_abandoned_call(self) -> None:
+    def _usage_reported(self) -> Usage:
+        """Ask the open stream what the provider has reported, folding nothing reported to ZERO_USAGE.
+
+        Call before the connection closes, because closing drops the stream this asks.
+        An adapter stream that reports None folds to ZERO_USAGE, the same fold usage_from_raw
+        applies to a response that reports no counters: both mean the provider stated nothing.
+        """
+        if self._adapter_stream is None:
+            return ZERO_USAGE
+        usage_reported = self._adapter_stream.usage_reported()
+        return usage_reported if usage_reported is not None else ZERO_USAGE
+
+    def _append_abandoned_call(self, usage_in_flight: Usage) -> None:
         """Record the abandonment, unless no log was given or the conclusion accounted for the call.
 
         A Response and a GenerationError each hand the caller this call's CallRecord, naming
@@ -179,13 +198,12 @@ class StreamHandle[OutputT]:
         in-flight abandonment.
         A StreamProtocolError hands over neither, so a cancellation following one still gets a
         record: it is the only account of the stream that was opened.
-        Every settled record here is an open that failed before the first item, so usage_settled
-        holds only what those failures carried, and what the stream billed for the items it already
-        delivered is unobservable client-side.
+        usage_settled holds what the settled records carried, and usage_in_flight what the adapter
+        could state of the attempt still open when the cancellation arrived.
         """
         if self._conclusion_carried_the_call:
             return
-        _append_abandoned_call(self._abandoned_call_log, self._ledger.freeze())
+        _append_abandoned_call(self._abandoned_call_log, self._ledger.freeze(), usage_in_flight)
 
     def _release_slot(self) -> None:
         if self._admission is not None:
@@ -235,7 +253,9 @@ class StreamHandle[OutputT]:
         wrapped.__cause__ = exc
         return wrapped
 
-    def _record_transient_error(self, wrapped: TransientError) -> Backoff:
+    def _record_transient_error(
+        self, wrapped: TransientError, usage: Usage = ZERO_USAGE
+    ) -> Backoff:
         """Record one transient failure as an attempt and register it with the RateLimiter.
 
         Called while the failing attempt's admission is still held;
@@ -244,12 +264,14 @@ class StreamHandle[OutputT]:
         protects the whole account: losing it because this one stream is past reopening would leave
         every other caller sending into the limit.
 
+        usage is what the provider reported for the attempt.
+
         Returns:
             The Backoff to sleep before the next open attempt;
             its delay is drawn once, so it equals any account-wide pause it set.
             A caller that will not reopen drops it.
         """
-        self._ledger.record(error=wrapped, assistant_message=None)
+        self._ledger.record(error=wrapped, assistant_message=None, usage=usage)
         assert self._admission is not None
         return self._rate_limiter.register_transient_error(
             self._admission, _extract_transient_errors(self._ledger.attempt_records)
@@ -268,25 +290,38 @@ class StreamHandle[OutputT]:
             raise RetriesExhaustedError(call=self._ledger.freeze()) from exc
         await backoff.sleep()
 
-    def _non_retriable_or_none(self, exc: Exception) -> GenerationError | None:
+    def _non_retriable_or_none(
+        self, exc: Exception, stream_usage: Usage | None
+    ) -> GenerationError | None:
         """Map one attempt error to the non-retriable error to propagate, or None when transient.
 
         Reached only for exceptions, which by the adapter contract are attempts the adapter read no
-        outcome from: what it did read it reports as an AttemptOutcome arm, which this handle
+        outcome from: what it did read it reports as an AttemptOutcome member, which this handle
         matches instead.
+
+        stream_usage is what the open stream reported, and None where the failure preceded any
+        stream. A provider that reports counters before its first item has already billed by the
+        time one of these errors arrives, so the reading is what keeps that attempt accountable.
         """
         if isinstance(exc, TransientError):
             return None
+        usage = ZERO_USAGE if stream_usage is None else stream_usage
         classification = self._adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out and gets a record. A rejection carries no response, so it billed nothing.
-            self._ledger.record(error=None, assistant_message=None)
+            # so it went out and gets a record.
+            self._ledger.record(error=None, assistant_message=None, usage=usage)
             return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
-        if classification == "unrecognized":
-            unrecognized = UnrecognizedError(error=exc, call=self._ledger.freeze())
-            unrecognized.__cause__ = exc
-            return unrecognized
+        if classification == "declared_final":
+            # The provider answered, so the attempt gets a record.
+            self._ledger.record(error=None, assistant_message=None, usage=usage)
+            return ProviderDeclaredFinalError(error=exc, call=self._ledger.freeze())
+        if classification == "unknown_exception":
+            if stream_usage is not None:
+                # The stream was open, so langchaint can say the attempt reached the provider and
+                # what that provider reported for it; the class records nothing where it cannot.
+                self._ledger.record(error=None, assistant_message=None, usage=stream_usage)
+            return UnknownExceptionError(error=exc, call=self._ledger.freeze())
         return None
 
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
@@ -317,7 +352,8 @@ class StreamHandle[OutputT]:
         Raises:
             InvalidRequestError: the adapter reported the conversation as InvalidRequest, or the open
                 failure was classified as a rejection of the request.
-            UnrecognizedError: the open failure was classified as unrecognized.
+            ProviderDeclaredFinalError: the provider declared the open failure final.
+            UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the attempts spent the retry budget.
         """
         while self._adapter_stream is None:
@@ -326,7 +362,7 @@ class StreamHandle[OutputT]:
             try:
                 opened = await self._bound_adapter.open_stream(self._conversation)
             except Exception as exc:
-                non_retriable = self._non_retriable_or_none(exc)
+                non_retriable = self._non_retriable_or_none(exc, None)
                 if non_retriable is not None:
                     self._release_slot()
                     raise non_retriable from exc
@@ -359,7 +395,8 @@ class StreamHandle[OutputT]:
                 available; __cause__ is the adapter's verdict on that failure.
             InvalidRequestError: the adapter reported a reopened conversation as InvalidRequest, or
                 classified an item or reopen error as a rejection of the request.
-            UnrecognizedError: the adapter classified an item or reopen error as unrecognized.
+            ProviderDeclaredFinalError: the provider declared an item or reopen error final.
+            UnknownExceptionError: the adapter could not place an item or reopen exception.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
             StopAsyncIteration: the stream is exhausted.
@@ -400,7 +437,11 @@ class StreamHandle[OutputT]:
                 await self._close_adapter_stream()
                 raise
             except Exception as exc:
-                non_retriable = self._non_retriable_or_none(exc)
+                # Read before any close, which drops the stream that reports it. A provider that
+                # reports counters before its first item has already billed for this attempt,
+                # whichever of the paths below it takes.
+                stream_usage = self._usage_reported()
+                non_retriable = self._non_retriable_or_none(exc, stream_usage)
                 if non_retriable is not None:
                     await self._close_adapter_stream()
                     raise non_retriable from exc
@@ -408,10 +449,12 @@ class StreamHandle[OutputT]:
                     wrapped = self._transient_error(
                         exc, f"stream failed after items were yielded: {exc}"
                     )
-                    self._record_transient_error(wrapped)
+                    self._record_transient_error(wrapped, stream_usage)
                     await self._close_adapter_stream()
                     raise RetryUnavailableError(call=self._ledger.freeze()) from wrapped
-                backoff = self._record_transient_error(self._transient_error(exc, str(exc)))
+                backoff = self._record_transient_error(
+                    self._transient_error(exc, str(exc)), stream_usage
+                )
                 await self._close_adapter_stream()
                 await self._backoff_or_exhaust(exc, backoff)
                 await self._open_stream_with_retries()
@@ -442,7 +485,8 @@ class StreamHandle[OutputT]:
             InvalidRequestError: draining the stream hit an item or reopen error the adapter
                 classified as a rejection of the request, or a reopened conversation the adapter
                 reported as InvalidRequest.
-            UnrecognizedError: draining the stream hit an item or reopen error the adapter classified as unrecognized.
+            ProviderDeclaredFinalError: draining hit an item or reopen error the provider declared final.
+            UnknownExceptionError: draining hit an item or reopen exception the adapter could not place.
             RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
             RefusalError: the adapter reported the assembled response as Refusal,
                 carrying this handle's attempt records.

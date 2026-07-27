@@ -5,13 +5,7 @@ as a GenerationError, the siblings run to completion whatever any one item does,
 to conversations[i]. So the call itself needs no try/except; the work is the loop over the results,
 which to_row renders to one table shape whether a slot succeeded or failed.
 
-The five GenerationError subclasses each name what happened: RetriesExhaustedError (the transient
-budget ran out), RefusalError (no structured output: the model refused or a provider filter
-blocked the turn), MaxCompletionTokensExceededError
-(the structured answer hit the token cap), InvalidRequestError (the request was rejected, by the
-provider or by the adapter before sending), and UnrecognizedError (the adapter could not name the
-provider's error).
-The class says what happened, not what to do next, and InvalidRequestError is where that gap is
+Each GenerationError subclass names what happened, not what to do next, and InvalidRequestError is where that gap is
 widest: a rejected conversation, a bad API key, a revoked permission, and an unknown model id all
 land there, so after fixing a key the same items are worth resubmitting unchanged. langchaint does
 not guess which it was, because a provider states a status and never a cause. So log the class name

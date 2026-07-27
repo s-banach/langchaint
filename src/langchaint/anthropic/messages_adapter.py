@@ -903,7 +903,7 @@ class AnthropicMessagesAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to rate_limit, transient, invalid_request, or unrecognized.
+        """Map the SDK exception to one of the five ErrorClassification members.
 
         A response's status decides, not the SDK exception class: _make_status_error returns a
         specific subclass only for the statuses it lists and the bare APIStatusError for every
@@ -914,12 +914,12 @@ class AnthropicMessagesAdapter(Adapter):
 
         APIConnectionError, which APITimeoutError subclasses, and RetryableError, the marker the
         SDK's own retry policy honors from middleware, are transient.
-        Anything else the SDK raises is unrecognized, which fails this item without a retry.
+        Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
             return "transient"
         if not isinstance(error, anthropic.APIStatusError):
-            return "unrecognized"
+            return "unknown_exception"
         return classification_from_response(
             status_code=error.response.status_code,
             headers=error.response.headers,
@@ -937,8 +937,16 @@ class AnthropicMessagesAdapter(Adapter):
 class _AnthropicStream(AdapterStream):
     """One open Messages stream, backed by the SDK's AsyncMessageStream."""
 
-    def __init__(self, *, sdk_stream: AsyncMessageStream[Any]) -> None:
+    def __init__(
+        self,
+        *,
+        sdk_stream: AsyncMessageStream[Any],
+        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    ) -> None:
         self._sdk_stream = sdk_stream
+        self._pricing = pricing
+        self._snapshot_started = False
+        """Whether an event has been accumulated, which is what makes current_message_snapshot readable."""
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -953,6 +961,7 @@ class _AnthropicStream(AdapterStream):
             StreamProtocolError: the stream ended without a stop reason.
         """
         async for event in self._sdk_stream:
+            self._snapshot_started = True
             if event.type == "content_block_delta":
                 if event.delta.type == "text_delta":
                     yield event.delta.text
@@ -969,6 +978,21 @@ class _AnthropicStream(AdapterStream):
     async def final(self) -> anthropic.types.Message:
         """Return the message the SDK assembled from the stream's events, after the stream ends."""
         return await self._sdk_stream.get_final_message()
+
+    @override
+    def usage_reported(self) -> Usage | None:
+        """Price the running message snapshot, or None before the first event is accumulated.
+
+        The SDK builds the snapshot from message_start and updates it as later events arrive, so
+        Message.usage carries input_tokens from the turn's first event onward (both are required
+        fields on anthropic 0.120.0). The cache counters are optional and the SDK copies them on at
+        message_delta, so a snapshot read mid-stream can be missing them.
+        Reading the snapshot before any event has been accumulated is an error in the SDK, so the
+        first pull through items() is what makes this readable.
+        """
+        if not self._snapshot_started:
+            return None
+        return _normalized_usage(self._sdk_stream.current_message_snapshot.usage, self._pricing)
 
     @override
     async def close(self) -> None:
@@ -1046,7 +1070,7 @@ class _BoundAnthropicText(BoundAdapter[str]):
             messages=messages,
         )
         sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(sdk_stream=sdk_stream)
+        return _AnthropicStream(sdk_stream=sdk_stream, pricing=self._adapter.pricing)
 
 
 class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
@@ -1189,4 +1213,4 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
             messages=messages,
         )
         sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(sdk_stream=sdk_stream)
+        return _AnthropicStream(sdk_stream=sdk_stream, pricing=self._adapter.pricing)

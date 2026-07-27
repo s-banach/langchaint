@@ -42,13 +42,14 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
+    ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
     RetriesExhaustedError,
     SchemaViolationError,
     TransientError,
     UnfinishedTurnError,
-    UnrecognizedError,
+    UnknownExceptionError,
     _extract_transient_errors,
 )
 from langchaint.inference_params import InferenceParams
@@ -548,8 +549,13 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             return InvalidRequestError(
                 reason=f"the provider rejected the request: {exc}", call=ledger.freeze()
             )
-        if classification == "unrecognized":
-            return UnrecognizedError(error=exc, call=ledger.freeze())
+        if classification == "declared_final":
+            # The provider answered, so the attempt gets a record; its answer was an error, which
+            # reports no billing, so the record is ZERO_USAGE unless a receipt was staged.
+            ledger.record(error=None, assistant_message=None)
+            return ProviderDeclaredFinalError(error=exc, call=ledger.freeze())
+        if classification == "unknown_exception":
+            return UnknownExceptionError(error=exc, call=ledger.freeze())
         error = TransientError(
             str(exc),
             retry_after_seconds=self.adapter.retry_after_seconds(exc),
@@ -647,7 +653,9 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         Raises:
             InvalidRequestError: the adapter reported the conversation as InvalidRequest, or classified
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
-            UnrecognizedError: the adapter classified an attempt's error as unrecognized;
+            ProviderDeclaredFinalError: the adapter classified an attempt's error as one the provider
+                declared final; terminal for this item, without a retry.
+            UnknownExceptionError: the adapter could not place an attempt's exception;
                 terminal for this item, without a retry.
             RefusalError: the adapter reported a Refusal attempt (no structured output: the model
                 refused or a provider filter blocked the turn); terminal for this item, without a retry.
@@ -792,7 +800,8 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Every non-success outcome propagates, all of them sharing the GenerationError base a caller
         can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
-        rejected request, UnrecognizedError on an unrecognized error, and one of RefusalError,
+        rejected request, ProviderDeclaredFinalError or UnknownExceptionError on an error the adapter
+        placed as final or could not place at all, and one of RefusalError,
         MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError,
         ContextWindowExceededError, UnfinishedTurnError, or ProviderFailedTerminallyError on a 200
         that produced no output.
@@ -896,8 +905,8 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
         Every item ends in its own slot: a Response, or the GenerationError it failed with
-        (retries exhausted, a rejected request, an unrecognized error, or a 200 that produced no
-        output), which to_row renders to a failure row so the batch stays table-ready.
+        (retries exhausted, a rejected request, an error langchaint does not retry, or a 200 that
+        produced no output), which to_row renders to a failure row so the batch stays table-ready.
         No item's failure reaches a sibling, so the returned list is always complete.
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.

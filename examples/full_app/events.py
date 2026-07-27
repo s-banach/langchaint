@@ -136,7 +136,8 @@ class ToolProgress:
 class LlmCallAbandoned:
     """One generate call outran config.per_call_timeout_seconds and was dropped; the run continues.
 
-    The request may have completed and billed server-side, so its spend is unobservable: the
+    The request may have completed and billed server-side, so its spend is unobservable: this app
+    generates only through generate_one, which reports nothing of a cut-off attempt. The
     AbandonedCall langchaint appended to the run's turn_log records the drop, and usage_so_far
     gains only what the call's settled attempts had already reported.
     turn_number is the turn whose call was dropped; the next turn resends from the same conversation,

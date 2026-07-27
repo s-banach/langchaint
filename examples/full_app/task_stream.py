@@ -139,8 +139,9 @@ consumer could want is a post-run fold over these records.
 def _spend_of(record: TurnRecord) -> Usage:
     """Return what one record billed, the fold step that turns an ordered turn_log into a total.
 
-    An AbandonedCall contributes only its settled attempts' spend, because the in-flight attempt's
-    cost is unobservable.
+    An AbandonedCall contributes its settled attempts' spend plus whatever the provider had
+    reported for the cut-off attempt: the rest of that attempt may have billed server-side with no
+    client-side channel reporting it.
     """
     match record:
         case LlmTurn():
@@ -150,7 +151,7 @@ def _spend_of(record: TurnRecord) -> Usage:
         case ToolTurn():
             return record.reported_usage
         case AbandonedCall():
-            return record.usage_settled
+            return Usage.sum_of((record.usage_settled, record.usage_in_flight))
 
 
 class AgentRun(ABC):

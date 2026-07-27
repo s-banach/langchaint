@@ -87,6 +87,7 @@ from langchaint.openai.responses_adapter import (
     _wire_input,
     _wire_tool_choice,
 )
+from langchaint.usage import Usage
 
 _DEFAULT_RATES = PricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -1480,15 +1481,19 @@ def _connection_error() -> openai.APIConnectionError:
         (_status_error(openai.APIStatusError, 413), "invalid_request"),
         (_status_error(openai.APIStatusError, 408), "transient"),
         (_status_error(openai.InternalServerError, 503), "transient"),
-        (_status_error(openai.APIStatusError, 302), "unrecognized"),
+        (_status_error(openai.APIStatusError, 302), "unknown_exception"),
         (_status_error(openai.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
         (
+            _status_error(openai.BadRequestError, 400, {"x-should-retry": "false"}),
+            "invalid_request",
+        ),
+        (
             _status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}),
-            "unrecognized",
+            "declared_final",
         ),
         (_status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
         (_status_error(openai.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
-        (ValueError("boom"), "unrecognized"),
+        (ValueError("boom"), "unknown_exception"),
     ],
 )
 def test_classify_maps_each_sdk_exception_to_its_classification(
@@ -1501,9 +1506,10 @@ def test_classify_maps_each_sdk_exception_to_its_classification(
     them, which is why the adapter reads the status rather than the exception class.
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
     x-should-retry overrides the status in both directions, except on a rate-limit status, which
-    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed.
-    A 3xx and the non-SDK ValueError land on the unrecognized default,
-    which fails the one item without a retry.
+    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed,
+    and on a 4xx marked final, which keeps the rejection name.
+    A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the provider
+    marked final lands on declared_final; each fails the one item without a retry.
     """
     assert _adapter().classify(error) == expected
 
@@ -1612,3 +1618,24 @@ def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> No
     request = _adapter()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
     assert request.instructions == "sys"
     assert request.input_prefix == []
+
+
+def test_usage_reported_reports_nothing_at_any_point_in_the_stream() -> None:
+    """Openai states usage only on the terminal response, so a stream cut off in flight has none.
+
+    Read before any pull and again after an item, because a stream cancelled mid-turn is exactly
+    where the caller would want a partial figure and there is none to give.
+    """
+
+    async def scenario() -> tuple[Usage | None, Usage | None]:
+        """Read the running usage before pulling anything, then after one item."""
+        adapter_stream = _stream([
+            _text_delta_event("he", 1),
+            _completed_event(_response(usage=_usage_with_cache()), 2),
+        ])
+        before = adapter_stream.usage_reported()
+        items = adapter_stream.items()
+        await anext(items)
+        return before, adapter_stream.usage_reported()
+
+    assert asyncio.run(scenario()) == (None, None)

@@ -970,7 +970,6 @@ def test_empty_turn_outcome_from_send_raises_row_shaped_without_retry() -> None:
 def test_schema_violation_outcome_from_send_raises_row_shaped_without_retry() -> None:
     """A SchemaViolation outcome fails the item, and pydantic's rejection travels on the error.
 
-    Never retried: the turn completed, so nothing about the attempt was transient.
     error_text carries none of the rejection, whose msg embeds the value a caller's own validator
     rejected; the tracing layer writes error_text into every span whatever capture_message_content
     the caller chose.

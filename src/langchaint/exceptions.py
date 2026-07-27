@@ -306,8 +306,8 @@ class SchemaViolationError(GenerationError):
     """The model finished its turn and its text is not an instance of the bound response_format.
 
     Fires only on the structured path; a text binding returns the same turn's text as its output.
-    Not retried: the turn completed on the terms it reports, so nothing about the attempt was
-    transient.
+    Not retried: the text failed the caller's own model, so what to do about it is the caller's
+    decision, as it is when a tool call's args fail the tool's args_model.
     The fix is a model the schema can express, or validation moved out of the model and into the
     caller's own code, where a rejected turn is data rather than a failed generation.
 

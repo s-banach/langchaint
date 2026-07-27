@@ -268,7 +268,7 @@ class SchemaViolation(NoOutput):
     """A completed turn whose text is not an instance of the binding's response_format.
 
     The retry loop records the attempt and fails the item with a SchemaViolationError, without
-    retrying: the turn completed, so nothing about the attempt was transient.
+    retrying.
 
     validation_error_json is ValidationError.json(include_url=False), which travels to the caller on
     that error. Every field pydantic reports is in it, the rejected value included, because a caller

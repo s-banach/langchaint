@@ -4,7 +4,7 @@ A provider-neutral LLM client library. Alpha: the API is unstable and may change
 
 ## Docstrings and comments
 
-Write docstrings and comments self-contained for human readers: state the constraint or reasoning inline; never cite internal dev documents, decision logs, spec files, or dead alternatives to the live code.
+Never cite internal dev documents, decision logs, spec files, or dead alternatives to the live code.
 Never refer to the repo's own prior state. Diff-relative prose is a sentence that only makes sense to a reader who saw the change that introduced it: wording like "as before", "no longer", or "now", a reference to a state that exists nowhere in the current tree, or a justification for a question no reader of the file would ask. The test: a sound sentence reads the same whether the code was born in its current shape or arrived there by refactor.
 
 Module docstrings are the spec of record for mechanics; CLAUDE.md is the spec of record for principles. Write in CLAUDE.md only a cross-module rule, its criterion, and at most one edge-case example per rule; keep how a behavior works in the docstring of the code that implements it, and when such a behavior changes, update that docstring, not CLAUDE.md. The durability test: a CLAUDE.md sentence reads the same after any refactor that preserves the design tenets, so a sentence naming a symbol belongs in that symbol's docstring, except where the rule is about that name (`input_tokens`).
@@ -21,9 +21,8 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 
 ## Naming rules
 
-- Make every name explicit: `system_prompt` not `system`, `inference_params` not `params`.
-- Give the keyword and the variable passed to it one name: `tool_manager=tool_manager`, because `name_1=name_2` gives one concept two names.
-- Use one name per concept end to end; no aliases. Call the project "langchaint", never "the package" or "the library"; use "package" only for its Python meanings.
+- Give the keyword and the variable passed to it one name: `tool_manager=tool_manager`.
+- Call the project "langchaint", never "the package" or "the library"; use "package" only for its Python meanings.
 - Say "adapter" for an implementation of the class `Adapter`, including in compounds, and "provider" for anthropic and openai themselves and for a platform serving their models; a concrete name composes the two (`AnthropicMessagesAdapter`). "Provider" is wider than the company because the serving platform counts: one adapter reports a different `provider_name` over a direct client than over a Bedrock one.
 - Prefer neutral over provider vocabulary: when providers disagree, take the majority wire name or a neutral one (`ToolCall` not `ToolUse`).
 - Never write bare `input_tokens`: anthropic's field of that name excludes cache reads while openai's equivalent includes them. Use the partition `input_tokens_cache_read`/`_cache_write`/`_cache_none` and the derived `input_tokens_total`.
@@ -90,21 +89,6 @@ Trigger: releasing a version. Bump `version` in `pyproject.toml` and push to `ma
 
 Pushing the bump to `main` is therefore the release act, and PyPI does not accept a re-upload of a version that already exists. Confirm with the user before pushing a commit that changes `version`.
 
-# Commit Review
+# Casts
 
-After each commit lands, spawn `commit-correctness-reviewer` and `commit-simplicity-reviewer` concurrently, each with the commit sha as its prompt. The first owns wrong results, failure paths, callers of changed code, false prose, unverified facts about installed packages, naming and design rules, and test power; the second owns duplication, redundant state, code smells, wasted work, and verbosity. Each reports only its own scope, so expect two reports and resolve both. Either may raise one design objection, the first where a premise yields a wrong result and the second where it imposes a lasting cost on callers; where both object to one premise, resolve it once. Before that spawn, `scripts/CI.sh` reports zero errors and you have run the author's pre-staging pass ("Before running `git add`" in the global CLAUDE.md) to completion on every staged file. The reviewers are the second pass, which is what lets rule 2 of each forbid re-running the checks. Both run on Opus; override to Sonnet only for a trivial commit.
-
-Done gate: count a commit as Done only after both reviews have returned, confirmed issues are fixed, and every objection is resolved: adopted by editing what its premise challenges, or declined with the reason stated to the user, never written into the repo. Deferring an objection is not resolving it.
-
-When a finding says a comment or a docstring sentence is inaccurate, delete the sentence unless it states a constraint, a reason, or a behavior a reader acts on. Rewriting it costs another review round and risks a fresh inaccuracy: an unconditional claim rewritten to be conditional acquires a new edge to get wrong, and prose that survived only because it was there is prose nobody needed. Rewrite instead of deleting only when you can name what a reader loses without the sentence.
-
-Fix the reviewers' findings in a new commit and review that one too; never amend a reviewed commit, because a review names a sha and an amend moves the code out from under the review that passed. A fix commit that changes no behavior and no prose closes without review, so whitespace and a private rename with no callers do not start another round. Squash the chain into one commit before pushing, so one feature reaches the remote as one commit and the review chain stays local. Never build on a not-Done commit.
-
-# Code smells
-
-Trigger: you write one of the constructs below. Redesign to remove it. If every redesign you find is worse, keep the construct with a comment stating why. Stop when the construct is gone or carries that comment.
-
-- `**kwargs` unpacking
-- `Any` for typing
-- `cast`. The keep-with-a-comment escape does not apply: redesign every `cast` away except at two boundaries. First, a deliberately-opaque value re-enters a typed API whose own serialization produced it, and the alternative is worse (for example a revalidation that silently reshapes the payload). Second, a langchaint vocabulary is deliberately wider than the SDK literal it is sent as, under "Honor user inputs faithfully". Keep a surviving `cast` to one line, its comment naming which boundary.
-- Unpacking data from one container (list, dict, pydantic object) and back into another.
+`cast` is on the global code-smell list, and here its keep-with-a-comment escape does not apply: redesign every `cast` away except at two boundaries. First, a deliberately-opaque value re-enters a typed API whose own serialization produced it, and the alternative is worse (for example a revalidation that silently reshapes the payload). Second, a langchaint vocabulary is deliberately wider than the SDK literal it is sent as, under "Honor user inputs faithfully". Keep a surviving `cast` to one line, its comment naming which boundary.

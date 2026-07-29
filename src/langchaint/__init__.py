@@ -40,7 +40,7 @@ from langchaint.exceptions import (
     UnknownExceptionError,
 )
 from langchaint.inference_params import InferenceParams, ReasoningEffort
-from langchaint.llm import LLM, BoundLLM, GenerationInput, HasTools, NoTools
+from langchaint.llm import LLM, BoundLLM, GenerationInput
 from langchaint.messages import (
     AssistantMessage,
     ImagePart,
@@ -109,7 +109,6 @@ __all__ = [
     "EscapedExceptionError",
     "GenerationError",
     "GenerationInput",
-    "HasTools",
     "ImagePart",
     "InferenceParams",
     "InvalidRequestError",
@@ -119,7 +118,6 @@ __all__ = [
     "MaxCompletionTokensExceededError",
     "Message",
     "MessageContent",
-    "NoTools",
     "Part",
     "ProviderDeclaredFinalError",
     "ProviderFailedTerminallyError",

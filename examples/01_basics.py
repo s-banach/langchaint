@@ -1,116 +1,55 @@
-"""Construct a model, bind it, and generate: text, structured output, rebind, and a batch.
+"""Construct a model, bind a prompt prefix onto it, and generate."""
 
-The whole surface is: pick a model function, freeze the prompt prefix with bind, then call a generate method.
-There are no generate methods on the un-bound LLM and no per-call parameter overrides; changing a parameter is rebind.
-
-The LangChain call-for-call map lives in MIGRATING_FROM_LANGCHAIN.md; this file shows the langchaint calls themselves.
-"""
-
-import asyncio
 from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import InferenceParams, to_tables
+from langchaint import ImagePart, InferenceParams, Message, TextPart, UserMessage, to_tables
 from langchaint.openai import openai_model
 
 
-async def plain_text() -> None:
-    """Generate one text turn.
-
-    openai_model reads OPENAI_API_KEY from the environment and returns an LLM.
-    Swapping providers is one import: anthropic_model("claude-sonnet-5") returns an LLM with the same surface.
-    bind() with no response_format returns BoundLLM[str], so response.output is the assistant text.
-    A bare str is shorthand for a Sequence[Message] of one user turn holding that text.
-    automatic_prompt_caching is required on every bind with no default, because caching changes billing;
-    these one-shot prompts reuse no prefix, so False. 02_tool_loop.py shows the case where True pays.
-    """
-    llm = openai_model("gpt-5.6-terra")
-    assistant = llm.bind(
-        system_prompt="You are a terse assistant.", automatic_prompt_caching=False
-    )
-    response = await assistant.generate_one("Name three primary colors.")
-    print(response.output)
-    print(f"{response.usage.cost_in_usd:.6f} USD, {response.usage.output_tokens} output tokens")
-
-
+# bind(response_format=...) sends this docstring to the provider as the schema description.
 class Sentiment(BaseModel):
-    """The structured output shape; the model's JSON is parsed into this."""
+    """The sentiment of one text, and how confident you are."""
 
     label: Literal["positive", "negative", "neutral"]
     confidence: float
 
 
-async def structured_output() -> None:
-    """Fix the output type to a model with bind(response_format=Model).
+async def basics() -> None:
+    """Bind a prefix, generate text, parse structured output, rebind, then run a batch.
 
-    The overload makes this a BoundLLM[Sentiment], so response.output is a Sentiment instance, already validated.
-    A refusal or a truncation on this structured path raises a GenerationError rather than returning bad data;
-    see 05_rate_limiting_and_errors.py for catching those.
+    Raises:
+        GenerationError: any terminal outcome of a generate_one call.
     """
     llm = openai_model("gpt-5.6-terra")
-    classifier = llm.bind(
-        system_prompt="Classify the sentiment of the user's message.",
-        response_format=Sentiment,
-        automatic_prompt_caching=False,
-    )
-    response = await classifier.generate_one("This is the best day I have had in months.")
-    sentiment = response.output
-    print(sentiment.label, sentiment.confidence)
 
+    assistant = llm.bind(system_prompt="Be terse.", automatic_prompt_caching=False)
 
-async def rebind_to_change_a_parameter() -> None:
-    """Change a bound parameter with rebind, which returns a new BoundLLM; the original is unchanged.
+    colors = await assistant.generate_one("Name three primary colors.")
+    print(f"answer: {colors.output}")
+    print(f"paid: {colors.usage.cost_in_usd} USD")
 
-    rebind carries the same overloads as bind, so rebind(response_format=None) switches the output type back to str.
-    A left-out field keeps its current value; inference_params is replaced whole, never merged field-wise.
-    """
-    llm = openai_model("gpt-5.6-terra")
-    base = llm.bind(
-        system_prompt="Answer in one sentence.",
-        inference_params=InferenceParams(max_completion_tokens=256),
-        automatic_prompt_caching=False,
-    )
-    longer = base.rebind(inference_params=InferenceParams(max_completion_tokens=2048))
-    response = await longer.generate_one("Explain how a suspension bridge carries load.")
-    print(response.output)
-
-
-async def batch_to_tables() -> None:
-    """Run an order-aligned batch with generate_many; flatten every result to two tables with to_tables.
-
-    A terminal per-item failure comes back as a GenerationError in its slot rather than raising, so the batch finishes;
-    to_tables fills the same columns for a success and a failure, so the mixed list is one pair of tables.
-    The output of each item is on its calls row and what each request billed is on its attempts rows,
-    so totalling the batch's spend is a sum over the attempts table.
-    Concurrency is bounded by the shared RateLimiter's max_in_flight (see 05_rate_limiting_and_errors.py).
-    """
-    llm = openai_model("gpt-5.6-terra")
-    summarizer = llm.bind(
-        system_prompt="Summarize in five words.",
-        automatic_prompt_caching=False,
-    )
-    documents = [
-        "The quarterly report shows revenue up twelve percent on strong subscription growth.",
-        "Heavy rain closed three mountain passes and stranded weekend hikers overnight.",
-        "The new compiler release cuts build times roughly in half on large projects.",
+    image_question: list[Message] = [
+        UserMessage(
+            content=[
+                TextPart(text="What color is this image?"),
+                ImagePart(data=b"<png bytes>", media_type="image/png"),
+            ]
+        )
     ]
-    results = await summarizer.generate_many(documents)
+    image_answer = await assistant.generate_one(image_question)
+    print(f"about the image: {image_answer.output}")
+
+    classifier = llm.bind(response_format=Sentiment, automatic_prompt_caching=False)
+    sentiment = (await classifier.generate_one("Best day I have had in months.")).output
+    print(f"{sentiment.label} at {sentiment.confidence} confidence")
+
+    # inference_params replaces the bound one whole: a field left out of it is None.
+    longer = assistant.rebind(inference_params=InferenceParams(max_completion_tokens=2048))
+    bridge = await longer.generate_one("How does a suspension bridge carry load?")
+    print(f"longer answer: {bridge.output}")
+
+    results = await assistant.generate_many(["Define entropy.", "Define enthalpy."])
     calls, attempts = to_tables(results)
-    for row in calls:
-        print(row["call_id"], "|", row["output"])
-    for row in attempts:
-        print(row["call_id"], "|", row["attempt_index"], "|", row["cost_in_usd"])
-    # pandas.DataFrame(calls) and pandas.DataFrame(attempts) are the two frames, joined on call_id.
-
-
-async def main() -> None:
-    """Run every snippet in this file."""
-    await plain_text()
-    await structured_output()
-    await rebind_to_change_a_parameter()
-    await batch_to_tables()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"{len(calls)} calls over {len(attempts)} attempts")

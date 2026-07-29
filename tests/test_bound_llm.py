@@ -25,11 +25,9 @@ from langchaint import (
     EmptyTurnError,
     EscapedExceptionError,
     GenerationError,
-    HasTools,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
     Message,
-    NoTools,
     ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RateLimiter,
@@ -1643,33 +1641,37 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
     output is optional on one binding only: structured plus a ToolManager, whose turn may be the tool
     calls. A text binding never types it optional, a tool-call turn's text being "" and not None.
     Every transition is exact, so dropping the ToolManager drops the None with it.
+    It also pins tool_manager's own type, which is what a tool loop dispatches through.
     """
     llm = LLM(_FakeAdapter())
     tool_manager = ToolManager([])
 
     text = llm.bind(automatic_prompt_caching=True)
-    assert_type(text, BoundLLM[str, NoTools])
+    assert_type(text, BoundLLM[str, None])
     text_with_tools = llm.bind(tool_manager=tool_manager, automatic_prompt_caching=True)
-    assert_type(text_with_tools, BoundLLM[str, HasTools])
+    assert_type(text_with_tools, BoundLLM[str, ToolManager])
     structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
-    assert_type(structured, BoundLLM[_Answer, NoTools])
+    assert_type(structured, BoundLLM[_Answer, None])
     structured_with_tools = llm.bind(
         response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
     )
-    assert_type(structured_with_tools, BoundLLM[_Answer, HasTools])
+    assert_type(structured_with_tools, BoundLLM[_Answer, ToolManager])
 
-    # BoundLLM[X] is BoundLLM[X, NoTools]: the PEP 696 default keeps the common annotation short.
+    # BoundLLM[X] is BoundLLM[X, None]: the PEP 696 default keeps the common annotation short.
     assert_type(structured, BoundLLM[_Answer])
 
-    assert_type(structured.rebind(tool_manager=tool_manager), BoundLLM[_Answer, HasTools])
-    assert_type(structured_with_tools.rebind(tool_manager=None), BoundLLM[_Answer, NoTools])
-    assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, HasTools])
-    assert_type(structured_with_tools.rebind(response_format=None), BoundLLM[str, HasTools])
-    assert_type(structured_with_tools.rebind(system_prompt="s"), BoundLLM[_Answer, HasTools])
+    assert_type(text_with_tools.tool_manager, ToolManager)
+    assert_type(text.tool_manager, None)
+
+    assert_type(structured.rebind(tool_manager=tool_manager), BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(tool_manager=None), BoundLLM[_Answer, None])
+    assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(response_format=None), BoundLLM[str, ToolManager])
+    assert_type(structured_with_tools.rebind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
 
 
 async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) -> None:
-    """Pin the return types the ToolsT overloads produce, which is what the parameter is for.
+    """Pin the return types the ToolManagerT overloads produce, which is what the parameter is for.
 
     Never called: pyrefly checks this body, and the assertions are about types alone. Running it
     would need a structured fake that sends, which _FakeStructuredBoundAdapter deliberately is not.

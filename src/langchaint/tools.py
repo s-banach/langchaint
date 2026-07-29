@@ -19,8 +19,8 @@ stop, route, escalate, and needs-approval are decisions the application makes in
 reading app_data or is_error.
 The application owns that loop and langchaint ships no agent loop of its own,
 so a control-flow return channel (a goto or an engine-state update smuggled through a tool's return value) is forbidden.
-No signature introspection and no docstring scraping: name, description, and schema are explicit,
-so what the provider sees is exactly what the code states.
+No signature introspection and no docstring scraping: name, description, and schema are explicit.
+An args_model's docstring and field descriptions reach the provider inside its model_json_schema().
 """
 
 import asyncio

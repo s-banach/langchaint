@@ -48,8 +48,8 @@ asyncio.run(main())
 ```
 
 `bind(response_format=Sentiment)` returns a `BoundLLM[Sentiment]`, so `response.output` is a validated `Sentiment` instance; without `response_format`, `output` is the assistant text.
-A bare `str` argument is shorthand for a `Sequence[Message]` of one `UserMessage` holding that text.
-`examples/` holds runnable files and `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
+A bare `str` generation_input is shorthand for `[UserMessage(content=generation_input)]`.
+`examples/` holds one snippet file per subject and `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
 
 ## What it has
 
@@ -58,28 +58,28 @@ A bare `str` argument is shorthand for a `Sequence[Message]` of one `UserMessage
 `BoundLLM` has `generate_one`, `generate_many`, and `stream_one`.
 
 **A constructor per backend returning a ready `LLM`.**
-`openai_model(...)`, `anthropic_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`; models outside a catalog are built directly from the re-exported adapter.
+`openai_model(...)`, `anthropic_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.
 
 **One accounting contract for success and failure.**
-Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`, but both carry `usage`, the paid total across every attempt, and `to_tables` flattens either to a calls table and an attempts table, so a mixed batch is one pair of tables.
+Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`.
+Both carry `usage`, the paid total across every attempt.
 
 **Priced usage.**
-`Usage` partitions input tokens by cache outcome, counts reasoning output separately, and carries one cost per priced category, priced at the service tier the response reported; `cost_in_usd` is their sum and the raw SDK usage rides beside it.
+`Usage` partitions input tokens by cache outcome and carries one cost per priced category; `cost_in_usd` is their sum.
 
 **One `RateLimiter` owning retrying and pacing.**
-One instance shared by several `LLM`s is one budget for the account they hit, gating every request start; a rate-limit error pauses admission for everyone sharing it.
-The SDK clients are configured to never retry beneath langchaint, so attempt counts stay true.
+One instance shared by several `LLM`s is one budget for the account they hit.
 
 **User-stated prompt caching.**
 `automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.
-`cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part; the wire mechanics are in the adapter module docstrings.
+`cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part.
 
 **Streaming as a handle.**
 `stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCall` items, with `await handle.final()` returning the assembled `Response`.
 
 **Tools under one protocol.**
-`PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` (the structured exit for a `tool_choice="required"` loop) share the `Tool` protocol, so one `ToolManager` holds a mix and an application adds its own form by implementing `Tool`.
-`ToolManager.dispatch` returns an outcome union; every arm carries the `tool_message` to append, and bad arguments or an unknown tool name become an outcome the model can correct rather than a raise.
+`PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` share the `Tool` protocol.
+One `ToolManager` holds a mix, and an application adds its own form by implementing `Tool`.
 
 **Reasoning preserved across turns.**
 Every provider reasoning element is re-sent verbatim on later requests, so tool-use continuations satisfy each provider's replay rules without application code.
@@ -89,19 +89,11 @@ Every provider reasoning element is re-sent verbatim on later requests, so tool-
 
 ## What it does not have
 
-Deliberate absences, each with its reason recorded in `CLAUDE.md` or a module docstring:
-
 - No agent class and no agent loop: the loop is ~15 lines of application code, shown in `examples/02_tool_loop.py`, and a tool returns data, never a control-flow signal.
-- No per-call parameter overrides: changing parameters is `rebind`.
-- No default for `automatic_prompt_caching`: every `bind` states it.
-- No `requests_per_minute`: throughput under the `max_in_flight` bound follows request duration, while a client-side rate number goes stale with the account tier.
-- No Converse adapter for Bedrock: the adapters take the SDKs' bundled Bedrock clients.
-- No provider-parameter passthrough dict: an unmapped provider parameter is reached by subclassing the concrete adapter.
-- No hand-written wire types and no client-side guessing at provider rules: stream assembly and structured-output parsing are the SDK's, and invalid inputs are sent so the provider's own error surfaces.
-- No partial tool-call arguments, usage, or stop reason in a stream: a tool call is yielded once complete, and `usage` and `stop_reason` live on `final()`'s `Response`.
+- No client-side guessing at provider rules.
 - No document or PDF part: convert before sending, rasterizing pages to `ImagePart` or extracting the text layer to `TextPart`.
 
-A Chat Completions adapter, and with it third-party compatible servers such as vLLM and Ollama, is not built yet; OpenAI support is the Responses API.
+No Chat Completions adapter is built yet; OpenAI support is the Responses API.
 
 ## Layout
 
@@ -109,13 +101,9 @@ A Chat Completions adapter, and with it third-party compatible servers such as v
     src/langchaint/anthropic/ the anthropic backend
     src/langchaint/openai/    the openai backend
     src/langchaint/tracing/   the OTel tracing subpackage
-    examples/                 runnable examples and MIGRATING_FROM_LANGCHAIN.md
-    CLAUDE.md                 design tenets, naming rules, and the per-module map
-
-Module docstrings are the spec of record for mechanics; `CLAUDE.md` holds the design rules.
+    examples/                 one snippet file per subject and MIGRATING_FROM_LANGCHAIN.md
 
 ## Verification
 
-Run `scripts/CI.sh`; everything it runs must pass with zero errors.
+Run `scripts/CI.sh`.
 The tests are offline and need no API keys.
-Provider behavior claims are verified by introspection against anthropic 0.120.0 and openai 2.45.0.

@@ -76,7 +76,6 @@ from langchaint import (
     DispatchHandled,
     DispatchManyOutcome,
     GenerationError,
-    HasTools,
     Message,
     PydanticTool,
     Response,
@@ -287,7 +286,7 @@ class ReActAgent(AgentRun):
     `timeout_seconds`, the events go out through on_event, and the span is the base class's business.
     """
 
-    def __init__(  # noqa: PLR0913 (the five arguments every run needs plus this loop's bound, tool_manager and prompt)
+    def __init__(
         self,
         *,
         agent_path: str,
@@ -295,8 +294,7 @@ class ReActAgent(AgentRun):
         tracer: Tracer,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
-        bound: TracedBoundLLM[str, HasTools],
-        tool_manager: ToolManager,
+        bound: TracedBoundLLM[str, ToolManager],
         prompt: str,
     ) -> None:
         """Add what this loop needs on top of what every run needs."""
@@ -308,7 +306,6 @@ class ReActAgent(AgentRun):
             on_event=on_event,
         )
         self.bound = bound
-        self.tool_manager = tool_manager
         self.prompt = prompt
         self.turn_number = 0
         self.tool_calls_made = 0
@@ -401,7 +398,7 @@ class ReActAgent(AgentRun):
         Every call is announced before any dispatch starts, so a UI shows the whole fan-out at once
         rather than one call appearing per completion.
         A call over config.max_tool_calls is declined through dispatch_many's precomputed argument,
-        so one dispatch_many call answers the whole batch, declines slotted in call order.
+        so one dispatch_many call answers the whole batch, with declines in call order.
 
         Raises:
             DispatchExceptionGroup: one or more tool functions raised. Its completed_outcomes are
@@ -437,7 +434,7 @@ class ReActAgent(AgentRun):
             )
 
         try:
-            outcomes = await self.tool_manager.dispatch_many(
+            outcomes = await self.bound.tool_manager.dispatch_many(
                 tool_calls, precomputed=_decline_over_budget
             )
         except DispatchExceptionGroup as group:
@@ -580,7 +577,6 @@ def build_delegate_tool(
                 tool_manager=tool_manager,
                 automatic_prompt_caching=True,
             ),
-            tool_manager=tool_manager,
             prompt=args.question,
         )
         try:
@@ -673,7 +669,6 @@ class App:
                 tool_manager=tool_manager,
                 automatic_prompt_caching=True,
             ),
-            tool_manager=tool_manager,
             prompt=prompt,
         )
 

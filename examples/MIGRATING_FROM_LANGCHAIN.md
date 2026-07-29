@@ -2,78 +2,80 @@
 
 langchaint is a thin, provider-neutral client over the official anthropic and openai SDKs.
 It has no chains, no runnables, no middleware stack, and no agent class.
-Most LangChain abstractions map to one plain call or to code you write in a loop you own.
-This guide gives the call-for-call map, then explains what replaces the middleware layer.
 
 ## API map
 
 | LangChain | langchaint |
 | --- | --- |
 | `ChatOpenAI(...)`, `init_chat_model(...)` | `openai_model("gpt-5.6-terra")` (or `anthropic_model("claude-sonnet-5")`), returns an `LLM` |
-| `model.invoke(messages)` | `llm.bind(...).generate_one(generation_input)`, returns a `Response` |
+| `model.invoke(messages)` | `llm.bind(...).generate_one(messages)`, returns a `Response` |
 | `model.ainvoke(...)` | `generate_one` is already async; there is no sync API |
 | `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([PydanticTool(...)]))` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
 | `model.batch([...])`, `model.abatch([...])` | `bound.generate_many([...])`, returns `list[Response \| GenerationError]` |
-| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)`, iterate `str \| ReasoningDelta \| ToolCall`, `await handle.final()` for the `Response` |
+| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)` gives a handle: iterate `str \| ReasoningDelta \| ToolCall`, then `await handle.final()` for the `Response` |
 | `astream_events(...)` to catch tool calls | the same `stream_one` iterator yields each completed `ToolCall` |
 | `create_react_agent(...)`, `AgentExecutor` | own the loop over `generate_one` and `ToolManager.dispatch` (see `02_tool_loop.py`) |
-| a tool returning `Command(goto=/update=)` | not supported by design; a tool returns data, the app routes between turns |
+| a tool returning `Command(goto=/update=)` | a tool returns data; the app routes between turns |
 | `RunnableRetry`, per-model `max_retries` | `RateLimiter(max_attempts=...)`, one instance shared across `LLM`s |
 | `InMemoryRateLimiter`, rate-limit middleware | `RateLimiter(max_in_flight=...)`, one shared account budget |
 | `.with_fallbacks([...])` | app-level `try`/`except` over two bindings (see below) |
 | `set_llm_cache(...)` client-side cache | provider prompt caching via `automatic_prompt_caching`, required on `bind` (no client cache) |
-| callbacks, LangSmith tracing | `langchaint.tracing.TracedLLM` over any OTel exporter (see `04_tracing.py`) |
-| `temperature=`, `top_p=`, `seed=` on the model | not exposed; `InferenceParams` carries only `max_completion_tokens` and `reasoning_effort` |
-| `SystemMessage` in the message list | `system_prompt=` on `bind`, frozen into the binding |
+| callbacks, LangSmith tracing | `langchaint.tracing.TracedLLM` over any OTel exporter (see `08_tracing.py`) |
+| `temperature=` on the model | `InferenceParams(temperature=...)` on `bind` |
+| `top_p=`, `seed=` on the model | subclass the adapter to send a provider parameter `InferenceParams` does not carry |
+| `SystemMessage` in the message list | `system_prompt=` on `bind` |
 | `HumanMessage` / `AIMessage` / `ToolMessage` | `UserMessage` / `AssistantMessage` / `ToolMessage` |
 
 ## The middleware layer: own the loop instead
 
-LangChain's agent middleware hooks (`before_model`, `after_model`, `modify_model_request`, `wrap_tool_call`, and the rest) exist because the framework owns the loop and lets you splice code into it.
-langchaint ships no loop, so there is nothing to splice into: each hook is plain code at the matching point in the loop you write.
+langchaint ships no loop.
+Each hook is plain code at the matching point in the loop you write.
 
 | Middleware hook | Where it goes in your loop |
 | --- | --- |
-| `before_model` | a statement before `await bound.generate_one(generation_input)` |
+| `before_model` | a statement before `await bound.generate_one(messages)` |
 | `after_model` | a statement after it, inspecting the `Response` (`stop_reason`, `tool_calls`, `usage`) |
-| `modify_model_request` | `bound = bound.rebind(...)` before the next turn; the binding is the request shape |
-| `wrap_tool_call`, tool error handling | `dispatch` already returns an is_error tool message for bad names and bad arguments; wrap your own code around the `dispatch` call |
-| human-in-the-loop / interrupts | check `call.name` (or a tool's `app_data`) between turns and decide; a declined call is an is_error `ToolMessage` you append (see `run_agent`'s `approve` gate) |
+| `modify_model_request` | `bound = bound.rebind(...)` before the next turn |
+| `wrap_tool_call`, tool error handling | wrap your own code around the `dispatch` call; `dispatch` answers a bad name or bad arguments with an is_error `ToolMessage` |
+| running one turn's tool calls concurrently | `ToolManager.dispatch_many(tool_calls)` (see `02_tool_loop.py`) |
+| human-in-the-loop / interrupts | `dispatch_many(tool_calls, precomputed=...)`; the `ToolMessage` you return replaces the tool run (see `approve_or_deny` in `02_tool_loop.py`) |
 | summarization / message trimming | edit the `messages` list you hold before the next turn |
-| structured-output middleware | `bind(response_format=Model)`; a refusal or truncation raises a `GenerationError` you catch |
-| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, smaller than `usage` wherever a failed attempt billed. Or `to_tables(results)` for a calls table and an attempts table, where per-attempt spend and the rates that priced it sit in their own rows. |
-
-The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full `Sequence[Message]` in scope.
+| structured-output middleware | `bind(response_format=Model)`; a refusal or a truncation raises a `GenerationError` |
+| usage / cost tracking | bill on `response.usage.cost_in_usd`, the paid total across every attempt. `response.usage_successful_attempt` is the kept answer's own usage, smaller wherever a failed attempt billed. Or `to_tables(results)` for a calls table and an attempts table |
 
 ## From LangGraph
 
-`StateGraph` nodes and conditional edges are plain control flow in the loop you own, and the middleware table above covers the `create_agent` hooks. Three mappings are specific to LangGraph apps.
+`StateGraph` nodes and conditional edges are plain control flow in the loop you own.
+The middleware table above covers the `create_agent` hooks.
 
 | LangGraph | langchaint |
 | --- | --- |
-| summing `AIMessage.usage_metadata` across turns to bill a run | `response.usage` is the paid total across retries and carries `cost_in_usd`; `Usage.sum_of` folds a run, and a call its deadline cut off reports its settled spend on `TimedOutError.usage` |
-| a per-call deadline as `awrap_model_call` middleware | `timeout_seconds` on the call it bounds (see `examples/10_deadlines.py`) |
-| `get_stream_writer()` and `astream(subgraphs=True)` stream a nested sub-agent progress tree to one consumer with no reference passing | no counterpart: the application owns the event stream, and `examples/full_app` (`events.py`, `harness.py`) is the runnable pattern |
+| summing `AIMessage.usage_metadata` across turns to bill a run | `Usage.sum_of(response.usage for response in responses)`, then `.cost_in_usd`. `TimedOutError.usage` accounts for a call its deadline cut off |
+| a per-call deadline as `awrap_model_call` middleware | `timeout_seconds` on the call it bounds (see `04_failures_and_deadlines.py`) |
+| `get_stream_writer()` and `astream(subgraphs=True)` stream a nested sub-agent progress tree to one consumer with no reference passing | no counterpart: the application owns the event stream (see `events.py` and `task_stream.py` in `examples/full_app`) |
 
-## Retries and rate limiting: one RateLimiter, not per-call config
+## Retries and rate limiting: one RateLimiter
 
 There is no retry setting on a generate call and no rate-limit middleware.
-One `RateLimiter` owns retrying (`max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`) and pacing (`max_in_flight`, default 8).
-It is stateful and shareable: pass one instance to every `LLM` hitting the same account and they share one budget, so a rate-limit error pauses admission for all of them until a request succeeds again.
-The runnable setup, one limiter across an openai and an anthropic model, is `shared_rate_limiter` in `05_rate_limiting_and_errors.py`.
+One `RateLimiter` owns retrying (`max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`) and pacing (`max_in_flight`).
+Pass one instance to every `LLM` hitting the same account.
+A second account gets a second instance, as in `04_failures_and_deadlines.py`.
 
-There is deliberately no `requests_per_minute`: an in-flight bound self-adjusts throughput along request duration, while a client-side rate number models one dimension of the provider's limit and goes stale with the account tier.
+There is no requests-per-minute parameter.
+Set `max_in_flight` where you would have set that number.
 
 ## Fallbacks: a try/except over two bindings
 
-There is no `.with_fallbacks`. A fallback is app code, because the app decides what counts as worth failing over.
-The runnable version, a `try`/`except GenerationError` over two bindings, is `generate_with_fallback` in `05_rate_limiting_and_errors.py`.
+There is no `.with_fallbacks`. A fallback is app code.
+Over `generate_one` it is a `try`/`except GenerationError` around a second binding.
+Over `generate_many` the failure is already a value in the returned list, so the fallback is an `isinstance` branch.
+`04_failures_and_deadlines.py` shows that form.
 
 ## Errors: success is a Response, failure is a GenerationError
 
-`generate_one` returns a `Response` on success and raises on a terminal outcome.
-`GenerationError` is the base of every terminal per-item failure: `RetriesExhaustedError` (transient budget spent), `RefusalError` (no structured output: the model refused or a provider filter blocked the turn), `MaxCompletionTokensExceededError` (the structured response hit the token cap), and `InvalidRequestError` (the provider or the adapter rejected this request) among them.
+`generate_one` returns a `Response` on success and raises a `GenerationError` on a terminal failure.
 Catch `GenerationError` to handle them all at once.
-In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_tables` renders successes and failures into the same two tables.
-The runnable catch, one `try`/`except GenerationError` around a structured `generate_one`, is `catch_generation_error` in `05_rate_limiting_and_errors.py`.
+`langchaint.exceptions` names each subclass and the condition for it.
+`generate_many` returns each failure in place of that item's `Response` instead of raising.
+Reading a batch's failures back is in `04_failures_and_deadlines.py`.

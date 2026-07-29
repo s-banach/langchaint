@@ -102,8 +102,6 @@ from langchaint.llm import (
     UNCHANGED,
     BoundLLM,
     GenerationInput,
-    HasTools,
-    NoTools,
     SequenceNotStr,
     Unchanged,
 )
@@ -938,7 +936,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[ModelT, HasTools]": ...
+    ) -> "TracedBoundLLM[ModelT, ToolManager]": ...
     @overload
     def bind[ModelT: BaseModel](
         self,
@@ -950,7 +948,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[ModelT, NoTools]": ...
+    ) -> "TracedBoundLLM[ModelT, None]": ...
     @overload
     def bind(
         self,
@@ -962,7 +960,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[str, HasTools]": ...
+    ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
     def bind(
         self,
@@ -974,7 +972,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "TracedBoundLLM[str, NoTools]": ...
+    ) -> "TracedBoundLLM[str, None]": ...
     def bind(
         self,
         *,
@@ -1005,7 +1003,7 @@ class TracedLLM:
         )
 
 
-class TracedBoundLLM[OutputT, ToolsT = NoTools]:
+class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """Wraps a BoundLLM so every generate call opens a span.
 
     Every call opens one CLIENT span, one outbound call each: generate_one's own, and one per item
@@ -1017,7 +1015,9 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     RateLimiter slot waits and backoff included), so the span's own duration already carries it.
     """
 
-    def __init__(self, *, bound_llm: BoundLLM[OutputT, ToolsT], span_config: _SpanConfig) -> None:
+    def __init__(
+        self, *, bound_llm: BoundLLM[OutputT, ToolManagerT], span_config: _SpanConfig
+    ) -> None:
         """Store the wrapped BoundLLM and the span configuration; compute the span name once.
 
         span_config is TracedLLM's, unchanged; TracedLLM documents what each of its values means.
@@ -1053,8 +1053,8 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         return self._bound_llm.response_format
 
     @property
-    def tool_manager(self) -> ToolManager | None:
-        """The wrapped BoundLLM's ToolManager, so the manual tool loop reads it as it read bound.tool_manager."""
+    def tool_manager(self) -> ToolManagerT:
+        """The wrapped BoundLLM's ToolManager, or None where none was bound."""
         return self._bound_llm.tool_manager
 
     @property
@@ -1073,7 +1073,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, HasTools]": ...
+    ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
     @overload
     def rebind[NewModelT: BaseModel](
         self,
@@ -1085,10 +1085,10 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, NoTools]": ...
+    ) -> "TracedBoundLLM[NewModelT, None]": ...
     @overload
     def rebind[NewModelT: BaseModel](
-        self: "TracedBoundLLM[OutputT, ToolsT]",
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
         tool_manager: Unchanged = ...,
@@ -1097,7 +1097,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, ToolsT]": ...
+    ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
     @overload
     def rebind(
         self,
@@ -1109,7 +1109,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, HasTools]": ...
+    ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
     def rebind(
         self,
@@ -1121,10 +1121,10 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, NoTools]": ...
+    ) -> "TracedBoundLLM[str, None]": ...
     @overload
     def rebind(
-        self: "TracedBoundLLM[OutputT, ToolsT]",
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
         tool_manager: Unchanged = ...,
@@ -1133,10 +1133,10 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, ToolsT]": ...
+    ) -> "TracedBoundLLM[str, ToolManagerT]": ...
     @overload
     def rebind(
-        self: "TracedBoundLLM[OutputT, ToolsT]",
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: ToolManager,
@@ -1145,10 +1145,10 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, HasTools]": ...
+    ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
     @overload
     def rebind(
-        self: "TracedBoundLLM[OutputT, ToolsT]",
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: None,
@@ -1157,10 +1157,10 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, NoTools]": ...
+    ) -> "TracedBoundLLM[OutputT, None]": ...
     @overload
     def rebind(
-        self: "TracedBoundLLM[OutputT, ToolsT]",
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: Unchanged = ...,
@@ -1169,7 +1169,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, ToolsT]": ...
+    ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
     def rebind(
         self,
         *,
@@ -1203,21 +1203,21 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     async def generate_one(
-        self: "TracedBoundLLM[str, ToolsT]",
+        self: "TracedBoundLLM[str, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
-        self: "TracedBoundLLM[OutputT, HasTools]",
+        self: "TracedBoundLLM[OutputT, ToolManager]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
-        self: "TracedBoundLLM[OutputT, NoTools]",
+        self: "TracedBoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
@@ -1311,7 +1311,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     async def generate_many(
-        self: "TracedBoundLLM[str, ToolsT]",
+        self: "TracedBoundLLM[str, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1319,7 +1319,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     ) -> list[CallResult[str]]: ...
     @overload
     async def generate_many(
-        self: "TracedBoundLLM[OutputT, HasTools]",
+        self: "TracedBoundLLM[OutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1327,7 +1327,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     ) -> list[CallResult[OutputT | None]]: ...
     @overload
     async def generate_many(
-        self: "TracedBoundLLM[OutputT, NoTools]",
+        self: "TracedBoundLLM[OutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1366,21 +1366,21 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     def stream_one(
-        self: "TracedBoundLLM[str, ToolsT]",
+        self: "TracedBoundLLM[str, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[str]": ...
     @overload
     def stream_one(
-        self: "TracedBoundLLM[OutputT, HasTools]",
+        self: "TracedBoundLLM[OutputT, ToolManager]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[OutputT | None]": ...
     @overload
     def stream_one(
-        self: "TracedBoundLLM[OutputT, NoTools]",
+        self: "TracedBoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,

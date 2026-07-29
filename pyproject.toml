@@ -217,13 +217,14 @@ lint.pylint.max-statements = 60
 # config object would relocate the count without shrinking it.
 lint.per-file-ignores."tests/*" = ["private-member-access", "too-many-arguments"]
 
-# The examples are standalone scripts run by path (python examples/01_basics.py),
-# deliberately not an importable package, so implicit-namespace-package
-# (which would demand an examples/__init__.py) does not apply.
+# The examples are standalone snippet files, not an importable package, so
+# implicit-namespace-package (which would demand an examples/__init__.py) does
+# not apply. They are type checked and linted like the rest of the tree.
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 
-# examples/full_app/ holds the multi-agent example app whose README argues for its shape. Like the
-# numbered examples its modules are standalone scripts run by path, hence implicit-namespace-package.
+# examples/full_app/ holds the multi-agent example app, its scripted offline adapter, and the suite
+# asserting its docstrings' claims. Its modules import each other by bare name, the way they resolve
+# when run by path, so there is no examples/full_app/__init__.py and implicit-namespace-package fires.
 # blind-except is ignored because catching bare Exception around a sub-run is deliberate: a narrower
 # except turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
 # of a message the parent model can answer around. Each such except carries a comment stating

@@ -2,9 +2,9 @@
 
 The reference architecture for a multi-agent application on langchaint: a ReAct loop with sub-agents, a
 graph, and two layers of timeout streams its progress to a UI and keeps its token accounting through
-every failure. langchaint deliberately ships no
-agent loop, so the loop is application code; `task_stream.py` is the shape to copy for it, and the rest
-of these files are the app around it.
+every failure.
+langchaint ships no agent loop, so the loop is application code.
+`task_stream.py` is the shape to copy for it, and the rest of these files are the app around it.
 
 Unlike the numbered examples, this one runs offline: `harness.py` is a scripted adapter, so nothing
 reaches a network and no API key is needed.
@@ -72,6 +72,11 @@ the `AgentRun` split between `final()` and `run()`,
 the `on_event=queue.put_nowait` decoupling a consumer can choose,
 and the two capabilities that ride on contextvars.
 
+`on_event` returns `None` and runs in the run's frame, so it must be quick and synchronous.
+A consumer that blocks in it slows the run down, and it has no way to await.
+One that is slow, or must await per event, passes `on_event=queue.put_nowait` and drains the queue in its own task.
+That queue is unbounded, and a run finishes with events still in it.
+
 ## The event vocabulary
 
 `events.py` holds one frozen dataclass per event, matched by type. Every event a run emits after its
@@ -135,38 +140,3 @@ install and where, code that exists only because the mechanism is ambient. Two r
 install the value before anything reads it and reset it on the way out (`final()` does both, and a
 dispatch task created inside the run inherits the value because `create_task` copies the creating
 context), and read an ambient value at the boundary, then hold it.
-
-## Rejected shapes
-
-**The agent as an async generator**: the shape an application reaches for first, yielding events from
-inside the loop. An async generator runs in whichever context its consumer resumes it from, so a run
-deadline or a span entered around a `yield` is open while the consumer runs: the deadline measures the
-consumer's pace and cancels into the consumer's frame, and the span leaks into whatever the consumer
-opens next. Every failure mode is silent and needs a slow or abandoned consumer to appear. Here the
-application never writes a generator: `run()` emits instead of yielding, and `final()` awaits it as a
-coroutine, so a `yield` in `run()` fails loudly at `await self.run()`.
-
-**The run as an async iterator**: each run owns a queue and a task driving its loop, and a consumer
-`async for`s the events. It buys the decoupling this shape leaves to the consumer, and the price is
-spread over everything else: a task and queue per run, a run that reports itself finished with events
-still queued, and a settle step on every abandon path, because cancelling the run's task is not the
-same as it having unwound and the accounting is not final until it has. The callback keeps the tree in
-one task tree, and a consumer that wants the decoupling back passes `on_event=queue.put_nowait`.
-
-**Everything ambient**: the run registry and `on_event` through contextvars too, not just the emitter.
-It removes constructor arguments that never vary per run, at the price of turning a missing value
-into a runtime `LookupError`; the emitter is the one value that earns that price, because tools cannot
-be threaded a reference.
-
-## What would change the recommendation
-
-The shape assumes one thing this app happens to be true of, and an application it is false of should
-choose differently.
-
-**That `on_event` is quick and synchronous.** It returns `None` and runs in the run's frame, so a
-consumer that blocks in it slows the run down and it has no way to await. That is correct for an `on_event`
-that renders a line or appends to a list. A consumer that is slow, or must await per event (feeding a
-rate-limited socket), fronts it with a queue: `on_event=queue.put_nowait` is constant-time, and the
-drain loop is the consumer's own task, paced by the consumer. That choice re-creates the iterator
-shape's costs for that consumer alone: the queue is unbounded, and a run finishes with events still
-queued.

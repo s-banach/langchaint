@@ -186,23 +186,6 @@ def _bind_adapter(
     return adapter.bind_structured(binding, response_format)
 
 
-class NoTools:
-    """Type-level marker: a binding that bound no ToolManager, so no turn can be a tool call.
-
-    Never instantiated. It and HasTools are the two values of BoundLLM's second type parameter,
-    which is what lets the request methods type output as the instance itself rather than as
-    optional: a binding that cannot receive a tool call always produces the output it was bound for.
-    """
-
-
-class HasTools:
-    """Type-level marker: a binding that bound a ToolManager, so a turn may be a tool call.
-
-    Never instantiated; the counterpart of NoTools, whose docstring states what the pair is for.
-    A structured binding marked this way types its output optional, None being the tool-call turn.
-    """
-
-
 class GenerateItem[OutputT](Protocol):
     """Runs one item of a batch.
 
@@ -259,7 +242,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[ModelT, HasTools]": ...
+    ) -> "BoundLLM[ModelT, ToolManager]": ...
     @overload
     def bind[ModelT: BaseModel](
         self,
@@ -271,7 +254,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[ModelT, NoTools]": ...
+    ) -> "BoundLLM[ModelT, None]": ...
     @overload
     def bind(
         self,
@@ -283,7 +266,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[str, HasTools]": ...
+    ) -> "BoundLLM[str, ToolManager]": ...
     @overload
     def bind(
         self,
@@ -295,7 +278,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         automatic_prompt_caching: bool,
-    ) -> "BoundLLM[str, NoTools]": ...
+    ) -> "BoundLLM[str, None]": ...
     def bind(
         self,
         *,
@@ -311,8 +294,8 @@ class LLM:
 
         response_format=Model gives BoundLLM[Model] whose output is a validated Model.
         Absent, bind gives BoundLLM[str] whose output is the assistant text.
-        Passing a tool_manager gives the HasTools form, whose structured request methods type output
-        as optional because a tool-call turn parses no instance; see BoundLLM.
+        Passing a tool_manager gives the BoundLLM[Model, ToolManager] form, whose structured request
+        methods type output as optional because a tool-call turn parses no instance; see BoundLLM.
         A caller holding a ToolManager | None gets the union of the two forms, whose request methods
         return the optional type, which is what a caller who does not know can act on.
         automatic_prompt_caching has no default: caching changes billing,
@@ -339,18 +322,23 @@ class LLM:
         )
 
 
-class BoundLLM[OutputT, ToolsT = NoTools]:
+class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """One frozen prefix plus the request methods; constructed by LLM.bind.
 
     OutputT is what the binding asks the model for: str, or the response_format instance.
-    ToolsT is NoTools or HasTools, and says whether a tool_manager was bound. It is what the request
-    methods overload on: a structured HasTools binding types its output OutputT | None, None being
-    the tool-call turn, and every other combination types it OutputT. Keeping the None out of OutputT
-    is what lets rebind add and remove a tool_manager and get the output type right both ways.
-    The parameter defaults to NoTools, so BoundLLM[Model] annotates the common binding and a
-    tool-bound one names both, BoundLLM[Model, HasTools].
+    ToolManagerT is the bound tool_manager's type, ToolManager or None.
+    The tool_manager property returns it.
+    A tool loop therefore dispatches through the binding it was handed.
+    ToolManagerT is also what the request methods overload on.
+    A structured BoundLLM[Model, ToolManager] types its output OutputT | None.
+    That None is the tool-call turn; every other combination types the output OutputT.
+    Keeping the None out of OutputT is what lets rebind add and remove a tool_manager.
+    The output type is then right both ways.
+    The parameter defaults to None, so BoundLLM[Model] annotates the common binding.
+    A tool-bound one names both, BoundLLM[Model, ToolManager].
+    bind writes ToolManager as the type argument for every manager, subclasses included.
 
-    tool_manager is kept for tool dispatch (the manual tool loop reads it);
+    tool_manager is kept for tool dispatch;
     the provider only ever sees the converted schemas inside the binding.
     """
 
@@ -361,16 +349,26 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         bound_adapter: BoundAdapter[OutputT | None],
         response_format: type[OutputT] | None,
         binding: Binding,
-        tool_manager: ToolManager | None,
+        tool_manager: ToolManagerT,
         rate_limiter: RateLimiter,
     ) -> None:
         """Store the frozen pieces; called by LLM.bind and rebind only."""
         self.adapter = adapter
         self.binding = binding
         self.response_format = response_format
-        self.tool_manager = tool_manager
         self.rate_limiter = rate_limiter
         self._bound_adapter = bound_adapter
+        self._tool_manager = tool_manager
+
+    @property
+    def tool_manager(self) -> ToolManagerT:
+        """The bound ToolManager, or None where none was bound.
+
+        A property, not an attribute, so ToolManagerT stays covariant.
+        An attribute is written as well as read, so its parameter would be invariant.
+        A structured binding then named by a ToolManager subclass would match no request method.
+        """
+        return self._tool_manager
 
     @overload
     def rebind[NewModelT: BaseModel](
@@ -383,7 +381,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, HasTools]": ...
+    ) -> "BoundLLM[NewModelT, ToolManager]": ...
     @overload
     def rebind[NewModelT: BaseModel](
         self,
@@ -395,10 +393,10 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, NoTools]": ...
+    ) -> "BoundLLM[NewModelT, None]": ...
     @overload
     def rebind[NewModelT: BaseModel](
-        self: "BoundLLM[OutputT, ToolsT]",
+        self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
         tool_manager: Unchanged = ...,
@@ -407,7 +405,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[NewModelT, ToolsT]": ...
+    ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
     @overload
     def rebind(
         self,
@@ -419,7 +417,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[str, HasTools]": ...
+    ) -> "BoundLLM[str, ToolManager]": ...
     @overload
     def rebind(
         self,
@@ -431,10 +429,10 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[str, NoTools]": ...
+    ) -> "BoundLLM[str, None]": ...
     @overload
     def rebind(
-        self: "BoundLLM[OutputT, ToolsT]",
+        self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
         tool_manager: Unchanged = ...,
@@ -443,10 +441,10 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[str, ToolsT]": ...
+    ) -> "BoundLLM[str, ToolManagerT]": ...
     @overload
     def rebind(
-        self: "BoundLLM[OutputT, ToolsT]",
+        self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: ToolManager,
@@ -455,10 +453,10 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, HasTools]": ...
+    ) -> "BoundLLM[OutputT, ToolManager]": ...
     @overload
     def rebind(
-        self: "BoundLLM[OutputT, ToolsT]",
+        self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: None,
@@ -467,10 +465,10 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, NoTools]": ...
+    ) -> "BoundLLM[OutputT, None]": ...
     @overload
     def rebind(
-        self: "BoundLLM[OutputT, ToolsT]",
+        self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
         tool_manager: Unchanged = ...,
@@ -479,7 +477,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
-    ) -> "BoundLLM[OutputT, ToolsT]": ...
+    ) -> "BoundLLM[OutputT, ToolManagerT]": ...
     def rebind(
         self,
         *,
@@ -491,11 +489,11 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "BoundLLM[Any, Any]":
-        """Replace bound fields; a left-out field keeps its current value.
+        """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
 
         response_format and tool_manager are the two fields whose change alters the static output
-        type, so they drive the overload return type: the first sets OutputT, the second sets ToolsT,
-        and leaving either out keeps what this binding has. Every combination is exact, including
+        type, so they drive the overload return type: the first sets OutputT, the second sets
+        ToolManagerT, and leaving either out keeps what this binding has. Every combination is exact, including
         dropping a tool_manager, which is what returns a structured binding to a non-optional output.
         Replace semantics: a passed inference_params replaces the bound one whole, never field-wise.
         Every rebind converts the binding to SDK keyword arguments again, a pure conversion with no I/O.
@@ -827,21 +825,21 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     async def generate_one(
-        self: "BoundLLM[str, ToolsT]",
+        self: "BoundLLM[str, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
-        self: "BoundLLM[OutputT, HasTools]",
+        self: "BoundLLM[OutputT, ToolManager]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
-        self: "BoundLLM[OutputT, NoTools]",
+        self: "BoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
@@ -929,7 +927,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     async def generate_many(
-        self: "BoundLLM[str, ToolsT]",
+        self: "BoundLLM[str, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -937,7 +935,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     ) -> list[CallResult[str]]: ...
     @overload
     async def generate_many(
-        self: "BoundLLM[OutputT, HasTools]",
+        self: "BoundLLM[OutputT, ToolManager]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -945,7 +943,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     ) -> list[CallResult[OutputT | None]]: ...
     @overload
     async def generate_many(
-        self: "BoundLLM[OutputT, NoTools]",
+        self: "BoundLLM[OutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
@@ -1077,21 +1075,21 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     @overload
     def stream_one(
-        self: "BoundLLM[str, ToolsT]",
+        self: "BoundLLM[str, ToolManagerT]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[str]: ...
     @overload
     def stream_one(
-        self: "BoundLLM[OutputT, HasTools]",
+        self: "BoundLLM[OutputT, ToolManager]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT | None]: ...
     @overload
     def stream_one(
-        self: "BoundLLM[OutputT, NoTools]",
+        self: "BoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,

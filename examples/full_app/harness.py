@@ -8,6 +8,7 @@ delay_seconds on a turn makes send suspend, which is how the timeout layers get 
 
 import asyncio
 import itertools
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import override
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from langchaint import (
     LLM,
     AssistantMessage,
+    Billing,
     Message,
     RateLimiter,
     TextPart,
@@ -30,7 +32,9 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
+    RequestParams,
 )
+from langchaint.call import ResponseIdentity
 
 
 class FakeRaw(BaseModel):
@@ -70,6 +74,18 @@ _TURN_USAGE = Usage(
 The costs are stated, not priced from the counters.
 A real adapter prices what the provider reported; this one reports round numbers.
 """
+
+
+_TURN_BILLING = Billing(
+    usage=_TURN_USAGE,
+    service_tier="scripted",
+    usage_raw=None,
+    input_cache_none_usd_per_million_tokens=60.00,
+    cache_read_usd_per_million_tokens=6.00,
+    cache_write_usd_per_million_tokens=75.00,
+    output_usd_per_million_tokens=200.00,
+)
+"""The rates behind _TURN_USAGE's costs, so counter times rate reproduces each stated cost."""
 
 
 @dataclass
@@ -129,6 +145,18 @@ def _tag_of(binding: Binding) -> str:
     return "default"
 
 
+@dataclass(frozen=True, kw_only=True)
+class _ScriptedRequest(RequestParams):
+    """What a scripted send would have put on the wire, which is the conversation and nothing else."""
+
+    conversation: tuple[Message, ...]
+
+    @override
+    def as_json(self) -> str:
+        """Render the conversation as a JSON array of each message's dump."""
+        return json.dumps([message.model_dump(mode="json") for message in self.conversation])
+
+
 class _ScriptedBoundAdapter(BoundAdapter[str]):
     """Plays one agent's scripted turns in order."""
 
@@ -137,9 +165,22 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         self._tag = tag
 
     @override
-    def usage_from_raw(self, raw: BaseModel) -> Usage:
+    def billing_from_raw(self, raw: BaseModel) -> Billing:
         """Report what one scripted turn bills, the same round numbers for every turn."""
-        return _TURN_USAGE
+        return _TURN_BILLING
+
+    @override
+    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+        """Name the scripted model and derive both ids from the turn this response came from.
+
+        Raises:
+            TypeError: raw is not a FakeRaw.
+        """
+        return ResponseIdentity(
+            model_served="scripted-model",
+            response_id=f"turn-{_turn_index(raw)}",
+            request_id=f"req-{_turn_index(raw)}",
+        )
 
     @override
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
@@ -163,7 +204,12 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    async def send(self, conversation: Sequence[Message]) -> FakeRaw:
+    def build_request(self, conversation: Sequence[Message]) -> RequestParams:
+        """Build the request the scripted sends ignore; the script decides what comes back."""
+        return _ScriptedRequest(conversation=tuple(conversation))
+
+    @override
+    async def send(self, request: RequestParams) -> FakeRaw:
         """Return a response naming the next scripted turn for this tag, after its delay.
 
         Raises:
@@ -183,8 +229,8 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         return FakeRaw(turn_index=turn_index)
 
     @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
-        """Reject a stream open: the example uses generate_one only."""
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Reject a stream open: the example never streams."""
         raise NotImplementedError
 
 

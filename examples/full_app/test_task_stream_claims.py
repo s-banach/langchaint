@@ -2,9 +2,9 @@
 
 Two of these are the reason the module has its shape.
 
-The first is the accounting claim: the totals are final the moment an app deadline's except runs,
-with no settling step, because the cancellation unwinds the whole tree before it propagates and every
-record was written where the spend happened.
+The first is the accounting claim: a call its own deadline cut off is on its run's turn_log and the
+run carries on from it, because langchaint owns that deadline and hands the loop a TimedOutError
+while the loop is still there to catch it.
 
 The second is the reach claim: a tool function reports into the on_event of whichever run dispatched
 it through the ambient GuiEmitter, with no emitter parameter on any tool.
@@ -31,9 +31,9 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from scenario import build_scripts
-from task_stream import AgentRun, App, ReActAgent, build_delegate_tool
+from task_stream import AgentRun, App, LlmFailure, build_delegate_tool
 
-from langchaint import AbandonedCall
+from langchaint import TimedOutError
 from langchaint.tracing import TracedLLM
 
 
@@ -41,10 +41,16 @@ def _discard(event: Event) -> None:
     """Drop the event; a test using this reads the runs and the totals instead."""
 
 
-def _abandoned_count(app: App) -> int:
-    """Count the AbandonedCall records across every run's turn_log, folded after the run."""
+def _timed_out_count(app: App) -> int:
+    """Count the calls their deadline cut off, across every run's turn_log, folded after the run.
+
+    Such a call lands as the LlmFailure holding a TimedOutError, which is the record that carries
+    what that call had billed.
+    """
     return sum(
-        isinstance(record, AbandonedCall) for run in app.runs.values() for record in run.turn_log
+        isinstance(record, LlmFailure) and isinstance(record.error, TimedOutError)
+        for run in app.runs.values()
+        for record in run.turn_log
     )
 
 
@@ -183,27 +189,23 @@ def test_the_agent_span_parents_its_own_generate_spans() -> None:
     assert len(generate_spans) == 2
 
 
-def test_the_per_agent_deadline_fires_on_cumulative_time() -> None:
-    """An ordinary enclosing timeout cuts a run off on cumulative time, no fixed-instant arithmetic."""
-    app = _build_app("agent_timeout")
+def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
+    """config.timeout_seconds ends one call, and the run keeps both the account and its next turn."""
+    app = _build_app("call_timeout")
     asyncio.run(app.run())
-    energy = app.runs["root/research_energy"]
-    assert isinstance(energy, ReActAgent)
-    assert "root/research_energy" in app.failures
-    assert "root/research_energy" not in app.answers
-    assert energy.usage.cost_in_usd > 0
-    assert _abandoned_count(app) == 1
-    # More than one call completed before the cut-off, which is the whole difference from the per-call
-    # deadline: that one would have ended the run on its first delayed call, at turn 1.
-    assert energy.turn_number >= 2
+    climate = app.runs["root/research_climate"]
+    assert _timed_out_count(app) == 1
+    assert "root/research_climate" in app.answers
+    assert climate.own_usage.cost_in_usd > 0
 
 
-def test_the_accounting_is_final_when_the_app_deadline_lands() -> None:
-    """Both researchers are mid-request when the app deadline fires; the except reads final totals.
+def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> None:
+    """Both researchers are mid-request when the app deadline fires; the turns before it survive.
 
-    The TaskGroup in App.run awaits every child's unwind before the cancellation propagates, and
-    generate_one appends each cancelled call's AbandonedCall inside the frame the cancellation
-    unwinds, so nothing stands between the except and the totals.
+    The TaskGroup in App.run awaits every child's unwind before the cancellation propagates, and a
+    turn appends its record when it happens, so nothing stands between the except and the settled
+    totals. The two in-flight calls add nothing: a cancellation destroys the frame holding the
+    account, which is the difference from config.timeout_seconds.
     """
     app = _build_app("app_timeout")
     at_except: list[tuple[int, float]] = []
@@ -213,13 +215,11 @@ def test_the_accounting_is_final_when_the_app_deadline_lands() -> None:
             async with asyncio.timeout(0.5):
                 await app.run()
         except TimeoutError:
-            at_except.append((_abandoned_count(app), _total_cost(app)))
+            at_except.append((_timed_out_count(app), _total_cost(app)))
 
     asyncio.run(drive())
     # Climate's first turn ($0.01 plus two searches at $0.002) and energy's ($0.01 plus one search).
-    # The two abandoned calls had no settled attempt, and no usage is fabricated for an in-flight
-    # attempt, so they add nothing.
-    assert at_except == [(2, pytest.approx(0.026))]
+    assert at_except == [(0, pytest.approx(0.026))]
 
 
 def test_a_run_cancelled_from_outside_emits_no_terminal_event() -> None:

@@ -1,82 +1,88 @@
-"""Offline tests for the neutral pricing arithmetic in pricing.py.
+"""Offline tests for the neutral pricing arithmetic: category_cost and Billing.
 
-These import no SDK: PricingTable.price consumes already-split counters,
-and the per-backend extraction from raw SDK usage is tested in the adapter test modules.
+These import no SDK. A rate table is provider-shaped and lives in the backend subpackage whose
+adapter spends it, so what a table's price() produces is tested in the adapter test modules.
 """
 
 import math
 
-from langchaint import PricingTable, Usage
-from langchaint.pricing import UNPRICED, category_cost
+import pytest
 
-_PRICING = PricingTable(
-    input_cache_none_usd_per_million_tokens=3.0,
-    output_usd_per_million_tokens=15.0,
-    cache_read_usd_per_million_tokens=0.3,
-    cache_write_usd_per_million_tokens=3.75,
-)
+from langchaint import ZERO_USAGE, Usage, category_cost
+from tests.helpers import stated_billing
 
 
-def _priced(pricing: PricingTable) -> Usage:
-    """One response's counters priced at the given table."""
-    return pricing.price(
-        input_tokens_cache_read=200,
-        input_tokens_cache_write=10,
-        input_tokens_cache_none=100,
+def _usage(
+    *,
+    input_tokens_cache_read: int = 0,
+    input_tokens_cache_write: int = 0,
+    input_tokens_cache_none: int = 0,
+    input_tokens_cache_read_cost_in_usd: float = 0.0,
+    input_tokens_cache_write_cost_in_usd: float = 0.0,
+    input_tokens_cache_none_cost_in_usd: float = 0.0,
+) -> Usage:
+    """One response's input side; output cancels out of the cache-savings counterfactual."""
+    return Usage(
+        input_tokens_cache_read=input_tokens_cache_read,
+        input_tokens_cache_write=input_tokens_cache_write,
+        input_tokens_cache_none=input_tokens_cache_none,
         output_tokens=50,
-        output_tokens_reasoning=20,
+        output_tokens_reasoning=0,
+        input_tokens_cache_read_cost_in_usd=input_tokens_cache_read_cost_in_usd,
+        input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
+        input_tokens_cache_none_cost_in_usd=input_tokens_cache_none_cost_in_usd,
+        output_tokens_cost_in_usd=0.75,
     )
 
 
-def test_price_computes_one_product_per_category() -> None:
-    """Each cost field is its counter times its rate over one million."""
-    usage = _priced(_PRICING)
-    assert usage.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
-    assert usage.input_tokens_cache_write_cost_in_usd == 10 * 3.75 / 1e6
-    assert usage.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
-    assert usage.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
-
-
-def test_price_carries_the_counters_through() -> None:
-    """The returned Usage reports the counters it was given, reasoning included."""
-    usage = _priced(_PRICING)
-    assert usage.input_tokens_cache_read == 200
-    assert usage.input_tokens_cache_write == 10
-    assert usage.input_tokens_cache_none == 100
-    assert usage.output_tokens == 50
-    assert usage.output_tokens_reasoning == 20
-
-
-def test_cost_in_usd_is_the_sum_of_the_four_categories() -> None:
-    """The priced total is exactly what the parts add to."""
-    usage = _priced(_PRICING)
-    assert usage.cost_in_usd == (
-        usage.input_tokens_cache_read_cost_in_usd
-        + usage.input_tokens_cache_write_cost_in_usd
-        + usage.input_tokens_cache_none_cost_in_usd
-        + usage.output_tokens_cost_in_usd
-    )
-
-
-def test_unpriced_makes_every_nonzero_category_nan() -> None:
-    """A response at a tier with no table keeps its counters and costs NaN."""
-    usage = _priced(UNPRICED)
-    assert usage.input_tokens_cache_read == 200
-    assert math.isnan(usage.input_tokens_cache_read_cost_in_usd)
-    assert math.isnan(usage.input_tokens_cache_write_cost_in_usd)
-    assert math.isnan(usage.input_tokens_cache_none_cost_in_usd)
-    assert math.isnan(usage.output_tokens_cost_in_usd)
-    assert math.isnan(usage.cost_in_usd)
+def test_category_cost_is_the_counter_times_the_rate_over_one_million() -> None:
+    """One multiplication and one division, with no rounding of its own."""
+    assert category_cost(200, 3.0) == 200 * 3.0 / 1e6
 
 
 def test_a_zero_counter_costs_zero_at_an_unknown_rate() -> None:
-    """0 * NaN is NaN, so the zero case is special-cased and the total stays a number."""
-    assert category_cost(0, float("nan")) == 0.0
-    usage = UNPRICED.price(
-        input_tokens_cache_read=0,
-        input_tokens_cache_write=0,
-        input_tokens_cache_none=0,
-        output_tokens=0,
-        output_tokens_reasoning=0,
+    """0 * NaN is NaN, so the zero case is special-cased and a total over it stays a number."""
+    assert category_cost(0, math.nan) == 0.0
+
+
+def test_cache_savings_is_what_the_uncached_counterfactual_would_have_added() -> None:
+    """Reads at a tenth of the uncached rate save the nine tenths they did not pay."""
+    billing = stated_billing(
+        _usage(
+            input_tokens_cache_read=1000,
+            input_tokens_cache_none=100,
+            input_tokens_cache_read_cost_in_usd=1000 * 0.3 / 1e6,
+            input_tokens_cache_none_cost_in_usd=100 * 3.0 / 1e6,
+        ),
+        input_cache_none_usd_per_million_tokens=3.0,
     )
-    assert usage.cost_in_usd == 0.0
+    assert billing.cache_savings_in_usd == pytest.approx(1000 * (3.0 - 0.3) / 1e6)
+
+
+def test_cache_savings_is_negative_where_the_write_premium_exceeded_the_read_discount() -> None:
+    """A response that wrote the cache and read little of it paid more than it would have uncached."""
+    billing = stated_billing(
+        _usage(
+            input_tokens_cache_write=1000,
+            input_tokens_cache_none=100,
+            input_tokens_cache_write_cost_in_usd=1000 * 3.75 / 1e6,
+            input_tokens_cache_none_cost_in_usd=100 * 3.0 / 1e6,
+        ),
+        input_cache_none_usd_per_million_tokens=3.0,
+    )
+    assert billing.cache_savings_in_usd == pytest.approx(1000 * (3.0 - 3.75) / 1e6)
+
+
+def test_cache_savings_is_nan_where_a_nonzero_input_counter_had_no_rate() -> None:
+    """An unpriced input category makes the saving unknown rather than understated."""
+    billing = stated_billing(
+        _usage(input_tokens_cache_read=1000, input_tokens_cache_read_cost_in_usd=math.nan),
+        input_cache_none_usd_per_million_tokens=math.nan,
+    )
+    assert math.isnan(billing.cache_savings_in_usd)
+
+
+def test_cache_savings_is_zero_where_no_input_was_billed() -> None:
+    """With no input tokens there is nothing to have saved, whatever the rate."""
+    billing = stated_billing(ZERO_USAGE)
+    assert billing.cache_savings_in_usd == 0.0

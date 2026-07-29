@@ -9,25 +9,22 @@ they are born together in one price() call, and one fold sums both.
 """
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
 
 from pydantic import ConfigDict, NonNegativeInt
 
 from langchaint.checked_copy import CheckedCopyModel
-
-if TYPE_CHECKING:
-    from langchaint.pricing import PricingTable
 
 
 class Usage(CheckedCopyModel):
     """Token counts for one request, normalized across providers, plus what each cost.
 
     The counters are provider-reported facts. The four costs are langchaint's estimate, priced by
-    the adapter from the raw provider counts against the table it holds for the service tier the
+    the adapter from the provider's own counters at the rates it holds for the service tier the
     response reported. They are stored rather than derived because a provider can bill one
-    normalized counter at several rates: Anthropic's 5-minute and 1-hour cache writes, which
-    input_tokens_cache_write collapses into one count, bill at different rates, so the cost is
-    computed from the raw split before the collapse and cannot be recovered from Usage afterwards.
+    normalized counter at several rates: Anthropic's 5-minute and 1-hour cache writes bill
+    differently and input_tokens_cache_write collapses both into one count, so no rate the table
+    holds recovers that cost. The provider's own usage object, carried beside this one, holds the
+    uncollapsed counters.
     No validator cross-checks a cost against its counter; that would require the table here.
 
     output_tokens_reasoning is the reasoning share of output_tokens
@@ -44,12 +41,11 @@ class Usage(CheckedCopyModel):
     the raw SDK usage beside this object (Usage.server_tool_use, anthropic 0.120.0);
     openai's ResponseUsage carries none.
 
-    Every counter is non-negative by validation, which the openai adapter relies on:
-    it derives input_tokens_cache_none by subtracting the cache counters from usage.input_tokens,
-    so a response over-reporting its cache counters would otherwise produce a silently negative remainder.
+    Every counter is non-negative by validation, so a defect that computes a negative count
+    cannot pass silently.
     The cost fields carry no such constraint: it rejects NaN, and an unpriceable response would fail
     validation and take its output down with it. Nothing checks the rates in a caller's own
-    PricingTable either, so a negative rate arrives here as a negative cost.
+    rate table either, so a negative rate arrives here as a negative cost.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -81,27 +77,6 @@ class Usage(CheckedCopyModel):
             + self.input_tokens_cache_write_cost_in_usd
             + self.input_tokens_cache_none_cost_in_usd
             + self.output_tokens_cost_in_usd
-        )
-
-    def reprice(self, pricing: "PricingTable") -> "Usage":
-        """Return these counters priced at another table's rates.
-
-        The counterfactual an application asks for by naming a table: what this call would have cost
-        at another tier's rates, or at a rate negotiated outside the shipped catalog.
-        It reads no service tier, since the table given is the rates asked about.
-
-        Two limits follow from one cache-write counter. A provider table that bills the writes at
-        several rates cannot be used here, because its extra rate has nothing to multiply, so this
-        takes the neutral PricingTable only and an Anthropic response mixing cache-write TTLs
-        reprices at one write rate. And repricing a folded Usage prices every call in the fold at
-        one table, which is the caller's judgment to make, as reading counters summed across models is.
-        """
-        return pricing.price(
-            input_tokens_cache_read=self.input_tokens_cache_read,
-            input_tokens_cache_write=self.input_tokens_cache_write,
-            input_tokens_cache_none=self.input_tokens_cache_none,
-            output_tokens=self.output_tokens,
-            output_tokens_reasoning=self.output_tokens_reasoning,
         )
 
     @staticmethod

@@ -3,15 +3,9 @@
 Every limit an agent is subject to lives here, so a reader answers "what is this agent allowed to do"
 from one frozen object rather than from arguments scattered across the launch site.
 
-timeout_seconds is applied inside the run itself (AgentRun.final), so no caller can launch an agent
-without its deadline.
-
-The two timeouts are different failure modes and neither substitutes for the other:
-per_call_timeout_seconds bounds one provider request, and the run goes on to its next turn with the
-same conversation, since an abandoned request appended nothing; timeout_seconds bounds the whole run,
-so an agent that keeps making fast progress toward nothing still stops. Because the per-call deadline is
-the inner one, a single hung request always trips it first, so timeout_seconds fires on cumulative time.
-A run whose every call hangs is bounded by max_turns rather than looping forever.
+timeout_seconds bounds one provider request, and the run goes on to its next turn with the same
+conversation, since a dropped request appended nothing. A run whose every call hangs is bounded by
+max_turns rather than looping forever.
 """
 
 from dataclasses import dataclass
@@ -36,8 +30,7 @@ class AgentConfig:
     system_prompt: str
     max_turns: int = 8
     max_tool_calls: int = 12
-    timeout_seconds: float = 30.0
-    per_call_timeout_seconds: float = 10.0
+    timeout_seconds: float = 10.0
     self_correction_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -69,32 +62,28 @@ def build_configs() -> dict[str, AgentConfig]:
             name="research_climate",
             system_prompt="[research_climate] Research the climate outlook.",
             max_turns=6,
-            timeout_seconds=2.0,
-            per_call_timeout_seconds=1.5,
+            timeout_seconds=1.5,
         ),
         AgentConfig(
             name="research_energy",
             system_prompt="[research_energy] Research the energy outlook.",
             max_turns=6,
             max_tool_calls=6,
-            timeout_seconds=2.0,
-            per_call_timeout_seconds=1.5,
+            timeout_seconds=1.5,
         ),
         AgentConfig(
             name="specialist",
             system_prompt="[specialist] Answer the question with one search.",
             max_turns=3,
             max_tool_calls=2,
-            timeout_seconds=1.5,
-            per_call_timeout_seconds=1.0,
+            timeout_seconds=1.0,
         ),
         AgentConfig(
             name="synthesize",
             system_prompt="[synthesize] Reconcile the findings.",
             max_turns=6,
             max_tool_calls=4,
-            timeout_seconds=3.0,
-            per_call_timeout_seconds=1.0,
+            timeout_seconds=1.0,
             self_correction_enabled=True,
         ),
     )

@@ -3,7 +3,7 @@
 generate_many never raises on an item. Each conversation settles into its own slot as a Response or
 as a GenerationError, the siblings run to completion whatever any one item does, and result i belongs
 to conversations[i]. So the call itself needs no try/except; the work is the loop over the results,
-which to_row renders to one table shape whether a slot succeeded or failed.
+which to_tables renders to a calls table and an attempts table whether a slot succeeded or failed.
 
 Each GenerationError subclass names what happened, not what to do next, and InvalidRequestError is where that gap is
 widest: a rejected conversation, a bad API key, a revoked permission, and an unknown model id all
@@ -18,14 +18,14 @@ remaining one is never sent, so it costs nothing.
 import asyncio
 
 from langchaint import (
+    CallResult,
     GenerationError,
     ImagePart,
     Message,
-    Response,
     TextPart,
     Usage,
     UserMessage,
-    to_row,
+    to_tables,
 )
 from langchaint.anthropic import anthropic_model
 
@@ -51,13 +51,13 @@ _CONVERSATIONS: list[str | list[Message]] = [
 
 async def run_batch(
     conversations: list[str | list[Message]],
-) -> list[Response[str] | GenerationError]:
+) -> list[CallResult[str]]:
     """Run the batch, print every slot as a row, and print what the whole batch paid.
 
     Nothing here catches anything: the conversation carrying the TIFF settles into its own slot as an
     InvalidRequestError while the two real calls complete, so the list is as long as the input and
-    to_row fills the same keys for every slot. A success leaves error_text None, a failure leaves
-    output None, and the unsent item's attempts is 0 because no request went out.
+    to_tables fills the same columns for every slot. A success leaves error_summary None, a failure
+    leaves output None, and the unsent item's attempts is 0 because no request went out.
     Usage.sum_of totals the spend over successes and failures alike, since every GenerationError
     carries the usage its attempts billed.
     """
@@ -66,24 +66,24 @@ async def run_batch(
         automatic_prompt_caching=False,
     )
     results = await summarizer.generate_many(conversations)
-    for index, result in enumerate(results):
-        row = to_row(result)
+    calls, _ = to_tables(results)
+    for row in calls:
         print(
-            f"item {index}: output={row['output']!r} "
-            f"error_text={row['error_text']!r} attempts={row['attempts']}"
+            f"item {row['call_id']}: output={row['output']!r} "
+            f"error_summary={row['error_summary']!r} attempts={row['attempts']}"
         )
     total = Usage.sum_of(result.usage for result in results)
     print(f"batch paid {total.cost_in_usd:.6f} USD")
     return results
 
 
-def log_failures(results: list[Response[str] | GenerationError]) -> None:
+def log_failures(results: list[CallResult[str]]) -> None:
     """Log each failed item's class name and error_text.
 
-    to_row has no error-class column: error_text is the message, and the class comes off the object
-    with type(result).__name__. That name is the low-cardinality value a log or dashboard groups
-    failures by, which is why langchaint.tracing sets it as the span's error.type; error_text is
-    prose for a human to read.
+    Neither table has an error-class column: the class comes off the object with
+    type(result).__name__. That name is the low-cardinality value a log or dashboard groups failures
+    by, which is why langchaint.tracing sets it as the span's error.type; error_text is prose for a
+    human to read.
     """
     for index, result in enumerate(results):
         if isinstance(result, GenerationError):
@@ -92,7 +92,7 @@ def log_failures(results: list[Response[str] | GenerationError]) -> None:
 
 def failed_conversations(
     conversations: list[str | list[Message]],
-    results: list[Response[str] | GenerationError],
+    results: list[CallResult[str]],
 ) -> list[str | list[Message]]:
     """Return the input conversations whose slots failed, ready to resubmit once the cause is fixed.
 

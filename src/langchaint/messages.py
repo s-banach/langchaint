@@ -30,6 +30,7 @@ class TextPart(CheckedCopyModel):
 
     text: str
     cache_breakpoint: bool = False
+    kind: Literal["text"] = "text"
 
 
 class ImagePart(CheckedCopyModel):
@@ -43,9 +44,10 @@ class ImagePart(CheckedCopyModel):
     data: bytes
     media_type: str
     cache_breakpoint: bool = False
+    kind: Literal["image"] = "image"
 
 
-type Part = TextPart | ImagePart
+type Part = Annotated[TextPart | ImagePart, Field(discriminator="kind")]
 """One element of a message body.
 
 Send a document by converting it first: rasterize its pages to ImagePart, or extract its text layer to TextPart.
@@ -76,12 +78,13 @@ class ToolCall(CheckedCopyModel):
     id: str
     name: str
     args_json: str
+    kind: Literal["tool_call"] = "tool_call"
 
 
 class UserMessage(CheckedCopyModel):
     """One user turn; content is plain text or a tuple of parts.
 
-    role discriminates the Message union,
+    kind discriminates the Message union,
     so a persisted conversation re-validates to the same message types by construction instead of by union member order.
 
     content is keyword-only, as on every model here; CheckedCopyModel's module docstring says why a
@@ -96,13 +99,13 @@ class UserMessage(CheckedCopyModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     content: str | tuple[Part, ...]
-    role: Literal["user"] = "user"
+    kind: Literal["user"] = "user"
 
 
 class ReasoningTrace(CheckedCopyModel):
     """One reasoning element the model produced, round-tripped verbatim.
 
-    The core never inspects reasoning: reasoning is the producing SDK item's
+    The core never inspects raw: raw is the producing SDK item's
     model_dump(mode="python", exclude_none=True), and the consuming adapter re-feeds that dict
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
     thinking block; OpenAI re-reads encrypted_content).
@@ -119,9 +122,9 @@ class ReasoningTrace(CheckedCopyModel):
     reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
     The dict field makes this model unhashable, unlike its frozen siblings; messages are never hashed.
 
-    text is the provider's readable text, assembled from text already inside reasoning
-    and adding nothing reasoning does not hold;
-    reasoning alone is what the adapter replays, so editing text changes what telemetry and an
+    text is the provider's readable text, assembled from text already inside raw
+    and adding nothing raw does not hold;
+    raw alone is what the adapter replays, so editing text changes what telemetry and an
     application display and never changes the request.
     None means no readable text came back: an anthropic redacted_thinking block (which carries only
     an opaque string), an anthropic thinking block whose thinking is empty, or an openai response
@@ -131,17 +134,14 @@ class ReasoningTrace(CheckedCopyModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    reasoning: Mapping[str, object]
+    raw: Mapping[str, object]
     text: str | None = None
+    kind: Literal["reasoning_trace"] = "reasoning_trace"
 
 
-type TurnElement = ReasoningTrace | TextPart | ToolCall
+type TurnElement = Annotated[ReasoningTrace | TextPart | ToolCall, Field(discriminator="kind")]
 """One element of an assistant turn, ordered as the provider emitted them.
-ReasoningTrace and TextPart both carry a text field, so what separates them on re-validation of a
-persisted conversation is the reasoning key:
-an element carrying reasoning is a ReasoningTrace and one carrying text alone is a TextPart.
-Every model here forbids extra keys, so that separation is total in either union member order:
-the two-key form fails TextPart outright, leaving ReasoningTrace the only member that accepts it.
+Discriminated on kind, so re-validating a persisted turn selects each element's member from its tag.
 TextPart, not Part: assistant turns still return no images.
 """
 
@@ -179,7 +179,7 @@ class AssistantMessage(CheckedCopyModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     turn: Annotated[tuple[TurnElement, ...], BeforeValidator(_text_only_turn)]
-    role: Literal["assistant"] = "assistant"
+    kind: Literal["assistant"] = "assistant"
 
     @model_validator(mode="after")
     def _reject_cache_breakpoint(self) -> "AssistantMessage":
@@ -221,7 +221,7 @@ class ToolMessage(CheckedCopyModel):
     tool_call_id: str
     content: str | tuple[Part, ...]
     is_error: bool = False
-    role: Literal["tool"] = "tool"
+    kind: Literal["tool"] = "tool"
 
     @classmethod
     def error(cls, tool_call: ToolCall, content: str | tuple[Part, ...]) -> "ToolMessage":
@@ -232,8 +232,8 @@ class ToolMessage(CheckedCopyModel):
         return cls(tool_call_id=tool_call.id, content=content, is_error=True)
 
 
-type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="role")]
-"""Discriminated on role: pydantic validation selects the member from the tag,
+type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="kind")]
+"""Discriminated on kind: pydantic validation selects the member from the tag,
 never from which member's fields happen to match,
 so callers can persist a conversation as JSON and re-validate it with a TypeAdapter.
 """

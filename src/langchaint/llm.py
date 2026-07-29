@@ -13,7 +13,7 @@ so a rate-limit error pauses admission account-wide until a request succeeds aga
 
 import asyncio
 from collections.abc import Iterator, Sequence
-from typing import Any, NamedTuple, Protocol, SupportsIndex, assert_never, overload
+from typing import Any, NamedTuple, Protocol, SupportsIndex, overload
 
 from pydantic import BaseModel
 
@@ -22,23 +22,17 @@ from langchaint.adapter import (
     AdapterResult,
     Binding,
     BoundAdapter,
-    ContextWindowExceeded,
-    EmptyTurn,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
     NoOutput,
-    ProviderFailedTerminally,
-    ProviderFailedTransiently,
-    Refusal,
+    RequestParams,
     ResponseOutcome,
-    SchemaViolation,
     ToolChoice,
-    UnfinishedTurn,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
     ContextWindowExceededError,
     EmptyTurnError,
+    EscapedExceptionError,
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
@@ -47,6 +41,7 @@ from langchaint.exceptions import (
     RefusalError,
     RetriesExhaustedError,
     SchemaViolationError,
+    TimedOutError,
     TransientError,
     UnfinishedTurnError,
     UnknownExceptionError,
@@ -55,7 +50,11 @@ from langchaint.exceptions import (
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.rate_limiter import Admission, Backoff, RateLimiter
-from langchaint.response import AbandonedCallLog, Response, _append_abandoned_call
+from langchaint.response import (
+    CallResult,
+    Response,
+    _abandoned_call_error,
+)
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
 
@@ -198,6 +197,27 @@ class HasTools:
     Never instantiated; the counterpart of NoTools, whose docstring states what the pair is for.
     A structured binding marked this way types its output optional, None being the tool-call turn.
     """
+
+
+class GenerateItem[OutputT](Protocol):
+    """Runs one item of a batch.
+
+    BoundLLM.generate_many passes its own _generate_one_any_binding. A wrapper passes an
+    implementation that calls the same method and does its own work around it, which is how one call
+    of a batch gets treated exactly as generate_one treats one call.
+    Pass timeout_seconds through: an implementation that dropped it would silently give its items no
+    deadline at all.
+    """
+
+    async def __call__(
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+    ) -> Response[OutputT | None]:
+        """Run the call, raising its GenerationError rather than returning it.
+
+        Raises:
+            GenerationError: the call failed; the batch turns it into that item's row.
+        """
+        ...
 
 
 class _Interpretation[OutputT](NamedTuple):
@@ -523,39 +543,38 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             rate_limiter=self.rate_limiter,
         )
 
-    def _new_ledger(self) -> _CallLedger:
-        """Open a ledger against this binding's adapter; the only place llm.py reads its identity."""
-        return _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
-
     def _classified_error(
-        self, exc: Exception, *, ledger: _CallLedger
+        self, exc: Exception, *, ledger: _CallLedger, request: RequestParams
     ) -> TransientError | GenerationError:
         """Sort one attempt's exception into the error to retry or this item's terminal failure.
 
         Reached only for exceptions, which by the adapter contract are attempts the adapter read no
-        outcome from: what it did read it reports as an AttemptOutcome arm, which the loop matches
+        outcome from: what it did read it reports as a ResponseOutcome member, which the loop matches
         instead. The returned TransientError carries the adapter's retry-after reading and whether
         the error was a rate limit, the two things the limiter needs to pace the next attempt;
         every other return is terminal for this item, and the caller raises it.
 
         StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
         """
+        ledger.note_request_id(self.adapter.request_id_from_error(exc))
         classification = self.adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out and gets a record. A rejection carries no response, so the record is
-            # ZERO_USAGE unless a receipt was staged, which is the exception raised while reading one.
+            # so it went out and gets a record. A rejection carries no response, so the record bills
+            # nothing unless a response was staged, which is the exception raised while reading one.
             ledger.record(error=None, assistant_message=None)
             return InvalidRequestError(
-                reason=f"the provider rejected the request: {exc}", call=ledger.freeze()
+                reason=f"the provider rejected the request: {exc}",
+                call=ledger.freeze(),
+                request=request,
             )
         if classification == "declared_final":
             # The provider answered, so the attempt gets a record; its answer was an error, which
-            # reports no billing, so the record is ZERO_USAGE unless a receipt was staged.
+            # reports no billing, so the record bills nothing unless a response was staged.
             ledger.record(error=None, assistant_message=None)
-            return ProviderDeclaredFinalError(error=exc, call=ledger.freeze())
+            return ProviderDeclaredFinalError(error=exc, call=ledger.freeze(), request=request)
         if classification == "unknown_exception":
-            return UnknownExceptionError(error=exc, call=ledger.freeze())
+            return UnknownExceptionError(error=exc, call=ledger.freeze(), request=request)
         error = TransientError(
             str(exc),
             retry_after_seconds=self.adapter.retry_after_seconds(exc),
@@ -607,39 +626,49 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         )
 
     def _staged_interpretation(
-        self, sent: BaseModel | InvalidRequest, *, ledger: _CallLedger
-    ) -> _Interpretation[OutputT | None] | InvalidRequest:
-        """Record the receipt of an arrived response, then read what it produced.
+        self, sent: BaseModel, *, ledger: _CallLedger
+    ) -> _Interpretation[OutputT | None]:
+        """Stage an arrived response with its billing, then read what it produced.
 
         Staging first is what makes the attempt and its billing survive a raise from interpret:
-        freeze closes a still-staged receipt, so the error that raise becomes carries the record.
-        An InvalidRequest passes through, having received nothing to record.
+        freeze closes a still-staged response, so the error that raise becomes carries the record.
 
         Raises:
             Exception: whatever interpret raises, for Adapter.classify to sort.
         """
-        if isinstance(sent, InvalidRequest):
-            return sent
-        ledger.stage_receipt(raw=sent, usage=self._bound_adapter.usage_from_raw(sent))
+        ledger.stage_response(
+            raw=sent,
+            billing=self._bound_adapter.billing_from_raw(sent),
+            identity=self._bound_adapter.identity_from_raw(sent),
+        )
         return _Interpretation(raw=sent, outcome=self._bound_adapter.interpret(sent))
 
     async def _generate_with_retries(
-        self, conversation: Sequence[Message], *, ledger: _CallLedger
+        self,
+        conversation: Sequence[Message],
+        *,
+        ledger: _CallLedger,
+        timeout_seconds: float | None,
     ) -> Response[OutputT | None]:
-        """Run the retry loop every generate method shares.
+        """Run the retry loop every generate method shares, under the caller's deadline.
 
         ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
-        into as each attempt settles, so a cancellation that kills this frame leaves the settled
-        attempts readable outside it; generate_one freezes it to build its AbandonedCall.
-        Every GenerationError and the Response are built from ledger.freeze(), the one site a call's
-        elapsed_seconds is computed.
+        into as each attempt settles. Every GenerationError and the Response are built from
+        ledger.freeze(), the one site a call's elapsed_seconds is computed.
 
-        The adapter reports one attempt as an AttemptOutcome member and never as a GenerationError,
+        timeout_seconds bounds this whole loop, slot waits and backoff sleeps included, and None
+        opens a scope that never expires. Expiring raises TimedOutError, whose docstring says why the
+        scope has to sit in this frame.
+        A cancellation from any scope but this one is the caller's own order and propagates
+        untouched. expired() is what tells the two apart: a TimeoutError this scope did not raise
+        came from under the loop unclassified, and re-raising it hands it to the same wrapping every
+        other unclassified exception gets.
+
+        The adapter reports one attempt as a ResponseOutcome member and never as a GenerationError,
         so this loop matches the member and constructs the item's GenerationError here, where the
         attempts and the timing are known.
-        Each arrived response is staged on the ledger with its price before anything is read off it,
+        Each arrived response is staged on the ledger with its billing before anything is read off it,
         so an exception from that read still leaves the attempt and its billing on the record.
-        Every exception, whether the attempt reached a response or not, goes to Adapter.classify.
         Each attempt holds a RateLimiter slot for the request only;
         backoff sleeps outside the slot so a waiting task does not hold capacity.
         Every failure and every success is registered with the limiter while the slot is still held,
@@ -674,29 +703,53 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                 (the 200's body reports that generating the response failed, for a reason a resend
                 would hit again); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
+            TimedOutError: timeout_seconds expired before the call produced a result.
         """
         ledger.start_call()
+        timeout_scope = asyncio.timeout(timeout_seconds)
+        try:
+            async with timeout_scope:
+                return await self._attempt_until_budget_runs_out(conversation, ledger=ledger)
+        except TimeoutError:
+            if not timeout_scope.expired():
+                raise
+            raise _abandoned_call_error(TimedOutError, ledger) from None
+
+    async def _attempt_until_budget_runs_out(
+        self, conversation: Sequence[Message], *, ledger: _CallLedger
+    ) -> Response[OutputT | None]:
+        """Send the request until it succeeds, fails terminally, or the retry budget runs out.
+
+        Runs inside the deadline opened by _generate_with_retries, its only caller.
+
+        Raises:
+            GenerationError: every failure _generate_with_retries names but TimedOutError, which its
+                scope raises.
+        """
+        built = self._bound_adapter.build_request(conversation)
+        if isinstance(built, InvalidRequest):
+            raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
+        request = built
         while ledger.attempts < self.rate_limiter.max_attempts:
             async with self.rate_limiter.slot() as admission:
                 ledger.start_attempt()
                 assistant_message: AssistantMessage | None = None
                 try:
                     interpreted = self._staged_interpretation(
-                        await self._bound_adapter.send(conversation), ledger=ledger
+                        await self._bound_adapter.send(request), ledger=ledger
                     )
                 except TransientError as exc:
+                    ledger.note_request_id(self.adapter.request_id_from_error(exc))
                     error: TransientError = exc
                 except Exception as exc:
-                    classified = self._classified_error(exc, ledger=ledger)
+                    classified = self._classified_error(exc, ledger=ledger, request=request)
                     if not isinstance(classified, TransientError):
                         raise classified from exc
                     error = classified
                 else:
-                    if isinstance(interpreted, InvalidRequest):
-                        raise InvalidRequestError(reason=interpreted.reason, call=ledger.freeze())
                     raw, outcome = interpreted
-                    match outcome:
-                        case AdapterResult():
+                    match outcome.kind:
+                        case "adapter_result":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
@@ -707,54 +760,57 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                                 stop_reason=outcome.stop_reason,
                                 assistant_message=outcome.assistant_message,
                             )
-                        case Refusal():
+                        case "refusal":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
-                            raise RefusalError(call=ledger.freeze())
-                        case MaxCompletionTokensExceeded():
+                            raise RefusalError(call=ledger.freeze(), request=request)
+                        case "max_completion_tokens_exceeded":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
-                            raise MaxCompletionTokensExceededError(call=ledger.freeze())
-                        case EmptyTurn():
+                            raise MaxCompletionTokensExceededError(
+                                call=ledger.freeze(), request=request
+                            )
+                        case "empty_turn":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
-                            raise EmptyTurnError(call=ledger.freeze())
-                        case SchemaViolation():
+                            raise EmptyTurnError(call=ledger.freeze(), request=request)
+                        case "schema_violation":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
                             raise SchemaViolationError(
                                 validation_error_json=outcome.validation_error_json,
                                 call=ledger.freeze(),
+                                request=request,
                             )
-                        case ContextWindowExceeded():
+                        case "context_window_exceeded":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
-                            raise ContextWindowExceededError(call=ledger.freeze())
-                        case UnfinishedTurn():
+                            raise ContextWindowExceededError(call=ledger.freeze(), request=request)
+                        case "unfinished_turn":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
-                            raise UnfinishedTurnError(reason=outcome.reason, call=ledger.freeze())
-                        case ProviderFailedTerminally():
+                            raise UnfinishedTurnError(
+                                reason=outcome.reason, call=ledger.freeze(), request=request
+                            )
+                        case "provider_failed_terminally":
                             self._record_completed_attempt(
                                 outcome, admission=admission, ledger=ledger
                             )
                             raise ProviderFailedTerminallyError(
-                                reason=outcome.reason, call=ledger.freeze()
+                                reason=outcome.reason, call=ledger.freeze(), request=request
                             )
-                        case ProviderFailedTransiently():
+                        case "provider_failed_transiently":
                             self.rate_limiter.register_success(admission)
                             error = TransientError(
                                 outcome.reason, is_rate_limit=outcome.is_rate_limit
                             )
                             assistant_message = outcome.assistant_message
-                        case _ as unhandled:
-                            assert_never(unhandled)
                 backoff = self._record_transient_error(
                     error,
                     admission=admission,
@@ -763,34 +819,31 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
                 )
             if ledger.attempts < self.rate_limiter.max_attempts:
                 await backoff.sleep()
-        raise RetriesExhaustedError(call=ledger.freeze())
+        raise RetriesExhaustedError(call=ledger.freeze(), request=request)
 
     @overload
     async def generate_one(
         self: "BoundLLM[str, ToolsT]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[OutputT, HasTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[OutputT, NoTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[OutputT]: ...
     async def generate_one(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None = None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
     ) -> Response[Any]:
         """Generate one response under the retry loop.
 
@@ -804,66 +857,68 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         placed as final or could not place at all, and one of RefusalError,
         MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError,
         ContextWindowExceededError, UnfinishedTurnError, or ProviderFailedTerminallyError on a 200
-        that produced no output.
-        _generate_with_retries names the condition for each.
+        that produced no output; _generate_with_retries names the condition for each.
+        EscapedExceptionError joins them on an Exception that escaped langchaint's own machinery,
+        raised by the guard around that loop.
 
-        abandoned_call_log, when given, receives one AbandonedCall if a cancellation (a caller's
-        asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts this call off. The append is
-        the only channel that path has: no value reaches the caller, and the settled attempts'
-        records live in this frame, which the cancellation unwinds. Every other outcome appends
-        nothing, because its usage travels on the Response or the raised GenerationError, which the
-        caller records itself.
+        timeout_seconds bounds the whole call, slot waits and backoff sleeps included, and expiring
+        raises TimedOutError, which carries what the cut-off call spent. None is no deadline.
+        A cancellation from anywhere else (a caller's own asyncio.timeout, a TaskGroup sibling
+        failing, shutdown) cuts the call off and propagates, so this call's settled attempts are lost
+        with the frame. Ask for the deadline here to keep that account.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled this call; when abandoned_call_log is
-                given, the AbandonedCall is appended first.
+            asyncio.CancelledError: an outer scope cancelled this call.
         """
-        return await self._generate_one_any_binding(
-            conversation, abandoned_call_log=abandoned_call_log
-        )
+        return await self._generate_one_any_binding(conversation, timeout_seconds=timeout_seconds)
 
     async def _generate_one_any_binding(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
     ) -> Response[OutputT | None]:
-        """Run one call, appending its AbandonedCall if a cancellation cuts the call off.
+        """Run one call under a ledger of its own, reporting every Exception as its failure.
 
         What generate_one does, at the widest output type, callable from a frame whose binding is not
         statically concrete: generate_one's overloads are keyed on the binding, so they match no
-        generic self. The batch path and the tracing wrapper reach the request through here.
+        generic self. The tracing wrapper reaches the request through here, and so does every batch
+        item, this being the GenerateItem generate_many passes.
+
+        The GenerationError clause re-raises the failures the retry loop already reported, which the
+        Exception clause below it would otherwise wrap a second time. TimedOutError is one of them,
+        so a deadline is never rewrapped as an escaped exception.
 
         Raises:
-            GenerationError: whatever _generate_with_retries failed the item with.
-            asyncio.CancelledError: an outer scope cancelled this call; the AbandonedCall is
-                appended first when abandoned_call_log is given.
+            GenerationError: whatever _generate_with_retries failed the call with, or
+                EscapedExceptionError wrapping any other Exception that reached here.
+            BaseException: whatever cut the call off, propagating unobserved.
         """
-        ledger = self._new_ledger()
+        ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
-            return await self._generate_with_retries(_as_conversation(conversation), ledger=ledger)
-        except asyncio.CancelledError:
-            _append_abandoned_call(abandoned_call_log, ledger.freeze())
+            return await self._generate_with_retries(
+                _as_conversation(conversation), ledger=ledger, timeout_seconds=timeout_seconds
+            )
+        except GenerationError:
             raise
+        except Exception as escaped:
+            raise EscapedExceptionError(error=escaped, call=ledger.freeze()) from escaped
 
     async def _generate_or_failure(
         self,
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None,
-    ) -> Response[OutputT | None] | GenerationError:
-        """One batch item: the Response, or the GenerationError caught as the failure row.
+        generate_item: "GenerateItem[OutputT]",
+        timeout_seconds: float | None,
+    ) -> CallResult[OutputT | None]:
+        """One batch item: the Response or the GenerationError.
 
-        Every terminal per-item outcome is a GenerationError, so nothing a request produces
-        escapes into the gather and reaches a sibling.
-        A cancellation is the one outcome that is not a row, so it runs through
-        _generate_one_any_binding, whose CancelledError handler appends this item's AbandonedCall
-        before re-raising.
+        Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
+        into the gather and reaches a sibling. An expired timeout_seconds is one of them, so one
+        item's deadline never cuts a sibling.
+
+        Raises:
+            BaseException: whatever cut the item off, propagating unobserved.
         """
         try:
-            return await self._generate_one_any_binding(
-                conversation, abandoned_call_log=abandoned_call_log
-            )
+            return await generate_item(conversation, timeout_seconds=timeout_seconds)
         except GenerationError as failure:
             return failure
 
@@ -873,31 +928,31 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[str] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[str]]: ...
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, HasTools]",
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[OutputT | None] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[OutputT | None]]: ...
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, NoTools]",
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[OutputT] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
-        abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> list[Response[Any] | GenerationError]:
+        timeout_seconds: float | None = None,
+    ) -> list[CallResult[Any]]:
         """Order-aligned batch: result i belongs to conversations[i].
 
         A Response's output is typed the way generate_one types it, per binding.
@@ -905,8 +960,9 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
         Every item ends in its own slot: a Response, or the GenerationError it failed with
-        (retries exhausted, a rejected request, an error langchaint does not retry, or a 200 that
-        produced no output), which to_row renders to a failure row so the batch stays table-ready.
+        (retries exhausted, a rejected request, an error langchaint does not retry, a 200 that
+        produced no output, or a defect in langchaint itself), which to_tables renders to a failure
+        row so the batch stays table-ready.
         No item's failure reaches a sibling, so the returned list is always complete.
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.
@@ -921,23 +977,22 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         and after a transport failure the rest simply run against a cold cache; there is no second warmer.
         There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
 
-        abandoned_call_log, when given, receives one AbandonedCall for each item that had started
-        when a cancellation (a caller's asyncio.timeout, a TaskGroup sibling failing, shutdown) cuts
-        the batch off; under warm_cache the items after the warming one have not started. An item
-        raising past the GenerationError arms discards the batch the same way, and every item that
-        did not itself raise is recorded. The returned list is lost with the frame on both paths, an
-        already-settled item's row with it, so the appends are the account of what the recorded
-        items spent.
+        timeout_seconds is each item's own deadline, started when that item starts, and an item that
+        expires gets a TimedOutError row while its siblings run on. Bound the batch this way rather
+        than with a scope of your own: a cancellation from outside discards the returned list,
+        settled rows and all, because the list is this frame's and the frame is what unwinds.
 
         Raises:
             TypeError: conversations is a bare str (from _reject_bare_str_batch).
-            asyncio.CancelledError: an outer scope cancelled the batch; when abandoned_call_log is
-                given, each started item's AbandonedCall is appended first.
-            BaseException: an item raised something that is not a GenerationError, a defect in
-                langchaint itself; _gather cancels the remaining items and it propagates.
+            asyncio.CancelledError: an outer scope cancelled the batch.
+            BaseException: an item raised a BaseException that is not an Exception, which langchaint
+                does not catch; _gather cancels the remaining items and it propagates.
         """
         return await self._generate_many_any_binding(
-            conversations, warm_cache=warm_cache, abandoned_call_log=abandoned_call_log
+            conversations,
+            warm_cache=warm_cache,
+            generate_item=self._generate_one_any_binding,
+            timeout_seconds=timeout_seconds,
         )
 
     async def _generate_many_any_binding(
@@ -945,62 +1000,66 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool,
-        abandoned_call_log: AbandonedCallLog | None,
-    ) -> list[Response[OutputT | None] | GenerationError]:
+        generate_item: "GenerateItem[OutputT]",
+        timeout_seconds: float | None,
+    ) -> list[CallResult[OutputT | None]]:
         """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
+
+        generate_item runs one item, so a caller that wraps each call wraps every item of a batch
+        alike, whichever branch below started it.
+        timeout_seconds is each item's own deadline, started when that item starts.
 
         Raises:
             TypeError: conversations is a bare str (from _reject_bare_str_batch).
-            asyncio.CancelledError: an outer scope cancelled the batch; when abandoned_call_log is
-                given, each started item's AbandonedCall is appended first.
-            BaseException: an item raised something that is not a GenerationError; _gather cancels
+            asyncio.CancelledError: an outer scope cancelled the batch.
+            BaseException: an item raised a BaseException that is not an Exception; _gather cancels
                 the remaining items and it propagates.
         """
         _reject_bare_str_batch(conversations)
         # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
         if warm_cache and conversations:
             first_result = await self._generate_or_failure(
-                conversations[0], abandoned_call_log=abandoned_call_log
+                conversations[0],
+                generate_item=generate_item,
+                timeout_seconds=timeout_seconds,
             )
-            try:
-                rest = await self._gather(conversations[1:], abandoned_call_log=abandoned_call_log)
-            except BaseException:
-                # The warming item settled in this frame rather than in a _gather task,
-                # so its record reaches the log here or not at all.
-                _append_abandoned_call(abandoned_call_log, first_result.call)
-                raise
+            rest = await self._gather(
+                conversations[1:],
+                generate_item=generate_item,
+                timeout_seconds=timeout_seconds,
+            )
             return [first_result, *rest]
-        return await self._gather(conversations[0:], abandoned_call_log=abandoned_call_log)
+        return await self._gather(
+            conversations[0:],
+            generate_item=generate_item,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def _gather(
         self,
         conversations: Sequence[str | Sequence[Message]],
         *,
-        abandoned_call_log: AbandonedCallLog | None,
-    ) -> list[Response[OutputT | None] | GenerationError]:
+        generate_item: "GenerateItem[OutputT]",
+        timeout_seconds: float | None,
+    ) -> list[CallResult[OutputT | None]]:
         """Run the items concurrently and return the settled list, order-aligned.
 
-        Nothing leaves this frame on the raising path, so every item's history reaches
-        abandoned_call_log or is lost. An item still running appends its own record while it unwinds
-        its cancellation; an item that already settled cannot, so its record is appended here from
-        the task's result, which carries it whether the item ended in a Response or a
-        GenerationError.
-
-        The cancelled item tasks are awaited before those appends because gather returns here with
-        siblings still running on both arms: an item's non-GenerationError raise propagates
+        The cancelled tasks are awaited before it raises, because gather returns here with siblings
+        still running on both paths: a KeyboardInterrupt or a SystemExit from an item propagates
         immediately, and a cancellation propagates as soon as the first item completes as cancelled.
-        Without the await a sibling's own append would land after the raise reached the caller, and
-        the task.exception() reads below would hit tasks that are not done.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled generate_many; the items are cancelled
-                and their outcomes are lost with the frame.
-            BaseException: an item raised something that is not a GenerationError, a defect in
-                langchaint itself; the remaining tasks are cancelled and it propagates.
+            asyncio.CancelledError: an outer scope cancelled generate_many.
+            BaseException: an item raised a BaseException that is not an Exception, which langchaint
+                does not catch; the remaining tasks are cancelled and it propagates.
         """
         tasks = [
             asyncio.create_task(
-                self._generate_or_failure(conversation, abandoned_call_log=abandoned_call_log)
+                self._generate_or_failure(
+                    conversation,
+                    generate_item=generate_item,
+                    timeout_seconds=timeout_seconds,
+                )
             )
             for conversation in conversations
         ]
@@ -1010,9 +1069,6 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            for task in tasks:
-                if not task.cancelled() and task.exception() is None:
-                    _append_abandoned_call(abandoned_call_log, task.result().call)
             raise
 
     @overload
@@ -1020,42 +1076,40 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         self: "BoundLLM[str, ToolsT]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> StreamHandle[str]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, HasTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT | None]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, NoTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT]: ...
     def stream_one(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None = None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
     ) -> StreamHandle[Any]:
         """Build the stream handle; entering it with `async with` opens the request.
 
         The handle's final() Response types output the way generate_one types it, per binding.
         A bare str is shorthand for a conversation of one UserMessage holding that text.
         Sync because nothing suspends until the handle is entered;
-        see StreamHandle for the retry, close, and abandoned_call_log contracts.
+        see StreamHandle for the retry, close, deadline, and abandoned contracts.
+        timeout_seconds bounds the block from entry until the call concludes, so it covers the open,
+        the item pulls, and whatever the block does between them. Its clock starts at entry, not
+        here, so a handle held before entering loses none of it. Work the block does after the call
+        concludes is the caller's own time.
         """
-        return self._stream_one_any_binding(conversation, abandoned_call_log=abandoned_call_log)
+        return self._stream_one_any_binding(conversation, timeout_seconds=timeout_seconds)
 
     def _stream_one_any_binding(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
     ) -> StreamHandle[OutputT | None]:
         """Build the handle at the widest output type; _generate_one_any_binding says why."""
         return StreamHandle(
@@ -1063,5 +1117,5 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             bound_adapter=self._bound_adapter,
             conversation=_as_conversation(conversation),
             rate_limiter=self.rate_limiter,
-            abandoned_call_log=abandoned_call_log,
+            timeout_seconds=timeout_seconds,
         )

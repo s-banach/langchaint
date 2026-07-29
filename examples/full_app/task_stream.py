@@ -4,13 +4,17 @@ The app hands every run one on_event callback, and a run reports by calling it; 
 async iterator.
 
 AgentRun splits the agent into two roles. The base class owns final(), the single entry point: it
-installs the run's GuiEmitter, opens the agent span and the run deadline around the loop, emits
-AgentStarted and the terminal event, and returns the answer or re-raises the failure. The application
-subclasses it and writes only run(), a plain coroutine, calling self.on_event(event) as it goes.
+installs the run's GuiEmitter, opens the agent span around the loop, emits AgentStarted and the
+terminal event, and returns the answer or re-raises the failure. The application subclasses it and
+writes only run(), a plain coroutine, calling self.on_event(event) as it goes.
 
-on_event runs inside the run's frame, so its time counts against config.timeout_seconds. A consumer
-wanting its pace decoupled from the run's deadline passes on_event=queue.put_nowait and drains the
-queue at its own pace; the decoupling is the consumer's choice, never the shape's.
+on_event runs inside the run's frame, so a consumer that blocks in it slows the run down. A consumer
+wanting its own pace passes on_event=queue.put_nowait and drains the queue itself; the decoupling is
+the consumer's choice, never the shape's.
+
+Each turn passes config.timeout_seconds to generate_one as its timeout_seconds. langchaint owns that
+scope, so a call that runs out comes back as a TimedOutError the loop records and continues from,
+rather than as a cancellation that would take the run with it.
 
 Two capabilities ride on contextvars, the same mechanism that nests OTel spans across tasks:
 
@@ -29,9 +33,8 @@ emitter is ambient because for it there is no call site to thread through.
 
 The state a failure must leave behind lives on this object, never in the coroutine frame doing the
 work: a timeout cancels the frame, and anything local to it is gone. The record follows the same
-rule: each run appends every TurnRecord to its own turn_log at the moment it happens (langchaint
-appends the AbandonedCall a cancellation would otherwise erase, because the log doubles as the
-call's abandoned_call_log), and every run registers itself at construction. Any metric a consumer
+rule: each run appends every TurnRecord to its own turn_log at the moment it happens, and every run
+registers itself at construction. Any metric a consumer
 could want is a post-run fold over the registered runs' ordered logs; a parent's subtree total is
 the fold filtered by path prefix. A CancelledError is a BaseException that passes through every
 `except Exception` in the tree, so a design that carries a sub-run's records home on a return path
@@ -69,7 +72,6 @@ from scenario import CritiqueVerdict, DelegateArgs, build_critique_tool, search_
 from langchaint import (
     LLM,
     ZERO_USAGE,
-    AbandonedCall,
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchManyOutcome,
@@ -78,6 +80,7 @@ from langchaint import (
     Message,
     PydanticTool,
     Response,
+    TimedOutError,
     Tool,
     ToolCall,
     ToolManager,
@@ -103,9 +106,10 @@ class LlmTurn:
 
 @dataclass(frozen=True)
 class LlmFailure:
-    """One generate call that failed after its retries, held as the GenerationError the run re-raised.
+    """One generate call that did not produce a response, held as the GenerationError describing it.
 
-    error.usage is what the failed call billed, which is why a failure is a record and not only a raise.
+    error.usage is what the call billed, which is why a failure is a record and not only a raise.
+    A call that ran out of time lands here too, as a TimedOutError.
     """
 
     turn_number: int
@@ -127,21 +131,18 @@ class ToolTurn:
     reported_usage: Usage
 
 
-type TurnRecord = LlmTurn | LlmFailure | ToolTurn | AbandonedCall
+type TurnRecord = LlmTurn | LlmFailure | ToolTurn
 """One record in a run's ordered turn_log, the full account of what the run did and spent.
 
-The loop appends the first three; generate_one appends the AbandonedCall inside the frame a
-cancellation unwinds, because the log doubles as the call's abandoned_call_log. Any metric a
-consumer could want is a post-run fold over these records.
+Any metric a consumer could want is a post-run fold over these records.
 """
 
 
 def _spend_of(record: TurnRecord) -> Usage:
     """Return what one record billed, the fold step that turns an ordered turn_log into a total.
 
-    An AbandonedCall contributes its settled attempts' spend plus whatever the provider had
-    reported for the cut-off attempt: the rest of that attempt may have billed server-side with no
-    client-side channel reporting it.
+    A timed-out call's LlmFailure contributes what its settled attempts billed. The attempt the
+    deadline cut off may have gone on to bill server-side, which no client-side channel reports.
     """
     match record:
         case LlmTurn():
@@ -150,12 +151,10 @@ def _spend_of(record: TurnRecord) -> Usage:
             return record.error.usage
         case ToolTurn():
             return record.reported_usage
-        case AbandonedCall():
-            return Usage.sum_of((record.usage_settled, record.usage_in_flight))
 
 
 class AgentRun(ABC):
-    """The reporting half of an agent: the emitter install, the deadline, the span, the terminal events.
+    """The reporting half of an agent: the emitter install, the span, and the terminal events.
 
     A subclass supplies run(), its loop, as a coroutine, and calls on_event as it goes. Awaiting final()
     drives that loop to the answer, and the outcome rides final()'s return and raise; the accounting
@@ -165,10 +164,9 @@ class AgentRun(ABC):
     the run ended. A subclass emits only what happens inside its loop.
 
     turn_log is the run's append-only ordered record: the loop appends one TurnRecord per settled
-    generate call, per failed one and per answered tool call, and langchaint appends an
-    AbandonedCall where a cancellation cut a generate call off. Any metric a consumer could want
-    is a fold over the logs, never a running sum, so there is no second copy of any record to
-    drift from.
+    generate call, per failed one, per answered tool call, and per call its deadline cut off. Any
+    metric a consumer could want is a fold over the logs, never a running sum, so there is no second
+    copy of any record to drift from.
     """
 
     def __init__(
@@ -210,8 +208,8 @@ class AgentRun(ABC):
     async def run(self) -> str:
         """Drive this agent's loop to its final answer, calling on_event as it goes.
 
-        A coroutine, never a generator: the base class awaits it under the run's deadline and span, and
-        a `yield` here would make it an async generator that cannot be awaited at all.
+        A coroutine, never a generator: the base class awaits it under the run's span, and a `yield`
+        here would make it an async generator that cannot be awaited at all.
 
         Returns:
             The run's final answer. Raising instead is how a run fails; the base class reports it.
@@ -251,7 +249,6 @@ class AgentRun(ABC):
         a tool restores its parent's emitter when it ends.
 
         Raises:
-            TimeoutError: the run outran config.timeout_seconds.
             Exception: whatever run() failed with; AgentFailed is emitted before the re-raise.
             asyncio.CancelledError: an outer deadline cancelled the run. No terminal event is emitted,
                 because the run has no outcome to report; the turn logs already hold the records.
@@ -267,8 +264,7 @@ class AgentRun(ABC):
                     usage=lambda: self.usage,
                     extra_attributes=self.span_attributes,
                 ):
-                    async with asyncio.timeout(self.config.timeout_seconds):
-                        answer = await self.run()
+                    answer = await self.run()
             except Exception as error:
                 self.on_event(
                     AgentFailed(
@@ -287,8 +283,8 @@ class AgentRun(ABC):
 class ReActAgent(AgentRun):
     """The example's loop, written as the application's half of the contract: one coroutine.
 
-    Everything here is ordinary async code. The per-call deadline is an ordinary `asyncio.timeout`, the
-    events go out through on_event, and the run's own deadline and span are the base class's business.
+    Everything here is ordinary async code. The per-call deadline is langchaint's own
+    `timeout_seconds`, the events go out through on_event, and the span is the base class's business.
     """
 
     def __init__(  # noqa: PLR0913 (the five arguments every run needs plus this loop's bound, tool_manager and prompt)
@@ -332,18 +328,15 @@ class ReActAgent(AgentRun):
         has returned an approval; until then the answer is appended and sent back with an instruction
         to critique, and config.max_turns is what bounds that.
 
-        Each turn is one generate_one call under an ordinary asyncio.timeout carrying
-        config.per_call_timeout_seconds. turn_log is passed as the call's abandoned_call_log, so a
-        cancellation from any deadline (this one, the run's, the app's) leaves its AbandonedCall on
-        the log before the CancelledError unwinds this frame; the loop appends a record for every
-        call that returns or raises, which is the app's half of the log.
+        Each turn is one generate_one call carrying config.timeout_seconds. Every outcome reaches
+        turn_log through the same append below, because a call that ran out of time comes back as a
+        TimedOutError rather than as a cancellation: the loop is still running when it arrives, so
+        it has somewhere to put the record.
 
         Raises:
-            GenerationError: a generate call failed after its retries; an LlmFailure holding it is
-                appended to turn_log before the re-raise.
-            TimeoutError: the base class's deadline cut the run off, or one leaked from inside a
-                call (the expired() check below tells them apart). A single call outrunning
-                config.per_call_timeout_seconds is handled in the loop, not raised.
+            GenerationError: a generate call failed after its retries, TimedOutError excepted; an
+                LlmFailure holding it is appended to turn_log before the raise. A call outrunning
+                config.timeout_seconds is recorded and retried on the next turn, not raised.
             RuntimeError: the model kept calling tools for config.max_turns turns.
             DispatchExceptionGroup: a tool function raised; the settled siblings are folded first.
             asyncio.CancelledError: an outer deadline cancelled the run.
@@ -358,17 +351,16 @@ class ReActAgent(AgentRun):
                     usage_so_far=self.usage,
                 )
             )
-            timeout_scope = asyncio.timeout(self.config.per_call_timeout_seconds)
             try:
-                async with timeout_scope:
-                    response = await self.bound.generate_one(
-                        self.conversation, abandoned_call_log=self.turn_log
-                    )
-            except TimeoutError:
-                if not timeout_scope.expired():
+                response = await self.bound.generate_one(
+                    self.conversation, timeout_seconds=self.config.timeout_seconds
+                )
+            except GenerationError as error:
+                self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
+                if not isinstance(error, TimedOutError):
                     raise
-                # generate_one appended the AbandonedCall on its way out; the dropped call also
-                # appended nothing to the conversation, so the next turn resends it unchanged.
+                # The dropped call appended nothing to the conversation, so the next turn resends it
+                # unchanged.
                 self.on_event(
                     LlmCallAbandoned(
                         agent_path=self.agent_path,
@@ -377,9 +369,6 @@ class ReActAgent(AgentRun):
                     )
                 )
                 continue
-            except GenerationError as error:
-                self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
-                raise
             self.turn_log.append(LlmTurn(turn_number=self.turn_number, response=response))
             self.on_event(
                 LlmResponse(
@@ -711,9 +700,9 @@ class App:
 
         The whole-app deadline is the caller's asyncio.timeout around this call. Its cancellation
         lands in whatever frame is running, and the TaskGroup awaits every child's unwind before
-        letting it propagate, so the accounting is final when the caller's except reads it: the
-        cancelled calls' AbandonedCall records are on the turn logs, appended by generate_one inside
-        the frames the cancellation unwound.
+        letting it propagate, so every turn that had settled is on its run's turn_log when the
+        caller's except reads it. A call still in flight is not: the cancellation destroys the frame
+        holding its account.
 
         Raises:
             asyncio.CancelledError: an outer deadline cancelled the graph mid-run.

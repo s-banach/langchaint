@@ -37,7 +37,6 @@ SCENARIOS = (
     Scenario(name="happy", script_name="happy"),
     Scenario(name="subagent_error", script_name="subagent_error"),
     Scenario(name="call_timeout", script_name="call_timeout"),
-    Scenario(name="agent_timeout", script_name="agent_timeout"),
     Scenario(name="app_timeout", script_name="app_timeout", app_timeout_seconds=0.5),
     Scenario(name="tool_budget", script_name="happy", climate_max_tool_calls=1),
     Scenario(name="unapproved_answer", script_name="unapproved_answer"),

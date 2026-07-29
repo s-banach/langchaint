@@ -132,21 +132,14 @@ def build_scripts(scenario: str) -> dict[str, list[Turn]]:
 
     Scenarios:
         happy: every agent completes.
-        call_timeout: one research_climate turn hangs past the per-call timeout, so that call is
-            counted abandoned; the run keeps what it had already spent.
-        agent_timeout: research_energy runs an extra turn with every turn delayed to well inside its
-            per-call timeout, so no single call trips and the per-agent deadline fires on cumulative
-            time. Both scenarios end with one call cancelled in flight, so what separates them is which
-            deadline did it: here two calls completed first, each well inside the per-call limit.
+        call_timeout: one research_climate turn hangs past config.timeout_seconds, so that call is
+            counted abandoned; the run keeps what it had already spent and answers on its next turn.
         app_timeout: both researchers stall on their second turn, so the whole-app deadline fires
             after each has already billed a turn, which is what makes the surviving fold worth reading.
         subagent_error: the specialist's second turn raises, after it has already billed one turn.
         unapproved_answer: synthesize answers before critiquing, so the self-correction bounce fires.
     """
     climate_delay = 5.0 if scenario == "call_timeout" else 0.0
-    # Comfortably under research_energy's per_call_timeout_seconds and, over three turns, past its
-    # timeout_seconds; build_configs gives the researchers 1.5 and 2.0 seconds.
-    slow_turn_delay = 0.8 if scenario == "agent_timeout" else 0.0
     app_delay = 5.0 if scenario == "app_timeout" else 0.0
     specialist_error = (
         SubAgentError("specialist backend fell over") if scenario == "subagent_error" else None
@@ -170,38 +163,15 @@ def build_scripts(scenario: str) -> dict[str, list[Turn]]:
             Turn(tool_calls=(call("search", '{"query": "ice loss gigatonnes per year"}'),)),
             Turn(text="Ice loss is roughly 270 Gt/yr.", error=specialist_error),
         ],
-        "research_energy": _energy_turns(trailing_delay=app_delay, per_turn_delay=slow_turn_delay),
+        "research_energy": [
+            Turn(tool_calls=(call("search", '{"query": "renewable share 2030"}'),)),
+            Turn(
+                text="Energy: renewables reach a third of supply.",
+                delay_seconds=app_delay,
+            ),
+        ],
         "synthesize": _synthesize_turns(skips_critique=scenario == "unapproved_answer"),
     }
-
-
-def _energy_turns(*, trailing_delay: float, per_turn_delay: float) -> list[Turn]:
-    """Build research_energy's turns, with an extra search turn once per_turn_delay is non-zero.
-
-    Three delayed turns are what push cumulative time past the per-agent deadline while every single
-    call stays inside the per-call one; at per_turn_delay 0 the extra turn is dropped and the script is
-    the two turns every other scenario runs.
-    """
-    searches = [
-        Turn(
-            tool_calls=(call("search", '{"query": "renewable share 2030"}'),),
-            delay_seconds=per_turn_delay,
-        )
-    ]
-    if per_turn_delay:
-        searches.append(
-            Turn(
-                tool_calls=(call("search", '{"query": "grid storage buildout"}'),),
-                delay_seconds=per_turn_delay,
-            )
-        )
-    return [
-        *searches,
-        Turn(
-            text="Energy: renewables reach a third of supply.",
-            delay_seconds=trailing_delay + per_turn_delay,
-        ),
-    ]
 
 
 def _synthesize_turns(*, skips_critique: bool) -> list[Turn]:

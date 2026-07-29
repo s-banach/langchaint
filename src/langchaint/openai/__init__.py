@@ -17,7 +17,7 @@ is OpenAIResponsesAdapter(client=..., provider_name="groq", ...) wrapped in an L
 openai_bedrock_model is the constructor for OpenAI models served by Bedrock;
 Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
 provider_name="azure.ai.openai", ...) wrapped in an LLM.
-pricing is a mapping from the service tier a response reports to the PricingTable that prices it.
+pricing is a mapping from the service tier a response reports to the OpenAIPricingTable that prices it.
 openai_model merges it over the model's public default-tier prices from OPENAI_PRICING, so a caller
 adds a tier or replaces the default rates with a negotiated one and omitting it prices at the public
 rates. A response served at a tier the mapping does not hold costs NaN.
@@ -50,11 +50,11 @@ except ModuleNotFoundError as exc:
 from langchaint.llm import LLM
 from langchaint.openai.responses_adapter import (
     OpenAIPricedServiceTier,
+    OpenAIPricingTable,
     OpenAIResponsesAdapter,
     OpenAIServiceTier,
     ReasoningSummary,
 )
-from langchaint.pricing import PricingTable
 from langchaint.rate_limiter import RateLimiter
 
 type OpenAIModelName = Literal[
@@ -69,50 +69,50 @@ type OpenAIModelName = Literal[
 ]
 """Model identifiers with public prices in OPENAI_PRICING."""
 
-OPENAI_PRICING: dict[OpenAIModelName, PricingTable] = {
-    "gpt-5.1": PricingTable(
+OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
+    "gpt-5.1": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.25,
         output_usd_per_million_tokens=10.00,
         cache_read_usd_per_million_tokens=0.125,
         cache_write_usd_per_million_tokens=0.00,
     ),
-    "gpt-5.2": PricingTable(
+    "gpt-5.2": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.75,
         output_usd_per_million_tokens=14.00,
         cache_read_usd_per_million_tokens=0.175,
         cache_write_usd_per_million_tokens=0.00,
     ),
-    "gpt-5.4": PricingTable(
+    "gpt-5.4": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=2.50,
         output_usd_per_million_tokens=15.00,
         cache_read_usd_per_million_tokens=0.25,
         cache_write_usd_per_million_tokens=0.00,
     ),
-    "gpt-5.4-mini": PricingTable(
+    "gpt-5.4-mini": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=0.75,
         output_usd_per_million_tokens=4.50,
         cache_read_usd_per_million_tokens=0.075,
         cache_write_usd_per_million_tokens=0.00,
     ),
-    "gpt-5.5": PricingTable(
+    "gpt-5.5": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
         output_usd_per_million_tokens=30.00,
         cache_read_usd_per_million_tokens=0.50,
         cache_write_usd_per_million_tokens=0.00,
     ),
-    "gpt-5.6-luna": PricingTable(
+    "gpt-5.6-luna": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.00,
         output_usd_per_million_tokens=6.00,
         cache_read_usd_per_million_tokens=0.10,
         cache_write_usd_per_million_tokens=1.25,
     ),
-    "gpt-5.6-terra": PricingTable(
+    "gpt-5.6-terra": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=2.50,
         output_usd_per_million_tokens=15.00,
         cache_read_usd_per_million_tokens=0.25,
         cache_write_usd_per_million_tokens=3.125,
     ),
-    "gpt-5.6-sol": PricingTable(
+    "gpt-5.6-sol": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
         output_usd_per_million_tokens=30.00,
         cache_read_usd_per_million_tokens=0.50,
@@ -141,7 +141,7 @@ def openai_model(
     model: OpenAIModelName,
     *,
     client: AsyncOpenAI | None = None,
-    pricing: Mapping[OpenAIPricedServiceTier, PricingTable] | None = None,
+    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = None,
     rate_limiter: RateLimiter | None = None,
     reasoning_summary: ReasoningSummary | None = None,
     service_tier: OpenAIServiceTier | None = None,
@@ -190,7 +190,7 @@ def openai_model(
 def openai_bedrock_model(
     model: str,
     *,
-    pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
+    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
     supports_prompt_cache_options: bool,
     aws_region: str | None = None,
     client: AsyncBedrockOpenAI | None = None,
@@ -256,6 +256,7 @@ __all__ = [
     "PROMPT_CACHE_OPTIONS_MODELS",
     "OpenAIModelName",
     "OpenAIPricedServiceTier",
+    "OpenAIPricingTable",
     "OpenAIResponsesAdapter",
     "OpenAIServiceTier",
     "ReasoningSummary",

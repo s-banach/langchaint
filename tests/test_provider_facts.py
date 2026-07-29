@@ -89,7 +89,7 @@ def _is_required(model: type[BaseModel], name: str) -> bool:
 def test_anthropic_cache_counters_stay_optional_ints() -> None:
     """The anthropic cache counters are Optional[int], which is what the `or 0` in the adapter reads.
 
-    _normalized_usage writes `usage.cache_read_input_tokens or 0`. Were these to become required
+    _billing_from_sdk_usage writes `usage.cache_read_input_tokens or 0`. Were these to become required
     ints, the `or 0` would still be correct but pointless.
     """
     for name in ("cache_read_input_tokens", "cache_creation_input_tokens"):
@@ -124,7 +124,7 @@ def test_anthropic_reasoning_counter_is_thinking_tokens() -> None:
 def test_openai_usage_counters_stay_required_ints() -> None:
     """The openai counters are required ints, which is why the adapter subtracts them unguarded.
 
-    _normalized_usage computes the uncached count as input_tokens minus cached_tokens minus
+    _billing_from_response computes the uncached count as input_tokens minus cached_tokens minus
     cache_write_tokens with no None handling. An optional field here would raise a TypeError on
     every response that omitted it.
     """
@@ -141,7 +141,7 @@ def test_openai_usage_details_objects_are_not_optional() -> None:
     """input_tokens_details and output_tokens_details are non-nullable, so the adapter reaches into them directly.
 
     Requiredness alone would not do: an annotation widened to `| None` with no default stays
-    required, and _normalized_usage's details.cached_tokens read would raise AttributeError on
+    required, and _billing_from_response's details.cached_tokens read would raise AttributeError on
     every response.
     """
     for name in ("input_tokens_details", "output_tokens_details"):

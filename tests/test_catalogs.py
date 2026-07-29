@@ -13,7 +13,7 @@ from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedro
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 
-from langchaint import LLM, PricingTable, RateLimiter
+from langchaint import LLM, RateLimiter
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
@@ -29,13 +29,14 @@ from langchaint.openai import (
     OPENAI_PRICING,
     OpenAIModelName,
     OpenAIPricedServiceTier,
+    OpenAIPricingTable,
     OpenAIResponsesAdapter,
     openai_bedrock_model,
     openai_model,
 )
 
-_ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, PricingTable] = {
-    "default": PricingTable(
+_ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
+    "default": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.0,
         output_usd_per_million_tokens=1.0,
         cache_read_usd_per_million_tokens=1.0,

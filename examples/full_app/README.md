@@ -1,7 +1,7 @@
 # Streaming a multi-agent app
 
 The reference architecture for a multi-agent application on langchaint: a ReAct loop with sub-agents, a
-graph, and three layers of timeout streams its progress to a UI and keeps its token accounting through
+graph, and two layers of timeout streams its progress to a UI and keeps its token accounting through
 every failure. langchaint deliberately ships no
 agent loop, so the loop is application code; `task_stream.py` is the shape to copy for it, and the rest
 of these files are the app around it.
@@ -25,46 +25,42 @@ spend, and reports its progress mid-call through the ambient `GuiEmitter`. A sub
 way: it writes its own `turn_log` as it goes.
 
 Each agent is constructed from an `AgentConfig` (`config.py`) fixing its `max_turns`, `max_tool_calls`,
-`timeout_seconds`, `per_call_timeout_seconds`, and `self_correction_enabled`.
+`timeout_seconds`, and `self_correction_enabled`.
 
-Three deadlines nest, and each catches a failure the others cannot:
+Two deadlines apply, and they differ in what a run can do afterwards:
 
-- `per_call_timeout_seconds` bounds one provider request, an ordinary `asyncio.timeout` around `generate_one`. The request is dropped and the loop goes on to its next turn with the same conversation, since an abandoned call appended nothing to it.
-- `timeout_seconds` bounds a whole run, so an agent making fast progress toward nothing still stops.
-- The whole-app deadline is applied by the consumer, an `asyncio.timeout` around `await app.run()`.
+- `timeout_seconds` bounds one provider request, handed to `generate_one` as its own `timeout_seconds`. langchaint owns that scope, so a request that runs out comes back as a `TimedOutError` while the loop is still running: the loop records it and takes its next turn with the same conversation, which the dropped call left untouched.
+- The whole-app deadline is the consumer's, an `asyncio.timeout` around `await app.run()`. It cancels, so nothing continues past it.
 
-Only the innermost one leaves a run able to continue, and that is what makes it a different limit rather
-than a shorter spelling of the next one out. A run whose every call hangs is bounded by `max_turns`.
+A run whose every call hangs is bounded by `max_turns`.
 
 `LlmCallAbandoned` is the event that reports a dropped request, so a UI shows the gap rather than a turn
 that silently produced nothing.
 
-A cancellation leaves a hole no client can close: the cancelled call may have completed and billed
-server-side, so its cost is unobservable. Each run's `turn_log` is passed to `generate_one` as its
-`abandoned_call_log`, so whichever deadline cancels a call, langchaint appends an `AbandonedCall`
-record before the unwind; counting only the innermost deadline's drops would report zero abandoned
-calls for a tree the app deadline cut off mid-request.
+A dropped request leaves a hole no client can close: it may have completed and billed server-side
+after the deadline landed, and that remainder is unobservable. What is observable is on the
+`TimedOutError` the loop appends to `turn_log`.
 
-The totals are final the moment the deadline's `except` runs: the whole tree runs in one task tree
-under `App.run`, so the cancellation has unwound every frame, `AbandonedCall` records included, before
-the `TimeoutError` reaches the consumer.
+The whole-app deadline is where the accounting stops. A call in flight when it lands dies with the
+frame holding its account, so what survives is every turn that had already settled; the whole tree
+runs in one task tree under `App.run`, so those are all written before the `TimeoutError` reaches the
+consumer.
 
 ## The scenarios
 
-`run_task_stream.py` plays the app through seven scenarios, each exercising one failure layer:
+`run_task_stream.py` plays the app through six scenarios, each exercising one failure layer:
 
 | scenario | exercises |
 |---|---|
 | `happy` | every agent completes; the specialist's spend lands inside its parent's subtree |
 | `subagent_error` | the specialist raises mid-run; the parent reads an `is_error` tool message and still answers |
-| `call_timeout` | one request outruns `per_call_timeout_seconds`; the run drops it and answers on the next turn |
-| `agent_timeout` | no single call trips the per-call limit, but cumulative time crosses `timeout_seconds` |
-| `app_timeout` | the whole-app deadline cuts both researchers off mid-request; the partial accounting survives |
+| `call_timeout` | one request outruns `timeout_seconds`; the run records it and answers on the next turn |
+| `app_timeout` | the whole-app deadline cuts both researchers off mid-request; the settled accounting survives |
 | `tool_budget` | `max_tool_calls=1` declines the remaining calls and the model finishes with what it has |
 | `unapproved_answer` | `synthesize` answers uncritiqued and the self-correction bounce sends it back |
 
-`test_task_stream_claims.py` asserts the claims the docstrings make, the two above all: the accounting
-is final the moment the app deadline's `except` runs, and a tool function's progress reaches the
+`test_task_stream_claims.py` asserts the claims the docstrings make, the two above all: a call its own
+deadline cut off is on `turn_log` and its run carries on, and a tool function's progress reaches the
 `on_event` of whichever run dispatched it.
 
 ## The shape
@@ -87,9 +83,9 @@ because a tool function does not know its run's total. `TurnStarted` carries the
 
 ## Why this shape
 
-**One task tree, so a deadline's `except` reads final accounting.** A callback adds no task and no
-queue per run, so the whole graph runs under `App.run`'s frame and its `TaskGroup`. A cancellation from
-any deadline unwinds every child before it propagates, which is what lets the consumer read the totals
+**One task tree, so the app deadline's `except` reads every settled turn.** A callback adds no task and no
+queue per run, so the whole graph runs under `App.run`'s frame and its `TaskGroup`. The cancellation
+unwinds every child before it propagates, which is what lets the consumer read the totals
 right in its `except` with no settling step: cancelling a task it does not await would not be the same
 as that task having unwound.
 
@@ -104,11 +100,12 @@ Each `TurnRecord` goes to the run's own `turn_log` at the moment it happens, and
 Any metric a consumer could possibly want is a post-run fold over the registered runs' ordered logs; a parent's subtree total is the fold filtered by path prefix.
 Nothing has to be carried, so nothing can be dropped, and nothing is stored twice, so there is no second copy to drift.
 
-**Each record rides the value that carries it, except the one that has no value.** A returned
-`Response` and a raised `GenerationError` carry their own `usage`; appending their records is the
-loop's job. A cancelled call returns nothing and raises nothing the loop can keep, so `generate_one`
-appends its `AbandonedCall` record to the `turn_log` passed as `abandoned_call_log`, inside the frame the
-cancellation unwinds, which no wrapper outside the call could do.
+**Ask langchaint for the deadline instead of wrapping the call in one.** A cancelled call carries
+nothing back: it returns no value and raises nothing the loop can keep, because the scope that
+converts the cancellation sits above the frame holding the call's account. Passing
+`timeout_seconds` puts that scope inside the frame instead, so a request that runs out arrives as a
+`TimedOutError` carrying its `usage`, and one `except GenerationError` records the returned
+`Response`, an ordinary failure, and a drop the same way.
 `DispatchExceptionGroup.completed_outcomes` keeps settled siblings' `app_data` when another tool
 raised, and it is worthless unhandled: an app that awaits `dispatch_many` with no handler loses its
 settled siblings' reported spend when a tool raises, because the money is on the exception and nobody
@@ -123,7 +120,7 @@ deleting the `except` would cost an answer, never a record.
 **OTel tracing needs a span the app owns.** langchaint spans one generate call and one tool dispatch and
 has no concept of a run, so a multi-turn agent's generate spans would arrive as siblings with nothing
 tying them together. `agent_span` (in `langchaint.tracing`) opens the `invoke_agent` span around the
-whole loop, in the object that owns the deadline and for the same reason: a caller cannot forget it.
+whole loop, in `final()` rather than in the loop, so a caller cannot forget it.
 Sub-agent nesting needs no plumbing, because the sub-run's `final()` runs in the frame `delegate` is
 awaiting in, which is the frame the tool span is current in; `test_task_stream_claims.py` asserts that
 rather than assumes it.
@@ -163,18 +160,13 @@ be threaded a reference.
 
 ## What would change the recommendation
 
-The shape assumes two things this app happens to be true of, and an application they are false of should
+The shape assumes one thing this app happens to be true of, and an application it is false of should
 choose differently.
 
-**That `on_event` is quick and synchronous.** It returns `None` and runs in the run's frame, so its
-time counts against `timeout_seconds` and it has no way to await. That is correct for an `on_event`
+**That `on_event` is quick and synchronous.** It returns `None` and runs in the run's frame, so a
+consumer that blocks in it slows the run down and it has no way to await. That is correct for an `on_event`
 that renders a line or appends to a list. A consumer that is slow, or must await per event (feeding a
 rate-limited socket), fronts it with a queue: `on_event=queue.put_nowait` is constant-time, and the
 drain loop is the consumer's own task, paced by the consumer. That choice re-creates the iterator
 shape's costs for that consumer alone: the queue is unbounded, and a run finishes with events still
 queued.
-
-**That `timeout_seconds` may include the consumer's time.** With `on_event` in the run's frame, the
-deadline bounds work plus reporting, and a consumer doing real work in `on_event` gets backpressure by
-construction: the run cannot outrun it. If the deadline must be a budget on provider work alone,
-passing `on_event=queue.put_nowait` takes the consumer's time back out of it.

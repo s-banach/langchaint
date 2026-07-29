@@ -42,7 +42,7 @@ langchaint ships no loop, so there is nothing to splice into: each hook is plain
 | human-in-the-loop / interrupts | check `call.name` (or a tool's `app_data`) between turns and decide; a declined call is an is_error `ToolMessage` you append (see `run_agent`'s `approve` gate) |
 | summarization / message trimming | edit the `conversation` list you hold before the next turn |
 | structured-output middleware | `bind(response_format=Model)`; a refusal or truncation raises a `GenerationError` you catch |
-| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, smaller than `usage` wherever a failed attempt billed. Or `to_row(result)` for a table. |
+| usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, smaller than `usage` wherever a failed attempt billed. Or `to_tables(results)` for a calls table and an attempts table, where per-attempt spend and the rates that priced it sit in their own rows. |
 
 The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full conversation in scope.
 
@@ -52,8 +52,8 @@ The gain from owning the loop is that a budget check, an approval gate, or a bin
 
 | LangGraph | langchaint |
 | --- | --- |
-| summing `AIMessage.usage_metadata` across turns to bill a run | `response.usage` is the paid total across retries and carries `cost_in_usd`; `Usage.sum_of` folds a run, and a cancelled call's settled spend lands in `abandoned_call_log` |
-| a per-call deadline as `awrap_model_call` middleware | `asyncio.timeout` around the call it bounds, in the loop you own (see `examples/full_app`) |
+| summing `AIMessage.usage_metadata` across turns to bill a run | `response.usage` is the paid total across retries and carries `cost_in_usd`; `Usage.sum_of` folds a run, and a call its deadline cut off reports its settled spend on `TimedOutError.usage` |
+| a per-call deadline as `awrap_model_call` middleware | `timeout_seconds` on the call it bounds (see `examples/10_deadlines.py`) |
 | `get_stream_writer()` and `astream(subgraphs=True)` stream a nested sub-agent progress tree to one consumer with no reference passing | no counterpart: the application owns the event stream, and `examples/full_app` (`events.py`, `harness.py`) is the runnable pattern |
 
 ## Retries and rate limiting: one RateLimiter, not per-call config
@@ -75,5 +75,5 @@ The runnable version, a `try`/`except GenerationError` over two bindings, is `ge
 `generate_one` returns a `Response` on success and raises on a terminal outcome.
 `GenerationError` is the base of every terminal per-item failure: `RetriesExhaustedError` (transient budget spent), `RefusalError` (no structured output: the model refused or a provider filter blocked the turn), `MaxCompletionTokensExceededError` (the structured response hit the token cap), and `InvalidRequestError` (the provider or the adapter rejected this request) among them.
 Catch `GenerationError` to handle them all at once.
-In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_row` renders successes and failures to the same table.
+In a batch, `generate_many` returns each terminal per-item failure as a `GenerationError` in its slot instead of raising, so the batch finishes and `to_tables` renders successes and failures into the same two tables.
 The runnable catch, one `try`/`except GenerationError` around a structured `generate_one`, is `catch_generation_error` in `05_rate_limiting_and_errors.py`.

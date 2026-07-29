@@ -15,7 +15,7 @@ Verified against anthropic 0.120.0:
 `Usage.input_tokens` excludes cache reads and writes, so the three langchaint counters map directly
 and no all-inclusive provider total exists to cross-check. That one is verified by docs rather than
 by introspection: the SDK documents no relationship among the input counters,
-so `_normalized_usage` carries the page that does.
+so `_billing_from_sdk_usage` carries the page that does.
 
 Reasoning replay, verified by docs and live runs because it is request-time behavior SDK introspection cannot show:
 the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
@@ -64,7 +64,7 @@ Mapping decisions:
 import base64
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Literal, cast, override
 
 import anthropic
@@ -111,6 +111,7 @@ from langchaint.adapter import (
     NoOutputOutcome,
     ReasoningDelta,
     Refusal,
+    RequestParams,
     ResponseOutcome,
     SchemaViolation,
     SpecificToolChoice,
@@ -118,8 +119,12 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedTurn,
     classification_from_response,
+    narrowed_request,
+    request_id_from_raw,
+    request_json,
     retry_after_seconds_from_headers,
 )
+from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError
 from langchaint.messages import (
     AssistantMessage,
@@ -133,7 +138,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import category_cost
+from langchaint.pricing import Billing, category_cost
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
@@ -185,16 +190,13 @@ _STANDARD_TIER: AnthropicPricedServiceTier = "standard"
 
 @dataclass(frozen=True, kw_only=True)
 class AnthropicPricingTable:
-    """USD prices per one million tokens for one model at one Anthropic service tier.
+    """One model's rates at one Anthropic service tier.
 
     Two cache-write rates, because Anthropic bills 5-minute and 1-hour writes differently and one
     response can report tokens written at both TTLs. Both are required: a table that priced only the
     TTL its adapter marks would price the other half of such a response at the wrong rate.
     price() spends both and reports their sum as one cache-write cost, so what reaches Usage is
     the neutral four categories.
-
-    input_cache_none_usd_per_million_tokens prices only the uncached input, the partition's
-    input_tokens_cache_none; cache reads and writes bill at their own rates.
     """
 
     input_cache_none_usd_per_million_tokens: float
@@ -203,47 +205,67 @@ class AnthropicPricingTable:
     cache_write_5m_usd_per_million_tokens: float
     cache_write_1h_usd_per_million_tokens: float
 
-    def price(
+    def price(  # noqa: PLR0913 (anthropic splits the cache-write counter that other providers report as one)
         self,
         *,
+        service_tier: str,
+        usage_raw: BaseModel | None,
         input_tokens_cache_read: int,
         input_tokens_cache_write_5m: int,
         input_tokens_cache_write_1h: int,
         input_tokens_cache_none: int,
         output_tokens: int,
         output_tokens_reasoning: int,
-    ) -> Usage:
+    ) -> Billing:
         """Price one response's counters, the two cache-write TTLs each at their own rate.
 
         The two write counts arrive apart and leave together: Usage.input_tokens_cache_write is
         their sum, and input_tokens_cache_write_cost_in_usd is the sum of what each cost.
+        The Billing reports one cache-write price, the blend the two TTLs actually billed at, so
+        the write counter times that price reproduces the write cost. Where nothing was written it
+        is the 5-minute rate, Anthropic's own default TTL for a cache_control marker.
 
         Raises:
             pydantic.ValidationError: a counter is negative.
         """
-        return Usage(
-            input_tokens_cache_read=input_tokens_cache_read,
-            input_tokens_cache_write=input_tokens_cache_write_5m + input_tokens_cache_write_1h,
-            input_tokens_cache_none=input_tokens_cache_none,
-            output_tokens=output_tokens,
-            output_tokens_reasoning=output_tokens_reasoning,
-            input_tokens_cache_read_cost_in_usd=category_cost(
-                input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+        cache_write_5m_cost_in_usd = category_cost(
+            input_tokens_cache_write_5m, self.cache_write_5m_usd_per_million_tokens
+        )
+        cache_write_1h_cost_in_usd = category_cost(
+            input_tokens_cache_write_1h, self.cache_write_1h_usd_per_million_tokens
+        )
+        input_tokens_cache_write = input_tokens_cache_write_5m + input_tokens_cache_write_1h
+        input_tokens_cache_write_cost_in_usd = (
+            cache_write_5m_cost_in_usd + cache_write_1h_cost_in_usd
+        )
+        return Billing(
+            usage=Usage(
+                input_tokens_cache_read=input_tokens_cache_read,
+                input_tokens_cache_write=input_tokens_cache_write,
+                input_tokens_cache_none=input_tokens_cache_none,
+                output_tokens=output_tokens,
+                output_tokens_reasoning=output_tokens_reasoning,
+                input_tokens_cache_read_cost_in_usd=category_cost(
+                    input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+                ),
+                input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
+                input_tokens_cache_none_cost_in_usd=category_cost(
+                    input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+                ),
+                output_tokens_cost_in_usd=category_cost(
+                    output_tokens, self.output_usd_per_million_tokens
+                ),
             ),
-            input_tokens_cache_write_cost_in_usd=(
-                category_cost(
-                    input_tokens_cache_write_5m, self.cache_write_5m_usd_per_million_tokens
-                )
-                + category_cost(
-                    input_tokens_cache_write_1h, self.cache_write_1h_usd_per_million_tokens
-                )
+            service_tier=service_tier,
+            usage_raw=usage_raw,
+            input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+            cache_write_usd_per_million_tokens=(
+                input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
+                if input_tokens_cache_write
+                else self.cache_write_5m_usd_per_million_tokens
             ),
-            input_tokens_cache_none_cost_in_usd=category_cost(
-                input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
-            ),
-            output_tokens_cost_in_usd=category_cost(
-                output_tokens, self.output_usd_per_million_tokens
-            ),
+            output_usd_per_million_tokens=self.output_usd_per_million_tokens,
         )
 
 
@@ -296,13 +318,26 @@ class _AnthropicRequest:
     of the API's 4-marker request limit for per-request marked parts."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class _AnthropicRequestParams(RequestParams):
+    """One messages request: the binding's precomputed fields and this call's converted messages."""
+
+    precomputed: _AnthropicRequest
+    messages: list[MessageParam]
+
+    @override
+    def as_json(self) -> str:
+        """Render the request as a JSON object, dropping every field left to the provider's default."""
+        return request_json(self, omitted_class=Omit)
+
+
 class _NotSendableError(Exception):
     """A conversation this adapter will not put on the wire, raised by a conversion helper.
 
-    Never leaves this module: _request_messages turns it into the InvalidRequest arm that
-    send and open_stream return. It exists because the conversation is found unsendable several
-    frames below them, in per-part converters whose callers would each have to thread a union
-    outward otherwise.
+    Never leaves this module: _request_messages turns it into the InvalidRequest that build_request
+    returns. It exists because the conversation is found unsendable several frames below
+    build_request, in per-part converters whose callers would each have to thread a union outward
+    otherwise.
     """
 
     def __init__(self, reason: str) -> None:
@@ -370,7 +405,7 @@ def _tool_result_content(
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
     """Convert one AssistantMessage to wire blocks in turn order.
 
-    A ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     because the API rejects a tool-use continuation whose latest thinking block was modified.
     A trace another provider produced goes to the wire the same way and the API rejects its
     unknown type key, so a conversation replayed through the wrong provider fails loudly;
@@ -404,7 +439,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
             # (which mutates blocks to place cache breakpoints) from ever writing into the
             # frozen message's stored payload.
             blocks.append(
-                cast("ThinkingBlockParam | RedactedThinkingBlockParam", dict(element.reasoning))
+                cast("ThinkingBlockParam | RedactedThinkingBlockParam", dict(element.raw))
             )
     return blocks
 
@@ -506,11 +541,9 @@ def _request_messages(
 ) -> list[MessageParam] | InvalidRequest:
     """Convert a conversation under this request's caching parameters, or report it unsendable.
 
-    The one place a _NotSendableError becomes an AttemptOutcome arm.
-    Every send and open_stream starts here and returns the InvalidRequest unchanged when it gets one.
-
-    Raises:
-        json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _wire_messages).
+    The one place a conversation this adapter will not put on the wire becomes an InvalidRequest.
+    An unparseable tool_call.args_json is one of those: the wire block holds the parsed arguments,
+    so text that is not JSON has no block to go in.
     """
     try:
         return _wire_messages(
@@ -521,6 +554,8 @@ def _request_messages(
         )
     except _NotSendableError as not_sendable:
         return InvalidRequest(reason=not_sendable.reason)
+    except json.JSONDecodeError as not_json:
+        return InvalidRequest(reason=f"a tool call's args_json is not valid JSON: {not_json}")
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
@@ -614,6 +649,23 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
     return raw
 
 
+def _identity_from_message(raw: BaseModel) -> ResponseIdentity:
+    """Read the message's own id, the model it reports serving the request, and the request id.
+
+    id and model are both required on anthropic.types.Message and every value of each is a str
+    (anthropic 0.120.0), so neither is absent and neither needs converting.
+
+    Raises:
+        TypeError: raw is not an anthropic Message.
+    """
+    message = _as_message(raw)
+    return ResponseIdentity(
+        model_served=message.model,
+        response_id=message.id,
+        request_id=request_id_from_raw(message),
+    )
+
+
 def _first_text_block_text(message: anthropic.types.Message) -> str | None:
     """Return the text of the turn's first text block, None when the turn holds none.
 
@@ -645,22 +697,29 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
         elif block.type == "thinking":
             turn.append(
                 ReasoningTrace(
-                    reasoning=block.model_dump(mode="python", exclude_none=True),
+                    raw=block.model_dump(mode="python", exclude_none=True),
                     text=block.thinking or None,
                 )
             )
         elif block.type == "redacted_thinking":
-            turn.append(
-                ReasoningTrace(reasoning=block.model_dump(mode="python", exclude_none=True))
-            )
+            turn.append(ReasoningTrace(raw=block.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
-def _normalized_usage(
+def _priced_tier(service_tier: AnthropicPricedServiceTier | None) -> AnthropicPricedServiceTier:
+    """Return the tier that selects the table: what the response reports, "standard" where it reports none.
+
+    A response reporting no tier prices at the standard rates, which is what a Bedrock response
+    needs: the field is unlikely to be populated there and Anthropic's service tiers do not apply.
+    """
+    return service_tier if service_tier is not None else _STANDARD_TIER
+
+
+def _billing_from_sdk_usage(
     usage: anthropic.types.Usage,
     pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
-) -> Usage:
-    """Map the raw counters onto langchaint's disjoint partition and price them at the served tier.
+) -> Billing:
+    """Price the raw counters at the table the served tier selects.
 
     `usage.input_tokens` excludes cache reads and writes, so it is exactly the uncached-input counter.
     The SDK documents no relationship among the input counters, so the source is the provider's
@@ -671,11 +730,9 @@ def _normalized_usage(
 
     usage.cache_creation splits the writes into 5-minute and 1-hour tokens, and one response can
     report both nonzero; when it is absent, cache_creation_input_tokens is read as 5-minute writes.
-    Reading the split here and the collapsed count elsewhere would report a write the cost included
-    and the counter did not, so both come off the same read and go into one price() call.
 
-    A response reporting no tier prices at the standard rates, which is what a Bedrock response
-    needs: the field is unlikely to be populated there and Anthropic's service tiers do not apply.
+    Raises:
+        pydantic.ValidationError: a reported counter is negative, so the priced Usage rejects it.
     """
     output_tokens_details = usage.output_tokens_details
     input_tokens_cache_write_5m = usage.cache_creation_input_tokens or 0
@@ -683,8 +740,10 @@ def _normalized_usage(
     if usage.cache_creation is not None:
         input_tokens_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens
         input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
-    served_tier = usage.service_tier if usage.service_tier is not None else _STANDARD_TIER
-    return pricing.get(served_tier, _UNPRICED).price(
+    service_tier = _priced_tier(usage.service_tier)
+    return pricing.get(service_tier, _UNPRICED).price(
+        service_tier=service_tier,
+        usage_raw=usage,
         input_tokens_cache_read=usage.cache_read_input_tokens or 0,
         input_tokens_cache_write_5m=input_tokens_cache_write_5m,
         input_tokens_cache_write_1h=input_tokens_cache_write_1h,
@@ -935,6 +994,17 @@ class AnthropicMessagesAdapter(Adapter):
             return retry_after_seconds_from_headers(error.response.headers)
         return None
 
+    @override
+    def request_id_from_error(self, error: Exception) -> str | None:
+        """Read the request-id header off the SDK exception.
+
+        APIStatusError is the only anthropic exception carrying request_id, which it reads off the
+        error response's headers, None where that response carried none (anthropic 0.120.0).
+        """
+        if isinstance(error, anthropic.APIStatusError):
+            return error.request_id
+        return None
+
 
 class _AnthropicStream(AdapterStream):
     """One open Messages stream, backed by the SDK's AsyncMessageStream."""
@@ -1003,8 +1073,8 @@ class _AnthropicStream(AdapterStream):
         return await self._sdk_stream.get_final_message()
 
     @override
-    def usage_reported(self) -> Usage | None:
-        """Price the running message snapshot, or None before the first event is accumulated.
+    def billing_reported(self) -> Billing | None:
+        """Return what the running message snapshot billed, or None before the first event is accumulated.
 
         The SDK builds the snapshot from message_start and updates it as later events arrive, so
         Message.usage carries input_tokens from the turn's first event onward (both are required
@@ -1015,7 +1085,18 @@ class _AnthropicStream(AdapterStream):
         """
         if not self._snapshot_started:
             return None
-        return _normalized_usage(self._sdk_stream.current_message_snapshot.usage, self._pricing)
+        return _billing_from_sdk_usage(
+            self._sdk_stream.current_message_snapshot.usage, self._pricing
+        )
+
+    @override
+    def request_id(self) -> str | None:
+        """Read the request-id header off the response the SDK stream is reading.
+
+        AsyncMessageStream.request_id is a public property over those headers, readable from the
+        moment the stream opens (anthropic 0.120.0).
+        """
+        return self._sdk_stream.request_id
 
     @override
     async def close(self) -> None:
@@ -1023,21 +1104,98 @@ class _AnthropicStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundAnthropicText(BoundAdapter[str]):
+class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
+    """What both anthropic bindings share: the request path, and what a response says about itself.
+
+    A subclass sets _adapter and _request in its own __init__ and implements interpret.
+    """
+
+    _adapter: AnthropicMessagesAdapter
+    _request: _AnthropicRequest
+
+    @override
+    def billing_from_raw(self, raw: BaseModel) -> Billing:
+        """Price the message's counters at the table its reported tier selects.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+            pydantic.ValidationError: the message reports a negative counter.
+        """
+        return _billing_from_sdk_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
+
+    @override
+    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+        """Read the message's own id, the model it reports serving the request, and the request id.
+
+        Raises:
+            TypeError: raw is not an anthropic Message.
+        """
+        return _identity_from_message(raw)
+
+    @override
+    def build_request(self, conversation: Sequence[Message]) -> RequestParams | InvalidRequest:
+        """Convert the conversation under the binding's precomputed fields."""
+        messages = _request_messages(conversation, self._request)
+        if isinstance(messages, InvalidRequest):
+            return messages
+        return _AnthropicRequestParams(precomputed=self._request, messages=messages)
+
+    @override
+    async def send(self, request: RequestParams) -> anthropic.types.Message:
+        """Send one non-streaming messages.create with the request's fields as explicit keywords.
+
+        Raises:
+            TypeError: request was built by another adapter.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+        """
+        params = narrowed_request(request, _AnthropicRequestParams)
+        precomputed = params.precomputed
+        return await self._adapter.client.messages.create(
+            model=precomputed.model,
+            max_tokens=precomputed.max_tokens,
+            temperature=precomputed.temperature,
+            system=precomputed.system,
+            tools=precomputed.tools,
+            tool_choice=precomputed.tool_choice,
+            output_config=precomputed.output_config,
+            thinking=precomputed.thinking,
+            service_tier=precomputed.service_tier,
+            messages=params.messages,
+        )
+
+    @override
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Open one messages.stream and return the live stream; connection failures raise here.
+
+        Raises:
+            TypeError: request was built by another adapter.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+        """
+        params = narrowed_request(request, _AnthropicRequestParams)
+        precomputed = params.precomputed
+        manager = self._adapter.client.messages.stream(
+            model=precomputed.model,
+            max_tokens=precomputed.max_tokens,
+            temperature=precomputed.temperature,
+            system=precomputed.system,
+            tools=precomputed.tools,
+            tool_choice=precomputed.tool_choice,
+            output_config=precomputed.output_config,
+            thinking=precomputed.thinking,
+            service_tier=precomputed.service_tier,
+            messages=params.messages,
+        )
+        return _AnthropicStream(
+            sdk_stream=await manager.__aenter__(), pricing=self._adapter.pricing
+        )
+
+
+class _BoundAnthropicText(_BoundAnthropic[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
     def __init__(self, *, adapter: AnthropicMessagesAdapter, request: _AnthropicRequest) -> None:
         self._adapter = adapter
         self._request = request
-
-    @override
-    def usage_from_raw(self, raw: BaseModel) -> Usage:
-        """Price the message's counters at the tier it reports.
-
-        Raises:
-            TypeError: raw is not an anthropic Message.
-        """
-        return _normalized_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
 
     @override
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
@@ -1053,50 +1211,8 @@ class _BoundAnthropicText(BoundAdapter[str]):
         assistant_message = _assistant_message_from(message)
         return _adapter_result(message, assistant_message.text, assistant_message)
 
-    @override
-    async def send(
-        self, conversation: Sequence[Message]
-    ) -> anthropic.types.Message | InvalidRequest:
-        """Send one non-streaming request via messages.create."""
-        messages = _request_messages(conversation, self._request)
-        if isinstance(messages, InvalidRequest):
-            return messages
-        return await self._adapter.client.messages.create(
-            model=self._request.model,
-            max_tokens=self._request.max_tokens,
-            temperature=self._request.temperature,
-            system=self._request.system,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            output_config=self._request.output_config,
-            thinking=self._request.thinking,
-            service_tier=self._request.service_tier,
-            messages=messages,
-        )
 
-    @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
-        """Open one streaming request; connection failures raise here."""
-        messages = _request_messages(conversation, self._request)
-        if isinstance(messages, InvalidRequest):
-            return messages
-        manager = self._adapter.client.messages.stream(
-            model=self._request.model,
-            max_tokens=self._request.max_tokens,
-            temperature=self._request.temperature,
-            system=self._request.system,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            output_config=self._request.output_config,
-            thinking=self._request.thinking,
-            service_tier=self._request.service_tier,
-            messages=messages,
-        )
-        sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(sdk_stream=sdk_stream, pricing=self._adapter.pricing)
-
-
-class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
+class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None]):
     """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
 
     def __init__(
@@ -1111,19 +1227,21 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         The format is built from the same transform_schema(TypeAdapter(...).json_schema()) call
         messages.parse makes, so the request carries what passing output_format would have sent.
         The merge is what keeps a reasoning effort the binding set: output_config carries both keys.
+        The merged value replaces the binding's, so every request this binding builds carries it and
+        the two bindings send the same fields.
         """
         self._adapter = adapter
-        self._request = request
         self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
         output_format = JSONOutputFormatParam(
             schema=transform_schema(self._output_type_adapter.json_schema()), type="json_schema"
         )
         bound_output_config = request.output_config
-        self._output_config: OutputConfigParam = (
+        output_config: OutputConfigParam = (
             {"format": output_format}
             if isinstance(bound_output_config, Omit)
             else {**bound_output_config, "format": output_format}
         )
+        self._request = replace(request, output_config=output_config)
 
     def _parsed_output(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage
@@ -1174,15 +1292,6 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         return EmptyTurn(assistant_message=assistant_message)
 
     @override
-    def usage_from_raw(self, raw: BaseModel) -> Usage:
-        """Price the message's counters at the tier it reports.
-
-        Raises:
-            TypeError: raw is not an anthropic Message.
-        """
-        return _normalized_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
-
-    @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, or report why the message produced none.
 
@@ -1195,45 +1304,3 @@ class _BoundAnthropicStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         if isinstance(output, NoOutput):
             return output
         return _adapter_result(message, output, assistant_message)
-
-    @override
-    async def send(
-        self, conversation: Sequence[Message]
-    ) -> anthropic.types.Message | InvalidRequest:
-        """Send one non-streaming request via messages.create."""
-        messages = _request_messages(conversation, self._request)
-        if isinstance(messages, InvalidRequest):
-            return messages
-        return await self._adapter.client.messages.create(
-            model=self._request.model,
-            max_tokens=self._request.max_tokens,
-            temperature=self._request.temperature,
-            system=self._request.system,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            output_config=self._output_config,
-            thinking=self._request.thinking,
-            service_tier=self._request.service_tier,
-            messages=messages,
-        )
-
-    @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream | InvalidRequest:
-        """Open one streaming request; connection failures raise here."""
-        messages = _request_messages(conversation, self._request)
-        if isinstance(messages, InvalidRequest):
-            return messages
-        manager = self._adapter.client.messages.stream(
-            model=self._request.model,
-            max_tokens=self._request.max_tokens,
-            temperature=self._request.temperature,
-            system=self._request.system,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            output_config=self._output_config,
-            thinking=self._request.thinking,
-            service_tier=self._request.service_tier,
-            messages=messages,
-        )
-        sdk_stream = await manager.__aenter__()
-        return _AnthropicStream(sdk_stream=sdk_stream, pricing=self._adapter.pricing)

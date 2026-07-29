@@ -11,8 +11,8 @@ import base64
 import json
 import math
 import re
-from collections.abc import AsyncIterator, Sequence
-from typing import override
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from typing import Literal, override
 
 import httpx
 import openai
@@ -43,17 +43,17 @@ from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails, ResponseStatus
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
-    PricingTable,
     ReasoningDelta,
     ReasoningEffort,
     ReasoningTrace,
     SpecificToolChoice,
+    StopReason,
     StreamItem,
     TextPart,
     ToolCall,
@@ -61,7 +61,9 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.adapter import (
+    Adapter,
     AdapterResult,
+    AdapterStream,
     Binding,
     EmptyTurn,
     ErrorClassification,
@@ -70,41 +72,44 @@ from langchaint.adapter import (
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
+    RequestParams,
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
 )
+from langchaint.call import ResponseIdentity
+from langchaint.conformance import AdapterConformance
 from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
     OpenAIPricedServiceTier,
+    OpenAIPricingTable,
     OpenAIResponsesAdapter,
     ReasoningSummary,
 )
 from langchaint.openai.responses_adapter import (
-    _adapter_result,
     _assistant_items,
     _assistant_message_from,
+    _billing_from_response,
     _BoundOpenAIStructured,
     _BoundOpenAIText,
     _normalized_stop_reason,
-    _normalized_usage,
+    _OpenAIRequestParams,
     _OpenAIStream,
     _wire_input,
     _wire_tool_choice,
 )
-from langchaint.usage import Usage
 
-_DEFAULT_RATES = PricingTable(
+_DEFAULT_RATES = OpenAIPricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
 )
 
-_PRICING: dict[OpenAIPricedServiceTier, PricingTable] = {"default": _DEFAULT_RATES}
+_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {"default": _DEFAULT_RATES}
 """The default tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = PricingTable(
+_PRIORITY_RATES = OpenAIPricingTable(
     input_cache_none_usd_per_million_tokens=5.0,
     output_usd_per_million_tokens=20.0,
     cache_read_usd_per_million_tokens=2.5,
@@ -170,12 +175,13 @@ def _response(
     incomplete_details: IncompleteDetails | None = None,
     service_tier: str | None = None,
     error: ResponseError | None = None,
+    model: str = "m",
 ) -> OpenAIResponse:
-    """Build a response carrying the given usage, output items, status, tier, and failure error."""
+    """Build a response whose id is fixed at "r1"; every field a test varies is a parameter."""
     return OpenAIResponse.model_validate({
         "id": "r1",
         "created_at": 0,
-        "model": "m",
+        "model": model,
         "object": "response",
         "output": output if output is not None else [_TEXT_OUTPUT_ITEM],
         "parallel_tool_calls": True,
@@ -189,9 +195,9 @@ def _response(
     })
 
 
-def test_normalized_usage_subtracts_cache_from_input_tokens_and_prices() -> None:
+def test_billing_subtracts_cache_from_input_tokens_and_prices() -> None:
     """The uncached counter is input_tokens minus both cache counts, and the priced cost rides on it."""
-    usage = _normalized_usage(_response(usage=_usage_with_cache()), _PRICING)
+    usage = _billing_from_response(_response(usage=_usage_with_cache()), _PRICING).usage
     assert usage.input_tokens_cache_read == 600
     assert usage.input_tokens_cache_write == 100
     assert usage.input_tokens_cache_none == 300
@@ -201,9 +207,31 @@ def test_normalized_usage_subtracts_cache_from_input_tokens_and_prices() -> None
     )
 
 
-def test_normalized_usage_reads_reasoning_tokens() -> None:
+def test_billing_carries_the_sdk_usage_object_itself() -> None:
+    """usage_raw is the response's own ResponseUsage by reference, and None where it reported none."""
+    raw = _response(usage=_usage_with_cache())
+    assert _billing_from_response(raw, _PRICING).usage_raw is raw.usage
+    assert _billing_from_response(_response(usage=None), _PRICING).usage_raw is None
+
+
+def test_billing_pins_the_priced_tier_and_the_rates_that_applied() -> None:
+    """The Billing holds the priced tier, not the reported value, and the four rates behind its costs.
+
+    A response reporting "auto" prices at "default", and the reported value survives on raw.
+    """
+    raw = _response(usage=_usage_with_cache(), service_tier="auto")
+    billing = _billing_from_response(raw, _PRICING)
+    assert billing.service_tier == "default"
+    assert billing.input_cache_none_usd_per_million_tokens == 2.5
+    assert billing.cache_read_usd_per_million_tokens == 1.25
+    assert billing.cache_write_usd_per_million_tokens == 3.125
+    assert billing.output_usd_per_million_tokens == 10.0
+    assert raw.service_tier == "auto"
+
+
+def test_billing_reads_reasoning_tokens() -> None:
     """output_tokens_reasoning reads the required reasoning_tokens counter."""
-    usage = _normalized_usage(
+    usage = _billing_from_response(
         _response(
             usage=ResponseUsage(
                 input_tokens=10,
@@ -214,43 +242,27 @@ def test_normalized_usage_reads_reasoning_tokens() -> None:
             )
         ),
         _PRICING,
-    )
+    ).usage
     assert usage.output_tokens_reasoning == 8
 
 
-def test_normalized_usage_rejects_cache_counts_exceeding_input_tokens() -> None:
-    """Cache counters summing past input_tokens raise instead of going negative.
-
-    The subtraction derives input_tokens_cache_none, so the guard is its non-negativity constraint.
-    """
-    with pytest.raises(ValidationError):
-        _normalized_usage(
-            _response(
-                usage=ResponseUsage(
-                    input_tokens=1000,
-                    input_tokens_details=InputTokensDetails(
-                        cached_tokens=900, cache_write_tokens=200
-                    ),
-                    output_tokens=40,
-                    output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
-                    total_tokens=1040,
-                )
-            ),
-            _PRICING,
-        )
+def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
+    """A response missing usage still stores the rates the tier that served it would have spent."""
+    billing = _billing_from_response(_response(usage=None), _PRICING)
+    assert billing.output_usd_per_million_tokens == 10.0
+    assert billing.service_tier == "default"
 
 
-def test_normalized_usage_falls_back_to_zero_without_usage() -> None:
-    """A response missing usage normalizes to zero counters and zero cost."""
-    usage = _normalized_usage(_response(usage=None), _PRICING)
-    assert usage.input_tokens_total == 0
-    assert usage.output_tokens == 0
-    assert usage.cost_in_usd == 0.0
+def test_a_response_that_billed_nothing_at_an_unpriced_tier_still_costs_zero() -> None:
+    """Every counter zero leaves the total a number even where no rate priced the tier."""
+    billing = _billing_from_response(_response(usage=None, service_tier="flex"), _PRICING)
+    assert math.isnan(billing.output_usd_per_million_tokens)
+    assert billing.usage.cost_in_usd == 0.0
 
 
 def test_the_categories_are_priced_apart() -> None:
     """Cache reads, cache writes, the uncached remainder, and output each bill at their rate."""
-    usage = _normalized_usage(_response(usage=_usage_with_cache()), _PRICING)
+    usage = _billing_from_response(_response(usage=_usage_with_cache()), _PRICING).usage
     assert usage.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
     assert usage.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
     assert usage.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
@@ -259,36 +271,40 @@ def test_the_categories_are_priced_apart() -> None:
 
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response; "auto" and no tier both price at default."""
-    pricing: dict[OpenAIPricedServiceTier, PricingTable] = {
+    pricing: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
         "default": _DEFAULT_RATES,
         "priority": _PRIORITY_RATES,
     }
-    at_priority = _normalized_usage(
+    at_priority = _billing_from_response(
         _response(usage=_usage_with_cache(), service_tier="priority"), pricing
-    )
-    at_default = _normalized_usage(
+    ).usage
+    at_default = _billing_from_response(
         _response(usage=_usage_with_cache(), service_tier="default"), pricing
-    )
-    reporting_auto = _normalized_usage(
+    ).usage
+    reporting_auto = _billing_from_response(
         _response(usage=_usage_with_cache(), service_tier="auto"), pricing
-    )
-    reporting_none = _normalized_usage(_response(usage=_usage_with_cache()), pricing)
+    ).usage
+    reporting_none = _billing_from_response(_response(usage=_usage_with_cache()), pricing).usage
     assert at_priority.cost_in_usd == pytest.approx(2 * at_default.cost_in_usd)
     assert reporting_auto.cost_in_usd == at_default.cost_in_usd
     assert reporting_none.cost_in_usd == at_default.cost_in_usd
 
 
-def test_cost_is_nan_when_the_served_tier_has_no_table() -> None:
-    """A response served at a tier the adapter holds no table for keeps its counters and costs NaN."""
-    usage = _normalized_usage(_response(usage=_usage_with_cache(), service_tier="flex"), _PRICING)
-    assert math.isnan(usage.cost_in_usd)
-    assert usage.input_tokens_total == 1000
-    assert usage.output_tokens == 40
+def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
+    """A response served at a tier no table prices still reports what it billed and who served it."""
+    billing = _billing_from_response(
+        _response(usage=_usage_with_cache(), service_tier="flex"), _PRICING
+    )
+    assert billing.service_tier == "flex"
+    assert billing.usage.input_tokens_total == 1000
+    assert billing.usage.output_tokens == 40
 
 
 def test_pricing_without_the_default_key_raises_at_construction() -> None:
     """A pricing mapping missing "default" fails before any request, naming the model."""
-    priority_only: dict[OpenAIPricedServiceTier, PricingTable] = {"priority": _PRIORITY_RATES}
+    priority_only: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
+        "priority": _PRIORITY_RATES
+    }
     with pytest.raises(ValueError, match=re.escape("'default'")):
         OpenAIResponsesAdapter(
             client=AsyncOpenAI(api_key="test"),
@@ -297,17 +313,6 @@ def test_pricing_without_the_default_key_raises_at_construction() -> None:
             provider_name="openai",
             supports_prompt_cache_options=True,
         )
-
-
-def test_stop_reason_is_tool_use_with_a_function_call_item() -> None:
-    """Any function_call output item derives tool_use, whatever the status."""
-    response = _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM])
-    assert _normalized_stop_reason(response) == "tool_use"
-
-
-def test_stop_reason_completed_is_end_turn() -> None:
-    """Status completed without tool calls derives end_turn."""
-    assert _normalized_stop_reason(_response(usage=None)) == "end_turn"
 
 
 _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
@@ -319,11 +324,51 @@ _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
 }
 
 
-def test_stop_reason_refusal_block_is_refusal() -> None:
-    """A refusal content block derives refusal, ahead of the status and tool-call checks."""
-    assert (
-        _normalized_stop_reason(_response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])) == "refusal"
+def _incomplete_response(reason: Literal["max_output_tokens", "content_filter"]) -> OpenAIResponse:
+    """Build an incomplete response reporting one of the two reasons the API declares."""
+    return _response(
+        usage=None, status="incomplete", incomplete_details=IncompleteDetails(reason=reason)
     )
+
+
+@pytest.mark.parametrize(
+    ("build_response", "expected"),
+    [
+        (
+            lambda: _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]),
+            "tool_use",
+        ),
+        (lambda: _response(usage=None), "end_turn"),
+        (lambda: _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM]), "refusal"),
+        (
+            lambda: _response(
+                usage=None, output=[_REFUSAL_MESSAGE_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]
+            ),
+            "refusal",
+        ),
+        (lambda: _incomplete_response("max_output_tokens"), "max_tokens"),
+        (lambda: _incomplete_response("content_filter"), "refusal"),
+        (lambda: _response(usage=None, status="failed"), "other"),
+    ],
+    ids=[
+        "function_call_item",
+        "completed",
+        "refusal_block",
+        "refusal_block_beside_a_function_call",
+        "incomplete_max_output_tokens",
+        "incomplete_content_filter",
+        "failed",
+    ],
+)
+def test_stop_reason_mapping(
+    build_response: Callable[[], OpenAIResponse], expected: StopReason
+) -> None:
+    """The API reports no finish reason field, so each stop reason is derived from the response.
+
+    The refusal check runs ahead of the tool-call check, which the row carrying both pins:
+    a filtered turn is a refusal whether or not the model also called a tool.
+    """
+    assert _normalized_stop_reason(build_response()) == expected
 
 
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
@@ -339,41 +384,6 @@ def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     assert _assistant_items(assistant_message) == [
         {"role": "assistant", "content": "I can't help with that"}
     ]
-
-
-def test_stop_reason_incomplete_for_max_output_tokens_is_max_tokens() -> None:
-    """Status incomplete with reason max_output_tokens derives max_tokens."""
-    response = _response(
-        usage=None,
-        status="incomplete",
-        incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-    )
-    assert _normalized_stop_reason(response) == "max_tokens"
-
-
-def test_stop_reason_incomplete_for_content_filter_is_refusal() -> None:
-    """Status incomplete with reason content_filter derives refusal."""
-    response = _response(
-        usage=None,
-        status="incomplete",
-        incomplete_details=IncompleteDetails(reason="content_filter"),
-    )
-    assert _normalized_stop_reason(response) == "refusal"
-
-
-def test_stop_reason_other_statuses_are_other() -> None:
-    """A failed status derives other."""
-    assert _normalized_stop_reason(_response(usage=None, status="failed")) == "other"
-
-
-def test_assistant_message_collects_text_and_tool_calls() -> None:
-    """The assistant turn carries the concatenated text and every function call."""
-    response = _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM])
-    assistant_message = _assistant_message_from(response)
-    assert assistant_message.text == "hey"
-    assert assistant_message.tool_calls == (
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-    )
 
 
 def test_reasoning_round_trips_verbatim_in_position() -> None:
@@ -394,14 +404,14 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     ]
     reasoning_trace = assistant_message.turn[0]
     assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
+    assert reasoning_trace.raw == _REASONING_OUTPUT_ITEM
     assert assistant_message.text == "hey"
     assert assistant_message.tool_calls == (
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
     )
     items = _assistant_items(assistant_message)
     assert len(items) == len(response.output)
-    assert items[0] == reasoning_trace.reasoning
+    assert items[0] == reasoning_trace.raw
     assert items[1] == {"role": "assistant", "content": "hey"}
     assert items[2] == {
         "type": "function_call",
@@ -425,101 +435,52 @@ def _reasoning_item(
     return item
 
 
-def test_one_summary_part_becomes_the_trace_text() -> None:
-    """A single summary part lands on the trace verbatim."""
-    response = _response(usage=None, output=[_reasoning_item(summary=("thought it over",))])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "thought it over"
+@pytest.mark.parametrize(
+    ("summary", "content", "expected_text"),
+    [
+        (("thought it over",), None, "thought it over"),
+        (
+            ("**Reading the question**\n\nFirst.", "**Answering**\n\nThen."),
+            None,
+            "**Reading the question**\n\nFirst.\n\n**Answering**\n\nThen.",
+        ),
+        (("the summary",), ("the content",), "the content"),
+        (("thought it over",), ("",), "thought it over"),
+        ((), ("worked it out",), "worked it out"),
+        ((), None, None),
+        (("", ""), None, None),
+        ((), ("", ""), None),
+        (("", "real"), None, "real"),
+    ],
+    ids=[
+        "one_summary_part",
+        "several_summary_parts",
+        "content_beside_a_summary",
+        "text_free_content_beside_a_summary",
+        "content_with_an_empty_summary",
+        "neither_list_holds_a_part",
+        "every_summary_part_empty",
+        "every_content_part_empty",
+        "an_empty_part_beside_a_real_one",
+    ],
+)
+def test_reasoning_trace_text_takes_the_content_over_the_summary_and_is_none_without_text(
+    summary: tuple[str, ...], content: tuple[str, ...] | None, expected_text: str | None
+) -> None:
+    r"""Parts join on a blank line, and a join that holds no text leaves trace.text None.
 
-
-def test_several_summary_parts_join_on_a_blank_line() -> None:
-    """Summary parts join on a blank line, because each is a separately delimited unit.
-
-    Joining on the empty string runs one part's last line into the next one's first.
+    Content is the reasoning the summary is a rendering of, so it wins wherever it has text.
+    Branching on whether the content list is present, rather than on the text it joins to, drops a
+    summary into an unreportable None whenever content is present but empty.
+    Parts join on a blank line because each is a separately delimited unit, and joining on the empty
+    string runs one part's last line into the next one's first.
+    Present-but-empty parts are what a trailing falsy check alone misses: two of them join into
+    "\n\n", which is truthy, so it would reach a span as a reasoning part carrying nothing.
     """
-    response = _response(
-        usage=None,
-        output=[
-            _reasoning_item(
-                summary=("**Reading the question**\n\nFirst.", "**Answering**\n\nThen.")
-            )
-        ],
-    )
+    response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
     trace = _assistant_message_from(response).turn[0]
     assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "**Reading the question**\n\nFirst.\n\n**Answering**\n\nThen."
-
-
-def test_content_wins_over_the_summary_when_both_hold_text() -> None:
-    """Both lists populated take the content, the reasoning the summary is a rendering of.
-
-    Reading the summary first, or concatenating the two, passes every other case here,
-    so this is what pins the precedence.
-    """
-    response = _response(
-        usage=None,
-        output=[_reasoning_item(summary=("the summary",), content=("the content",))],
-    )
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "the content"
-
-
-def test_a_content_list_holding_no_text_leaves_the_summary() -> None:
-    """A present content list whose parts are empty is not text, so the summary supplies it.
-
-    Branching on whether the content list is present, rather than on the text it joins to,
-    passes every other case here and drops the summary into an unreportable None.
-    """
-    response = _response(
-        usage=None,
-        output=[_reasoning_item(summary=("thought it over",), content=("",))],
-    )
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "thought it over"
-
-
-def test_content_supplies_the_text_when_the_summary_is_empty() -> None:
-    """An empty summary leaves the content parts, whose text reaches the trace."""
-    response = _response(usage=None, output=[_reasoning_item(content=("worked it out",))])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "worked it out"
-
-
-def test_a_reasoning_item_holding_no_text_leaves_the_trace_text_none() -> None:
-    """Empty summary and content leave text None, the no-readable-text signal."""
-    response = _response(usage=None, output=[_reasoning_item()])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text is None
-
-
-def test_parts_that_are_all_empty_leave_the_trace_text_none() -> None:
-    r"""Several empty parts yield None, not the separator they would otherwise join into.
-
-    Present-but-empty parts are the case a trailing falsy check alone misses:
-    two of them join into "\n\n", which is truthy, so it would reach a span as a
-    reasoning part carrying nothing.
-    """
-    response = _response(usage=None, output=[_reasoning_item(summary=("", ""))])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text is None
-    content_only = _response(usage=None, output=[_reasoning_item(content=("", ""))])
-    content_trace = _assistant_message_from(content_only).turn[0]
-    assert isinstance(content_trace, ReasoningTrace)
-    assert content_trace.text is None
-
-
-def test_an_empty_part_beside_a_real_one_drops_out_of_the_join() -> None:
-    """An empty part contributes no leading or trailing blank line to the joined text."""
-    response = _response(usage=None, output=[_reasoning_item(summary=("", "real"))])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "real"
+    assert trace.text == expected_text
 
 
 def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
@@ -542,41 +503,14 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
     assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
 
 
-def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder() -> None:
-    """A stored dict carrying a field newer than the installed SDK param re-emits unchanged.
-
-    A consume step that reshaped the dict to the pinned param keys would corrupt the payload
-    the API re-reads across an SDK upgrade.
-    """
-    reasoning: dict[str, object] = {
-        "type": "reasoning",
-        "id": "rs_1",
-        "summary": [],
-        "encrypted_content": "enc-1",
-        "field_newer_than_sdk": "x",
-    }
-    assistant_message = AssistantMessage(turn=(ReasoningTrace(reasoning=reasoning),))
-    assert _assistant_items(assistant_message) == [reasoning]
-
-
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """An anthropic-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
-    reasoning: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(
-        turn=(ReasoningTrace(reasoning=reasoning), TextPart(text="hi"))
-    )
+    raw: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
+    assistant_message = AssistantMessage(turn=(ReasoningTrace(raw=raw), TextPart(text="hi")))
     assert _assistant_items(assistant_message) == [
-        reasoning,
+        raw,
         {"role": "assistant", "content": "hi"},
     ]
-
-
-def test_adapter_result_carries_the_output_and_the_mapped_stop_reason() -> None:
-    """The result carries the extracted output and the neutral stop reason the response maps to."""
-    response = _response(usage=_usage_with_cache())
-    result = _adapter_result(response, "hey", _assistant_message_from(response))
-    assert result.output == "hey"
-    assert result.stop_reason == "end_turn"
 
 
 def test_wire_input_converts_each_message_kind() -> None:
@@ -676,61 +610,70 @@ def _binding(
     )
 
 
-def test_request_sends_a_summary_alone_when_no_effort_is_bound() -> None:
-    """reasoning_summary alone still sends the reasoning object, holding only the summary key.
+@pytest.mark.parametrize(
+    ("reasoning_summary", "reasoning_effort", "expected_reasoning"),
+    [
+        ("detailed", None, {"summary": "detailed"}),
+        (None, "high", {"effort": "high"}),
+        ("auto", "low", {"effort": "low", "summary": "auto"}),
+        (None, None, None),
+    ],
+    ids=["summary_alone", "effort_alone", "both_keys", "neither_key"],
+)
+def test_request_assembles_the_reasoning_object_key_by_key(
+    reasoning_summary: ReasoningSummary | None,
+    reasoning_effort: ReasoningEffort | None,
+    expected_reasoning: dict[str, str] | None,
+) -> None:
+    """A key travels only where it is set, and neither set sends no reasoning object at all.
 
     A summary is reached through the same object effort travels in, so gating that object on effort
-    would silently ask for no summary whenever a caller set one without an effort.
+    would silently ask for no summary whenever a caller set one without an effort. An explicit null
+    summary is a different request from omitting the key, which is what key-by-key assembly buys
+    over one Reasoning(effort=..., summary=...) call.
     """
-    request = _adapter(reasoning_summary="detailed")._request(
-        _binding(automatic_prompt_caching=True)
+    request = _adapter(reasoning_summary=reasoning_summary)._request(
+        _binding(automatic_prompt_caching=True, reasoning_effort=reasoning_effort)
     )
-    assert request.reasoning == {"summary": "detailed"}
+    if expected_reasoning is None:
+        assert isinstance(request.reasoning, openai.Omit)
+    else:
+        assert request.reasoning == expected_reasoning
 
 
-def test_request_sends_an_effort_alone_without_a_summary_key() -> None:
-    """A bound effort with no summary sends the effort key and no summary key.
+@pytest.mark.parametrize(
+    ("supports_prompt_cache_options", "automatic_prompt_caching", "expected_options"),
+    [
+        (True, False, {"mode": "explicit"}),
+        (True, True, None),
+        (False, False, None),
+        (False, True, None),
+    ],
+    ids=[
+        "supported_and_caching_disabled",
+        "supported_and_caching_automatic",
+        "unsupported_and_caching_disabled",
+        "unsupported_and_caching_automatic",
+    ],
+)
+def test_request_sends_explicit_mode_only_to_a_model_that_takes_it_with_caching_disabled(
+    expected_options: dict[str, str] | None,
+    *,
+    supports_prompt_cache_options: bool,
+    automatic_prompt_caching: bool,
+) -> None:
+    """Explicit mode with no breakpoints is the one prompt_cache_options value langchaint sends.
 
-    An explicit null summary is a different request from omitting the key,
-    which is what key-by-key assembly buys over one Reasoning(effort=..., summary=...) call.
+    Every other row leaves the omit sentinel, so nothing reaches the wire: a model that does not
+    take the parameter gets none under either binding value.
     """
-    request = _adapter()._request(_binding(automatic_prompt_caching=True, reasoning_effort="high"))
-    assert request.reasoning == {"effort": "high"}
-
-
-def test_request_sends_both_reasoning_keys_when_both_are_set() -> None:
-    """Effort and summary set together travel in one reasoning object."""
-    request = _adapter(reasoning_summary="auto")._request(
-        _binding(automatic_prompt_caching=True, reasoning_effort="low")
+    request = _adapter(supports_prompt_cache_options=supports_prompt_cache_options)._request(
+        _binding(automatic_prompt_caching=automatic_prompt_caching)
     )
-    assert request.reasoning == {"effort": "low", "summary": "auto"}
-
-
-def test_request_omits_reasoning_when_neither_key_is_set() -> None:
-    """Neither key set leaves reasoning at the omit sentinel, sending no reasoning object."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=True))
-    assert isinstance(request.reasoning, openai.Omit)
-
-
-def test_request_omits_prompt_cache_options_under_automatic_caching() -> None:
-    """Automatic caching leaves prompt_cache_options at the omit sentinel."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=True))
-    assert isinstance(request.prompt_cache_options, openai.Omit)
-
-
-def test_request_requests_explicit_mode_when_caching_disabled() -> None:
-    """Disabled caching sends explicit mode with no breakpoints."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=False))
-    assert request.prompt_cache_options == {"mode": "explicit"}
-
-
-def test_request_omits_prompt_cache_options_where_the_model_lacks_the_parameter() -> None:
-    """A model not taking prompt_cache_options gets none under either binding value."""
-    adapter = _adapter(supports_prompt_cache_options=False)
-    disabled = adapter._request(_binding(automatic_prompt_caching=False))
-    assert isinstance(disabled.prompt_cache_options, openai.Omit)
-    enabled = adapter._request(_binding(automatic_prompt_caching=True))
-    assert isinstance(enabled.prompt_cache_options, openai.Omit)
+    if expected_options is None:
+        assert isinstance(request.prompt_cache_options, openai.Omit)
+    else:
+        assert request.prompt_cache_options == expected_options
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -778,12 +721,20 @@ def test_request_omits_tool_fields_without_tools() -> None:
 class _FakeSDKStream(AsyncResponseStream[None]):
     """Replays constructed events without a connection.
 
-    Overrides exactly the surface _OpenAIStream uses (iteration and close);
+    Overrides exactly the surface _OpenAIStream uses (iteration, close, and the _response its
+    headers are read off);
     the base __init__ is deliberately not called, so the untouched base machinery stays unusable.
     """
 
-    def __init__(self, replay_events: Sequence[ResponseStreamEvent]) -> None:
+    def __init__(
+        self, replay_events: Sequence[ResponseStreamEvent], headers: dict[str, str] | None = None
+    ) -> None:
         self._replay_events = list(replay_events)
+        self._response = httpx.Response(
+            200,
+            headers=headers,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        )
 
     @override
     async def __aiter__(self) -> AsyncIterator[ResponseStreamEvent]:
@@ -795,9 +746,21 @@ class _FakeSDKStream(AsyncResponseStream[None]):
         return
 
 
-def _stream(replay_events: Sequence[ResponseStreamEvent]) -> _OpenAIStream:
-    """Build an adapter stream over replayed events."""
-    return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events))
+def _stream(
+    replay_events: Sequence[ResponseStreamEvent], headers: dict[str, str] | None = None
+) -> _OpenAIStream:
+    """Build an adapter stream over replayed events, reading headers off a constructed response."""
+    return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events, headers))
+
+
+def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
+    """The stream's own response is the only channel a streamed turn has for the header.
+
+    The response the SDK assembles from the events never carries it, so a null here would leave
+    every streaming call with no id to take to provider support.
+    """
+    assert _stream([], {"x-request-id": "req_stream"}).request_id() == "req_stream"
+    assert _stream([]).request_id() is None
 
 
 async def _text_final(adapter_stream: _OpenAIStream) -> ResponseOutcome[str]:
@@ -957,16 +920,6 @@ def test_a_summary_part_boundary_streams_the_separator_the_assembled_trace_uses(
     assert streamed == trace.text == "First, water evaporates.\n\nThen it condenses."
 
 
-def test_deltas_within_one_summary_part_stream_with_nothing_between_them() -> None:
-    """Only a done event separates; the deltas of one part concatenate into that part's text."""
-    translated = _collected_items([
-        _summary_delta_event("weigh", 0, 1),
-        _summary_delta_event("ing it", 0, 2),
-        _completed_event(_response(usage=_usage_with_cache()), 3),
-    ])
-    assert _streamed_reasoning(translated) == "weighing it"
-
-
 def test_the_reasoning_text_channel_separates_its_parts_the_same_way() -> None:
     """The content channel's own done event drives the separator, as the summary channel's does."""
     translated = _collected_items([
@@ -992,33 +945,34 @@ def test_a_pending_separator_crosses_from_one_reasoning_channel_to_the_other() -
     assert _streamed_reasoning(translated) == "First.\n\nThen."
 
 
-def test_a_done_event_before_any_delta_streams_no_leading_separator() -> None:
+@pytest.mark.parametrize(
+    "replay_events",
+    [
+        [
+            _summary_done_event("", 0, 1),
+            _summary_delta_event("thought it over", 1, 2),
+            _completed_event(_response(usage=_usage_with_cache()), 3),
+        ],
+        [
+            _summary_delta_event("", 0, 1),
+            _summary_done_event("", 0, 2),
+            _summary_delta_event("thought it over", 1, 3),
+            _completed_event(_response(usage=_usage_with_cache()), 4),
+        ],
+    ],
+    ids=["a_done_event_with_no_delta_before_it", "a_part_whose_only_delta_was_empty"],
+)
+def test_a_summary_part_that_streamed_no_text_leaves_the_next_part_unseparated(
+    replay_events: Sequence[ResponseStreamEvent],
+) -> None:
     """A part that streamed no text arms nothing, so the reasoning never opens on a blank line.
 
     A summary part holding no text is dropped from the assembled trace, and the stream owes the
-    same: a separator falls between two reasoning deltas or not at all.
+    same: a separator falls between two reasoning deltas or not at all. An empty delta is not text
+    either, so counting it as one would open the reasoning on a blank line, its part having
+    contributed nothing for a separator to follow.
     """
-    translated = _collected_items([
-        _summary_done_event("", 0, 1),
-        _summary_delta_event("thought it over", 1, 2),
-        _completed_event(_response(usage=_usage_with_cache()), 3),
-    ])
-    assert translated == [ReasoningDelta(text="thought it over")]
-
-
-def test_a_delta_carrying_no_characters_is_dropped_rather_than_streamed() -> None:
-    """An empty delta is not text: it yields no item and leaves the next part unseparated.
-
-    Counting it as text would open the reasoning on a blank line, since the part it belongs to
-    contributes nothing for a separator to follow.
-    """
-    translated = _collected_items([
-        _summary_delta_event("", 0, 1),
-        _summary_done_event("", 0, 2),
-        _summary_delta_event("thought it over", 1, 3),
-        _completed_event(_response(usage=_usage_with_cache()), 4),
-    ])
-    assert translated == [ReasoningDelta(text="thought it over")]
+    assert _collected_items(replay_events) == [ReasoningDelta(text="thought it over")]
 
 
 def test_an_empty_delta_does_not_consume_the_pending_separator() -> None:
@@ -1156,7 +1110,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
         result = _assert_result(await _text_final(adapter_stream))
         reasoning_trace = result.assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
-        assert reasoning_trace.reasoning == _REASONING_OUTPUT_ITEM
+        assert reasoning_trace.raw == _REASONING_OUTPUT_ITEM
 
     asyncio.run(scenario())
 
@@ -1166,7 +1120,7 @@ def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -
 
     The API reported the run as not finished, so whatever text had accumulated is a fragment;
     returning it as a Response would present that fragment as the turn. final() hands back the
-    response the run billed for, which usage_from_raw prices.
+    response the run billed for, which billing_from_raw prices.
     """
 
     async def scenario() -> None:
@@ -1183,7 +1137,7 @@ def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -
         assert translated == []
         raw = await adapter_stream.final()
         assert isinstance(_text_bound().interpret(raw), ProviderFailedTransiently)
-        assert _text_bound().usage_from_raw(raw).input_tokens_total == 1000
+        assert _text_bound().billing_from_raw(raw).usage.input_tokens_total == 1000
 
     asyncio.run(scenario())
 
@@ -1229,12 +1183,6 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         assert result.stop_reason == "max_tokens"
 
     asyncio.run(scenario())
-
-
-def test_stream_without_terminal_raises() -> None:
-    """Ending without any terminal event is a protocol violation."""
-    with pytest.raises(StreamProtocolError):
-        _collected_items([_text_delta_event("he", 1)])
 
 
 def test_final_before_items_are_exhausted_raises() -> None:
@@ -1310,15 +1258,6 @@ def _structured_response(
     )
 
 
-def test_structured_bind_builds_the_schema_the_sdk_parse_helper_builds() -> None:
-    """The text parameter equals what responses.parse(text_format=Model) would have sent.
-
-    The adapter sends the schema itself so it can validate the response text in its own frame; this
-    is what keeps the request unchanged by that move.
-    """
-    assert _structured_bound()._text == {"format": type_to_text_format_param(_StructuredReport)}
-
-
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's output text into the response_format."""
     outcome = _structured_parse(_structured_response(_REPORT_JSON))
@@ -1377,28 +1316,6 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
     assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
 
-def test_structured_stream_terminal_reports_max_completion_tokens_exceeded() -> None:
-    """A structured stream's incomplete terminal is MaxCompletionTokensExceeded.
-
-    The stream sends no text_format, so its terminal response is a plain Response on every status and
-    one function reads them all.
-    """
-    outcome = _structured_parse(
-        _structured_response(
-            None,
-            status="incomplete",
-            incomplete_details=IncompleteDetails(reason="max_output_tokens"),
-        )
-    )
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
-
-
-def test_structured_stream_terminal_reports_a_failed_run_as_the_provider_failure() -> None:
-    """A structured stream's failed terminal takes the same member the text binding reports."""
-    outcome = _structured_parse(_structured_response(None, status="failed", error=_SERVER_ERROR))
-    assert isinstance(outcome, ProviderFailedTransiently)
-
-
 def _text_bound() -> _BoundOpenAIText:
     """Build a text-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
@@ -1433,10 +1350,35 @@ def test_text_bind_send_hands_back_a_failed_status_for_interpret_to_report(
         return _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
 
     monkeypatch.setattr(text_bound._adapter.client.responses, "create", fake_create)
-    raw = asyncio.run(text_bound.send([UserMessage(content="q")]))
+    raw = asyncio.run(text_bound.send(text_bound.build_request([UserMessage(content="q")])))
     assert isinstance(raw, OpenAIResponse)
     assert isinstance(text_bound.interpret(raw), ProviderFailedTransiently)
-    assert text_bound.usage_from_raw(raw).cost_in_usd > 0.0
+    assert text_bound.billing_from_raw(raw).usage.cost_in_usd > 0.0
+
+
+def test_identity_reads_the_responses_own_id_and_served_model() -> None:
+    """Both values come off the response verbatim, neither from the id the binding sent.
+
+    The response names a model other than the adapter's, so reading the sent id would fail here.
+    A response the SDK did not parse from an HTTP response body carries no request id, which is the
+    state every streamed response is in.
+    """
+    identity = _text_bound().identity_from_raw(_response(usage=None, model="m-2026-01-01"))
+    assert identity == ResponseIdentity(
+        model_served="m-2026-01-01", response_id="r1", request_id=None
+    )
+
+
+def test_identity_reads_the_request_id_the_sdk_attached_to_the_response() -> None:
+    """A response parsed from a response body carries the request-id header, which identity reports.
+
+    The assignment is what the SDK's own add_request_id does to every model it parses from a body
+    (openai 2.48.0).
+    """
+    response = _response(usage=None)
+    response._request_id = "req_openai"
+    identity = _text_bound().identity_from_raw(response)
+    assert identity.request_id == "req_openai"
 
 
 def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_validates() -> None:
@@ -1590,10 +1532,10 @@ def test_every_request_carries_the_reasoning_include(
 
     async def scenario() -> None:
         conversation = [UserMessage(content="q")]
-        await text_bound.send(conversation)
-        await text_bound.open_stream(conversation)
-        await structured_bound.send(conversation)
-        await structured_bound.open_stream(conversation)
+        await text_bound.send(text_bound.build_request(conversation))
+        await text_bound.open_stream(text_bound.build_request(conversation))
+        await structured_bound.send(structured_bound.build_request(conversation))
+        await structured_bound.open_stream(structured_bound.build_request(conversation))
 
     asyncio.run(scenario())
     assert includes == [["reasoning.encrypted_content"]] * 4
@@ -1631,12 +1573,26 @@ def test_both_structured_request_paths_send_the_text_parameter(
     )
 
     async def scenario() -> None:
-        conversation = [UserMessage(content="q")]
-        await structured_bound.send(conversation)
-        await structured_bound.open_stream(conversation)
+        request = structured_bound.build_request([UserMessage(content="q")])
+        await structured_bound.send(request)
+        await structured_bound.open_stream(request)
 
     asyncio.run(scenario())
     assert texts == [{"format": type_to_text_format_param(_StructuredReport)}] * 2
+
+
+def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
+    """as_json holds the binding's precomputed fields and this call's converted input.
+
+    temperature is absent rather than null, because the binding set none and the request body carries
+    no such key.
+    """
+    request = _structured_bound().build_request([UserMessage(content="hi")])
+    assert isinstance(request, _OpenAIRequestParams)
+    rendered = json.loads(request.as_json())
+    assert rendered["input"] == [{"role": "user", "content": "hi"}]
+    assert rendered["precomputed"]["instructions"] == "sys"
+    assert "temperature" not in rendered["precomputed"]
 
 
 def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
@@ -1649,29 +1605,31 @@ def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
     return openai.RateLimitError("rate limited", response=response, body=None)
 
 
-def test_retry_after_seconds_prefers_the_millisecond_header() -> None:
-    """retry-after-ms wins over retry-after because it is more precise."""
-    error = _rate_limit_error({"retry-after-ms": "1500", "retry-after": "49"})
-    assert _adapter().retry_after_seconds(error) == 1.5
+def test_retry_after_seconds_reads_the_headers_of_an_sdk_error_and_nothing_else() -> None:
+    """The override finds the headers on the SDK's own exception and yields None for any other.
 
-
-def test_retry_after_seconds_parses_the_seconds_header() -> None:
-    """Without retry-after-ms, retry-after is parsed as float seconds."""
-    error = _rate_limit_error({"retry-after": "49"})
-    assert _adapter().retry_after_seconds(error) == 49.0
-
-
-def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
-    """No headers, an unparseable value, and a non-SDK error all yield None."""
+    The parsing itself is tested in tests/test_adapter.py against the shared function; what is
+    provider-specific is where the headers are found. httpx.Headers is case-insensitive, so the
+    lookup keeps working whatever case the server sent.
+    """
     adapter = _adapter()
+    assert adapter.retry_after_seconds(_rate_limit_error({"Retry-After-MS": "1500"})) == 1.5
     assert adapter.retry_after_seconds(_rate_limit_error({})) is None
-    assert (
-        adapter.retry_after_seconds(
-            _rate_limit_error({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
-        )
-        is None
-    )
     assert adapter.retry_after_seconds(ValueError("boom")) is None
+
+
+def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
+    """The override reports the header the SDK read off the error response, None for any other error.
+
+    openai sends the id in x-request-id; a response without that header and an exception that never
+    reached one both give None.
+    """
+    adapter = _adapter()
+    assert (
+        adapter.request_id_from_error(_rate_limit_error({"x-request-id": "req_429"})) == "req_429"
+    )
+    assert adapter.request_id_from_error(_rate_limit_error({})) is None
+    assert adapter.request_id_from_error(ValueError("boom")) is None
 
 
 def _status_error[ErrorT: openai.APIStatusError](
@@ -1693,55 +1651,6 @@ def _connection_error() -> openai.APIConnectionError:
     return openai.APIConnectionError(
         request=httpx.Request("POST", "https://api.openai.com/v1/responses")
     )
-
-
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (_status_error(openai.RateLimitError, 429), "rate_limit"),
-        (_status_error(openai.InternalServerError, 500), "transient"),
-        (_connection_error(), "transient"),
-        (openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")), "transient"),
-        (_status_error(openai.ConflictError, 409), "transient"),
-        (_status_error(openai.BadRequestError, 400), "invalid_request"),
-        (_status_error(openai.AuthenticationError, 401), "invalid_request"),
-        (_status_error(openai.PermissionDeniedError, 403), "invalid_request"),
-        (_status_error(openai.NotFoundError, 404), "invalid_request"),
-        (_status_error(openai.UnprocessableEntityError, 422), "invalid_request"),
-        (_status_error(openai.APIStatusError, 413), "invalid_request"),
-        (_status_error(openai.APIStatusError, 408), "transient"),
-        (_status_error(openai.InternalServerError, 503), "transient"),
-        (_status_error(openai.APIStatusError, 302), "unknown_exception"),
-        (_status_error(openai.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
-        (
-            _status_error(openai.BadRequestError, 400, {"x-should-retry": "false"}),
-            "invalid_request",
-        ),
-        (
-            _status_error(openai.InternalServerError, 500, {"x-should-retry": "false"}),
-            "declared_final",
-        ),
-        (_status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
-        (_status_error(openai.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
-        (ValueError("boom"), "unknown_exception"),
-    ],
-)
-def test_classify_maps_each_sdk_exception_to_its_classification(
-    error: Exception, expected: ErrorClassification
-) -> None:
-    """Each error lands on the classification the adapter's classify docstring names.
-
-    Each status code is the one the SDK raises that class for, read from openai 2.45.0;
-    the bare APIStatusError rows are the statuses the SDK maps to no class of its own, 413 among
-    them, which is why the adapter reads the status rather than the exception class.
-    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance.
-    x-should-retry overrides the status in both directions, except on a rate-limit status, which
-    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed,
-    and on a 4xx marked final, which keeps the rejection name.
-    A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the provider
-    marked final lands on declared_final; each fails the one item without a retry.
-    """
-    assert _adapter().classify(error) == expected
 
 
 def test_adapter_pins_sdk_retries_off() -> None:
@@ -1850,22 +1759,119 @@ def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> No
     assert request.input_prefix == []
 
 
-def test_usage_reported_reports_nothing_at_any_point_in_the_stream() -> None:
-    """Openai states usage only on the terminal response, so a stream cut off in flight has none.
+def _conformance_output() -> list[object]:
+    """Build one reasoning item then one message item, mapping one to one onto their wire items.
 
-    Read before any pull and again after an item, because a stream cancelled mid-turn is exactly
-    where the caller would want a partial figure and there is none to give.
+    The reasoning item carries a key the installed SDK does not name. An adapter that rebuilt the
+    item from its own pinned model would drop that key, which the API rejects on replay because
+    encrypted_content must arrive byte-identical.
     """
+    return [_REASONING_OUTPUT_ITEM | {"field_newer_than_sdk": "x"}, dict(_TEXT_OUTPUT_ITEM)]
 
-    async def scenario() -> tuple[Usage | None, Usage | None]:
-        """Read the running usage before pulling anything, then after one item."""
-        adapter_stream = _stream([
-            _text_delta_event("he", 1),
-            _completed_event(_response(usage=_usage_with_cache()), 2),
-        ])
-        before = adapter_stream.usage_reported()
-        items = adapter_stream.items()
-        await anext(items)
-        return before, adapter_stream.usage_reported()
 
-    assert asyncio.run(scenario()) == (None, None)
+class TestOpenAIResponsesConformance(AdapterConformance):
+    """The neutral invariants, over the OpenAI Responses adapter's own SDK objects."""
+
+    @override
+    def make_adapter(self) -> Adapter:
+        """Build the adapter these invariants run against, priced for the default tier alone."""
+        return _adapter()
+
+    @override
+    def response_with_cache_writes(self) -> BaseModel:
+        """Return a turn whose input_tokens carries both a cache read and a cache write."""
+        return _response(usage=_usage_with_cache(), output=_conformance_output())
+
+    @override
+    def response_without_usage(self) -> BaseModel:
+        """Return a turn whose usage field is absent, which openai answers a run with."""
+        return _response(usage=None, output=_conformance_output())
+
+    @override
+    def response_at_an_unpriced_tier(self) -> BaseModel:
+        """Return a turn served at flex, which _PRICING holds no table for."""
+        return _response(
+            usage=_usage_with_cache(), output=_conformance_output(), service_tier="flex"
+        )
+
+    @override
+    def response_with_impossible_counters(self) -> BaseModel:
+        """Return a turn whose cache counts sum past input_tokens.
+
+        The uncached counter is the subtraction, so counts summing past the total drive it below
+        zero.
+        """
+        return _response(
+            usage=ResponseUsage(
+                input_tokens=1000,
+                input_tokens_details=InputTokensDetails(cached_tokens=900, cache_write_tokens=200),
+                output_tokens=40,
+                output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+                total_tokens=1040,
+            ),
+            output=_conformance_output(),
+        )
+
+    @override
+    def response_with_reasoning(self) -> BaseModel:
+        """Return a turn whose reasoning item carries the unnamed key."""
+        return _response(usage=_usage_with_cache(), output=_conformance_output())
+
+    @override
+    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
+        """Read the input items past the one the conversation's user message became."""
+        assert isinstance(request, _OpenAIRequestParams)
+        return request.input[1:]
+
+    @override
+    def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
+        """Return the same turn as the ParsedResponse a stream assembles into and as a Response."""
+        whole = _response(usage=_usage_with_cache(), output=_conformance_output())
+        return ParsedResponse[None].model_validate(whole.model_dump()), whole
+
+    @override
+    def stream_without_its_terminal_event(self) -> AdapterStream:
+        """Return a stream whose events end before any terminal event."""
+        return _stream([_text_delta_event("he", 1)])
+
+    @override
+    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
+        """Return the adapter's whole exception table.
+
+        Each status code is the one the SDK raises that class for, read from openai 2.45.0;
+        the bare APIStatusError rows are the statuses the SDK maps to no class of its own, 413 among
+        them, which is why the adapter reads the status rather than the exception class.
+        APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
+        isinstance.
+        x-should-retry overrides the status in both directions, except on a rate-limit status, which
+        stays rate_limit whatever the header says, so the limiter's account-wide pause is still
+        armed, and on a 4xx marked final, which keeps the rejection name.
+        A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the
+        provider marked final lands on declared_final; each fails the one item without a retry.
+        """
+        return {
+            _status_error(openai.RateLimitError, 429): "rate_limit",
+            _status_error(openai.InternalServerError, 500): "transient",
+            _connection_error(): "transient",
+            openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")): "transient",
+            _status_error(openai.ConflictError, 409): "transient",
+            _status_error(openai.BadRequestError, 400): "invalid_request",
+            _status_error(openai.AuthenticationError, 401): "invalid_request",
+            _status_error(openai.PermissionDeniedError, 403): "invalid_request",
+            _status_error(openai.NotFoundError, 404): "invalid_request",
+            _status_error(openai.UnprocessableEntityError, 422): "invalid_request",
+            _status_error(openai.APIStatusError, 413): "invalid_request",
+            _status_error(openai.APIStatusError, 408): "transient",
+            _status_error(openai.InternalServerError, 503): "transient",
+            _status_error(openai.APIStatusError, 302): "unknown_exception",
+            _status_error(openai.BadRequestError, 400, {"x-should-retry": "true"}): "transient",
+            _status_error(
+                openai.BadRequestError, 400, {"x-should-retry": "false"}
+            ): "invalid_request",
+            _status_error(
+                openai.InternalServerError, 500, {"x-should-retry": "false"}
+            ): "declared_final",
+            _status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}): "rate_limit",
+            _status_error(openai.RateLimitError, 429, {"x-should-retry": "true"}): "rate_limit",
+            ValueError("boom"): "unknown_exception",
+        }

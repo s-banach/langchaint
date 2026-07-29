@@ -27,7 +27,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Protocol
+from typing import Literal, Protocol
 
 import jsonschema.exceptions
 import jsonschema.protocols
@@ -92,6 +92,7 @@ class DispatchHandled[AppDataT = None]:
 
     tool_message: ToolMessage
     app_data: AppDataT | None = None
+    kind: Literal["handled"] = "handled"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -129,6 +130,7 @@ class DispatchInvalidToolArgs:
 
     tool_message: ToolMessage
     details: tuple[InvalidToolArgsDetail, ...]
+    kind: Literal["invalid_tool_args"] = "invalid_tool_args"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -146,6 +148,7 @@ class DispatchUnknownTool:
 
     tool_message: ToolMessage
     called_name: str
+    kind: Literal["unknown_tool"] = "unknown_tool"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -162,6 +165,7 @@ class DispatchPrecomputed:
     """
 
     tool_message: ToolMessage
+    kind: Literal["precomputed"] = "precomputed"
 
 
 type DispatchOutcome = (

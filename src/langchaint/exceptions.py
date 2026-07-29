@@ -4,8 +4,8 @@ One property decides an error's fate: whether a retry may fix it.
 A TransientError is retried, everything else is not.
 No NonRetriableError class exists; "non-retriable" simply means "not a TransientError".
 
-Every non-retriable outcome is one item's result: generate_one raises it,
-and generate_many returns it in that item's slot, so no item's failure cancels a sibling.
+No item's failure cancels a sibling: a non-retriable outcome fails the one item it belongs to.
+GenerationError says which of its subclasses each generate method delivers.
 There is no error that dooms a whole batch, because langchaint cannot tell one apart from
 an item's own rejection: a provider states a status, never whether the binding or this one
 conversation caused it. A binding defect langchaint can detect raises at construction or
@@ -13,17 +13,17 @@ bind time instead, before any request is sent.
 
 TransientError is a per-attempt control signal between an adapter and a retry loop, raised to no
 application: a loop that cannot retry one reports it as RetryUnavailableError, carrying the call.
-The GenerationError subclasses are terminal per-item results a to_row failure row is built from:
+The GenerationError subclasses are terminal per-item results a to_tables failure row is built from:
 RetriesExhaustedError, RetryUnavailableError, RefusalError, MaxCompletionTokensExceededError,
 EmptyTurnError, SchemaViolationError, ContextWindowExceededError, UnfinishedTurnError,
-ProviderFailedTerminallyError, InvalidRequestError, ProviderDeclaredFinalError, and
-UnknownExceptionError.
+ProviderFailedTerminallyError, InvalidRequestError, ProviderDeclaredFinalError,
+UnknownExceptionError, EscapedExceptionError, AbandonedCallError, and TimedOutError.
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
-so the adapter reports it as an AttemptOutcome member where it reads the response.
-Every GenerationError is constructed by a retry loop, which is the only scope that knows a call's
-attempts and timing; an adapter reports one attempt and never a GenerationError.
+so the adapter reports it as a ResponseOutcome member where it reads the response.
+Every GenerationError is constructed by a scope holding the call's ledger, the only scope that knows
+its attempts and timing; an adapter reports one attempt and never a GenerationError.
 
 Three exceptions sit outside this axis, none of them a GenerationError.
 DispatchExceptionGroup and InvalidToolArgsError belong to the tool layer, not the generate loop.
@@ -40,11 +40,15 @@ from pydantic import ValidationError
 
 from langchaint.call import AttemptRecord, CallRecord, _CallCarrier
 from langchaint.messages import AssistantMessage, StopReason
+from langchaint.pricing import Billing
 from langchaint.usage import Usage
 
 if TYPE_CHECKING:
     # Type-only: tools.py imports this module at runtime, so importing the dispatch outcome types
-    # here at runtime would be a cycle. The annotations below quote them.
+    # here at runtime would be a cycle, and adapter.py imports tools.py, so RequestParams is one too.
+    # The annotations below quote both. Nothing here constructs either: a retry loop hands
+    # GenerationError the request it built, and ToolManager builds the dispatch outcomes.
+    from langchaint.adapter import RequestParams
     from langchaint.tools import DispatchManyOutcome
 
 
@@ -92,7 +96,7 @@ def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
 
 
 class GenerationError(_CallCarrier, Exception):
-    """A terminal per-item generate result that becomes a to_row failure row.
+    """A terminal per-item generate result that becomes a to_tables failure row.
 
     The base for the non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
@@ -107,33 +111,47 @@ class GenerationError(_CallCarrier, Exception):
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     ProviderFailedTerminallyError (the 200's body reports that generating the response failed),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending),
-    ProviderDeclaredFinalError (the provider answered with an error and declared it final), and
-    UnknownExceptionError (the adapter could not place the attempt's exception).
-    generate_one raises any of them;
-    generate_many returns each in the slot of the item it belongs to,
-    so to_row renders a uniform failure row.
+    ProviderDeclaredFinalError (the provider answered with an error and declared it final),
+    UnknownExceptionError (the adapter could not place the attempt's exception),
+    EscapedExceptionError (an exception escaped langchaint's own machinery),
+    AbandonedCallError (the call was cut off before its result reached the caller), and
+    TimedOutError (the call was cut off by the timeout_seconds the caller asked for).
+    generate_one raises every one of them but two: RetryUnavailableError, which comes only from a
+    stream_one block, and AbandonedCallError itself, which is never raised.
+    generate_many returns each of the ones generate_one raises in the slot of the item it belongs to,
+    so to_tables renders a uniform failure row.
 
-    call is this call's history; model, provider_name, attempt_records, and elapsed_seconds read
-    off it, and with stop_reason they mirror the fields a success Response carries
-    so to_row fills the same row shape from either.
+    call is this call's history; model, provider_name, attempt_records, started_at_monotonic_seconds,
+    and elapsed_seconds read off it, and with stop_reason they mirror the fields a success Response carries
+    so to_tables fills the same columns from either.
+    request is what every attempt of the call sent, which is what someone reading a failure asks for
+    next. None where no request is in scope to carry: where the adapter reported the conversation
+    InvalidRequest, having built none, on EscapedExceptionError, whose exception can come from
+    anywhere, and on AbandonedCallError, a cancellation being nobody's request defect.
+    No success carries one: build_request is a function of the conversation and the binding the
+    caller still holds, so a call that came back is reconstructible without archiving what it sent.
+    It holds the whole prompt, so it stays off error_text and __str__.
     usage (carrying cost_in_usd) is the paid total summed from the records
     (a refusal or truncation reads its one completed attempt;
     a retry-exhausted item sums its records, near zero when they were transport failures);
     attempts and error_text are derived from the records too.
     A caller recovers each attempt's turn and its raw provider response from attempt_records.
 
-    Only a retry loop constructs one of these, because only a loop knows the attempts and the timing,
-    and every field is set in the constructor. An adapter reports what one attempt produced (an
-    AttemptOutcome arm) and never a GenerationError, so none exists in a half-built state.
+    Only a scope holding the call's ledger constructs one of these, because only it knows the
+    attempts and the timing, and every field is set in the constructor. An adapter reports what one
+    attempt produced (a ResponseOutcome member) and never a GenerationError, so none exists in a
+    half-built state.
     """
 
     call: CallRecord
     usage: Usage
+    request: "RequestParams | None"
 
-    def __init__(self, *, call: CallRecord) -> None:
-        """Store the call and fold the paid total from its records."""
+    def __init__(self, *, call: CallRecord, request: "RequestParams | None") -> None:
+        """Store the call and what it sent, and fold the paid total from the records."""
         super().__init__()
         self.call = call
+        self.request = request
         self.usage = Usage.sum_of(record.usage for record in call.attempt_records)
 
     @property
@@ -144,7 +162,7 @@ class GenerationError(_CallCarrier, Exception):
         ContextWindowExceededError each fix their own value; every other subclass inherits None.
 
         Fixed by the class rather than taken as a constructor argument, because a raise site must
-        not choose a value the subclass already fixes. to_row and gen_ai_attributes both read it
+        not choose a value the subclass already fixes. to_tables and gen_ai_attributes both read it
         off Response | GenerationError, so this property is what spares each an isinstance ladder
         over the subclasses.
         """
@@ -166,8 +184,8 @@ class GenerationError(_CallCarrier, Exception):
         Every attempt that reached a billable 200 records the turn it carried, so a failure the
         provider generated content for reaches that content here, and a call whose attempts all
         failed before a 200 has none.
-        It is the field a success Response carries under the same name, so to_row and the tracing
-        layer read one name off either.
+        It is the field a success Response carries under the same name, so the tracing layer reads
+        one name off either.
         Content, so it stays off error_text and __str__.
         """
         for record in reversed(self.attempt_records):
@@ -177,16 +195,16 @@ class GenerationError(_CallCarrier, Exception):
 
     @property
     def attempts(self) -> int:
-        """Requests langchaint observed going out: one attempt record each.
-
-        Below the requests sent when the adapter could not place the last attempt's exception and no
-        response had arrived, which is the count an UnknownExceptionError costs.
-        """
+        """Requests langchaint observed going out: one attempt record each."""
         return len(self.attempt_records)
 
     @property
     def error_text(self) -> str:
-        """The failure-row error cell; RetriesExhaustedError folds its attempt chain instead."""
+        """The whole failure as one string, which the tracing layer sets as the call span's status.
+
+        RetriesExhaustedError overrides it to fold its attempt chain in, because a chain of transient
+        errors is the failure and no one of them is.
+        """
         return str(self)
 
 
@@ -318,10 +336,12 @@ class SchemaViolationError(GenerationError):
 
     validation_error_json: str
 
-    def __init__(self, *, validation_error_json: str, call: CallRecord) -> None:
+    def __init__(
+        self, *, validation_error_json: str, call: CallRecord, request: "RequestParams | None"
+    ) -> None:
         """Store what the validation rejected, then the call."""
         self.validation_error_json = validation_error_json
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @property
     @override
@@ -365,10 +385,10 @@ class UnfinishedTurnError(GenerationError):
 
     reason: str
 
-    def __init__(self, *, reason: str, call: CallRecord) -> None:
+    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
         """Store what the provider reported, then the call."""
         self.reason = reason
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @override
     def _summary(self) -> str:
@@ -389,10 +409,10 @@ class ProviderFailedTerminallyError(GenerationError):
 
     reason: str
 
-    def __init__(self, *, reason: str, call: CallRecord) -> None:
+    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
         """Store what the provider reported, then the call."""
         self.reason = reason
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @override
     def _summary(self) -> str:
@@ -403,10 +423,11 @@ class InvalidRequestError(GenerationError):
     """The provider or the adapter rejected this one request; the item fails as a row.
 
     Two sources, both meaning the request as sent (or as it would have been sent) is not acceptable:
-    the provider's own rejection, which Adapter.classify returns "invalid_request" for, and the
-    adapter reporting the conversation as a InvalidRequest outcome, because it cannot be put on the
-    wire with the meaning the message states.
+    the provider's own rejection, which Adapter.classify returns "invalid_request" for, and
+    build_request reporting the conversation InvalidRequest, because it cannot be put on the wire
+    with the meaning the message states.
     Not retried: the same request would be rejected the same way.
+    request is None on the second source, where none was built, and holds what went out on the first.
 
     The provider's rejection is every 4xx the retry policy declines, not only a rejected conversation.
     A bad API key, a permission failure, and an unknown model id land here too.
@@ -423,10 +444,10 @@ class InvalidRequestError(GenerationError):
 
     reason: str
 
-    def __init__(self, *, reason: str, call: CallRecord) -> None:
+    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
         """Store the rejection, then the call."""
         self.reason = reason
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @override
     def _summary(self) -> str:
@@ -445,10 +466,12 @@ class ProviderDeclaredFinalError(GenerationError):
 
     error: Exception
 
-    def __init__(self, *, error: Exception, call: CallRecord) -> None:
+    def __init__(
+        self, *, error: Exception, call: CallRecord, request: "RequestParams | None"
+    ) -> None:
         """Store the provider's exception, then the call."""
         self.error = error
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @override
     def _summary(self) -> str:
@@ -465,21 +488,125 @@ class UnknownExceptionError(GenerationError):
     Not retried: a defect must surface rather than be retried silently at billing expense.
     error is the exception classify could not place, also chained as __cause__.
     The attempt it ends has a record wherever langchaint can account for it: a response had arrived
-    and staged its receipt, or an open stream had reported what the provider billed.
+    and staged its billing, or an open stream had reported what the provider billed.
     Where nothing arrived, both usage and attempts are short by that attempt: langchaint cannot say
     what it billed, nor even that it reached the provider.
     """
 
     error: Exception
 
-    def __init__(self, *, error: Exception, call: CallRecord) -> None:
+    def __init__(
+        self, *, error: Exception, call: CallRecord, request: "RequestParams | None"
+    ) -> None:
         """Store the unplaceable exception, then the call."""
         self.error = error
-        super().__init__(call=call)
+        super().__init__(call=call, request=request)
 
     @override
     def _summary(self) -> str:
         return f"langchaint could not place this exception: {self.error}"
+
+
+class EscapedExceptionError(GenerationError):
+    """An exception escaped langchaint's own machinery; the item fails as a row.
+
+    The outermost guard around one call, so a defect anywhere between the caller and the adapter
+    ends as that call's failure rather than as a raise past it. In a batch that is what keeps one
+    item's defect from discarding the settled rows and billing of its siblings.
+    Report it as a defect in langchaint.
+    Nothing is silenced: error is the escaped exception, also chained as __cause__, and error_text
+    carries its text, which is the only description of a condition langchaint does not model.
+
+    The attempt in flight when the exception escaped has a record where a response had arrived and
+    staged its billing, which is what langchaint can account for.
+    """
+
+    error: Exception
+
+    def __init__(self, *, error: Exception, call: CallRecord) -> None:
+        """Store the escaped exception, then the call."""
+        self.error = error
+        super().__init__(call=call, request=None)
+
+    @override
+    def _summary(self) -> str:
+        return f"an exception escaped langchaint: {self.error}"
+
+
+class AbandonedCallError(GenerationError):
+    """The account of one call whose result never reached the caller.
+
+    A cancelled call returns no value, and the BaseException must propagate for the cancelling
+    scope's teardown to run, so this is the only carrier of what the call did. StreamHandle sets one
+    as its abandoned.
+    A GenerationError like every other, so to_tables renders it to a failure row and error_summary
+    names it.
+
+    in_flight_attempt_started_at_monotonic_seconds says a request was in flight when the cut hit and
+    when that request started, and is None where the cut fell between attempts. That attempt gets no
+    AttemptRecord: an ending nobody observed would make the ending fields conditional on every
+    record.
+    billing_in_flight is what the provider had reported for that attempt by the time of the cut, and
+    is None wherever it had reported nothing, which is true of every non-stream call. A counter the
+    provider sends late is missing from it.
+    usage is the settled records' fold plus billing_in_flight's usage, the paid total this call is
+    known to have incurred, which is usage's scope on every carrier. What the cut-off attempt billed
+    beyond the provider's last report is unobservable client-side and none of it is fabricated.
+    Reconciliation closes that gap from the provider's side, which model and provider_name identify.
+    """
+
+    billing_in_flight: Billing | None
+    in_flight_attempt_started_at_monotonic_seconds: float | None
+
+    def __init__(
+        self,
+        *,
+        call: CallRecord,
+        billing_in_flight: Billing | None,
+        in_flight_attempt_started_at_monotonic_seconds: float | None,
+    ) -> None:
+        """Store the cut-off attempt's account, then add what it billed to the settled total."""
+        super().__init__(call=call, request=None)
+        self.billing_in_flight = billing_in_flight
+        self.in_flight_attempt_started_at_monotonic_seconds = (
+            in_flight_attempt_started_at_monotonic_seconds
+        )
+        if billing_in_flight is not None:
+            self.usage = Usage.sum_of([self.usage, billing_in_flight.usage])
+
+    @property
+    @override
+    def attempts(self) -> int:
+        """Requests langchaint observed going out, counting the one cut off without a record.
+
+        That request went out, so leaving it out would put a smaller number on the calls row than
+        the attempts rows to_tables writes for the same call.
+        """
+        if self.in_flight_attempt_started_at_monotonic_seconds is None:
+            return len(self.attempt_records)
+        return len(self.attempt_records) + 1
+
+    @override
+    def _summary(self) -> str:
+        return "the call was cut off before its result reached the caller"
+
+
+class TimedOutError(AbandonedCallError):
+    """The timeout_seconds the caller asked for expired before the call produced a result.
+
+    Raised, where its base is only ever stored: langchaint owns the scope that expired, so the
+    expiry surfaces inside the frame holding the call's ledger and leaves as an ordinary
+    GenerationError. A scope the caller owns ends the call from outside that frame, so whatever it
+    raises there carries no account of what the call spent.
+
+    The deadline covers the whole call, so it can expire while a request is in flight, during a
+    backoff sleep, or while waiting for a RateLimiter slot. The last of those reports attempts == 0,
+    which is how a caller tells an item that never sent from one the provider answered slowly.
+    """
+
+    @override
+    def _summary(self) -> str:
+        return "the call timed out before it produced a result"
 
 
 class InvalidToolArgsError(Exception):

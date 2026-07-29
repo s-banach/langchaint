@@ -18,9 +18,11 @@ from langchaint.adapter import (
 )
 from langchaint.call import AttemptRecord, CallRecord
 from langchaint.exceptions import (
+    AbandonedCallError,
     ContextWindowExceededError,
     DispatchExceptionGroup,
     EmptyTurnError,
+    EscapedExceptionError,
     GenerationError,
     InvalidRequestError,
     InvalidToolArgsError,
@@ -32,6 +34,7 @@ from langchaint.exceptions import (
     RetryUnavailableError,
     SchemaViolationError,
     StreamProtocolError,
+    TimedOutError,
     TransientError,
     UnfinishedTurnError,
     UnknownExceptionError,
@@ -52,9 +55,15 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import PricingTable
+from langchaint.pricing import Billing, category_cost
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import AbandonedCall, AbandonedCallLog, Response, RowValue, to_row
+from langchaint.response import (
+    CallResult,
+    Response,
+    RowValue,
+    Tables,
+    to_tables,
+)
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
     CaptureTool,
@@ -79,12 +88,13 @@ from langchaint.usage import ZERO_USAGE, Usage
 __all__ = [
     "LLM",
     "ZERO_USAGE",
-    "AbandonedCall",
-    "AbandonedCallLog",
+    "AbandonedCallError",
     "AssistantMessage",
     "AttemptRecord",
+    "Billing",
     "BoundLLM",
     "CallRecord",
+    "CallResult",
     "CaptureTool",
     "ContextWindowExceededError",
     "DispatchCaptured",
@@ -96,6 +106,7 @@ __all__ = [
     "DispatchPrecomputed",
     "DispatchUnknownTool",
     "EmptyTurnError",
+    "EscapedExceptionError",
     "GenerationError",
     "HasTools",
     "ImagePart",
@@ -109,7 +120,6 @@ __all__ = [
     "MessageContent",
     "NoTools",
     "Part",
-    "PricingTable",
     "ProviderDeclaredFinalError",
     "ProviderFailedTerminallyError",
     "PydanticTool",
@@ -128,7 +138,9 @@ __all__ = [
     "StreamHandle",
     "StreamItem",
     "StreamProtocolError",
+    "Tables",
     "TextPart",
+    "TimedOutError",
     "Tool",
     "ToolCall",
     "ToolChoice",
@@ -143,5 +155,6 @@ __all__ = [
     "UnknownExceptionError",
     "Usage",
     "UserMessage",
-    "to_row",
+    "category_cost",
+    "to_tables",
 ]

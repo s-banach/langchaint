@@ -14,7 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import BoundLLM, GenerationError, RateLimiter, Response, to_row
+from langchaint import BoundLLM, GenerationError, RateLimiter, Response, to_tables
 from langchaint.anthropic import anthropic_model
 from langchaint.openai import openai_model
 
@@ -46,7 +46,7 @@ async def catch_generation_error() -> None:
 
     On the structured path a refusal raises RefusalError and a token-cap truncation raises
     MaxCompletionTokensExceededError; a spent transient budget raises RetriesExhaustedError on any path.
-    to_row renders the caught error to the same row shape a Response fills, so a failure logs beside successes.
+    to_tables fills the caught error into the same columns a Response fills, so a failure logs beside successes.
     """
     classifier = openai_model("gpt-5.6-terra").bind(
         system_prompt="Classify the sentiment as positive or negative.",
@@ -57,8 +57,8 @@ async def catch_generation_error() -> None:
         response = await classifier.generate_one("This is the best day in months.")
         print("ok:", response.output.label)
     except GenerationError as err:
-        row = to_row(err)
-        print("failed:", type(err).__name__, "|", row["error_text"])
+        (call_row,) = to_tables(err).calls
+        print("failed:", type(err).__name__, "|", call_row["error_summary"])
 
 
 def report_billing(response: Response[str]) -> None:

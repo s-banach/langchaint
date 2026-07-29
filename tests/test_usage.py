@@ -1,8 +1,8 @@
-"""Usage: the input partition, the non-negativity guard, the cost total, repricing, and folding.
+"""Usage: the input partition, the non-negativity guard, the cost total, and folding.
 
 The three input counters are a disjoint partition, so input_tokens_total is their sum.
-Every counter is non-negative by validation, which the openai adapter's subtraction relies on;
-the cost fields carry no such constraint, because an unpriceable category stores NaN there.
+Every counter is non-negative by validation.
+The cost fields carry no such constraint, because an unpriceable category stores NaN there.
 Usage.sum_of folds counters and per-category costs, and ZERO_USAGE totals an empty batch.
 """
 
@@ -11,7 +11,7 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from langchaint import ZERO_USAGE, PricingTable, Usage
+from langchaint import ZERO_USAGE, Usage
 
 
 def _usage(
@@ -55,12 +55,7 @@ def test_cost_in_usd_sums_the_four_categories() -> None:
 
 
 def test_negative_counter_is_rejected() -> None:
-    """A negative counter raises.
-
-    The openai adapter derives input_tokens_cache_none by subtraction,
-    so without this constraint a response over-reporting its cache counters would construct a Usage
-    with a negative remainder.
-    """
+    """A negative counter raises, so no carrier holds a Usage claiming negative tokens."""
     with pytest.raises(ValidationError):
         _usage(cache_read=900, cache_write=200, cache_none=-100, output=40)
 
@@ -86,37 +81,9 @@ def test_a_sum_containing_a_nan_cost_is_nan() -> None:
     assert total.output_tokens == 50
 
 
-def test_reprice_prices_the_counters_at_another_table() -> None:
-    """Reprice keeps the counters and replaces every cost with what the given table charges."""
-    usage = _usage(
-        cache_read=200,
-        cache_write=10,
-        cache_none=100,
-        output=50,
-        reasoning=20,
-        cache_read_cost=float("nan"),
-        output_cost=float("nan"),
-    )
-    repriced = usage.reprice(
-        PricingTable(
-            input_cache_none_usd_per_million_tokens=3.0,
-            output_usd_per_million_tokens=15.0,
-            cache_read_usd_per_million_tokens=0.3,
-            cache_write_usd_per_million_tokens=3.75,
-        )
-    )
-    assert repriced.input_tokens_cache_read == 200
-    assert repriced.output_tokens_reasoning == 20
-    assert repriced.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
-    assert repriced.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
-    assert repriced.cost_in_usd == pytest.approx(
-        (200 * 0.3 + 10 * 3.75 + 100 * 3.0 + 50 * 15.0) / 1e6
-    )
-
-
 def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
-    """Every counter and every category cost folds on its own."""
-    left = _usage(
+    """Every counter and every category cost folds on its own, over a batch of more than two."""
+    first = _usage(
         cache_read=1,
         cache_write=2,
         cache_none=3,
@@ -127,7 +94,7 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
         cache_none_cost=0.03,
         output_cost=0.04,
     )
-    right = _usage(
+    second = _usage(
         cache_read=10,
         cache_write=20,
         cache_none=30,
@@ -138,17 +105,28 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
         cache_none_cost=0.30,
         output_cost=0.40,
     )
-    total = Usage.sum_of([left, right])
-    assert total.input_tokens_cache_read == 11
-    assert total.input_tokens_cache_write == 22
-    assert total.input_tokens_cache_none == 33
-    assert total.output_tokens == 44
-    assert total.output_tokens_reasoning == 6
-    assert total.input_tokens_cache_read_cost_in_usd == pytest.approx(0.11)
-    assert total.input_tokens_cache_write_cost_in_usd == pytest.approx(0.22)
-    assert total.input_tokens_cache_none_cost_in_usd == pytest.approx(0.33)
-    assert total.output_tokens_cost_in_usd == pytest.approx(0.44)
-    assert total.cost_in_usd == pytest.approx(1.10)
+    third = _usage(
+        cache_read=100,
+        cache_write=200,
+        cache_none=300,
+        output=400,
+        reasoning=50,
+        cache_read_cost=1.00,
+        cache_write_cost=2.00,
+        cache_none_cost=3.00,
+        output_cost=4.00,
+    )
+    total = Usage.sum_of([first, second, third])
+    assert total.input_tokens_cache_read == 111
+    assert total.input_tokens_cache_write == 222
+    assert total.input_tokens_cache_none == 333
+    assert total.output_tokens == 444
+    assert total.output_tokens_reasoning == 56
+    assert total.input_tokens_cache_read_cost_in_usd == pytest.approx(1.11)
+    assert total.input_tokens_cache_write_cost_in_usd == pytest.approx(2.22)
+    assert total.input_tokens_cache_none_cost_in_usd == pytest.approx(3.33)
+    assert total.output_tokens_cost_in_usd == pytest.approx(4.44)
+    assert total.cost_in_usd == pytest.approx(11.10)
 
 
 def test_sum_of_with_zero_usage_changes_nothing() -> None:
@@ -156,19 +134,6 @@ def test_sum_of_with_zero_usage_changes_nothing() -> None:
     usage = _usage(cache_none=7, output=3, cache_none_cost=0.2, output_cost=0.3)
     assert Usage.sum_of([usage, ZERO_USAGE]) == usage
     assert Usage.sum_of([ZERO_USAGE, usage]) == usage
-
-
-def test_sum_of_totals_a_batch() -> None:
-    """Usage.sum_of folds several usages into one paid total."""
-    usages = [
-        _usage(cache_none=1, output=2, output_cost=0.10),
-        _usage(cache_none=3, output=4, output_cost=0.20),
-        _usage(cache_none=5, output=6, output_cost=0.30),
-    ]
-    total = Usage.sum_of(usages)
-    assert total.input_tokens_cache_none == 9
-    assert total.output_tokens == 12
-    assert total.cost_in_usd == pytest.approx(0.60)
 
 
 def test_sum_of_empty_is_zero_usage() -> None:

@@ -43,7 +43,7 @@ Verified against openai 2.45.0:
   `reasoning.effort` and `reasoning.summary` are assembled key by key so an unset one is omitted
   rather than sent as an explicit null.
 
-Cache writes bill starting with gpt-5.6, so the PricingTable's cache-write rate applies here too.
+Cache writes bill starting with gpt-5.6, so the OpenAIPricingTable's cache-write rate applies here too.
 That is a price rather than a wire fact, so it comes from the page the subpackage docstring cites,
 not from the SDK.
 
@@ -51,7 +51,7 @@ not from the SDK.
 `input_tokens_details.cache_write_tokens`, so it is the provider-reported all-inclusive input total
 the Usage partition is checked against. That one is verified by docs rather than by introspection:
 the SDK documents no relationship among the input counters,
-so `_normalized_usage` carries the page that does.
+so `_billing_from_response` carries the page that does.
 
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;
@@ -86,7 +86,7 @@ Mapping decisions:
 
 import base64
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
 
 import openai
@@ -138,6 +138,7 @@ from langchaint.adapter import (
     ProviderFailedTransiently,
     ReasoningDelta,
     Refusal,
+    RequestParams,
     ResponseOutcome,
     SchemaViolation,
     SpecificToolChoice,
@@ -145,8 +146,12 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedTurn,
     classification_from_response,
+    narrowed_request,
+    request_id_from_raw,
+    request_json,
     retry_after_seconds_from_headers,
 )
+from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
@@ -162,9 +167,9 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import UNPRICED, PricingTable
+from langchaint.pricing import Billing, category_cost
 from langchaint.tools import ToolSchema
-from langchaint.usage import ZERO_USAGE, Usage
+from langchaint.usage import Usage
 
 _RATE_LIMIT_STATUSES = frozenset({429})
 
@@ -238,6 +243,22 @@ class _OpenAIRequest:
     prompt_cache_options: PromptCacheOptions | Omit
     service_tier: OpenAIServiceTier | Omit
     include: list[ResponseIncludable]
+    text: ResponseTextConfigParam | Omit
+    """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class _OpenAIRequestParams(RequestParams):
+    """One responses request: the binding's precomputed fields and this call's converted input."""
+
+    precomputed: _OpenAIRequest
+    input: list[ResponseInputItemParam]
+    """What goes on the wire as input: the binding's input_prefix followed by the conversation."""
+
+    @override
+    def as_json(self) -> str:
+        """Render the request as a JSON object, dropping every field left to the provider's default."""
+        return request_json(self, omitted_class=Omit)
 
 
 def _image_data_uri(image_part: ImagePart) -> str:
@@ -315,7 +336,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
     each ToolCall becomes a function_call item keyed by call_id,
     which the paired ToolMessage's function_call_output references.
-    A ReasoningTrace's reasoning dict goes to the wire unchanged, routed by its own type key,
+    A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     so encrypted_content replays byte-identical.
     A trace another provider produced goes to the wire the same way and the API rejects its
     unknown type key, so a conversation replayed through the wrong provider fails loudly;
@@ -351,7 +372,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             # Reconstructing it field by field would risk changing the
             # payload the API re-reads. The shallow copy keeps the wire path from ever aliasing
             # the frozen message's stored payload into a mutable request structure.
-            items.append(cast("ResponseReasoningItemParam", dict(element.reasoning)))
+            items.append(cast("ResponseReasoningItemParam", dict(element.raw)))
     flush_text_run()
     return items
 
@@ -490,6 +511,23 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
     return raw
 
 
+def _identity_from_response(raw: BaseModel) -> ResponseIdentity:
+    """Read the response's own id, the model it reports serving the request, and the request id.
+
+    id and model are both required on openai.types.responses.Response and every value of each is a
+    str (openai 2.48.0), so neither is absent and neither needs converting.
+
+    Raises:
+        TypeError: raw is not an openai Response.
+    """
+    response = _as_response(raw)
+    return ResponseIdentity(
+        model_served=response.model,
+        response_id=response.id,
+        request_id=request_id_from_raw(response),
+    )
+
+
 def _first_output_text(response: OpenAIResponse) -> str | None:
     """Return the text of the turn's first output_text content part, None when it holds none.
 
@@ -571,7 +609,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
         if item.type == "reasoning":
             turn.append(
                 ReasoningTrace(
-                    reasoning=item.model_dump(mode="python", exclude_none=True),
+                    raw=item.model_dump(mode="python", exclude_none=True),
                     text=_reasoning_text(item),
                 )
             )
@@ -600,10 +638,95 @@ def _priced_tier(service_tier: OpenAIServiceTier | None) -> OpenAIPricedServiceT
     return service_tier
 
 
-def _normalized_usage(
-    response: OpenAIResponse, pricing: Mapping[OpenAIPricedServiceTier, PricingTable]
-) -> Usage:
-    """Map one response's raw counters onto langchaint's disjoint partition and price them.
+@dataclass(frozen=True, kw_only=True)
+class OpenAIPricingTable:
+    """One model's rates at one OpenAI service tier, one rate per priced category.
+
+    cache_write_usd_per_million_tokens applies because OpenAI bills cache writes (reported as
+    input_tokens_details.cache_write_tokens) starting with gpt-5.6.
+
+    An adapter holds one table per service tier it can price and selects by the tier the response
+    reports, so a response served at a tier the caller supplied no table for costs NaN
+    rather than these rates.
+    """
+
+    input_cache_none_usd_per_million_tokens: float
+    output_usd_per_million_tokens: float
+    cache_read_usd_per_million_tokens: float
+    cache_write_usd_per_million_tokens: float
+
+    def price(
+        self,
+        *,
+        service_tier: str,
+        usage_raw: BaseModel | None,
+        input_tokens_cache_read: int,
+        input_tokens_cache_write: int,
+        input_tokens_cache_none: int,
+        output_tokens: int,
+        output_tokens_reasoning: int,
+    ) -> Billing:
+        """Price one response's counters at these rates.
+
+        The counters arrive as arguments rather than in a counts object,
+        which would exist only to be unpacked again one call later.
+        output_tokens_reasoning buys no cost, being the reasoning share of output_tokens and billed
+        at the output rate; it is a parameter because the returned Usage carries it.
+
+        The total is the sum of the four category costs, so the parts are individually meaningful
+        and sum to cost_in_usd exactly; that association differs from a fused single-division chain
+        only at sub-ULP scale, immaterial once billing rounds to cents.
+
+        Raises:
+            pydantic.ValidationError: a counter is negative.
+        """
+        return Billing(
+            usage=Usage(
+                input_tokens_cache_read=input_tokens_cache_read,
+                input_tokens_cache_write=input_tokens_cache_write,
+                input_tokens_cache_none=input_tokens_cache_none,
+                output_tokens=output_tokens,
+                output_tokens_reasoning=output_tokens_reasoning,
+                input_tokens_cache_read_cost_in_usd=category_cost(
+                    input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+                ),
+                input_tokens_cache_write_cost_in_usd=category_cost(
+                    input_tokens_cache_write, self.cache_write_usd_per_million_tokens
+                ),
+                input_tokens_cache_none_cost_in_usd=category_cost(
+                    input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+                ),
+                output_tokens_cost_in_usd=category_cost(
+                    output_tokens, self.output_usd_per_million_tokens
+                ),
+            ),
+            service_tier=service_tier,
+            usage_raw=usage_raw,
+            input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+            cache_write_usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
+            output_usd_per_million_tokens=self.output_usd_per_million_tokens,
+        )
+
+
+_UNPRICED = OpenAIPricingTable(
+    input_cache_none_usd_per_million_tokens=float("nan"),
+    output_usd_per_million_tokens=float("nan"),
+    cache_read_usd_per_million_tokens=float("nan"),
+    cache_write_usd_per_million_tokens=float("nan"),
+)
+"""The table an adapter prices at when the response reports a service tier it holds no table for.
+
+Every nonzero counter costs NaN and every zero counter costs zero, so the response's own numbers
+survive and the cost says it is unknown. Pricing at some other tier's rates instead would report a
+number wrong by that tier's multiplier, and raising would destroy a response that was paid for.
+"""
+
+
+def _billing_from_response(
+    response: OpenAIResponse, pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable]
+) -> Billing:
+    """Price one response's raw counters at the table its priced tier selects.
 
     The whole response is the argument, not its usage: the tier that selects the rates is on the
     response and the counters are on the usage, and pricing one response's counters at another
@@ -617,13 +740,29 @@ def _normalized_usage(
     https://developers.openai.com/api/docs/guides/prompt-caching
     output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
 
-    A response with no usage at all prices to ZERO_USAGE, which is zero counters and zero cost.
+    A response with no usage at all bills zero counters, at the priced tier's rates.
+
+    Raises:
+        pydantic.ValidationError: the counters leave input_tokens_cache_none negative, a response
+            over-reporting its cache counters, so the priced Usage rejects it.
     """
+    service_tier = _priced_tier(response.service_tier)
+    table = pricing.get(service_tier, _UNPRICED)
     usage = response.usage
     if usage is None:
-        return ZERO_USAGE
+        return table.price(
+            service_tier=service_tier,
+            usage_raw=None,
+            input_tokens_cache_read=0,
+            input_tokens_cache_write=0,
+            input_tokens_cache_none=0,
+            output_tokens=0,
+            output_tokens_reasoning=0,
+        )
     details = usage.input_tokens_details
-    return pricing.get(_priced_tier(response.service_tier), UNPRICED).price(
+    return table.price(
+        service_tier=service_tier,
+        usage_raw=usage,
         input_tokens_cache_read=details.cached_tokens,
         input_tokens_cache_write=details.cache_write_tokens,
         input_tokens_cache_none=(
@@ -672,7 +811,7 @@ class OpenAIResponsesAdapter(Adapter):
         *,
         client: AsyncOpenAI,
         model: str,
-        pricing: Mapping[OpenAIPricedServiceTier, PricingTable],
+        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
         provider_name: str,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
@@ -791,6 +930,7 @@ class OpenAIResponsesAdapter(Adapter):
             ),
             service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],
+            text=omit,
         )
 
     @override
@@ -840,6 +980,17 @@ class OpenAIResponsesAdapter(Adapter):
         """Read the server-stated wait from the SDK exception's response headers."""
         if isinstance(error, openai.APIStatusError):
             return retry_after_seconds_from_headers(error.response.headers)
+        return None
+
+    @override
+    def request_id_from_error(self, error: Exception) -> str | None:
+        """Read the request-id header off the SDK exception.
+
+        APIStatusError is the only openai exception carrying request_id, which it reads off the
+        error response's headers, None where that response carried none (openai 2.48.0).
+        """
+        if isinstance(error, openai.APIStatusError):
+            return error.request_id
         return None
 
 
@@ -934,14 +1085,23 @@ class _OpenAIStream(AdapterStream):
         return self._terminal_response
 
     @override
-    def usage_reported(self) -> Usage | None:
+    def billing_reported(self) -> None:
         """None: openai reports usage only on the terminal response, so an open stream has none.
 
         The SDK's stream state accumulates the response's output items and no counters
         (openai 2.45.0), and ResponseUsage arrives on the response the completed event carries,
         which is exactly the event a stream that ends early never receives.
         """
-        return None
+
+    @override
+    def request_id(self) -> str | None:
+        """Read the request-id header off the response the SDK stream is reading.
+
+        AsyncResponseStream exposes its httpx response only as _response, which it sets in its
+        constructor, so this is readable from the moment the stream opens and there is no public
+        route to the same headers (openai 2.48.0).
+        """
+        return self._sdk_stream._response.headers.get("x-request-id")  # noqa: SLF001
 
     @override
     async def close(self) -> None:
@@ -949,21 +1109,108 @@ class _OpenAIStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAIText(BoundAdapter[str]):
+class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
+    """What both openai bindings share: the request path, and what a response says about itself.
+
+    A subclass sets _adapter and _request in its own __init__ and implements interpret.
+    """
+
+    _adapter: OpenAIResponsesAdapter
+    _request: _OpenAIRequest
+
+    @override
+    def billing_from_raw(self, raw: BaseModel) -> Billing:
+        """Price the response's counters at the table its priced tier selects.
+
+        Raises:
+            TypeError: raw is not an openai Response.
+            pydantic.ValidationError: the response over-reports its cache counters, leaving the
+                derived uncached-input counter negative.
+        """
+        return _billing_from_response(_as_response(raw), pricing=self._adapter.pricing)
+
+    @override
+    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+        """Read the response's own id, the model it reports serving the request, and the request id.
+
+        Raises:
+            TypeError: raw is not an openai Response.
+        """
+        return _identity_from_response(raw)
+
+    @override
+    def build_request(self, conversation: Sequence[Message]) -> RequestParams:
+        """Convert the conversation into the input every attempt of this call sends.
+
+        Returns no InvalidRequest: this adapter puts every conversation on the wire.
+        """
+        return _OpenAIRequestParams(
+            precomputed=self._request,
+            input=[*self._request.input_prefix, *_wire_input(conversation)],
+        )
+
+    @override
+    async def send(self, request: RequestParams) -> OpenAIResponse:
+        """Send one non-streaming responses.create with the request's fields as explicit keywords.
+
+        Raises:
+            TypeError: request was built by another adapter.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+        """
+        params = narrowed_request(request, _OpenAIRequestParams)
+        precomputed = params.precomputed
+        return await self._adapter.client.responses.create(
+            model=precomputed.model,
+            instructions=precomputed.instructions,
+            max_output_tokens=precomputed.max_output_tokens,
+            temperature=precomputed.temperature,
+            reasoning=precomputed.reasoning,
+            tools=precomputed.tools,
+            tool_choice=precomputed.tool_choice,
+            parallel_tool_calls=precomputed.parallel_tool_calls,
+            prompt_cache_options=precomputed.prompt_cache_options,
+            service_tier=precomputed.service_tier,
+            include=precomputed.include,
+            text=precomputed.text,
+            store=False,
+            input=params.input,
+        )
+
+    @override
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Open one responses.stream and return the live stream; connection failures raise here.
+
+        Raises:
+            TypeError: request was built by another adapter.
+            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+        """
+        params = narrowed_request(request, _OpenAIRequestParams)
+        precomputed = params.precomputed
+        manager = self._adapter.client.responses.stream(
+            model=precomputed.model,
+            instructions=precomputed.instructions,
+            max_output_tokens=precomputed.max_output_tokens,
+            temperature=precomputed.temperature,
+            reasoning=precomputed.reasoning,
+            tools=precomputed.tools,
+            tool_choice=precomputed.tool_choice,
+            parallel_tool_calls=precomputed.parallel_tool_calls,
+            prompt_cache_options=precomputed.prompt_cache_options,
+            service_tier=precomputed.service_tier,
+            include=precomputed.include,
+            text=precomputed.text,
+            store=False,
+            input=params.input,
+        )
+        return _OpenAIStream(sdk_stream=await manager.__aenter__())
+
+
+class _BoundOpenAIText(_BoundOpenAI[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
     def __init__(self, *, adapter: OpenAIResponsesAdapter, request: _OpenAIRequest) -> None:
         self._adapter = adapter
         self._request = request
-
-    @override
-    def usage_from_raw(self, raw: BaseModel) -> Usage:
-        """Price the response's counters at the tier it reports.
-
-        Raises:
-            TypeError: raw is not an openai Response.
-        """
-        return _normalized_usage(_as_response(raw), pricing=self._adapter.pricing)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
@@ -988,48 +1235,8 @@ class _BoundOpenAIText(BoundAdapter[str]):
             return _provider_failure(response, assistant_message=assistant_message)
         return _adapter_result(response, assistant_message.text, assistant_message)
 
-    @override
-    async def send(self, conversation: Sequence[Message]) -> OpenAIResponse:
-        """Send one non-streaming request via responses.create."""
-        return await self._adapter.client.responses.create(
-            model=self._request.model,
-            instructions=self._request.instructions,
-            max_output_tokens=self._request.max_output_tokens,
-            temperature=self._request.temperature,
-            reasoning=self._request.reasoning,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            parallel_tool_calls=self._request.parallel_tool_calls,
-            prompt_cache_options=self._request.prompt_cache_options,
-            service_tier=self._request.service_tier,
-            include=self._request.include,
-            store=False,
-            input=[*self._request.input_prefix, *_wire_input(conversation)],
-        )
 
-    @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
-        """Open one streaming request; connection failures raise here."""
-        manager = self._adapter.client.responses.stream(
-            model=self._request.model,
-            instructions=self._request.instructions,
-            max_output_tokens=self._request.max_output_tokens,
-            temperature=self._request.temperature,
-            reasoning=self._request.reasoning,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            parallel_tool_calls=self._request.parallel_tool_calls,
-            prompt_cache_options=self._request.prompt_cache_options,
-            service_tier=self._request.service_tier,
-            include=self._request.include,
-            store=False,
-            input=[*self._request.input_prefix, *_wire_input(conversation)],
-        )
-        sdk_stream = await manager.__aenter__()
-        return _OpenAIStream(sdk_stream=sdk_stream)
-
-
-class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
+class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
     """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
 
     def __init__(
@@ -1043,13 +1250,14 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
 
         The format is built by the same type_to_text_format_param call responses.parse makes, so the
         request carries what passing text_format would have sent.
+        It replaces the binding's omitted text field, so every request this binding builds carries it
+        and the two bindings send the same fields.
         """
         self._adapter = adapter
-        self._request = request
         self._response_format = response_format
-        self._text: ResponseTextConfigParam = {
-            "format": type_to_text_format_param(response_format)
-        }
+        self._request = replace(
+            request, text={"format": type_to_text_format_param(response_format)}
+        )
 
     def _no_instance(
         self,
@@ -1132,15 +1340,6 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         return self._no_instance(response, validation_error, assistant_message)
 
     @override
-    def usage_from_raw(self, raw: BaseModel) -> Usage:
-        """Price the response's counters at the tier it reports.
-
-        Raises:
-            TypeError: raw is not an openai Response.
-        """
-        return _normalized_usage(_as_response(raw), pricing=self._adapter.pricing)
-
-    @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, or report why the response produced none.
 
@@ -1153,48 +1352,3 @@ class _BoundOpenAIStructured[ModelT: BaseModel](BoundAdapter[ModelT | None]):
         if isinstance(output, NoOutput):
             return output
         return _adapter_result(response, output, assistant_message)
-
-    @override
-    async def send(self, conversation: Sequence[Message]) -> OpenAIResponse:
-        """Send one non-streaming request via responses.create.
-
-        The return type omits InvalidRequest: this adapter sends every conversation.
-        """
-        return await self._adapter.client.responses.create(
-            model=self._request.model,
-            instructions=self._request.instructions,
-            max_output_tokens=self._request.max_output_tokens,
-            temperature=self._request.temperature,
-            reasoning=self._request.reasoning,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            parallel_tool_calls=self._request.parallel_tool_calls,
-            prompt_cache_options=self._request.prompt_cache_options,
-            service_tier=self._request.service_tier,
-            include=self._request.include,
-            store=False,
-            input=[*self._request.input_prefix, *_wire_input(conversation)],
-            text=self._text,
-        )
-
-    @override
-    async def open_stream(self, conversation: Sequence[Message]) -> AdapterStream:
-        """Open one streaming request; connection failures raise here."""
-        manager = self._adapter.client.responses.stream(
-            model=self._request.model,
-            instructions=self._request.instructions,
-            max_output_tokens=self._request.max_output_tokens,
-            temperature=self._request.temperature,
-            reasoning=self._request.reasoning,
-            tools=self._request.tools,
-            tool_choice=self._request.tool_choice,
-            parallel_tool_calls=self._request.parallel_tool_calls,
-            prompt_cache_options=self._request.prompt_cache_options,
-            service_tier=self._request.service_tier,
-            include=self._request.include,
-            store=False,
-            input=[*self._request.input_prefix, *_wire_input(conversation)],
-            text=self._text,
-        )
-        sdk_stream = await manager.__aenter__()
-        return _OpenAIStream(sdk_stream=sdk_stream)

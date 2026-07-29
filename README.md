@@ -61,7 +61,7 @@ A bare `str` argument is shorthand for a conversation of one `UserMessage` holdi
 `openai_model(...)`, `anthropic_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`; models outside a catalog are built directly from the re-exported adapter.
 
 **One accounting contract for success and failure.**
-Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`, but both carry `usage`, the paid total across every attempt, and `to_row` flattens either to one row shape, so a mixed batch is one table.
+Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`, but both carry `usage`, the paid total across every attempt, and `to_tables` flattens either to a calls table and an attempts table, so a mixed batch is one pair of tables.
 
 **Priced usage.**
 `Usage` partitions input tokens by cache outcome, counts reasoning output separately, and carries one cost per priced category, priced at the service tier the response reported; `cost_in_usd` is their sum and the raw SDK usage rides beside it.

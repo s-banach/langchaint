@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import InferenceParams, to_row
+from langchaint import InferenceParams, to_tables
 from langchaint.openai import openai_model
 
 
@@ -76,11 +76,13 @@ async def rebind_to_change_a_parameter() -> None:
     print(response.output)
 
 
-async def batch_to_rows() -> None:
-    """Run an order-aligned batch with generate_many; flatten every result to one table shape with to_row.
+async def batch_to_tables() -> None:
+    """Run an order-aligned batch with generate_many; flatten every result to two tables with to_tables.
 
     A terminal per-item failure comes back as a GenerationError in its slot rather than raising, so the batch finishes;
-    to_row renders a success and a failure to the same keys, so the mixed list is one table.
+    to_tables fills the same columns for a success and a failure, so the mixed list is one pair of tables.
+    The output of each item is on its calls row and what each request billed is on its attempts rows,
+    so totalling the batch's spend is a sum over the attempts table.
     Concurrency is bounded by the shared RateLimiter's max_in_flight (see 05_rate_limiting_and_errors.py).
     """
     llm = openai_model("gpt-5.6-terra")
@@ -94,10 +96,12 @@ async def batch_to_rows() -> None:
         "The new compiler release cuts build times roughly in half on large projects.",
     ]
     results = await summarizer.generate_many(documents)
-    rows = [to_row(result) for result in results]
-    for row in rows:
-        print(row["output"], "|", row["cost_in_usd"])
-    # pandas.DataFrame(rows) turns rows into a dataframe for eval logging.
+    calls, attempts = to_tables(results)
+    for row in calls:
+        print(row["call_id"], "|", row["output"])
+    for row in attempts:
+        print(row["call_id"], "|", row["attempt_index"], "|", row["cost_in_usd"])
+    # pandas.DataFrame(calls) and pandas.DataFrame(attempts) are the two frames, joined on call_id.
 
 
 async def main() -> None:
@@ -105,7 +109,7 @@ async def main() -> None:
     await plain_text()
     await structured_output()
     await rebind_to_change_a_parameter()
-    await batch_to_rows()
+    await batch_to_tables()
 
 
 if __name__ == "__main__":

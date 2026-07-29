@@ -7,7 +7,7 @@ while every function exception (including a function-internal ValidationError) p
 """
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -87,12 +87,6 @@ def test_validate_and_run_returns_the_function_result() -> None:
     """Valid args_json reaches the function as the validated model."""
     result = asyncio.run(_echo_tool().validate_and_run('{"text": "tide"}'))
     assert result == "tide"
-
-
-def test_validate_and_run_raises_invalid_tool_args_on_bad_json() -> None:
-    """An args_json that fails validation raises InvalidToolArgsError."""
-    with pytest.raises(InvalidToolArgsError):
-        asyncio.run(_echo_tool().validate_and_run('{"text": 5.5}'))
 
 
 def test_invalid_tool_args_holds_the_validation_error() -> None:
@@ -219,21 +213,6 @@ def test_dispatch_carries_a_parts_result_into_tool_message_content() -> None:
     assert result.app_data is None
 
 
-def test_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
-    """An invalid args_json is model data: a DispatchInvalidToolArgs holding the neutral details, no raise.
-
-    The tool_message must carry the validation detail (the failing field), or the model has nothing to correct against,
-    and details names the failing field for a caller authoring its own reply.
-    """
-    call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
-    assert result.tool_message.is_error is True
-    assert "invalid arguments for echo" in result.tool_message.content
-    assert "text" in result.tool_message.content
-    assert any("text" in detail.path for detail in result.details)
-
-
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     """The PydanticTool path's content and details are exactly the conversion and rendering of the pydantic error.
 
@@ -241,6 +220,9 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     through _details_from_pydantic, and rendering reproduces both fields, pinning that dispatch passes
     the tool name and the converted details through to the renderer rather than formatting the string itself,
     and that the stored details are the same conversion the content was rendered from.
+
+    The match reads result.details with no assert, cast, or type ignore, which pyrefly checks and
+    which is the point of giving invalid args their own arm.
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(InvalidToolArgsError) as caught:
@@ -249,25 +231,12 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     expected_content = render_invalid_tool_args("echo", expected_details)
     call = ToolCall(id="call1", name="echo", args_json=args_json)
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
-    assert result.tool_message.is_error is True
-    assert result.tool_message.content == expected_content
-    assert result.details == expected_details
-
-
-def test_dispatch_invalid_args_match_arm_reads_details_without_assert() -> None:
-    """Matching DispatchInvalidToolArgs narrows details, read with no assert.
-
-    The match arm reads result.details directly;
-    pyrefly checks that this typechecks with no assert, cast, or type ignore, which is the point of the split arm.
-    """
-    call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     match result:
         case DispatchInvalidToolArgs():
-            paths = [detail.path for detail in result.details]
-            assert any("text" in path for path in paths)
-        case DispatchHandled():
+            assert result.tool_message.is_error is True
+            assert result.tool_message.content == expected_content
+            assert result.details == expected_details
+        case DispatchHandled() | DispatchUnknownTool():
             pytest.fail("invalid args must return DispatchInvalidToolArgs")
 
 
@@ -420,28 +389,6 @@ def test_dispatch_carries_app_data_on_the_error_outcome() -> None:
     assert result.app_data is receipt
 
 
-def test_dispatch_reads_a_pydantic_app_data_typed_without_revalidation() -> None:
-    """The read site narrows result.app_data to its concrete type and reads its field, no model_validate."""
-
-    async def _cited_function(args: _EchoArgs) -> ToolOutputExplicit[_Cites]:
-        """Return content plus a pydantic app_data."""
-        return ToolOutputExplicit(
-            content=f"echoed {args.text}", app_data=_Cites(citations=["doc-1"])
-        )
-
-    tool = PydanticTool(
-        name="cited",
-        description="Returns content plus app_data.",
-        args_model=_EchoArgs,
-        function=_cited_function,
-    )
-    call = ToolCall(id="call1", name="cited", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert isinstance(result.app_data, _Cites)
-    assert result.app_data.citations == ["doc-1"]
-
-
 def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> None:
     """PydanticTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
 
@@ -576,16 +523,6 @@ def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> No
     assert schema.args_schema is _WEATHER_SCHEMA
 
 
-def test_schema_tool_dispatch_passes_the_parsed_mapping_to_the_function() -> None:
-    """A valid call reaches the function as the parsed arguments mapping and comes back a DispatchHandled."""
-    call = ToolCall(id="call1", name="weather", args_json='{"city": "Oslo"}')
-    result = asyncio.run(_weather_tool().dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert result.tool_message.content == "sunny in Oslo"
-    assert result.tool_message.is_error is False
-    assert result.app_data is None
-
-
 def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> None:
     """An out-of-schema argument object becomes a DispatchInvalidToolArgs built from jsonschema's own errors.
 
@@ -606,28 +543,6 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     assert result.details == expected_details
     assert any(detail.message == "'city' is a required property" for detail in result.details)
     assert result.tool_message.content == render_invalid_tool_args("weather", expected_details)
-
-
-def test_schema_tool_dispatch_returns_invalid_args_for_non_object_json() -> None:
-    """A non-object args_json is the one thing JSONSchemaTool rejects locally: a DispatchInvalidToolArgs, no raise.
-
-    A scalar JSON payload cannot be a tool's arguments, so it comes back as the invalid-args arm holding the
-    neutral details, symmetric with the pydantic tool, so the loop and the model can recover.
-    """
-    call = ToolCall(id="call1", name="weather", args_json="5")
-    result = asyncio.run(_weather_tool().dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
-    assert result.tool_message.is_error is True
-    assert "invalid arguments for weather" in result.tool_message.content
-    assert len(result.details) >= 1
-
-
-def test_schema_tool_dispatch_returns_invalid_args_for_malformed_json() -> None:
-    """Malformed args_json is rejected the same way: a DispatchInvalidToolArgs, not a propagating decode error."""
-    call = ToolCall(id="call1", name="weather", args_json='{"city": ')
-    result = asyncio.run(_weather_tool().dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
-    assert result.tool_message.is_error is True
 
 
 def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
@@ -656,27 +571,31 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     assert isinstance(result, DispatchHandled)
     assert result.tool_message.content == "sunny in Oslo"
     assert result.tool_message.is_error is False
+    assert result.app_data is None
     assert calls == ["function"]
 
 
-def test_schema_tool_schema_violation_skips_the_function() -> None:
-    """A schema violation becomes a DispatchInvalidToolArgs and the function never runs."""
+@pytest.mark.parametrize(
+    "args_json",
+    ['{"town": "Oslo"}', "5", '{"city": '],
+    ids=["schema_violation", "non_object_json", "malformed_json"],
+)
+def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_json: str) -> None:
+    """Each args_json a JSONSchemaTool rejects becomes the invalid-args arm, and the function never runs.
+
+    A scalar payload cannot be a tool's arguments and a truncated one cannot be decoded, so neither
+    reaches jsonschema; a decoded object that violates the schema is what jsonschema itself rejects.
+    All three come back holding the neutral details, symmetric with the pydantic tool, so the loop
+    and the model can recover rather than meeting a propagating exception.
+    """
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
-    result = asyncio.run(
-        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"town": "Oslo"}'))
-    )
+    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json=args_json)))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.tool_call_id == "c1"
-    assert calls == []
-
-
-def test_schema_tool_non_object_json_skips_the_function() -> None:
-    """A non-object args_json fails the JSON-object precondition: jsonschema never sees it, the function never runs."""
-    calls: list[str] = []
-    tool = _recording_weather_tool(calls)
-    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json="5")))
-    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.tool_message.is_error is True
+    assert "invalid arguments for weather" in result.tool_message.content
+    assert len(result.details) >= 1
     assert calls == []
 
 
@@ -698,7 +617,11 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
-    """A JSONSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel."""
+    """A JSONSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel.
+
+    dispatch returns DispatchHandled[AppDataT], so the local annotation on the read typechecks with
+    no isinstance: dispatching the tool directly, rather than through a manager, keeps its own app_data type.
+    """
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
     async def _mcp_function(
@@ -721,7 +644,8 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
     result = asyncio.run(tool.dispatch(call))
     assert isinstance(result, DispatchHandled)
     assert result.tool_message.content == "weather for Oslo"
-    assert result.app_data is raw_result
+    raw: Mapping[str, object] | None = result.app_data
+    assert raw is raw_result
 
 
 def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
@@ -744,37 +668,6 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
     assert isinstance(weather_result, DispatchHandled)
     assert echo_result.tool_message.content == "hi"
     assert weather_result.tool_message.content == "sunny in Oslo"
-
-
-def test_schema_tool_dispatch_carries_its_app_data_type_without_isinstance() -> None:
-    """JSONSchemaTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
-
-    Dispatching the JSONSchemaTool directly (not via the manager) keeps its own app_data type, so the local annotation
-    raw: Mapping[str, object] | None typechecks with no isinstance.
-    This is the JSONSchemaTool analogue of the PydanticTool.dispatch test.
-    """
-
-    async def _mcp_function(
-        args: Mapping[str, object],
-    ) -> ToolOutputExplicit[Mapping[str, object]]:
-        """Return content plus a mapping app_data."""
-        return ToolOutputExplicit(
-            content=f"weather for {args['city']}", app_data={"source": "mcp"}
-        )
-
-    tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
-        name="weather",
-        description="Report the weather via MCP.",
-        args_schema=_WEATHER_SCHEMA,
-        function=_mcp_function,
-    )
-    result = asyncio.run(
-        tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
-    )
-    assert isinstance(result, DispatchHandled)
-    raw: Mapping[str, object] | None = result.app_data
-    assert raw is not None
-    assert raw["source"] == "mcp"
 
 
 def _raiser_tool() -> PydanticTool[_EchoArgs]:
@@ -1188,31 +1081,37 @@ def test_capture_tool_schema_converts_name_description_and_args_schema() -> None
     assert schema.args_schema == _CapturedAnswer.model_json_schema()
 
 
-def test_capture_returns_the_validated_instance_as_a_required_field() -> None:
+@pytest.mark.parametrize(
+    ("build_tool", "expected_acknowledgement"),
+    [
+        (_answer_capture_tool, "Answer received"),
+        (
+            lambda: CaptureTool(
+                name="final_response",
+                description="Submit the final answer.",
+                args_model=_CapturedAnswer,
+            ),
+            "Acknowledged",
+        ),
+    ],
+    ids=["acknowledgement_given", "acknowledgement_defaulted"],
+)
+def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
+    build_tool: Callable[[], CaptureTool[_CapturedAnswer]], expected_acknowledgement: str
+) -> None:
     """A valid call returns DispatchCaptured: the acknowledgement tool_message plus the typed instance.
 
     Matching the arm reads captured.answer directly, with no None guard and no isinstance beyond the arm match;
     pyrefly checks that this typechecks, which is the point of the required field.
-    The tool_message carries the call id and the acknowledgement as non-error content.
+    A CaptureTool built without an acknowledgement answers "Acknowledged".
     """
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
-    outcome = asyncio.run(_answer_capture_tool().capture(call))
+    outcome = asyncio.run(build_tool().capture(call))
     assert isinstance(outcome, DispatchCaptured)
     assert outcome.captured.answer == "tide"
     assert outcome.tool_message.tool_call_id == "call1"
-    assert outcome.tool_message.content == "Answer received"
+    assert outcome.tool_message.content == expected_acknowledgement
     assert outcome.tool_message.is_error is False
-
-
-def test_capture_tool_default_acknowledgement() -> None:
-    """A CaptureTool built without acknowledgement answers a valid call with "Acknowledged"."""
-    tool = CaptureTool(
-        name="final_response", description="Submit the final answer.", args_model=_CapturedAnswer
-    )
-    call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
-    outcome = asyncio.run(tool.capture(call))
-    assert isinstance(outcome, DispatchCaptured)
-    assert outcome.tool_message.content == "Acknowledged"
 
 
 def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:

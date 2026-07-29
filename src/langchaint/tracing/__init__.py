@@ -1,9 +1,8 @@
 """OTel span tracing for langchaint, as a thin wrapper that never fakes an event boundary it traces.
 
 TracedLLM wraps an LLM and mirrors bind / rebind so every binding stays traced;
-TracedBoundLLM wraps a BoundLLM and opens one span per generate call (CLIENT for generate_one,
-which wraps one outbound call, INTERNAL for generate_many's aggregate span,
-which makes no call of its own);
+TracedBoundLLM wraps a BoundLLM and opens one CLIENT span per outbound call, which is one span for
+generate_one and one per item of a generate_many batch;
 TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
 TracedToolManager is a ToolManager whose every dispatch opens one INTERNAL execute_tool span;
 it is a subclass, not a wrapper, so it passes to LLM.bind's tool_manager parameter as one object,
@@ -16,21 +15,19 @@ Every Traced class also requires capture_message_content, which decides whether 
 the conversation itself; it has no default, because recording prompts is a privacy choice langchaint never makes.
 
 Every span the convention defines a kind for carries gen_ai.operation.name, which it marks required:
-"chat" on the generate_one and stream spans, "execute_tool" on a dispatch span.
+"chat" on the chat and stream spans, "execute_tool" on a dispatch span.
 It is set at span start, after extra_attributes, so an application constant cannot displace it.
-generate_many's aggregate span carries no operation name; TracedBoundLLM.generate_many says why.
 
 The further attributes each span kind carries, capture_message_content True included:
 
-generate_one (CLIENT) and the stream span (CLIENT): gen_ai.provider.name, gen_ai.request.model,
-gen_ai.usage.input_tokens, gen_ai.usage.output_tokens, gen_ai.usage.reasoning.output_tokens,
-gen_ai.usage.cache_read.input_tokens, gen_ai.usage.cache_creation.input_tokens,
+the chat span (CLIENT) and the stream span (CLIENT): gen_ai.provider.name, gen_ai.request.model,
+gen_ai.response.model, gen_ai.usage.input_tokens, gen_ai.usage.output_tokens,
+gen_ai.usage.reasoning.output_tokens, gen_ai.usage.cache_read.input_tokens,
+gen_ai.usage.cache_creation.input_tokens,
 gen_ai.response.finish_reasons, langchaint.attempts, langchaint.cost_in_usd,
 and under capture gen_ai.system_instructions, gen_ai.tool.definitions, gen_ai.input.messages,
 and gen_ai.output.messages.
 The stream span adds gen_ai.response.time_to_first_chunk.
-generate_many (INTERNAL): langchaint.batch_item_count and the extra_attributes, nothing else;
-it has no single result to map and no single conversation to capture.
 execute_tool (INTERNAL): gen_ai.tool.name, gen_ai.tool.call.id, error.type on a failure,
 and under capture gen_ai.tool.call.arguments and gen_ai.tool.call.result.
 invoke_agent (INTERNAL) is the one span the application opens itself, through agent_span, around its
@@ -38,8 +35,7 @@ own agent loop: gen_ai.agent.name, langchaint.agent_path, the usage partition su
 langchaint.cost_in_usd, and whatever the application's exit-time extra_attributes adds.
 Every span kind carries error.type when it ends on an exception.
 langchaint.* is the prefix for the attributes the GenAI convention defines no counterpart for, which is
-exactly langchaint.attempts, langchaint.cost_in_usd, langchaint.batch_item_count, and
-langchaint.agent_path.
+exactly langchaint.attempts, langchaint.cost_in_usd, and langchaint.agent_path.
 The langchaint.attempt_failed span event carries error_text and elapsed_seconds per failed attempt.
 
 The wrapper owns the span lifecycle
@@ -47,9 +43,6 @@ The wrapper owns the span lifecycle
 and never fakes an event boundary a span is supposed to measure:
 TracedStreamHandle iterates so it can record gen_ai.response.time_to_first_chunk
 and close the span on a failing or abandoned stream, rather than delegating the iteration it needs to witness.
-generate_many is the exception by design: it is a bulk convenience,
-so it delegates to BoundLLM.generate_many under one aggregate span
-and leaves per-item detail to the returned rows (to_row).
 The mapper owns only attribute names and values, the part that varies by convention;
 a mapper cannot change the span name, kind, or status, and a raising mapper is caught and logged, never propagated.
 
@@ -83,7 +76,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import TracebackType
@@ -102,7 +95,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
-from langchaint.exceptions import GenerationError
+from langchaint.exceptions import AbandonedCallError, GenerationError
 from langchaint.inference_params import InferenceParams
 from langchaint.llm import (
     LLM,
@@ -126,7 +119,7 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.rate_limiter import RateLimiter
-from langchaint.response import AbandonedCallLog, Response
+from langchaint.response import CallResult, Response
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
     DispatchHandled,
@@ -149,10 +142,10 @@ and the GenAI convention's finish-reason key gen_ai.response.finish_reasons is o
 type SpanAttributes = Mapping[str, SpanAttributeValue]
 """A span's attributes, keyed by name."""
 
-type AttributeMapper = Callable[[Response[object] | GenerationError], SpanAttributes]
+type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
 """Maps one generate result to its span attributes.
 
-The parameter is Response[object] | GenerationError
+The parameter is CallResult[object]
 because the mapper reads the shared Response/GenerationError fields; Response[object] accepts any Response[OutputT]
 because Response's OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
 No mapper receives the conversation, so gen_ai_attributes cannot put a prompt on a span.
@@ -308,7 +301,7 @@ def _finish_reason(stop_reason: StopReason) -> str:
     return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
 
 
-def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttributes:
+def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
     It is the default attribute_mapper, and public so a custom AttributeMapper extends it
@@ -332,10 +325,15 @@ def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttribu
     gen_ai.response.finish_reasons is the plural array the convention defines, carrying the mapped
     finish reason rather than the raw StopReason so it agrees with gen_ai.output.messages;
     it is omitted when stop_reason is None (no completed turn).
+    gen_ai.response.model is the last attempt's model_served: on a success that is the attempt whose
+    answer the result carries. It is omitted where that attempt received no response and where the
+    call recorded no attempt, which the convention allows by conditioning it on being available.
     The usage and cost attributes are the call's paid totals across every attempt (result.usage is that scope),
     not one request's counts; per-attempt detail stays visible as the langchaint.attempt_failed span events.
     """
     usage = result.usage
+    records = result.attempt_records
+    model_served = records[-1].model_served if records else None
     attributes: dict[str, str | bool | int | float | Sequence[str]] = {
         "gen_ai.provider.name": result.provider_name,
         "gen_ai.request.model": result.model,
@@ -347,6 +345,8 @@ def gen_ai_attributes(result: Response[object] | GenerationError) -> SpanAttribu
         "langchaint.attempts": result.attempts,
         "langchaint.cost_in_usd": usage.cost_in_usd,
     }
+    if model_served is not None:
+        attributes["gen_ai.response.model"] = model_served
     if result.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
     return attributes
@@ -713,7 +713,7 @@ def _output_content_attributes(
 
 
 def _apply_output_content(
-    span: Span, result: Response[object] | GenerationError, span_config: _SpanConfig
+    span: Span, result: CallResult[object], span_config: _SpanConfig
 ) -> None:
     """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
 
@@ -732,7 +732,7 @@ def _apply_output_content(
     )
 
 
-def _record_attempt_failed_events(span: Span, result: Response[object] | GenerationError) -> None:
+def _record_attempt_failed_events(span: Span, result: CallResult[object]) -> None:
     """Add one langchaint.attempt_failed event per failed attempt in the result's records.
 
     Each event carries the attempt's error text and its own elapsed_seconds;
@@ -749,7 +749,7 @@ def _record_attempt_failed_events(span: Span, result: Response[object] | Generat
 
 def _apply_result_attributes(
     span: Span,
-    result: Response[object] | GenerationError,
+    result: CallResult[object],
     attribute_mapper: AttributeMapper,
 ) -> None:
     """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
@@ -820,7 +820,7 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
     """Set gen_ai.operation.name on a just-started span.
 
     The convention marks this attribute required on the span kinds it defines, which is every span
-    this module opens except generate_many's aggregate; TracedBoundLLM.generate_many says why it is absent there.
+    this module opens.
     Applied at span start, so it is present however the span ends, and after extra_attributes,
     so an application constant cannot displace a required attribute.
     """
@@ -1007,9 +1007,8 @@ class TracedLLM:
 class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     """Wraps a BoundLLM so every generate call opens a span.
 
-    generate_one opens one CLIENT span (one outbound call);
-    generate_many opens one INTERNAL span around the delegated batch (no per-item child spans,
-    no outbound call of its own).
+    Every call opens one CLIENT span, one outbound call each: generate_one's own, and one per item
+    of a generate_many batch, which is why the traces do not say which method was called.
     The span name is the GenAI convention {operation} {model}, wrapper-owned,
     so a custom mapper changes attributes only, never the name, kind, or status.
     There is no langchaint.elapsed_seconds attribute:
@@ -1206,27 +1205,24 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         self: "TracedBoundLLM[str, ToolsT]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
         self: "TracedBoundLLM[OutputT, HasTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
         self: "TracedBoundLLM[OutputT, NoTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> Response[OutputT]: ...
     async def generate_one(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None = None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
     ) -> Response[Any]:
         """Open a span around the whole generate_one call, delegate, attribute, and end the span.
 
@@ -1236,15 +1232,57 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         Under capture_message_content the input attributes are set at span start, so they are present on the
         failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
         a GenerationError's last recorded one included.
-        abandoned_call_log passes through to the delegated generate_one, which documents it;
-        the CancelledError it re-raises propagates here and the span ends with no status set.
 
         Raises:
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
-                a refusal, a truncation, a rejected request, or a provider error langchaint does not
-                retry); the span is attributed and closed first.
-            asyncio.CancelledError: an outer scope cancelled the call; the delegated generate_one
-                appended any AbandonedCall first, and the span ends.
+                a refusal, a truncation, a rejected request, a provider error langchaint does not
+                retry, or an Exception that escaped langchaint's own machinery); the span is
+                attributed and closed first.
+            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
+                status set.
+        """
+        return await self._generate_one_any_binding(conversation, timeout_seconds=timeout_seconds)
+
+    async def _generate_one_any_binding(
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+    ) -> Response[Any]:
+        """Run one call under a chat span of its own.
+
+        The un-overloaded entry point, because a generic binding matches none of generate_one's
+        overloads, which are keyed on a concrete one. Same request, widest type.
+        It is also the GenerateItem passed to the wrapped BoundLLM, so a batch of n conversations
+        traces as n chat spans, exactly as n generate_one calls do. timeout_seconds passes through
+        unread, so a traced batch gets the deadline an untraced one gets.
+
+        Raises:
+            GenerationError: the call failed; the span is attributed and closed first, and a batch
+                turns the error into that item's row. TimedOutError is one of them, so a call that
+                ran out of time closes its span like any other failure.
+            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
+                status set.
+        """
+        return await self._under_chat_span(
+            conversation,
+            self._bound_llm._generate_one_any_binding(  # noqa: SLF001
+                conversation, timeout_seconds=timeout_seconds
+            ),
+        )
+
+    async def _under_chat_span(
+        self, conversation: str | Sequence[Message], call: Coroutine[Any, Any, Response[Any]]
+    ) -> Response[Any]:
+        """Await one call inside a CLIENT chat span, attributing the span from however it ends.
+
+        The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
+        Under capture_message_content the input attributes are set at span start, so they are present on the
+        failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
+        a GenerationError's last recorded one included.
+
+        Raises:
+            GenerationError: whatever the call failed with, the span attributed and closed first.
+            Exception: anything else the call raised, recorded on the span before it re-raises.
+            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
+                status set.
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         try:
@@ -1252,11 +1290,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
             _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, conversation)
             try:
-                # The un-overloaded entry point, because this frame's binding is generic and
-                # generate_one's overloads are keyed on a concrete one. Same request, widest type.
-                response = await self._bound_llm._generate_one_any_binding(  # noqa: SLF001
-                    conversation, abandoned_call_log=abandoned_call_log
-                )
+                response = await call
             except GenerationError as exc:
                 _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
                 _apply_output_content(span, exc, self._span_config)
@@ -1278,110 +1312,78 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[str] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[str]]: ...
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, HasTools]",
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[OutputT | None] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[OutputT | None]]: ...
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, NoTools]",
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = ...,
-        abandoned_call_log: AbandonedCallLog | None = ...,
-    ) -> list[Response[OutputT] | GenerationError]: ...
+        timeout_seconds: float | None = ...,
+    ) -> list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
         conversations: SequenceNotStr[str | Sequence[Message]],
         *,
         warm_cache: bool = False,
-        abandoned_call_log: AbandonedCallLog | None = None,
-    ) -> list[Response[Any] | GenerationError]:
-        """Order-aligned batch under one INTERNAL span; per-item detail lives in the returned rows.
+        timeout_seconds: float | None = None,
+    ) -> list[CallResult[Any]]:
+        """Order-aligned batch, traced as one chat span per item and nothing else.
 
         The overloads mirror BoundLLM.generate_many's, so each row's output is typed per binding.
 
-        warm_cache and abandoned_call_log pass through to BoundLLM.generate_many, which documents
-        them; the span brackets the warming first item and the rest alike.
+        warm_cache and timeout_seconds pass through to BoundLLM.generate_many, which documents them.
 
-        Delegates to BoundLLM.generate_many rather than re-gathering into per-item child spans:
-        generate_many is a bulk convenience (dataset passes, evals),
-        not the agent loop, which traces individual generate_one / stream_one turns;
-        a batch user reads per-item cost and timing from the returned Response / GenerationError rows (to_row),
-        for which spans add nothing.
-        The one span here brackets the whole batch's wall time;
-        kind is INTERNAL because it makes no outbound call of its own, the delegated items do;
-        a CLIENT batch span would register as a phantom outbound call in APM dependency graphs.
-        The mapper is not invoked (there is no single result to map);
-        the span carries the extra_attributes and langchaint.batch_item_count, the number of conversations
-        (a langchaint.* attribute because the GenAI convention defines no batch-size key).
-        It is the one span here with no gen_ai.operation.name, which the convention marks required on the
-        span kinds it defines: it defines no batch-aggregate span, so nothing is required of this one,
-        and claiming "chat" would make every batch count as one more chat request on a backend that groups
-        by that key, while carrying no model, no token counts, and no finish reason to back the claim.
-        The span name still reads "chat {model}", which the convention leaves free-form.
-        No content attributes are set under any capture_message_content value:
-        the span covers a batch with no single conversation and no single assistant turn,
-        the same reason the mapper is not invoked here.
-        Every per-item outcome comes back as a row, so the span stays OK on mixed results and takes
-        error status only when the batch as a whole fails to run.
+        A batch large enough for one span per item to be too many spans is what an OTel sampler is
+        for, configured on the SDK where every other tracing volume decision is made.
 
         Raises:
             TypeError: conversations is a bare str (the whole-batch guard, in the delegated method).
-            Exception: an item raised something that is not a GenerationError, a defect in langchaint
-                itself; the span records it before re-raising.
-            asyncio.CancelledError: an outer scope cancelled the batch; the delegated generate_many
-                appended any AbandonedCall first, and the span ends.
+            asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
+                ended.
+            BaseException: an item raised a BaseException that is not an Exception, which langchaint
+                does not catch; the remaining items are cancelled and it propagates.
         """
-        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.INTERNAL)
-        try:
-            _apply_extra_attributes(span, self._span_config.extra_attributes)
-            try:
-                # The un-overloaded entry point; generate_one above says why.
-                results = await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
-                    conversations, warm_cache=warm_cache, abandoned_call_log=abandoned_call_log
-                )
-            except Exception as exc:
-                _record_other_exception(span, exc)
-                raise
-            _set_span_attribute(span, "langchaint.batch_item_count", len(results))
-            _set_ok_status(span)
-            return results
-        finally:
-            _end_span(span)
+        # The un-overloaded entry point; _generate_one_any_binding says why.
+        return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
+            conversations,
+            warm_cache=warm_cache,
+            generate_item=self._generate_one_any_binding,
+            timeout_seconds=timeout_seconds,
+        )
 
     @overload
     def stream_one(
         self: "TracedBoundLLM[str, ToolsT]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[str]": ...
     @overload
     def stream_one(
         self: "TracedBoundLLM[OutputT, HasTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[OutputT | None]": ...
     @overload
     def stream_one(
         self: "TracedBoundLLM[OutputT, NoTools]",
         conversation: str | Sequence[Message],
         *,
-        abandoned_call_log: AbandonedCallLog | None = ...,
+        timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[OutputT]": ...
     def stream_one(
-        self,
-        conversation: str | Sequence[Message],
-        *,
-        abandoned_call_log: AbandonedCallLog | None = None,
+        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
     ) -> "TracedStreamHandle[Any]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
 
@@ -1389,7 +1391,6 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
         The span opens when the handle is entered, matching StreamHandle's own contract that
         the request opens there.
-        abandoned_call_log passes through to the wrapped StreamHandle, which documents it.
         The binding and the conversation are passed down rather than rendered here:
         the handle needs them to build its input attributes when the span starts,
         and rendering them here would serialize the conversation unconditionally, including for the
@@ -1397,9 +1398,9 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         The cost is that the handle holds the conversation for the stream's whole life.
         """
         return TracedStreamHandle(
-            # The un-overloaded entry point; generate_one says why.
+            # The un-overloaded entry point; _generate_one_any_binding says why.
             stream_handle=self._bound_llm._stream_one_any_binding(  # noqa: SLF001
-                conversation, abandoned_call_log=abandoned_call_log
+                conversation, timeout_seconds=timeout_seconds
             ),
             span_config=self._span_config,
             span_name=self._span_name,
@@ -1447,6 +1448,14 @@ class TracedStreamHandle[OutputT]:
         self._span_started_at_monotonic_seconds: float | None = None
         self._span_ended = False
         self._first_item_seen = False
+
+    @property
+    def abandoned(self) -> AbandonedCallError | None:
+        """The wrapped handle's account of this call where a cancellation cut it off, None otherwise.
+
+        StreamHandle.abandoned says when it is set.
+        """
+        return self._stream_handle.abandoned
 
     def _start_span_once(self) -> Span:
         """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
@@ -1503,7 +1512,8 @@ class TracedStreamHandle[OutputT]:
 
         StopAsyncIteration passes through without ending the span,
         so a following final() can still set attributes and end it.
-        Any other exception ends the span with error status (a failing stream, or a cancellation, does not leak a span).
+        A cancellation passes through the same way, because __aexit__ is what can tell this handle's
+        own expired timeout_seconds from an outer cancellation, and leaving the block always runs it.
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
@@ -1522,9 +1532,6 @@ class TracedStreamHandle[OutputT]:
             raise
         except Exception as exc:
             _record_stream_conclusion(span, exc, self._span_config)
-            self._end_span_once()
-            raise
-        except BaseException:
             self._end_span_once()
             raise
         self._mark_first_item(span)
@@ -1567,9 +1574,19 @@ class TracedStreamHandle[OutputT]:
         A span already ended by a mid-iteration failure or by final() is left alone.
         An open span abandoned with an in-flight exception (a consuming loop body that raised) records that exception
         and takes error status before ending.
+
+        A cancellation leaves __anext__ and final() without ending the span, because only here is it
+        known whether it was this handle's own timeout_seconds: the inner __aexit__ turns that one
+        into a GenerationError, which is the call's result and takes the same attributes any other
+        terminal result does. An outer cancellation ends the span with no status, the run having no
+        outcome to report.
         """
         try:
             await self._stream_handle.__aexit__(exc_type, exc, traceback)
+        except GenerationError as conclusion:
+            if self._span is not None and not self._span_ended:
+                _record_stream_conclusion(self._span, conclusion, self._span_config)
+            raise
         finally:
             if self._span is not None and not self._span_ended:
                 if isinstance(exc, Exception):
@@ -1598,9 +1615,6 @@ class TracedStreamHandle[OutputT]:
             response = await self._stream_handle.final()
         except Exception as exc:
             _record_stream_conclusion(span, exc, self._span_config)
-            self._end_span_once()
-            raise
-        except BaseException:
             self._end_span_once()
             raise
         _apply_result_attributes(span, response, self._span_config.attribute_mapper)

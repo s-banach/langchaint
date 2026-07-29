@@ -11,33 +11,15 @@ extra="forbid" (pydantic merges model_config from bases, so a subclass of a mode
 inherits it), and the construction-time rejection that setting buys.
 """
 
-import importlib
 import inspect
-import pkgutil
-from collections.abc import Iterator
-from types import ModuleType
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
-import langchaint
 from langchaint.checked_copy import CheckedCopyModel
 from langchaint.messages import Message
 from langchaint.usage import Usage
-
-
-def _package_modules() -> Iterator[ModuleType]:
-    """Import every module under langchaint, backend subpackages included.
-
-    Importing the backend subpackages and tracing requires both SDKs and opentelemetry-api,
-    which the dev environment installs for the adapter and tracing tests.
-
-    Yields:
-        Each imported module, the package itself first.
-    """
-    yield langchaint
-    for module_info in pkgutil.walk_packages(langchaint.__path__, prefix="langchaint."):
-        yield importlib.import_module(module_info.name)
+from tests.helpers import package_modules
 
 
 def test_every_package_pydantic_model_inherits_checked_copy_model() -> None:
@@ -48,7 +30,7 @@ def test_every_package_pydantic_model_inherits_checked_copy_model() -> None:
     """
     offenders = [
         f"{cls.__module__}.{cls.__name__}"
-        for module in _package_modules()
+        for module in package_modules()
         for _name, cls in inspect.getmembers(module, inspect.isclass)
         if cls.__module__ == module.__name__
         and issubclass(cls, BaseModel)
@@ -162,10 +144,14 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
 @pytest.mark.parametrize(
     ("payload", "key", "error_type"),
     [
-        ({"content": "x", "role": "user", "junk": 1}, "junk", "extra_forbidden"),
-        ({"turn": [{"text": "a"}], "role": "assistant", "junk": 1}, "junk", "extra_forbidden"),
-        ({"role": "user"}, "content", "missing"),
-        ({"role": "assistant"}, "turn", "missing"),
+        ({"content": "x", "kind": "user", "junk": 1}, "junk", "extra_forbidden"),
+        (
+            {"turn": [{"text": "a", "kind": "text"}], "kind": "assistant", "junk": 1},
+            "junk",
+            "extra_forbidden",
+        ),
+        ({"kind": "user"}, "content", "missing"),
+        ({"kind": "assistant"}, "turn", "missing"),
     ],
 )
 def test_reloading_a_malformed_conversation_locates_the_key_as_a_validation_error(

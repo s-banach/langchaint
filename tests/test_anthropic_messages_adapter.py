@@ -8,9 +8,8 @@ and the precomputed request the binding determines.
 import asyncio
 import base64
 import json
-import math
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import get_args, override
 
 import anthropic
@@ -35,6 +34,7 @@ from pydantic import BaseModel, TypeAdapter
 from langchaint import (
     LLM,
     AssistantMessage,
+    Billing,
     ImagePart,
     InferenceParams,
     PydanticTool,
@@ -44,12 +44,15 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolChoice,
     ToolManager,
     ToolMessage,
     UserMessage,
 )
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
+    Adapter,
+    AdapterStream,
     Binding,
     ContextWindowExceeded,
     EmptyTurn,
@@ -58,6 +61,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     NoOutputOutcome,
     Refusal,
+    RequestParams,
     SchemaViolation,
     UnfinishedTurn,
 )
@@ -73,20 +77,21 @@ from langchaint.anthropic import (
 )
 from langchaint.anthropic.messages_adapter import (
     _adapter_result,
+    _AnthropicRequestParams,
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
+    _billing_from_sdk_usage,
     _BoundAnthropicStructured,
     _normalized_stop_reason,
-    _normalized_usage,
     _NotSendableError,
     _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,
 )
-from langchaint.exceptions import StreamProtocolError
+from langchaint.call import ResponseIdentity
+from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
-from langchaint.usage import Usage
 
 _STANDARD_RATES = AnthropicPricingTable(
     input_cache_none_usd_per_million_tokens=3.0,
@@ -163,9 +168,9 @@ def _usage_with_cache_split() -> at.Usage:
     )
 
 
-def test_normalized_usage_partitions_input_counters_and_prices() -> None:
-    """input_tokens is the uncached counter, and the normalized usage carries the priced cost."""
-    usage = _normalized_usage(_usage_with_cache_split(), _PRICING)
+def test_billing_partitions_input_counters_and_prices() -> None:
+    """input_tokens is the uncached counter, and the Billing's usage carries the priced cost."""
+    usage = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING).usage
     assert usage.input_tokens_cache_read == 200
     assert usage.input_tokens_cache_write == 30
     assert usage.input_tokens_cache_none == 100
@@ -173,14 +178,40 @@ def test_normalized_usage_partitions_input_counters_and_prices() -> None:
     assert usage.cost_in_usd == (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
 
 
-def test_normalized_usage_counts_the_writes_it_bills_for() -> None:
-    """The cache-write counter reads the same source the cost does, so the two cannot disagree.
+def test_billing_carries_the_sdk_usage_object_itself() -> None:
+    """usage_raw is the SDK usage object by reference, not a copy."""
+    usage = _usage_with_cache_split()
+    billing = _billing_from_sdk_usage(usage, _PRICING)
+    assert billing.usage_raw is usage
+
+
+def test_billing_pins_the_served_tier_and_the_rates_that_applied() -> None:
+    """The Billing holds the served tier and the rates the tier's table charged."""
+    billing = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING)
+    assert billing.service_tier == "standard"
+    assert billing.input_cache_none_usd_per_million_tokens == 3.0
+    assert billing.cache_read_usd_per_million_tokens == 0.3
+    assert billing.output_usd_per_million_tokens == 15.0
+
+
+def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
+    """A response served at a tier no table prices still reports what it billed and who served it."""
+    billing = _billing_from_sdk_usage(
+        at.Usage(input_tokens=100, output_tokens=50, service_tier="priority"), _PRICING
+    )
+    assert billing.service_tier == "priority"
+    assert billing.usage.input_tokens_total == 100
+    assert billing.usage.output_tokens == 50
+
+
+def test_billing_counts_the_writes_it_bills_for() -> None:
+    """The cache-write counters read the same source the cost does, so the two cannot disagree.
 
     cache_creation_input_tokens and the cache_creation split are separate optional SDK fields with
     no documented relationship, so a response carrying only the split would otherwise report a
     cost covering 30 written tokens and a counter saying none were written.
     """
-    usage = _normalized_usage(
+    usage = _billing_from_sdk_usage(
         at.Usage(
             input_tokens=100,
             output_tokens=0,
@@ -189,39 +220,34 @@ def test_normalized_usage_counts_the_writes_it_bills_for() -> None:
             ),
         ),
         _PRICING,
-    )
+    ).usage
     assert usage.input_tokens_cache_write == 30
     assert abs(usage.cost_in_usd - (100 * 3.0 + 10 * 3.75 + 20 * 6.0) / 1e6) < 1e-12
 
 
-def test_normalized_usage_treats_none_cache_counts_as_zero() -> None:
+def test_billing_treats_none_cache_counts_as_zero() -> None:
     """Absent cache counters normalize to zero, not None."""
-    usage = _normalized_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
+    usage = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING).usage
     assert usage.input_tokens_cache_read == 0
     assert usage.input_tokens_cache_write == 0
     assert usage.input_tokens_cache_none == 7
 
 
-def test_normalized_usage_reads_reasoning_tokens_and_defaults_to_zero() -> None:
+def test_billing_reads_reasoning_tokens_and_defaults_to_zero() -> None:
     """output_tokens_reasoning reads thinking_tokens, and is zero when output_tokens_details is absent."""
-    with_details = _normalized_usage(
+    with_details = _billing_from_sdk_usage(
         at.Usage(
             input_tokens=1,
             output_tokens=9,
             output_tokens_details=at.OutputTokensDetails(thinking_tokens=4),
         ),
         _PRICING,
-    )
+    ).usage
     assert with_details.output_tokens_reasoning == 4
-    without_details = _normalized_usage(at.Usage(input_tokens=1, output_tokens=9), _PRICING)
+    without_details = _billing_from_sdk_usage(
+        at.Usage(input_tokens=1, output_tokens=9), _PRICING
+    ).usage
     assert without_details.output_tokens_reasoning == 0
-
-
-def test_cost_splits_five_minute_and_one_hour_cache_writes() -> None:
-    """The two cache-write tiers bill at their own rates from cache_creation."""
-    cost = _normalized_usage(_usage_with_cache_split(), _PRICING).cost_in_usd
-    expected = (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
-    assert abs(cost - expected) < 1e-12
 
 
 def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> None:
@@ -231,28 +257,44 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
         output_tokens=0,
         cache_creation_input_tokens=40,
     )
-    cost = _normalized_usage(usage, _PRICING).cost_in_usd
+    cost = _billing_from_sdk_usage(usage, _PRICING).usage.cost_in_usd
     expected = (100 * 3.0 + 40 * 3.75) / 1e6
     assert abs(cost - expected) < 1e-12
 
 
-def test_cost_is_nan_when_the_served_tier_has_no_table() -> None:
-    """A response served at a tier the adapter holds no table for keeps its counters and costs NaN.
+def test_the_stored_write_price_is_the_blend_of_what_the_two_ttls_billed() -> None:
+    """A response mixing both write TTLs stores one write price, and it reproduces the write cost.
 
-    The response was paid for, so the generation path keeps it and reports the cost as unknown.
+    Usage collapses the two write counters into one, so neither TTL's own rate reproduces the cost;
+    the blend does, which is what lets a stored record reprice itself without the split counts.
     """
-    usage = at.Usage(
-        input_tokens=100,
-        output_tokens=50,
-        cache_read_input_tokens=200,
-        cache_creation_input_tokens=30,
-        service_tier="priority",
+    billing = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING)
+    usage = billing.usage
+    assert usage.input_tokens_cache_write == 30
+    assert usage.input_tokens_cache_write_cost_in_usd == pytest.approx(
+        usage.input_tokens_cache_write * billing.cache_write_usd_per_million_tokens / 1e6
     )
-    normalized = _normalized_usage(usage, _PRICING)
-    assert math.isnan(normalized.cost_in_usd)
-    assert math.isnan(normalized.output_tokens_cost_in_usd)
-    assert normalized.input_tokens_total == 330
-    assert normalized.output_tokens == 50
+    assert 3.75 < billing.cache_write_usd_per_million_tokens < 6.0
+
+
+def test_equal_write_rates_store_that_rate_as_the_write_price() -> None:
+    """With both TTLs priced alike the blend is that rate, so blending adds no artifact."""
+    equal_write_rates = AnthropicPricingTable(
+        input_cache_none_usd_per_million_tokens=3.0,
+        output_usd_per_million_tokens=15.0,
+        cache_read_usd_per_million_tokens=0.3,
+        cache_write_5m_usd_per_million_tokens=3.75,
+        cache_write_1h_usd_per_million_tokens=3.75,
+    )
+    billing = _billing_from_sdk_usage(_usage_with_cache_split(), {"standard": equal_write_rates})
+    assert billing.cache_write_usd_per_million_tokens == pytest.approx(3.75)
+
+
+def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> None:
+    """With nothing written there is nothing to blend, so the write price is the default TTL's rate."""
+    billing = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
+    assert billing.usage.input_tokens_cache_write == 0
+    assert billing.cache_write_usd_per_million_tokens == 3.75
 
 
 def test_the_reported_tier_selects_the_table() -> None:
@@ -262,16 +304,16 @@ def test_the_reported_tier_selects_the_table() -> None:
         "standard": _STANDARD_RATES,
         "priority": _PRIORITY_RATES,
     }
-    at_priority = _normalized_usage(at.Usage(**counters, service_tier="priority"), pricing)
-    at_standard = _normalized_usage(at.Usage(**counters, service_tier="standard"), pricing)
-    reporting_none = _normalized_usage(at.Usage(**counters), pricing)
-    assert at_priority.cost_in_usd == pytest.approx(2 * at_standard.cost_in_usd)
-    assert reporting_none.cost_in_usd == at_standard.cost_in_usd
+    at_priority = _billing_from_sdk_usage(at.Usage(**counters, service_tier="priority"), pricing)
+    at_standard = _billing_from_sdk_usage(at.Usage(**counters, service_tier="standard"), pricing)
+    reporting_none = _billing_from_sdk_usage(at.Usage(**counters), pricing)
+    assert at_priority.usage.cost_in_usd == pytest.approx(2 * at_standard.usage.cost_in_usd)
+    assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
 
 
 def test_the_categories_are_priced_apart() -> None:
     """Each stored cost is its own category's product, and they sum to cost_in_usd."""
-    usage = _normalized_usage(_usage_with_cache_split(), _PRICING)
+    usage = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING).usage
     assert usage.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
     assert usage.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
     assert usage.input_tokens_cache_write_cost_in_usd == (10 * 3.75 + 20 * 6.0) / 1e6
@@ -375,16 +417,20 @@ def test_adapter_result_extracts_text_and_tool_use() -> None:
     assert result.stop_reason == "tool_use"
 
 
-def _message_with_content(content: list[at.ContentBlock]) -> at.Message:
+def _message_with_content(
+    content: list[at.ContentBlock],
+    stop_reason: at.StopReason = "tool_use",
+    usage: at.Usage | None = None,
+) -> at.Message:
     """Build an SDK message carrying the given content blocks."""
     return at.Message(
         id="msg_1",
         content=content,
         model="claude-sonnet-5",
         role="assistant",
-        stop_reason="tool_use",
+        stop_reason=stop_reason,
         type="message",
-        usage=at.Usage(input_tokens=1, output_tokens=1),
+        usage=usage if usage is not None else at.Usage(input_tokens=1, output_tokens=1),
     )
 
 
@@ -407,7 +453,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     ]
     reasoning_trace = assistant_message.turn[0]
     assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.reasoning == {
+    assert reasoning_trace.raw == {
         "type": "thinking",
         "thinking": "check first",
         "signature": "sig-1",
@@ -419,7 +465,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     )
     blocks = _assistant_content_blocks(assistant_message)
     assert len(blocks) == len(message.content)
-    assert blocks[0] == reasoning_trace.reasoning
+    assert blocks[0] == reasoning_trace.raw
     assert blocks[1] == {"type": "text", "text": "hello"}
     assert blocks[2] == {
         "type": "tool_use",
@@ -441,7 +487,7 @@ def test_empty_thinking_text_normalizes_to_none() -> None:
     reasoning_trace = _assistant_message_from(message).turn[0]
     assert isinstance(reasoning_trace, ReasoningTrace)
     assert reasoning_trace.text is None
-    assert reasoning_trace.reasoning["thinking"] == ""
+    assert reasoning_trace.raw["thinking"] == ""
 
 
 def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
@@ -462,30 +508,12 @@ def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     ]
 
 
-def test_reasoning_with_a_key_the_installed_sdk_lacks_survives_the_wire_builder() -> None:
-    """A stored dict carrying a field newer than the installed SDK param re-emits unchanged.
-
-    A consume step that reshaped the dict to the pinned param keys would modify the thinking block
-    across an SDK upgrade, which the API rejects on a tool-use continuation.
-    """
-    reasoning = {
-        "type": "thinking",
-        "thinking": "t",
-        "signature": "s",
-        "field_newer_than_sdk": "x",
-    }
-    assistant_message = AssistantMessage(turn=(ReasoningTrace(reasoning=reasoning),))
-    assert _assistant_content_blocks(assistant_message) == [reasoning]
-
-
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """An openai-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
-    reasoning = {"type": "reasoning", "id": "rs_1"}
-    assistant_message = AssistantMessage(
-        turn=(ReasoningTrace(reasoning=reasoning), TextPart(text="hi"))
-    )
+    raw = {"type": "reasoning", "id": "rs_1"}
+    assistant_message = AssistantMessage(turn=(ReasoningTrace(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
-        reasoning,
+        raw,
         {"type": "text", "text": "hi"},
     ]
 
@@ -536,9 +564,7 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
         AssistantMessage(
             turn=(
                 TextPart(text="t"),
-                ReasoningTrace(
-                    reasoning={"type": "thinking", "thinking": "x", "signature": "s"},
-                ),
+                ReasoningTrace(raw={"type": "thinking", "thinking": "x", "signature": "s"}),
             )
         )
     ]
@@ -601,27 +627,39 @@ def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -
         )
 
 
-def test_wire_tool_choice_required_becomes_any_and_inverts_parallel() -> None:
-    """Neutral required maps to any; disable_parallel_tool_use is the inverse."""
-    for parallel in (True, False):
-        assert _wire_tool_choice("required", parallel_tool_calls=parallel) == {
-            "type": "any",
-            "disable_parallel_tool_use": not parallel,
-        }
+@pytest.mark.parametrize("parallel_tool_calls", [True, False])
+@pytest.mark.parametrize(
+    ("tool_choice", "expected_without_parallel_flag"),
+    [
+        ("auto", {"type": "auto"}),
+        ("required", {"type": "any"}),
+        (SpecificToolChoice(tool_name="x"), {"type": "tool", "name": "x"}),
+    ],
+    ids=["auto", "required", "specific_tool"],
+)
+def test_wire_tool_choice_carries_the_inverted_parallel_flag(
+    tool_choice: ToolChoice,
+    expected_without_parallel_flag: dict[str, object],
+    *,
+    parallel_tool_calls: bool,
+) -> None:
+    """Neutral required maps to any, and every form carrying the flag inverts it.
 
-
-def test_wire_tool_choice_specific_tool_names_the_tool() -> None:
-    """A SpecificToolChoice becomes the named-tool form."""
-    assert _wire_tool_choice(SpecificToolChoice(tool_name="x"), parallel_tool_calls=True) == {
-        "type": "tool",
-        "name": "x",
-        "disable_parallel_tool_use": False,
+    disable_parallel_tool_use is the inverse of the neutral parallel_tool_calls, so a form that
+    passed it through unchanged would ask for the opposite of what the caller stated.
+    """
+    assert _wire_tool_choice(tool_choice, parallel_tool_calls=parallel_tool_calls) == {
+        **expected_without_parallel_flag,
+        "disable_parallel_tool_use": not parallel_tool_calls,
     }
 
 
-def test_wire_tool_choice_none_forbids_calls() -> None:
-    """Neutral none maps to the none form with no parallel flag."""
-    assert _wire_tool_choice("none", parallel_tool_calls=True) == {"type": "none"}
+@pytest.mark.parametrize("parallel_tool_calls", [True, False])
+def test_wire_tool_choice_none_forbids_calls_and_carries_no_parallel_flag(
+    *, parallel_tool_calls: bool
+) -> None:
+    """Neutral none maps to the none form, which takes no parallel flag at either binding."""
+    assert _wire_tool_choice("none", parallel_tool_calls=parallel_tool_calls) == {"type": "none"}
 
 
 def _adapter() -> AnthropicMessagesAdapter:
@@ -764,17 +802,30 @@ class _FakeSDKMessageStream(AsyncMessageStream[None]):
     """Replays constructed events without a connection.
 
     Overrides exactly the surface _AnthropicStream uses (iteration, close,
-    and the current_message_snapshot the stop-reason check reads); the base __init__ is deliberately not called,
+    the current_message_snapshot the stop-reason check reads, and the response its headers are read
+    off); the base __init__ is deliberately not called,
     so the untouched base machinery stays unusable.
+    The inherited request_id property is left in place, so a test of it exercises the SDK's own read.
     """
 
     def __init__(
         self,
         replay_events: Sequence[ParsedMessageStreamEvent],
         message_snapshot: ParsedMessage[None],
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._replay_events = list(replay_events)
         self._message_snapshot = message_snapshot
+        self._http_response = httpx.Response(
+            200,
+            headers=headers,
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        )
+
+    @property
+    @override
+    def response(self) -> httpx.Response:
+        return self._http_response
 
     @override
     async def __aiter__(self) -> AsyncIterator[ParsedMessageStreamEvent]:
@@ -814,11 +865,25 @@ def _message_snapshot(
 def _anthropic_stream(
     replay_events: Sequence[ParsedMessageStreamEvent],
     message_snapshot: ParsedMessage[None],
+    headers: dict[str, str] | None = None,
 ) -> _AnthropicStream:
-    """Build an adapter stream over replayed events."""
+    """Build an adapter stream over replayed events, reading headers off a constructed response."""
     return _AnthropicStream(
-        sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot), pricing=_PRICING
+        sdk_stream=_FakeSDKMessageStream(replay_events, message_snapshot, headers),
+        pricing=_PRICING,
     )
+
+
+def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
+    """The stream's own response is the only channel a streamed turn has for the header.
+
+    The message the SDK assembles from the events never carries it, so a null here would leave every
+    streaming call with no id to take to provider support.
+    """
+    snapshot = _message_snapshot("end_turn")
+    with_header = _anthropic_stream([], snapshot, {"request-id": "req_stream"})
+    assert with_header.request_id() == "req_stream"
+    assert _anthropic_stream([], snapshot).request_id() is None
 
 
 def _text_delta_event(text: str, index: int) -> at.RawContentBlockDeltaEvent:
@@ -909,24 +974,6 @@ def test_stream_yields_bare_text_and_one_complete_tool_call() -> None:
     ]
 
 
-def test_stream_yields_a_thinking_delta_as_a_reasoning_delta() -> None:
-    """A thinking delta is wrapped in ReasoningDelta while answer text stays a bare string."""
-    thinking_delta_event = at.RawContentBlockDeltaEvent(
-        type="content_block_delta",
-        index=0,
-        delta=at.ThinkingDelta(type="thinking_delta", thinking="checking"),
-    )
-
-    async def scenario() -> list[StreamItem]:
-        adapter_stream = _anthropic_stream(
-            [thinking_delta_event, _text_delta_event("hey", 1)],
-            _message_snapshot("end_turn"),
-        )
-        return [item async for item in adapter_stream.items()]
-
-    assert asyncio.run(scenario()) == [ReasoningDelta(text="checking"), "hey"]
-
-
 def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
     """A block's stop event puts a blank line before the next block's first delta.
 
@@ -942,15 +989,6 @@ def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
         _thinking_block_stop_event("Then it condenses.", 1),
     ])
     assert _streamed_reasoning(translated) == "First, water evaporates.\n\nThen it condenses."
-
-
-def test_deltas_within_one_thinking_block_stream_with_nothing_between_them() -> None:
-    """Only a block stop separates; the deltas of one block concatenate into that block's text."""
-    translated = _collected_items([
-        _thinking_delta_event("weigh", 0),
-        _thinking_delta_event("ing it", 0),
-    ])
-    assert _streamed_reasoning(translated) == "weighing it"
 
 
 def test_a_block_stop_with_no_delta_after_it_streams_no_trailing_separator() -> None:
@@ -1045,23 +1083,11 @@ def test_stream_final_turn_carries_reasoning() -> None:
         assistant_message = _assistant_message_from(await adapter_stream.final())
         reasoning_trace = assistant_message.turn[0]
         assert isinstance(reasoning_trace, ReasoningTrace)
-        assert reasoning_trace.reasoning == {
+        assert reasoning_trace.raw == {
             "type": "thinking",
             "thinking": "check",
             "signature": "sig-1",
         }
-
-    asyncio.run(scenario())
-
-
-def test_stream_without_stop_reason_raises() -> None:
-    """Ending with no stop reason on the accumulated message is a protocol violation."""
-
-    async def scenario() -> None:
-        adapter_stream = _anthropic_stream([_text_delta_event("he", 0)], _message_snapshot(None))
-        with pytest.raises(StreamProtocolError):
-            async for _item in adapter_stream.items():
-                pass
 
     asyncio.run(scenario())
 
@@ -1093,6 +1119,30 @@ _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
 
+def test_identity_reads_the_messages_own_id_and_served_model() -> None:
+    """Both values come off the message verbatim, neither from the id the binding sent.
+
+    A message the SDK did not parse from an HTTP response body carries no request id, which is the
+    state every streamed message is in.
+    """
+    identity = _structured_bound().identity_from_raw(_message_with_content([]))
+    assert identity == ResponseIdentity(
+        model_served="claude-sonnet-5", response_id="msg_1", request_id=None
+    )
+
+
+def test_identity_reads_the_request_id_the_sdk_attached_to_the_message() -> None:
+    """A message parsed from a response body carries the request-id header, which identity reports.
+
+    The assignment is what the SDK's own add_request_id does to every model it parses from a body
+    (anthropic 0.120.0).
+    """
+    message = _message_with_content([])
+    message._request_id = "req_anthropic"
+    identity = _structured_bound().identity_from_raw(message)
+    assert identity.request_id == "req_anthropic"
+
+
 def _structured_message(
     text: str | None,
     stop_reason: at.StopReason | None = "end_turn",
@@ -1116,7 +1166,7 @@ def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config()
     is what keeps the request unchanged by that move, the binding's own effort key included.
     """
     adapted_type: TypeAdapter[_StructuredReport] = TypeAdapter(_StructuredReport)
-    assert _structured_bound()._output_config == {
+    assert _structured_bound()._request.output_config == {
         "effort": "high",
         "format": {"schema": transform_schema(adapted_type.json_schema()), "type": "json_schema"},
     }
@@ -1151,12 +1201,13 @@ def test_both_structured_request_paths_send_the_output_config(
     monkeypatch.setattr(messages_resource, "stream", fake_stream)
 
     async def scenario() -> None:
-        conversation = [UserMessage(content="q")]
-        await structured_bound.send(conversation)
-        await structured_bound.open_stream(conversation)
+        request = structured_bound.build_request([UserMessage(content="q")])
+        assert not isinstance(request, InvalidRequest)
+        await structured_bound.send(request)
+        await structured_bound.open_stream(request)
 
     asyncio.run(scenario())
-    assert output_configs == [structured_bound._output_config] * 2
+    assert output_configs == [structured_bound._request.output_config] * 2
 
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
@@ -1165,10 +1216,32 @@ def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     assert outcome == _StructuredReport(city="Nairobi", celsius=25)
 
 
-def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
-    """An end_turn with no text block and no tool call is EmptyTurn: the model said nothing."""
-    outcome = _structured_parse(_structured_message(None))
-    assert isinstance(outcome, EmptyTurn)
+@pytest.mark.parametrize(
+    ("stop_reason", "expected_outcome_type"),
+    [
+        ("end_turn", EmptyTurn),
+        ("refusal", Refusal),
+        ("max_tokens", MaxCompletionTokensExceeded),
+        ("model_context_window_exceeded", ContextWindowExceeded),
+        (None, UnfinishedTurn),
+    ],
+    ids=[
+        "end_turn",
+        "refusal",
+        "max_tokens",
+        "model_context_window_exceeded",
+        "no_stop_reason",
+    ],
+)
+def test_structured_bind_reports_a_text_free_turn_by_its_stop_reason(
+    stop_reason: at.StopReason | None, expected_outcome_type: type[NoOutputOutcome]
+) -> None:
+    """A turn with no text block parses no instance, so the stop reason is what names the outcome.
+
+    A null stop reason is not a finished turn, so it is unfinished rather than empty.
+    """
+    outcome = _structured_parse(_structured_message(None, stop_reason=stop_reason))
+    assert isinstance(outcome, expected_outcome_type)
 
 
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
@@ -1194,20 +1267,6 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_
     assert isinstance(outcome, MaxCompletionTokensExceeded)
 
 
-def test_structured_bind_reports_refusal_on_a_refusal_stop_reason() -> None:
-    """A refusal stop_reason with no instance is Refusal."""
-    outcome = _structured_parse(_structured_message(None, stop_reason="refusal"))
-    assert isinstance(outcome, Refusal)
-
-
-def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_tokens_stop_reason() -> (
-    None
-):
-    """A max_tokens stop_reason with no text is MaxCompletionTokensExceeded."""
-    outcome = _structured_parse(_structured_message(None, stop_reason="max_tokens"))
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
-
-
 def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
     """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
     assert _structured_parse(_structured_message(None, stop_reason="tool_use")) is None
@@ -1219,25 +1278,11 @@ def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_
     assert outcome is None
 
 
-def test_structured_bind_reports_context_window_exceeded_on_the_overflow_stop_reason() -> None:
-    """model_context_window_exceeded is ContextWindowExceeded, not a resend of a request too long to serve."""
-    outcome = _structured_parse(
-        _structured_message(None, stop_reason="model_context_window_exceeded")
-    )
-    assert isinstance(outcome, ContextWindowExceeded)
-
-
 def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
     """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
     assert isinstance(outcome, UnfinishedTurn)
     assert "pause_turn" in outcome.reason
-
-
-def test_structured_bind_reports_a_null_stop_reason_as_unfinished() -> None:
-    """A message with no stop reason is not a finished turn, so its content is not the answer."""
-    outcome = _structured_parse(_structured_message(None, stop_reason=None))
-    assert isinstance(outcome, UnfinishedTurn)
 
 
 def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation() -> None:
@@ -1256,29 +1301,29 @@ def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
     return anthropic.RateLimitError("rate limited", response=response, body=None)
 
 
-def test_retry_after_seconds_prefers_the_millisecond_header() -> None:
-    """retry-after-ms wins over retry-after because it is more precise."""
-    error = _rate_limit_error({"retry-after-ms": "1500", "retry-after": "49"})
-    assert _adapter().retry_after_seconds(error) == 1.5
+def test_retry_after_seconds_reads_the_headers_of_an_sdk_error_and_nothing_else() -> None:
+    """The override finds the headers on the SDK's own exception and yields None for any other.
 
-
-def test_retry_after_seconds_parses_the_seconds_header() -> None:
-    """Without retry-after-ms, retry-after is parsed as float seconds."""
-    error = _rate_limit_error({"retry-after": "49"})
-    assert _adapter().retry_after_seconds(error) == 49.0
-
-
-def test_retry_after_seconds_is_none_without_headers_or_status() -> None:
-    """No headers, an unparseable value, and a non-SDK error all yield None."""
+    The parsing itself is tested in tests/test_adapter.py against the shared function; what is
+    provider-specific is where the headers are found. httpx.Headers is case-insensitive, so the
+    lookup keeps working whatever case the server sent.
+    """
     adapter = _adapter()
+    assert adapter.retry_after_seconds(_rate_limit_error({"Retry-After-MS": "1500"})) == 1.5
     assert adapter.retry_after_seconds(_rate_limit_error({})) is None
-    assert (
-        adapter.retry_after_seconds(
-            _rate_limit_error({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
-        )
-        is None
-    )
     assert adapter.retry_after_seconds(ValueError("boom")) is None
+
+
+def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
+    """The override reports the header the SDK read off the error response, None for any other error.
+
+    anthropic sends the id in request-id; a response without that header and an exception that never
+    reached one both give None.
+    """
+    adapter = _adapter()
+    assert adapter.request_id_from_error(_rate_limit_error({"request-id": "req_429"})) == "req_429"
+    assert adapter.request_id_from_error(_rate_limit_error({})) is None
+    assert adapter.request_id_from_error(ValueError("boom")) is None
 
 
 def _status_error[ErrorT: anthropic.APIStatusError](
@@ -1300,63 +1345,6 @@ def _connection_error() -> anthropic.APIConnectionError:
     return anthropic.APIConnectionError(
         request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     )
-
-
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (_status_error(anthropic.RateLimitError, 429), "rate_limit"),
-        (_status_error(anthropic.OverloadedError, 529), "rate_limit"),
-        (_status_error(anthropic.InternalServerError, 500), "transient"),
-        (_connection_error(), "transient"),
-        (
-            anthropic.APITimeoutError(httpx.Request("POST", "https://api.anthropic.com")),
-            "transient",
-        ),
-        (_status_error(anthropic.ConflictError, 409), "transient"),
-        (anthropic.RetryableError("middleware said retry"), "transient"),
-        (_status_error(anthropic.BadRequestError, 400), "invalid_request"),
-        (_status_error(anthropic.AuthenticationError, 401), "invalid_request"),
-        (_status_error(anthropic.PermissionDeniedError, 403), "invalid_request"),
-        (_status_error(anthropic.NotFoundError, 404), "invalid_request"),
-        (_status_error(anthropic.RequestTooLargeError, 413), "invalid_request"),
-        (_status_error(anthropic.UnprocessableEntityError, 422), "invalid_request"),
-        (_status_error(anthropic.APIStatusError, 402), "invalid_request"),
-        (_status_error(anthropic.APIStatusError, 408), "transient"),
-        (_status_error(anthropic.InternalServerError, 503), "transient"),
-        (_status_error(anthropic.APIStatusError, 302), "unknown_exception"),
-        (_status_error(anthropic.BadRequestError, 400, {"x-should-retry": "true"}), "transient"),
-        (
-            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "false"}),
-            "invalid_request",
-        ),
-        (
-            _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"}),
-            "declared_final",
-        ),
-        (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "false"}), "rate_limit"),
-        (_status_error(anthropic.RateLimitError, 429, {"x-should-retry": "true"}), "rate_limit"),
-        (ValueError("boom"), "unknown_exception"),
-    ],
-)
-def test_classify_maps_each_sdk_exception_to_its_classification(
-    error: Exception, expected: ErrorClassification
-) -> None:
-    """Each error lands on the classification the adapter's classify docstring names.
-
-    Each status code is the one the SDK raises that class for, read from anthropic 0.120.0;
-    the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
-    which is why the adapter reads the status rather than the exception class.
-    OverloadedError is anthropic's own overload signal and shares the rate_limit class with RateLimitError.
-    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that isinstance,
-    and RetryableError carries no response at all.
-    x-should-retry overrides the status in both directions, except on a rate-limit status, which
-    stays rate_limit whatever the header says, so the limiter's account-wide pause is still armed,
-    and on a 4xx marked final, which keeps the rejection name.
-    A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the provider
-    marked final lands on declared_final; each fails the one item without a retry.
-    """
-    assert _adapter().classify(error) == expected
 
 
 def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
@@ -1484,19 +1472,44 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
         )
 
 
-def test_send_reports_an_unsendable_conversation_as_invalid_request() -> None:
-    """An unsendable conversation reaches send's caller as the InvalidRequest arm, with nothing sent.
+def test_build_request_reports_an_unsendable_conversation_as_invalid_request() -> None:
+    """An unsendable conversation reaches build_request's caller as the InvalidRequest arm.
 
-    The client holds no API key, so reaching the wire would fail rather than return this arm.
+    Nothing is sent: the retry loop takes this answer before its first attempt.
     """
+    conversation = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
+    outcome = _structured_bound().build_request(conversation)
+    assert isinstance(outcome, InvalidRequest)
+    assert "image/tiff" in outcome.reason
 
-    async def scenario() -> None:
-        conversation = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
-        outcome = await _structured_bound().send(conversation)
-        assert isinstance(outcome, InvalidRequest)
-        assert "image/tiff" in outcome.reason
 
-    asyncio.run(scenario())
+def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> None:
+    """A replayed tool call whose args_json is not JSON is a conversation, not a raise.
+
+    args_json is caller data that nothing validates on the way in, so a batch item carrying one must
+    fail as its own row rather than escape the retry loop and cancel its siblings.
+    """
+    conversation = [
+        AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
+        ToolMessage(tool_call_id="c1", content="ok"),
+    ]
+    outcome = _structured_bound().build_request(conversation)
+    assert isinstance(outcome, InvalidRequest)
+    assert "args_json" in outcome.reason
+
+
+def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
+    """as_json holds the binding's precomputed fields and this call's converted messages.
+
+    temperature is absent rather than null, because the binding set none and the request body carries
+    no such key.
+    """
+    request = _structured_bound().build_request([UserMessage(content="hi")])
+    assert isinstance(request, _AnthropicRequestParams)
+    rendered = json.loads(request.as_json())
+    assert rendered["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert rendered["precomputed"]["model"] == "m"
+    assert "temperature" not in rendered["precomputed"]
 
 
 def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_caching() -> None:
@@ -1685,25 +1698,153 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
         )
 
 
-def test_usage_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
+def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
     """The running snapshot is readable only once an event has been accumulated.
 
     The SDK builds the snapshot from message_start and asserts on a read before that, so the
     adapter reports None until its first pull and prices the snapshot from then on.
     The snapshot carries input_tokens and output_tokens as required fields, so a mid-stream read
-    always prices something.
+    always has counters to report.
     """
 
-    async def scenario() -> tuple[Usage | None, Usage | None]:
-        """Read the running usage before pulling anything, then after one item."""
+    async def scenario() -> tuple[Billing | None, Billing | None]:
+        """Read the running billing before pulling anything, then after one item."""
         adapter_stream = _anthropic_stream(
             [_text_delta_event("he", 0)], _message_snapshot("end_turn")
         )
-        before = adapter_stream.usage_reported()
+        before = adapter_stream.billing_reported()
         items = adapter_stream.items()
         await anext(items)
-        return before, adapter_stream.usage_reported()
+        return before, adapter_stream.billing_reported()
 
     before, after = asyncio.run(scenario())
     assert before is None
-    assert after == _normalized_usage(at.Usage(input_tokens=1, output_tokens=1), _PRICING)
+    assert after == _billing_from_sdk_usage(at.Usage(input_tokens=1, output_tokens=1), _PRICING)
+
+
+def _turn_content() -> list[at.ContentBlock]:
+    """Build one thinking block carrying a key the installed SDK does not name, then one text block.
+
+    model_construct rather than the constructor: the extra key is the point, and the constructor of
+    a pinned SDK model has no field for a key that SDK does not name.
+    """
+    return [
+        at.ThinkingBlock.model_construct(
+            type="thinking", thinking="check first", signature="sig-1", field_newer_than_sdk="x"
+        ),
+        at.TextBlock(type="text", text="hello"),
+    ]
+
+
+def _turn_message(usage: at.Usage) -> at.Message:
+    """Build a finished turn of one thinking block then one text block, billing the given usage."""
+    return _message_with_content(_turn_content(), stop_reason="end_turn", usage=usage)
+
+
+class TestAnthropicMessagesConformance(AdapterConformance):
+    """The neutral invariants, over the Anthropic Messages adapter's own SDK objects."""
+
+    @override
+    def make_adapter(self) -> Adapter:
+        """Build the adapter these invariants run against, priced for the standard tier alone."""
+        return _adapter()
+
+    @override
+    def response_with_cache_writes(self) -> BaseModel:
+        """Return a turn whose usage exercises every input counter and the write TTL split."""
+        return _turn_message(_usage_with_cache_split())
+
+    @override
+    def response_without_usage(self) -> BaseModel:
+        """Return a turn reporting zero everywhere, anthropic's Message requiring a usage object."""
+        return _turn_message(at.Usage(input_tokens=0, output_tokens=0))
+
+    @override
+    def response_at_an_unpriced_tier(self) -> BaseModel:
+        """Return a turn served at priority, which _PRICING holds no table for."""
+        return _turn_message(
+            at.Usage(
+                input_tokens=100,
+                output_tokens=50,
+                cache_read_input_tokens=200,
+                cache_creation_input_tokens=30,
+                service_tier="priority",
+            )
+        )
+
+    @override
+    def response_with_impossible_counters(self) -> BaseModel:
+        """Return a turn reporting a negative output counter."""
+        return _turn_message(at.Usage(input_tokens=1, output_tokens=-1))
+
+    @override
+    def response_with_reasoning(self) -> BaseModel:
+        """Return a turn whose thinking block carries the unnamed key."""
+        return _turn_message(_usage_with_cache_split())
+
+    @override
+    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
+        """Read the content blocks of the assistant message this request ends with."""
+        assert isinstance(request, _AnthropicRequestParams)
+        return _content_blocks(request.messages[-1])
+
+    @override
+    def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
+        """Return the same turn as the ParsedMessage a stream assembles into and as a Message."""
+        whole = _turn_message(_usage_with_cache_split())
+        return ParsedMessage[None].model_validate(whole.model_dump()), whole
+
+    @override
+    def stream_without_its_terminal_event(self) -> AdapterStream:
+        """Return a stream whose accumulated message ends with no stop reason."""
+        return _anthropic_stream([_text_delta_event("he", 0)], _message_snapshot(None))
+
+    @override
+    def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
+        """Return the adapter's whole exception table.
+
+        Each status code is the one the SDK raises that class for, read from anthropic 0.120.0;
+        the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
+        which is why the adapter reads the status rather than the exception class.
+        OverloadedError is anthropic's own overload signal and shares rate_limit with RateLimitError.
+        APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
+        isinstance, and RetryableError carries no response at all.
+        x-should-retry overrides the status in both directions, except on a rate-limit status, which
+        stays rate_limit whatever the header says, so the limiter's account-wide pause is still
+        armed, and on a 4xx marked final, which keeps the rejection name.
+        A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the
+        provider marked final lands on declared_final; each fails the one item without a retry.
+        """
+        return {
+            _status_error(anthropic.RateLimitError, 429): "rate_limit",
+            _status_error(anthropic.OverloadedError, 529): "rate_limit",
+            _status_error(anthropic.InternalServerError, 500): "transient",
+            _connection_error(): "transient",
+            anthropic.APITimeoutError(
+                httpx.Request("POST", "https://api.anthropic.com")
+            ): "transient",
+            _status_error(anthropic.ConflictError, 409): "transient",
+            anthropic.RetryableError("middleware said retry"): "transient",
+            _status_error(anthropic.BadRequestError, 400): "invalid_request",
+            _status_error(anthropic.AuthenticationError, 401): "invalid_request",
+            _status_error(anthropic.PermissionDeniedError, 403): "invalid_request",
+            _status_error(anthropic.NotFoundError, 404): "invalid_request",
+            _status_error(anthropic.RequestTooLargeError, 413): "invalid_request",
+            _status_error(anthropic.UnprocessableEntityError, 422): "invalid_request",
+            _status_error(anthropic.APIStatusError, 402): "invalid_request",
+            _status_error(anthropic.APIStatusError, 408): "transient",
+            _status_error(anthropic.InternalServerError, 503): "transient",
+            _status_error(anthropic.APIStatusError, 302): "unknown_exception",
+            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "true"}): "transient",
+            _status_error(
+                anthropic.BadRequestError, 400, {"x-should-retry": "false"}
+            ): "invalid_request",
+            _status_error(
+                anthropic.InternalServerError, 500, {"x-should-retry": "false"}
+            ): "declared_final",
+            _status_error(
+                anthropic.RateLimitError, 429, {"x-should-retry": "false"}
+            ): "rate_limit",
+            _status_error(anthropic.RateLimitError, 429, {"x-should-retry": "true"}): "rate_limit",
+            ValueError("boom"): "unknown_exception",
+        }

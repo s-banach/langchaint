@@ -13,7 +13,7 @@ generous enough that none of them normally expires.
 import asyncio
 from time import monotonic
 
-from langchaint import BoundLLM, GenerationError, Message, Response, to_tables
+from langchaint import BoundLLM, GenerationError, GenerationInput, Response, to_tables
 from langchaint.anthropic import anthropic_model
 
 _CHAIN_BUDGET_SECONDS = 60.0
@@ -34,7 +34,7 @@ async def one_call(summarizer: BoundLLM[str]) -> str | None:
     return response.output
 
 
-async def one_batch(summarizer: BoundLLM[str], conversations: list[str | list[Message]]) -> None:
+async def one_batch(summarizer: BoundLLM[str], generation_inputs: list[GenerationInput]) -> None:
     """Give every item its own thirty seconds.
 
     The deadline starts when that item starts, not when the batch does, and generate_many raises
@@ -42,7 +42,7 @@ async def one_batch(summarizer: BoundLLM[str], conversations: list[str | list[Me
     on. A batch wider than max_in_flight can spend a queued item's whole deadline behind its
     siblings; that item reports attempts 0, which is how its row says it never sent.
     """
-    results = await summarizer.generate_many(conversations, timeout_seconds=30)
+    results = await summarizer.generate_many(generation_inputs, timeout_seconds=30)
     calls, _ = to_tables(results)
     for row in calls:
         print(

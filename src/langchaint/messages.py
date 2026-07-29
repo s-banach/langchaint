@@ -1,7 +1,7 @@
 """Provider-neutral messages and content parts.
 
 Messages carry no provider knowledge;
-adapters convert whole conversations to wire shapes because conversion depends on the full sequence,
+adapters convert a whole Sequence[Message] to wire shapes because conversion depends on the full sequence,
 not on one message at a time.
 The system prompt is a generate-method parameter, not a message type,
 because providers place it in different request locations.
@@ -21,7 +21,7 @@ class TextPart(CheckedCopyModel):
     cache_breakpoint True marks the exact end of a reusable prompt prefix:
     everything from the start of the request through this part is the span the provider may cache.
     The adapters map it to anthropic's block-level cache_control and openai's part-level prompt_cache_breakpoint.
-    Only the latest marks become cache writes, so a conversation that accrues one mark per turn
+    Only the latest marks become cache writes, so a Sequence[Message] that accrues one mark per turn
     keeps working as it grows: each adapter's docstring states the per-request write limit and
     whether the adapter or the API is what applies it.
     """
@@ -85,10 +85,11 @@ class UserMessage(CheckedCopyModel):
     """One user turn; content is plain text or a tuple of parts.
 
     kind discriminates the Message union,
-    so a persisted conversation re-validates to the same message types by construction instead of by union member order.
+    so a persisted Sequence[Message] re-validates to the same message types by construction
+    instead of by union member order.
 
     content is keyword-only, as on every model here; CheckedCopyModel's module docstring says why a
-    positional UserMessage("Hello") is rejected. A conversation that is one user turn goes to
+    positional UserMessage("Hello") is rejected. A Sequence[Message] that is one user turn goes to
     BoundLLM.generate_one as a bare string, which wraps it in a UserMessage.
 
     Raises:
@@ -112,10 +113,10 @@ class ReasoningTrace(CheckedCopyModel):
     Only the producing provider can accept the dict: replaying it through another provider is a
     malformed request that provider rejects, so switching providers means first rebuilding
     concluded assistant turns without their traces.
-    Full reasoning history is the default and the conversation is the only control surface:
-    trimming is the application's job, done the same way, by rebuilding concluded assistant turns without their traces;
+    Full reasoning history is the default, and editing the Sequence[Message] is the only way to change it:
+    trimming is the application's job, done by rebuilding concluded assistant turns without their traces;
     a turn whose tool calls still await results must keep its reasoning,
-    and there is no bind-time on/off parameter because it would be redundant with editing the conversation.
+    and there is no bind-time on/off parameter because it would be redundant with that edit.
     Beyond replay correctness, keeping traces matters for quality
     (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
     and for prompt caching:
@@ -235,7 +236,7 @@ class ToolMessage(CheckedCopyModel):
 type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="kind")]
 """Discriminated on kind: pydantic validation selects the member from the tag,
 never from which member's fields happen to match,
-so callers can persist a conversation as JSON and re-validate it with a TypeAdapter.
+so callers can persist a Sequence[Message] as JSON and re-validate it with a TypeAdapter.
 """
 
 type StopReason = Literal[
@@ -245,5 +246,5 @@ type StopReason = Literal[
 adapters map unrecognized provider values to "other" so a new provider value cannot break callers.
 context_window_exceeded carries no provider prefix because this vocabulary is langchaint's own;
 it earns a member rather than "other" because it names a terminal condition a caller acts on,
-by shortening the conversation or moving to a model with a larger window.
+by shortening the GenerationInput or moving to a model with a larger window.
 """

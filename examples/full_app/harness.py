@@ -147,14 +147,14 @@ def _tag_of(binding: Binding) -> str:
 
 @dataclass(frozen=True, kw_only=True)
 class _ScriptedRequest(RequestParams):
-    """What a scripted send would have put on the wire, which is the conversation and nothing else."""
+    """What a scripted send would have put on the wire, which is the messages and nothing else."""
 
-    conversation: tuple[Message, ...]
+    messages: tuple[Message, ...]
 
     @override
     def as_json(self) -> str:
-        """Render the conversation as a JSON array of each message's dump."""
-        return json.dumps([message.model_dump(mode="json") for message in self.conversation])
+        """Render the messages as a JSON array of each message's dump."""
+        return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
 class _ScriptedBoundAdapter(BoundAdapter[str]):
@@ -204,9 +204,9 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams:
+    def build_request(self, messages: Sequence[Message]) -> RequestParams:
         """Build the request the scripted sends ignore; the script decides what comes back."""
-        return _ScriptedRequest(conversation=tuple(conversation))
+        return _ScriptedRequest(messages=tuple(messages))
 
     @override
     async def send(self, request: RequestParams) -> FakeRaw:

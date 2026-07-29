@@ -139,7 +139,7 @@ class LlmCallAbandoned:
     The request may have completed and billed server-side beyond what the provider had reported
     when the deadline hit, and that remainder is unobservable client-side. The TimedOutError
     on the run's turn_log records the drop, and usage_so_far gains what it accounts for.
-    turn_number is the turn whose call was dropped; the next turn resends from the same conversation,
+    turn_number is the turn whose call was dropped; the next turn resends from the same messages,
     which the dropped call left untouched.
     """
 

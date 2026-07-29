@@ -1,6 +1,6 @@
 """The kind discriminator on the Message, Part, and TurnElement unions.
 
-Persist/resume serializes a conversation with a TypeAdapter and re-validates it,
+Persist/resume serializes a Sequence[Message] with a TypeAdapter and re-validates it,
 so a payload that re-validates to the wrong union member silently corrupts replay.
 Every member carries a kind tag, and a payload without one is rejected rather than matched by shape.
 """
@@ -19,7 +19,7 @@ from langchaint import (
     UserMessage,
 )
 
-_CONVERSATION_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
+_MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
 def test_turn_elements_validate_to_the_member_their_tag_names() -> None:
@@ -79,7 +79,7 @@ def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> Non
 def test_validation_without_a_kind_tag_is_rejected() -> None:
     """A message payload missing kind fails validation, proving the discriminator is engaged."""
     with pytest.raises(ValidationError):
-        _CONVERSATION_TYPE_ADAPTER.validate_python([{"content": "hi"}])
+        _MESSAGES_TYPE_ADAPTER.validate_python([{"content": "hi"}])
 
 
 def test_string_turn_coercion() -> None:
@@ -129,7 +129,7 @@ def test_tool_message_is_frozen() -> None:
 
 def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
     """A marked part survives the JSON round trip; an unmarked part re-validates with the default."""
-    conversation: tuple[Message, ...] = (
+    messages: tuple[Message, ...] = (
         UserMessage(
             content=(
                 TextPart(text="shared context", cache_breakpoint=True),
@@ -141,10 +141,8 @@ def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
             content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),),
         ),
     )
-    restored = _CONVERSATION_TYPE_ADAPTER.validate_json(
-        _CONVERSATION_TYPE_ADAPTER.dump_json(conversation)
-    )
-    assert restored == conversation
+    restored = _MESSAGES_TYPE_ADAPTER.validate_json(_MESSAGES_TYPE_ADAPTER.dump_json(messages))
+    assert restored == messages
     restored_user = restored[0]
     assert isinstance(restored_user, UserMessage)
     assert isinstance(restored_user.content, tuple)

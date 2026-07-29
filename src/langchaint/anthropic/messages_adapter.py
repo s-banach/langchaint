@@ -25,7 +25,7 @@ It rejects consecutive thinking blocks re-sent out of their emission order, whic
 Cache breakpoints: with automatic_prompt_caching bound True,
 the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
 or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,
-so the cached span grows with the conversation.
+so the cached span grows with the Sequence[Message].
 Bound False, the adapter writes no marker of its own.
 The adapter never sends the API's top-level automatic cache_control request parameter:
 it is unavailable on Bedrock, which this adapter also serves.
@@ -42,7 +42,7 @@ The binding's own markers (marked system parts, the automatic frozen-prefix and 
 spend slots first; a binding whose markers alone exceed the limit fails at bind with ValueError.
 The remainder is the per-request budget for marked message parts:
 the latest marks up to that budget are written and older ones left unwritten,
-mirroring openai's documented latest-N rule so a conversation that accrues one mark per turn keeps working.
+mirroring openai's documented latest-N rule so a Sequence[Message] that accrues one mark per turn keeps working.
 Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
 "1h" writes ttl "1h", whose writes bill at each table's cache_write_1h_usd_per_million_tokens).
 
@@ -332,10 +332,10 @@ class _AnthropicRequestParams(RequestParams):
 
 
 class _NotSendableError(Exception):
-    """A conversation this adapter will not put on the wire, raised by a conversion helper.
+    """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
 
     Never leaves this module: _request_messages turns it into the InvalidRequest that build_request
-    returns. It exists because the conversation is found unsendable several frames below
+    returns. It exists because a Sequence[Message] is found unsendable several frames below
     build_request, in per-part converters whose callers would each have to thread a union outward
     otherwise.
     """
@@ -408,7 +408,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     because the API rejects a tool-use continuation whose latest thinking block was modified.
     A trace another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a conversation replayed through the wrong provider fails loudly;
+    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
     switching providers means first rebuilding concluded assistant turns without their traces.
     An empty TextPart is skipped because the API rejects empty text blocks.
 
@@ -454,7 +454,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
         _NotSendableError: a part other than the message's last sets cache_breakpoint.
             The API accepts such a request, and the enclosing block's marker silently moves the
             boundary to the block's end, so the wire form would not mean what the message says;
-            the adapter reports the conversation InvalidRequest and the item fails its own row.
+            build_request returns InvalidRequest and the item fails its own row.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -472,16 +472,16 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
 
 
 def _wire_messages(
-    conversation: Sequence[Message],
+    messages: Sequence[Message],
     *,
     automatic_prompt_caching: bool,
     cache_ttl: CacheTTL,
     message_mark_budget: int,
 ) -> list[MessageParam]:
-    """Convert a conversation to wire messages.
+    """Convert messages to wire messages.
 
     With automatic_prompt_caching, places the per-request cache breakpoint on the last content block,
-    so the cached span grows with the conversation.
+    so the cached span grows with messages.
     A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
     so that request writes none.
     A part with cache_breakpoint marks its own block in a user message
@@ -504,7 +504,7 @@ def _wire_messages(
             wire.append(("user", list(pending_tool_results)))
             pending_tool_results.clear()
 
-    for message in conversation:
+    for message in messages:
         if isinstance(message, ToolMessage):
             tool_result_block: ToolResultBlockParam = {
                 "type": "tool_result",
@@ -537,17 +537,17 @@ def _wire_messages(
 
 
 def _request_messages(
-    conversation: Sequence[Message], request: _AnthropicRequest
+    messages: Sequence[Message], request: _AnthropicRequest
 ) -> list[MessageParam] | InvalidRequest:
-    """Convert a conversation under this request's caching parameters, or report it unsendable.
+    """Convert messages under this request's caching parameters, or report them unsendable.
 
-    The one place a conversation this adapter will not put on the wire becomes an InvalidRequest.
+    The one place a Sequence[Message] this adapter will not put on the wire becomes an InvalidRequest.
     An unparseable tool_call.args_json is one of those: the wire block holds the parsed arguments,
     so text that is not JSON has no block to go in.
     """
     try:
         return _wire_messages(
-            conversation,
+            messages,
             automatic_prompt_caching=request.automatic_prompt_caching,
             cache_ttl=request.cache_ttl,
             message_mark_budget=request.message_mark_budget,
@@ -1133,12 +1133,12 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
         return _identity_from_message(raw)
 
     @override
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Convert the conversation under the binding's precomputed fields."""
-        messages = _request_messages(conversation, self._request)
-        if isinstance(messages, InvalidRequest):
-            return messages
-        return _AnthropicRequestParams(precomputed=self._request, messages=messages)
+    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+        """Convert messages under the binding's precomputed fields."""
+        wire_messages = _request_messages(messages, self._request)
+        if isinstance(wire_messages, InvalidRequest):
+            return wire_messages
+        return _AnthropicRequestParams(precomputed=self._request, messages=wire_messages)
 
     @override
     async def send(self, request: RequestParams) -> anthropic.types.Message:

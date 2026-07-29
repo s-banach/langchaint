@@ -21,7 +21,7 @@ async def plain_text() -> None:
     openai_model reads OPENAI_API_KEY from the environment and returns an LLM.
     Swapping providers is one import: anthropic_model("claude-sonnet-5") returns an LLM with the same surface.
     bind() with no response_format returns BoundLLM[str], so response.output is the assistant text.
-    A bare str is shorthand for a conversation of one user turn holding that text.
+    A bare str is shorthand for a Sequence[Message] of one user turn holding that text.
     automatic_prompt_caching is required on every bind with no default, because caching changes billing;
     these one-shot prompts reuse no prefix, so False. 02_tool_loop.py shows the case where True pays.
     """

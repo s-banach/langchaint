@@ -44,7 +44,7 @@ class Response[OutputT](_CallCarrier):
     Every attempt record but the last failed and the last succeeded.
     assistant_message is the adapter-built turn exactly as the provider produced it,
     the whole ordered turn (reasoning, text, and tool calls in emission order),
-    held by reference for appending to a conversation.
+    held by reference for appending to a Sequence[Message].
     Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
     and is the rewrap this field exists to prevent.
     The last attempt record holds the same object, because the record is where every attempt's turn
@@ -178,7 +178,7 @@ def _call_row(*, call_id: int, result: CallResult[object]) -> dict[str, RowValue
     output is the parsed result, None on a failure and None on the tool-call turn of a structured
     tool-bound binding, which stop_reason "tool_use" tells apart.
     request_json is what every attempt of a failed call sent, rendered as a JSON object. It is None
-    on a success, whose request is reconstructible from the conversation and the binding the caller
+    on a success, whose request is reconstructible from the Sequence[Message] and the binding the caller
     still holds, and None on a failure the adapter declared before building a request.
     It holds the whole prompt, so a caller writing this table somewhere the outputs may not go drops
     the column.

@@ -294,7 +294,7 @@ class _EmptyTurnStream(_FakeStream):
 
 
 class _ContextWindowExceededStream(_FakeStream):
-    """A stream whose assembled response reports the conversation overflowed the context window."""
+    """A stream whose assembled response reports the request overflowed the context window."""
 
     @override
     def scripted_response(self) -> _ScriptedResponse:
@@ -538,21 +538,21 @@ type _ScriptedSend = Exception | _ScriptedResponse
 
 The two exist because the adapter contract splits that way: an attempt with no response to read is
 an exception for Adapter.classify, and a response is what send returns and interpret then reads.
-A conversation the fake will not put on the wire is its invalid_request, which build_request reports
+A Sequence[Message] the fake will not put on the wire is its invalid_request, which build_request reports
 before any send.
 """
 
 
 @dataclass(frozen=True, kw_only=True)
 class _FakeRequest(RequestParams):
-    """What the fake would put on the wire, which is the conversation and nothing else."""
+    """What the fake would put on the wire, which is the messages and nothing else."""
 
-    conversation: tuple[Message, ...]
+    messages: tuple[Message, ...]
 
     @override
     def as_json(self) -> str:
-        """Render the conversation as a JSON array of each message's dump."""
-        return json.dumps([message.model_dump(mode="json") for message in self.conversation])
+        """Render the messages as a JSON array of each message's dump."""
+        return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
 def _as_fake_request(request: RequestParams) -> _FakeRequest:
@@ -631,12 +631,12 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         return self._scripted_by_raw_id[_as_fake_raw(raw).id].outcome
 
     @override
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Report the scripted refusal, else carry the conversation into the request."""
+    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+        """Report the scripted refusal, else carry messages into the request."""
         if self._invalid_requests:
             return self._invalid_requests.pop(0)
         self.build_count += 1
-        return _FakeRequest(conversation=tuple(conversation))
+        return _FakeRequest(messages=tuple(messages))
 
     @override
     async def send(self, request: RequestParams) -> BaseModel:
@@ -645,7 +645,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         Raises:
             TypeError: request is not a _FakeRequest.
         """
-        conversation = _as_fake_request(request).conversation
+        messages = _as_fake_request(request).messages
         self.send_count += 1
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -665,7 +665,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
                 self._scripted_by_raw_id[raw.id] = scripted
                 self.sent_raws.append(raw)
                 return raw
-            first = conversation[0]
+            first = messages[0]
             content = (
                 first.content
                 if self._echo and isinstance(first, UserMessage) and isinstance(first.content, str)
@@ -720,7 +720,7 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
         raise NotImplementedError
 
     @override
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams:
+    def build_request(self, messages: Sequence[Message]) -> RequestParams:
         """Unreachable: response_format rebind tests do not generate."""
         raise NotImplementedError
 
@@ -1079,7 +1079,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_conversation_build_request_refuses_fails_the_item_with_nothing_sent() -> None:
+def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> None:
     """An InvalidRequest from build_request fails the item before any request goes out.
 
     classify returns "transient" here and is never reached: a returned outcome is not an exception,
@@ -1163,7 +1163,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
         assert rejected_record.usage == ZERO_USAGE
         assert rejected_record.raw is None
         assert isinstance(classified.value.__cause__, ValueError)
-        assert classified.value.request == _FakeRequest(conversation=(UserMessage(content="hi"),))
+        assert classified.value.request == _FakeRequest(messages=(UserMessage(content="hi"),))
 
     asyncio.run(scenario())
 
@@ -1718,10 +1718,10 @@ def test_automatic_prompt_caching_participates_in_binding_equality() -> None:
 
 
 def test_generate_many_aligns_results_with_inputs() -> None:
-    """Result i belongs to conversations[i], preserving input order."""
+    """Result i belongs to generation_inputs[i], preserving input order."""
 
     async def scenario() -> None:
-        """Run a two-item batch whose fake echoes each conversation's first turn."""
+        """Run a two-item batch whose fake echoes each item's first turn."""
         adapter = _FakeAdapter(echo=True)
         bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
@@ -1789,7 +1789,7 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
 def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -> None:
     """A rejected item comes back as its InvalidRequestError row; the sibling still succeeds.
 
-    Nothing a single item does reaches a sibling, so the batch returns one outcome per conversation.
+    Nothing a single item does reaches a sibling, so the batch returns one outcome per generation_input.
     """
 
     async def scenario() -> None:
@@ -1813,7 +1813,7 @@ def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -
 
 
 def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_together() -> None:
-    """warm_cache completes conversations[0] before any sibling starts; the rest run at normal concurrency."""
+    """warm_cache completes generation_inputs[0] before any sibling starts; the rest run at normal concurrency."""
 
     async def scenario() -> None:
         """Run an identical three-item batch on two fresh slow fakes and compare the recorded peaks.
@@ -1822,19 +1822,19 @@ def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_togeth
         the unwarmed control reaches 3, proving warm_cache alone changed the ordering.
         A fresh adapter per run keeps the two peaks independent readings.
         """
-        conversations = [[UserMessage(content=str(index))] for index in range(3)]
+        generation_inputs = [[UserMessage(content=str(index))] for index in range(3)]
         warmed_adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         warmed_bound_llm = LLM(
             warmed_adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)
         ).bind(automatic_prompt_caching=True)
-        warmed = await warmed_bound_llm.generate_many(conversations, warm_cache=True)
+        warmed = await warmed_bound_llm.generate_many(generation_inputs, warm_cache=True)
         assert _batch_outputs(warmed) == ["0", "1", "2"]
         assert warmed_adapter.bound_adapters[0].peak_in_flight == 2
         control_adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         control_bound_llm = LLM(
             control_adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)
         ).bind(automatic_prompt_caching=True)
-        control = await control_bound_llm.generate_many(conversations)
+        control = await control_bound_llm.generate_many(generation_inputs)
         assert _batch_outputs(control) == ["0", "1", "2"]
         assert control_adapter.bound_adapters[0].peak_in_flight == 3
 
@@ -1975,7 +1975,7 @@ def test_a_defect_over_a_staged_response_keeps_the_attempt_and_its_billing() -> 
 
 
 def test_bare_str_is_shorthand_for_one_user_message() -> None:
-    """A bare str reaches the adapter as a conversation of one UserMessage."""
+    """A bare str reaches the adapter as a Sequence[Message] of one UserMessage."""
 
     async def scenario() -> None:
         """Drive each generate method with a bare str against the echo fake.
@@ -2006,7 +2006,7 @@ def test_generate_many_rejects_a_bare_str_batch() -> None:
         """
         adapter = _FakeAdapter(echo=True)
         bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
-        with pytest.raises(TypeError, match="bare str"):
+        with pytest.raises(TypeError, match="generation_inputs is a bare str"):
             # pyrefly: ignore[no-matching-overload]
             await bound_llm.generate_many("hi")
         assert adapter.bound_adapters[0].send_count == 0
@@ -2015,13 +2015,13 @@ def test_generate_many_rejects_a_bare_str_batch() -> None:
 
 
 def test_stream_one_accepts_a_bare_str() -> None:
-    """stream_one coerces a bare str to a conversation of one UserMessage."""
+    """stream_one coerces a bare str to a Sequence[Message] of one UserMessage."""
 
     async def scenario() -> None:
-        """Build a handle from a bare str and check the stored conversation."""
+        """Build a handle from a bare str and check the stored messages."""
         bound_llm = LLM(_FakeAdapter()).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one("hi") as handle:
-            assert handle._conversation == (UserMessage(content="hi"),)
+            assert handle._messages == (UserMessage(content="hi"),)
             response = await handle.final()
         assert response.output == "ab"
 
@@ -3051,7 +3051,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
 
 
 def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened() -> None:
-    """A conversation build_request refuses fails the item before any stream is opened.
+    """build_request refusing the messages fails the item before any stream is opened.
 
     The handle builds the InvalidRequestError, so a caller reading model or attempt_records off it
     succeeds; it carries no request, there being none to carry.
@@ -3408,8 +3408,8 @@ def test_max_in_flight_bounds_batch_concurrency() -> None:
         bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=2)).bind(
             automatic_prompt_caching=True
         )
-        conversations = [[UserMessage(content=str(index))] for index in range(5)]
-        results = await bound_llm.generate_many(conversations)
+        generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
+        results = await bound_llm.generate_many(generation_inputs)
         assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
         assert adapter.bound_adapters[0].peak_in_flight == 2
 

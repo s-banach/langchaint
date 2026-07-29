@@ -29,7 +29,7 @@ Each agent is constructed from an `AgentConfig` (`config.py`) fixing its `max_tu
 
 Two deadlines apply, and they differ in what a run can do afterwards:
 
-- `timeout_seconds` bounds one provider request, handed to `generate_one` as its own `timeout_seconds`. langchaint owns that scope, so a request that runs out comes back as a `TimedOutError` while the loop is still running: the loop records it and takes its next turn with the same conversation, which the dropped call left untouched.
+- `timeout_seconds` bounds one provider request, handed to `generate_one` as its own `timeout_seconds`. langchaint owns that scope, so a request that runs out comes back as a `TimedOutError` while the loop is still running: the loop records it and takes its next turn with the same `messages`, which the dropped call left untouched.
 - The whole-app deadline is the consumer's, an `asyncio.timeout` around `await app.run()`. It cancels, so nothing continues past it.
 
 A run whose every call hangs is bounded by `max_turns`.
@@ -90,7 +90,7 @@ right in its `except` with no settling step: cancelling a task it does not await
 as that task having unwound.
 
 **The state that matters must not live in a coroutine frame.** A timeout cancels the frame; anything
-local to it is gone. The conversation, the counters and the turn records live on the `AgentRun` object;
+local to it is gone. The `messages`, the counters and the turn records live on the `AgentRun` object;
 the answer and the failure ride `final()`'s return and raise, which the caller is awaiting.
 
 **Records are written where things happen, and no total is a running sum.** A whole-app
@@ -114,7 +114,7 @@ covers only the calls that settled, so no index lines up), and re-raises.
 
 **A sub-agent failure should be data, not an exception.** `delegate` catches and returns an `is_error`
 tool message. The parent model reads it and adapts, and in `subagent_error` the parent still produces a
-correct final answer. The catch decides the conversation only: the spend was recorded as it happened, so
+correct final answer. The catch decides the `messages` only: the spend was recorded as it happened, so
 deleting the `except` would cost an answer, never a record.
 
 **OTel tracing needs a span the app owns.** langchaint spans one generate call and one tool dispatch and

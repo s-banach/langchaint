@@ -40,7 +40,7 @@ from langchaint.exceptions import (
     UnknownExceptionError,
 )
 from langchaint.inference_params import InferenceParams, ReasoningEffort
-from langchaint.llm import LLM, BoundLLM, HasTools, NoTools
+from langchaint.llm import LLM, BoundLLM, GenerationInput, HasTools, NoTools
 from langchaint.messages import (
     AssistantMessage,
     ImagePart,
@@ -108,6 +108,7 @@ __all__ = [
     "EmptyTurnError",
     "EscapedExceptionError",
     "GenerationError",
+    "GenerationInput",
     "HasTools",
     "ImagePart",
     "InferenceParams",

@@ -8,7 +8,7 @@ No item's failure cancels a sibling: a non-retriable outcome fails the one item 
 GenerationError says which of its subclasses each generate method delivers.
 There is no error that dooms a whole batch, because langchaint cannot tell one apart from
 an item's own rejection: a provider states a status, never whether the binding or this one
-conversation caused it. A binding defect langchaint can detect raises at construction or
+request caused it. A binding defect langchaint can detect raises at construction or
 bind time instead, before any request is sent.
 
 TransientError is a per-attempt control signal between an adapter and a retry loop, raised to no
@@ -107,7 +107,7 @@ class GenerationError(_CallCarrier, Exception):
     EmptyTurnError (the model finished the turn and produced nothing),
     SchemaViolationError (the model finished the turn and its text is not an instance of the
     bound response_format),
-    ContextWindowExceededError (the conversation overflowed the model's context window),
+    ContextWindowExceededError (the request overflowed the model's context window),
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     ProviderFailedTerminallyError (the 200's body reports that generating the response failed),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending),
@@ -125,10 +125,10 @@ class GenerationError(_CallCarrier, Exception):
     and elapsed_seconds read off it, and with stop_reason they mirror the fields a success Response carries
     so to_tables fills the same columns from either.
     request is what every attempt of the call sent, which is what someone reading a failure asks for
-    next. None where no request is in scope to carry: where the adapter reported the conversation
+    next. None where no request is in scope to carry: where build_request returned
     InvalidRequest, having built none, on EscapedExceptionError, whose exception can come from
     anywhere, and on AbandonedCallError, a cancellation being nobody's request defect.
-    No success carries one: build_request is a function of the conversation and the binding the
+    No success carries one: build_request is a function of the Sequence[Message] and the binding the
     caller still holds, so a call that came back is reconstructible without archiving what it sent.
     It holds the whole prompt, so it stays off error_text and __str__.
     usage (carrying cost_in_usd) is the paid total summed from the records
@@ -242,7 +242,7 @@ class RetryUnavailableError(GenerationError):
     one an item pull raised after the caller already held part of the turn, and one the assembled
     response reported, which arrives when the stream is already over. Either ends the call whatever
     the retry budget still holds. A stream that failed before its first item is reopened instead,
-    under that budget. Reopen after this error by calling stream_one again with the same conversation.
+    under that budget. Reopen after this error by calling stream_one again with the same GenerationInput.
 
     The failure itself is the TransientError on the last attempt record, and is __cause__ as well:
     it carries the adapter's own message, retry_after_seconds, and is_rate_limit.
@@ -355,10 +355,10 @@ class SchemaViolationError(GenerationError):
 
 
 class ContextWindowExceededError(GenerationError):
-    """The conversation overflowed the model's context window.
+    """The request overflowed the model's context window.
 
-    Not retried: the same conversation overflows identically on every attempt.
-    The fix is a shorter conversation or a model with a larger window.
+    Not retried: the same request overflows identically on every attempt.
+    The fix is a shorter GenerationInput or a model with a larger window.
     """
 
     @property
@@ -369,7 +369,7 @@ class ContextWindowExceededError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        return "the conversation exceeded the model's context window"
+        return "the request exceeded the model's context window"
 
 
 class UnfinishedTurnError(GenerationError):
@@ -424,12 +424,12 @@ class InvalidRequestError(GenerationError):
 
     Two sources, both meaning the request as sent (or as it would have been sent) is not acceptable:
     the provider's own rejection, which Adapter.classify returns "invalid_request" for, and
-    build_request reporting the conversation InvalidRequest, because it cannot be put on the wire
-    with the meaning the message states.
+    build_request returning InvalidRequest, because the messages cannot be put on the wire
+    with the meaning they state.
     Not retried: the same request would be rejected the same way.
     request is None on the second source, where none was built, and holds what went out on the first.
 
-    The provider's rejection is every 4xx the retry policy declines, not only a rejected conversation.
+    The provider's rejection is every 4xx the retry policy declines, not only a rejected GenerationInput.
     A bad API key, a permission failure, and an unknown model id land here too.
     A caller separating them reads status_code off __cause__, which holds the exception classify saw.
     Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.120.0, openai 2.45.0).

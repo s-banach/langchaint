@@ -25,9 +25,9 @@ call's record.
 Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
 (system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
 to precomputed SDK keyword arguments once;
-`BoundAdapter.build_request` adds the per-call conversation to them, and `send` and `open_stream`
+`BoundAdapter.build_request` adds the per-call `messages` to them, and `send` and `open_stream`
 take the `RequestParams` it built, so every attempt of one call sends the same request and a
-conversation the adapter will not put on the wire is found before the first attempt.
+`Sequence[Message]` the adapter will not put on the wire is found before the first attempt.
 The split into two bind methods is what fixes the output type at bind time:
 each method is monomorphic in its output type, so no sentinel value has to imply a type downstream.
 """
@@ -205,7 +205,7 @@ class Binding:
     """The frozen prefix of one BoundLLM, in langchaint terms only.
 
     Every field here determines the provider's cacheable prompt prefix or is fixed per binding by design;
-    per-request data is the conversation argument of the BoundAdapter methods, nothing else.
+    per-request data is the messages argument of the BoundAdapter methods, nothing else.
     """
 
     system_prompt: str | tuple[TextPart, ...] | None
@@ -213,7 +213,7 @@ class Binding:
 
     The parts form exists to carry cache_breakpoint marks inside the system prompt:
     the anthropic adapter renders one system text block per part,
-    and the openai adapter sends the parts as a developer-role input message ahead of the conversation
+    and the openai adapter sends the parts as a developer-role input message ahead of the Sequence[Message]
     (the SDK documents `instructions` as "a system (or developer) message inserted into the model's context",
     and only input message parts carry prompt_cache_breakpoint).
     A plain str renders as one anthropic system block and as the openai instructions parameter.
@@ -230,7 +230,7 @@ class Binding:
     the openai adapter leaves the provider's implicit caching in place.
     False: the anthropic adapter writes no breakpoints of its own,
     and the openai adapter requests explicit-mode caching with no breakpoints,
-    so a conversation without marked parts caches nothing and pays no cache writes.
+    so a Sequence[Message] without marked parts caches nothing and pays no cache writes.
     Under either value, a part with cache_breakpoint True adds a breakpoint at exactly that boundary,
     so False plus marked parts is the fully user-specified caching configuration.
     On openai, False reaches the wire only through an adapter built with supports_prompt_cache_options True,
@@ -253,7 +253,7 @@ class AdapterResult[OutputT]:
     called tools: the calls are on assistant_message, and no failure occurred.
     A turn can both parse an instance and call tools, so tool_calls is what says whether a tool result
     is owed.
-    assistant_message is the full turn including tool calls, for appending to a conversation.
+    assistant_message is the full turn including tool calls, for appending to a Sequence[Message].
     """
 
     output: OutputT
@@ -372,10 +372,10 @@ class EmptyTurn(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class ContextWindowExceeded(NoOutput):
-    """A 200 reporting that the conversation overflowed the model's context window.
+    """A 200 reporting that the request overflowed the model's context window.
 
     The retry loop records the attempt and fails the item with a ContextWindowExceededError, without
-    retrying: the same conversation overflows identically every time.
+    retrying: the same request overflows identically every time.
     """
 
     kind: Literal["context_window_exceeded"] = "context_window_exceeded"
@@ -398,7 +398,7 @@ class UnfinishedTurn(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class InvalidRequest:
-    """A conversation the adapter will not put on the wire; nothing was sent.
+    """A Sequence[Message] the adapter will not put on the wire; nothing was sent.
 
     Raised by no one and billed by no one: the retry loop records no attempt and fails the item with
     an InvalidRequestError. reason states what cannot be sent, and becomes that error's message.
@@ -558,15 +558,15 @@ class BoundAdapter[OutputT](ABC):
     """One adapter bound to a frozen prefix.
 
     Constructed by Adapter.bind_text or Adapter.bind_structured, which precompute the SDK keyword arguments once;
-    build_request adds the per-request conversation, and send and open_stream take what it built.
+    build_request adds the per-request messages, and send and open_stream take what it built.
     """
 
     @abstractmethod
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Convert the conversation and the binding into the request every attempt of this call sends.
+    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+        """Convert messages and the binding into the request every attempt of this call sends.
 
-        Called once per call, before the first attempt, so a conversation the adapter will not put on
-        the wire is found without a request going out and without a retry budget being spent on it.
+        Called once per call, before the first attempt, so messages the adapter will not put on
+        the wire are found without a request going out and without a retry budget being spent on it.
         Returns InvalidRequest with the reason in that case. No I/O.
         """
         ...
@@ -755,7 +755,7 @@ class Adapter(ABC):
         """Classify an exception raised by send, open_stream, or a stream's items().
 
         Every classification fails at most its own item.
-        A provider states a status, never whether the binding or this one conversation caused it.
+        A provider states a status, never whether the binding or this one request caused it.
         A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
         Anything the adapter cannot place must map to "unknown_exception",
         which fails the one item without a retry, so bugs surface without being retried silently.

@@ -2,7 +2,7 @@
 
 Construction and validation are covered by extra="forbid", which the hook below requires of every
 subclass: pydantic's "ignore" default would drop a misspelled field name silently, leaving an object
-without the value its caller supplied. The cost is that a conversation written by a newer langchaint
+without the value its caller supplied. The cost is that a Sequence[Message] written by a newer langchaint
 raises when an older one loads it, instead of the added field being discarded.
 The hook also rejects a subclass that defines __init__, so every model here keeps pydantic's
 generated keyword-only constructor and one error shape. A positional constructor, the custom

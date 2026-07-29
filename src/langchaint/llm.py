@@ -4,7 +4,7 @@ LLM composes an adapter and a RateLimiter.
 LLM has no generate methods.
 bind() freezes everything that determines the cacheable prompt prefix,
 fixes the output type, and precomputes SDK keyword arguments once;
-the returned BoundLLM takes only the per-request conversation.
+the returned BoundLLM takes only the per-request GenerationInput.
 There are no per-call parameter overrides; changing parameters is rebind().
 The RateLimiter slot gates every request start on every path, retries included;
 the retry loop feeds every failure and every success back
@@ -74,16 +74,20 @@ class Unchanged:
 UNCHANGED = Unchanged()
 
 
+type GenerationInput = str | Sequence[Message]
+"""What one request is generated from: a bare str is shorthand for a Sequence[Message] of one UserMessage."""
+
+
 class SequenceNotStr[T_co](Protocol):
     """A Sequence that a type checker rejects a bare str for.
 
-    str satisfies Sequence[str | Sequence[Message]] (a str is a sequence of str),
+    str satisfies Sequence[GenerationInput] (a str is a sequence of str),
     so a plain Sequence batch parameter statically accepts generate_many("hi"),
     which would run one request per character.
     This protocol structurally matches list and tuple but not str,
     because typeshed's str.__contains__ accepts only str while the protocol requires __contains__(value: object).
     Being covariant, it also accepts a caller's list[str] or list[list[UserMessage]],
-    which the invariant list[str | Sequence[Message]] would reject.
+    which the invariant list[GenerationInput] would reject.
     Same shape as openai._types.SequenceNotStr, originally from the useful_types library;
     index() and count() are omitted deliberately, matching it.
     If typeshed ever widens str.__contains__,
@@ -111,26 +115,26 @@ class SequenceNotStr[T_co](Protocol):
         ...
 
 
-def _reject_bare_str_batch(conversations: SequenceNotStr[str | Sequence[Message]]) -> None:
+def _reject_bare_str_batch(generation_inputs: SequenceNotStr[GenerationInput]) -> None:
     """Reject a bare str passed as the whole batch.
 
     The SequenceNotStr parameter type makes the type checker reject a bare str;
     this runtime guard is the backstop for untyped callers.
 
     Raises:
-        TypeError: conversations is a bare str.
+        TypeError: generation_inputs is a bare str.
     """
-    if isinstance(conversations, str):
+    if isinstance(generation_inputs, str):
         raise TypeError(
-            "conversations is a bare str; wrap it in a list, or use generate_one"
-            " for a single conversation"
+            "generation_inputs is a bare str; wrap it in a list, or use generate_one"
+            " for a single generation_input"
         )
 
 
-def _as_conversation(conversation: str | Sequence[Message]) -> Sequence[Message]:
-    if isinstance(conversation, str):
-        return (UserMessage(content=conversation),)
-    return conversation
+def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
+    if isinstance(generation_input, str):
+        return (UserMessage(content=generation_input),)
+    return generation_input
 
 
 def _build_binding(
@@ -210,7 +214,7 @@ class GenerateItem[OutputT](Protocol):
     """
 
     async def __call__(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None
     ) -> Response[OutputT | None]:
         """Run the call, raising its GenerationError rather than returning it.
 
@@ -645,7 +649,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     async def _generate_with_retries(
         self,
-        conversation: Sequence[Message],
+        messages: Sequence[Message],
         *,
         ledger: _CallLedger,
         timeout_seconds: float | None,
@@ -680,7 +684,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         so a slow request is distinguishable from time spent rate limited.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation as InvalidRequest, or classified
+            InvalidRequestError: build_request returned InvalidRequest, or the adapter classified
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
             ProviderDeclaredFinalError: the adapter classified an attempt's error as one the provider
                 declared final; terminal for this item, without a retry.
@@ -709,14 +713,14 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         timeout_scope = asyncio.timeout(timeout_seconds)
         try:
             async with timeout_scope:
-                return await self._attempt_until_budget_runs_out(conversation, ledger=ledger)
+                return await self._attempt_until_budget_runs_out(messages, ledger=ledger)
         except TimeoutError:
             if not timeout_scope.expired():
                 raise
             raise _abandoned_call_error(TimedOutError, ledger) from None
 
     async def _attempt_until_budget_runs_out(
-        self, conversation: Sequence[Message], *, ledger: _CallLedger
+        self, messages: Sequence[Message], *, ledger: _CallLedger
     ) -> Response[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
 
@@ -726,7 +730,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             GenerationError: every failure _generate_with_retries names but TimedOutError, which its
                 scope raises.
         """
-        built = self._bound_adapter.build_request(conversation)
+        built = self._bound_adapter.build_request(messages)
         if isinstance(built, InvalidRequest):
             raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
         request = built
@@ -824,33 +828,32 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_one(
         self: "BoundLLM[str, ToolsT]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[OutputT, HasTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[OutputT, NoTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT]: ...
     async def generate_one(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> Response[Any]:
         """Generate one response under the retry loop.
 
         output is None only on a structured tool-bound binding, where the turn parsed no instance;
         the overloads type it away everywhere else, a text turn's output being "" and not None.
         Response.output states what a None means and what to branch on for a pending tool call.
-        A bare str is shorthand for a conversation of one UserMessage holding that text.
         Every non-success outcome propagates, all of them sharing the GenerationError base a caller
         can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
         rejected request, ProviderDeclaredFinalError or UnknownExceptionError on an error the adapter
@@ -870,10 +873,12 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         Raises:
             asyncio.CancelledError: an outer scope cancelled this call.
         """
-        return await self._generate_one_any_binding(conversation, timeout_seconds=timeout_seconds)
+        return await self._generate_one_any_binding(
+            generation_input, timeout_seconds=timeout_seconds
+        )
 
     async def _generate_one_any_binding(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None
     ) -> Response[OutputT | None]:
         """Run one call under a ledger of its own, reporting every Exception as its failure.
 
@@ -894,7 +899,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
             return await self._generate_with_retries(
-                _as_conversation(conversation), ledger=ledger, timeout_seconds=timeout_seconds
+                _as_messages(generation_input), ledger=ledger, timeout_seconds=timeout_seconds
             )
         except GenerationError:
             raise
@@ -903,7 +908,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     async def _generate_or_failure(
         self,
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         generate_item: "GenerateItem[OutputT]",
         timeout_seconds: float | None,
@@ -918,14 +923,14 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
             BaseException: whatever cut the item off, propagating unobserved.
         """
         try:
-            return await generate_item(conversation, timeout_seconds=timeout_seconds)
+            return await generate_item(generation_input, timeout_seconds=timeout_seconds)
         except GenerationError as failure:
             return failure
 
     @overload
     async def generate_many(
         self: "BoundLLM[str, ToolsT]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
@@ -933,7 +938,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, HasTools]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
@@ -941,22 +946,21 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, NoTools]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         timeout_seconds: float | None = None,
     ) -> list[CallResult[Any]]:
-        """Order-aligned batch: result i belongs to conversations[i].
+        """Order-aligned batch: result i belongs to generation_inputs[i].
 
         A Response's output is typed the way generate_one types it, per binding.
-        Each conversation may be a bare str, shorthand for a conversation of one UserMessage holding that text.
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
         Every item ends in its own slot: a Response, or the GenerationError it failed with
@@ -967,7 +971,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         Concurrency is bounded by rate_limiter.max_in_flight,
         which gates every request start and is shared with everything else using the same RateLimiter instance.
 
-        warm_cache runs conversations[0] to completion before starting the rest,
+        warm_cache runs generation_inputs[0] to completion before starting the rest,
         because a provider cache entry is readable only after the response that writes it begins,
         so a batch sharing a cached prefix otherwise pays one cold cache write per in-flight item.
         It costs one item of serial latency and warms unconditionally,
@@ -983,13 +987,13 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         settled rows and all, because the list is this frame's and the frame is what unwinds.
 
         Raises:
-            TypeError: conversations is a bare str (from _reject_bare_str_batch).
+            TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
                 does not catch; _gather cancels the remaining items and it propagates.
         """
         return await self._generate_many_any_binding(
-            conversations,
+            generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
             timeout_seconds=timeout_seconds,
@@ -997,7 +1001,7 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
 
     async def _generate_many_any_binding(
         self,
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool,
         generate_item: "GenerateItem[OutputT]",
@@ -1010,34 +1014,34 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         timeout_seconds is each item's own deadline, started when that item starts.
 
         Raises:
-            TypeError: conversations is a bare str (from _reject_bare_str_batch).
+            TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception; _gather cancels
                 the remaining items and it propagates.
         """
-        _reject_bare_str_batch(conversations)
+        _reject_bare_str_batch(generation_inputs)
         # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
-        if warm_cache and conversations:
+        if warm_cache and generation_inputs:
             first_result = await self._generate_or_failure(
-                conversations[0],
+                generation_inputs[0],
                 generate_item=generate_item,
                 timeout_seconds=timeout_seconds,
             )
             rest = await self._gather(
-                conversations[1:],
+                generation_inputs[1:],
                 generate_item=generate_item,
                 timeout_seconds=timeout_seconds,
             )
             return [first_result, *rest]
         return await self._gather(
-            conversations[0:],
+            generation_inputs[0:],
             generate_item=generate_item,
             timeout_seconds=timeout_seconds,
         )
 
     async def _gather(
         self,
-        conversations: Sequence[str | Sequence[Message]],
+        generation_inputs: Sequence[GenerationInput],
         *,
         generate_item: "GenerateItem[OutputT]",
         timeout_seconds: float | None,
@@ -1056,12 +1060,12 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         tasks = [
             asyncio.create_task(
                 self._generate_or_failure(
-                    conversation,
+                    generation_input,
                     generate_item=generate_item,
                     timeout_seconds=timeout_seconds,
                 )
             )
-            for conversation in conversations
+            for generation_input in generation_inputs
         ]
         try:
             return list(await asyncio.gather(*tasks))
@@ -1074,31 +1078,30 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     def stream_one(
         self: "BoundLLM[str, ToolsT]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[str]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, HasTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT | None]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, NoTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT]: ...
     def stream_one(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> StreamHandle[Any]:
         """Build the stream handle; entering it with `async with` opens the request.
 
         The handle's final() Response types output the way generate_one types it, per binding.
-        A bare str is shorthand for a conversation of one UserMessage holding that text.
         Sync because nothing suspends until the handle is entered;
         see StreamHandle for the retry, close, deadline, and abandoned contracts.
         timeout_seconds bounds the block from entry until the call concludes, so it covers the open,
@@ -1106,16 +1109,16 @@ class BoundLLM[OutputT, ToolsT = NoTools]:
         here, so a handle held before entering loses none of it. Work the block does after the call
         concludes is the caller's own time.
         """
-        return self._stream_one_any_binding(conversation, timeout_seconds=timeout_seconds)
+        return self._stream_one_any_binding(generation_input, timeout_seconds=timeout_seconds)
 
     def _stream_one_any_binding(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None
     ) -> StreamHandle[OutputT | None]:
         """Build the handle at the widest output type; _generate_one_any_binding says why."""
         return StreamHandle(
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,
-            conversation=_as_conversation(conversation),
+            messages=_as_messages(generation_input),
             rate_limiter=self.rate_limiter,
             timeout_seconds=timeout_seconds,
         )

@@ -500,7 +500,7 @@ def test_to_tables_writes_the_request_a_failed_call_sent_and_nothing_else() -> N
     """A failure's row carries what every attempt of the call sent, rendered by the adapter.
 
     The prompt reaches the table through this column alone: error_summary is the failure's own text,
-    so a caller who drops request_json is left with no conversation content in the calls table.
+    so a caller who drops request_json is left with no message content in the calls table.
     """
     calls, _attempts = to_tables(_failure(attempt_records=(_record(error=TransientError("e1")),)))
     assert calls[0]["request_json"] == json.dumps({"prompt": "the-prompt-text"})
@@ -520,7 +520,7 @@ def test_to_tables_writes_no_request_where_the_call_built_none() -> None:
 def test_a_failures_text_carries_no_part_of_the_request() -> None:
     """error_text and __str__ stay free of the prompt, which the tracing layer writes unconditionally.
 
-    A caller who set capture_message_content False would otherwise find the conversation in a span
+    A caller who set capture_message_content False would otherwise find the GenerationInput in a span
     anyway, through the error's own text.
     """
     failure = _failure(attempt_records=(_record(error=TransientError("e1")),))

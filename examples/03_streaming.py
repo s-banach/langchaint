@@ -67,9 +67,9 @@ async def stream_agent(
     Raises:
         RuntimeError: if the model keeps calling tools for max_turns turns without returning a final answer.
     """
-    conversation: list[Message] = [UserMessage(content=prompt)]
+    messages: list[Message] = [UserMessage(content=prompt)]
     for _ in range(max_turns):
-        handle = bound.stream_one(conversation)
+        handle = bound.stream_one(messages)
         async with handle:
             async for item in handle:
                 match item:
@@ -80,12 +80,12 @@ async def stream_agent(
                     case ToolCall():
                         print(f"\n[calling {item.name}]")
             response = await handle.final()
-        conversation.append(response.assistant_message)
+        messages.append(response.assistant_message)
         if not response.tool_calls:
             return response.output
         for call in response.tool_calls:
             outcome = await tool_manager.dispatch(call)
-            conversation.append(outcome.tool_message)
+            messages.append(outcome.tool_message)
     raise RuntimeError(f"agent did not finish within {max_turns} turns")
 
 

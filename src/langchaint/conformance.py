@@ -143,7 +143,7 @@ class AdapterConformance(ABC):
 
         The one fixture that is not an input: what an adapter puts on the wire has no neutral shape,
         so the author supplies the reader and langchaint supplies the comparison.
-        The request comes from a conversation of one UserMessage followed by the assistant turn
+        The request comes from a Sequence[Message] of one UserMessage followed by the assistant turn
         under test, so everything the user message put on the wire is what to skip past.
         """
         ...

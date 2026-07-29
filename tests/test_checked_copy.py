@@ -154,12 +154,12 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
         ({"kind": "assistant"}, "turn", "missing"),
     ],
 )
-def test_reloading_a_malformed_conversation_locates_the_key_as_a_validation_error(
+def test_reloading_a_malformed_message_locates_the_key_as_a_validation_error(
     payload: dict[str, object], key: str, error_type: str
 ) -> None:
     """A surplus key and a missing field both raise ValidationError naming where they are.
 
-    This is the reload path for a persisted conversation, so one exception type across the tree
+    This is the reload path for a persisted Sequence[Message], so one exception type across the tree
     is what lets an application catch every malformed message with ValidationError and read its
     location. A message model defining its own __init__ breaks both halves: pydantic binds the
     payload to that signature first, and the binding failure is a TypeError naming no location.

@@ -520,7 +520,7 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:
     """Consecutive ToolMessages collapse into one user message of tool_result blocks."""
-    conversation = [
+    messages = [
         UserMessage(content="hi"),
         AssistantMessage(
             turn=(
@@ -532,7 +532,7 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     assert [message["role"] for message in wire] == ["user", "assistant", "user"]
     tool_results = _content_blocks(wire[2])
@@ -543,12 +543,12 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
 
 def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
     """The per-request breakpoint lands on the last block of the last message."""
-    conversation = [
+    messages = [
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
     )
     tool_results = _content_blocks(wire[0])
     assert tool_results[-1]["cache_control"] == {"type": "ephemeral"}
@@ -556,11 +556,11 @@ def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
 
 
 def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
-    """A conversation ending on a thinking block writes no breakpoint that request.
+    """A Sequence[Message] ending on a thinking block writes no breakpoint that request.
 
     The thinking wire params carry no cache_control key, so the marker has nowhere valid to go.
     """
-    conversation = [
+    messages = [
         AssistantMessage(
             turn=(
                 TextPart(text="t"),
@@ -569,19 +569,19 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
         )
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
     )
     assert all("cache_control" not in block for block in _content_blocks(wire[0]))
 
 
 def test_wire_messages_writes_no_breakpoint_when_caching_disabled() -> None:
     """With caching off, no block anywhere carries a cache_control marker."""
-    conversation = [
+    messages = [
         UserMessage(content="hi"),
         ToolMessage(tool_call_id="tu_1", content="r1"),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     assert all(
         "cache_control" not in block for message in wire for block in _content_blocks(message)
@@ -593,14 +593,14 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
 
     A dropped part or a mis-encoded image would change this exact block list.
     """
-    conversation = [
+    messages = [
         ToolMessage(
             tool_call_id="tu_1",
             content=(TextPart(text="saw"), ImagePart(data=b"png", media_type="image/png")),
         )
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["content"] == [
@@ -618,12 +618,12 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
 
 def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -> None:
     """A tool_result image media type outside the accepted set is not sendable."""
-    conversation = [
+    messages = [
         ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
     ]
     with pytest.raises(_NotSendableError, match="image/tiff"):
         _wire_messages(
-            conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+            messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
 
 
@@ -1413,7 +1413,7 @@ def test_bedrock_table_is_total_over_the_bedrock_ids() -> None:
 
 def test_wire_messages_marks_a_marked_user_part() -> None:
     """A user part with cache_breakpoint carries the marker on its own block; unmarked siblings carry none."""
-    conversation = [
+    messages = [
         UserMessage(
             content=(
                 TextPart(text="shared context", cache_breakpoint=True),
@@ -1422,7 +1422,7 @@ def test_wire_messages_marks_a_marked_user_part() -> None:
         ),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     blocks = _content_blocks(wire[0])
     assert blocks[0]["cache_control"] == {"type": "ephemeral"}
@@ -1431,27 +1431,27 @@ def test_wire_messages_marks_a_marked_user_part() -> None:
 
 def test_wire_messages_marks_a_marked_image_part() -> None:
     """An image part with cache_breakpoint carries the marker on its image block."""
-    conversation = [
+    messages = [
         UserMessage(
             content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),)
         ),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part() -> None:
     """A marked last part of a ToolMessage marks the enclosing tool_result block, never a nested block."""
-    conversation = [
+    messages = [
         ToolMessage(
             tool_call_id="tu_1",
             content=(TextPart(text="a"), TextPart(text="b", cache_breakpoint=True)),
         )
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["cache_control"] == {"type": "ephemeral"}
@@ -1460,7 +1460,7 @@ def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part()
 
 def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
     """A marked part before the ToolMessage's last is rejected instead of silently moving the boundary."""
-    conversation = [
+    messages = [
         ToolMessage(
             tool_call_id="tu_1",
             content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
@@ -1468,32 +1468,32 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
     ]
     with pytest.raises(_NotSendableError, match="last part"):
         _wire_messages(
-            conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+            messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
 
 
-def test_build_request_reports_an_unsendable_conversation_as_invalid_request() -> None:
-    """An unsendable conversation reaches build_request's caller as the InvalidRequest arm.
+def test_build_request_reports_an_unsendable_sequence_as_invalid_request() -> None:
+    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest arm.
 
     Nothing is sent: the retry loop takes this answer before its first attempt.
     """
-    conversation = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
-    outcome = _structured_bound().build_request(conversation)
+    messages = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
+    outcome = _structured_bound().build_request(messages)
     assert isinstance(outcome, InvalidRequest)
     assert "image/tiff" in outcome.reason
 
 
 def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> None:
-    """A replayed tool call whose args_json is not JSON is a conversation, not a raise.
+    """A replayed tool call whose args_json is not JSON is an InvalidRequest, not a raise.
 
     args_json is caller data that nothing validates on the way in, so a batch item carrying one must
     fail as its own row rather than escape the retry loop and cancel its siblings.
     """
-    conversation = [
+    messages = [
         AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
         ToolMessage(tool_call_id="c1", content="ok"),
     ]
-    outcome = _structured_bound().build_request(conversation)
+    outcome = _structured_bound().build_request(messages)
     assert isinstance(outcome, InvalidRequest)
     assert "args_json" in outcome.reason
 
@@ -1514,13 +1514,13 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
 
 def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_caching() -> None:
     """Five marks spend the 4-marker request budget on the latest four; the oldest goes unwritten."""
-    conversation = [
+    messages = [
         UserMessage(
             content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(5))
         ),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     blocks = _content_blocks(wire[0])
     assert "cache_control" not in blocks[0]
@@ -1529,14 +1529,14 @@ def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cachi
 
 def test_wire_messages_reserves_two_slots_for_automatic_markers() -> None:
     """With automatic caching, only the latest two marks are written beside the last-block marker."""
-    conversation = [
+    messages = [
         UserMessage(
             content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(3))
         ),
         UserMessage(content="question"),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
     )
     marked_blocks = _content_blocks(wire[0])
     assert "cache_control" not in marked_blocks[0]
@@ -1609,14 +1609,14 @@ def test_request_str_system_budget_leaves_two_slots_for_message_marks() -> None:
 
 
 def test_wire_messages_budget_mixes_user_and_tool_result_marks_across_messages() -> None:
-    """The latest-N budget counts marks across message kinds in conversation order."""
-    conversation = [
+    """The latest-N budget counts marks across message kinds in message order."""
+    messages = [
         UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
         ToolMessage(tool_call_id="tu_1", content=(TextPart(text="mid", cache_breakpoint=True),)),
         UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=2
     )
     assert "cache_control" not in _content_blocks(wire[0])[0]
     assert _content_blocks(wire[1])[0]["cache_control"] == {"type": "ephemeral"}
@@ -1627,11 +1627,11 @@ def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automat
     None
 ):
     """An explicit mark on the last block and the automatic last-block marker write one identical marker."""
-    conversation = [
+    messages = [
         UserMessage(content=(TextPart(text="q", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
     )
     assert _content_blocks(wire[0]) == [
         {"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}
@@ -1640,11 +1640,11 @@ def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automat
 
 def test_wire_messages_writes_no_marks_at_zero_budget() -> None:
     """A zero budget leaves every mark unwritten instead of slicing the whole list."""
-    conversation = [
+    messages = [
         UserMessage(content=(TextPart(text="m", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=0
+        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=0
     )
     assert "cache_control" not in _content_blocks(wire[0])[0]
 
@@ -1679,12 +1679,12 @@ def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
 
 def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() -> None:
     """cache_ttl="1h" puts the explicit ttl key on cache_breakpoint marks and the automatic last-block marker."""
-    conversation = [
+    messages = [
         UserMessage(content=(TextPart(text="context", cache_breakpoint=True),)),
         UserMessage(content="question"),
     ]
     wire = _wire_messages(
-        conversation, automatic_prompt_caching=True, cache_ttl="1h", message_mark_budget=2
+        messages, automatic_prompt_caching=True, cache_ttl="1h", message_mark_budget=2
     )
     assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert _content_blocks(wire[1])[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}

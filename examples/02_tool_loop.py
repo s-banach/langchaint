@@ -68,7 +68,7 @@ async def run_agent(
     so the loop survives a hallucinated call.
     The approve gate is where a between-turns decision goes (a human approval prompt, a budget check, a routing choice):
     a declined call becomes an is_error ToolMessage the model reads and adapts to, exactly like any other tool failure.
-    No interrupt machinery and no engine-owned state; the app holds the conversation and the control flow.
+    No interrupt machinery and no engine-owned state; the app holds the messages and the control flow.
     max_turns bounds the run so a model that keeps calling tools cannot loop forever spending tokens;
     that ceiling is a budget the app owns, the kind of control an engine that hides the loop does not give you.
     bound must have been bound with this same tool_manager, so the provider was sent its schemas.
@@ -76,19 +76,19 @@ async def run_agent(
     Raises:
         RuntimeError: if the model keeps calling tools for max_turns turns without returning a final answer.
     """
-    conversation: list[Message] = [UserMessage(content=prompt)]
+    messages: list[Message] = [UserMessage(content=prompt)]
     for _ in range(max_turns):
-        response = await bound.generate_one(conversation)
-        conversation.append(response.assistant_message)
+        response = await bound.generate_one(messages)
+        messages.append(response.assistant_message)
         if not response.tool_calls:
             return response.output
         for call in response.tool_calls:
             if approve is not None and not approve(call):
                 declined = ToolMessage.error(call, "The user declined this action.")
-                conversation.append(declined)
+                messages.append(declined)
                 continue
             outcome = await tool_manager.dispatch(call)
-            conversation.append(outcome.tool_message)
+            messages.append(outcome.tool_message)
     raise RuntimeError(f"agent did not finish within {max_turns} turns")
 
 
@@ -96,7 +96,7 @@ async def basic_run() -> None:
     """Wire a ToolManager into the binding and run the loop with no approval gate.
 
     The same ToolManager instance goes into bind (so its schemas are sent) and into the loop (so calls dispatch to it).
-    automatic_prompt_caching=True because the loop re-sends the growing conversation every turn,
+    automatic_prompt_caching=True because the loop re-sends the growing Sequence[Message] every turn,
     so each turn re-reads the cached prefix the previous turn wrote.
     """
     tool_manager = ToolManager([weather_tool])
@@ -123,12 +123,12 @@ async def reading_dispatch_outcomes() -> None:
     bound = openai_model("gpt-5.6-terra").bind(
         tool_manager=tool_manager, automatic_prompt_caching=False
     )
-    conversation: list[Message] = [UserMessage(content="What is the weather in Oslo?")]
-    response = await bound.generate_one(conversation)
-    conversation.append(response.assistant_message)
+    messages: list[Message] = [UserMessage(content="What is the weather in Oslo?")]
+    response = await bound.generate_one(messages)
+    messages.append(response.assistant_message)
     for call in response.tool_calls:
         outcome = await tool_manager.dispatch(call)
-        conversation.append(outcome.tool_message)
+        messages.append(outcome.tool_message)
         match outcome:
             case DispatchHandled(app_data=app_data):
                 print("tool ran; app-facing data:", app_data)

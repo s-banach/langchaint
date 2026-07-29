@@ -96,14 +96,14 @@ class StreamHandle[OutputT]:
         *,
         adapter: Adapter,
         bound_adapter: BoundAdapter[OutputT],
-        conversation: Sequence[Message],
+        messages: Sequence[Message],
         rate_limiter: RateLimiter,
         timeout_seconds: float | None,
     ) -> None:
         """Store the request; called by BoundLLM.stream_one only."""
         self._adapter = adapter
         self._bound_adapter = bound_adapter
-        self._conversation = conversation
+        self._messages = messages
         self._rate_limiter = rate_limiter
         self._timeout_seconds = timeout_seconds
         self._deadline: asyncio.Timeout | None = None
@@ -151,11 +151,11 @@ class StreamHandle[OutputT]:
         puts one request on the wire however many streams it opens.
 
         Raises:
-            InvalidRequestError: build_request reported the conversation InvalidRequest, so nothing
+            InvalidRequestError: build_request returned InvalidRequest, so nothing
                 can go out for this call.
         """
         if self._request is None:
-            built = self._bound_adapter.build_request(self._conversation)
+            built = self._bound_adapter.build_request(self._messages)
             if isinstance(built, InvalidRequest):
                 raise self._invalid_request_error(built.reason, None)
             self._request = built
@@ -165,7 +165,7 @@ class StreamHandle[OutputT]:
         """Open the request and return self.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation InvalidRequest, or the open
+            InvalidRequestError: build_request returned InvalidRequest, or the open
                 failure was classified as a rejection of the request.
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.
@@ -431,7 +431,7 @@ class StreamHandle[OutputT]:
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
         """Build the row-shaped InvalidRequestError for this handle, chained to cause when there is one.
 
-        cause is None where build_request reported the conversation InvalidRequest: nothing went out
+        cause is None where build_request returned InvalidRequest: nothing went out
         and no exception was involved.
         """
         invalid_request = InvalidRequestError(
@@ -456,7 +456,7 @@ class StreamHandle[OutputT]:
         Every failing path out of an attempt returns the admission, cancellation included.
 
         Raises:
-            InvalidRequestError: the adapter reported the conversation InvalidRequest, or the open
+            InvalidRequestError: build_request returned InvalidRequest, or the open
                 failure was classified as a rejection of the request.
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.

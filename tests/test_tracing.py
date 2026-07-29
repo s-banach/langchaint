@@ -1910,7 +1910,7 @@ def test_every_payload_attribute_reaches_validation() -> None:
     """
 
     async def scenario() -> None:
-        """Generate over a full conversation, then dispatch a tool call with object arguments."""
+        """Generate over a full Sequence[Message], then dispatch a tool call with object arguments."""
         tracer, _exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
@@ -2063,10 +2063,10 @@ def test_capture_off_leaves_every_content_key_off_the_span() -> None:
 
 
 def test_capture_on_records_all_four_content_attributes_in_convention_shape() -> None:
-    """capture_message_content True records the system prompt, tools, conversation, and assistant turn."""
+    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant turn."""
 
     async def scenario() -> None:
-        """Generate over a conversation carrying every message role and inspect the shapes."""
+        """Generate over a Sequence[Message] carrying every message role and inspect the shapes."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
@@ -2125,11 +2125,11 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
     asyncio.run(scenario())
 
 
-def test_a_str_conversation_is_captured_as_one_user_message() -> None:
-    """The bare-str conversation form renders as the one user message it means."""
+def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
+    """The bare-str GenerationInput form renders as the one user message it means."""
 
     async def scenario() -> None:
-        """Generate from a str conversation and read the input messages back."""
+        """Generate from a str GenerationInput and read the input messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one("hi")
@@ -2144,7 +2144,7 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
     """An ImagePart records its media type and never its base64 payload."""
 
     async def scenario() -> None:
-        """Generate over a conversation holding an image and read the input messages back."""
+        """Generate over a Sequence[Message] holding an image and read the input messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one([
@@ -2234,7 +2234,7 @@ def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
 
 
 def test_an_absent_system_prompt_omits_its_key_while_capture_stays_on() -> None:
-    """No bound system prompt omits gen_ai.system_instructions; the conversation is still captured.
+    """No bound system prompt omits gen_ai.system_instructions; the GenerationInput is still captured.
 
     The captured input messages are what separates this from the capture-off case.
     """
@@ -2323,8 +2323,8 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
     asyncio.run(scenario())
 
 
-def test_generate_many_captures_each_items_own_conversation_under_capture() -> None:
-    """Each item's span carries that item's conversation, not the batch's, which has no single one."""
+def test_generate_many_captures_each_items_own_generation_input_under_capture() -> None:
+    """Each item's span carries that item's generation_input, not the batch's, which has no single one."""
 
     async def scenario() -> None:
         """Run a two-item batch under capture and read the content off each item's span."""
@@ -2534,7 +2534,7 @@ def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_pa
     asyncio.run(scenario())
 
 
-def test_conversation_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
+def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
     """A parsed argument object nests inside gen_ai.input.messages; unparseable text stays a string there.
 
     This is the site where the nesting matters: the parts array is serialized as a whole, so a parsed

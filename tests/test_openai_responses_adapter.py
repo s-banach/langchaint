@@ -375,7 +375,7 @@ def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """A refusal content part becomes a TextPart, so the refused turn replays as the model wrote it.
 
     Dropped instead, the turn holds no elements and sends nothing back, which reopens the
-    conversation at the point the model declined.
+    Sequence[Message] at the point the model declined.
     """
     assistant_message = _assistant_message_from(
         _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
@@ -1531,11 +1531,11 @@ def test_every_request_carries_the_reasoning_include(
     )
 
     async def scenario() -> None:
-        conversation = [UserMessage(content="q")]
-        await text_bound.send(text_bound.build_request(conversation))
-        await text_bound.open_stream(text_bound.build_request(conversation))
-        await structured_bound.send(structured_bound.build_request(conversation))
-        await structured_bound.open_stream(structured_bound.build_request(conversation))
+        messages = [UserMessage(content="q")]
+        await text_bound.send(text_bound.build_request(messages))
+        await text_bound.open_stream(text_bound.build_request(messages))
+        await structured_bound.send(structured_bound.build_request(messages))
+        await structured_bound.open_stream(structured_bound.build_request(messages))
 
     asyncio.run(scenario())
     assert includes == [["reasoning.encrypted_content"]] * 4
@@ -1819,7 +1819,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
-        """Read the input items past the one the conversation's user message became."""
+        """Read the input items past the one the user message became."""
         assert isinstance(request, _OpenAIRequestParams)
         return request.input[1:]
 

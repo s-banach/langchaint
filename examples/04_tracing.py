@@ -6,10 +6,10 @@ so the wrapper is free when tracing is off.
 TracedLLM mirrors bind and rebind, so a rebound object stays traced.
 The default mapper, gen_ai_attributes, emits GenAI-convention attributes (token counts, cache counters, finish reason)
 plus the two langchaint scalars the convention has no counterpart for, cost and attempts;
-no mapper receives the conversation, so gen_ai_attributes cannot put a prompt on a span,
+no mapper receives the GenerationInput, so gen_ai_attributes cannot put a prompt on a span,
 while a custom mapper reads whatever it reaches on the result, raw included.
 
-capture_message_content decides separately whether the spans carry the conversation itself.
+capture_message_content decides separately whether the spans carry the GenerationInput itself.
 It is required and has no default, because recording prompts is a privacy choice langchaint never makes for you.
 False below: the spans carry metrics and no message content.
 The tracing module docstring lists every attribute each span kind emits under either value.

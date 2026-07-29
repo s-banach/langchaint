@@ -12,7 +12,7 @@ Every Traced class accepts extra_attributes, a constant mapping set on each span
 (an agent name for cross-trace aggregation, a deployment tag);
 an attribute set at completion (a mapper's, an outcome's) wins a key collision.
 Every Traced class also requires capture_message_content, which decides whether the spans carry
-the conversation itself; it has no default, because recording prompts is a privacy choice langchaint never makes.
+the GenerationInput itself; it has no default, because recording prompts is a privacy choice langchaint never makes.
 
 Every span the convention defines a kind for carries gen_ai.operation.name, which it marks required:
 "chat" on the chat and stream spans, "execute_tool" on a dispatch span.
@@ -101,6 +101,7 @@ from langchaint.llm import (
     LLM,
     UNCHANGED,
     BoundLLM,
+    GenerationInput,
     HasTools,
     NoTools,
     SequenceNotStr,
@@ -148,12 +149,12 @@ type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
 The parameter is CallResult[object]
 because the mapper reads the shared Response/GenerationError fields; Response[object] accepts any Response[OutputT]
 because Response's OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
-No mapper receives the conversation, so gen_ai_attributes cannot put a prompt on a span.
+No mapper receives the GenerationInput, so gen_ai_attributes cannot put a prompt on a span.
 A custom mapper is bounded only by what it reaches on the result, which includes raw, the SDK response object
 held by reference; openai 2.45.0's response model declares an instructions field,
 which is where a str system_prompt is sent.
 Capturing prompt content is the capture_message_content parameter, which the wrapper applies itself
-because the wrapper already has the conversation in scope as a method argument.
+because the wrapper already has the GenerationInput in scope as a method argument.
 """
 
 _PACKAGE_VERSION = importlib.metadata.version("langchaint")
@@ -597,16 +598,16 @@ def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
     return parts
 
 
-def _conversation_messages(conversation: str | Sequence[Message]) -> list[dict[str, object]]:
-    """Render a conversation as the convention's message array.
+def _input_messages(generation_input: GenerationInput) -> list[dict[str, object]]:
+    """Render a GenerationInput as the convention's message array.
 
-    A bare str conversation is the one-user-message form BoundLLM accepts, and renders as that message.
+    A bare str is the one-user-message form BoundLLM accepts, and renders as that message.
     A ToolMessage becomes a tool_call_response part inside a tool-role message,
     the shape the schema specifies rather than langchaint's own.
     """
-    if isinstance(conversation, str):
-        return [{"role": "user", "parts": [{"type": "text", "content": conversation}]}]
-    return [_message(message) for message in conversation]
+    if isinstance(generation_input, str):
+        return [{"role": "user", "parts": [{"type": "text", "content": generation_input}]}]
+    return [_message(message) for message in generation_input]
 
 
 def _message(message: Message) -> dict[str, object]:
@@ -662,7 +663,7 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
 
 
 def _input_content_attributes(
-    binding: Binding, conversation: str | Sequence[Message]
+    binding: Binding, generation_input: GenerationInput
 ) -> dict[str, str | bool | int | float | Sequence[str]]:
     """Build the input-side content attributes for one call, each a JSON string.
 
@@ -680,9 +681,9 @@ def _input_content_attributes(
         )
     if binding.tool_schemas:
         attributes["gen_ai.tool.definitions"] = json.dumps(_tool_definitions(binding.tool_schemas))
-    messages = _conversation_messages(conversation)
-    if messages:
-        attributes["gen_ai.input.messages"] = json.dumps(messages)
+    input_messages = _input_messages(generation_input)
+    if input_messages:
+        attributes["gen_ai.input.messages"] = json.dumps(input_messages)
     return attributes
 
 
@@ -789,7 +790,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
     The build is caught and logged at warning level and never propagated, the same way a raising
     AttributeMapper is, so a telemetry defect never breaks a paid call or discards its result;
     the span keeps whatever attributes were already set.
-    Building inside the is_recording guard is why the conversation is serialized here rather than earlier:
+    Building inside the is_recording guard is why the GenerationInput is serialized here rather than earlier:
     an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
     """
     if not _is_recording(span):
@@ -889,7 +890,7 @@ class TracedLLM:
     ) -> None:
         """Resolve the tracer once, at construction.
 
-        capture_message_content True puts the bound system prompt, the bound tool definitions, the conversation,
+        capture_message_content True puts the bound system prompt, the bound tool definitions, the GenerationInput,
         and the assistant turn on every span this LLM's bindings open.
         It is required and has no default: recording prompts is a privacy choice langchaint never makes for the user,
         the way automatic_prompt_caching is a billing choice bind never makes.
@@ -1025,7 +1026,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         self._span_config = span_config
         self._span_name = f"{_CHAT_OPERATION} {bound_llm.adapter.model}"
 
-    def _apply_input_content(self, span: Span, conversation: str | Sequence[Message]) -> None:
+    def _apply_input_content(self, span: Span, generation_input: GenerationInput) -> None:
         """Set the input-side content attributes on a just-started span, when capture is on and it is recording.
 
         Set at span start alongside extra_attributes, so they are present however the span ends,
@@ -1033,7 +1034,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         """
         if self._span_config.capture_message_content:
             _apply_content_attributes(
-                span, lambda: _input_content_attributes(self._bound_llm.binding, conversation)
+                span, lambda: _input_content_attributes(self._bound_llm.binding, generation_input)
             )
 
     @property
@@ -1203,26 +1204,26 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_one(
         self: "TracedBoundLLM[str, ToolsT]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[str]: ...
     @overload
     async def generate_one(
         self: "TracedBoundLLM[OutputT, HasTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT | None]: ...
     @overload
     async def generate_one(
         self: "TracedBoundLLM[OutputT, NoTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT]: ...
     async def generate_one(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> Response[Any]:
         """Open a span around the whole generate_one call, delegate, attribute, and end the span.
 
@@ -1241,16 +1242,18 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
             asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
                 status set.
         """
-        return await self._generate_one_any_binding(conversation, timeout_seconds=timeout_seconds)
+        return await self._generate_one_any_binding(
+            generation_input, timeout_seconds=timeout_seconds
+        )
 
     async def _generate_one_any_binding(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None
     ) -> Response[Any]:
         """Run one call under a chat span of its own.
 
         The un-overloaded entry point, because a generic binding matches none of generate_one's
         overloads, which are keyed on a concrete one. Same request, widest type.
-        It is also the GenerateItem passed to the wrapped BoundLLM, so a batch of n conversations
+        It is also the GenerateItem passed to the wrapped BoundLLM, so a batch of n generation_inputs
         traces as n chat spans, exactly as n generate_one calls do. timeout_seconds passes through
         unread, so a traced batch gets the deadline an untraced one gets.
 
@@ -1262,14 +1265,14 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
                 status set.
         """
         return await self._under_chat_span(
-            conversation,
+            generation_input,
             self._bound_llm._generate_one_any_binding(  # noqa: SLF001
-                conversation, timeout_seconds=timeout_seconds
+                generation_input, timeout_seconds=timeout_seconds
             ),
         )
 
     async def _under_chat_span(
-        self, conversation: str | Sequence[Message], call: Coroutine[Any, Any, Response[Any]]
+        self, generation_input: GenerationInput, call: Coroutine[Any, Any, Response[Any]]
     ) -> Response[Any]:
         """Await one call inside a CLIENT chat span, attributing the span from however it ends.
 
@@ -1288,7 +1291,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         try:
             _apply_extra_attributes(span, self._span_config.extra_attributes)
             _apply_operation_name(span, _CHAT_OPERATION)
-            self._apply_input_content(span, conversation)
+            self._apply_input_content(span, generation_input)
             try:
                 response = await call
             except GenerationError as exc:
@@ -1309,7 +1312,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_many(
         self: "TracedBoundLLM[str, ToolsT]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
@@ -1317,7 +1320,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, HasTools]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
@@ -1325,14 +1328,14 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, NoTools]",
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
-        conversations: SequenceNotStr[str | Sequence[Message]],
+        generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         timeout_seconds: float | None = None,
@@ -1347,7 +1350,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         for, configured on the SDK where every other tracing volume decision is made.
 
         Raises:
-            TypeError: conversations is a bare str (the whole-batch guard, in the delegated method).
+            TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated method).
             asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
                 ended.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
@@ -1355,7 +1358,7 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
         """
         # The un-overloaded entry point; _generate_one_any_binding says why.
         return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
-            conversations,
+            generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
             timeout_seconds=timeout_seconds,
@@ -1364,26 +1367,26 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
     @overload
     def stream_one(
         self: "TracedBoundLLM[str, ToolsT]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[str]": ...
     @overload
     def stream_one(
         self: "TracedBoundLLM[OutputT, HasTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[OutputT | None]": ...
     @overload
     def stream_one(
         self: "TracedBoundLLM[OutputT, NoTools]",
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> "TracedStreamHandle[OutputT]": ...
     def stream_one(
-        self, conversation: str | Sequence[Message], *, timeout_seconds: float | None = None
+        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> "TracedStreamHandle[Any]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
 
@@ -1391,21 +1394,21 @@ class TracedBoundLLM[OutputT, ToolsT = NoTools]:
 
         The span opens when the handle is entered, matching StreamHandle's own contract that
         the request opens there.
-        The binding and the conversation are passed down rather than rendered here:
+        The binding and the generation_input are passed down rather than rendered here:
         the handle needs them to build its input attributes when the span starts,
-        and rendering them here would serialize the conversation unconditionally, including for the
+        and rendering them here would serialize the generation_input unconditionally, including for the
         non-recording spans an application with no configured TracerProvider gets.
-        The cost is that the handle holds the conversation for the stream's whole life.
+        The cost is that the handle holds the generation_input for the stream's whole life.
         """
         return TracedStreamHandle(
             # The un-overloaded entry point; _generate_one_any_binding says why.
             stream_handle=self._bound_llm._stream_one_any_binding(  # noqa: SLF001
-                conversation, timeout_seconds=timeout_seconds
+                generation_input, timeout_seconds=timeout_seconds
             ),
             span_config=self._span_config,
             span_name=self._span_name,
             binding=self._bound_llm.binding,
-            conversation=conversation,
+            generation_input=generation_input,
         )
 
 
@@ -1431,19 +1434,19 @@ class TracedStreamHandle[OutputT]:
         span_config: _SpanConfig,
         span_name: str,
         binding: Binding,
-        conversation: str | Sequence[Message],
+        generation_input: GenerationInput,
     ) -> None:
         """Store the wrapped handle and the span pieces; the span is not started here.
 
         span_config is the binding's, unchanged; TracedLLM documents what each of its values means.
-        binding and conversation are held only to build the input content attributes when the span starts,
+        binding and generation_input are held only to build the input content attributes when the span starts,
         and are read for nothing else.
         """
         self._stream_handle = stream_handle
         self._span_config = span_config
         self._span_name = span_name
         self._binding = binding
-        self._conversation = conversation
+        self._generation_input = generation_input
         self._span: Span | None = None
         self._span_started_at_monotonic_seconds: float | None = None
         self._span_ended = False
@@ -1462,7 +1465,7 @@ class TracedStreamHandle[OutputT]:
 
         Called by __aenter__ alone, which raises on a second entry, so this runs at most once per handle.
         The input content attributes are built here rather than in stream_one: stream_one opens no span and
-        does no I/O by contract, so rendering there would serialize the conversation even for the
+        does no I/O by contract, so rendering there would serialize the generation_input even for the
         non-recording spans an unconfigured application gets, which _apply_content_attributes skips.
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
@@ -1471,7 +1474,7 @@ class TracedStreamHandle[OutputT]:
         _apply_operation_name(span, _CHAT_OPERATION)
         if self._span_config.capture_message_content:
             _apply_content_attributes(
-                span, lambda: _input_content_attributes(self._binding, self._conversation)
+                span, lambda: _input_content_attributes(self._binding, self._generation_input)
             )
         self._span_started_at_monotonic_seconds = time.monotonic()
         return span
@@ -1705,7 +1708,7 @@ class TracedToolManager(ToolManager):
     same span already says no tool produced it, so a consumer reading both is not misled.
     gen_ai.tool.call.result is what dispatch returned, which is not necessarily what the model read:
     the application owns the loop, so on any arm it may rewrite, replace, or drop the tool_message it
-    received before appending it to the conversation.
+    received before appending it to the Sequence[Message].
     The generate span's gen_ai.input.messages then carries different text for that call, and both spans are
     correct, each reporting its own boundary; the difference is the application's edit made visible.
     The two join on the tool call id, which is gen_ai.tool.call.id here and the tool_call_response part's id there.

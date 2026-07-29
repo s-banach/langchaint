@@ -30,7 +30,7 @@ Verified against openai 2.45.0:
   With automatic_prompt_caching False on a model taking `prompt_cache_options`,
   marked parts are what re-enables caching at exactly those boundaries.
 - The API stores responses server-side for later retrieval by default;
-  the adapter always sends `store=False` because conversation state is the caller's conversation argument,
+  the adapter always sends `store=False`: the caller's `GenerationInput` is the whole state,
   and a stored copy would be an unused side effect.
 - The adapter sends `include=["reasoning.encrypted_content"]` on every request,
   so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`.
@@ -223,14 +223,14 @@ class _OpenAIRequest:
     instructions is the bound str system prompt; a parts system prompt travels in input_prefix instead.
     tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
     include is always ["reasoning.encrypted_content"]:
-    the adapter re-feeds the whole conversation every turn, so every response's reasoning items
+    the adapter re-feeds the whole Sequence[Message] every turn, so every response's reasoning items
     must carry the payload a later request replays.
     """
 
     model: str
     instructions: str | None
     input_prefix: list[ResponseInputItemParam]
-    """Items sent ahead of the conversation every request: a system_prompt bound as parts becomes
+    """Items sent ahead of the Sequence[Message] every request: a system_prompt bound as parts becomes
     one developer-role input message here (its parts carry prompt_cache_breakpoint marks,
     which the instructions string cannot), and a str or absent system_prompt leaves it empty."""
 
@@ -253,7 +253,7 @@ class _OpenAIRequestParams(RequestParams):
 
     precomputed: _OpenAIRequest
     input: list[ResponseInputItemParam]
-    """What goes on the wire as input: the binding's input_prefix followed by the conversation."""
+    """What goes on the wire as input: the binding's input_prefix followed by the Sequence[Message]."""
 
     @override
     def as_json(self) -> str:
@@ -339,7 +339,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     so encrypted_content replays byte-identical.
     A trace another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a conversation replayed through the wrong provider fails loudly;
+    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
     switching providers means first rebuilding concluded assistant turns without their traces.
     """
     items: list[ResponseInputItemParam] = []
@@ -377,10 +377,10 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     return items
 
 
-def _wire_input(conversation: Sequence[Message]) -> list[ResponseInputItemParam]:
-    """Convert a conversation to input items; the system prompt is not one."""
+def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
+    """Convert messages to input items; the system prompt is not one."""
     wire: list[ResponseInputItemParam] = []
-    for message in conversation:
+    for message in messages:
         if isinstance(message, ToolMessage):
             function_call_output: FunctionCallOutput = {
                 "type": "function_call_output",
@@ -823,8 +823,8 @@ class OpenAIResponsesAdapter(Adapter):
         counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
         so the SDK must never retry beneath it.
 
-        reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text and the
-        traced conversation where the reasoning item carries no reasoning text of its own;
+        reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text where the
+        reasoning item carries no reasoning text of its own;
         None sends no summary field and leaves the provider default in place.
         A model may return no summary even when one is requested.
         It is a constructor parameter rather than an InferenceParams field because InferenceParams
@@ -1139,14 +1139,14 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
         return _identity_from_response(raw)
 
     @override
-    def build_request(self, conversation: Sequence[Message]) -> RequestParams:
-        """Convert the conversation into the input every attempt of this call sends.
+    def build_request(self, messages: Sequence[Message]) -> RequestParams:
+        """Convert messages into the input every attempt of this call sends.
 
-        Returns no InvalidRequest: this adapter puts every conversation on the wire.
+        Returns no InvalidRequest: this adapter puts every Sequence[Message] on the wire.
         """
         return _OpenAIRequestParams(
             precomputed=self._request,
-            input=[*self._request.input_prefix, *_wire_input(conversation)],
+            input=[*self._request.input_prefix, *_wire_input(messages)],
         )
 
     @override

@@ -79,12 +79,12 @@ class DispatchHandled[AppDataT = None]:
     """A tool call the tool executed: the model-facing tool_message plus app_data.
 
     Covers success and a tool-authored failure; tool_message.is_error distinguishes them, the same bool the tool set.
-    tool_message is the ToolMessage the application appends to the conversation and the provider sees.
+    tool_message is the ToolMessage the application appends to the Sequence[Message] and the provider sees.
     app_data is what the tool routed to the application, passed through live and read back at its concrete type.
     PydanticTool.dispatch carries the tool's own AppDataT onto this arm, so a known-tool caller needs no isinstance.
     For the function-bearing forms app_data is the function's, None when the function returned bare content.
     For CaptureTool it is the capture, present on every valid manager-routed call.
-    It never reaches the provider: only tool_message enters the conversation the adapters convert.
+    It never reaches the provider: only tool_message enters the Sequence[Message] the adapters convert.
     ToolManager.dispatch dispatches a heterogeneous tool set whose per-call AppDataT is erased,
     so its DispatchHandled is parameterized with the widest app_data the channel allows
     (BaseModel | Mapping[str, object] | None) and the app folds over that union there.
@@ -291,7 +291,8 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
 class DispatchCaptured[CapturedT: BaseModel]:
     """A capture call whose arguments validated: the acknowledgement tool_message plus the captured instance.
 
-    tool_message is the acknowledgement ToolMessage the application appends to the conversation for the model to read.
+    tool_message is the acknowledgement ToolMessage the application appends to the Sequence[Message]
+    for the model to read.
     captured is the validated args_model instance, a required field.
     Matching this arm proves the capture happened, so no consumer revalidates or None-guards captured.
     Returned only by CaptureTool.capture; a manager-routed call erases the capture onto DispatchHandled.app_data.
@@ -595,7 +596,7 @@ def _handled_outcome[AppDataT](
 
 
 class ToolManager:
-    """Holds the tools of one conversation and routes calls to them.
+    """Holds tools by name and routes calls to them.
 
     Validation and function execution live on the held tool's own dispatch, where its type parameters are concrete;
     the manager only resolves the called name and returns the outcome as a DispatchOutcome.

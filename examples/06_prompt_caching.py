@@ -72,7 +72,7 @@ def anthropic_marker_budget() -> None:
     the latest marks up to that budget are written, older marks are left unwritten.
     openai needs no budget arithmetic: every mark is sent, and the server matches on the latest three
     (implicit mode) or four (explicit mode), older breakpoints staying usable read-only.
-    Both behaviors let a conversation that accrues one mark per turn keep working as it grows.
+    Both behaviors let a Sequence[Message] that accrues one mark per turn keep working as it grows.
     """
     four_marked_parts = [
         TextPart(text=f"Instruction section {index}.", cache_breakpoint=True) for index in range(4)
@@ -143,7 +143,7 @@ async def provider_divergent_marks_are_rejected() -> None:
     except ValidationError as err:
         print(f"AssistantMessage rejected the marked turn part: {err.errors()[0]['msg']}")
     tool_call = ToolCall(id="call_1", name="lookup_policy", args_json="{}")
-    conversation: list[Message] = [
+    messages: list[Message] = [
         UserMessage(content="Do you handle refunds?"),
         AssistantMessage(turn=[tool_call]),
         ToolMessage(
@@ -156,7 +156,7 @@ async def provider_divergent_marks_are_rejected() -> None:
     ]
     bound = anthropic_model("claude-sonnet-5").bind(automatic_prompt_caching=False)
     try:
-        await bound.generate_one(conversation)
+        await bound.generate_one(messages)
     except InvalidRequestError as err:
         print(f"generate_one rejected the non-last marked tool part: {err}")
 

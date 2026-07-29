@@ -4,7 +4,7 @@ Every limit an agent is subject to lives here, so a reader answers "what is this
 from one frozen object rather than from arguments scattered across the launch site.
 
 timeout_seconds bounds one provider request, and the run goes on to its next turn with the same
-conversation, since a dropped request appended nothing. A run whose every call hangs is bounded by
+messages, since a dropped request appended nothing. A run whose every call hangs is bounded by
 max_turns rather than looping forever.
 """
 

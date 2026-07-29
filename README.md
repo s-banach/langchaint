@@ -48,7 +48,7 @@ asyncio.run(main())
 ```
 
 `bind(response_format=Sentiment)` returns a `BoundLLM[Sentiment]`, so `response.output` is a validated `Sentiment` instance; without `response_format`, `output` is the assistant text.
-A bare `str` argument is shorthand for a conversation of one `UserMessage` holding that text.
+A bare `str` argument is shorthand for a `Sequence[Message]` of one `UserMessage` holding that text.
 `examples/` holds runnable files and `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
 
 ## What it has

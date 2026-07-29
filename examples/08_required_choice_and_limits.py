@@ -137,7 +137,7 @@ async def run_agent[FinalT: BaseModel](
     Raises:
         RuntimeError: if no valid final_response call is captured within FORCED_TRIES forced turns.
     """
-    conversation: list[Message] = [UserMessage(content=prompt)]
+    messages: list[Message] = [UserMessage(content=prompt)]
     responses: list[Response[str]] = []
     tool_reported_usages: list[Usage] = []
 
@@ -166,14 +166,14 @@ async def run_agent[FinalT: BaseModel](
                     case DispatchHandled(app_data=Usage() as reported_usage):
                         tool_reported_usages.append(reported_usage)
                 tool_message = dispatch_outcome.tool_message
-            conversation.append(tool_message)
+            messages.append(tool_message)
         return final_response
 
     async def take_turn(turn_bound: BoundLLM[str, HasTools], *, forcing: bool) -> FinalT | None:
         """GenerationError propagates from generate_one."""
-        response = await turn_bound.generate_one(conversation)
+        response = await turn_bound.generate_one(messages)
         responses.append(response)
-        conversation.append(response.assistant_message)
+        messages.append(response.assistant_message)
         return await answer_calls(response.tool_calls, forcing=forcing)
 
     def completed(final_response: FinalT) -> RunResult[FinalT]:
@@ -259,7 +259,7 @@ async def budgeted_run() -> None:
     The same ToolManager instance goes into bind (so its schemas are sent) and into the loop (so calls dispatch to it).
     final_response_tool is in the manager so bind sends its schema.
     The loop answers its calls through capture, by name, before dispatch is considered.
-    automatic_prompt_caching=True because the loop re-sends the growing conversation every turn.
+    automatic_prompt_caching=True because the loop re-sends the growing Sequence[Message] every turn.
     """
     final_response_tool = build_final_response_tool(FinalResponse)
     tool_manager = ToolManager([search_tool, build_delegate_tool(), final_response_tool])

@@ -313,7 +313,7 @@ class ReActAgent(AgentRun):
         self.turn_number = 0
         self.tool_calls_made = 0
         self.critique_approved = False
-        self.conversation: list[Message] = []
+        self.messages: list[Message] = []
 
     @override
     def span_attributes(self) -> Mapping[str, str | int | float | bool]:
@@ -341,7 +341,7 @@ class ReActAgent(AgentRun):
             DispatchExceptionGroup: a tool function raised; the settled siblings are folded first.
             asyncio.CancelledError: an outer deadline cancelled the run.
         """
-        self.conversation.append(UserMessage(content=self.prompt))
+        self.messages.append(UserMessage(content=self.prompt))
         for _ in range(self.config.max_turns):
             self.turn_number += 1
             self.on_event(
@@ -353,13 +353,13 @@ class ReActAgent(AgentRun):
             )
             try:
                 response = await self.bound.generate_one(
-                    self.conversation, timeout_seconds=self.config.timeout_seconds
+                    self.messages, timeout_seconds=self.config.timeout_seconds
                 )
             except GenerationError as error:
                 self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
                 if not isinstance(error, TimedOutError):
                     raise
-                # The dropped call appended nothing to the conversation, so the next turn resends it
+                # The dropped call appended nothing to self.messages, so the next turn resends it
                 # unchanged.
                 self.on_event(
                     LlmCallAbandoned(
@@ -379,11 +379,11 @@ class ReActAgent(AgentRun):
                     usage_so_far=self.usage,
                 )
             )
-            self.conversation.append(response.assistant_message)
+            self.messages.append(response.assistant_message)
             tool_calls = response.tool_calls
             if not tool_calls:
                 if self.config.self_correction_enabled and not self.critique_approved:
-                    self.conversation.append(
+                    self.messages.append(
                         UserMessage(
                             content="Call critique on that draft and revise it before answering."
                         )
@@ -447,7 +447,7 @@ class ReActAgent(AgentRun):
         # Every call the model made gets a reply in its original order, declined ones included:
         # a provider rejects a turn whose tool calls are not all answered.
         for outcome in outcomes:
-            self.conversation.append(outcome.tool_message)
+            self.messages.append(outcome.tool_message)
 
     def _settle_outcomes(
         self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyOutcome]

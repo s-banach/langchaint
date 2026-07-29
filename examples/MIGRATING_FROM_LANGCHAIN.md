@@ -10,7 +10,7 @@ This guide gives the call-for-call map, then explains what replaces the middlewa
 | LangChain | langchaint |
 | --- | --- |
 | `ChatOpenAI(...)`, `init_chat_model(...)` | `openai_model("gpt-5.6-terra")` (or `anthropic_model("claude-sonnet-5")`), returns an `LLM` |
-| `model.invoke(messages)` | `llm.bind(...).generate_one(conversation)`, returns a `Response` |
+| `model.invoke(messages)` | `llm.bind(...).generate_one(generation_input)`, returns a `Response` |
 | `model.ainvoke(...)` | `generate_one` is already async; there is no sync API |
 | `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([PydanticTool(...)]))` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
@@ -35,16 +35,16 @@ langchaint ships no loop, so there is nothing to splice into: each hook is plain
 
 | Middleware hook | Where it goes in your loop |
 | --- | --- |
-| `before_model` | a statement before `await bound.generate_one(conversation)` |
+| `before_model` | a statement before `await bound.generate_one(generation_input)` |
 | `after_model` | a statement after it, inspecting the `Response` (`stop_reason`, `tool_calls`, `usage`) |
 | `modify_model_request` | `bound = bound.rebind(...)` before the next turn; the binding is the request shape |
 | `wrap_tool_call`, tool error handling | `dispatch` already returns an is_error tool message for bad names and bad arguments; wrap your own code around the `dispatch` call |
 | human-in-the-loop / interrupts | check `call.name` (or a tool's `app_data`) between turns and decide; a declined call is an is_error `ToolMessage` you append (see `run_agent`'s `approve` gate) |
-| summarization / message trimming | edit the `conversation` list you hold before the next turn |
+| summarization / message trimming | edit the `messages` list you hold before the next turn |
 | structured-output middleware | `bind(response_format=Model)`; a refusal or truncation raises a `GenerationError` you catch |
 | usage / cost tracking | bill on `response.usage` (the paid total across retries, carrying `cost_in_usd`); `response.usage_successful_attempt` is the single kept answer's own usage, smaller than `usage` wherever a failed attempt billed. Or `to_tables(results)` for a calls table and an attempts table, where per-attempt spend and the rates that priced it sit in their own rows. |
 
-The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full conversation in scope.
+The gain from owning the loop is that a budget check, an approval gate, or a binding swap is ordinary control flow with the full `Sequence[Message]` in scope.
 
 ## From LangGraph
 

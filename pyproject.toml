@@ -7,7 +7,6 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "John Hopfensperger" }]
 requires-python = ">=3.13"
-keywords = ["llm", "anthropic", "openai", "claude", "async"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -31,7 +30,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "anthropic>=0.120.0",
-    "openai>=2.45.0",
+    "openai>=2.51.0",
     "opentelemetry-api>=1.30.0",
     # opentelemetry-sdk is needed only by the tracing tests' in-memory exporter
     # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper

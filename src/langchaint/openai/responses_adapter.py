@@ -178,14 +178,14 @@ type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionP
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
 """How much readable text to ask the API for, the values reasoning.summary takes."""
 
-type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority"]
+type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 """What a request may ask for, and what a response reports (openai 2.45.0 types both with this literal).
 
 The API documents the response value as the processing mode actually used and says it may differ
 from the value the request set, so the tier is read off each response rather than assumed.
 """
 
-type OpenAIPricedServiceTier = Literal["default", "flex", "scale", "priority"]
+type OpenAIPricedServiceTier = Literal["default", "flex", "scale", "priority", "fast"]
 """The pricing mapping's key: the tiers a caller can hold rates for.
 
 "auto" is excluded. It is in the response literal only because request and response share one type,

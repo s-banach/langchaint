@@ -215,7 +215,7 @@ def _wire_reasoning(
 
 
 @dataclass(frozen=True, kw_only=True)
-class _OpenAIRequest:
+class _OpenAIPrecomputedFields:
     """The typed request fields one binding precomputes.
 
     Fields set to the SDK's omit sentinel leave the provider default in place; passing them as explicit keywords
@@ -251,7 +251,7 @@ class _OpenAIRequest:
 class _OpenAIRequestParams(RequestParams):
     """One responses request: the binding's precomputed fields and this call's converted input."""
 
-    precomputed: _OpenAIRequest
+    precomputed: _OpenAIPrecomputedFields
     input: list[ResponseInputItemParam]
     """What goes on the wire as input: the binding's input_prefix followed by the Sequence[Message]."""
 
@@ -876,7 +876,7 @@ class OpenAIResponsesAdapter(Adapter):
         self.reasoning_summary = reasoning_summary
         self.service_tier: OpenAIServiceTier | None = service_tier
 
-    def _request(self, binding: Binding) -> _OpenAIRequest:
+    def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 
         A str system_prompt travels as the instructions parameter,
@@ -903,7 +903,7 @@ class OpenAIResponsesAdapter(Adapter):
             tools = _wire_tools(binding.tool_schemas)
             tool_choice = _wire_tool_choice(binding.tool_choice)
             parallel_tool_calls = binding.parallel_tool_calls
-        return _OpenAIRequest(
+        return _OpenAIPrecomputedFields(
             model=self.model,
             instructions=instructions,
             input_prefix=input_prefix,
@@ -936,7 +936,7 @@ class OpenAIResponsesAdapter(Adapter):
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O."""
-        return _BoundOpenAIText(adapter=self, request=self._request(binding))
+        return _BoundOpenAIText(adapter=self, precomputed_fields=self._precompute_fields(binding))
 
     @override
     def bind_structured[ModelT: BaseModel](
@@ -945,7 +945,7 @@ class OpenAIResponsesAdapter(Adapter):
         """Bind for structured output validated into response_format; pure conversion, no I/O."""
         return _BoundOpenAIStructured(
             adapter=self,
-            request=self._request(binding),
+            precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
         )
 
@@ -1112,11 +1112,11 @@ class _OpenAIStream(AdapterStream):
 class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
     """What both openai bindings share: the request path, and what a response says about itself.
 
-    A subclass sets _adapter and _request in its own __init__ and implements interpret.
+    A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.
     """
 
     _adapter: OpenAIResponsesAdapter
-    _request: _OpenAIRequest
+    _precomputed_fields: _OpenAIPrecomputedFields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> Billing:
@@ -1145,8 +1145,8 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
         Returns no InvalidRequest: this adapter puts every Sequence[Message] on the wire.
         """
         return _OpenAIRequestParams(
-            precomputed=self._request,
-            input=[*self._request.input_prefix, *_wire_input(messages)],
+            precomputed=self._precomputed_fields,
+            input=[*self._precomputed_fields.input_prefix, *_wire_input(messages)],
         )
 
     @override
@@ -1208,9 +1208,11 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
 class _BoundOpenAIText(_BoundOpenAI[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(self, *, adapter: OpenAIResponsesAdapter, request: _OpenAIRequest) -> None:
+    def __init__(
+        self, *, adapter: OpenAIResponsesAdapter, precomputed_fields: _OpenAIPrecomputedFields
+    ) -> None:
         self._adapter = adapter
-        self._request = request
+        self._precomputed_fields = precomputed_fields
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
@@ -1243,7 +1245,7 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         self,
         *,
         adapter: OpenAIResponsesAdapter,
-        request: _OpenAIRequest,
+        precomputed_fields: _OpenAIPrecomputedFields,
         response_format: type[ModelT],
     ) -> None:
         """Precompute the request's text parameter, the JSON-schema format this binding asks for.
@@ -1255,8 +1257,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         """
         self._adapter = adapter
         self._response_format = response_format
-        self._request = replace(
-            request, text={"format": type_to_text_format_param(response_format)}
+        self._precomputed_fields = replace(
+            precomputed_fields, text={"format": type_to_text_format_param(response_format)}
         )
 
     def _no_instance(

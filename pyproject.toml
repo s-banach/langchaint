@@ -209,7 +209,7 @@ lint.pylint.max-returns = 10
 lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
-# The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._request,
+# The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._precompute_fields,
 # BoundLLM._bound_adapter); those accesses are the unit under test, so private-member-access
 # cannot be satisfied without exposing internals.
 # too-many-arguments is ignored because the fake adapters' constructors take one

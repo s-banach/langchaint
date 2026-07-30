@@ -295,7 +295,7 @@ def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
 
 
 @dataclass(frozen=True, kw_only=True)
-class _AnthropicRequest:
+class _AnthropicPrecomputedFields:
     """The typed request fields one binding precomputes.
 
     Fields set to the SDK's omit sentinel leave the provider default in place;
@@ -322,7 +322,7 @@ class _AnthropicRequest:
 class _AnthropicRequestParams(RequestParams):
     """One messages request: the binding's precomputed fields and this call's converted messages."""
 
-    precomputed: _AnthropicRequest
+    precomputed: _AnthropicPrecomputedFields
     messages: list[MessageParam]
 
     @override
@@ -488,7 +488,7 @@ def _wire_messages(
     and the enclosing tool_result block in a tool message;
     the latest marks up to message_mark_budget are written and older ones left unwritten.
     message_mark_budget is what the binding's markers leave of the request limit,
-    computed once in _request; at 0, every mark goes unwritten.
+    computed once in _precompute_fields; at 0, every mark goes unwritten.
 
     Raises:
         _NotSendableError: an image part's media_type is outside the API's set (from _part_block),
@@ -537,9 +537,9 @@ def _wire_messages(
 
 
 def _request_messages(
-    messages: Sequence[Message], request: _AnthropicRequest
+    messages: Sequence[Message], precomputed_fields: _AnthropicPrecomputedFields
 ) -> list[MessageParam] | InvalidRequest:
-    """Convert messages under this request's caching parameters, or report them unsendable.
+    """Convert messages under the binding's caching parameters, or report them unsendable.
 
     The one place a Sequence[Message] this adapter will not put on the wire becomes an InvalidRequest.
     An unparseable tool_call.args_json is one of those: the wire block holds the parsed arguments,
@@ -548,9 +548,9 @@ def _request_messages(
     try:
         return _wire_messages(
             messages,
-            automatic_prompt_caching=request.automatic_prompt_caching,
-            cache_ttl=request.cache_ttl,
-            message_mark_budget=request.message_mark_budget,
+            automatic_prompt_caching=precomputed_fields.automatic_prompt_caching,
+            cache_ttl=precomputed_fields.cache_ttl,
+            message_mark_budget=precomputed_fields.message_mark_budget,
         )
     except _NotSendableError as not_sendable:
         return InvalidRequest(reason=not_sendable.reason)
@@ -852,7 +852,7 @@ class AnthropicMessagesAdapter(Adapter):
         self.cache_ttl: CacheTTL = cache_ttl
         self.service_tier: AnthropicServiceTier | None = service_tier
 
-    def _request(self, binding: Binding) -> _AnthropicRequest:
+    def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 
         A str system_prompt is one system block; a parts system_prompt is one block per part,
@@ -925,7 +925,7 @@ class AnthropicMessagesAdapter(Adapter):
                 "OutputConfigParam", {"effort": binding.inference_params.reasoning_effort}
             )
             thinking = {"type": "adaptive"}
-        return _AnthropicRequest(
+        return _AnthropicPrecomputedFields(
             model=self.model,
             max_tokens=(
                 max_tokens if max_tokens is not None else self.default_max_completion_tokens
@@ -949,7 +949,9 @@ class AnthropicMessagesAdapter(Adapter):
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O."""
-        return _BoundAnthropicText(adapter=self, request=self._request(binding))
+        return _BoundAnthropicText(
+            adapter=self, precomputed_fields=self._precompute_fields(binding)
+        )
 
     @override
     def bind_structured[ModelT: BaseModel](
@@ -958,7 +960,7 @@ class AnthropicMessagesAdapter(Adapter):
         """Bind for structured output validated into response_format; pure conversion, no I/O."""
         return _BoundAnthropicStructured(
             adapter=self,
-            request=self._request(binding),
+            precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
         )
 
@@ -1107,11 +1109,11 @@ class _AnthropicStream(AdapterStream):
 class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
     """What both anthropic bindings share: the request path, and what a response says about itself.
 
-    A subclass sets _adapter and _request in its own __init__ and implements interpret.
+    A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.
     """
 
     _adapter: AnthropicMessagesAdapter
-    _request: _AnthropicRequest
+    _precomputed_fields: _AnthropicPrecomputedFields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> Billing:
@@ -1135,10 +1137,12 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
         """Convert messages under the binding's precomputed fields."""
-        wire_messages = _request_messages(messages, self._request)
+        wire_messages = _request_messages(messages, self._precomputed_fields)
         if isinstance(wire_messages, InvalidRequest):
             return wire_messages
-        return _AnthropicRequestParams(precomputed=self._request, messages=wire_messages)
+        return _AnthropicRequestParams(
+            precomputed=self._precomputed_fields, messages=wire_messages
+        )
 
     @override
     async def send(self, request: RequestParams) -> anthropic.types.Message:
@@ -1193,9 +1197,11 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
 class _BoundAnthropicText(_BoundAnthropic[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(self, *, adapter: AnthropicMessagesAdapter, request: _AnthropicRequest) -> None:
+    def __init__(
+        self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
+    ) -> None:
         self._adapter = adapter
-        self._request = request
+        self._precomputed_fields = precomputed_fields
 
     @override
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
@@ -1219,7 +1225,7 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         self,
         *,
         adapter: AnthropicMessagesAdapter,
-        request: _AnthropicRequest,
+        precomputed_fields: _AnthropicPrecomputedFields,
         response_format: type[ModelT],
     ) -> None:
         """Precompute the request's output_config, the JSON-schema format merged into the binding's.
@@ -1235,13 +1241,13 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         output_format = JSONOutputFormatParam(
             schema=transform_schema(self._output_type_adapter.json_schema()), type="json_schema"
         )
-        bound_output_config = request.output_config
+        bound_output_config = precomputed_fields.output_config
         output_config: OutputConfigParam = (
             {"format": output_format}
             if isinstance(bound_output_config, Omit)
             else {**bound_output_config, "format": output_format}
         )
-        self._request = replace(request, output_config=output_config)
+        self._precomputed_fields = replace(precomputed_fields, output_config=output_config)
 
     def _parsed_output(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage

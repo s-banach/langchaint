@@ -2,7 +2,7 @@
 
 These pin behavior the type checker cannot: usage partition arithmetic, the 5-minute/1-hour cache-write cost split,
 stop-reason mapping, tool_use extraction, cache-breakpoint placement, tool-choice translation,
-and the precomputed request the binding determines.
+and the request fields the binding precomputes.
 """
 
 import asyncio
@@ -691,14 +691,14 @@ def _binding(
 
 def test_request_omits_tool_sentinels_without_tools() -> None:
     """No tools leaves both tools and tool_choice at the omit sentinel."""
-    request = _adapter()._request(
+    precomputed_fields = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
-    assert request.max_tokens == 4096
-    assert isinstance(request.tools, anthropic.Omit)
-    assert isinstance(request.tool_choice, anthropic.Omit)
-    assert request.output_config == {"effort": "high"}
-    assert request.thinking == {"type": "adaptive"}
+    assert precomputed_fields.max_tokens == 4096
+    assert isinstance(precomputed_fields.tools, anthropic.Omit)
+    assert isinstance(precomputed_fields.tool_choice, anthropic.Omit)
+    assert precomputed_fields.output_config == {"effort": "high"}
+    assert precomputed_fields.thinking == {"type": "adaptive"}
 
 
 def test_request_passes_widened_reasoning_effort_through() -> None:
@@ -711,9 +711,9 @@ def test_request_passes_widened_reasoning_effort_through() -> None:
         inference_params=InferenceParams(reasoning_effort="minimal"),
         automatic_prompt_caching=False,
     )
-    request = _adapter()._request(binding)
-    assert request.output_config == {"effort": "minimal"}
-    assert request.thinking == {"type": "adaptive"}
+    precomputed_fields = _adapter()._precompute_fields(binding)
+    assert precomputed_fields.output_config == {"effort": "minimal"}
+    assert precomputed_fields.thinking == {"type": "adaptive"}
 
 
 def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> None:
@@ -726,14 +726,14 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
         inference_params=InferenceParams(),
         automatic_prompt_caching=False,
     )
-    request = _adapter()._request(binding)
-    assert isinstance(request.output_config, anthropic.Omit)
-    assert isinstance(request.thinking, anthropic.Omit)
+    precomputed_fields = _adapter()._precompute_fields(binding)
+    assert isinstance(precomputed_fields.output_config, anthropic.Omit)
+    assert isinstance(precomputed_fields.thinking, anthropic.Omit)
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _adapter()._request(
+    unset = _adapter()._precompute_fields(
         _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
     )
     assert isinstance(unset.temperature, anthropic.Omit)
@@ -745,7 +745,7 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         inference_params=InferenceParams(temperature=0.2),
         automatic_prompt_caching=False,
     )
-    assert _adapter()._request(binding).temperature == 0.2
+    assert _adapter()._precompute_fields(binding).temperature == 0.2
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -755,7 +755,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     different request from omitting the key.
     """
     binding = _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
-    assert isinstance(_adapter()._request(binding).service_tier, anthropic.Omit)
+    assert isinstance(_adapter()._precompute_fields(binding).service_tier, anthropic.Omit)
     stated = AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test"),
         model="m",
@@ -763,16 +763,16 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
         provider_name="anthropic",
         service_tier="standard_only",
     )
-    assert stated._request(binding).service_tier == "standard_only"
+    assert stated._precompute_fields(binding).service_tier == "standard_only"
 
 
 def test_request_marks_the_system_block_only_when_caching() -> None:
     """The system block carries a breakpoint under caching and none without it."""
-    cached = _adapter()._request(
+    cached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
     assert _block_list(cached.system)[0]["cache_control"] == {"type": "ephemeral"}
-    uncached = _adapter()._request(
+    uncached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     assert "cache_control" not in _block_list(uncached.system)[0]
@@ -781,11 +781,11 @@ def test_request_marks_the_system_block_only_when_caching() -> None:
 def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
     """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
-    without_system = _adapter()._request(
+    without_system = _adapter()._precompute_fields(
         _binding(system_prompt=None, tool_schemas=schemas, automatic_prompt_caching=True)
     )
     assert _block_list(without_system.tools)[-1]["cache_control"] == {"type": "ephemeral"}
-    with_system = _adapter()._request(
+    with_system = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_prompt_caching=True)
     )
     assert "cache_control" not in _block_list(with_system.tools)[-1]
@@ -1102,11 +1102,11 @@ class _StructuredReport(BaseModel):
 def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     """Build a structured-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
-    request = adapter._request(
+    precomputed_fields = adapter._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     return _BoundAnthropicStructured(
-        adapter=adapter, request=request, response_format=_StructuredReport
+        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
 
 
@@ -1166,7 +1166,7 @@ def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config()
     is what keeps the request unchanged by that move, the binding's own effort key included.
     """
     adapted_type: TypeAdapter[_StructuredReport] = TypeAdapter(_StructuredReport)
-    assert _structured_bound()._request.output_config == {
+    assert _structured_bound()._precomputed_fields.output_config == {
         "effort": "high",
         "format": {"schema": transform_schema(adapted_type.json_schema()), "type": "json_schema"},
     }
@@ -1207,7 +1207,7 @@ def test_both_structured_request_paths_send_the_output_config(
         await structured_bound.open_stream(request)
 
     asyncio.run(scenario())
-    assert output_configs == [structured_bound._request.output_config] * 2
+    assert output_configs == [structured_bound._precomputed_fields.output_config] * 2
 
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
@@ -1546,7 +1546,7 @@ def test_wire_messages_reserves_two_slots_for_automatic_markers() -> None:
 
 def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
     """A parts system_prompt is one block per part; marked parts and the automatic last block carry markers."""
-    request = _adapter()._request(
+    precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
                 TextPart(text="stable instructions", cache_breakpoint=True),
@@ -1556,16 +1556,16 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
             automatic_prompt_caching=True,
         )
     )
-    assert request.system == [
+    assert precomputed_fields.system == [
         {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "semi-stable context", "cache_control": {"type": "ephemeral"}},
     ]
-    assert request.message_mark_budget == 1
+    assert precomputed_fields.message_mark_budget == 1
 
 
 def test_request_system_parts_without_automatic_caching_mark_only_marked_parts() -> None:
     """Bound False, only the marked system part carries a marker; the budget spends only on it."""
-    request = _adapter()._request(
+    precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
                 TextPart(text="stable", cache_breakpoint=True),
@@ -1575,17 +1575,17 @@ def test_request_system_parts_without_automatic_caching_mark_only_marked_parts()
             automatic_prompt_caching=False,
         )
     )
-    assert request.system == [
+    assert precomputed_fields.system == [
         {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "volatile"},
     ]
-    assert request.message_mark_budget == 3
+    assert precomputed_fields.message_mark_budget == 3
 
 
 def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> None:
     """Four marked system parts plus the automatic markers cannot fit the 4-marker limit."""
     with pytest.raises(ValueError, match="limit"):
-        _adapter()._request(
+        _adapter()._precompute_fields(
             _binding(
                 system_prompt=tuple(
                     TextPart(text=f"s{index}", cache_breakpoint=True) for index in range(4)
@@ -1598,11 +1598,11 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
 
 def test_request_str_system_budget_leaves_two_slots_for_message_marks() -> None:
     """A str system prompt under automatic caching leaves two slots for message marks."""
-    request = _adapter()._request(
+    precomputed_fields = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
-    assert request.message_mark_budget == 2
-    uncached = _adapter()._request(
+    assert precomputed_fields.message_mark_budget == 2
+    uncached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
     assert uncached.message_mark_budget == 4
@@ -1662,19 +1662,25 @@ def _adapter_1h() -> AnthropicMessagesAdapter:
 
 def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the automatic system marker and flows into the request."""
-    request = _adapter_1h()._request(
+    precomputed_fields = _adapter_1h()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
-    assert _block_list(request.system)[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-    assert request.cache_ttl == "1h"
+    assert _block_list(precomputed_fields.system)[0]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    assert precomputed_fields.cache_ttl == "1h"
 
 
 def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the last-tool marker."""
-    request = _adapter_1h()._request(
+    precomputed_fields = _adapter_1h()._precompute_fields(
         _binding(system_prompt=None, tool_schemas=_tool_schemas(), automatic_prompt_caching=True)
     )
-    assert _block_list(request.tools)[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert _block_list(precomputed_fields.tools)[-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
 
 
 def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() -> None:
@@ -1693,7 +1699,7 @@ def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() ->
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
     """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
     with pytest.raises(ValueError, match="empty tuple"):
-        _adapter()._request(
+        _adapter()._precompute_fields(
             _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
         )
 

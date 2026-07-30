@@ -3,7 +3,7 @@
 These pin behavior the type checker cannot:
 the usage partition derived by subtracting cache counts from input_tokens and its cross-check, cost arithmetic,
 input-item placement, tool-choice translation, stop-reason derivation (the API reports no finish reason),
-the zero-usage fallback when a response omits usage, and the precomputed request the binding determines.
+the zero-usage fallback when a response omits usage, and the request fields the binding precomputes.
 """
 
 import asyncio
@@ -632,13 +632,13 @@ def test_request_assembles_the_reasoning_object_key_by_key(
     summary is a different request from omitting the key, which is what key-by-key assembly buys
     over one Reasoning(effort=..., summary=...) call.
     """
-    request = _adapter(reasoning_summary=reasoning_summary)._request(
+    precomputed_fields = _adapter(reasoning_summary=reasoning_summary)._precompute_fields(
         _binding(automatic_prompt_caching=True, reasoning_effort=reasoning_effort)
     )
     if expected_reasoning is None:
-        assert isinstance(request.reasoning, openai.Omit)
+        assert isinstance(precomputed_fields.reasoning, openai.Omit)
     else:
-        assert request.reasoning == expected_reasoning
+        assert precomputed_fields.reasoning == expected_reasoning
 
 
 @pytest.mark.parametrize(
@@ -667,13 +667,13 @@ def test_request_sends_explicit_mode_only_to_a_model_that_takes_it_with_caching_
     Every other row leaves the omit sentinel, so nothing reaches the wire: a model that does not
     take the parameter gets none under either binding value.
     """
-    request = _adapter(supports_prompt_cache_options=supports_prompt_cache_options)._request(
-        _binding(automatic_prompt_caching=automatic_prompt_caching)
-    )
+    precomputed_fields = _adapter(
+        supports_prompt_cache_options=supports_prompt_cache_options
+    )._precompute_fields(_binding(automatic_prompt_caching=automatic_prompt_caching))
     if expected_options is None:
-        assert isinstance(request.prompt_cache_options, openai.Omit)
+        assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
     else:
-        assert request.prompt_cache_options == expected_options
+        assert precomputed_fields.prompt_cache_options == expected_options
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -683,7 +683,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     different request from omitting the key.
     """
     binding = _binding(automatic_prompt_caching=True)
-    assert isinstance(_adapter()._request(binding).service_tier, openai.Omit)
+    assert isinstance(_adapter()._precompute_fields(binding).service_tier, openai.Omit)
     stated = OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
         model="m",
@@ -692,12 +692,12 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
         supports_prompt_cache_options=True,
         service_tier="flex",
     )
-    assert stated._request(binding).service_tier == "flex"
+    assert stated._precompute_fields(binding).service_tier == "flex"
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _adapter()._request(_binding(automatic_prompt_caching=True))
+    unset = _adapter()._precompute_fields(_binding(automatic_prompt_caching=True))
     assert isinstance(unset.temperature, openai.Omit)
     binding = Binding(
         system_prompt=None,
@@ -707,15 +707,15 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         inference_params=InferenceParams(temperature=0.2),
         automatic_prompt_caching=True,
     )
-    assert _adapter()._request(binding).temperature == 0.2
+    assert _adapter()._precompute_fields(binding).temperature == 0.2
 
 
 def test_request_omits_tool_fields_without_tools() -> None:
     """No tools leaves tools, tool_choice, and parallel_tool_calls at the omit sentinel."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=True))
-    assert isinstance(request.tools, openai.Omit)
-    assert isinstance(request.tool_choice, openai.Omit)
-    assert isinstance(request.parallel_tool_calls, openai.Omit)
+    precomputed_fields = _adapter()._precompute_fields(_binding(automatic_prompt_caching=True))
+    assert isinstance(precomputed_fields.tools, openai.Omit)
+    assert isinstance(precomputed_fields.tool_choice, openai.Omit)
+    assert isinstance(precomputed_fields.parallel_tool_calls, openai.Omit)
 
 
 class _FakeSDKStream(AsyncResponseStream[None]):
@@ -1206,9 +1206,11 @@ class _StructuredReport(BaseModel):
 def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
     """Build a structured-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
-    request = adapter._request(_binding(automatic_prompt_caching=False, system_prompt="sys"))
+    precomputed_fields = adapter._precompute_fields(
+        _binding(automatic_prompt_caching=False, system_prompt="sys")
+    )
     return _BoundOpenAIStructured(
-        adapter=adapter, request=request, response_format=_StructuredReport
+        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
 
 
@@ -1320,7 +1322,8 @@ def _text_bound() -> _BoundOpenAIText:
     """Build a text-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
     return _BoundOpenAIText(
-        adapter=adapter, request=adapter._request(_binding(automatic_prompt_caching=False))
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(_binding(automatic_prompt_caching=False)),
     )
 
 
@@ -1508,7 +1511,7 @@ def test_every_request_carries_the_reasoning_include(
     so without this parameter every replayed reasoning item could be silently empty.
     """
     adapter = _adapter()
-    request = adapter._request(_binding(automatic_prompt_caching=True))
+    precomputed_fields = adapter._precompute_fields(_binding(automatic_prompt_caching=True))
     includes: list[object] = []
 
     async def fake_create(**request_kwargs: object) -> OpenAIResponse:
@@ -1525,9 +1528,9 @@ def test_every_request_carries_the_reasoning_include(
 
     monkeypatch.setattr(adapter.client.responses, "create", fake_create)
     monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
-    text_bound = _BoundOpenAIText(adapter=adapter, request=request)
+    text_bound = _BoundOpenAIText(adapter=adapter, precomputed_fields=precomputed_fields)
     structured_bound = _BoundOpenAIStructured(
-        adapter=adapter, request=request, response_format=_StructuredReport
+        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
 
     async def scenario() -> None:
@@ -1551,7 +1554,7 @@ def test_both_structured_request_paths_send_the_text_parameter(
     request that omitted its schema.
     """
     adapter = _adapter()
-    request = adapter._request(_binding(automatic_prompt_caching=True))
+    precomputed_fields = adapter._precompute_fields(_binding(automatic_prompt_caching=True))
     texts: list[object] = []
 
     async def fake_create(**request_kwargs: object) -> OpenAIResponse:
@@ -1569,7 +1572,7 @@ def test_both_structured_request_paths_send_the_text_parameter(
     monkeypatch.setattr(adapter.client.responses, "create", fake_create)
     monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
     structured_bound = _BoundOpenAIStructured(
-        adapter=adapter, request=request, response_format=_StructuredReport
+        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
 
     async def scenario() -> None:
@@ -1727,7 +1730,7 @@ def test_wire_input_sends_every_mark_without_a_client_side_cap() -> None:
 
 def test_request_system_parts_become_a_developer_input_message() -> None:
     """A parts system_prompt travels as a developer-role input message; instructions stays unset."""
-    request = _adapter()._request(
+    precomputed_fields = _adapter()._precompute_fields(
         _binding(
             automatic_prompt_caching=True,
             system_prompt=(
@@ -1736,8 +1739,8 @@ def test_request_system_parts_become_a_developer_input_message() -> None:
             ),
         )
     )
-    assert request.instructions is None
-    assert request.input_prefix == [
+    assert precomputed_fields.instructions is None
+    assert precomputed_fields.input_prefix == [
         {
             "role": "developer",
             "content": [
@@ -1754,9 +1757,11 @@ def test_request_system_parts_become_a_developer_input_message() -> None:
 
 def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> None:
     """A str system_prompt keeps the instructions mapping and sends no prefix item."""
-    request = _adapter()._request(_binding(automatic_prompt_caching=True, system_prompt="sys"))
-    assert request.instructions == "sys"
-    assert request.input_prefix == []
+    precomputed_fields = _adapter()._precompute_fields(
+        _binding(automatic_prompt_caching=True, system_prompt="sys")
+    )
+    assert precomputed_fields.instructions == "sys"
+    assert precomputed_fields.input_prefix == []
 
 
 def _conformance_output() -> list[object]:

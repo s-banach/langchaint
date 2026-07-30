@@ -129,9 +129,10 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
 """Cataloged models accepting the prompt_cache_options request parameter.
 
 openai documents the parameter as gpt-5.6-and-later (openai 2.45.0), and it is what carries a
-binding's automatic_prompt_caching False to the wire, so a model absent here keeps caching under
-either binding value. At the OPENAI_PRICING rates that costs nothing: every model absent here
-bills zero for a cache write and reads cached input below its uncached rate.
+binding's automatic_prompt_caching False to the wire, so binding False on a model absent here
+raises instead of sending a parameter the model does not take.
+Bind True on those models: every one of them bills zero for a cache write and reads cached input
+below its uncached rate, so leaving the provider's automatic caching in place costs nothing.
 Held apart from those rates rather than derived from them, because a price and a parameter's
 availability are two facts openai can change independently.
 """
@@ -211,9 +212,8 @@ def openai_bedrock_model(
     supports_prompt_cache_options is required for the same absence of a catalog: it says whether
     the model takes the prompt_cache_options request parameter, which openai documents as
     gpt-5.6-and-later (openai 2.45.0), and no Bedrock id maps to that boundary here.
-    False leaves the parameter unsent, so the model keeps caching under either binding value;
-    pass False only where the pricing beside it charges nothing for a cache write, since otherwise
-    a caller binding automatic_prompt_caching False pays for the caching they declined.
+    False makes bind raise for a binding that declines caching, the parameter that would carry it
+    being one the model does not take.
     client None constructs AsyncBedrockOpenAI(aws_region=aws_region)
     (None resolves the region from the AWS credential chain).
     There is no http_client parameter, because the Bedrock Responses API has one client class,

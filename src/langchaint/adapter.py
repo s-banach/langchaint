@@ -233,10 +233,8 @@ class Binding:
     so a Sequence[Message] without marked parts caches nothing and pays no cache writes.
     Under either value, a part with cache_breakpoint True adds a breakpoint at exactly that boundary,
     so False plus marked parts is the fully user-specified caching configuration.
-    On openai, False reaches the wire only through an adapter built with supports_prompt_cache_options True,
-    which openai documents as gpt-5.6 and later; on any other model the parameter is unsent
-    and the provider's implicit caching stays in place whatever this value says.
-    Older openai models cache automatically with free writes, so False buys nothing on them; bind True.
+    On openai, False requires an adapter built with supports_prompt_cache_options True,
+    which openai documents as gpt-5.6 and later; on any other model it raises at bind time.
     """
 
 
@@ -733,6 +731,10 @@ class Adapter(ABC):
         """Bind for plain-text output.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
+
+        Raises:
+            ValueError: the binding asks for something this adapter's model cannot be sent,
+                which is a defect to report before any request rather than a request to spend.
         """
         ...
 
@@ -747,6 +749,10 @@ class Adapter(ABC):
         for the same reason. Every other turn that yields no instance is a NoOutputOutcome member.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
+
+        Raises:
+            ValueError: the binding asks for something this adapter's model cannot be sent,
+                which is a defect to report before any request rather than a request to spend.
         """
         ...
 

@@ -46,6 +46,7 @@ from openai.types.responses.response_usage import InputTokensDetails, OutputToke
 from pydantic import BaseModel
 
 from langchaint import (
+    LLM,
     AssistantMessage,
     ImagePart,
     InferenceParams,
@@ -646,17 +647,15 @@ def test_request_assembles_the_reasoning_object_key_by_key(
     [
         (True, False, {"mode": "explicit"}),
         (True, True, None),
-        (False, False, None),
         (False, True, None),
     ],
     ids=[
         "supported_and_caching_disabled",
         "supported_and_caching_automatic",
-        "unsupported_and_caching_disabled",
         "unsupported_and_caching_automatic",
     ],
 )
-def test_request_sends_explicit_mode_only_to_a_model_that_takes_it_with_caching_disabled(
+def test_request_sends_explicit_mode_exactly_when_the_binding_declines_caching(
     expected_options: dict[str, str] | None,
     *,
     supports_prompt_cache_options: bool,
@@ -664,8 +663,9 @@ def test_request_sends_explicit_mode_only_to_a_model_that_takes_it_with_caching_
 ) -> None:
     """Explicit mode with no breakpoints is the one prompt_cache_options value langchaint sends.
 
-    Every other row leaves the omit sentinel, so nothing reaches the wire: a model that does not
-    take the parameter gets none under either binding value.
+    Bound True leaves the omit sentinel whatever the model takes, so the provider's implicit caching
+    stays in place. The fourth combination, bound False on a model that takes no parameter, has no
+    row here because it raises instead of building fields.
     """
     precomputed_fields = _adapter(
         supports_prompt_cache_options=supports_prompt_cache_options
@@ -674,6 +674,26 @@ def test_request_sends_explicit_mode_only_to_a_model_that_takes_it_with_caching_
         assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
     else:
         assert precomputed_fields.prompt_cache_options == expected_options
+
+
+def test_declining_caching_on_a_model_without_the_parameter_raises() -> None:
+    """A model taking no prompt_cache_options cannot be told to stop caching, so bind refuses."""
+    with pytest.raises(ValueError, match="supports_prompt_cache_options"):
+        _adapter(supports_prompt_cache_options=False)._precompute_fields(
+            _binding(automatic_prompt_caching=False)
+        )
+
+
+def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
+    """LLM.bind raises, so one bad configuration fails once rather than per item in a batch.
+
+    bind converts eagerly, so this asserts the raise is not deferred to a request method, where a
+    generate_many would send one doomed request per item and return one failure row per item.
+    The match names the model, which is what tells a caller with several LLMs which one refused.
+    """
+    llm = LLM(_adapter(supports_prompt_cache_options=False))
+    with pytest.raises(ValueError, match="model 'm'"):
+        llm.bind(automatic_prompt_caching=False)
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:

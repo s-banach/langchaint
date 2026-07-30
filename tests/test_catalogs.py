@@ -100,8 +100,8 @@ implementation and pass however that set were edited.
 def test_the_prompt_cache_options_expectations_cover_the_catalog() -> None:
     """Every cataloged model has an expected value, so adding one to OPENAI_PRICING fails here.
 
-    Without this, a new model reaches openai_model untested and silently takes the absent-model
-    branch, sending no caching parameter however openai prices or documents it.
+    Without this, a new model reaches openai_model untested and takes the absent-model branch,
+    where bind(automatic_prompt_caching=False) raises for a model that accepts the parameter.
     """
     assert set(_PROMPT_CACHE_OPTIONS_SUPPORT) == set(OPENAI_PRICING)
 
@@ -112,8 +112,8 @@ def test_openai_model_wires_prompt_cache_options_support(
 ) -> None:
     """openai_model reads the flag from PROMPT_CACHE_OPTIONS_MODELS, gpt-5.6 and later.
 
-    A model dropped from that set, or misspelled in it, fails here instead of silently sending
-    no caching parameter for a model that takes one.
+    A model dropped from that set, or misspelled in it, fails here instead of at every bind that
+    declines caching on a model taking the parameter.
     """
     llm = openai_model(model, client=AsyncOpenAI(api_key="offline"))
     adapter = llm.adapter
@@ -126,8 +126,8 @@ def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported
     """The caller's value reaches the adapter, no Bedrock id being cataloged to derive it from.
 
     Both values are asserted because forwarding is the whole contract here: an implementation
-    hardcoding either one satisfies every other Bedrock test, and hardcoding False would leave a
-    caller who asked to stop caching paying for it on a model that bills cache writes.
+    hardcoding either one satisfies every other Bedrock test, and hardcoding False would refuse
+    every binding that declines caching.
     """
     llm = openai_bedrock_model(
         "openai.gpt-oss-120b-1:0",

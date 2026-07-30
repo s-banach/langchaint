@@ -19,11 +19,10 @@ Verified against openai 2.45.0:
   implicit mode writes up to the latest three explicit breakpoints and explicit mode up to the
   latest four, older marks staying readable for matching; and `ttl` takes "30m" as its only value,
   so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
-  The adapter sends the parameter only when the binding sets automatic_prompt_caching False and the
-  constructor's supports_prompt_cache_options is True; bound True,
+  The adapter sends the parameter when the binding sets automatic_prompt_caching False; bound True,
   the provider's implicit caching is left in place and nothing is sent.
-  A model that predates the parameter therefore has no way to turn caching off and gets no caching
-  parameter at all, which keeps automatic_prompt_caching a binding parameter every model accepts.
+  On a model whose supports_prompt_cache_options is False, a binding that declines caching raises at
+  bind time, the parameter that would carry it being one the model does not take.
 - A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
   under either binding value, and the adapter sends every mark and caps nothing,
   the per-request write limits above being the API's to apply.
@@ -839,17 +838,17 @@ class OpenAIResponsesAdapter(Adapter):
 
         supports_prompt_cache_options says whether the model accepts the prompt_cache_options
         request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
-        False leaves the parameter unsent under either binding value, so a model that cannot be
-        told to stop caching is sent no caching parameter instead of one it does not document,
-        and automatic_prompt_caching stays a binding parameter every model accepts.
-        It has no default because a wrong value is silent either way: True on a model without the
-        parameter risks a rejected request, False on one with it leaves caching running for a
-        caller who declined it, at whatever that model charges for it. openai_model reads the
-        value from PROMPT_CACHE_OPTIONS_MODELS; openai_bedrock_model requires it from its own
-        caller, having no catalog of Bedrock ids to read. It is a parameter here rather than a
-        lookup on model because model is a str whose namespace this adapter cannot know: it
-        serves the platforms provider_name_by_client_class maps and every OpenAI-compatible
-        endpoint a base AsyncOpenAI's base_url reaches.
+        That parameter is the only thing that carries automatic_prompt_caching False to the wire,
+        so False here makes bind raise for a binding that declines caching, rather than cache
+        anyway at whatever that model charges for it.
+        It has no default because a wrong value fails either way: True on a model without the
+        parameter risks a rejected request, and False on one with it refuses a binding the model
+        would have accepted.
+        openai_model reads the value from PROMPT_CACHE_OPTIONS_MODELS; openai_bedrock_model
+        requires it from its own caller, having no catalog of Bedrock ids to read.
+        It is a parameter here rather than a lookup on model because model is a str whose namespace
+        this adapter cannot know: it serves the platforms provider_name_by_client_class maps and
+        every OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.
 
         pricing holds one table per service tier this adapter can price, keyed by what a response
         reports, and a response served at a tier absent from it costs NaN. The "default" key is
@@ -883,7 +882,19 @@ class OpenAIResponsesAdapter(Adapter):
         which the SDK documents as "a system (or developer) message inserted into the model's context".
         A parts system_prompt travels as that message itself, a developer-role input message
         first in every request's input, because only input message parts carry prompt_cache_breakpoint.
+
+        Raises:
+            ValueError: the binding declines automatic caching on a model built with
+                supports_prompt_cache_options False.
         """
+        if not binding.automatic_prompt_caching and not self.supports_prompt_cache_options:
+            raise ValueError(
+                f"model {self.model!r} was built with supports_prompt_cache_options False, "
+                "so prompt_cache_options is never sent. "
+                "prompt_cache_options is what carries automatic_prompt_caching False to the wire. "
+                "Bind automatic_prompt_caching=True, or set supports_prompt_cache_options True "
+                "if the model accepts it."
+            )
         instructions: str | None = None
         input_prefix: list[ResponseInputItemParam] = []
         if isinstance(binding.system_prompt, str):
@@ -924,9 +935,7 @@ class OpenAIResponsesAdapter(Adapter):
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             prompt_cache_options=(
-                PromptCacheOptions(mode="explicit")
-                if self.supports_prompt_cache_options and not binding.automatic_prompt_caching
-                else omit
+                omit if binding.automatic_prompt_caching else PromptCacheOptions(mode="explicit")
             ),
             service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],
@@ -935,14 +944,20 @@ class OpenAIResponsesAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O."""
+        """Bind for plain-text output; pure conversion, no I/O.
+
+        Propagates _precompute_fields' ValueError for a binding this adapter's model cannot be sent.
+        """
         return _BoundOpenAIText(adapter=self, precomputed_fields=self._precompute_fields(binding))
 
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O."""
+        """Bind for structured output validated into response_format; pure conversion, no I/O.
+
+        Propagates _precompute_fields' ValueError for a binding this adapter's model cannot be sent.
+        """
         return _BoundOpenAIStructured(
             adapter=self,
             precomputed_fields=self._precompute_fields(binding),

@@ -301,6 +301,11 @@ class LLM:
         automatic_prompt_caching has no default: caching changes billing,
         so langchaint never chooses a caching configuration for the caller.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
+
+        Raises:
+            ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
+                prompt. Also raised by the adapter for a binding its model cannot be sent, which is
+                where an automatic_prompt_caching the model cannot honor is refused.
         """
         binding = _build_binding(
             system_prompt=system_prompt,
@@ -503,6 +508,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         so measure it on the deployment you ship on.
         langchaint owns no cache-safety matrix over this.
         A matrix carried in the code goes stale the moment a provider changes a model.
+
+        Raises:
+            ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
+                prompt. Also raised by the adapter for a binding its model cannot be sent, which is
+                where an automatic_prompt_caching the model cannot honor is refused.
         """
         new_tool_manager = (
             self.tool_manager if isinstance(tool_manager, Unchanged) else tool_manager

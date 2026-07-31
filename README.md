@@ -79,6 +79,10 @@ One instance shared by several `LLM`s is one budget for the account they hit.
 
 **Tools under one protocol.**
 `PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` share the `Tool` protocol.
+Use `@tool(description=...)` for an async function with one `BaseModel` parameter.
+The parameter annotation supplies `args_model`.
+`name` defaults to `function.__name__`; pass `name` to override it.
+Construct `PydanticTool(...)` directly when its fields come from runtime data.
 One `ToolManager` holds a mix, and an application adds its own form by implementing `Tool`.
 
 **Reasoning preserved across turns.**

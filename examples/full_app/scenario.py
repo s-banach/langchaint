@@ -14,7 +14,7 @@ from events import current_gui_emitter
 from harness import Turn, call
 from pydantic import BaseModel
 
-from langchaint import PydanticTool, ToolOutputExplicit, Usage
+from langchaint import PydanticTool, ToolOutputExplicit, Usage, tool
 
 SEARCH_USAGE = Usage(
     input_tokens_cache_read=0,
@@ -48,7 +48,8 @@ class DelegateArgs(BaseModel):
     question: str
 
 
-async def search(args: SearchArgs) -> ToolOutputExplicit[Usage]:
+@tool(description="Search the corpus for a query.", name="search")
+async def search_tool(args: SearchArgs) -> ToolOutputExplicit[Usage]:
     """Return a canned result and report what the call spent as a Usage through app_data.
 
     content is what the model reads; the Usage rides to the loop, which folds it into the run total.
@@ -95,6 +96,7 @@ def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
     """
     pending_rejections = [_FIRST_VERDICT]
 
+    @tool(description="Critique a draft; return approval or a revision instruction.")
     async def critique(args: CritiqueArgs) -> ToolOutputExplicit[CritiqueVerdict]:  # noqa: ARG001  # the verdict is scripted, so the draft is deliberately unread
         """Hand out the next scripted verdict, driving one revision then approval.
 
@@ -107,20 +109,7 @@ def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
             )
         return ToolOutputExplicit(content="approved", app_data=CritiqueVerdict(approved=True))
 
-    return PydanticTool(
-        name="critique",
-        description="Critique a draft; returns 'approved' or a revision instruction.",
-        args_model=CritiqueArgs,
-        function=critique,
-    )
-
-
-search_tool = PydanticTool(
-    name="search",
-    description="Search the corpus for a query.",
-    args_model=SearchArgs,
-    function=search,
-)
+    return critique
 
 
 class SubAgentError(Exception):

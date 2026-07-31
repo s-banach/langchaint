@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from langchaint import Message, PydanticTool, UserMessage
+from langchaint import Message, UserMessage, tool
 from langchaint.openai import openai_model
 from langchaint.tracing import TracedLLM, TracedToolManager
 
@@ -13,6 +13,7 @@ class WeatherArgs(BaseModel):
     city: str
 
 
+@tool(description="Return the current weather for a city.")
 async def get_weather(args: WeatherArgs) -> str:
     """Return a canned weather report."""
     return f"It is 18C and clear in {args.city}."
@@ -27,15 +28,9 @@ async def traced_tool_turn() -> str:
     """
     # capture_message_content has no default: False keeps message content off the spans.
     traced = TracedLLM(openai_model("gpt-5.6-terra"), capture_message_content=False)
-    weather_tool = PydanticTool(
-        name="get_weather",
-        description="Return the current weather for a city.",
-        args_model=WeatherArgs,
-        function=get_weather,
-    )
     bound = traced.bind(
         system_prompt="Use tools to answer the user's question.",
-        tool_manager=TracedToolManager([weather_tool], capture_message_content=False),
+        tool_manager=TracedToolManager([get_weather], capture_message_content=False),
         automatic_prompt_caching=False,
     )
 

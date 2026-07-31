@@ -8,6 +8,7 @@ while every function exception (including a function-internal ValidationError) p
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from typing import assert_type
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -34,6 +35,7 @@ from langchaint import (
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
+    tool,
 )
 from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
 
@@ -54,6 +56,42 @@ class _EchoArgs(BaseModel):
 async def _echo_function(args: _EchoArgs) -> str:
     """Return the validated text unchanged."""
     return args.text
+
+
+@tool(description="Echo the text without reading this function's docstring.")
+async def _decorated_echo(args: "_EchoArgs") -> str:
+    """Describe implementation behavior that the provider must not receive."""
+    return args.text
+
+
+class _EchoRecord(BaseModel):
+    """Application data produced beside an echo result."""
+
+    text: str
+
+
+@tool(description="Echo the text and build a later-defined record.")
+async def _decorated_later_return(
+    args: _EchoArgs,
+) -> "ToolOutputExplicit[_LaterEchoRecord]":
+    """Return application data whose class follows this function."""
+    return ToolOutputExplicit(content=args.text, app_data=_LaterEchoRecord(text=args.text))
+
+
+class _LaterEchoRecord(BaseModel):
+    """Application data defined after its producing function."""
+
+    text: str
+
+
+class _MissingAttributeNamespace:
+    """Provide a namespace without the annotation test's requested attribute."""
+
+
+@tool(description="Echo the text and record it.", name="record_echo")
+async def _decorated_record_echo(args: _EchoArgs) -> ToolOutputExplicit[_EchoRecord]:
+    """Return model content and application data."""
+    return ToolOutputExplicit(content=args.text, app_data=_EchoRecord(text=args.text))
 
 
 async def _validation_error_function(args: _EchoArgs) -> str:
@@ -81,6 +119,82 @@ def test_schema_converts_name_description_and_args_schema() -> None:
     assert schema.description == "Echo the text back."
     assert schema.args_schema == _EchoArgs.model_json_schema()
     assert ToolManager([_echo_tool()]).schemas() == (schema,)
+
+
+def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
+    """Verify tool reads the parameter annotation, function name, and explicit description."""
+    assert_type(_decorated_echo, PydanticTool[_EchoArgs, None])
+    assert_type(_decorated_record_echo, PydanticTool[_EchoArgs, _EchoRecord])
+    assert_type(_decorated_later_return, PydanticTool[_EchoArgs, _LaterEchoRecord])
+    assert _decorated_echo.name == "_decorated_echo"
+    assert (
+        _decorated_echo.description == "Echo the text without reading this function's docstring."
+    )
+    assert _decorated_echo.args_model is _EchoArgs
+    assert _decorated_echo.schema().args_schema == _EchoArgs.model_json_schema()
+    assert _decorated_record_echo.name == "record_echo"
+    outcome = asyncio.run(
+        _decorated_record_echo.dispatch(
+            ToolCall(id="call_decorated", name="record_echo", args_json='{"text":"tide"}')
+        )
+    )
+    assert isinstance(outcome, DispatchHandled)
+    assert outcome.app_data == _EchoRecord(text="tide")
+
+
+def test_tool_decorator_resolves_quoted_local_args_model() -> None:
+    """Verify tool resolves its parameter annotation from the decorator's local namespace."""
+
+    class _LocalArgs(BaseModel):
+        """Arguments defined in the decorator's local namespace."""
+
+        text: str
+
+    @tool(description="Echo locally defined arguments.")
+    async def _local_echo(args: "_LocalArgs") -> str:
+        return args.text
+
+    assert_type(_local_echo, PydanticTool[_LocalArgs, None])
+    assert _local_echo.args_model is _LocalArgs
+
+
+def test_tool_decorator_rejects_invalid_function_shapes() -> None:
+    """Verify tool rejects functions PydanticTool cannot call with one validated BaseModel."""
+
+    def _sync(args: _EchoArgs) -> str:
+        return args.text
+
+    async def _two_parameters(args: _EchoArgs, other: _EchoArgs) -> str:
+        return args.text + other.text
+
+    async def _keyword_only(*, args: _EchoArgs) -> str:
+        return args.text
+
+    async def _plain_annotation(args: str) -> str:
+        return args
+
+    # pyrefly: ignore[implicit-any-parameter]
+    async def _missing_annotation(args) -> str:  # noqa: ANN001
+        return str(args)
+
+    async def _missing_attribute_annotation(
+        args: "_MissingAttributeNamespace.Missing",  # pyrefly: ignore[missing-attribute]
+    ) -> str:
+        return str(args)
+
+    decorator = tool(description="Invalid test function.")
+    with pytest.raises(TypeError, match="must be async"):
+        decorator(_sync)  # pyrefly: ignore[bad-argument-type]
+    with pytest.raises(TypeError, match="exactly one parameter"):
+        decorator(_two_parameters)  # pyrefly: ignore[bad-argument-type]
+    with pytest.raises(TypeError, match="positionally"):
+        decorator(_keyword_only)  # pyrefly: ignore[bad-argument-type]
+    with pytest.raises(TypeError, match="BaseModel subclass"):
+        decorator(_plain_annotation)
+    with pytest.raises(TypeError, match="BaseModel subclass"):
+        decorator(_missing_annotation)
+    with pytest.raises(TypeError, match="annotation could not resolve"):
+        decorator(_missing_attribute_annotation)
 
 
 def test_validate_and_run_returns_the_function_result() -> None:

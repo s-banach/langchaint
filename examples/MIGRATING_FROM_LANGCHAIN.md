@@ -10,7 +10,7 @@ It has no chains, no runnables, no middleware stack, and no agent class.
 | `ChatOpenAI(...)`, `init_chat_model(...)` | `openai_model("gpt-5.6-terra")` (or `anthropic_model("claude-sonnet-5")`), returns an `LLM` |
 | `model.invoke(messages)` | `llm.bind(...).generate_one(messages)`, returns a `Response` |
 | `model.ainvoke(...)` | `generate_one` is already async; there is no sync API |
-| `model.bind_tools([...])` | `llm.bind(tool_manager=ToolManager([PydanticTool(...)]))` |
+| `model.bind_tools([...])` | decorate `get_weather` with `@tool(description=...)`, then pass `ToolManager([get_weather])` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
 | `model.batch([...])`, `model.abatch([...])` | `bound.generate_many([...])`, returns `list[Response \| GenerationError]` |
 | `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)` gives a handle: iterate `str \| ReasoningDelta \| ToolCall`, then `await handle.final()` for the `Response` |

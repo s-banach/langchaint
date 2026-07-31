@@ -19,15 +19,17 @@ stop, route, escalate, and needs-approval are decisions the application makes in
 reading app_data or is_error.
 The application owns that loop and langchaint ships no agent loop of its own,
 so a control-flow return channel (a goto or an engine-state update smuggled through a tool's return value) is forbidden.
-No signature introspection and no docstring scraping: name, description, and schema are explicit.
+The tool decorator reads one parameter annotation and function.__name__.
+Every description remains explicit; no docstring supplies provider-facing text.
 An args_model's docstring and field descriptions reach the provider inside its model_json_schema().
 """
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeIs
 
 import jsonschema.exceptions
 import jsonschema.protocols
@@ -285,6 +287,99 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         except InvalidToolArgsError as error:
             return _invalid_args_outcome(call, _details_from_pydantic(error.validation_error))
         return _handled_outcome(call, await self.function(args))
+
+
+def _is_matching_args_model[ArgsT: BaseModel, AppDataT](
+    annotation: object,
+    _function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]],
+) -> TypeIs[type[ArgsT]]:
+    """Check whether annotation reifies function's statically inferred ArgsT."""
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _ToolDecorator:
+    """Build a PydanticTool from one function and explicit provider-facing metadata."""
+
+    description: str
+    name: str | None
+
+    def __call__[ArgsT: BaseModel, AppDataT = None](
+        self,
+        function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]],
+    ) -> PydanticTool[ArgsT, AppDataT]:
+        """Resolve args_model without reading the return annotation.
+
+        Raises:
+            TypeError: function is not async, has another parameter shape, or lacks a BaseModel annotation.
+        """
+        if not inspect.isfunction(function):
+            raise TypeError("@tool must decorate a function")
+        if not inspect.iscoroutinefunction(function):
+            raise TypeError(f"@tool function {function.__name__!r} must be async")
+        try:
+            signature = inspect.signature(function)
+        except (TypeError, ValueError) as error:
+            raise TypeError(f"@tool could not inspect function {function.__name__!r}") from error
+        parameters = tuple(signature.parameters.values())
+        if len(parameters) != 1:
+            raise TypeError(
+                f"@tool function {function.__name__!r} must have exactly one parameter"
+            )
+        parameter = parameters[0]
+        if parameter.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            raise TypeError(
+                f"@tool function {function.__name__!r} must accept its parameter positionally"
+            )
+        args_model: object = parameter.annotation
+        if isinstance(args_model, str):
+            resolved_annotations: set[str] = set()
+            decorator_frame = inspect.currentframe()
+            if decorator_frame is None or decorator_frame.f_back is None:
+                local_namespace = function.__globals__
+            else:
+                local_namespace = decorator_frame.f_back.f_locals
+            del decorator_frame
+            try:
+                while isinstance(args_model, str):
+                    if args_model in resolved_annotations:
+                        break
+                    resolved_annotations.add(args_model)
+                    args_model = eval(args_model, function.__globals__, local_namespace)
+            except Exception as error:
+                raise TypeError(
+                    f"@tool function {function.__name__!r} parameter {parameter.name!r} "
+                    "annotation could not resolve"
+                ) from error
+            if isinstance(args_model, str):
+                raise TypeError(
+                    f"@tool function {function.__name__!r} parameter {parameter.name!r} "
+                    "annotation could not resolve"
+                )
+        if not _is_matching_args_model(args_model, function):
+            raise TypeError(
+                f"@tool function {function.__name__!r} parameter {parameter.name!r} "
+                "must be annotated with a BaseModel subclass"
+            )
+        return PydanticTool(
+            name=function.__name__ if self.name is None else self.name,
+            description=self.description,
+            args_model=args_model,
+            function=function,
+        )
+
+
+def tool(*, description: str, name: str | None = None) -> _ToolDecorator:
+    """Decorate one async function as a PydanticTool.
+
+    Args:
+        description: Provider-facing purpose.
+        name: ToolSchema.name. None uses function.__name__.
+    """
+    return _ToolDecorator(description=description, name=name)
 
 
 @dataclass(frozen=True, kw_only=True)

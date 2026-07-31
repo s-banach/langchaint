@@ -4,12 +4,12 @@ from pydantic import BaseModel
 
 from langchaint import (
     Message,
-    PydanticTool,
     ToolCall,
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
     UserMessage,
+    tool,
 )
 from langchaint.openai import openai_model
 
@@ -27,19 +27,12 @@ class ApiFee(BaseModel):
     fee_in_usd: float
 
 
+@tool(description="Return the current weather for a city.")
 async def get_weather(args: WeatherArgs) -> ToolOutputExplicit[ApiFee]:
     """Report the weather to the model, and the lookup's fee to the application."""
     return ToolOutputExplicit(
         content=f"It is 18C and clear in {args.city}.", app_data=ApiFee(fee_in_usd=0.01)
     )
-
-
-weather_tool = PydanticTool(
-    name="get_weather",
-    description="Return the current weather for a city.",
-    args_model=WeatherArgs,
-    function=get_weather,
-)
 
 
 def approve_or_deny(call: ToolCall) -> ToolMessage | None:
@@ -62,7 +55,7 @@ async def run_agent(
     """
     bound = openai_model("gpt-5.6-terra").bind(
         system_prompt="Use tools to answer the user's question.",
-        tool_manager=ToolManager([weather_tool]),
+        tool_manager=ToolManager([get_weather]),
         automatic_prompt_caching=True,
     )
 

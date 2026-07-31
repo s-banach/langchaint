@@ -6,10 +6,10 @@ from langchaint import (
     CaptureTool,
     DispatchCaptured,
     Message,
-    PydanticTool,
     SpecificToolChoice,
     ToolManager,
     UserMessage,
+    tool,
 )
 from langchaint.openai import openai_model
 
@@ -27,6 +27,7 @@ class FinalResponse(BaseModel):
     sources: list[str]
 
 
+@tool(description="Search the corpus for a topic.")
 async def search(args: SearchArgs) -> str:
     """Return what the model reads as the search result."""
     return f"Three sources discuss {args.query}."
@@ -44,16 +45,10 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
         description="Submit your final structured answer. Call this exactly once, when you are done.",
         args_model=FinalResponse,
     )
-    search_tool = PydanticTool(
-        name="search",
-        description="Search the corpus for a topic.",
-        args_model=SearchArgs,
-        function=search,
-    )
     # "required" forces some tool call on every turn.
     bound = openai_model("gpt-5.6-terra").bind(
         system_prompt="Research the question, then submit final_response.",
-        tool_manager=ToolManager([search_tool, final_response_tool]),
+        tool_manager=ToolManager([search, final_response_tool]),
         tool_choice="required",
         automatic_prompt_caching=True,
     )

@@ -87,6 +87,7 @@ from langchaint import (
     ToolOutputExplicit,
     Usage,
     UserMessage,
+    tool,
 )
 from langchaint.tracing import TracedBoundLLM, TracedLLM, TracedToolManager, agent_span
 
@@ -554,6 +555,7 @@ def build_delegate_tool(
     """
     spawn_counter = itertools.count()
 
+    @tool(description="Delegate a focused question to the specialist sub-agent.")
     async def delegate(args: DelegateArgs) -> ToolOutputExplicit[None]:
         """Run the specialist to its answer; its spend is already on its log.
 
@@ -592,12 +594,7 @@ def build_delegate_tool(
             )
         return ToolOutputExplicit(content=answer, app_data=None)
 
-    return PydanticTool(
-        name="delegate",
-        description="Delegate a focused question to the specialist sub-agent.",
-        args_model=DelegateArgs,
-        function=delegate,
-    )
+    return delegate
 
 
 class App:

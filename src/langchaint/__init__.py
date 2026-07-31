@@ -8,6 +8,7 @@ The adapter-author contract stays in langchaint.adapter.
 Internal helpers (Admission, Backoff, SequenceNotStr) are importable but off __all__.
 Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
 schema() returns, are on __all__: both appear in signatures application code writes against.
+The tool decorator builds PydanticTool from an async function's parameter annotation.
 """
 
 from langchaint.adapter import (
@@ -82,6 +83,7 @@ from langchaint.tools import (
     ToolOutput,
     ToolOutputExplicit,
     ToolSchema,
+    tool,
 )
 from langchaint.usage import ZERO_USAGE, Usage
 
@@ -156,4 +158,5 @@ __all__ = [
     "UserMessage",
     "category_cost",
     "to_tables",
+    "tool",
 ]

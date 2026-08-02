@@ -115,13 +115,12 @@ class ReasoningTrace(CheckedCopyModel):
     model_dump(mode="python", exclude_none=True), and the consuming adapter re-feeds that dict
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
     thinking block; OpenAI re-reads encrypted_content).
-    Only the producing provider can accept the dict: replaying it through another provider is a
-    malformed request that provider rejects, so switching providers means first rebuilding
-    concluded assistant turns without their traces.
-    Full reasoning history is the default, and editing the Sequence[Message] is the only way to change it:
-    trimming is the application's job, done by rebuilding concluded assistant turns without their traces;
-    a turn whose tool calls still await results must keep its reasoning,
-    and there is no bind-time on/off parameter because it would be redundant with that edit.
+    Replaying a trace through another provider is a malformed request that provider rejects.
+    Switching providers therefore means first rebuilding assistant turns without their traces.
+    Full reasoning history is the default; editing the Sequence[Message] is the only way to change it.
+    Trimming is the application's job.
+    Trimming for length removes whole turns; a kept turn keeps its traces.
+    The anthropic API 400s a tool-use continuation missing the latest assistant turn's thinking.
     Beyond replay correctness, keeping traces matters for quality
     (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
     and for prompt caching:

@@ -365,8 +365,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     so encrypted_content replays byte-identical.
     A trace another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
-    switching providers means first rebuilding concluded assistant turns without their traces.
+    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
     """
     items: list[ResponseInputItemParam] = []
     pending_texts: list[str] = []

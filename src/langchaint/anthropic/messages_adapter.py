@@ -433,8 +433,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
     because the API rejects a tool-use continuation whose latest thinking block was modified.
     A trace another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
-    switching providers means first rebuilding concluded assistant turns without their traces.
+    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
     An empty TextPart is skipped because the API rejects empty text blocks.
 
     Raises:

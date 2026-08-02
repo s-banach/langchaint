@@ -76,6 +76,7 @@ from langchaint.anthropic import (
     anthropic_model,
 )
 from langchaint.anthropic.messages_adapter import (
+    PARSE_FALLTHROUGH_COUNTS,
     _adapter_result,
     _AnthropicRequestParams,
     _AnthropicStream,
@@ -88,9 +89,12 @@ from langchaint.anthropic.messages_adapter import (
     _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,
+    parse_anthropic,
 )
 from langchaint.call import ResponseIdentity
 from langchaint.conformance import AdapterConformance
+from langchaint.exceptions import TransientError
+from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 
 _STANDARD_RATES = AnthropicPricingTable(
@@ -1304,17 +1308,42 @@ def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
     return anthropic.RateLimitError("rate limited", response=response, body=None)
 
 
-def test_retry_after_seconds_reads_the_headers_of_an_sdk_error_and_nothing_else() -> None:
-    """The override finds the headers on the SDK's own exception and yields None for any other.
+def test_parse_anthropic_reads_retry_after_from_the_headers_without_letting_it_pick() -> None:
+    """A retry-after header fills the verdict's retry_after and never changes which verdict.
 
-    The parsing itself is tested in tests/test_adapter.py against the shared function; what is
-    provider-specific is where the headers are found. httpx.Headers is case-insensitive, so the
-    lookup keeps working whatever case the server sent.
+    The header parsing itself is tested in tests/test_adapter.py against the shared function;
+    what is provider-specific is where the headers are found. httpx.Headers is case-insensitive,
+    so the lookup keeps working whatever case the server sent.
     """
-    adapter = _adapter()
-    assert adapter.retry_after_seconds(_rate_limit_error({"Retry-After-MS": "1500"})) == 1.5
-    assert adapter.retry_after_seconds(_rate_limit_error({})) is None
-    assert adapter.retry_after_seconds(ValueError("boom")) is None
+    assert parse_anthropic(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(
+        retry_after=1.5
+    )
+    assert parse_anthropic(_rate_limit_error({})) == PauseAll(retry_after=None)
+    bad_request = _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"})
+    assert parse_anthropic(bad_request) == DoNotRetry()
+
+
+def test_parse_anthropic_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:
+    """An unlisted status lands one tagged count; a listed status leaves the counter alone."""
+    before = dict(PARSE_FALLTHROUGH_COUNTS)
+    assert parse_anthropic(_status_error(anthropic.RateLimitError, 429)) == PauseAll(
+        retry_after=None
+    )
+    assert parse_anthropic(_status_error(anthropic.APIStatusError, 408)) == RetryThisOne(
+        retry_after=None
+    )
+    assert dict(PARSE_FALLTHROUGH_COUNTS) == before
+    assert parse_anthropic(_status_error(anthropic.APIStatusError, 599)) == RetryThisOne(
+        retry_after=None
+    )
+    tag = "status=599 type=None"
+    assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
+
+
+def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_status() -> None:
+    """A rate-limit or overload error type pauses the domain whatever status carried it."""
+    overloaded = _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error")
+    assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
@@ -1333,14 +1362,20 @@ def _status_error[ErrorT: anthropic.APIStatusError](
     error_class: type[ErrorT],
     status_code: int,
     headers: dict[str, str] | None = None,
+    error_type: str | None = None,
 ) -> ErrorT:
-    """Build one of the SDK's status exceptions around a constructed httpx response."""
+    """Build one of the SDK's status exceptions around a constructed httpx response.
+
+    error_type fills the body's error.type the way the SDK reads it onto the exception; None
+    builds the exception a non-JSON body produces, whose type attribute is None.
+    """
     response = httpx.Response(
         status_code,
         request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
         headers=headers,
     )
-    return error_class("boom", response=response, body=None)
+    body = None if error_type is None else {"error": {"type": error_type, "message": "boom"}}
+    return error_class("boom", response=response, body=body)
 
 
 def _connection_error() -> anthropic.APIConnectionError:
@@ -1812,28 +1847,24 @@ class TestAnthropicMessagesConformance(AdapterConformance):
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
         """Return the adapter's whole exception table.
 
-        Each status code is the one the SDK raises that class for, read from anthropic 0.120.0;
+        Each status code is the one the SDK raises that class for, read from anthropic 0.120.2;
         the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
         which is why the adapter reads the status rather than the exception class.
-        OverloadedError is anthropic's own overload signal and shares rate_limit with RateLimitError.
         APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
         isinstance, and RetryableError carries no response at all.
-        x-should-retry overrides the status in both directions, except on a rate-limit status, which
-        stays rate_limit whatever the header says, so the limiter's account-wide pause is still
-        armed, and on a 4xx marked final, which keeps the rejection name.
-        A 3xx and the non-SDK ValueError land on the unknown_exception default, and a 5xx the
-        provider marked final lands on declared_final; each fails the one item without a retry.
+        A status row states the name a DoNotRetry failure takes, never whether it is retried:
+        every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
+        declared_final, and any other status is unknown_exception.
+        ValueError stands in for an exception the adapter cannot place.
         """
         return {
-            _status_error(anthropic.RateLimitError, 429): "rate_limit",
-            _status_error(anthropic.OverloadedError, 529): "rate_limit",
-            _status_error(anthropic.InternalServerError, 500): "transient",
             _connection_error(): "transient",
             anthropic.APITimeoutError(
                 httpx.Request("POST", "https://api.anthropic.com")
             ): "transient",
-            _status_error(anthropic.ConflictError, 409): "transient",
             anthropic.RetryableError("middleware said retry"): "transient",
+            _status_error(anthropic.RateLimitError, 429): "invalid_request",
+            _status_error(anthropic.ConflictError, 409): "invalid_request",
             _status_error(anthropic.BadRequestError, 400): "invalid_request",
             _status_error(anthropic.AuthenticationError, 401): "invalid_request",
             _status_error(anthropic.PermissionDeniedError, 403): "invalid_request",
@@ -1841,19 +1872,63 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             _status_error(anthropic.RequestTooLargeError, 413): "invalid_request",
             _status_error(anthropic.UnprocessableEntityError, 422): "invalid_request",
             _status_error(anthropic.APIStatusError, 402): "invalid_request",
-            _status_error(anthropic.APIStatusError, 408): "transient",
-            _status_error(anthropic.InternalServerError, 503): "transient",
-            _status_error(anthropic.APIStatusError, 302): "unknown_exception",
-            _status_error(anthropic.BadRequestError, 400, {"x-should-retry": "true"}): "transient",
+            _status_error(anthropic.APIStatusError, 408): "invalid_request",
             _status_error(
                 anthropic.BadRequestError, 400, {"x-should-retry": "false"}
             ): "invalid_request",
             _status_error(
                 anthropic.InternalServerError, 500, {"x-should-retry": "false"}
             ): "declared_final",
-            _status_error(
-                anthropic.RateLimitError, 429, {"x-should-retry": "false"}
-            ): "rate_limit",
-            _status_error(anthropic.RateLimitError, 429, {"x-should-retry": "true"}): "rate_limit",
+            _status_error(anthropic.OverloadedError, 529): "unknown_exception",
+            _status_error(anthropic.InternalServerError, 500): "unknown_exception",
+            _status_error(anthropic.InternalServerError, 503): "unknown_exception",
+            _status_error(anthropic.APIStatusError, 302): "unknown_exception",
             ValueError("boom"): "unknown_exception",
+        }
+
+    @override
+    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
+        """Return the parse rows: every listed status, both defaults, both TransientError forms.
+
+        The statuses and error types come from the errors page parse_anthropic's docstring cites,
+        plus the 408 and 409 timeouts it sources from the SDK's own retry predicate;
+        the rows without an error_type exercise the exception a non-JSON body produces.
+        """
+        return {
+            _status_error(
+                anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
+            ): PauseAll(retry_after=7.0),
+            _status_error(anthropic.OverloadedError, 529, error_type="overloaded_error"): PauseAll(
+                retry_after=None
+            ),
+            _status_error(
+                anthropic.InternalServerError, 500, error_type="api_error"
+            ): RetryThisOne(retry_after=None),
+            _status_error(
+                anthropic.InternalServerError, 504, error_type="timeout_error"
+            ): RetryThisOne(retry_after=None),
+            _status_error(anthropic.APIStatusError, 408): RetryThisOne(retry_after=None),
+            _status_error(anthropic.ConflictError, 409): RetryThisOne(retry_after=None),
+            _status_error(
+                anthropic.BadRequestError, 400, error_type="invalid_request_error"
+            ): DoNotRetry(),
+            _status_error(
+                anthropic.AuthenticationError, 401, error_type="authentication_error"
+            ): DoNotRetry(),
+            _status_error(anthropic.APIStatusError, 402, error_type="billing_error"): DoNotRetry(),
+            _status_error(
+                anthropic.PermissionDeniedError, 403, error_type="permission_error"
+            ): DoNotRetry(),
+            _status_error(
+                anthropic.NotFoundError, 404, error_type="not_found_error"
+            ): DoNotRetry(),
+            _status_error(
+                anthropic.RequestTooLargeError, 413, error_type="request_too_large"
+            ): DoNotRetry(),
+            _status_error(anthropic.UnprocessableEntityError, 422): DoNotRetry(),
+            _status_error(anthropic.InternalServerError, 503): RetryThisOne(retry_after=None),
+            TransientError(
+                "throttled body", retry_after_seconds=3.0, is_rate_limit=True
+            ): PauseAll(retry_after=3.0),
+            TransientError("failed body"): RetryThisOne(retry_after=None),
         }

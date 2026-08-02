@@ -13,7 +13,7 @@ from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedro
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 
-from langchaint import LLM, RateLimiter
+from langchaint import LLM, SharedBackoff, TransientError
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
@@ -33,6 +33,7 @@ from langchaint.openai import (
     OpenAIResponsesAdapter,
     openai_bedrock_model,
     openai_model,
+    parse_openai,
 )
 
 _ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
@@ -305,18 +306,23 @@ def test_service_tier_reaches_the_adapter_from_both_first_party_constructors() -
     assert unstated.service_tier is None
 
 
-def test_rate_limiter_lands_on_the_llm() -> None:
-    """A caller-supplied RateLimiter is the LLM's; None means a fresh default."""
-    rate_limiter = RateLimiter(max_attempts=5)
+def test_shared_backoff_and_max_attempts_land_on_the_llm() -> None:
+    """A caller-supplied SharedBackoff and max_attempts are the LLM's; omitting them means the LLM defaults."""
+    shared_backoff = SharedBackoff(
+        parse=parse_openai, failure_types=(TransientError,), capacity=16
+    )
     llm = openai_model(
         "gpt-5.6-terra",
         client=AsyncOpenAI(api_key="offline"),
-        rate_limiter=rate_limiter,
+        shared_backoff=shared_backoff,
+        max_attempts=5,
     )
-    assert llm.rate_limiter is rate_limiter
+    assert llm.shared_backoff is shared_backoff
+    assert llm.max_attempts == 5
     defaulted = openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="offline"))
-    assert isinstance(defaulted.rate_limiter, RateLimiter)
-    assert defaulted.rate_limiter is not rate_limiter
+    assert isinstance(defaulted.shared_backoff, SharedBackoff)
+    assert defaulted.shared_backoff is not shared_backoff
+    assert defaulted.max_attempts == 3
 
 
 def test_reasoning_summary_lands_on_the_adapter() -> None:

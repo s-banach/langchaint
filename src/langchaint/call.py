@@ -50,7 +50,7 @@ class AttemptRecord:
     langchaint defines no time origin because it does not own the enclosing loop;
     subtract whatever origin the caller holds (an agent-loop start, another record)
     to place records on a shared timeline.
-    The bracket spans the request itself and excludes RateLimiter slot waits and backoff sleeps,
+    The bracket spans the request itself and excludes SharedBackoff admission waits and backoff sleeps,
     so a slow request is distinguishable from time spent rate limited;
     the gap between consecutive records is that wait.
     On a stream the succeeding record spans opening the stream to its exhaustion, because that is the whole request.
@@ -125,8 +125,8 @@ class CallRecord:
     started_at_monotonic_seconds is a raw time.monotonic() reading, meaningful only as a difference
     and only within one process, as on AttemptRecord. It is the origin an attempt record's start is
     read against.
-    elapsed_seconds spans that stamp to the stamp the call was frozen at, RateLimiter slot waits
-    and backoff sleeps included;
+    elapsed_seconds spans that stamp to the stamp the call was frozen at, SharedBackoff admission
+    waits and backoff sleeps included;
     it is stored rather than folded from the records, because the records deliberately exclude those waits.
     model and provider_name name what served the call, which is what a caller reconciling spend
     against the provider's own billing asks about.

@@ -54,8 +54,9 @@ from langchaint.openai.responses_adapter import (
     OpenAIResponsesAdapter,
     OpenAIServiceTier,
     ReasoningSummary,
+    parse_openai,
 )
-from langchaint.rate_limiter import RateLimiter
+from langchaint.shared_backoff import SharedBackoff
 
 type OpenAIModelName = Literal[
     "gpt-5.1",
@@ -143,7 +144,8 @@ def openai_model(
     *,
     client: AsyncOpenAI | None = None,
     pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = None,
-    rate_limiter: RateLimiter | None = None,
+    shared_backoff: SharedBackoff | None = None,
+    max_attempts: int = 3,
     reasoning_summary: ReasoningSummary | None = None,
     service_tier: OpenAIServiceTier | None = None,
 ) -> LLM:
@@ -156,9 +158,9 @@ def openai_model(
     A response served at a tier this mapping does not hold costs NaN.
     Whether the model takes prompt_cache_options comes from PROMPT_CACHE_OPTIONS_MODELS,
     whose docstring gives what a model outside it does with bind(automatic_prompt_caching=False).
-    rate_limiter None means the RateLimiter defaults;
-    pass one shared instance across models on the same account to share its budget,
-    built in the same event loop as the LLMs, since one instance serves one loop.
+    shared_backoff and max_attempts have the LLM.__init__ meanings;
+    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
+    and note one instance serves one event loop.
     reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
     where the reasoning item carries no reasoning text of its own;
     None leaves the provider default in place.
@@ -168,7 +170,8 @@ def openai_model(
     the response reports none: state service_tier on such a project, or state its rates in pricing.
 
     Raises:
-        ValueError: client is an AsyncBedrockOpenAI or AsyncAzureOpenAI, raised by the adapter.
+        ValueError: max_attempts is not a positive int (from LLM.__init__), or
+            client is an AsyncBedrockOpenAI or AsyncAzureOpenAI, raised by the adapter.
             This constructor states provider_name="openai", which neither client reaches, and both
             subclass AsyncOpenAI, so the annotation alone accepts them. Reach those providers with
             openai_bedrock_model, or by building the adapter directly with the provider_name the
@@ -184,18 +187,20 @@ def openai_model(
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         ),
-        rate_limiter=rate_limiter,
+        shared_backoff=shared_backoff,
+        max_attempts=max_attempts,
     )
 
 
-def openai_bedrock_model(
+def openai_bedrock_model(  # noqa: PLR0913 (the ready-LLM constructor states every choice: client, pricing, caching, and pacing)
     model: str,
     *,
     pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
     supports_prompt_cache_options: bool,
     aws_region: str | None = None,
     client: AsyncBedrockOpenAI | None = None,
-    rate_limiter: RateLimiter | None = None,
+    shared_backoff: SharedBackoff | None = None,
+    max_attempts: int = 3,
     reasoning_summary: ReasoningSummary | None = None,
 ) -> LLM:
     """Build a ready LLM for one OpenAI model served by Bedrock, on the Responses API.
@@ -219,9 +224,9 @@ def openai_bedrock_model(
     There is no http_client parameter, because the Bedrock Responses API has one client class,
     so client=AsyncBedrockOpenAI(http_client=...) loses nothing; anthropic_bedrock_model takes one
     only because it picks between two client classes and would forgo that routing.
-    rate_limiter None means the RateLimiter defaults;
-    pass one shared instance across models on the same account to share its budget,
-    built in the same event loop as the LLMs, since one instance serves one loop.
+    shared_backoff and max_attempts have the LLM.__init__ meanings;
+    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
+    and note one instance serves one event loop.
     reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
     where the reasoning item carries no reasoning text of its own;
     None leaves the provider default in place.
@@ -230,6 +235,7 @@ def openai_bedrock_model(
         ValueError: both client and aws_region are given. A passed client already carries its
             region, so the aws_region beside it would be dropped and every request would go to
             the client's region instead, silently.
+            LLM.__init__ raises it when max_attempts is not a positive int.
             OpenAIResponsesAdapter.__init__ raises it too when pricing has no "default" key,
             which prices every response reporting no service tier; nothing merges one in here,
             because no catalog maps a Bedrock model id.
@@ -247,7 +253,8 @@ def openai_bedrock_model(
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         ),
-        rate_limiter=rate_limiter,
+        shared_backoff=shared_backoff,
+        max_attempts=max_attempts,
     )
 
 
@@ -262,4 +269,5 @@ __all__ = [
     "ReasoningSummary",
     "openai_bedrock_model",
     "openai_model",
+    "parse_openai",
 ]

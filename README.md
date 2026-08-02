@@ -6,7 +6,7 @@ Alpha: the API is unstable and may change without notice.
 ## The point
 
 langchaint is the layer between an application's own agent loop and the provider SDKs.
-Across providers it gives one message tree, one error taxonomy, one priced `Usage`, and one `RateLimiter` that owns retrying and pacing.
+Across providers it gives one message tree, one error taxonomy, one priced `Usage`, and one `SharedBackoff` that owns pacing.
 The application keeps the agent loop and states every billing-relevant choice itself, starting with prompt caching; langchaint defaults none of them.
 
 ## Install
@@ -67,8 +67,10 @@ Both carry `usage`, the paid total across every attempt.
 **Priced usage.**
 `Usage` partitions input tokens by cache outcome and carries one cost per priced category; `cost_in_usd` is their sum.
 
-**One `RateLimiter` owning retrying and pacing.**
-One instance shared by several `LLM`s is one budget for the account they hit.
+**One `SharedBackoff` owning pacing.**
+One instance is one backpressure domain for the account it guards.
+Its `admitted()` block gates every request start; a rate limit pauses the whole domain.
+`max_attempts` on the `LLM` bounds retrying.
 
 **User-stated prompt caching.**
 `automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.

@@ -1,7 +1,7 @@
 """The neutral adapter helpers, driven directly rather than through either backend.
 
-retry_after_seconds_from_headers is reached in production only through each adapter's
-retry_after_seconds override, so the adapter test modules cover the override reading its own SDK's
+retry_after_seconds_from_headers is reached in production only through parse_anthropic and
+parse_openai, so the backend test modules cover each parse reading its own SDK's
 exception. What they cannot state is the parsing itself, which is one function shared by both:
 the header precedence, the units, and which malformed value falls through to the other header.
 request_json and narrowed_request are the same shape: each adapter calls them with its own SDK's

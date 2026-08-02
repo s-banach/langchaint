@@ -117,8 +117,8 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.rate_limiter import RateLimiter
 from langchaint.response import CallResult, Response
+from langchaint.shared_backoff import SharedBackoff
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
     DispatchHandled,
@@ -922,9 +922,9 @@ class TracedLLM:
         return self._llm.adapter
 
     @property
-    def rate_limiter(self) -> RateLimiter:
-        """The wrapped LLM's RateLimiter, so an app sharing a budget never reaches for a private field."""
-        return self._llm.rate_limiter
+    def shared_backoff(self) -> SharedBackoff:
+        """The wrapped LLM's SharedBackoff, so an app sharing a domain never reaches for a private field."""
+        return self._llm.shared_backoff
 
     @overload
     def bind[ModelT: BaseModel](
@@ -1013,7 +1013,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     so a custom mapper changes attributes only, never the name, kind, or status.
     There is no langchaint.elapsed_seconds attribute:
     the span brackets the same interval elapsed_seconds measures (request start to completion,
-    RateLimiter slot waits and backoff included), so the span's own duration already carries it.
+    admission waits and backoff included), so the span's own duration already carries it.
     """
 
     def __init__(
@@ -1059,9 +1059,9 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         return self._bound_llm.tool_manager
 
     @property
-    def rate_limiter(self) -> RateLimiter:
-        """The wrapped BoundLLM's RateLimiter."""
-        return self._bound_llm.rate_limiter
+    def shared_backoff(self) -> SharedBackoff:
+        """The wrapped BoundLLM's SharedBackoff."""
+        return self._bound_llm.shared_backoff
 
     @overload
     def rebind[NewModelT: BaseModel](
@@ -1490,7 +1490,7 @@ class TracedStreamHandle[OutputT]:
 
         The value is the monotonic seconds from the span's start (__aenter__) to the first item.
         The convention defines this key as measured from request issuance;
-        the span starts one step earlier, so the value here also covers the RateLimiter slot wait
+        the span starts one step earlier, so the value here also covers the admission wait
         and any backoff before the request went out.
         That is the interval a caller waited for its first chunk, and the wider origin is stated
         so a reader comparing this against another instrumentation's value knows which way it leans.

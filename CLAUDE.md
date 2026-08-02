@@ -38,7 +38,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 
 - Never choose a billing-relevant configuration for the user: `automatic_prompt_caching` is a required keyword with no default (an unstated `False` is a billing choice as real as opting in), and any convenience on top of user-stated caching is opt-in and default-off. Honor user-placed `cache_breakpoint` marks under either binding value.
 - Leave the tool loop to the application: ship no agent loop, and make a tool function return data, never a control-flow signal.
-- Keep one `RateLimiter` owning retrying and pacing: one instance is one shared budget for the account it guards, gating every request-start path.
+- Keep one `SharedBackoff` owning pacing: one instance is one backpressure domain for the account it guards, and its `admitted()` block gates every request-start path.
 - Wrap official SDK clients and delegate stream assembly to the SDK. Write no wire TypedDicts by hand. Validate a structured response against the caller's model where the response is in scope, because an SDK that validates inside the call returning the response raises where neither the response nor its billing is reachable.
 - Give the error taxonomy one axis, retry: retry a transient error and propagate the rest. Every non-transient error is one item's failure row, so a batch returns one outcome per `GenerationInput` and no item's failure cancels a sibling. A defect langchaint can detect in a binding raises before any request is sent. Never report a parse that returned no output as data.
 - Put the provider's own error text in the error langchaint raises, unabridged: a prefix naming what failed, then the provider string. Never summarize, truncate, or replace it, because the provider's wording is the only description of a condition langchaint does not model. Keep generated content out of `error_text` and `__str__`: the tracing layer writes both into spans unconditionally, so content placed there escapes whatever `capture_message_content` the caller chose. Content a caller recovers from a failure goes on its own field.
@@ -63,7 +63,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `llm.py`: the client `LLM` and the `BoundLLM` its `bind` returns.
 - `adapter.py`: the neutral base contract, dual-audience; imports no SDK.
 - `conformance.py`: the invariants every adapter holds to, as a test class an adapter author inherits; imports no SDK and no test runner.
-- `rate_limiter.py`: retrying and pacing.
+- `shared_backoff.py`: the `SharedBackoff` backpressure domain, its `admitted()` block, the verdicts, and `PrivateBackoff`.
 - `exceptions.py`: the error vocabulary.
 - `response.py`: the generate results and their flattening to a calls table and an attempts table.
 - `call.py`: the per-call history: one attempt's record, the frozen `CallRecord` every result carries, and the ledger the retry loops drive.

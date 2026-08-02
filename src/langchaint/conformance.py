@@ -37,11 +37,12 @@ from langchaint.adapter import (
     RequestParams,
 )
 from langchaint.call import AttemptRecord, CallRecord
-from langchaint.exceptions import AbandonedCallError, StreamProtocolError
+from langchaint.exceptions import AbandonedCallError, StreamProtocolError, TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import ReasoningTrace, UserMessage
 from langchaint.pricing import Billing, category_cost
 from langchaint.response import RowValue, to_tables
+from langchaint.shared_backoff import Verdict
 from langchaint.usage import ZERO_USAGE
 
 _PLAIN_TEXT_BINDING = Binding(
@@ -167,6 +168,15 @@ class AdapterConformance(ABC):
         """Every SDK exception this adapter places, against the classification it places it as."""
         ...
 
+    @abstractmethod
+    def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
+        """Every failure row this adapter's parse maps, against the exact verdict it returns.
+
+        Cover at least one exception per verdict kind, one carrying a server-stated retry_after,
+        and one status the provider's table does not list.
+        """
+        ...
+
     def _bound_adapter(self) -> BoundAdapter[str]:
         """Bind a fresh adapter for plain text under the one binding these invariants use."""
         return self.make_adapter().bind_text(_PLAIN_TEXT_BINDING)
@@ -289,6 +299,35 @@ class AdapterConformance(ABC):
         assert adapter.classify(Exception("no adapter has seen this")) in get_args(
             ErrorClassification.__value__
         )
+
+    def test_every_listed_failure_parses_and_an_unknown_one_still_does(self) -> None:
+        """Every listed failure takes its stated verdict, and an unlisted one still gets one.
+
+        parse must return a verdict for every input without raising, statuses and error types the
+        provider adds later included: SharedBackoff turns a raise into ParserContractError, which
+        fails the request with no verdict at all.
+        """
+        adapter = self.make_adapter()
+        for failure, verdict in self.sdk_errors_and_verdicts().items():
+            assert adapter.parse(failure) == verdict
+        unknown = adapter.parse(Exception("no adapter has seen this"))
+        assert isinstance(unknown, get_args(Verdict.__value__))
+
+    def test_failure_types_names_only_exception_subclasses_and_carries_transient_error(
+        self,
+    ) -> None:
+        """failure_types members are strict Exception subclasses, and TransientError is one.
+
+        SharedBackoff rejects anything else at construction, so a violation here fails before any
+        request. TransientError is required because the retry loop raises it inside the admitted()
+        block for a billable response reporting a transient failure; an adapter without it would
+        leave those failures unrecorded.
+        """
+        adapter = self.make_adapter()
+        for failure_type in adapter.failure_types:
+            assert issubclass(failure_type, Exception)
+            assert failure_type is not Exception
+        assert TransientError in adapter.failure_types
 
     def test_the_stream_assembled_type_reads_the_same_as_the_whole_response(self) -> None:
         """One turn read off the type a stream assembles into and off a whole response agree.

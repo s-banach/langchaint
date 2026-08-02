@@ -1,14 +1,18 @@
 """The client; generation happens only through a binding.
 
-LLM composes an adapter and a RateLimiter.
+LLM composes an adapter and a SharedBackoff.
 LLM has no generate methods.
 bind() freezes everything that determines the cacheable prompt prefix,
 fixes the output type, and precomputes SDK keyword arguments once;
 the returned BoundLLM takes only the per-request GenerationInput.
 There are no per-call parameter overrides; changing parameters is rebind().
-The RateLimiter slot gates every request start on every path, retries included;
-the retry loop feeds every failure and every success back
-so a rate-limit error pauses admission account-wide until a request succeeds again.
+The SharedBackoff admitted() block gates every request start on every path, retries included,
+and one block spans one attempt.
+The retry loop raises each provider failure inside the block, so the exit parses and records it,
+and acts on the verdict the block leaves on Admission.verdict:
+a PauseAll holds every request in the domain at entry until the shared pause ends,
+a RetryThisOne waits out a PrivateBackoff between blocks,
+and a DoNotRetry becomes the item's terminal GenerationError, named by Adapter.classify.
 """
 
 import asyncio
@@ -19,11 +23,9 @@ from pydantic import BaseModel
 
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     Binding,
     BoundAdapter,
     InvalidRequest,
-    NoOutput,
     RequestParams,
     ResponseOutcome,
     ToolChoice,
@@ -36,6 +38,7 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
+    ParserContractError,
     ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
@@ -45,15 +48,19 @@ from langchaint.exceptions import (
     TransientError,
     UnfinishedTurnError,
     UnknownExceptionError,
-    _extract_transient_errors,
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
-from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import (
     CallResult,
     Response,
     _abandoned_call_error,
+)
+from langchaint.shared_backoff import (
+    Admission,
+    DoNotRetry,
+    PrivateBackoff,
+    SharedBackoff,
 )
 from langchaint.streaming import StreamHandle
 from langchaint.tools import ToolManager
@@ -225,11 +232,31 @@ class LLM:
         self,
         adapter: Adapter,
         *,
-        rate_limiter: RateLimiter | None = None,
+        shared_backoff: SharedBackoff | None = None,
+        max_attempts: int = 3,
     ) -> None:
-        """Store the shared pieces; rate_limiter None means the defaults."""
+        """Store the shared pieces.
+
+        shared_backoff None builds a private domain from the adapter's parse and failure_types,
+        at the SharedBackoff defaults with capacity 8. One instance is one backpressure domain,
+        so pass the same instance to every LLM whose requests share a provider quota.
+        max_attempts counts requests sent including the first, so 1 means no retrying.
+
+        Raises:
+            ValueError: max_attempts is not a positive non-bool int, a defect to report before
+                any request rather than a retry budget to misread.
+        """
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
         self.adapter = adapter
-        self.rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        self.shared_backoff = (
+            shared_backoff
+            if shared_backoff is not None
+            else SharedBackoff(
+                parse=adapter.parse, failure_types=adapter.failure_types, capacity=8
+            )
+        )
+        self.max_attempts = max_attempts
 
     @overload
     def bind[ModelT: BaseModel](
@@ -323,7 +350,8 @@ class LLM:
             response_format=response_format,
             binding=binding,
             tool_manager=tool_manager,
-            rate_limiter=self.rate_limiter,
+            shared_backoff=self.shared_backoff,
+            max_attempts=self.max_attempts,
         )
 
 
@@ -355,13 +383,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         response_format: type[OutputT] | None,
         binding: Binding,
         tool_manager: ToolManagerT,
-        rate_limiter: RateLimiter,
+        shared_backoff: SharedBackoff,
+        max_attempts: int,
     ) -> None:
         """Store the frozen pieces; called by LLM.bind and rebind only."""
         self.adapter = adapter
         self.binding = binding
         self.response_format = response_format
-        self.rate_limiter = rate_limiter
+        self.shared_backoff = shared_backoff
+        self.max_attempts = max_attempts
         self._bound_adapter = bound_adapter
         self._tool_manager = tool_manager
 
@@ -552,23 +582,22 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             response_format=new_response_format,
             binding=new_binding,
             tool_manager=new_tool_manager,
-            rate_limiter=self.rate_limiter,
+            shared_backoff=self.shared_backoff,
+            max_attempts=self.max_attempts,
         )
 
-    def _classified_error(
+    def _terminal_error(
         self, exc: Exception, *, ledger: _CallLedger, request: RequestParams
-    ) -> TransientError | GenerationError:
-        """Sort one attempt's exception into the error to retry or this item's terminal failure.
+    ) -> GenerationError:
+        """Name this item's terminal failure from the adapter's classification of exc.
 
-        Reached only for exceptions, which by the adapter contract are attempts the adapter read no
-        outcome from: what it did read it reports as a ResponseOutcome member, which the loop matches
-        instead. The returned TransientError carries the adapter's retry-after reading and whether
-        the error was a rate limit, the two things the limiter needs to pace the next attempt;
-        every other return is terminal for this item, and the caller raises it.
+        Reached on a DoNotRetry verdict and on an exception outside failure_types that classify
+        did not call transient, so the "transient" member cannot arrive; if a classify defect
+        produces one anyway, it lands on the unknown_exception default with everything else out
+        of place.
 
         StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
         """
-        ledger.note_request_id(self.adapter.request_id_from_error(exc))
         classification = self.adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
@@ -585,57 +614,77 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             # reports no billing, so the record bills nothing unless a response was staged.
             ledger.record(error=None, assistant_message=None)
             return ProviderDeclaredFinalError(error=exc, call=ledger.freeze(), request=request)
-        if classification == "unknown_exception":
-            return UnknownExceptionError(error=exc, call=ledger.freeze(), request=request)
-        error = TransientError(
-            str(exc),
-            retry_after_seconds=self.adapter.retry_after_seconds(exc),
-            is_rate_limit=classification == "rate_limit",
-        )
-        error.__cause__ = exc
-        return error
+        return UnknownExceptionError(error=exc, call=ledger.freeze(), request=request)
 
-    def _record_completed_attempt(
+    async def _pace_after_verdict(
         self,
-        outcome: AdapterResult[OutputT | None] | NoOutput,
+        exc: Exception,
         *,
         admission: Admission,
-        ledger: _CallLedger,
-    ) -> None:
-        """Register the completed request with the limiter and close its attempt.
-
-        error is None on every member reaching here: the request succeeded, and what the adapter
-        made of the response is the item's outcome, not this attempt's failure.
-        Called while the attempt's slot is still held, so a completed request ends the limiter's
-        recovery before anyone else is admitted. Every 200 counts as completed, including one that
-        produced no output: the provider served the request, which is what the recovery probe asks.
-        """
-        self.rate_limiter.register_success(admission)
-        ledger.record(error=None, assistant_message=outcome.assistant_message)
-
-    def _record_transient_error(
-        self,
-        error: TransientError,
-        *,
-        admission: Admission,
+        private_backoff: PrivateBackoff,
         assistant_message: AssistantMessage | None,
         ledger: _CallLedger,
-    ) -> Backoff:
-        """Close the failed attempt and register it with the limiter, while its slot is still held.
+        request: RequestParams,
+    ) -> None:
+        """Record one verdicted attempt, then wait whatever the verdict asks before the next.
 
-        admission is the failing attempt's still-held admission;
-        register_transient_error raises RuntimeError for one already released.
+        exc is a failure_types exception, so the admitted() block's exit parsed it and left the
+        verdict on admission.verdict. A verdict of None is folded into the terminal branch: the
+        exit parses every failure_types exception, so a None reaching here has no verdict to act
+        on.
+        The attempt's record carries a TransientError: exc itself when it is one, otherwise one
+        wrapping exc with the verdict's capped retry_after.
+        On RetryThisOne the wait is the PrivateBackoff's, floored by the verdict's retry_after;
+        on PauseAll there is no wait of our own, because the next admitted() entry already holds
+        until the shared pause ends. Neither waits after the last attempt.
         assistant_message is the turn a 200 the provider filled with a failure still carried, and
         None where the attempt received no response.
 
-        Returns:
-            The Backoff to sleep before the next attempt;
-            its delay is drawn once, so it equals any account-wide pause it set.
+        Raises:
+            GenerationError: the verdict is DoNotRetry; _terminal_error names which.
         """
+        ledger.note_request_id(self.adapter.request_id_from_error(exc))
+        verdict = admission.verdict
+        if verdict is None or isinstance(verdict, DoNotRetry):
+            raise self._terminal_error(exc, ledger=ledger, request=request) from exc
+        if isinstance(exc, TransientError):
+            error = exc
+        else:
+            error = TransientError(
+                str(exc),
+                retry_after_seconds=verdict.retry_after,
+                is_rate_limit=verdict.kind == "pause_all",
+            )
+            error.__cause__ = exc
         ledger.record(error=error, assistant_message=assistant_message)
-        return self.rate_limiter.register_transient_error(
-            admission, _extract_transient_errors(ledger.attempt_records)
-        )
+        if verdict.kind == "retry_this_one" and ledger.attempts < self.max_attempts:
+            await asyncio.sleep(private_backoff.next_wait(verdict.retry_after))
+
+    async def _pace_after_transport_failure(
+        self,
+        exc: Exception,
+        *,
+        private_backoff: PrivateBackoff,
+        ledger: _CallLedger,
+        request: RequestParams,
+    ) -> GenerationError | None:
+        """Record one transport failure and wait, or return the terminal error for it.
+
+        exc is outside failure_types, so it exited the admitted() block unparsed and unrecorded
+        there. classify's "transient" is a transport failure that produced nothing parseable: the
+        loop retries it alone, as RetryThisOne with no retry_after, and does not wait after the
+        last attempt. For anything else this returns the GenerationError _terminal_error names,
+        and the caller raises it so the raise sits beside the except clause that caught exc.
+        """
+        ledger.note_request_id(self.adapter.request_id_from_error(exc))
+        if self.adapter.classify(exc) != "transient":
+            return self._terminal_error(exc, ledger=ledger, request=request)
+        error = TransientError(str(exc))
+        error.__cause__ = exc
+        ledger.record(error=error, assistant_message=None)
+        if ledger.attempts < self.max_attempts:
+            await asyncio.sleep(private_backoff.next_wait(None))
+        return None
 
     def _staged_interpretation(
         self, sent: BaseModel, *, ledger: _CallLedger
@@ -668,9 +717,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         into as each attempt settles. Every GenerationError and the Response are built from
         ledger.freeze(), the one site a call's elapsed_seconds is computed.
 
-        timeout_seconds bounds this whole loop, slot waits and backoff sleeps included, and None
-        opens a scope that never expires. Expiring raises TimedOutError, whose docstring says why the
-        scope has to sit in this frame.
+        timeout_seconds bounds this whole loop, admission waits and backoff sleeps included, and
+        None opens a scope that never expires. Expiring raises TimedOutError, whose docstring says
+        why the scope has to sit in this frame.
         A cancellation from any scope but this one is the caller's own order and propagates
         untouched. expired() is what tells the two apart: a TimeoutError this scope did not raise
         came from under the loop unclassified, and re-raising it hands it to the same wrapping every
@@ -681,14 +730,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         attempts and the timing are known.
         Each arrived response is staged on the ledger with its billing before anything is read off it,
         so an exception from that read still leaves the attempt and its billing on the record.
-        Each attempt holds a RateLimiter slot for the request only;
-        backoff sleeps outside the slot so a waiting task does not hold capacity.
-        Every failure and every success is registered with the limiter while the slot is still held,
-        so a rate-limit error pauses admission account-wide before anyone else is admitted and a completed request
-        ends recovery. Every 200 counts as completed, including one that produced no output:
-        the provider served the request, which is what the recovery probe asks.
+        Each attempt spans one admitted() block, held for the request only;
+        backoff sleeps sit outside the block so a waiting task does not hold capacity.
+        Each provider failure is raised inside the block, so the exit records its verdict before
+        anyone else is admitted and a rate-limit error pauses the whole domain.
         Every attempt is timed onto an AttemptRecord whose bracket is the send only,
-        excluding the slot wait and the backoff sleep,
+        excluding the admission wait and the backoff sleep,
         so a slow request is distinguishable from time spent rate limited.
 
         Raises:
@@ -716,6 +763,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 would hit again); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
             TimedOutError: timeout_seconds expired before the call produced a result.
+            ParserContractError: the adapter's parse violated its contract on an attempt's failure.
         """
         ledger.start_call()
         timeout_scope = asyncio.timeout(timeout_seconds)
@@ -737,100 +785,86 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             GenerationError: every failure _generate_with_retries names but TimedOutError, which its
                 scope raises.
+            ParserContractError: the adapter's parse violated its contract on an attempt's failure.
         """
         built = self._bound_adapter.build_request(messages)
         if isinstance(built, InvalidRequest):
             raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
         request = built
-        while ledger.attempts < self.rate_limiter.max_attempts:
-            async with self.rate_limiter.slot() as admission:
-                ledger.start_attempt()
-                assistant_message: AssistantMessage | None = None
-                try:
-                    interpreted = self._staged_interpretation(
+        private_backoff = PrivateBackoff(self.shared_backoff)
+        while ledger.attempts < self.max_attempts:
+            admission = self.shared_backoff.admitted()
+            assistant_message: AssistantMessage | None = None
+            try:
+                async with admission:
+                    ledger.start_attempt()
+                    raw, outcome = self._staged_interpretation(
                         await self._bound_adapter.send(request), ledger=ledger
                     )
-                except TransientError as exc:
-                    ledger.note_request_id(self.adapter.request_id_from_error(exc))
-                    error: TransientError = exc
-                except Exception as exc:
-                    classified = self._classified_error(exc, ledger=ledger, request=request)
-                    if not isinstance(classified, TransientError):
-                        raise classified from exc
-                    error = classified
-                else:
-                    raw, outcome = interpreted
-                    match outcome.kind:
-                        case "adapter_result":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            return Response(
-                                output=outcome.output,
-                                call=ledger.freeze(),
-                                raw=raw,
-                                stop_reason=outcome.stop_reason,
-                                assistant_message=outcome.assistant_message,
-                            )
-                        case "refusal":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise RefusalError(call=ledger.freeze(), request=request)
-                        case "max_completion_tokens_exceeded":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise MaxCompletionTokensExceededError(
-                                call=ledger.freeze(), request=request
-                            )
-                        case "empty_turn":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise EmptyTurnError(call=ledger.freeze(), request=request)
-                        case "schema_violation":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise SchemaViolationError(
-                                validation_error_json=outcome.validation_error_json,
-                                call=ledger.freeze(),
-                                request=request,
-                            )
-                        case "context_window_exceeded":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise ContextWindowExceededError(call=ledger.freeze(), request=request)
-                        case "unfinished_turn":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise UnfinishedTurnError(
-                                reason=outcome.reason, call=ledger.freeze(), request=request
-                            )
-                        case "provider_failed_terminally":
-                            self._record_completed_attempt(
-                                outcome, admission=admission, ledger=ledger
-                            )
-                            raise ProviderFailedTerminallyError(
-                                reason=outcome.reason, call=ledger.freeze(), request=request
-                            )
-                        case "provider_failed_transiently":
-                            self.rate_limiter.register_success(admission)
-                            error = TransientError(
-                                outcome.reason, is_rate_limit=outcome.is_rate_limit
-                            )
-                            assistant_message = outcome.assistant_message
-                backoff = self._record_transient_error(
-                    error,
+                    if outcome.kind == "provider_failed_transiently":
+                        # Raised inside the block so the exit parses it: a billable 200 whose
+                        # body reports a transient failure is still a provider failure, and a
+                        # rate-limit body pauses the domain exactly as a 429 status does.
+                        assistant_message = outcome.assistant_message
+                        raise TransientError(  # noqa: TRY301 (the admitted() block's exit is the parser, so the raise must sit inside it)
+                            outcome.reason, is_rate_limit=outcome.is_rate_limit
+                        )
+            except ParserContractError:
+                # A parse contract violation is langchaint's defect, not the attempt's failure:
+                # it skips the verdict handling below and reaches the caller inside EscapedExceptionError.
+                raise
+            except self.shared_backoff.failure_types as exc:
+                await self._pace_after_verdict(
+                    exc,
                     admission=admission,
+                    private_backoff=private_backoff,
                     assistant_message=assistant_message,
                     ledger=ledger,
+                    request=request,
                 )
-            if ledger.attempts < self.rate_limiter.max_attempts:
-                await backoff.sleep()
+            except Exception as exc:
+                terminal = await self._pace_after_transport_failure(
+                    exc, private_backoff=private_backoff, ledger=ledger, request=request
+                )
+                if terminal is not None:
+                    raise terminal from exc
+            else:
+                # error is None on every member reaching here: the request succeeded, and what the
+                # adapter made of the response is the item's outcome, not this attempt's failure.
+                ledger.record(error=None, assistant_message=outcome.assistant_message)
+                match outcome.kind:
+                    case "adapter_result":
+                        return Response(
+                            output=outcome.output,
+                            call=ledger.freeze(),
+                            raw=raw,
+                            stop_reason=outcome.stop_reason,
+                            assistant_message=outcome.assistant_message,
+                        )
+                    case "refusal":
+                        raise RefusalError(call=ledger.freeze(), request=request)
+                    case "max_completion_tokens_exceeded":
+                        raise MaxCompletionTokensExceededError(
+                            call=ledger.freeze(), request=request
+                        )
+                    case "empty_turn":
+                        raise EmptyTurnError(call=ledger.freeze(), request=request)
+                    case "schema_violation":
+                        raise SchemaViolationError(
+                            validation_error_json=outcome.validation_error_json,
+                            call=ledger.freeze(),
+                            request=request,
+                        )
+                    case "context_window_exceeded":
+                        raise ContextWindowExceededError(call=ledger.freeze(), request=request)
+                    case "unfinished_turn":
+                        raise UnfinishedTurnError(
+                            reason=outcome.reason, call=ledger.freeze(), request=request
+                        )
+                    case "provider_failed_terminally":
+                        raise ProviderFailedTerminallyError(
+                            reason=outcome.reason, call=ledger.freeze(), request=request
+                        )
         raise RetriesExhaustedError(call=ledger.freeze(), request=request)
 
     @overload
@@ -872,7 +906,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         EscapedExceptionError joins them on an Exception that escaped langchaint's own machinery,
         raised by the guard around that loop.
 
-        timeout_seconds bounds the whole call, slot waits and backoff sleeps included, and expiring
+        timeout_seconds bounds the whole call, admission waits and backoff sleeps included, and expiring
         raises TimedOutError, which carries what the cut-off call spent. None is no deadline.
         A cancellation from anywhere else (a caller's own asyncio.timeout, a TaskGroup sibling
         failing, shutdown) cuts the call off and propagates, so this call's settled attempts are lost
@@ -976,8 +1010,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         produced no output, or a defect in langchaint itself), which to_tables renders to a failure
         row so the batch stays table-ready.
         No item's failure reaches a sibling, so the returned list is always complete.
-        Concurrency is bounded by rate_limiter.max_in_flight,
-        which gates every request start and is shared with everything else using the same RateLimiter instance.
+        Concurrency is bounded by shared_backoff.capacity, which gates every request start and is
+        shared with everything else using the same SharedBackoff instance;
+        a capacity of None leaves the bound to whatever spawns the work.
 
         warm_cache runs generation_inputs[0] to completion before starting the rest,
         because a provider cache entry is readable only after the response that writes it begins,
@@ -1127,6 +1162,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             adapter=self.adapter,
             bound_adapter=self._bound_adapter,
             messages=_as_messages(generation_input),
-            rate_limiter=self.rate_limiter,
+            shared_backoff=self.shared_backoff,
+            max_attempts=self.max_attempts,
             timeout_seconds=timeout_seconds,
         )

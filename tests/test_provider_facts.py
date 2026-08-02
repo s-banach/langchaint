@@ -12,7 +12,6 @@ import typing
 import anthropic
 import httpx
 import openai
-import pytest
 from anthropic.types import (
     ImageBlockParam,
     RawContentBlockDeltaEvent,
@@ -40,15 +39,8 @@ from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel
 
-from langchaint.adapter import classification_from_response
-from langchaint.anthropic.messages_adapter import (
-    _RATE_LIMIT_STATUSES as _ANTHROPIC_RATE_LIMIT_STATUSES,
-)
 from langchaint.anthropic.messages_adapter import AnthropicPricedServiceTier
 from langchaint.openai.responses_adapter import _DISPOSITION_BY_ERROR_CODE
-from langchaint.openai.responses_adapter import (
-    _RATE_LIMIT_STATUSES as _OPENAI_RATE_LIMIT_STATUSES,
-)
 
 
 def _field_annotation(model: type[BaseModel], name: str) -> object:
@@ -213,12 +205,8 @@ def test_anthropic_service_tier_members_are_the_pricing_mapping_keys() -> None:
     assert reported == ("standard", "priority", "batch")
 
 
-_RETRY_GRID_STATUSES = (400, 401, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 529)
-"""Statuses driven through both SDKs' retry predicate."""
-
-
 def _response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
-    """Build the httpx.Response the SDK retry predicates and error constructors read."""
+    """Build the httpx.Response the SDK error constructors read."""
     return httpx.Response(
         status_code=status_code,
         headers=headers,
@@ -226,42 +214,36 @@ def _response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
     )
 
 
-@pytest.mark.parametrize("should_retry_header", [None, "true", "false"])
-@pytest.mark.parametrize("status_code", _RETRY_GRID_STATUSES)
-def test_langchaint_retries_exactly_what_both_sdks_retry(
-    status_code: int, should_retry_header: str | None
-) -> None:
-    """classification_from_response reproduces both SDKs' _should_retry over the status grid.
+def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None:
+    """APIStatusError.type is the body's error.type, and None where the body is not that shape.
 
-    langchaint constructs its clients with max_retries=0 and owns the retrying, so this predicate is
-    reimplemented rather than called.
-    Each adapter's own _RATE_LIMIT_STATUSES is compared against its own SDK, so the two differ here
-    the way they differ in the adapters (anthropic counts 529 a rate limit, openai does not).
-    A rate-limit status carrying x-should-retry: false is the one deliberate departure: the SDKs obey
-    the directive and stop, langchaint classifies rate_limit and retries, because the directive
-    speaks for the one request while the pause a rate limit triggers protects the shared account.
+    parse_anthropic tests failure.type ahead of the status, so this read is what lets an
+    overloaded_error on an unlisted status still pause the domain.
     """
-    headers = {} if should_retry_header is None else {"x-should-retry": should_retry_header}
-    response = _response_with(status_code, headers)
-    anthropic_retries = anthropic.Anthropic(api_key="k")._should_retry(response)
-    openai_retries = openai.OpenAI(api_key="k")._should_retry(response)
-    assert anthropic_retries == openai_retries, "the two SDKs' retry policies diverged"
-    for sdk_retries, rate_limit_statuses in (
-        (anthropic_retries, _ANTHROPIC_RATE_LIMIT_STATUSES),
-        (openai_retries, _OPENAI_RATE_LIMIT_STATUSES),
-    ):
-        classification = classification_from_response(
-            status_code=status_code,
-            headers=response.headers,
-            rate_limit_statuses=rate_limit_statuses,
-        )
-        langchaint_retries = classification in ("transient", "rate_limit")
-        if status_code in rate_limit_statuses and should_retry_header == "false":
-            assert classification == "rate_limit", rate_limit_statuses
-            assert langchaint_retries, rate_limit_statuses
-            assert not sdk_retries, rate_limit_statuses
-        else:
-            assert langchaint_retries == sdk_retries, rate_limit_statuses
+    client = anthropic.Anthropic(api_key="k")
+    body = {"type": "error", "error": {"type": "overloaded_error", "message": "boom"}}
+    error = client._make_status_error("boom", body=body, response=_response_with(529, {}))
+    assert isinstance(error, anthropic.APIStatusError)
+    assert error.type == "overloaded_error"
+    bodyless = client._make_status_error("boom", body=None, response=_response_with(529, {}))
+    assert isinstance(bodyless, anthropic.APIStatusError)
+    assert bodyless.type is None
+
+
+def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
+    """APIStatusError.code is the body's code, and None where the body is not a dict.
+
+    parse_openai tests failure.code inside its 429 branch, so this read is what keeps a spend-limit
+    429 terminal instead of pausing the domain.
+    """
+    client = openai.OpenAI(api_key="k")
+    body = {"code": "insufficient_quota", "type": "insufficient_quota", "message": "boom"}
+    error = client._make_status_error("boom", body=body, response=_response_with(429, {}))
+    assert isinstance(error, openai.APIStatusError)
+    assert error.code == "insufficient_quota"
+    bodyless = client._make_status_error("boom", body=None, response=_response_with(429, {}))
+    assert isinstance(bodyless, openai.APIStatusError)
+    assert bodyless.code is None
 
 
 def test_both_sdk_clients_retry_twice_by_default() -> None:

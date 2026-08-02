@@ -2,7 +2,7 @@
 
 An adapter wraps one official SDK client and is the only place provider knowledge lives:
 converting the binding to SDK keyword arguments, sending, translating stream events, normalizing usage, computing cost,
-and classifying errors.
+and reading failures (`parse` for the retry-or-pause verdict, `classify` for the terminal name).
 Adapters delegate stream assembly to the SDK and validate a structured response's text themselves:
 the SDKs validate inside the call that returns the response, where a rejection reaches the caller as
 an exception carrying neither the response nor its billing, and an adapter that validates in its own
@@ -12,9 +12,9 @@ Reporting model: an adapter reports one attempt; only the retry loop knows the c
 So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
 constructs a `GenerationError`, which is a verdict about a call it cannot see.
 What no member can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
-that propagate for `Adapter.classify` to sort.
+that propagate through the admitted() block, whose exit parses the `failure_types` ones.
 `AdapterStream.items` is the exception to the return contract, because an async iterator can only
-raise: a mid-stream failure reaches the stream handle as an exception and goes through `classify` too.
+raise: a mid-stream failure reaches the stream handle as an exception and exits the block the same way.
 
 Billing before interpretation: `send` and `AdapterStream.final` hand back the SDK response object
 itself, and `billing_from_raw`, `identity_from_raw`, and `interpret` read it in separate calls the
@@ -32,28 +32,39 @@ The split into two bind methods is what fixes the output type at bind time:
 each method is monomorphic in its output type, so no sentinel value has to imply a type downstream.
 """
 
+import email.utils
 import json
+import logging
+import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+from collections import Counter
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel
 
 from langchaint.call import ResponseIdentity
+from langchaint.exceptions import TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
 from langchaint.pricing import Billing
+from langchaint.shared_backoff import PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 
+_logger = logging.getLogger(__name__)
+
 type ErrorClassification = Literal[
-    "rate_limit", "transient", "invalid_request", "declared_final", "unknown_exception"
+    "transient", "invalid_request", "declared_final", "unknown_exception"
 ]
-"""Whether a retry may fix the error, and what to call it when it cannot.
+"""What a retry loop does with a failure Adapter.parse gave no verdict, or verdicted DoNotRetry.
 
 A string classification, not an exception class; the retry loop maps it onto one.
-"rate_limit" is transient and account-wide, so RateLimiter pauses admission for everyone sharing it.
-"transient" is retried by the failing task alone.
+The retry-or-pause decision for a parseable provider failure is Adapter.parse's, so classify is
+consulted only for an exception outside Adapter.failure_types, and to name the terminal error for
+one parse verdicted DoNotRetry.
+"transient" is a transport failure that produced nothing parseable (a connection drop, a timeout):
+the retry loop retries it alone, as RetryThisOne with no retry_after.
 "invalid_request" is not retried: the provider rejected this request, so sending it again
 would be rejected again (the retry loop raises InvalidRequestError).
 "declared_final" is not retried: the provider answered with an error and declared it final, so a
@@ -66,9 +77,14 @@ resend would fail the same way (the retry loop raises ProviderDeclaredFinalError
 def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None:
     """Parse the server-stated wait from response headers.
 
-    Tries the non-standard retry-after-ms header (milliseconds) first because it is more precise,
-    then retry-after as float seconds; both providers send these on rate-limit responses.
-    The HTTP-date form of retry-after is not parsed.
+    Three readings, in order, taking the first that yields a positive number: the non-standard
+    retry-after-ms header (milliseconds), which is the most precise; retry-after as float seconds;
+    and retry-after as an HTTP-date, accepted only in the form ending in "GMT" and converted by
+    subtracting the current wall-clock time. Both SDK clients read the three in this order
+    (anthropic 0.120.2, openai 2.51.0).
+    The HTTP-date reading is the one place langchaint reads wall-clock time, because a timestamp can
+    only be compared against wall-clock time; a clock skewed against the provider's misreads it, and
+    SharedBackoff caps whatever this returns at its longest_wait.
     None means no usable server-stated delay; non-positive values are treated as absent.
     """
     retry_after_ms_header = headers.get("retry-after-ms")
@@ -81,13 +97,30 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
             if retry_after_seconds > 0:
                 return retry_after_seconds
     retry_after_header = headers.get("retry-after")
-    if retry_after_header is not None:
-        try:
-            retry_after_seconds = float(retry_after_header)
-        except ValueError:
-            return None
-        if retry_after_seconds > 0:
-            return retry_after_seconds
+    if retry_after_header is None:
+        return None
+    try:
+        retry_after_seconds = float(retry_after_header)
+    except ValueError:
+        return _retry_after_seconds_from_http_date(retry_after_header)
+    if retry_after_seconds > 0:
+        return retry_after_seconds
+    return None
+
+
+def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None:
+    """Convert a GMT-suffixed HTTP-date retry-after into seconds from now, or None.
+
+    None for a date that does not parse, one not ending in "GMT", and one at or before the current time.
+    """
+    if not retry_after_header.endswith("GMT"):
+        return None
+    parsed = email.utils.parsedate_tz(retry_after_header)
+    if parsed is None:
+        return None
+    retry_after_seconds = email.utils.mktime_tz(parsed) - time.time()
+    if retry_after_seconds > 0:
+        return retry_after_seconds
     return None
 
 
@@ -100,37 +133,22 @@ def request_id_from_raw(raw: BaseModel) -> str | None:
     return getattr(raw, "_request_id", None)
 
 
-def classification_from_response(
-    *, status_code: int, headers: Mapping[str, str], rate_limit_statuses: Collection[int]
-) -> ErrorClassification:
-    """Classify one error response by its status and its retry directive.
+def terminal_classification_from_response(
+    *, status_code: int, headers: Mapping[str, str]
+) -> Literal["invalid_request", "declared_final", "unknown_exception"]:
+    """Name the terminal error for one error response, by its status and its retry directive.
 
-    Both SDKs encode the same retry policy, which langchaint owns because it constructs its clients
-    with max_retries=0: the non-standard x-should-retry header decides when present, then 408
-    (request timeouts), 409 (lock timeouts), 429, and 500 and above retry, and nothing else does.
-    What that policy retries is retried here, and outside rate_limit_statuses what it declines is
-    named: a 4xx is this request's rejection, whoever issued it, a status the provider declared
-    final is declared_final, and anything left is a status langchaint has no account of.
+    Whether the failure is retried is Adapter.parse's verdict, so this only names what a
+    DoNotRetry failure becomes: a 4xx is this request's rejection, whoever issued it; a status the
+    non-standard x-should-retry header declared final is declared_final; and anything left is a
+    status langchaint has no account of.
     The 4xx test comes before the declared_final test, so a rejected request the directive marked
     final keeps the rejection name. declared_final states a disposition and never what failed,
     because that is all the directive says.
-
-    rate_limit_statuses is the provider's own set of rate-limit statuses
-    (429 for both, plus anthropic's 529), classified ahead of the retry directive because that
-    directive speaks for the one request while the pause a rate limit triggers protects the shared
-    account. A rate-limit status is therefore classified rate_limit whatever the directive says,
-    so the account-wide pause is never lost to a verdict about the one request.
     """
-    if status_code in rate_limit_statuses:
-        return "rate_limit"
-    should_retry = should_retry_from_headers(headers)
-    if should_retry:
-        return "transient"
-    if should_retry is None and (status_code in (408, 409) or status_code >= 500):
-        return "transient"
     if 400 <= status_code < 500:
         return "invalid_request"
-    if should_retry is False:
+    if should_retry_from_headers(headers) is False:
         return "declared_final"
     return "unknown_exception"
 
@@ -147,6 +165,34 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     if should_retry_header == "false":
         return False
     return None
+
+
+def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
+    """Map a TransientError raised inside an admitted() block to its verdict.
+
+    The shared rule both provider parse functions apply to the one failure_types member langchaint
+    itself raises: a billable 200 whose body reports a transient provider-side failure, which the
+    retry loop re-raises as a TransientError so the block's exit records it.
+    is_rate_limit says the provider named a rate limit, so the whole domain pauses; anything else is
+    the one request's to retry. Either verdict carries the error's own retry_after_seconds.
+    """
+    if error.is_rate_limit:
+        return PauseAll(retry_after=error.retry_after_seconds)
+    return RetryThisOne(retry_after=error.retry_after_seconds)
+
+
+def record_parse_fallthrough(
+    fallthrough_counts: Counter[str], *, parse_name: str, status_code: object, error_type: object
+) -> None:
+    """Count and log one parse fallthrough to a status-family default.
+
+    A provider parse function calls this when no listed row matched the failure.
+    The count and the warning make a new provider status or error type visible.
+    Without them the default would absorb it silently.
+    """
+    tag = f"status={status_code} type={error_type}"
+    fallthrough_counts[tag] += 1
+    _logger.warning("%s fell through to a status-family default for %s", parse_name, tag)
 
 
 REASONING_PART_SEPARATOR = "\n\n"
@@ -332,9 +378,12 @@ class ProviderFailedTransiently(NoOutput):
     RetryUnavailableError: this outcome is read from the assembled response, so that stream is over
     and the handle opens no other.
     reason is the provider's own description of the failure.
-    is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it to
-    the RateLimiter, which pauses admission for every task sharing it, exactly as a 429 status does.
-    A stream sets no such pause, so a sibling task learns of the limit from its own next request.
+    is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it
+    through the admitted() block's exit, whose PauseAll verdict pauses the whole SharedBackoff
+    domain, exactly as a 429 status does.
+    A stream sets no such pause, so a sibling task learns of the limit from its own next request:
+    this outcome arrives with the stream already over, concluded inside the handle rather than
+    raised through the block.
     """
 
     reason: str
@@ -758,10 +807,35 @@ class Adapter(ABC):
         """
         ...
 
+    failure_types: ClassVar[tuple[type[Exception], ...]]
+    """The exception types parse maps to a verdict, for SharedBackoff's failure_types.
+
+    Each concrete adapter states its own: its SDK's status-error class, whose response carries the
+    status and error type parse reads, plus TransientError, which the retry loop raises for a 200
+    whose body reports a transient failure. Transport failures that produced nothing parseable (a
+    connection drop, a timeout) stay out, propagating unrecorded for classify to sort.
+    Every member must be a strict subclass of Exception; SharedBackoff rejects anything else at
+    construction.
+    """
+
+    @abstractmethod
+    def parse(self, failure: Exception) -> Verdict:
+        """Map one failure_types exception to its verdict, for SharedBackoff's parse.
+
+        The verdict comes from the status and the error type, never from a retry-after header,
+        which only sets the verdict's retry_after. Return a verdict for every input without
+        raising, unknown statuses and error types included, falling through to documented
+        defaults; each provider's parse function names its table and its defaults.
+        """
+        ...
+
     @abstractmethod
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify an exception raised by send, open_stream, or a stream's items().
+        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
+        Consulted by the retry loop on the two failures the verdict does not settle: an exception
+        outside failure_types, where "transient" marks a transport failure the loop retries alone,
+        and a failure parse verdicted DoNotRetry, where the terminal name picks the GenerationError.
         Every classification fails at most its own item.
         A provider states a status, never whether the binding or this one request caused it.
         A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
@@ -769,14 +843,6 @@ class Adapter(ABC):
         which fails the one item without a retry, so bugs surface without being retried silently.
         """
         ...
-
-    def retry_after_seconds(self, error: Exception) -> float | None:  # noqa: ARG002
-        """Return the server-stated wait carried by error, when the SDK exposes one.
-
-        The base implementation knows no SDK types and returns None;
-        adapters override it to read their SDK exception's response headers via retry_after_seconds_from_headers.
-        """
-        return None
 
     def request_id_from_error(self, error: Exception) -> str | None:  # noqa: ARG002
         """Return the request-id header carried by error, when the SDK exposes one.

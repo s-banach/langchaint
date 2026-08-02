@@ -20,18 +20,22 @@ from langchaint import (
     DispatchOutcome,
     DispatchPrecomputed,
     DispatchUnknownTool,
+    DoNotRetry,
     ImagePart,
     InvalidToolArgsDetail,
     Message,
     Part,
+    PauseAll,
     ReasoningDelta,
     ReasoningTrace,
+    RetryThisOne,
     StreamItem,
     TextPart,
     ToolCall,
     ToolMessage,
     TurnElement,
     UserMessage,
+    Verdict,
 )
 from langchaint.adapter import (
     AdapterResult,
@@ -182,6 +186,23 @@ def _by_stream_item_kind_missing_an_arm(item: StreamItem) -> object:
             return item.text
 
 
+def _by_verdict_kind(verdict: Verdict) -> object:
+    """Cover Verdict, whose DoNotRetry arm is the one carrying no retry_after."""
+    match verdict.kind:
+        case "pause_all":
+            return verdict.retry_after
+        case "retry_this_one":
+            return verdict.retry_after
+        case "do_not_retry":
+            return verdict.kind
+
+
+def _by_verdict_kind_missing_an_arm(verdict: Verdict) -> object:
+    match verdict.kind:  # pyrefly: ignore[non-exhaustive-match]
+        case "pause_all":
+            return verdict.retry_after
+
+
 def test_a_message_kind_selects_the_arm_that_carries_the_field_read() -> None:
     """Each Message arm's tag reaches a field the other arms do not carry."""
     assert _by_message_kind(UserMessage(content="hi")) == "hi"
@@ -252,6 +273,14 @@ def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_arm_carri
         expected for _, expected in outcomes
     ]
     assert _by_response_outcome_kind_missing_an_arm(Refusal(assistant_message=_TURN)) is None
+
+
+def test_a_verdict_kind_selects_the_arm_that_carries_the_field_read() -> None:
+    """The two retrying arms' tags reach retry_after, which DoNotRetry does not carry."""
+    assert _by_verdict_kind(PauseAll(retry_after=7.0)) == 7.0
+    assert _by_verdict_kind(RetryThisOne(retry_after=2.0)) == 2.0
+    assert _by_verdict_kind(DoNotRetry()) == "do_not_retry"
+    assert _by_verdict_kind_missing_an_arm(DoNotRetry()) is None
 
 
 def test_a_stream_item_kind_selects_the_arm_that_carries_the_field_read() -> None:

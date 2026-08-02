@@ -5,7 +5,7 @@ __all__ re-exports only the SDK-free application surface.
 The backend constructors, their price catalogs, and the adapters stay in their subpackages:
 re-exporting them here would force import langchaint through both SDKs.
 The adapter-author contract stays in langchaint.adapter.
-Internal helpers (Admission, Backoff, SequenceNotStr) are importable but off __all__.
+Internal helpers (SequenceNotStr) are importable but off __all__.
 Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
 schema() returns, are on __all__: both appear in signatures application code writes against.
 The tool decorator builds PydanticTool from an async function's parameter annotation.
@@ -24,10 +24,12 @@ from langchaint.exceptions import (
     DispatchExceptionGroup,
     EmptyTurnError,
     EscapedExceptionError,
+    GaveUpWaiting,
     GenerationError,
     InvalidRequestError,
     InvalidToolArgsError,
     MaxCompletionTokensExceededError,
+    ParserContractError,
     ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
@@ -57,13 +59,21 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.pricing import Billing, category_cost
-from langchaint.rate_limiter import RateLimiter
 from langchaint.response import (
     CallResult,
     Response,
     RowValue,
     Tables,
     to_tables,
+)
+from langchaint.shared_backoff import (
+    Admission,
+    DoNotRetry,
+    PauseAll,
+    PrivateBackoff,
+    RetryThisOne,
+    SharedBackoff,
+    Verdict,
 )
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
@@ -91,6 +101,7 @@ __all__ = [
     "LLM",
     "ZERO_USAGE",
     "AbandonedCallError",
+    "Admission",
     "AssistantMessage",
     "AttemptRecord",
     "Billing",
@@ -107,8 +118,10 @@ __all__ = [
     "DispatchOutcome",
     "DispatchPrecomputed",
     "DispatchUnknownTool",
+    "DoNotRetry",
     "EmptyTurnError",
     "EscapedExceptionError",
+    "GaveUpWaiting",
     "GenerationError",
     "GenerationInput",
     "ImagePart",
@@ -120,20 +133,24 @@ __all__ = [
     "MaxCompletionTokensExceededError",
     "Message",
     "MessageContent",
+    "ParserContractError",
     "Part",
+    "PauseAll",
+    "PrivateBackoff",
     "ProviderDeclaredFinalError",
     "ProviderFailedTerminallyError",
     "PydanticTool",
-    "RateLimiter",
     "ReasoningDelta",
     "ReasoningEffort",
     "ReasoningTrace",
     "RefusalError",
     "Response",
     "RetriesExhaustedError",
+    "RetryThisOne",
     "RetryUnavailableError",
     "RowValue",
     "SchemaViolationError",
+    "SharedBackoff",
     "SpecificToolChoice",
     "StopReason",
     "StreamHandle",
@@ -156,6 +173,7 @@ __all__ = [
     "UnknownExceptionError",
     "Usage",
     "UserMessage",
+    "Verdict",
     "category_cost",
     "to_tables",
     "tool",

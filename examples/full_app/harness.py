@@ -11,7 +11,7 @@ import itertools
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import override
+from typing import ClassVar, override
 
 from pydantic import BaseModel
 
@@ -19,11 +19,14 @@ from langchaint import (
     LLM,
     AssistantMessage,
     Billing,
+    DoNotRetry,
     Message,
-    RateLimiter,
+    SharedBackoff,
     TextPart,
     ToolCall,
+    TransientError,
     Usage,
+    Verdict,
 )
 from langchaint.adapter import (
     Adapter,
@@ -33,6 +36,7 @@ from langchaint.adapter import (
     BoundAdapter,
     ErrorClassification,
     RequestParams,
+    verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
 
@@ -130,6 +134,15 @@ class ScriptedAdapter(Adapter):
     ) -> BoundAdapter[ModelT]:
         """Reject a structured binding: the example reads structured output from tool arguments."""
         raise NotImplementedError
+
+    failure_types: ClassVar[tuple[type[Exception], ...]] = (TransientError,)
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Map a TransientError with the shared rule; the example scripts nothing else transient."""
+        if isinstance(failure, TransientError):
+            return verdict_from_transient_error(failure)
+        return DoNotRetry()
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
@@ -243,8 +256,16 @@ def call(name: str, args_json: str) -> ToolCall:
 
 
 def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
-    """Wrap a ScriptedAdapter in an LLM with a fast, generous limiter."""
+    """Wrap a ScriptedAdapter in an LLM with a fast, generous backpressure domain."""
+    adapter = ScriptedAdapter(scripts)
     return LLM(
-        ScriptedAdapter(scripts),
-        rate_limiter=RateLimiter(max_attempts=2, backoff_base_seconds=0.001, max_in_flight=16),
+        adapter,
+        shared_backoff=SharedBackoff(
+            parse=adapter.parse,
+            failure_types=adapter.failure_types,
+            capacity=16,
+            minimum_wait_ceiling=0.001,
+            longest_wait=0.01,
+        ),
+        max_attempts=2,
     )

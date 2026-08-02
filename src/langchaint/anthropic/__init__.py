@@ -49,9 +49,10 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicServiceTier,
     CacheTTL,
+    parse_anthropic,
 )
 from langchaint.llm import LLM
-from langchaint.rate_limiter import RateLimiter
+from langchaint.shared_backoff import SharedBackoff
 
 type AnthropicModelName = Literal[
     "claude-fable-5",
@@ -175,7 +176,7 @@ _BEDROCK_CLIENT_CLASS: dict[
 }
 
 
-def anthropic_model(
+def anthropic_model(  # noqa: PLR0913 (the ready-LLM constructor states every choice: client, pricing, caching, tier, and pacing)
     model: AnthropicModelName,
     *,
     client: AsyncAnthropic | None = None,
@@ -183,7 +184,8 @@ def anthropic_model(
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
     service_tier: AnthropicServiceTier | None = None,
-    rate_limiter: RateLimiter | None = None,
+    shared_backoff: SharedBackoff | None = None,
+    max_attempts: int = 3,
 ) -> LLM:
     """Build a ready LLM for one cataloged model on the Messages API.
 
@@ -197,12 +199,13 @@ def anthropic_model(
     paying off when requests reusing the prefix arrive more than five minutes apart.
     service_tier is what the request asks for, None sending nothing; it is not what prices the
     response, since anthropic's request and response tier vocabularies share no word.
-    rate_limiter None means the RateLimiter defaults;
-    pass one shared instance across models on the same account to share its budget,
-    built in the same event loop as the LLMs, since one instance serves one loop.
+    shared_backoff and max_attempts have the LLM.__init__ meanings;
+    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
+    and note one instance serves one event loop.
 
     Raises:
-        ValueError: client is a Bedrock client, which does not reach the "anthropic" provider this
+        ValueError: max_attempts is not a positive int (from LLM.__init__), or
+            client is a Bedrock client, which does not reach the "anthropic" provider this
             constructor states (from Adapter.__init__; the narrowed client annotation already
             excludes one at check time, since the Bedrock classes are siblings of AsyncAnthropic
             rather than subclasses).
@@ -217,7 +220,8 @@ def anthropic_model(
             cache_ttl=cache_ttl,
             service_tier=service_tier,
         ),
-        rate_limiter=rate_limiter,
+        shared_backoff=shared_backoff,
+        max_attempts=max_attempts,
     )
 
 
@@ -230,7 +234,8 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
-    rate_limiter: RateLimiter | None = None,
+    shared_backoff: SharedBackoff | None = None,
+    max_attempts: int = 3,
 ) -> LLM:
     """Build a ready LLM for one cataloged Bedrock wire model id.
 
@@ -260,12 +265,13 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
     cache_ttl has the anthropic_model meaning; Bedrock supports both tiers.
     There is no service_tier parameter: Anthropic's service tiers are its own platform's, and this
     constructor reaches Bedrock, so there is no tier here for a request to ask for.
-    rate_limiter None means the RateLimiter defaults;
-    pass one shared instance across models on the same account to share its budget,
-    built in the same event loop as the LLMs, since one instance serves one loop.
+    shared_backoff and max_attempts have the LLM.__init__ meanings;
+    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
+    and note one instance serves one event loop.
 
     Raises:
-        ValueError: client is provided together with http_client or aws_region,
+        ValueError: max_attempts is not a positive int (from LLM.__init__);
+            client is provided together with http_client or aws_region;
             or client is provided but its class does not serve model's Bedrock API.
         anthropic.AnthropicError: model is served by the "mantle" Bedrock API, client is None, and
             AsyncAnthropicBedrockMantle.__init__ resolves neither a region nor a base URL.
@@ -297,7 +303,8 @@ def anthropic_bedrock_model(  # noqa: PLR0913 (Bedrock adds aws_region and http_
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         ),
-        rate_limiter=rate_limiter,
+        shared_backoff=shared_backoff,
+        max_attempts=max_attempts,
     )
 
 
@@ -314,4 +321,5 @@ __all__ = [
     "CacheTTL",
     "anthropic_bedrock_model",
     "anthropic_model",
+    "parse_anthropic",
 ]

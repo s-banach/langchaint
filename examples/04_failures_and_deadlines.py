@@ -1,4 +1,4 @@
-"""What goes wrong and what bounds it: per-account rate limiters, terminal errors, and deadlines."""
+"""What goes wrong and what bounds it: per-account SharedBackoff domains, terminal errors, and deadlines."""
 
 from langchaint import (
     CallResult,
@@ -6,11 +6,11 @@ from langchaint import (
     GenerationInput,
     ImagePart,
     Message,
-    RateLimiter,
+    SharedBackoff,
     TextPart,
     UserMessage,
 )
-from langchaint.anthropic import anthropic_model
+from langchaint.anthropic import AnthropicMessagesAdapter, anthropic_model, parse_anthropic
 from langchaint.openai import openai_model
 
 
@@ -22,12 +22,17 @@ async def run_batch_and_handle_what_failed() -> list[CallResult[str]]:
     """
     # max_attempts counts requests sent including the first.
     # Only transient errors are retried.
-    # Construct a RateLimiter explicitly to override the default settings:
-    anthropic_limiter = RateLimiter(max_attempts=5, max_in_flight=16)
-
-    summarizer = anthropic_model("claude-sonnet-5", rate_limiter=anthropic_limiter).bind(
-        system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
+    # Construct a SharedBackoff explicitly to override the default settings; one instance is one
+    # account's backpressure domain, shared by passing it to every constructor on that account.
+    anthropic_backoff = SharedBackoff(
+        parse=parse_anthropic,
+        failure_types=AnthropicMessagesAdapter.failure_types,
+        capacity=16,
     )
+
+    summarizer = anthropic_model(
+        "claude-sonnet-5", shared_backoff=anthropic_backoff, max_attempts=5
+    ).bind(system_prompt="Summarize in one sentence.", automatic_prompt_caching=False)
     fallback = openai_model("gpt-5.6-terra").bind(
         system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
     )

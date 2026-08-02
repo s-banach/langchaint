@@ -8,7 +8,7 @@ Together they pin the retry loop, rebind rebuild, batch ordering, and the stream
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, assert_type, override
 
@@ -22,20 +22,22 @@ from langchaint import (
     Billing,
     BoundLLM,
     ContextWindowExceededError,
+    DoNotRetry,
     EmptyTurnError,
     EscapedExceptionError,
     GenerationError,
     InvalidRequestError,
     MaxCompletionTokensExceededError,
     Message,
+    ParserContractError,
     ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
-    RateLimiter,
     RefusalError,
     Response,
     RetriesExhaustedError,
     RetryUnavailableError,
     SchemaViolationError,
+    SharedBackoff,
     StopReason,
     StreamItem,
     StreamProtocolError,
@@ -48,8 +50,9 @@ from langchaint import (
     UnknownExceptionError,
     Usage,
     UserMessage,
+    Verdict,
 )
-from langchaint import rate_limiter as rate_limiter_module
+from langchaint import shared_backoff as shared_backoff_module
 from langchaint.adapter import (
     Adapter,
     AdapterResult,
@@ -68,11 +71,13 @@ from langchaint.adapter import (
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
+    verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
 from langchaint.llm import UNCHANGED, Unchanged
+from langchaint.shared_backoff import _NEVER
 from langchaint.streaming import StreamHandle
-from tests.helpers import stated_billing, uniform_returns_ceiling
+from tests.helpers import random_returns_zero, stated_billing
 
 _USAGE = Usage(
     input_tokens_cache_read=0,
@@ -91,12 +96,33 @@ _USAGE_STREAM = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.001})
 """The stream final()'s assembled usage, distinct so a stream cost is visible."""
 
 
-def _fast_rate_limiter(*, max_attempts: int = 3, max_in_flight: int = 8) -> RateLimiter:
-    """Build a fresh near-zero-backoff rate limiter; one instance serves one event loop."""
-    return RateLimiter(
-        max_attempts=max_attempts,
-        backoff_base_seconds=0.001,
-        max_in_flight=max_in_flight,
+def _parse_fake(failure: Exception) -> Verdict:
+    """Map a TransientError with the shared rule, as a provider parse maps its own SDK errors.
+
+    Every other exception the fakes raise stands for a transport failure outside failure_types,
+    so this parse never sees one; DoNotRetry is the fallthrough a real parse would end on.
+    """
+    if isinstance(failure, TransientError):
+        return verdict_from_transient_error(failure)
+    return DoNotRetry()
+
+
+def _parse_raises(_failure: Exception) -> Verdict:
+    """Violate the parse contract on every failure, standing in for a buggy provider parse."""
+    raise RuntimeError("parse defect")
+
+
+def _fast_shared_backoff(
+    *, capacity: int | None = 8, parse: Callable[[Exception], Verdict] = _parse_fake
+) -> SharedBackoff:
+    """Build a fresh near-zero-wait SharedBackoff; one instance serves one event loop."""
+    return SharedBackoff(
+        parse=parse,
+        failure_types=(TransientError,),
+        capacity=capacity,
+        minimum_wait_ceiling=0.001,
+        longest_wait=0.002,
+        admission_gap=0.0001,
     )
 
 
@@ -808,6 +834,13 @@ class _FakeAdapter(Adapter):
         bound: BoundAdapter[ModelT] = _FakeStructuredBoundAdapter()
         return bound
 
+    failure_types: ClassVar[tuple[type[Exception], ...]] = (TransientError,)
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Delegate to the module-level rule _fast_shared_backoff also parses with."""
+        return _parse_fake(failure)
+
     @override
     def classify(self, error: Exception) -> ErrorClassification:
         """Return the fixed verdict for every exception classify sees."""
@@ -849,7 +882,7 @@ def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_recor
 
     async def scenario() -> None:
         """Drive one generate_one whose interpret raises over the response send returned."""
-        bound_llm = LLM(_InterpretRaisesAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_InterpretRaisesAdapter(), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(UnknownExceptionError) as unplaceable:
@@ -875,7 +908,7 @@ def test_stream_final_records_the_response_before_interpreting_it() -> None:
         """Call final() on a stream whose interpret raises, then freeze the ledger it left."""
         stream = _FakeStream()
         bound_llm = LLM(
-            _InterpretRaisesAdapter(stream=stream), rate_limiter=_fast_rate_limiter()
+            _InterpretRaisesAdapter(stream=stream), shared_backoff=_fast_shared_backoff()
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(RuntimeError, match="interpretation failed"):
@@ -901,7 +934,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
     async def scenario() -> None:
         """Drive one generate_one through a single transient failure."""
         adapter = _FakeAdapter(failures=[TransientError("boom")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             system_prompt="s", automatic_prompt_caching=True
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -944,7 +977,7 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
 
     async def streamed_counts(adapter: _FakeAdapter) -> tuple[int, int]:
         """Drain one stream over adapter and return its bound adapter's build and open counts."""
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -957,7 +990,7 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
         sent_adapter = _FakeAdapter(
             failures=[TransientError("boom"), TransientError("boom again")]
         )
-        sent_llm = LLM(sent_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        sent_llm = LLM(sent_adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         await sent_llm.generate_one([UserMessage(content="hi")])
@@ -987,7 +1020,7 @@ def test_a_failed_attempt_records_the_request_id_off_its_error() -> None:
             failures=[_RequestIdError("boom", "req-from-error"), TransientError("boom again")],
             classify_result="transient",
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1012,7 +1045,7 @@ def test_an_adapter_raised_transient_error_still_names_its_request() -> None:
         sent_adapter = _FakeAdapter(
             failures=[_TransientRequestIdError("boom", "req-from-sent-transient")]
         )
-        sent_llm = LLM(sent_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        sent_llm = LLM(sent_adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         sent = await sent_llm.generate_one([UserMessage(content="hi")])
@@ -1021,7 +1054,7 @@ def test_an_adapter_raised_transient_error_still_names_its_request() -> None:
         stream_adapter = _FakeAdapter(
             open_failures=[_TransientRequestIdError("boom", "req-from-open-transient")]
         )
-        bound_llm = LLM(stream_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(stream_adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -1037,7 +1070,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
     async def scenario() -> None:
         """Drive one generate_one to exhaustion under a two-attempt budget."""
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
@@ -1058,15 +1091,22 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 ) -> None:
     """The failed record's own span stays small; the backoff shows up as the gap between records.
 
-    The full-jitter draw is pinned to its ceiling so the backoff gap is deterministic here.
+    The random draw is pinned so each drawn wait is its ceiling, making the backoff gap deterministic.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
+    monkeypatch.setattr(shared_backoff_module.random, "random", random_returns_zero)
 
     async def scenario() -> None:
         """Recover from one failure under a visible 0.05s backoff."""
         adapter = _FakeAdapter(failures=[TransientError("boom")])
-        rate_limiter = RateLimiter(max_attempts=2, backoff_base_seconds=0.05)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = SharedBackoff(
+            parse=_parse_fake,
+            failure_types=(TransientError,),
+            capacity=8,
+            minimum_wait_ceiling=0.05,
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
+            automatic_prompt_caching=True
+        )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         failed, succeeded = response.attempt_records
         assert failed.elapsed_seconds < 0.05
@@ -1091,7 +1131,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
         adapter = _FakeAdapter(
             invalid_requests=[InvalidRequest(reason="nope")], classify_result="transient"
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(InvalidRequestError) as rejected:
@@ -1104,31 +1144,6 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
         assert rejected.value.provider_name == adapter.provider_name
         assert rejected.value.attempt_records == ()
         assert rejected.value.usage == ZERO_USAGE
-
-    asyncio.run(scenario())
-
-
-def test_a_rejected_request_registers_no_success_with_the_rate_limiter() -> None:
-    """A rejection is not a completed request, so it must not end the recovery.
-
-    A registered success would clear a rate-limit pause that no provider response lifted.
-    """
-
-    async def scenario() -> None:
-        """Put the limiter into recovery, then take a rejection while holding its probe slot."""
-        rate_limiter = _fast_rate_limiter()
-        failing_admission = await rate_limiter.acquire()
-        _ = rate_limiter.register_transient_error(
-            failing_admission,
-            (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
-        )
-        rate_limiter.release(failing_admission)
-        assert rate_limiter._recovering
-        adapter = _FakeAdapter(failures=[ValueError("nope")], classify_result="invalid_request")
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        with pytest.raises(InvalidRequestError):
-            await bound_llm.generate_one([UserMessage(content="hi")])
-        assert rate_limiter._recovering
 
     asyncio.run(scenario())
 
@@ -1150,7 +1165,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
             ],
             classify_result="invalid_request",
         )
-        bound_llm = LLM(classified_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(classified_adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(InvalidRequestError) as classified:
@@ -1175,7 +1190,7 @@ def test_refusal_outcome_from_send_raises_row_shaped_without_retry() -> None:
     async def scenario() -> None:
         """Drive one generate_one whose send reports the Refusal member."""
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(RefusalError) as refusal:
@@ -1226,7 +1241,7 @@ def test_a_no_output_outcome_from_send_raises_row_shaped_without_retry(
     async def scenario() -> None:
         """Drive one generate_one whose send reports the outcome."""
         adapter = _FakeAdapter(failures=[_billed(outcome)])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(expected_error) as caught:
@@ -1260,7 +1275,7 @@ def test_schema_violation_outcome_from_send_raises_row_shaped_without_retry() ->
                 )
             ]
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(SchemaViolationError) as schema_violation:
@@ -1295,7 +1310,7 @@ def test_unfinished_turn_outcome_from_send_raises_carrying_the_adapter_s_reason(
                 )
             ]
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(UnfinishedTurnError) as unfinished_turn:
@@ -1314,7 +1329,7 @@ def test_provider_failed_transiently_from_send_is_retried_and_keeps_its_billing(
     async def scenario() -> None:
         """Drive one generate_one whose first send reports the failure and whose second succeeds."""
         adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1329,41 +1344,16 @@ def test_provider_failed_transiently_from_send_is_retried_and_keeps_its_billing(
     asyncio.run(scenario())
 
 
-def test_provider_failed_transiently_ends_the_rate_limiter_recovery() -> None:
-    """A failed 200 is a completed request, so it ends recovery like any other 200.
-
-    The provider served the request, which is what the recovery probe asks; that its body reports a
-    failure is the item's problem, not the account's quota's.
-    """
-
-    async def scenario() -> None:
-        """Put the limiter into recovery, then report the failure while holding its probe slot."""
-        rate_limiter = _fast_rate_limiter()
-        failing_admission = await rate_limiter.acquire()
-        _ = rate_limiter.register_transient_error(
-            failing_admission,
-            (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
-        )
-        rate_limiter.release(failing_admission)
-        assert rate_limiter._recovering
-        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        await bound_llm.generate_one([UserMessage(content="hi")])
-        assert not rate_limiter._recovering
-
-    asyncio.run(scenario())
-
-
 def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admission() -> None:
-    """A failure the provider named a rate limit puts the shared limiter into recovery.
+    """A failure the provider named a rate limit pauses the whole domain.
 
     The flag is the only thing distinguishing this 200 from any other failed one, and it has to
-    reach the RateLimiter for a rate limit reported inside a 200 to pace the account at all.
+    reach the admitted() block's exit for a rate limit reported inside a 200 to pace the domain at all.
     """
 
     async def scenario() -> None:
-        """Spend the whole budget on rate-limited failures, so recovery is still in force at the end."""
-        rate_limiter = _fast_rate_limiter(max_attempts=1)
+        """Spend the whole budget on rate-limited failures, so the pause is still running at the end."""
+        shared_backoff = _fast_shared_backoff()
         adapter = _FakeAdapter(
             failures=[
                 _billed(
@@ -1375,13 +1365,16 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
                 )
             ]
         )
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=1).bind(
+            automatic_prompt_caching=True
+        )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = exhausted.value.attempt_records
         assert isinstance(record.error, TransientError)
         assert record.error.is_rate_limit
-        assert rate_limiter._recovering
+        # Only a PauseAll record moves _pause_until off the sentinel, so this is the flag arriving.
+        assert shared_backoff._pause_until != _NEVER
 
     asyncio.run(scenario())
 
@@ -1404,7 +1397,7 @@ def test_provider_failed_terminally_from_send_raises_row_shaped_without_retry() 
                 )
             ]
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(ProviderFailedTerminallyError) as provider_failure:
@@ -1427,7 +1420,7 @@ def test_a_plain_exception_classified_transient_is_retried() -> None:
         adapter = _FakeAdapter(
             failures=[ValueError("x1"), ValueError("x2")], classify_result="transient"
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1447,7 +1440,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
     async def scenario() -> None:
         """Drive one generate_one whose send raises a classify-invalid_request exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="invalid_request")
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(InvalidRequestError) as rejected:
@@ -1469,7 +1462,7 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
     async def scenario() -> None:
         """Drive one generate_one whose send raises a classify-unknown_exception exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unknown_exception")
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(UnknownExceptionError) as unplaceable:
@@ -1498,7 +1491,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
     async def scenario() -> None:
         """Drive one generate_one whose send raises a classify-declared_final exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="declared_final")
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(ProviderDeclaredFinalError) as declared_final:
@@ -1521,12 +1514,12 @@ def test_an_unplaceable_exception_becomes_the_items_failure_row_and_siblings_con
     """A classify-unknown_exception item comes back as its UnknownExceptionError row; the sibling succeeds."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send is unplaceable."""
+        """Serialize a two-item batch (capacity=1) whose first send is unplaceable."""
         adapter = _FakeAdapter(
             echo=True, failures=[ValueError("boom")], classify_result="unknown_exception"
         )
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
@@ -1549,7 +1542,7 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
     async def scenario() -> None:
         """Settle one item, then cancel the batch while the other's send hangs."""
         adapter = _FakeAdapter(hang_from_send=2)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=1)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=1)).bind(
             automatic_prompt_caching=True
         )
         call = asyncio.create_task(
@@ -1739,15 +1732,17 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
     """A mixed batch keeps each result in its input slot: the failure where it failed, successes elsewhere."""
 
     async def scenario() -> None:
-        """Serialize a three-item batch (max_in_flight=1) whose first send fails under a one-attempt budget.
+        """Serialize a three-item batch (capacity=1) whose first send fails under a one-attempt budget.
 
-        One slot runs the items in submission order,
+        One permit runs the items in submission order,
         so the single scripted failure lands on the first item and the other two succeed,
         which is exactly the mixed-outcome alignment under test.
         """
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
-        rate_limiter = _fast_rate_limiter(max_attempts=1, max_in_flight=1)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=1).bind(
+            automatic_prompt_caching=True
+        )
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
@@ -1767,13 +1762,13 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
     """An item whose send reports Refusal comes back as the RefusalError in its slot, siblings succeed."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first send reports Refusal."""
+        """Serialize a two-item batch (capacity=1) whose first send reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
             failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
@@ -1795,12 +1790,12 @@ def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (max_in_flight=1) whose first build_request refuses."""
+        """Serialize a two-item batch (capacity=1) whose first build_request refuses."""
         adapter = _FakeAdapter(
             echo=True, invalid_requests=[InvalidRequest(reason="misconfigured")]
         )
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
@@ -1827,14 +1822,14 @@ def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_togeth
         generation_inputs = [[UserMessage(content=str(index))] for index in range(3)]
         warmed_adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         warmed_bound_llm = LLM(
-            warmed_adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)
+            warmed_adapter, shared_backoff=_fast_shared_backoff(capacity=8)
         ).bind(automatic_prompt_caching=True)
         warmed = await warmed_bound_llm.generate_many(generation_inputs, warm_cache=True)
         assert _batch_outputs(warmed) == ["0", "1", "2"]
         assert warmed_adapter.bound_adapters[0].peak_in_flight == 2
         control_adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         control_bound_llm = LLM(
-            control_adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)
+            control_adapter, shared_backoff=_fast_shared_backoff(capacity=8)
         ).bind(automatic_prompt_caching=True)
         control = await control_bound_llm.generate_many(generation_inputs)
         assert _batch_outputs(control) == ["0", "1", "2"]
@@ -1849,7 +1844,7 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
     async def scenario() -> None:
         """Fail the deterministic first send under a one-attempt budget; the other two succeed."""
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=1)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=1).bind(
             automatic_prompt_caching=True
         )
         results = await bound_llm.generate_many(
@@ -1905,7 +1900,7 @@ def test_a_defect_becomes_one_items_row_and_leaves_the_batch_complete() -> None:
     async def scenario() -> None:
         """Raise past the retry loop on the one item whose send fails, and let the other succeed."""
         adapter = _ClassifyRaisesAdapter(failures=[ValueError("defect")], echo=True)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         results = await bound_llm.generate_many([
@@ -1937,12 +1932,50 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
     async def scenario() -> None:
         """Fail the one send and let classify raise past the retry loop."""
         adapter = _ClassifyRaisesAdapter(failures=[ValueError("defect")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(EscapedExceptionError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
         assert str(raised.value) == "an exception escaped langchaint: classify defect"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provider_outcome() -> (
+    None
+):
+    """generate_one raises EscapedExceptionError whose error is the ParserContractError.
+
+    A parse contract violation must not take the transport-failure path,
+    where classify would report it as an UnknownExceptionError failure row, a provider outcome.
+    """
+
+    async def scenario() -> None:
+        """Fail the one send with a TransientError whose parse raises."""
+        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(EscapedExceptionError) as raised:
+            await bound_llm.generate_one([UserMessage(content="a")])
+        assert isinstance(raised.value.error, ParserContractError)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_a_parse_contract_violation_on_a_stream_open_reaches_the_caller() -> None:
+    """Entering stream_one raises the ParserContractError itself; no stream-path frame wraps it."""
+
+    async def scenario() -> None:
+        """Fail the one open with a TransientError whose parse raises."""
+        adapter = _FakeAdapter(open_failures=[TransientError("boom")])
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind(
+            automatic_prompt_caching=True
+        )
+        with pytest.raises(ParserContractError):
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -1963,7 +1996,7 @@ def test_a_defect_over_a_staged_response_keeps_the_attempt_and_its_billing() -> 
     async def scenario() -> None:
         """Stage the response, raise from interpret, then raise again from classify placing it."""
         adapter = _ClassifyRaisesOverStagedResponseAdapter()
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(EscapedExceptionError) as raised:
@@ -2030,37 +2063,37 @@ def test_stream_one_accepts_a_bare_str() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_cancelled_mid_iteration_releases_the_slot() -> None:
-    """A cancelled item pull returns its slot without waiting for the block to exit."""
+def test_stream_cancelled_mid_iteration_releases_the_permit() -> None:
+    """A cancelled item pull returns its permit without waiting for the block to exit."""
 
     async def scenario() -> None:
-        """Cancel a suspended item pull inside the block, then prove the slot is free."""
+        """Cancel a suspended item pull inside the block, then prove the permit is free."""
         adapter = _FakeAdapter(stream=_HangingStream())
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             consumer = asyncio.create_task(anext(handle))
             await asyncio.sleep(0.01)
             _ = consumer.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await consumer
-            # Still inside the block, so only the cancellation can have freed the one in-flight slot.
-            admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-            rate_limiter.release(admission)
+            # Still inside the block, so only the cancellation can have freed the one permit.
+            async with shared_backoff.admitted(budget=1.0):
+                pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
-    """A cancellation while the open is in flight returns its slot.
+    """A cancellation while the open is in flight returns its permit.
 
-    __aexit__ never runs when __aenter__ raises, so only __aenter__ itself can free the admission here.
+    __aexit__ never runs when __aenter__ raises, so only __aenter__ itself can exit the admission here.
     """
 
     async def scenario() -> None:
-        """Time out an entry whose open_stream never returns, then prove the slot is free."""
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(_FakeAdapter(hang_from_open=1), rate_limiter=rate_limiter).bind(
+        """Time out an entry whose open_stream never returns, then prove the permit is free."""
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(_FakeAdapter(hang_from_open=1), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
 
@@ -2071,25 +2104,25 @@ def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
 
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(enter_and_leave(), timeout=0.02)
-        admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-        rate_limiter.release(admission)
+        async with shared_backoff.admitted(budget=1.0):
+            pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
-    """A cancellation while the pre-first-item retry is reopening returns its slot.
+    """A cancellation while the pre-first-item retry is reopening returns its permit.
 
     The reopen runs inside _next_item's transient-failure handler, which no sibling except clause covers.
-    _open_stream_with_retries releases in its own BaseException handler, so the block's exit is not what
-    returns the slot.
+    _open_stream_with_retries exits the admission in its own BaseException handler, so the handle
+    block's exit is not what returns the permit.
     """
 
     async def scenario() -> None:
-        """Time out an iteration whose second open never returns, then prove the slot is free."""
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        """Time out an iteration whose second open never returns, then prove the permit is free."""
+        shared_backoff = _fast_shared_backoff(capacity=1)
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream(), hang_from_open=2)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
 
         async def drain() -> None:
             """Enter and iterate; the first items() fails, so the retry reopens into the hang."""
@@ -2099,8 +2132,8 @@ def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
 
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(drain(), timeout=0.05)
-        admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-        rate_limiter.release(admission)
+        async with shared_backoff.admitted(budget=1.0):
+            pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2117,7 +2150,7 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
     async def scenario() -> None:
         """Time out a consumer suspended on a hanging stream, then read the handle."""
         adapter = _FakeAdapter(stream=_HangingStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2152,7 +2185,7 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
         """Time out a consumer on a hanging stream that reports a running spend."""
         stream = _HangingStream()
         stream._usage_reported = _USAGE_STREAM
-        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2173,27 +2206,26 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_close_that_raises_still_returns_the_in_flight_slot() -> None:
-    """A failed teardown does not cost the shared budget a slot, and does not reach the caller.
+def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
+    """A failed teardown does not cost the shared budget a permit, and does not reach the caller.
 
-    An admission the close skips is gone for the process's life, so the limiter's capacity shrinks
+    A permit the close skips is gone for the process's life, so the domain's capacity shrinks
     by one on every such stream.
     """
 
     async def scenario() -> None:
-        """Leave the block early over a stream whose close raises, then check both slots are free."""
-        rate_limiter = _fast_rate_limiter(max_in_flight=2)
+        """Leave the block early over a stream whose close raises, then check both permits are free."""
+        shared_backoff = _fast_shared_backoff(capacity=2)
         bound_llm = LLM(
-            _FakeAdapter(stream=_FailingCloseStream()), rate_limiter=rate_limiter
+            _FakeAdapter(stream=_FailingCloseStream()), shared_backoff=shared_backoff
         ).bind(automatic_prompt_caching=True)
         # Leaving after one item keeps the admission held into __aexit__, so the close is the only
-        # path that can return it; exhausting the iterator releases it before the close is reached.
+        # path that can return it; exhausting the iterator exits it before the close is reached.
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 break
-        admissions = [await rate_limiter.acquire() for _ in range(2)]
-        for admission in admissions:
-            rate_limiter.release(admission)
+        async with shared_backoff.admitted(budget=1.0), shared_backoff.admitted(budget=1.0):
+            pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2206,9 +2238,9 @@ def test_a_stream_cancelled_during_the_open_sets_its_abandoned() -> None:
 
     async def scenario() -> None:
         """Time out an entry whose open never returns, then read the handle."""
-        bound_llm = LLM(_FakeAdapter(hang_from_open=1), rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            _FakeAdapter(hang_from_open=1), shared_backoff=_fast_shared_backoff()
+        ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def enter_and_leave() -> None:
@@ -2232,14 +2264,14 @@ def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
 
     async def scenario() -> None:
         """Consume one stream to final(), leave a second before its first item."""
-        bound_llm = LLM(_FakeAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         completed = bound_llm.stream_one([UserMessage(content="hi")])
         async with completed:
             await completed.final()
         second_adapter = _FakeAdapter(stream=_HangingStream())
-        second_bound_llm = LLM(second_adapter, rate_limiter=_fast_rate_limiter()).bind(
+        second_bound_llm = LLM(second_adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         left_early = second_bound_llm.stream_one([UserMessage(content="hi")])
@@ -2261,7 +2293,7 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
     async def scenario() -> None:
         """Absorb a refusal from final() inside the block, then hang into the caller's deadline."""
         adapter = _FakeAdapter(stream=_RefusingStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2290,7 +2322,7 @@ def test_a_stream_cancelled_after_a_protocol_error_sets_its_abandoned() -> None:
     async def scenario() -> None:
         """Absorb the protocol error inside the block, then hang into the caller's deadline."""
         bound_llm = LLM(
-            _FakeAdapter(stream=_ProtocolErrorStream()), rate_limiter=_fast_rate_limiter()
+            _FakeAdapter(stream=_ProtocolErrorStream()), shared_backoff=_fast_shared_backoff()
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -2311,36 +2343,27 @@ def test_a_stream_cancelled_after_a_protocol_error_sets_its_abandoned() -> None:
 
 
 _MID_STREAM_RETRY_AFTER_SECONDS = 30.0
-"""The server-stated wait _StatesRetryAfterAdapter reports, under the limiter's 60-second cap so it passes through."""
+"""The server-stated wait the failing stream reports, under the default longest_wait cap so it passes through."""
 
 
-class _StatesRetryAfterAdapter(_FakeAdapter):
-    """A _FakeAdapter reporting a fixed server-stated wait on every failure it is asked about."""
-
-    @override
-    def retry_after_seconds(self, error: Exception) -> float | None:
-        """Report the fixed wait, whatever the failure."""
-        return _MID_STREAM_RETRY_AFTER_SECONDS
-
-
-def test_a_mid_stream_rate_limit_pauses_the_account() -> None:
+def test_a_mid_stream_rate_limit_pauses_the_domain() -> None:
     """A rate limit that lands after the first item still pauses admission and reaches the caller.
 
-    This stream is past reopening, so nothing here retries; the pause protects every other caller
-    sharing the limiter, and dropping it because this one stream is finished would leave them all
-    sending into the limit. The RetryUnavailableError's __cause__ carries the same verdict and the
-    same server-stated wait, so an application reading it sees the rate limit rather than an
-    unclassified failure.
+    This stream is past reopening, so nothing here retries; the admitted() block still exits with
+    the failure, so the pause protects every other caller sharing the domain, and dropping it
+    because this one stream is finished would leave them all sending into the limit. The
+    RetryUnavailableError's __cause__ carries the same verdict and the same server-stated wait, so
+    an application reading it sees the rate limit rather than an unclassified failure.
     """
 
     async def scenario() -> None:
-        """Let the iteration fail after one item, then read the limiter's state and the error."""
-        rate_limiter = _fast_rate_limiter()
+        """Let the iteration fail after one item, then read the domain's pause and the error."""
+        shared_backoff = SharedBackoff(
+            parse=_parse_fake, failure_types=(TransientError,), capacity=8
+        )
         bound_llm = LLM(
-            _StatesRetryAfterAdapter(
-                stream=_FailsAfterFirstItemStream(), classify_result="rate_limit"
-            ),
-            rate_limiter=rate_limiter,
+            _FakeAdapter(stream=_RaisesItsOwnTransientErrorStream()),
+            shared_backoff=shared_backoff,
         ).bind(automatic_prompt_caching=True)
         before_monotonic_seconds = time.monotonic()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2351,10 +2374,9 @@ def test_a_mid_stream_rate_limit_pauses_the_account() -> None:
         assert isinstance(cause, TransientError)
         assert cause.is_rate_limit
         assert cause.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
-        assert rate_limiter._recovering
         # A server-stated wait is followed un-jittered, so the pause is that wait from the failure.
         assert (
-            rate_limiter._paused_until
+            shared_backoff._pause_until
             >= before_monotonic_seconds + _MID_STREAM_RETRY_AFTER_SECONDS
         )
 
@@ -2402,7 +2424,7 @@ def test_an_adapter_stated_mid_stream_transient_error_becomes_the_cause_unwrappe
         stream = _RaisesItsOwnTransientErrorStream()
         bound_llm = LLM(
             _FakeAdapter(stream=stream, classify_result="transient"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(RetryUnavailableError) as raised:
@@ -2432,7 +2454,7 @@ class _CloseRaisesBaseExceptionStream(_FakeStream):
 def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
     """The record survives a teardown that raises past every Exception handler.
 
-    __aexit__ closes before it sets abandoned, so that the record reports a returned slot and a
+    __aexit__ closes before it sets abandoned, so that the record reports a returned permit and a
     closed connection. Without the set in a finally, the one exception the close does not swallow
     would take the cancelled stream's only account with it.
     """
@@ -2441,7 +2463,7 @@ def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
         """Cancel the block, then let the close raise on the way out."""
         bound_llm = LLM(
             _FakeAdapter(stream=_CloseRaisesBaseExceptionStream(), classify_result="transient"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -2480,7 +2502,7 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
         stream._usage_reported = usage_reported
         bound_llm = LLM(
             _FakeAdapter(stream=stream, classify_result="transient"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(RetryUnavailableError) as raised:
@@ -2504,7 +2526,7 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
         """Absorb the mid-stream failure inside the block, then hang into the caller's deadline."""
         bound_llm = LLM(
             _FakeAdapter(stream=_FailsAfterFirstItemStream(), classify_result="transient"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -2537,7 +2559,7 @@ def test_a_stream_cancelled_after_a_drain_failure_sets_no_abandoned() -> None:
         """Absorb an unplaceable item failure inside the block, then hang into the deadline."""
         bound_llm = LLM(
             _FakeAdapter(stream=_UnnamedItemErrorStream(), classify_result="unknown_exception"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -2561,7 +2583,7 @@ def test_stream_sends_one_request_when_final_follows_the_block() -> None:
     async def scenario() -> None:
         """Drain a stream inside the block, then call final() after it."""
         adapter = _FakeAdapter()
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2581,7 +2603,7 @@ def test_stream_unentered_handle_raises_instead_of_opening() -> None:
     async def scenario() -> None:
         """Use a handle straight from stream_one, without async with."""
         adapter = _FakeAdapter()
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2600,7 +2622,7 @@ def test_stream_handle_raises_on_a_second_entry() -> None:
     async def scenario() -> None:
         """Enter, leave, then enter the same handle again."""
         adapter = _FakeAdapter()
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2645,7 +2667,7 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
     async def scenario() -> None:
         """Drain a stream whose final() reports Refusal, then read the raised RefusalError."""
         adapter = _FakeAdapter(stream=_RefusingStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2673,7 +2695,7 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
     async def scenario() -> None:
         """Drain a stream whose final() reports UnfinishedTurn, then read the raised error."""
         adapter = _FakeAdapter(stream=_UnfinishedTurnStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2699,7 +2721,7 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
     async def scenario() -> None:
         """Drain a stream whose final() reports SchemaViolation, then read the raised error."""
         adapter = _FakeAdapter(stream=_SchemaViolationStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2738,7 +2760,7 @@ def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
     async def scenario() -> None:
         """Drain a stream whose final() reports the outcome, then read the raised error."""
         adapter = _FakeAdapter(stream=stream)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2764,7 +2786,7 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
     async def scenario() -> None:
         """Drain a stream whose final() reports the failure, then read the raised error."""
         adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2794,7 +2816,7 @@ def test_stream_that_yielded_nothing_still_fails_transiently_without_reopening()
     async def scenario() -> None:
         """Drain a stream that yields nothing, then read what final() raises."""
         adapter = _FakeAdapter(stream=_YieldsNothingThenFailsTransientlyStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=3)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=3).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2813,7 +2835,7 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
     async def scenario() -> None:
         """Drain a stream whose final() reports the terminal failure, then read the raised error."""
         adapter = _FakeAdapter(stream=_ProviderFailedTerminallyStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2839,7 +2861,7 @@ def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned
     async def scenario() -> None:
         """Absorb the failure from final() inside the block, then hang into the caller's deadline."""
         adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")])
@@ -2868,7 +2890,7 @@ def test_a_stream_that_drops_mid_turn_records_the_id_its_open_response_carried()
     async def scenario() -> None:
         """Drain a stream whose first items() call fails before yielding."""
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2889,7 +2911,7 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
         adapter = _FakeAdapter(
             stream=_FailsWithARequestIdBeforeFirstItemStream(), classify_result="transient"
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2913,7 +2935,7 @@ def test_a_request_id_on_the_assembled_response_outranks_the_streams_own() -> No
         """Drain a stream whose assembled response names its own request."""
         stream = _FakeStream()
         stream.raw = _FakeRawResponse(id="fake-final", request_id="req-from-assembled")
-        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2939,7 +2961,7 @@ def test_stream_retry_populates_attempt_records() -> None:
             open_failures=[_RequestIdError("connection reset", "req-from-open-failure")],
             classify_result="transient",
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2975,7 +2997,7 @@ def test_a_stream_stamps_its_first_item_and_not_a_later_one() -> None:
         """Drain a stream that waits between its items and read the record it froze."""
         gap_seconds = _SlowAfterFirstItemStream.gap_seconds
         adapter = _FakeAdapter(stream=_SlowAfterFirstItemStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -2997,7 +3019,7 @@ def test_a_non_stream_attempt_leaves_its_first_item_stamp_unset() -> None:
 
     async def scenario() -> None:
         """Run one generate_one and read the record it froze."""
-        bound_llm = LLM(_FakeAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -3013,7 +3035,7 @@ def test_a_reopened_stream_stamps_its_own_first_item() -> None:
     async def scenario() -> None:
         """Drain a stream whose first items() call fails before yielding."""
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3036,7 +3058,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
             open_failures=[TransientError("connection reset"), ValueError("boom")],
             classify_result="invalid_request",
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(InvalidRequestError) as rejected:
@@ -3062,7 +3084,7 @@ def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened
     async def scenario() -> None:
         """Enter a handle whose build_request refuses."""
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="nope")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(InvalidRequestError) as rejected:
@@ -3085,7 +3107,7 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
         adapter = _FakeAdapter(
             open_failures=[ValueError("boom")], classify_result="unknown_exception"
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(UnknownExceptionError) as unplaceable:
@@ -3110,7 +3132,7 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
         adapter = _FakeAdapter(
             open_failures=[ValueError("boom")], classify_result="declared_final"
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(ProviderDeclaredFinalError) as declared_final:
@@ -3132,7 +3154,7 @@ def test_stream_item_failure_before_the_first_item_reopens_and_retries() -> None
     async def scenario() -> None:
         """Drain a stream whose first items() call fails before yielding."""
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3174,7 +3196,7 @@ def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
         stream._usage_reported = _USAGE_STREAM
         bound_llm = LLM(
             _FakeAdapter(stream=stream, classify_result=classify_result),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(expected_error) as caught:
@@ -3199,7 +3221,7 @@ def test_an_unplaceable_mid_stream_error_records_the_attempt_with_nothing_report
         """Let the iteration hit the failure after one item on a stream reporting no counters."""
         bound_llm = LLM(
             _FakeAdapter(stream=_FailsAfterFirstItemStream(), classify_result="unknown_exception"),
-            rate_limiter=_fast_rate_limiter(),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(UnknownExceptionError) as caught:
@@ -3225,7 +3247,7 @@ def test_a_stream_that_broke_before_its_first_item_records_what_the_provider_rep
         stream = _FailsBeforeFirstItemStream()
         stream._usage_reported = _USAGE_STREAM
         adapter = _FakeAdapter(stream=stream)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3246,7 +3268,7 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
     async def scenario() -> None:
         """Open a stream under a two-attempt budget whose every open_stream fails transiently."""
         adapter = _FakeAdapter(open_failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
@@ -3317,7 +3339,7 @@ def test_stream_final_replays_every_error_that_concluded_the_call(
 
     async def scenario() -> None:
         """Call final() twice on a stream whose call cannot end in a Response."""
-        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3342,7 +3364,7 @@ def test_stream_final_replays_a_raise_from_the_adapter_stream() -> None:
     async def scenario() -> None:
         """Call final() twice on a stream whose own final() raises."""
         stream = _FinalRaisesStream()
-        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3384,30 +3406,49 @@ def test_stream_closes_on_context_exit() -> None:
     asyncio.run(scenario())
 
 
-def test_server_stated_retry_after_overrides_exponential_backoff() -> None:
-    """A tiny retry_after_seconds beats a backoff base that would stall the test."""
+def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
+    """A server-stated wait on a retried failure floors the private wait and pauses nothing shared.
+
+    The private draw is at most minimum_wait_ceiling, here 0.001 seconds.
+    So only the floor can push the measured wait past retry_after_seconds.
+    """
 
     async def scenario() -> None:
-        """Recover from one rate-limit failure whose server-stated wait is near zero."""
+        """Recover from one failure whose server-stated wait exceeds the tiny private ceiling."""
+        retry_after_seconds = 0.05
         adapter = _FakeAdapter(
-            failures=[TransientError("rate limited", retry_after_seconds=0.001)]
+            failures=[TransientError("slow down", retry_after_seconds=retry_after_seconds)]
         )
-        rate_limiter = RateLimiter(max_attempts=2, backoff_base_seconds=30.0)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = SharedBackoff(
+            parse=_parse_fake,
+            failure_types=(TransientError,),
+            capacity=8,
+            minimum_wait_ceiling=0.001,
+            longest_wait=1.0,
+            admission_gap=0.0001,
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
+            automatic_prompt_caching=True
+        )
+        started_at = time.monotonic()
         response = await bound_llm.generate_one([UserMessage(content="hi")])
+        elapsed_seconds = time.monotonic() - started_at
         assert response.output == "ok"
         assert response.attempts == 2
+        assert elapsed_seconds >= retry_after_seconds
+        # Only a PauseAll record moves _pause_until off the sentinel; a RetryThisOne must not.
+        assert shared_backoff._pause_until == _NEVER
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_max_in_flight_bounds_batch_concurrency() -> None:
-    """A five-item batch under max_in_flight=2 never overlaps more than two sends."""
+def test_capacity_bounds_batch_concurrency() -> None:
+    """A five-item batch under capacity=2 never overlaps more than two sends."""
 
     async def scenario() -> None:
         """Run the batch on a slow fake and read the recorded peak."""
         adapter = _FakeAdapter(echo=True, send_seconds=0.01)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=2)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=2)).bind(
             automatic_prompt_caching=True
         )
         generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
@@ -3418,36 +3459,44 @@ def test_max_in_flight_bounds_batch_concurrency() -> None:
     asyncio.run(scenario())
 
 
-def test_backoff_sleep_does_not_hold_the_in_flight_slot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """With max_in_flight=1, a task backing off lets another request run.
+def test_backoff_sleep_does_not_hold_the_capacity_permit() -> None:
+    """With capacity=1, a task backing off lets another request run.
 
-    The failure carries no retry_after_seconds, so nothing pauses admission;
-    only a held slot could delay the second request.
-    What pins the release is the second request's own duration: it is admitted while the first backs off,
-    so it finishes in far less than the backoff it would otherwise queue behind.
-    first_task.done() cannot pin this alone: a slot held across the sleep passes to the waiting second request
-    the moment the first retries, so the first is unfinished under either placement.
-    The full-jitter draw is pinned to its ceiling so the backoff outlasts the second request deterministically.
+    The failure is not a rate limit, so nothing pauses admission.
+    Only a held permit could delay the second request.
+    What pins the release is the second request's own duration.
+    It is admitted while the first backs off, so it finishes in far less than that backoff.
+    first_task.done() cannot pin this alone.
+    A permit held across the sleep passes to the second request the moment the first retries.
+    So the first is unfinished under either placement.
+    The failure's retry_after_seconds floors the private wait.
+    The floor makes the backoff outlast the second request deterministically.
     """
-    monkeypatch.setattr(rate_limiter_module.random, "uniform", uniform_returns_ceiling)
 
     async def scenario() -> None:
-        """Interleave a retrying item with a clean one under one slot."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
-        backoff_base_seconds = 0.2
-        rate_limiter = RateLimiter(
-            max_attempts=2, backoff_base_seconds=backoff_base_seconds, max_in_flight=1
+        """Interleave a retrying item with a clean one under one permit."""
+        retry_after_seconds = 0.2
+        adapter = _FakeAdapter(
+            failures=[TransientError("boom", retry_after_seconds=retry_after_seconds)]
         )
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = SharedBackoff(
+            parse=_parse_fake,
+            failure_types=(TransientError,),
+            capacity=1,
+            minimum_wait_ceiling=0.001,
+            longest_wait=1.0,
+            admission_gap=0.0001,
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
+            automatic_prompt_caching=True
+        )
         first_task = asyncio.create_task(bound_llm.generate_one([UserMessage(content="a")]))
         await asyncio.sleep(0.01)
         started_at = time.monotonic()
         second = await bound_llm.generate_one([UserMessage(content="b")])
         second_elapsed_seconds = time.monotonic() - started_at
         assert second.output == "ok"
-        assert second_elapsed_seconds < backoff_base_seconds / 2
+        assert second_elapsed_seconds < retry_after_seconds / 2
         assert not first_task.done()
         first = await first_task
         assert first.output == "ok"
@@ -3456,102 +3505,64 @@ def test_backoff_sleep_does_not_hold_the_in_flight_slot(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_protocol_error_releases_the_slot() -> None:
-    """A StreamProtocolError from items() returns the slot and closes the stream."""
+def test_stream_protocol_error_releases_the_permit() -> None:
+    """A StreamProtocolError from items() returns the permit and closes the stream."""
 
     async def scenario() -> None:
-        """Drive final() into the protocol error, then acquire the slot inside the still-open block."""
+        """Drive final() into the protocol error, then re-admit inside the still-open block."""
         stream = _ProtocolErrorStream()
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(_FakeAdapter(stream=stream), rate_limiter=rate_limiter).bind(
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(StreamProtocolError):
                 await handle.final()
             assert stream.closed is True
-            async with rate_limiter.slot():
+            async with shared_backoff.admitted(budget=1.0):
                 pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_releases_its_slot_when_exhausted() -> None:
-    """Exhausting a stream returns its RateLimiter slot before the handle's block exits.
+def test_stream_releases_its_permit_when_exhausted() -> None:
+    """Exhausting a stream returns its capacity permit before the handle's block exits.
 
-    The acquire sits inside the still-open block, so only the release on exhaustion can satisfy it;
-    acquiring after the block would be satisfied by the release on block exit instead.
+    The re-admission sits inside the still-open block, so only the release on exhaustion can
+    satisfy it; after the block it would be satisfied by the release on block exit instead.
     """
 
     async def scenario() -> None:
-        """Drain one stream under max_in_flight=1, then acquire the slot inside the still-open block."""
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
-        bound_llm = LLM(_FakeAdapter(), rate_limiter=rate_limiter).bind(
+        """Drain one stream under capacity=1, then re-admit inside the still-open block."""
+        shared_backoff = _fast_shared_backoff(capacity=1)
+        bound_llm = LLM(_FakeAdapter(), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
-            async with rate_limiter.slot():
+            async with shared_backoff.admitted(budget=1.0):
                 pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_rate_limited_attempt_then_success_ends_the_recovery() -> None:
-    """The retry loop registers the rate-limit failure and the success, so admission fully reopens."""
+def test_a_rate_limited_stream_open_pauses_the_domain_and_the_retry_succeeds() -> None:
+    """A rate-limited open pauses the domain, and the reopened stream completes normally."""
 
     async def scenario() -> None:
-        """Recover one generate_one from a rate-limit error, then confirm admission fully reopened."""
-        adapter = _FakeAdapter(
-            failures=[
-                TransientError("rate limited", retry_after_seconds=0.001, is_rate_limit=True)
-            ]
-        )
-        rate_limiter = _fast_rate_limiter(max_attempts=2)
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
-        response = await bound_llm.generate_one([UserMessage(content="hi")])
-        assert response.output == "ok"
-        assert response.attempts == 2
-        # Admission fully reopened only if two concurrent acquires are both admitted; probe-only recovery admits one,
-        # so a skipped register_success fails here.
-        acquires = [asyncio.create_task(rate_limiter.acquire()) for _ in range(2)]
-        await asyncio.sleep(0.01)
-        assert sum(task.done() for task in acquires) == 2
-        for admission in await asyncio.gather(*acquires):
-            rate_limiter.release(admission)
-
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
-def test_stream_open_rate_limit_registers_and_recovery_ends_at_open() -> None:
-    """A rate-limited open_stream pauses admission; the successful open ends the recovery.
-
-    Recovery must be over before any item is pulled: the open is a completed request that already cleared the quota,
-    so a stream slow to first token must not keep holding the probe.
-    """
-
-    async def scenario() -> None:
-        """Retry a stream open through a rate-limit error, then confirm admission reopened at open."""
+        """Retry a stream open through a rate-limit failure, then finish the stream."""
         adapter = _FakeAdapter(
             open_failures=[
                 TransientError("rate limited", retry_after_seconds=0.001, is_rate_limit=True)
             ]
         )
-        rate_limiter = _fast_rate_limiter()
-        bound_llm = LLM(adapter, rate_limiter=rate_limiter).bind(automatic_prompt_caching=True)
+        shared_backoff = _fast_shared_backoff()
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            # Entering opened the stream and no item has been pulled yet,
-            # so the open alone must have ended recovery.
-            assert handle._yielded_any is False
-            # Admission fully reopened only if two concurrent acquires are both admitted;
-            # probe-only recovery admits one, so a register_success not fired at open fails here.
-            acquires = [asyncio.create_task(rate_limiter.acquire()) for _ in range(2)]
-            await asyncio.sleep(0.01)
-            assert sum(task.done() for task in acquires) == 2
-            for admission in await asyncio.gather(*acquires):
-                rate_limiter.release(admission)
             response = await handle.final()
+        # Only a PauseAll record moves _pause_until off the sentinel, so this is the open's failure arriving.
+        assert shared_backoff._pause_until != _NEVER
         assert response.output == "ab"
         assert response.attempts == 2
 
@@ -3591,7 +3602,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
             # 1-based, so the request that hangs is the one after the settled ones.
             hang_from_send=settled_attempts + 1,
         )
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         with pytest.raises(TimedOutError) as raised:
@@ -3608,17 +3619,17 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_deadline_expiring_before_a_slot_reports_no_attempts() -> None:
+def test_a_deadline_expiring_before_admission_reports_no_attempts() -> None:
     """A call that never got admitted reports attempts == 0, so a caller can tell it never sent.
 
-    max_in_flight is 1 and the holder never returns its slot, so the second call spends its whole
-    deadline inside the RateLimiter and sends nothing.
+    capacity is 1 and the holder never returns its permit, so the second call spends its whole
+    deadline waiting for admission and sends nothing.
     """
 
     async def scenario() -> None:
-        """Hold the only slot, then run a second call under a deadline it cannot outlast."""
+        """Hold the only permit, then run a second call under a deadline it cannot outlast."""
         adapter = _FakeAdapter(hang_from_send=1)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=1)).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=1)).bind(
             automatic_prompt_caching=True
         )
         holder = asyncio.create_task(bound_llm.generate_one([UserMessage(content="held")]))
@@ -3643,9 +3654,9 @@ def test_an_outer_cancellation_inside_the_deadline_stays_a_cancellation() -> Non
 
     async def scenario() -> None:
         """Cancel a call from outside while its own generous deadline is still running."""
-        bound_llm = LLM(_FakeAdapter(hang_from_send=1), rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            _FakeAdapter(hang_from_send=1), shared_backoff=_fast_shared_backoff()
+        ).bind(automatic_prompt_caching=True)
         call = asyncio.create_task(
             bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=30.0)
         )
@@ -3664,7 +3675,7 @@ def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
     async def scenario() -> None:
         """Hang the second item's send while the first answers."""
         adapter = _FakeAdapter(hang_from_send=2, echo=True)
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         results = await bound_llm.generate_many(
@@ -3687,9 +3698,9 @@ def test_a_stream_deadline_raises_and_leaves_abandoned_unset() -> None:
 
     async def scenario() -> None:
         """Enter a stream whose open never returns, under a deadline."""
-        bound_llm = LLM(_FakeAdapter(hang_from_open=1), rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            _FakeAdapter(hang_from_open=1), shared_backoff=_fast_shared_backoff()
+        ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
         with pytest.raises(TimedOutError):
             async with handle:
@@ -3705,7 +3716,8 @@ def test_a_stream_deadline_expiring_mid_items_raises() -> None:
     async def scenario() -> None:
         """Enter a stream that stalls after its first item, under a deadline."""
         bound_llm = LLM(
-            _FakeAdapter(stream=_HangsAfterFirstItemStream()), rate_limiter=_fast_rate_limiter()
+            _FakeAdapter(stream=_HangsAfterFirstItemStream()),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
         seen: list[StreamItem] = []
@@ -3737,7 +3749,7 @@ def test_a_stream_deadline_stops_at_the_calls_conclusion() -> None:
 
     async def scenario() -> None:
         """Take the Response, then outlive the deadline inside the block."""
-        bound_llm = LLM(_FakeAdapter(), rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
@@ -3760,7 +3772,8 @@ def test_a_stream_deadline_stops_at_a_conclusion_an_item_pull_raised() -> None:
     async def scenario() -> None:
         """Take the UnknownExceptionError mid-iteration, then outlive the deadline in the block."""
         bound_llm = LLM(
-            _FakeAdapter(stream=_FailsAfterFirstItemStream()), rate_limiter=_fast_rate_limiter()
+            _FakeAdapter(stream=_FailsAfterFirstItemStream()),
+            shared_backoff=_fast_shared_backoff(),
         ).bind(automatic_prompt_caching=True)
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
         async with handle:
@@ -3783,7 +3796,7 @@ def test_a_failed_stream_entry_leaves_no_armed_deadline() -> None:
     async def scenario() -> None:
         """Fail an entry under a short deadline, then outlive that deadline uncancelled."""
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="no")])
-        bound_llm = LLM(adapter, rate_limiter=_fast_rate_limiter()).bind(
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
@@ -3801,9 +3814,9 @@ def test_no_deadline_lets_a_callers_own_scope_expire() -> None:
 
     async def scenario() -> None:
         """Run a call with no deadline and let an outer scope cut it."""
-        bound_llm = LLM(_FakeAdapter(hang_from_send=1), rate_limiter=_fast_rate_limiter()).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            _FakeAdapter(hang_from_send=1), shared_backoff=_fast_shared_backoff()
+        ).bind(automatic_prompt_caching=True)
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):
                 await bound_llm.generate_one([UserMessage(content="hi")])

@@ -7,15 +7,16 @@ and an async context manager whose entry opens the request and whose exit closes
 A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
 Assembling the turn and reading what it produced live behind AdapterStream.final();
 the handle owns retry, pacing, and accounting.
-Connection failures before the first yielded item are retried under the RateLimiter;
+Connection failures before the first yielded item are retried;
 after the first yielded item nothing is retried,
 because replaying items the caller already consumed would duplicate output.
-A transient failure the item iterator raises is recorded and fed back to the RateLimiter on both
-paths, so a rate limit paces the account whether or not the stream that hit it could still reopen.
+Each open attempt is its own SharedBackoff admitted() block, and a successful open leaves the
+block held, so the admission spans the stream from opening until it closes or exhausts and a
+long-lived stream counts against capacity for its whole life.
+A failure the item iterator raises exits the block, so its verdict is recorded on both paths and
+a rate limit pauses the domain whether or not the stream that hit it could still reopen.
 A transient failure past the first item ends the call as RetryUnavailableError, as does one the
 assembled response reports.
-An open stream holds one RateLimiter in-flight slot from opening until the stream closes or exhausts,
-so long-lived streams count against max_in_flight for their whole life.
 """
 
 import asyncio
@@ -29,20 +30,12 @@ from pydantic import BaseModel
 
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     BoundAdapter,
-    ContextWindowExceeded,
-    EmptyTurn,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
-    ProviderFailedTerminally,
-    Refusal,
     RequestParams,
     ResponseOutcome,
-    SchemaViolation,
     StreamItem,
-    UnfinishedTurn,
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
@@ -63,12 +56,18 @@ from langchaint.exceptions import (
     TransientError,
     UnfinishedTurnError,
     UnknownExceptionError,
-    _extract_transient_errors,
 )
 from langchaint.messages import Message
 from langchaint.pricing import Billing
-from langchaint.rate_limiter import Admission, Backoff, RateLimiter
 from langchaint.response import CallResult, Response, _abandoned_call_error
+from langchaint.shared_backoff import (
+    Admission,
+    PauseAll,
+    PrivateBackoff,
+    RetryThisOne,
+    SharedBackoff,
+    Verdict,
+)
 
 type _State = Literal["unopened", "open", "finished"]
 
@@ -97,14 +96,17 @@ class StreamHandle[OutputT]:
         adapter: Adapter,
         bound_adapter: BoundAdapter[OutputT],
         messages: Sequence[Message],
-        rate_limiter: RateLimiter,
+        shared_backoff: SharedBackoff,
+        max_attempts: int,
         timeout_seconds: float | None,
     ) -> None:
         """Store the request; called by BoundLLM.stream_one only."""
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages
-        self._rate_limiter = rate_limiter
+        self._shared_backoff = shared_backoff
+        self._max_attempts = max_attempts
+        self._private_backoff = PrivateBackoff(shared_backoff)
         self._timeout_seconds = timeout_seconds
         self._deadline: asyncio.Timeout | None = None
         """The deadline scope while the call is in progress, None once it is not.
@@ -171,6 +173,7 @@ class StreamHandle[OutputT]:
             UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the opens spent the retry budget.
             TimedOutError: timeout_seconds expired before the request opened.
+            ParserContractError: the adapter's parse violated its contract on a failed open.
             RuntimeError: this handle was already entered; build a new one with stream_one.
         """
         if self._state != "unopened":
@@ -182,15 +185,15 @@ class StreamHandle[OutputT]:
         try:
             await self._open_stream_with_retries()
         except BaseException as exc:
-            # __aexit__ does not run when __aenter__ raises, so finish, release, and close the
-            # deadline here. Leaving the deadline open would leave a live timer that cancels this
-            # task at an arbitrary later point, outside any block this handle governs.
-            # _open_stream_with_retries returns the slot on every path that raises, so this release
-            # covers only the case where it never acquired one; it is idempotent either way.
+            # __aexit__ does not run when __aenter__ raises, so finish, exit the admission, and
+            # close the deadline here. Leaving the deadline open would leave a live timer that
+            # cancels this task at an arbitrary later point, outside any block this handle governs.
+            # _open_stream_with_retries exits the admission on every path that raises, so this exit
+            # covers only the case where it never entered one; it is idempotent either way.
             # The abandonment is recorded here because no other frame sees a cancellation that lands
             # during the open.
             self._state = "finished"
-            self._release_slot()
+            await self._exit_admission(None)
             billing_in_flight = self._billing_reported()
             if await self._close_deadline(exc):
                 raise self._timed_out_error(billing_in_flight) from None
@@ -295,19 +298,36 @@ class StreamHandle[OutputT]:
             return
         self.abandoned = _abandoned_call_error(AbandonedCallError, self._ledger, billing_in_flight)
 
-    def _release_slot(self) -> None:
-        if self._admission is not None:
-            self._rate_limiter.release(self._admission)
-            self._admission = None
+    async def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
+        """Exit the held admitted() block and return the verdict it recorded, None without one.
+
+        exc is what the block ends with: a failure_types member is parsed and its verdict
+        recorded, and anything else, None included, only returns the capacity permit.
+        Idempotent: a later call finds no admission and returns None, which is what lets every
+        closing path exit without checking what the others did.
+
+        Raises:
+            ParserContractError: the adapter's parse violated its contract on the failure exc carried.
+        """
+        if self._admission is None:
+            return None
+        admission, self._admission = self._admission, None
+        _ = await admission.__aexit__(
+            type(exc) if exc is not None else None,
+            exc,
+            exc.__traceback__ if exc is not None else None,
+        )
+        return admission.verdict
 
     async def _close_adapter_stream(self) -> None:
-        """Close the provider connection and return the in-flight slot, whatever the close does.
+        """Close the provider connection and exit the admitted() block, whatever the close does.
 
         A close failure is logged rather than raised, because the request it belonged to has already
         ended and the exception would only displace the Response or the error the caller came for.
-        The release sits in a finally rather than after the handler, so a BaseException out of the
-        close returns the slot too. Either way, an admission this method skips is gone from the
-        shared budget for the process's life.
+        The admission exit sits in a finally rather than after the handler, so a BaseException out
+        of the close returns the capacity permit too.
+        A failing path that already exited the block with its failure leaves this exit nothing to
+        do, _exit_admission being idempotent.
         The stream is dropped before the close is awaited, so a teardown that fails is attempted
         once: __aexit__, which closes again after the paths that close mid-stream, finds nothing to
         close.
@@ -320,81 +340,90 @@ class StreamHandle[OutputT]:
                 await adapter_stream.close()
         except Exception:
             _logger.warning(
-                "closing the provider stream raised; the in-flight slot was returned",
+                "closing the provider stream raised; the capacity permit was returned",
                 exc_info=True,
             )
         finally:
-            self._release_slot()
+            _ = await self._exit_admission(None)
 
-    def _transient_error(self, exc: Exception, message: str) -> TransientError:
-        """Wrap one attempt error as the TransientError that carries its retry directive.
+    def _transient_error(
+        self, exc: Exception, message: str, verdict: Verdict | None
+    ) -> TransientError:
+        """Wrap one attempt failure as the TransientError its attempt record carries.
 
         An exception that already is a TransientError is its own wrapper, so an adapter that stated
         retry_after_seconds and is_rate_limit itself keeps them; message is then unused, because
         replacing the adapter's own text would lose what it said.
+        The wrapper takes the verdict's capped retry_after and calls a PauseAll a rate limit;
+        a failure outside failure_types has no verdict and carries neither.
         """
         if isinstance(exc, TransientError):
             return exc
-        wrapped = TransientError(
-            message,
-            retry_after_seconds=self._adapter.retry_after_seconds(exc),
-            is_rate_limit=self._adapter.classify(exc) == "rate_limit",
-        )
+        match verdict:
+            case PauseAll(retry_after=retry_after):
+                wrapped = TransientError(
+                    message, retry_after_seconds=retry_after, is_rate_limit=True
+                )
+            case RetryThisOne(retry_after=retry_after):
+                wrapped = TransientError(message, retry_after_seconds=retry_after)
+            case _:
+                wrapped = TransientError(message)
         wrapped.__cause__ = exc
         return wrapped
 
     def _record_transient_error(
         self, wrapped: TransientError, billing: Billing | None = None
-    ) -> Backoff:
-        """Record one transient failure as an attempt and register it with the RateLimiter.
+    ) -> None:
+        """Record one transient failure as an attempt.
 
-        Called while the failing attempt's admission is still held;
-        register_transient_error raises RuntimeError for one already released.
-        A failure this stream cannot retry still registers, because the pause a rate limit sets
-        protects the whole account: losing it because this one stream is past reopening would leave
-        every other caller sending into the limit.
+        The failure's verdict is already recorded: the admitted() block's exit did that, so the
+        pause a rate limit sets protects the whole domain even for a failure this stream cannot
+        retry, whose loss would otherwise leave every other caller sending into the limit.
 
         billing is what the provider reported for the attempt.
-
-        Returns:
-            The Backoff to sleep before the next open attempt;
-            its delay is drawn once, so it equals any account-wide pause it set.
-            A caller that will not reopen drops it.
         """
         self._ledger.record(error=wrapped, assistant_message=None, billing=billing)
-        assert self._admission is not None
-        return self._rate_limiter.register_transient_error(
-            self._admission, _extract_transient_errors(self._ledger.attempt_records)
-        )
 
-    async def _backoff_or_exhaust(self, exc: Exception, backoff: Backoff) -> None:
-        """Back off before the next open attempt; call after the failed attempt's release.
+    async def _backoff_or_exhaust(self, exc: Exception, verdict: Verdict | None) -> None:
+        """Wait before the next open attempt, as the failure's verdict asks.
 
-        backoff is the value _record_transient_error returned for this failure,
-        so the sleep matches the account-wide pause the same draw set.
+        On PauseAll there is no wait of our own, because the next admitted() entry already holds
+        until the shared pause ends. Every other failure waits out the PrivateBackoff, floored by
+        a RetryThisOne's stated retry_after.
 
         Raises:
             RetriesExhaustedError: the recorded failure spent the last attempt.
         """
-        if self._ledger.attempts >= self._rate_limiter.max_attempts:
+        if self._ledger.attempts >= self._max_attempts:
             raise RetriesExhaustedError(call=self._ledger.freeze(), request=self._request) from exc
-        await backoff.sleep()
+        match verdict:
+            case PauseAll():
+                return
+            case RetryThisOne(retry_after=retry_after):
+                await asyncio.sleep(self._private_backoff.next_wait(retry_after))
+            case _:
+                await asyncio.sleep(self._private_backoff.next_wait(None))
 
-    def _non_retriable_or_none(
-        self, exc: Exception, stream_billing: Billing | None
+    def _terminal_error_or_none(
+        self, exc: Exception, *, verdict: Verdict | None, stream_billing: Billing | None
     ) -> GenerationError | None:
-        """Map one attempt error to the non-retriable error to propagate, or None when transient.
+        """Map one attempt failure to the terminal error to propagate, or None when a retry may fix it.
 
         Reached only for exceptions, which by the adapter contract are attempts the adapter read no
         outcome from: what it did read it reports as a ResponseOutcome member, which this handle
         matches instead.
+        verdict is what the failure's admitted() block recorded: a failure_types exc is terminal
+        only on DoNotRetry, and an exc outside failure_types has no verdict and is terminal unless
+        classify calls it transient (a transport failure that produced nothing parseable).
+        A terminal failure's name comes from classify, mapped exactly as BoundLLM._terminal_error
+        maps it; anything classify cannot place lands on UnknownExceptionError.
 
         stream_billing is what the open stream has reported, None where no stream is open and None
         again where an open one has reported nothing. A provider that reports counters before its
         first item has already billed by the time one of these errors arrives, so the reading is
         what keeps that attempt accountable.
 
-        The request id goes to the ledger before the transient check, so an attempt this handle will
+        The request id goes to the ledger before the retry decision, so an attempt this handle will
         retry carries it too. An open stream is the second source: a connection that drops mid-turn
         raises an error carrying no id, while the stream still holds the headers the 200 arrived with.
         """
@@ -402,7 +431,10 @@ class StreamHandle[OutputT]:
         if request_id is None and self._adapter_stream is not None:
             request_id = self._adapter_stream.request_id()
         self._ledger.note_request_id(request_id)
-        if isinstance(exc, TransientError):
+        if verdict is not None:
+            if verdict.kind != "do_not_retry":
+                return None
+        elif isinstance(exc, TransientError) or self._adapter.classify(exc) == "transient":
             return None
         classification = self._adapter.classify(exc)
         if classification == "invalid_request":
@@ -416,17 +448,13 @@ class StreamHandle[OutputT]:
             return ProviderDeclaredFinalError(
                 error=exc, call=self._ledger.freeze(), request=self._request
             )
-        if classification == "unknown_exception":
-            if self._adapter_stream is not None:
-                # The stream was open, so langchaint can say the attempt reached the provider and
-                # what that provider reported for it; the class records nothing where it cannot.
-                # The open test is the stream itself, not its billing, which is None on an open
-                # stream that has reported nothing yet.
-                self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-            return UnknownExceptionError(
-                error=exc, call=self._ledger.freeze(), request=self._request
-            )
-        return None
+        if self._adapter_stream is not None:
+            # The stream was open, so langchaint can say the attempt reached the provider and
+            # what that provider reported for it; the class records nothing where it cannot.
+            # The open test is the stream itself, not its billing, which is None on an open
+            # stream that has reported nothing yet.
+            self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
+        return UnknownExceptionError(error=exc, call=self._ledger.freeze(), request=self._request)
 
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
         """Build the row-shaped InvalidRequestError for this handle, chained to cause when there is one.
@@ -447,13 +475,12 @@ class StreamHandle[OutputT]:
     async def _open_stream_with_retries(self) -> None:
         """Take the call's request, then open one adapter stream, retrying transient failures.
 
-        A fresh admission is acquired for each attempt and released before the backoff sleep,
-        so a waiting task never holds capacity while this one backs off.
-        A successful open registers the admission with the limiter,
-        ending any recovery this handle's probe was serving,
-        so a stream slow to first token cannot stall the shared account's admission.
-        The slot stays held for the stream's whole life; only recovery ends here, not the in-flight hold.
-        Every failing path out of an attempt returns the admission, cancellation included.
+        Each attempt is its own admitted() block, exited with the failure before any wait,
+        so a waiting task never holds capacity while this one backs off and the failure's
+        verdict reaches the shared domain either way.
+        A successful open leaves the block held for the stream's whole life,
+        so the stream counts against capacity until it closes or exhausts.
+        Every failing path out of an attempt exits the block, cancellation included.
 
         Raises:
             InvalidRequestError: build_request returned InvalidRequest, or the open
@@ -461,32 +488,30 @@ class StreamHandle[OutputT]:
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the attempts spent the retry budget.
+            ParserContractError: the adapter's parse violated its contract on a failed open.
         """
         request = self._request_for_this_call()
         while self._adapter_stream is None:
-            self._admission = await self._rate_limiter.acquire()
+            self._admission = await self._shared_backoff.admitted().__aenter__()
             self._ledger.start_attempt()
             try:
                 opened = await self._bound_adapter.open_stream(request)
             except Exception as exc:
-                non_retriable = self._non_retriable_or_none(exc, None)
-                if non_retriable is not None:
-                    self._release_slot()
-                    raise non_retriable from exc
-                backoff = self._record_transient_error(self._transient_error(exc, str(exc)))
-                self._release_slot()
-                await self._backoff_or_exhaust(exc, backoff)
+                verdict = await self._exit_admission(exc)
+                terminal = self._terminal_error_or_none(exc, verdict=verdict, stream_billing=None)
+                if terminal is not None:
+                    raise terminal from exc
+                self._record_transient_error(self._transient_error(exc, str(exc), verdict))
+                await self._backoff_or_exhaust(exc, verdict)
                 continue
             except BaseException:
-                # CancelledError is a BaseException the clause above does not catch. Releasing here
-                # returns the admission at the same point on every failing path, so no caller's
+                # CancelledError is a BaseException the clause above does not catch. Exiting here
+                # returns the permit at the same point on every failing path, so no caller's
                 # unwind is what the shared budget depends on.
-                self._release_slot()
+                _ = await self._exit_admission(None)
                 raise
             self._adapter_stream = opened
             self._items = self._adapter_stream.items()
-            assert self._admission is not None
-            self._rate_limiter.register_success(self._admission)
 
     async def __anext__(self) -> StreamItem:
         """Return the next item.
@@ -503,6 +528,7 @@ class StreamHandle[OutputT]:
             UnknownExceptionError: the adapter could not place an item or reopen exception.
             RetriesExhaustedError: a pre-first-item failure spent the retry budget.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
+            ParserContractError: the adapter's parse violated its contract on an item or reopen failure.
             StopAsyncIteration: the stream is exhausted.
             RuntimeError: the handle is unopened or finished.
         """
@@ -536,7 +562,7 @@ class StreamHandle[OutputT]:
             except StopAsyncIteration:
                 if self._ended_at_monotonic_seconds is None:
                     self._ended_at_monotonic_seconds = time.monotonic()
-                self._release_slot()
+                _ = await self._exit_admission(None)
                 raise
             except StreamProtocolError:
                 await self._close_adapter_stream()
@@ -546,31 +572,37 @@ class StreamHandle[OutputT]:
                 # reports counters before its first item has already billed for this attempt,
                 # whichever of the paths below it takes.
                 stream_billing = self._billing_reported()
-                non_retriable = self._non_retriable_or_none(exc, stream_billing)
-                if non_retriable is not None:
+                # The admission exits with the failure before the stream closes, so the verdict is
+                # recorded first and the close's own exit finds nothing left to do.
+                verdict = await self._exit_admission(exc)
+                terminal = self._terminal_error_or_none(
+                    exc, verdict=verdict, stream_billing=stream_billing
+                )
+                if terminal is not None:
                     await self._close_adapter_stream()
-                    raise non_retriable from exc
+                    raise terminal from exc
                 if self._yielded_any:
                     wrapped = self._transient_error(
-                        exc, f"stream failed after items were yielded: {exc}"
+                        exc, f"stream failed after items were yielded: {exc}", verdict
                     )
-                    _ = self._record_transient_error(wrapped, stream_billing)
+                    self._record_transient_error(wrapped, stream_billing)
                     await self._close_adapter_stream()
                     raise RetryUnavailableError(
                         call=self._ledger.freeze(), request=self._request
                     ) from wrapped
-                backoff = self._record_transient_error(
-                    self._transient_error(exc, str(exc)), stream_billing
+                self._record_transient_error(
+                    self._transient_error(exc, str(exc), verdict), stream_billing
                 )
                 await self._close_adapter_stream()
-                await self._backoff_or_exhaust(exc, backoff)
+                await self._backoff_or_exhaust(exc, verdict)
                 await self._open_stream_with_retries()
                 continue
             except BaseException:
                 # CancelledError is a BaseException the clauses above do not catch.
-                # Cancelling an item pull in its own task leaves the block open, so waiting for __aexit__
-                # would strand this slot. Return it, then let the cancellation propagate.
-                self._release_slot()
+                # Cancelling an item pull in its own task leaves the block open, so waiting for the
+                # adapter stream's close would strand the permit. Exit the admission, then let the
+                # cancellation propagate.
+                _ = await self._exit_admission(None)
                 raise
             self._ledger.stamp_first_item()
             self._yielded_any = True
@@ -606,6 +638,7 @@ class StreamHandle[OutputT]:
             RetryUnavailableError: the adapter reported the assembled response as
                 ProviderFailedTransiently; that response ends the stream, so no retry was available.
                 That 200's billing and turn are on its attempt record.
+            ParserContractError: draining hit a failure whose parse violated its contract.
             RuntimeError: the handle is unopened, or it is finished with no conclusion stored
                 (drained to exhaustion, then left the block).
         """
@@ -645,13 +678,13 @@ class StreamHandle[OutputT]:
             except BaseException as exc:
                 # A cancellation is not a conclusion, the same rule __anext__ applies:
                 # it destroys the frames that could have observed the call rather than ending it.
-                # The interpretation is inside the try because every _conclude case records the
-                # attempt first, so a raise past that record would let a second call record it again.
+                # The interpretation is inside the try because _conclude records the attempt before
+                # it returns, so a raise past that record would let a second call record it again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                     await self._close_deadline(exc)
                 raise
-            # Every _conclude case builds its result off the frozen CallRecord, so the caller has an
+            # _conclude builds every result off the frozen CallRecord, so the caller has an
             # account of the call whichever one it was.
             self._conclusion_carried_the_call = True
             await self._close_deadline(None)
@@ -669,13 +702,32 @@ class StreamHandle[OutputT]:
         """Build what this outcome concludes the call with: the Response, or the error to raise.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
-        Every case closes the staged response into this attempt's record first, so the call it freezes
-        into the result holds the terminal response and what it billed.
+        Every outcome closes the staged response into this attempt's record before the result is
+        built, so the call it freezes into the result holds the terminal response and what it billed.
         raw is that response, which only a success carries onward.
         """
+        if outcome.kind == "provider_failed_transiently":
+            failure = TransientError(outcome.reason, is_rate_limit=outcome.is_rate_limit)
+            self._ledger.record_ending_at(
+                ended_at_monotonic_seconds,
+                error=failure,
+                assistant_message=outcome.assistant_message,
+            )
+            retry_unavailable = RetryUnavailableError(
+                call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                request=self._request,
+            )
+            retry_unavailable.__cause__ = failure
+            return retry_unavailable
+        # error is None on every member reaching here: the request succeeded, and what the adapter
+        # made of the response is the item's outcome, not this attempt's failure.
+        self._ledger.record_ending_at(
+            ended_at_monotonic_seconds,
+            error=None,
+            assistant_message=outcome.assistant_message,
+        )
         match outcome.kind:
             case "adapter_result":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return Response(
                     output=outcome.output,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
@@ -684,85 +736,40 @@ class StreamHandle[OutputT]:
                     assistant_message=outcome.assistant_message,
                 )
             case "refusal":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return RefusalError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "max_completion_tokens_exceeded":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return MaxCompletionTokensExceededError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "empty_turn":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return EmptyTurnError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "schema_violation":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return SchemaViolationError(
                     validation_error_json=outcome.validation_error_json,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "context_window_exceeded":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return ContextWindowExceededError(
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "unfinished_turn":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return UnfinishedTurnError(
                     reason=outcome.reason,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
             case "provider_failed_terminally":
-                self._record_completed_attempt(outcome, ended_at_monotonic_seconds)
                 return ProviderFailedTerminallyError(
                     reason=outcome.reason,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     request=self._request,
                 )
-            case "provider_failed_transiently":
-                failure = TransientError(outcome.reason, is_rate_limit=outcome.is_rate_limit)
-                self._ledger.record_ending_at(
-                    ended_at_monotonic_seconds,
-                    error=failure,
-                    assistant_message=outcome.assistant_message,
-                )
-                retry_unavailable = RetryUnavailableError(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    request=self._request,
-                )
-                retry_unavailable.__cause__ = failure
-                return retry_unavailable
-
-    def _record_completed_attempt(
-        self,
-        outcome: AdapterResult[OutputT]
-        | Refusal
-        | MaxCompletionTokensExceeded
-        | EmptyTurn
-        | SchemaViolation
-        | ContextWindowExceeded
-        | UnfinishedTurn
-        | ProviderFailedTerminally,
-        ended_at_monotonic_seconds: float,
-    ) -> None:
-        """Record the attempt that reached a billable 200, whatever the adapter made of it.
-
-        error is None on every member here: the request itself succeeded, and what the adapter made of
-        the response is the item's outcome, not this attempt's failure.
-        ProviderFailedTransiently is the one member _conclude records itself, because its record
-        carries the TransientError the failure was classified as.
-        """
-        self._ledger.record_ending_at(
-            ended_at_monotonic_seconds,
-            error=None,
-            assistant_message=outcome.assistant_message,
-        )

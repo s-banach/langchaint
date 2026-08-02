@@ -53,10 +53,10 @@ def package_modules() -> Iterator[ModuleType]:
         yield importlib.import_module(module_info.name)
 
 
-def uniform_returns_ceiling(_low: float, high: float) -> float:
-    """Stand in for random.uniform, returning the ceiling of the range.
+def random_returns_zero() -> float:
+    """Stand in for random.random, returning zero.
 
-    Patched over the random.uniform rate_limiter draws its full jitter from, this makes a backoff delay its ceiling.
-    A test can then state the delay the retry loop waits.
+    Patched over the random.random shared_backoff draws waits from, this makes every drawn wait its
+    ceiling. A test can then state the delay the retry loop waits.
     """
-    return high
+    return 0.0

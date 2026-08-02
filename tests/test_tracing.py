@@ -92,7 +92,7 @@ from tests.test_bound_llm import (
     _FakeAdapter,
     _FakeBoundAdapter,
     _FakeStream,
-    _fast_rate_limiter,
+    _fast_shared_backoff,
     _HangsAfterFirstItemStream,
     _RefusingStream,
 )
@@ -337,7 +337,7 @@ def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -
         """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=_IsRecordingRaisesTracer(),
             capture_message_content=True,
         )
@@ -406,7 +406,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -432,7 +432,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -455,7 +455,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -487,7 +487,7 @@ def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -513,7 +513,7 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
         adapter = _FakeAdapter(hang_from_send=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -537,7 +537,7 @@ def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> 
         """Time out an entry whose open never returns, then read the traced handle and the span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(hang_from_open=1), rate_limiter=_fast_rate_limiter()),
+            LLM(_FakeAdapter(hang_from_open=1), shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -586,7 +586,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         traced = TracedLLM(
             LLM(
                 _FakeAdapter(stream=_HangsAfterFirstItemStream()),
-                rate_limiter=_fast_rate_limiter(),
+                shared_backoff=_fast_shared_backoff(),
             ),
             tracer=tracer,
             capture_message_content=False,
@@ -617,7 +617,7 @@ def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
         adapter = _FakeAdapter(hang_from_send=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -639,7 +639,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
         adapter = _FakeAdapter(failures=[TransientError("boom")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -668,10 +668,12 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
             echo=True,
             failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
-        rate_limiter = _fast_rate_limiter(max_in_flight=1)
+        shared_backoff = _fast_shared_backoff(capacity=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=rate_limiter), tracer=tracer, capture_message_content=False
+            LLM(adapter, shared_backoff=shared_backoff),
+            tracer=tracer,
+            capture_message_content=False,
         )
         results = await traced.bind(automatic_prompt_caching=True).generate_many([
             [UserMessage(content="a")],
@@ -686,7 +688,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         assert all(span.kind == SpanKind.CLIENT for span in spans)
         assert all(_attribute(span, "gen_ai.operation.name") == "chat" for span in spans)
         assert all(_attribute(span, "langchaint.cost_in_usd") is not None for span in spans)
-        # max_in_flight=1 serializes the batch, so the refused item is the first span to end.
+        # capacity=1 serializes the batch, so the refused item is the first span to end.
         refused, *succeeded = spans
         assert refused.status.status_code == StatusCode.ERROR
         assert _attribute(refused, "error.type") == "RefusalError"
@@ -851,7 +853,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
         adapter = _FakeAdapter(stream=_MidFailStream(), classify_result="transient")
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -878,7 +880,7 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
         adapter = _FakeAdapter(open_failures=[TransientError("connection reset")] * 4)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -903,7 +905,7 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
         adapter = _FakeAdapter(stream=_RefusingStream())
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -1078,7 +1080,7 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -1155,15 +1157,15 @@ def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> Spa
 
 
 def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
-    """The adapter and rate_limiter pass through TracedLLM; the BoundLLM fields through TracedBoundLLM."""
+    """The adapter and shared_backoff pass through TracedLLM; the BoundLLM fields through TracedBoundLLM."""
     adapter = _FakeAdapter()
-    rate_limiter = _fast_rate_limiter()
-    traced = TracedLLM(LLM(adapter, rate_limiter=rate_limiter), capture_message_content=False)
+    shared_backoff = _fast_shared_backoff()
+    traced = TracedLLM(LLM(adapter, shared_backoff=shared_backoff), capture_message_content=False)
     assert traced.adapter is adapter
-    assert traced.rate_limiter is rate_limiter
+    assert traced.shared_backoff is shared_backoff
     bound = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert bound.adapter is adapter
-    assert bound.rate_limiter is rate_limiter
+    assert bound.shared_backoff is shared_backoff
     assert bound.response_format is _Answer
     assert bound.tool_manager is None
     assert bound.binding.system_prompt is None
@@ -1203,7 +1205,7 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
         """Rebind, then stream and batch under one extra_attributes mapping; every span carries it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
             extra_attributes={"gen_ai.agent.name": "agent_a"},
             tracer=tracer,
             capture_message_content=False,
@@ -1536,11 +1538,11 @@ def test_generate_many_passes_warm_cache_through() -> None:
     """warm_cache reaches BoundLLM.generate_many: the warming item never overlaps a sibling."""
 
     async def scenario() -> None:
-        """Run a three-item batch on a slow fake with a wide slot and read the recorded peak."""
+        """Run a three-item batch on a slow fake with a wide capacity and read the recorded peak."""
         adapter = _FakeAdapter(echo=True, send_seconds=0.01)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter(max_in_flight=8)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -2282,7 +2284,7 @@ def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> Non
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=True,
         )
@@ -2310,7 +2312,7 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=2)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
             tracer=tracer,
             capture_message_content=True,
         )
@@ -2331,7 +2333,7 @@ def test_generate_many_captures_each_items_own_generation_input_under_capture() 
         """Run a two-item batch under capture and read the content off each item's span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), rate_limiter=_fast_rate_limiter(max_in_flight=1)),
+            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
             tracer=tracer,
             capture_message_content=True,
         )
@@ -2725,7 +2727,7 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter(max_attempts=3)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=3),
             tracer=tracer,
             capture_message_content=capture_message_content,
         )
@@ -2770,7 +2772,7 @@ def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reas
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, rate_limiter=_fast_rate_limiter()),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=True,
         )

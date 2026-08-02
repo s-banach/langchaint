@@ -388,7 +388,7 @@ def test_to_tables_places_each_attempt_on_the_calls_timeline() -> None:
     """started_after_seconds is measured from the call's start, so the first wait is visible.
 
     The gap between one row's start plus its elapsed_seconds and the next row's start is the
-    RateLimiter wait or backoff sleep between the two, which no attempt bracket covers.
+    admission wait or backoff sleep between the two, which no attempt bracket covers.
     """
     _, attempts = to_tables(
         _failure(

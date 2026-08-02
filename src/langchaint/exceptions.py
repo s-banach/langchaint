@@ -25,12 +25,14 @@ so the adapter reports it as a ResponseOutcome member where it reads the respons
 Every GenerationError is constructed by a scope holding the call's ledger, the only scope that knows
 its attempts and timing; an adapter reports one attempt and never a GenerationError.
 
-Three exceptions sit outside this axis, none of them a GenerationError.
+Five exceptions sit outside this axis, none of them a GenerationError.
 DispatchExceptionGroup and InvalidToolArgsError belong to the tool layer, not the generate loop.
 ToolManager.dispatch_many raises the group after every sibling dispatch settled.
 It groups the tool-function defects and carries the settled calls' outcomes.
 PydanticTool.validate_and_run raises InvalidToolArgsError when a tool call's args fail validation.
 StreamProtocolError says a stream did not follow the event contract.
+GaveUpWaiting and ParserContractError belong to SharedBackoff.
+The first reports an admitted() entry whose budget expired; the second reports a parse that violated its contract.
 """
 
 from collections.abc import Sequence
@@ -56,11 +58,12 @@ class TransientError(Exception):
     """One failed attempt that a retry may fix.
 
     __cause__ holds the original provider exception when one exists.
-    retry_after_seconds is the server-stated wait parsed from the response's retry-after headers,
-    when the provider sent one;
-    RateLimiter honors it up to a 60-second cap and uses it to pause admission account-wide.
-    is_rate_limit marks the errors Adapter.classify returned "rate_limit" for;
-    RateLimiter pauses admission on them and requires a successful probe request before resuming full admission.
+    It plays two parts around the SharedBackoff admitted() block.
+    As a failure_types member, one raised inside the block is parsed by
+    verdict_from_transient_error: is_rate_limit True becomes PauseAll and pauses the domain,
+    False becomes RetryThisOne, and retry_after_seconds is the wait the verdict carries.
+    As the attempt record's error, each retry loop wraps a parsed provider failure in one holding
+    the verdict's capped retry_after, so the record states the wait the loop honored.
     No billing fields: the attempt that reached a billable 200 is recorded carrying this error, so
     what it cost and the response it was read from are on that AttemptRecord.
     """
@@ -83,7 +86,7 @@ def _extract_transient_errors(
 ) -> tuple[TransientError, ...]:
     """Return the errors of the failed attempts, in order.
 
-    The fold RetriesExhaustedError and RateLimiter.delay_seconds consume;
+    The fold RetriesExhaustedError consumes;
     on a failure this is every record's error, on a success all but the last.
     """
     return tuple(record.error for record in attempt_records if record.error is not None)
@@ -600,7 +603,7 @@ class TimedOutError(AbandonedCallError):
     raises there carries no account of what the call spent.
 
     The deadline covers the whole call, so it can expire while a request is in flight, during a
-    backoff sleep, or while waiting for a RateLimiter slot. The last of those reports attempts == 0,
+    backoff sleep, or while waiting for SharedBackoff admission. The last of those reports attempts == 0,
     which is how a caller tells an item that never sent from one the provider answered slowly.
     """
 
@@ -699,4 +702,22 @@ class StreamProtocolError(Exception):
     (no stop reason on the Messages API, no terminal response on the Responses API,
     or a StreamHandle that finished iterating with no adapter stream left to ask),
     and where final() is called before items() is exhausted, so no terminal response was captured.
+    """
+
+
+class GaveUpWaiting(Exception):  # noqa: N818 (the interface names the outcome, not an error kind)
+    """The `budget` expired before SharedBackoff.admitted's entry admitted the request.
+
+    Entry holds nothing: no permit, no queue place, and nothing recorded.
+    A fresh attempt joins the same queue behind the same pause, so do not resubmit at once.
+    """
+
+
+class ParserContractError(Exception):
+    """A SharedBackoff `parse` raised, or returned something that is not a verdict.
+
+    A defect in `parse`, not a provider classification: fix `parse` rather than retrying through it.
+    __cause__ holds what `parse` raised, where it raised.
+    Behind that as context sits the provider failure `parse` was given.
+    Nothing was recorded, and Admission.verdict is None.
     """

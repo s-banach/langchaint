@@ -64,6 +64,7 @@ Mapping decisions:
 import base64
 import json
 from abc import ABC
+from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Literal, cast, override
@@ -119,14 +120,16 @@ from langchaint.adapter import (
     StreamItem,
     ToolChoice,
     UnfinishedTurn,
-    classification_from_response,
     narrowed_request,
+    record_parse_fallthrough,
     request_id_from_raw,
     request_json,
     retry_after_seconds_from_headers,
+    terminal_classification_from_response,
+    verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.exceptions import StreamProtocolError
+from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.messages import (
     AssistantMessage,
     Message,
@@ -140,6 +143,7 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.pricing import Billing, category_cost
+from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
@@ -162,8 +166,28 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 )
 
 
-_RATE_LIMIT_STATUSES = frozenset({429, 529})
-"""529 is the SDK's overloaded status (anthropic 0.120.0), which pauses admission like a 429."""
+_PAUSE_STATUSES = frozenset({429, 529})
+"""429 rate_limit_error and 529 overloaded_error: the whole account is throttled, so all pause."""
+
+_PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error"})
+"""The two _PAUSE_STATUSES error types, which pause at any status carrying them."""
+
+_RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 504})
+"""One request's failure, retried without pausing siblings.
+
+500 api_error and 504 timeout_error come from the errors page.
+408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 0.120.2 _should_retry).
+"""
+
+_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
+"""The statuses anthropic's errors page lists as this request's rejection; a resend fails again."""
+
+PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
+"""How often parse_anthropic fell to a status-family default, keyed by status and error type.
+
+A diagnostic surface, read by no decision: a growing key names a status or error type the
+tables above should learn.
+"""
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
@@ -767,6 +791,59 @@ def _adapter_result[OutputT](
     )
 
 
+def parse_anthropic(failure: Exception) -> Verdict:
+    """Map one AnthropicMessagesAdapter.failure_types exception to its verdict.
+
+    The listed rows come from anthropic's errors page,
+    https://platform.claude.com/docs/en/api/errors (read 2026-08-01):
+    _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne,
+    and _DO_NOT_RETRY_STATUSES are DoNotRetry.
+    408 and 409 are in _RETRY_THIS_ONE_STATUSES from the SDK rather than the page: anthropic's SDK
+    retries both, naming them request and lock timeouts (anthropic 0.120.2 _should_retry).
+    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
+    a _PAUSE_ERROR_TYPES type pauses at any status, because the type is the throttle signal
+    whatever status carried it; an unlisted 5xx is RetryThisOne, one attempt's server-side
+    failure; any other unlisted status is DoNotRetry, matching the page's rule that 400 covers
+    otherwise-unlisted 4xx errors.
+    The status and the error type pick the verdict; a retry-after header only fills its retry_after.
+    A TransientError takes verdict_from_transient_error's shared mapping.
+    Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
+    """
+    if isinstance(failure, TransientError):
+        return verdict_from_transient_error(failure)
+    if not isinstance(failure, anthropic.APIStatusError):
+        record_parse_fallthrough(
+            PARSE_FALLTHROUGH_COUNTS,
+            parse_name="parse_anthropic",
+            status_code=None,
+            error_type=type(failure).__name__,
+        )
+        return DoNotRetry()
+    retry_after = retry_after_seconds_from_headers(failure.response.headers)
+    if failure.type in _PAUSE_ERROR_TYPES or failure.status_code in _PAUSE_STATUSES:
+        if failure.status_code not in _PAUSE_STATUSES:
+            record_parse_fallthrough(
+                PARSE_FALLTHROUGH_COUNTS,
+                parse_name="parse_anthropic",
+                status_code=failure.status_code,
+                error_type=failure.type,
+            )
+        return PauseAll(retry_after=retry_after)
+    if failure.status_code in _RETRY_THIS_ONE_STATUSES:
+        return RetryThisOne(retry_after=retry_after)
+    if failure.status_code in _DO_NOT_RETRY_STATUSES:
+        return DoNotRetry()
+    record_parse_fallthrough(
+        PARSE_FALLTHROUGH_COUNTS,
+        parse_name="parse_anthropic",
+        status_code=failure.status_code,
+        error_type=failure.type,
+    )
+    if failure.status_code >= 500:
+        return RetryThisOne(retry_after=retry_after)
+    return DoNotRetry()
+
+
 class AnthropicMessagesAdapter(Adapter):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
@@ -807,7 +884,7 @@ class AnthropicMessagesAdapter(Adapter):
         its base_url decides what it reaches.
 
         The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
-        counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
+        counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
         so the SDK must never retry beneath it.
         The copy re-feeds client._client (the caller's httpx.AsyncClient) explicitly:
         the two Bedrock client classes override copy() without the "http_client or self._client" reuse the
@@ -965,37 +1042,42 @@ class AnthropicMessagesAdapter(Adapter):
             response_format=response_format,
         )
 
+    failure_types: ClassVar[tuple[type[Exception], ...]] = (
+        anthropic.APIStatusError,
+        TransientError,
+    )
+    """The exceptions parse_anthropic maps to a verdict.
+
+    APIStatusError catches every error status, not only the ones with their own subclass:
+    _make_status_error returns a specific subclass only for the statuses it lists and the bare
+    APIStatusError for every other one (anthropic 0.120.2, Bedrock clients included), so a
+    subclass list would silently drop whatever status the provider adds next.
+    """
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Delegate to parse_anthropic, whose docstring names the table and the defaults."""
+        return parse_anthropic(failure)
+
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to one of the five ErrorClassification members.
-
-        A response's status decides, not the SDK exception class: _make_status_error returns a
-        specific subclass only for the statuses it lists and the bare APIStatusError for every
-        other one (verified against anthropic 0.120.0, Bedrock clients included), so a class list
-        would silently drop whatever status the provider adds next.
-        classification_from_response holds the shared rule; 529 joins 429 as a rate limit here
-        because the SDK reserves it for an overloaded service.
+        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
         APIConnectionError, which APITimeoutError subclasses, and RetryableError, the marker the
-        SDK's own retry policy honors from middleware, are transient.
+        SDK's own retry policy honors from middleware, are the transport failures that produced
+        nothing parseable: transient.
+        An APIStatusError only arrives here after parse verdicted DoNotRetry, since every one is
+        in failure_types; terminal_classification_from_response names what it becomes.
         Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
             return "transient"
         if not isinstance(error, anthropic.APIStatusError):
             return "unknown_exception"
-        return classification_from_response(
+        return terminal_classification_from_response(
             status_code=error.response.status_code,
             headers=error.response.headers,
-            rate_limit_statuses=_RATE_LIMIT_STATUSES,
         )
-
-    @override
-    def retry_after_seconds(self, error: Exception) -> float | None:
-        """Read the server-stated wait from the SDK exception's response headers."""
-        if isinstance(error, anthropic.APIStatusError):
-            return retry_after_seconds_from_headers(error.response.headers)
-        return None
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:

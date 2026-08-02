@@ -85,6 +85,7 @@ Mapping decisions:
 
 import base64
 from abc import ABC
+from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
@@ -145,14 +146,16 @@ from langchaint.adapter import (
     StreamItem,
     ToolChoice,
     UnfinishedTurn,
-    classification_from_response,
     narrowed_request,
+    record_parse_fallthrough,
     request_id_from_raw,
     request_json,
     retry_after_seconds_from_headers,
+    terminal_classification_from_response,
+    verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.exceptions import StreamProtocolError
+from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
@@ -168,10 +171,33 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.pricing import Billing, category_cost
+from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
 
-_RATE_LIMIT_STATUSES = frozenset({429})
+_PAUSE_STATUSES = frozenset({429, 503})
+"""429 rate limits and both documented 503 forms: the whole account is throttled, so all pause."""
+
+_SPEND_LIMIT_CODES = frozenset({
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+})
+"""The error.code values whose 429 no wait restores: credits or a set spend limit ran out."""
+
+_RETRY_THIS_ONE_STATUSES = frozenset({500, 408, 409})
+"""One request's server-side failure or collision, retried without pausing siblings."""
+
+_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404})
+"""The statuses that reject this request; a resend fails the same way."""
+
+PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
+"""How often parse_openai fell to a status-family default, keyed by status and error type.
+
+A diagnostic surface, read by no decision: a growing key names a status or error type the
+tables above should learn.
+"""
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
@@ -468,9 +494,9 @@ def _provider_failure(
     sentence, which says exactly that.
     An error code outside the table is terminal: retrying is what spends the budget, so a code nobody
     classified fails the item rather than being resent at full price.
-    rate_limit_exceeded sets is_rate_limit, which the retry loop's TransientError carries to the
-    RateLimiter, pausing admission the way a 429 status does. Neither member carries a server-stated
-    wait, so that pause runs for the jittered backoff.
+    rate_limit_exceeded sets is_rate_limit, which the retry loop's TransientError carries into the
+    admitted() block's exit, where parse maps it to PauseAll and pauses admission the way a 429
+    status does. Neither member carries a server-stated wait, so the pause runs for the drawn wait.
     """
     error = response.error
     if error is None:
@@ -784,6 +810,56 @@ def _adapter_result[OutputT](
     )
 
 
+def parse_openai(failure: Exception) -> Verdict:
+    """Map one OpenAIResponsesAdapter.failure_types exception to its verdict.
+
+    The listed rows come from openai's error-code guide,
+    https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
+    _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
+    DoNotRetry because the guide states retrying those will not restore access;
+    _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
+    404 is in _DO_NOT_RETRY_STATUSES from the SDK rather than the guide: the SDK raises
+    NotFoundError for it (openai 2.51.0), and a resend of an unknown model or path fails the same way.
+    error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
+    still read insufficient_quota, so the type separates nothing.
+    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
+    an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
+    status is DoNotRetry.
+    The status and the error code pick the verdict; a retry-after header only fills its
+    retry_after.
+    A TransientError takes verdict_from_transient_error's shared mapping.
+    Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
+    """
+    if isinstance(failure, TransientError):
+        return verdict_from_transient_error(failure)
+    if not isinstance(failure, openai.APIStatusError):
+        record_parse_fallthrough(
+            PARSE_FALLTHROUGH_COUNTS,
+            parse_name="parse_openai",
+            status_code=None,
+            error_type=type(failure).__name__,
+        )
+        return DoNotRetry()
+    retry_after = retry_after_seconds_from_headers(failure.response.headers)
+    if failure.status_code in _PAUSE_STATUSES:
+        if failure.code in _SPEND_LIMIT_CODES:
+            return DoNotRetry()
+        return PauseAll(retry_after=retry_after)
+    if failure.status_code in _RETRY_THIS_ONE_STATUSES:
+        return RetryThisOne(retry_after=retry_after)
+    if failure.status_code in _DO_NOT_RETRY_STATUSES:
+        return DoNotRetry()
+    record_parse_fallthrough(
+        PARSE_FALLTHROUGH_COUNTS,
+        parse_name="parse_openai",
+        status_code=failure.status_code,
+        error_type=failure.type,
+    )
+    if failure.status_code >= 500:
+        return RetryThisOne(retry_after=retry_after)
+    return DoNotRetry()
+
+
 class OpenAIResponsesAdapter(Adapter):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
@@ -820,7 +896,7 @@ class OpenAIResponsesAdapter(Adapter):
         """Store the SDK client, which owns credentials and endpoints.
 
         The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
-        counts every request as an attempt, and feeds rate-limit errors to the RateLimiter,
+        counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
         so the SDK must never retry beneath it.
 
         reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text where the
@@ -965,38 +1041,41 @@ class OpenAIResponsesAdapter(Adapter):
             response_format=response_format,
         )
 
+    failure_types: ClassVar[tuple[type[Exception], ...]] = (
+        openai.APIStatusError,
+        TransientError,
+    )
+    """The exceptions parse_openai maps to a verdict.
+
+    APIStatusError catches every error status, not only the ones with their own subclass:
+    _make_status_error returns a specific subclass only for the statuses it lists and the bare
+    APIStatusError for every other one (openai 2.51.0), so a subclass list would silently drop
+    413, which openai maps to no class, and whatever status the provider adds next.
+    """
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Delegate to parse_openai, whose docstring names the table and the defaults."""
+        return parse_openai(failure)
+
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Map the SDK exception to one of the five ErrorClassification members.
+        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
-        A response's status decides, not the SDK exception class: _make_status_error returns a
-        specific subclass only for the statuses it lists and the bare APIStatusError for every
-        other one (verified against openai 2.45.0), so a class list would silently drop 413, which
-        openai maps to no class, and whatever status the provider adds next.
-        classification_from_response holds the shared rule; 429 is the only rate-limit status here,
-        openai having no counterpart to anthropic's 529.
-        503 is not added to match it: the SDK draws no line between it and any other 5xx,
-        and transient already retries it.
-
-        APIConnectionError, which APITimeoutError subclasses, carries no response and is transient.
+        APIConnectionError, which APITimeoutError subclasses, carries no response: a transport
+        failure that produced nothing parseable, transient.
+        An APIStatusError only arrives here after parse verdicted DoNotRetry, since every one is
+        in failure_types; terminal_classification_from_response names what it becomes.
         Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, openai.APIConnectionError):
             return "transient"
         if not isinstance(error, openai.APIStatusError):
             return "unknown_exception"
-        return classification_from_response(
+        return terminal_classification_from_response(
             status_code=error.response.status_code,
             headers=error.response.headers,
-            rate_limit_statuses=_RATE_LIMIT_STATUSES,
         )
-
-    @override
-    def retry_after_seconds(self, error: Exception) -> float | None:
-        """Read the server-stated wait from the SDK exception's response headers."""
-        if isinstance(error, openai.APIStatusError):
-            return retry_after_seconds_from_headers(error.response.headers)
-        return None
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:

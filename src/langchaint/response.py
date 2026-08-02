@@ -182,7 +182,7 @@ def _call_row(*, call_id: int, result: CallResult[object]) -> dict[str, RowValue
     still holds, and None on a failure the adapter declared before building a request.
     It holds the whole prompt, so a caller writing this table somewhere the outputs may not go drops
     the column.
-    elapsed_seconds belongs here because it spans the RateLimiter waits and backoff sleeps no attempt
+    elapsed_seconds belongs here because it spans the admission waits and backoff sleeps no attempt
     bracket covers, so it is its own measurement rather than a fold. Spend is not: every billing
     column sits in the attempts table and a caller sums what they need.
     """
@@ -212,8 +212,8 @@ def _attempt_row(
     The timing columns are durations, not clock readings, because AttemptRecord's stamps are raw
     time.monotonic() values that mean nothing outside the process that took them.
     started_after_seconds places the attempt on the call's timeline, so the gap between one row's
-    start and the previous row's end is the RateLimiter wait or backoff sleep between them, and the
-    first row's own value is the slot wait before the first request went out.
+    start and the previous row's end is the admission wait or backoff sleep between them, and the
+    first row's own value is the admission wait before the first request went out.
     seconds_to_first_item is how long this attempt's stream took to yield anything, None on a
     non-stream attempt and on a stream that yielded nothing.
     model_served and response_id are what the provider said about the response this attempt

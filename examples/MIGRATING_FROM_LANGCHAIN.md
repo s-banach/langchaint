@@ -17,8 +17,8 @@ It has no chains, no runnables, no middleware stack, and no agent class.
 | `astream_events(...)` to catch tool calls | the same `stream_one` iterator yields each completed `ToolCall` |
 | `create_react_agent(...)`, `AgentExecutor` | own the loop over `generate_one` and `ToolManager.dispatch` (see `02_tool_loop.py`) |
 | a tool returning `Command(goto=/update=)` | a tool returns data; the app routes between turns |
-| `RunnableRetry`, per-model `max_retries` | `RateLimiter(max_attempts=...)`, one instance shared across `LLM`s |
-| `InMemoryRateLimiter`, rate-limit middleware | `RateLimiter(max_in_flight=...)`, one shared account budget |
+| `RunnableRetry`, per-model `max_retries` | `max_attempts` on `LLM` and the backend constructors |
+| `InMemoryRateLimiter`, rate-limit middleware | `SharedBackoff(admission_gap=..., capacity=...)`, one instance shared across `LLM`s on the same account |
 | `.with_fallbacks([...])` | app-level `try`/`except` over two bindings (see below) |
 | `set_llm_cache(...)` client-side cache | provider prompt caching via `automatic_prompt_caching`, required on `bind` (no client cache) |
 | callbacks, LangSmith tracing | `langchaint.tracing.TracedLLM` over any OTel exporter (see `08_tracing.py`) |
@@ -55,15 +55,16 @@ The middleware table above covers the `create_agent` hooks.
 | a per-call deadline as `awrap_model_call` middleware | `timeout_seconds` on the call it bounds (see `04_failures_and_deadlines.py`) |
 | `get_stream_writer()` and `astream(subgraphs=True)` stream a nested sub-agent progress tree to one consumer with no reference passing | no counterpart: the application owns the event stream (see `events.py` and `task_stream.py` in `examples/full_app`) |
 
-## Retries and rate limiting: one RateLimiter
+## Retries and rate limiting: one SharedBackoff
 
 There is no retry setting on a generate call and no rate-limit middleware.
-One `RateLimiter` owns retrying (`max_attempts`, `backoff_base_seconds`, `backoff_max_seconds`) and pacing (`max_in_flight`).
+`max_attempts` on the `LLM` bounds retrying, and one `SharedBackoff` owns pacing: its `admitted()` block gates every request start, a rate limit pauses every request in the domain, and `capacity` bounds how many requests are in flight at once.
 Pass one instance to every `LLM` hitting the same account.
 A second account gets a second instance, as in `04_failures_and_deadlines.py`.
 
 There is no requests-per-minute parameter.
-Set `max_in_flight` where you would have set that number.
+`admission_gap` is the smallest interval between two request starts.
+A gap of `60 / N` seconds caps starts at `N` per minute while demand queues.
 
 ## Fallbacks: a try/except over two bindings
 

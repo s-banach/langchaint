@@ -798,7 +798,7 @@ class ToolManager:
             # gather already cancelled the sibling tasks but does not wait for them;
             # settle them so no tool task is still unwinding after this raise.
             for task in tasks:
-                task.cancel()
+                _ = task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         for (index, _), result in zip(to_dispatch, results, strict=True):

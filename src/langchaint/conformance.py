@@ -224,7 +224,7 @@ class AdapterConformance(ABC):
         raw = self.response_with_impossible_counters()
         bound_adapter = self._bound_adapter()
         try:
-            bound_adapter.billing_from_raw(raw)
+            _ = bound_adapter.billing_from_raw(raw)
         except ValueError:
             return
         raise AssertionError("billing_from_raw accepted counters that cannot be partitioned")

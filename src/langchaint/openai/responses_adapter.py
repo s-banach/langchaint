@@ -84,6 +84,7 @@ Mapping decisions:
 """
 
 import base64
+from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
@@ -95,6 +96,7 @@ from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
     FunctionToolParam,
+    ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCallParam,
     ResponseIncludable,
     ResponseInputImageContentParam,
@@ -112,7 +114,6 @@ from openai.types.responses import (
 from openai.types.responses.response_create_params import PromptCacheOptions
 from openai.types.responses.response_input_param import (
     FunctionCallOutput,
-    ResponseFunctionCallOutputItemListParam,
     ResponseInputItemParam,
 )
 from openai.types.shared_params.reasoning import Reasoning
@@ -1116,7 +1117,9 @@ class _OpenAIStream(AdapterStream):
         constructor, so this is readable from the moment the stream opens and there is no public
         route to the same headers (openai 2.48.0).
         """
-        return self._sdk_stream._response.headers.get("x-request-id")  # noqa: SLF001
+        http_response = self._sdk_stream._response  # noqa: SLF001
+        request_id: str | None = http_response.headers.get("x-request-id")
+        return request_id
 
     @override
     async def close(self) -> None:
@@ -1124,7 +1127,7 @@ class _OpenAIStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundOpenAI[OutputT](BoundAdapter[OutputT]):
+class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
     """What both openai bindings share: the request path, and what a response says about itself.
 
     A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.

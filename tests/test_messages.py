@@ -58,7 +58,7 @@ def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
     The tag selects the member before any field is read, so no element is matched by its shape.
     """
     with pytest.raises(ValidationError) as caught:
-        AssistantMessage.model_validate({"kind": "assistant", "turn": [{"text": "hi"}]})
+        _ = AssistantMessage.model_validate({"kind": "assistant", "turn": [{"text": "hi"}]})
     assert [(error["loc"], error["type"]) for error in caught.value.errors()] == [
         (("turn", 0), "union_tag_not_found")
     ]
@@ -67,7 +67,7 @@ def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
 def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> None:
     """A tagged element is validated against that member alone, so one bad field is one error."""
     with pytest.raises(ValidationError) as caught:
-        AssistantMessage.model_validate({
+        _ = AssistantMessage.model_validate({
             "kind": "assistant",
             "turn": [{"kind": "text", "text": 1}],
         })
@@ -79,7 +79,7 @@ def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> Non
 def test_validation_without_a_kind_tag_is_rejected() -> None:
     """A message payload missing kind fails validation, proving the discriminator is engaged."""
     with pytest.raises(ValidationError):
-        _MESSAGES_TYPE_ADAPTER.validate_python([{"content": "hi"}])
+        _ = _MESSAGES_TYPE_ADAPTER.validate_python([{"content": "hi"}])
 
 
 def test_string_turn_coercion() -> None:
@@ -154,9 +154,9 @@ def test_assistant_turn_rejects_a_marked_text_part() -> None:
     """A TextPart with cache_breakpoint in an assistant turn fails validation on every construction path."""
     marked = TextPart(text="hey", cache_breakpoint=True)
     with pytest.raises(ValidationError, match="cache_breakpoint"):
-        AssistantMessage(turn=(marked,))
+        _ = AssistantMessage(turn=(marked,))
     with pytest.raises(ValidationError, match="cache_breakpoint"):
-        AssistantMessage.model_validate({
+        _ = AssistantMessage.model_validate({
             "kind": "assistant",
             "turn": [{"kind": "text", "text": "hey", "cache_breakpoint": True}],
         })
@@ -175,13 +175,13 @@ def test_model_copy_rejects_a_derived_property_key() -> None:
     """
     message = AssistantMessage(turn=(ToolCall(id="c1", name="probe", args_json="{}"),))
     with pytest.raises(TypeError, match="derived property of AssistantMessage"):
-        message.model_copy(update={"tool_calls": ()})
+        _ = message.model_copy(update={"tool_calls": ()})
 
 
 def test_model_copy_rejects_a_key_that_is_not_a_field() -> None:
     """A typo key raises and the message lists the model's fields."""
     with pytest.raises(TypeError, match="not a field of UserMessage"):
-        UserMessage(content="hi").model_copy(update={"contnet": "bye"})
+        _ = UserMessage(content="hi").model_copy(update={"contnet": "bye"})
 
 
 def test_model_copy_with_a_field_key_returns_the_modified_copy() -> None:

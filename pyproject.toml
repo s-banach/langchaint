@@ -42,13 +42,15 @@ dev = [
     # docstring names the revision it was verified against.
     "opentelemetry-semantic-conventions>=0.64b0",
     "pytest>=9.0.2",
-    "pyrefly>=1.2.0.dev2",
+    "pyrefly>=1.2.0",
     "ruff>=0.16.0",
+    # jsonschema ships no stubs, so its callers in tools.py go unchecked without these.
+    "types-jsonschema>=4.26.0.20260518",
     "typos>=1.48.0",
 ]
 
 [tool.pyrefly]
-preset = "strict"
+preset = "all"
 # project-includes bounds type checking to exactly these trees; search-path is the separate
 # import-resolution setting, "src" being the langchaint import root. scripts is in because
 # tests/test_tracing.py imports scripts.refresh_semconv_genai for the one map naming which
@@ -61,21 +63,10 @@ project-includes = ["src", "tests", "examples", "scripts"]
 # by path with that directory on sys.path.
 search-path = ["src", ".", "examples/full_app"]
 
-# Enabled above strict: redundant-cast enforces the "no cast" smell's
-# stale half (every finding is a deletable cast), deprecated flags
-# stdlib/library deprecations before an upgrade breaks them, and
-# non-exhaustive-match catches a missing Literal or enum case.
-# explicit-any stays off: the remaining Any sites are deliberate
-# existential typing (overload implementations, SDK stream generics,
-# the heterogeneous Tool collection), and suppressions on deliberate
-# Any would only add noise. When pyrefly 1.2.0 lands, also enable
-# implicit-any-variable (inference gaps that silently make a variable
-# Any): the tree is clean for it since Tool.validate_and_run owns the
-# typed validate-then-call pair, but 1.1.1 rejects the rule name.
 [tool.pyrefly.errors]
-redundant-cast = "error"
-deprecated = "error"
-non-exhaustive-match = "error"
+implicit-bool = false
+# An @overload set requires a permissive implementation signature, which this rule flags.
+explicit-any = false
 
 [tool.pytest.ini_options]
 # examples/full_app is in because its claims suite asserts what the app's docstrings say,
@@ -193,9 +184,6 @@ lint.ignore = [
     "none-not-at-end-of-union",
 ]
 
-# Docstrings and comments break lines at sentence boundaries, not at a column
-# width; a sentence longer than this cap breaks at a clause boundary. Code
-# stays at line-length 99 via the formatter; E501 is deliberately unselected.
 lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
@@ -208,28 +196,8 @@ lint.pylint.max-returns = 10
 lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
-# The tests exercise private helpers and attributes directly (AnthropicMessagesAdapter._precompute_fields,
-# BoundLLM._bound_adapter); those accesses are the unit under test, so private-member-access
-# cannot be satisfied without exposing internals.
-# too-many-arguments is ignored because the fake adapters' constructors take one
-# keyword per scripted behavior (a failure list, a hang point, a delay); grouping them into a
-# config object would relocate the count without shrinking it.
 lint.per-file-ignores."tests/*" = ["private-member-access", "too-many-arguments"]
-
-# The examples are standalone snippet files, not an importable package, so
-# implicit-namespace-package (which would demand an examples/__init__.py) does
-# not apply. They are type checked and linted like the rest of the tree.
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
-
-# examples/full_app/ holds the multi-agent example app, its scripted offline adapter, and the suite
-# asserting its docstrings' claims. Its modules import each other by bare name, the way they resolve
-# when run by path, so there is no examples/full_app/__init__.py and implicit-namespace-package fires.
-# blind-except is ignored because catching bare Exception around a sub-run is deliberate: a narrower
-# except turns a defect in a sub-agent's own tool into an exception unwinding past the parent instead
-# of a message the parent model can answer around. Each such except carries a comment stating
-# that. too-many-return-statements is ignored because the event renderer is one
-# exhaustive match over the closed Event union, one return per arm; splitting it would
-# reintroduce an unreachable fallback arm.
 lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
 
 [tool.typos.default.extend-words]

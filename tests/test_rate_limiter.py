@@ -29,7 +29,7 @@ async def _register_failure(
     Call only while admission is open: an existing pause would make the acquire wait it out.
     """
     failing_admission = await rate_limiter.acquire()
-    rate_limiter.register_transient_error(failing_admission, errors_from_attempts)
+    _ = rate_limiter.register_transient_error(failing_admission, errors_from_attempts)
     rate_limiter.release(failing_admission)
 
 
@@ -164,10 +164,10 @@ def test_pause_is_never_shortened() -> None:
         rate_limiter = RateLimiter()
         first_failing = await rate_limiter.acquire()
         second_failing = await rate_limiter.acquire()
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             first_failing, [_rate_limit_error(retry_after_seconds=0.08)]
         )
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             second_failing, [_rate_limit_error(retry_after_seconds=0.001)]
         )
         rate_limiter.release(first_failing)
@@ -214,7 +214,7 @@ def test_a_success_frees_the_probe_role_before_the_probe_releases_its_slot() -> 
         await _register_failure(rate_limiter, [_rate_limit_error(retry_after_seconds=0.01)])
         long_lived_admission = await rate_limiter.acquire()
         rate_limiter.register_success(long_lived_admission)
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             long_lived_admission, [_rate_limit_error(retry_after_seconds=0.01)]
         )
         next_probe = await rate_limiter.acquire()
@@ -256,7 +256,7 @@ def test_non_probe_success_does_not_end_recovery() -> None:
         rate_limiter = RateLimiter(backoff_base_seconds=0.01)
         pre_incident = await rate_limiter.acquire()
         failing_admission = await rate_limiter.acquire()
-        rate_limiter.register_transient_error(failing_admission, [_rate_limit_error()])
+        _ = rate_limiter.register_transient_error(failing_admission, [_rate_limit_error()])
         rate_limiter.release(failing_admission)
         # The pre-incident request was admitted in the open state, so it is not the probe;
         # its success must be a no-op that leaves the one-probe gate closed.
@@ -282,7 +282,7 @@ def test_probe_rate_limit_failure_pauses_admission_again() -> None:
         first_chain = [_rate_limit_error()]
         await _register_failure(rate_limiter, first_chain)
         probe_admission = await asyncio.wait_for(rate_limiter.acquire(), timeout=1.0)
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             probe_admission,
             [
                 *first_chain,
@@ -311,7 +311,7 @@ def test_a_released_admission_is_rejected_everywhere() -> None:
         with pytest.raises(RuntimeError, match="already released"):
             rate_limiter.register_success(admission)
         with pytest.raises(RuntimeError, match="already released"):
-            rate_limiter.register_transient_error(
+            _ = rate_limiter.register_transient_error(
                 admission, [_rate_limit_error(retry_after_seconds=30.0)]
             )
         # The rejected calls must have mutated nothing: the immediate acquire pins that the

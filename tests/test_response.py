@@ -165,13 +165,13 @@ def _failure(*, attempt_records: tuple[AttemptRecord, ...]) -> RetriesExhaustedE
 def test_response_rejects_empty_attempt_records() -> None:
     """A Response without a single record has no history and is rejected."""
     with pytest.raises(ValueError, match="at least one record"):
-        _response(output="ok", attempt_records=())
+        _ = _response(output="ok", attempt_records=())
 
 
 def test_response_rejects_an_error_free_record_before_the_last() -> None:
     """A success record can only be last: the loop stops on the attempt that succeeded."""
     with pytest.raises(ValueError, match="only the last"):
-        _response(
+        _ = _response(
             output="ok",
             attempt_records=(_record(error=None), _record(error=TransientError("e"))),
         )
@@ -180,7 +180,7 @@ def test_response_rejects_an_error_free_record_before_the_last() -> None:
 def test_response_rejects_a_failed_last_record() -> None:
     """A Response is a success, so its final record must be the one that succeeded."""
     with pytest.raises(ValueError, match="must be error-free"):
-        _response(output="ok", attempt_records=(_record(error=TransientError("e")),))
+        _ = _response(output="ok", attempt_records=(_record(error=TransientError("e")),))
 
 
 def test_retries_exhausted_error_derives_from_its_records() -> None:

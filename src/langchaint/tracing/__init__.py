@@ -557,11 +557,12 @@ def _tool_call_arguments(args_json: str) -> object:
     the caller's own telemetry guard rather than being silently reported as unparseable text.
     """
     try:
-        return json.loads(
+        parsed: object = json.loads(
             args_json, parse_float=_finite_float, parse_constant=_reject_non_json_constant
         )
     except ValueError:
         return args_json
+    return parsed
 
 
 def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:

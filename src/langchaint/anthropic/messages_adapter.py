@@ -63,6 +63,7 @@ Mapping decisions:
 
 import base64
 import json
+from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Literal, cast, override
@@ -1106,7 +1107,7 @@ class _AnthropicStream(AdapterStream):
         await self._sdk_stream.close()
 
 
-class _BoundAnthropic[OutputT](BoundAdapter[OutputT]):
+class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
     """What both anthropic bindings share: the request path, and what a response says about itself.
 
     A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.

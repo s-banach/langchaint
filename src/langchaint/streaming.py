@@ -554,7 +554,7 @@ class StreamHandle[OutputT]:
                     wrapped = self._transient_error(
                         exc, f"stream failed after items were yielded: {exc}"
                     )
-                    self._record_transient_error(wrapped, stream_billing)
+                    _ = self._record_transient_error(wrapped, stream_billing)
                     await self._close_adapter_stream()
                     raise RetryUnavailableError(
                         call=self._ledger.freeze(), request=self._request

@@ -231,7 +231,7 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     """Passing both client and http_client raises: a passed client already owns its transport."""
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
     with pytest.raises(ValueError, match="http_client="):
-        anthropic_bedrock_model(
+        _ = anthropic_bedrock_model(
             "anthropic.claude-opus-4-8", client=client, http_client=httpx.AsyncClient()
         )
 
@@ -246,13 +246,13 @@ def test_both_bedrock_constructors_raise_on_a_region_beside_a_client() -> None:
     (anthropic 0.120.0, openai 2.45.0).
     """
     with pytest.raises(ValueError, match="aws_region="):
-        anthropic_bedrock_model(
+        _ = anthropic_bedrock_model(
             "anthropic.claude-opus-4-8",
             aws_region="eu-west-1",
             client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
         )
     with pytest.raises(ValueError, match="aws_region="):
-        openai_bedrock_model(
+        _ = openai_bedrock_model(
             "openai.gpt-oss-120b-1:0",
             pricing=_ARBITRARY_PRICING,
             supports_prompt_cache_options=False,
@@ -406,7 +406,7 @@ def test_openai_model_raises_on_a_client_that_does_not_reach_openai(client: Asyn
     grouped by provider.
     """
     with pytest.raises(ValueError, match="contradicts the client"):
-        openai_model("gpt-5.6-terra", client=client)
+        _ = openai_model("gpt-5.6-terra", client=client)
 
 
 @pytest.mark.parametrize(
@@ -427,7 +427,7 @@ def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
     request and a span reporting "anthropic".
     """
     with pytest.raises(ValueError, match="contradicts the client"):
-        AnthropicMessagesAdapter(
+        _ = AnthropicMessagesAdapter(
             client=client,
             model="claude-sonnet-5",
             pricing=_ARBITRARY_ANTHROPIC_PRICING,
@@ -447,4 +447,4 @@ def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
         pass
 
     with pytest.raises(ValueError, match="contradicts the client"):
-        openai_model("gpt-5.6-terra", client=SigV4BedrockOpenAI(aws_region="us-east-1"))
+        _ = openai_model("gpt-5.6-terra", client=SigV4BedrockOpenAI(aws_region="us-east-1"))

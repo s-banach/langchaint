@@ -73,7 +73,8 @@ def fetch(url: str) -> bytes:
         urllib.error.URLError: the host could not be reached.
     """
     with urllib.request.urlopen(url) as response:
-        return response.read()
+        content: bytes = response.read()
+    return content
 
 
 def resolve_head_sha() -> str:
@@ -86,7 +87,8 @@ def resolve_head_sha() -> str:
         KeyError: the response carried no sha, meaning the API shape changed.
     """
     payload = json.loads(fetch(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
-    return payload["sha"]
+    sha: str = payload["sha"]
+    return sha
 
 
 def render_source_doc(sha: str) -> str:
@@ -130,9 +132,9 @@ def main() -> None:
     DESTINATION.mkdir(parents=True, exist_ok=True)
     for file in sorted(ATTRIBUTE_SCHEMA_FILES.values()):
         content = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{file}")
-        (DESTINATION / file).write_bytes(content)
+        _ = (DESTINATION / file).write_bytes(content)
         print(f"wrote {DESTINATION / file} ({len(content)} bytes)")
-    SOURCE_DOC.write_text(render_source_doc(sha))
+    _ = SOURCE_DOC.write_text(render_source_doc(sha))
     print(f"wrote {SOURCE_DOC} at {sha}")
 
 

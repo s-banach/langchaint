@@ -2028,7 +2028,8 @@ def _captured(exporter: InMemorySpanExporter, key: str) -> object:
     assert span.attributes is not None
     value = span.attributes[key]
     assert isinstance(value, str)
-    return json.loads(value)
+    parsed: object = json.loads(value)
+    return parsed
 
 
 def test_capture_off_leaves_every_content_key_off_the_span() -> None:

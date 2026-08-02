@@ -8,7 +8,7 @@ while every function exception (including a function-internal ValidationError) p
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from typing import assert_type
+from typing import TYPE_CHECKING, assert_type
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -38,6 +38,9 @@ from langchaint import (
     tool,
 )
 from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
+
+if TYPE_CHECKING:
+    from jsonschema.protocols import Validator
 
 _WEATHER_SCHEMA: Mapping[str, object] = {
     "type": "object",
@@ -99,7 +102,7 @@ async def _validation_error_function(args: _EchoArgs) -> str:
 
     The model_validate call always raises because the payload lacks the required text field.
     """
-    _EchoArgs.model_validate({"wrong": args.text})
+    _ = _EchoArgs.model_validate({"wrong": args.text})
     return "unreachable"
 
 
@@ -175,7 +178,7 @@ def test_tool_decorator_rejects_invalid_function_shapes() -> None:
 
     # pyrefly: ignore[implicit-any-parameter]
     async def _missing_annotation(args) -> str:  # noqa: ANN001
-        return str(args)
+        return str(args)  # pyrefly: ignore[unknown-argument-type]
 
     async def _missing_attribute_annotation(
         args: "_MissingAttributeNamespace.Missing",  # pyrefly: ignore[missing-attribute]
@@ -184,17 +187,17 @@ def test_tool_decorator_rejects_invalid_function_shapes() -> None:
 
     decorator = tool(description="Invalid test function.")
     with pytest.raises(TypeError, match="must be async"):
-        decorator(_sync)  # pyrefly: ignore[bad-argument-type]
+        _ = decorator(_sync)  # pyrefly: ignore[bad-argument-type]
     with pytest.raises(TypeError, match="exactly one parameter"):
-        decorator(_two_parameters)  # pyrefly: ignore[bad-argument-type]
+        _ = decorator(_two_parameters)  # pyrefly: ignore[bad-argument-type]
     with pytest.raises(TypeError, match="positionally"):
-        decorator(_keyword_only)  # pyrefly: ignore[bad-argument-type]
+        _ = decorator(_keyword_only)  # pyrefly: ignore[bad-argument-type]
     with pytest.raises(TypeError, match="BaseModel subclass"):
-        decorator(_plain_annotation)
+        _ = decorator(_plain_annotation)
     with pytest.raises(TypeError, match="BaseModel subclass"):
-        decorator(_missing_annotation)
+        _ = decorator(_missing_annotation)
     with pytest.raises(TypeError, match="annotation could not resolve"):
-        decorator(_missing_attribute_annotation)
+        _ = decorator(_missing_attribute_annotation)
 
 
 def test_validate_and_run_returns_the_function_result() -> None:
@@ -212,7 +215,7 @@ def test_invalid_tool_args_holds_the_validation_error() -> None:
     which a dropped __str__ override (leaving super().__init__()'s empty message) would fail.
     """
     with pytest.raises(InvalidToolArgsError) as caught:
-        asyncio.run(_echo_tool().validate_and_run('{"wrong": "key"}'))
+        _ = asyncio.run(_echo_tool().validate_and_run('{"wrong": "key"}'))
     error = caught.value
     assert isinstance(error.validation_error, ValidationError)
     assert any("text" in entry["loc"] for entry in error.validation_error.errors())
@@ -239,7 +242,7 @@ def test_details_from_pydantic_and_renderer_format_per_field() -> None:
         subject: str = Field(min_length=1)
 
     with pytest.raises(ValidationError) as caught:
-        _SendArgs.model_validate_json('{"to":[{"x":1},5],"subject":""}')
+        _ = _SendArgs.model_validate_json('{"to":[{"x":1},5],"subject":""}')
     validation_error = caught.value
     details = _details_from_pydantic(validation_error)
     assert details == tuple(
@@ -285,7 +288,7 @@ def test_render_invalid_tool_args_formats_neutral_details() -> None:
 def test_render_invalid_tool_args_rejects_empty_details() -> None:
     """Empty details raise ValueError: claiming invalid arguments with no listed failure would mislead the model."""
     with pytest.raises(ValueError, match="no details to render"):
-        render_invalid_tool_args("search", [])
+        _ = render_invalid_tool_args("search", [])
 
 
 def test_dispatch_wraps_success_in_a_tool_message() -> None:
@@ -340,7 +343,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(InvalidToolArgsError) as caught:
-        asyncio.run(_echo_tool().validate_and_run(args_json))
+        _ = asyncio.run(_echo_tool().validate_and_run(args_json))
     expected_details = _details_from_pydantic(caught.value.validation_error)
     expected_content = render_invalid_tool_args("echo", expected_details)
     call = ToolCall(id="call1", name="echo", args_json=args_json)
@@ -401,7 +404,7 @@ def test_function_validation_error_propagates_as_a_defect() -> None:
     )
     call = ToolCall(id="call1", name="broken", args_json='{"text": "tide"}')
     with pytest.raises(ValidationError):
-        asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = asyncio.run(ToolManager([tool]).dispatch(call))
 
 
 def test_dispatch_carries_a_returned_is_error_result() -> None:
@@ -565,7 +568,7 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
     )
     call = ToolCall(id="call1", name="failing", args_json='{"text": "tide"}')
     with pytest.raises(RuntimeError, match="function broke on tide"):
-        asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = asyncio.run(ToolManager([tool]).dispatch(call))
 
 
 def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
@@ -583,7 +586,7 @@ def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> N
             InvalidToolArgsError: always; the nested payload lacks the required text field.
         """
         try:
-            _EchoArgs.model_validate({"wrong": args.text})
+            _ = _EchoArgs.model_validate({"wrong": args.text})
         except ValidationError as exc:
             raise InvalidToolArgsError(exc) from exc
         return "unreachable"
@@ -596,15 +599,15 @@ def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> N
     )
     call = ToolCall(id="call1", name="nested", args_json='{"text": "tide"}')
     with pytest.raises(InvalidToolArgsError):
-        asyncio.run(tool.dispatch(call))
+        _ = asyncio.run(tool.dispatch(call))
     with pytest.raises(InvalidToolArgsError):
-        asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = asyncio.run(ToolManager([tool]).dispatch(call))
 
 
 def test_duplicate_tool_names_are_rejected() -> None:
     """Two tools sharing a name raise ValueError at construction."""
     with pytest.raises(ValueError, match="duplicate tool name"):
-        ToolManager([_echo_tool(), _echo_tool()])
+        _ = ToolManager([_echo_tool(), _echo_tool()])
 
 
 async def _weather_function(args: dict[str, object]) -> str:
@@ -650,9 +653,12 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
+    # The Validator protocol types iter_errors as yielding ValidationError, where the concrete
+    # Draft202012Validator's own stub yields Incomplete.
+    validator: Validator = Draft202012Validator(_WEATHER_SCHEMA)
     expected_details = tuple(
         InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
-        for error in Draft202012Validator(_WEATHER_SCHEMA).iter_errors({"town": "Oslo"})
+        for error in validator.iter_errors({"town": "Oslo"})
     )
     assert result.details == expected_details
     assert any(detail.message == "'city' is a required property" for detail in result.details)
@@ -727,7 +733,7 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
         function=_weather_function,
     )
     with pytest.raises(UnknownType):
-        asyncio.run(tool.dispatch(ToolCall(id="c1", name="bad", args_json='{"city": "Oslo"}')))
+        _ = asyncio.run(tool.dispatch(ToolCall(id="c1", name="bad", args_json='{"city": "Oslo"}')))
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
@@ -934,7 +940,7 @@ def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> N
         return ToolMessage(tool_call_id="other-id", content="skipped")
 
     with pytest.raises(ValueError, match=r"'c2'.*'other-id'"):
-        asyncio.run(manager.dispatch_many(tool_calls, precomputed=_mismatched))
+        _ = asyncio.run(manager.dispatch_many(tool_calls, precomputed=_mismatched))
     assert ran_texts == []
 
 
@@ -951,7 +957,7 @@ def test_dispatch_many_precomputed_raising_propagates_before_any_dispatch() -> N
         raise RuntimeError(f"broken precomputed on {tool_call.id}")
 
     with pytest.raises(RuntimeError, match="broken precomputed on c1"):
-        asyncio.run(manager.dispatch_many(tool_calls, precomputed=_broken))
+        _ = asyncio.run(manager.dispatch_many(tool_calls, precomputed=_broken))
     assert ran_texts == []
 
 
@@ -967,7 +973,7 @@ def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
     ]
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        asyncio.run(
+        _ = asyncio.run(
             manager.dispatch_many(
                 tool_calls,
                 precomputed=lambda tool_call: supplied_message if tool_call.id == "c1" else None,
@@ -1014,7 +1020,7 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
     ]
     manager = ToolManager([_raiser_tool(), spender])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        asyncio.run(manager.dispatch_many(tool_calls))
+        _ = asyncio.run(manager.dispatch_many(tool_calls))
     group = caught.value
     assert [str(error) for error in group.exceptions] == ["broke on a"]
     assert len(group.completed_outcomes) == 1
@@ -1034,7 +1040,7 @@ def test_dispatch_many_collects_every_defect_in_call_order() -> None:
     ]
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        asyncio.run(manager.dispatch_many(tool_calls))
+        _ = asyncio.run(manager.dispatch_many(tool_calls))
     group = caught.value
     assert [str(error) for error in group.exceptions] == ["broke on a", "broke on b"]
     assert [outcome.tool_message.tool_call_id for outcome in group.completed_outcomes] == ["c2"]
@@ -1053,7 +1059,7 @@ def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes(
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     subgroups: list[ExceptionGroup[RuntimeError]] = []
     try:
-        asyncio.run(manager.dispatch_many(tool_calls))
+        _ = asyncio.run(manager.dispatch_many(tool_calls))
     except* RuntimeError as subgroup:
         subgroups.append(subgroup)
     assert len(subgroups) == 1
@@ -1092,7 +1098,7 @@ def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
         ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
     ]
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(manager.dispatch_many(tool_calls))
+        _ = asyncio.run(manager.dispatch_many(tool_calls))
 
 
 def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
@@ -1126,7 +1132,7 @@ def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
         ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
     ]
     with pytest.raises(asyncio.CancelledError) as caught:
-        asyncio.run(manager.dispatch_many(tool_calls))
+        _ = asyncio.run(manager.dispatch_many(tool_calls))
     cause = caught.value.__cause__
     assert isinstance(cause, DispatchExceptionGroup)
     assert [str(error) for error in cause.exceptions] == ["broke on a"]
@@ -1164,7 +1170,7 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
         dispatch_task = asyncio.ensure_future(manager.dispatch_many(tool_calls))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        dispatch_task.cancel()
+        _ = dispatch_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await dispatch_task
         assert sorted(unwound) == ["a", "b"]
@@ -1236,7 +1242,7 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(ValidationError) as caught:
-        _CapturedAnswer.model_validate_json(args_json)
+        _ = _CapturedAnswer.model_validate_json(args_json)
     expected_details = _details_from_pydantic(caught.value)
     expected_content = render_invalid_tool_args("final_response", expected_details)
     call = ToolCall(id="call1", name="final_response", args_json=args_json)

@@ -1118,7 +1118,7 @@ def test_a_rejected_request_registers_no_success_with_the_rate_limiter() -> None
         """Put the limiter into recovery, then take a rejection while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
         failing_admission = await rate_limiter.acquire()
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             failing_admission,
             (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
         )
@@ -1340,7 +1340,7 @@ def test_provider_failed_transiently_ends_the_rate_limiter_recovery() -> None:
         """Put the limiter into recovery, then report the failure while holding its probe slot."""
         rate_limiter = _fast_rate_limiter()
         failing_admission = await rate_limiter.acquire()
-        rate_limiter.register_transient_error(
+        _ = rate_limiter.register_transient_error(
             failing_admission,
             (TransientError("429", retry_after_seconds=0.0, is_rate_limit=True),),
         )
@@ -1556,7 +1556,7 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
             bound_llm.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
         )
         await asyncio.sleep(0.02)
-        call.cancel()
+        _ = call.cancel()
         with pytest.raises(asyncio.CancelledError):
             await call
         assert adapter.bound_adapters[0].send_count == 2
@@ -2041,7 +2041,7 @@ def test_stream_cancelled_mid_iteration_releases_the_slot() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             consumer = asyncio.create_task(anext(handle))
             await asyncio.sleep(0.01)
-            consumer.cancel()
+            _ = consumer.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await consumer
             # Still inside the block, so only the cancellation can have freed the one in-flight slot.
@@ -3569,7 +3569,7 @@ def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
 def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
     """Empty parts are a configuration error; None is the way to bind no system prompt."""
     with pytest.raises(ValueError, match="empty"):
-        LLM(_FakeAdapter()).bind(system_prompt=[], automatic_prompt_caching=True)
+        _ = LLM(_FakeAdapter()).bind(system_prompt=[], automatic_prompt_caching=True)
 
 
 @pytest.mark.parametrize("settled_attempts", [1, 0])
@@ -3629,7 +3629,7 @@ def test_a_deadline_expiring_before_a_slot_reports_no_attempts() -> None:
         assert timed_out.attempts == 0
         assert timed_out.in_flight_attempt_started_at_monotonic_seconds is None
         assert timed_out.usage == ZERO_USAGE
-        holder.cancel()
+        _ = holder.cancel()
         await asyncio.gather(holder, return_exceptions=True)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -3650,7 +3650,7 @@ def test_an_outer_cancellation_inside_the_deadline_stays_a_cancellation() -> Non
             bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=30.0)
         )
         await asyncio.sleep(0.02)
-        call.cancel()
+        _ = call.cancel()
         with pytest.raises(asyncio.CancelledError):
             await call
         assert call.cancelled()

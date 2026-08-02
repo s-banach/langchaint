@@ -117,20 +117,23 @@ _PRIORITY_RATES = AnthropicPricingTable(
 def _as_dict(value: object) -> dict[str, object]:
     """View one wire TypedDict as a plain dict for structural assertions."""
     assert isinstance(value, dict)
-    return {str(key): item for key, item in value.items()}
+    mapping: dict[object, object] = value
+    return {str(key): item for key, item in mapping.items()}
 
 
 def _content_blocks(message: MessageParam) -> list[dict[str, object]]:
     """Return one wire message's content blocks as plain dicts."""
     content = _as_dict(message)["content"]
     assert isinstance(content, list)
-    return [_as_dict(block) for block in content]
+    blocks: list[object] = content
+    return [_as_dict(block) for block in blocks]
 
 
 def _block_list(value: object) -> list[dict[str, object]]:
     """View a wire block list (never the omit sentinel here) as plain dicts."""
     assert isinstance(value, list)
-    return [_as_dict(block) for block in value]
+    blocks: list[object] = value
+    return [_as_dict(block) for block in blocks]
 
 
 class _EchoArgs(BaseModel):
@@ -329,7 +332,7 @@ def test_pricing_without_the_standard_key_raises_at_construction() -> None:
         "priority": _PRIORITY_RATES
     }
     with pytest.raises(ValueError, match=re.escape("'standard'")):
-        AnthropicMessagesAdapter(
+        _ = AnthropicMessagesAdapter(
             client=AsyncAnthropic(api_key="test"),
             model="claude-sonnet-5",
             pricing=priority_only,
@@ -622,7 +625,7 @@ def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -
         ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
     ]
     with pytest.raises(_NotSendableError, match="image/tiff"):
-        _wire_messages(
+        _ = _wire_messages(
             messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
 
@@ -795,7 +798,7 @@ def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
     """An image media type outside the accepted set is not sendable."""
     message = UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))
     with pytest.raises(_NotSendableError):
-        _user_content_blocks(message)
+        _ = _user_content_blocks(message)
 
 
 class _FakeSDKMessageStream(AsyncMessageStream[None]):
@@ -808,7 +811,7 @@ class _FakeSDKMessageStream(AsyncMessageStream[None]):
     The inherited request_id property is left in place, so a test of it exercises the SDK's own read.
     """
 
-    def __init__(
+    def __init__(  # pyrefly: ignore[missing-super-call]
         self,
         replay_events: Sequence[ParsedMessageStreamEvent],
         message_snapshot: ParsedMessage[None],
@@ -1402,7 +1405,7 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
     """A legacy client for a mantle-only model fails at construction, naming the model and required class."""
     legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
     with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
-        anthropic_bedrock_model("anthropic.claude-sonnet-5", client=legacy_client)
+        _ = anthropic_bedrock_model("anthropic.claude-sonnet-5", client=legacy_client)
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
 
 
@@ -1467,7 +1470,7 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
         )
     ]
     with pytest.raises(_NotSendableError, match="last part"):
-        _wire_messages(
+        _ = _wire_messages(
             messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
         )
 
@@ -1585,7 +1588,7 @@ def test_request_system_parts_without_automatic_caching_mark_only_marked_parts()
 def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> None:
     """Four marked system parts plus the automatic markers cannot fit the 4-marker limit."""
     with pytest.raises(ValueError, match="limit"):
-        _adapter()._precompute_fields(
+        _ = _adapter()._precompute_fields(
             _binding(
                 system_prompt=tuple(
                     TextPart(text=f"s{index}", cache_breakpoint=True) for index in range(4)
@@ -1699,7 +1702,7 @@ def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() ->
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
     """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
     with pytest.raises(ValueError, match="empty tuple"):
-        _adapter()._precompute_fields(
+        _ = _adapter()._precompute_fields(
             _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
         )
 

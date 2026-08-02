@@ -117,7 +117,7 @@ def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it(
         other: int
 
     with pytest.raises(ValidationError, match="junk"):
-        Child(value=1, other=2, junk=3)  # pyrefly: ignore[unexpected-keyword]
+        _ = Child(value=1, other=2, junk=3)  # pyrefly: ignore[unexpected-keyword]
 
 
 def test_construction_rejects_a_key_that_is_not_a_field() -> None:
@@ -127,7 +127,7 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
     class-definition hook above is what keeps the rest of them from regressing.
     """
     with pytest.raises(ValidationError, match="inpit_tokens_cache_read"):
-        Usage(
+        _ = Usage(
             input_tokens_cache_read=0,
             input_tokens_cache_write=0,
             input_tokens_cache_none=1,
@@ -166,7 +166,7 @@ def test_reloading_a_malformed_message_locates_the_key_as_a_validation_error(
     """
     message_type_adapter = TypeAdapter[Message](Message)
     with pytest.raises(ValidationError, match=key) as caught:
-        message_type_adapter.validate_python(payload)
+        _ = message_type_adapter.validate_python(payload)
     assert [(error["loc"][-1], error["type"]) for error in caught.value.errors()] == [
         (key, error_type)
     ]

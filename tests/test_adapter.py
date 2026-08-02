@@ -151,4 +151,4 @@ def test_narrowed_request_hands_back_the_adapters_own_and_refuses_every_other() 
     own = _Request(model="m", temperature=0.5)
     assert narrowed_request(own, _Request) is own
     with pytest.raises(TypeError, match="_OtherRequest"):
-        narrowed_request(_OtherRequest(), _Request)
+        _ = narrowed_request(_OtherRequest(), _Request)

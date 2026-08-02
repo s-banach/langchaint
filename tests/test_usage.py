@@ -57,7 +57,7 @@ def test_cost_in_usd_sums_the_four_categories() -> None:
 def test_negative_counter_is_rejected() -> None:
     """A negative counter raises, so no carrier holds a Usage claiming negative tokens."""
     with pytest.raises(ValidationError):
-        _usage(cache_read=900, cache_write=200, cache_none=-100, output=40)
+        _ = _usage(cache_read=900, cache_write=200, cache_none=-100, output=40)
 
 
 def test_nan_cost_is_stored() -> None:

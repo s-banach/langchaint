@@ -151,7 +151,7 @@ def test_reading_the_emitter_outside_a_run_raises_naming_what_to_install() -> No
     reader a message better than the default "no value", which names only a variable.
     """
     with pytest.raises(LookupError, match="inside a run's loop"):
-        current_gui_emitter()
+        _ = current_gui_emitter()
 
 
 def test_sub_agent_span_nests_under_the_delegate_tool_span() -> None:
@@ -324,11 +324,11 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
     registry: dict[str, AgentRun] = {}
     config = AgentConfig(name="twin", system_prompt="[twin] p")
     tracer = TracerProvider().get_tracer("full_app.test")
-    NoOpRun(
+    _ = NoOpRun(
         agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard
     )
     with pytest.raises(ValueError, match="already registered"):
-        NoOpRun(
+        _ = NoOpRun(
             agent_path="root/twin",
             config=config,
             tracer=tracer,

@@ -37,10 +37,11 @@ from openai.types.responses import (
     ResponseReasoningSummaryTextDoneEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
+    ResponseStatus,
     ResponseUsage,
 )
 from openai.types.responses.parsed_response import ParsedResponse
-from openai.types.responses.response import IncompleteDetails, ResponseStatus
+from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel
@@ -307,7 +308,7 @@ def test_pricing_without_the_default_key_raises_at_construction() -> None:
         "priority": _PRIORITY_RATES
     }
     with pytest.raises(ValueError, match=re.escape("'default'")):
-        OpenAIResponsesAdapter(
+        _ = OpenAIResponsesAdapter(
             client=AsyncOpenAI(api_key="test"),
             model="gpt-5.6-terra",
             pricing=priority_only,
@@ -679,7 +680,7 @@ def test_request_sends_explicit_mode_exactly_when_the_binding_declines_caching(
 def test_declining_caching_on_a_model_without_the_parameter_raises() -> None:
     """A model taking no prompt_cache_options cannot be told to stop caching, so bind refuses."""
     with pytest.raises(ValueError, match="supports_prompt_cache_options"):
-        _adapter(supports_prompt_cache_options=False)._precompute_fields(
+        _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
             _binding(automatic_prompt_caching=False)
         )
 
@@ -693,7 +694,7 @@ def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
     """
     llm = LLM(_adapter(supports_prompt_cache_options=False))
     with pytest.raises(ValueError, match="model 'm'"):
-        llm.bind(automatic_prompt_caching=False)
+        _ = llm.bind(automatic_prompt_caching=False)
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -746,7 +747,7 @@ class _FakeSDKStream(AsyncResponseStream[None]):
     the base __init__ is deliberately not called, so the untouched base machinery stays unusable.
     """
 
-    def __init__(
+    def __init__(  # pyrefly: ignore[missing-super-call]
         self, replay_events: Sequence[ResponseStreamEvent], headers: dict[str, str] | None = None
     ) -> None:
         self._replay_events = list(replay_events)

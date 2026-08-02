@@ -452,13 +452,15 @@ def request_json(request: RequestParams, *, omitted_class: type) -> str:
 def _without_omitted(value: object, omitted_class: type) -> object:
     """Return value with every mapping key whose value is an omit sentinel dropped, recursively."""
     if isinstance(value, dict):
+        mapping: dict[object, object] = value
         return {
             key: _without_omitted(item, omitted_class)
-            for key, item in value.items()
+            for key, item in mapping.items()
             if not isinstance(item, omitted_class)
         }
     if isinstance(value, list):
-        return [_without_omitted(item, omitted_class) for item in value]
+        items: list[object] = value
+        return [_without_omitted(item, omitted_class) for item in items]
     return value
 
 

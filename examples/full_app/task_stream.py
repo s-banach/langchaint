@@ -724,7 +724,7 @@ class App:
         )
         async with asyncio.TaskGroup() as group:
             for node in (climate, energy):
-                group.create_task(self._settle_node(node))
+                _ = group.create_task(self._settle_node(node))
 
         upstream = "\n".join(
             f"{path}: {self.answers.get(path, f'FAILED ({self.failures.get(path)})')}"

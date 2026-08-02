@@ -36,11 +36,11 @@ import langchaint.tracing
 from langchaint import (
     LLM,
     AssistantMessage,
+    CallResult,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
-    GenerationError,
     ImagePart,
     InvalidRequestError,
     JSONSchemaTool,
@@ -933,7 +933,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
         """Rebind, then generate and stream on the rebound object under a key-recording mapper."""
         keys_seen: list[frozenset[str]] = []
 
-        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(_result: CallResult[object]) -> SpanAttributes:
             """Record its own key set and emit exactly one attribute."""
             keys_seen.append(frozenset({"custom.mapped"}))
             return {"custom.mapped": True}
@@ -991,7 +991,7 @@ def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
     async def scenario() -> None:
         """Generate under a two-key mapper and assert the span carries those two plus the required one."""
 
-        def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(result: CallResult[object]) -> SpanAttributes:
             """Emit two fixed attributes drawn from the result."""
             return {"custom.model": result.model, "custom.attempts": result.attempts}
 
@@ -1020,7 +1020,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         """Generate under a TracerProvider-less tracer and assert the mapper never ran."""
         calls: list[int] = []
 
-        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(_result: CallResult[object]) -> SpanAttributes:
             """Count each invocation."""
             calls.append(1)
             return {}
@@ -1048,7 +1048,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
     async def scenario() -> None:
         """Generate under a mapper that raises and confirm the result and span survive."""
 
-        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(_result: CallResult[object]) -> SpanAttributes:
             """Raise to simulate a buggy user mapper.
 
             Raises:
@@ -1084,7 +1084,7 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
         """Run a two-item batch under a counting mapper and read what each item's span carries."""
         mapped_outputs: list[object] = []
 
-        def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(result: CallResult[object]) -> SpanAttributes:
             """Record the result mapped and emit it as an attribute."""
             output = result.output if isinstance(result, Response) else None
             mapped_outputs.append(output)
@@ -1119,7 +1119,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
     async def scenario() -> None:
         """Drain a stream under a raising mapper and read final()."""
 
-        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(_result: CallResult[object]) -> SpanAttributes:
             """Raise on every call.
 
             Raises:
@@ -1189,7 +1189,7 @@ def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() ->
     async def scenario() -> None:
         """Generate under extra_attributes plus a colliding mapper key and inspect the span."""
 
-        def _mapper(_result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(_result: CallResult[object]) -> SpanAttributes:
             """Emit one attribute colliding with an extra_attributes key."""
             return {"shared.key": "mapped"}
 
@@ -1250,7 +1250,7 @@ def test_gen_ai_attributes_is_public_and_composable() -> None:
     async def scenario() -> None:
         """Generate under a composed mapper and check a standard key and the derived key."""
 
-        def _mapper(result: Response[object] | GenerationError) -> SpanAttributes:
+        def _mapper(result: CallResult[object]) -> SpanAttributes:
             """Extend the built-in attributes with the call's total request time."""
             return {
                 **gen_ai_attributes(result),

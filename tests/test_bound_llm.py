@@ -21,6 +21,7 @@ from langchaint import (
     AssistantMessage,
     Billing,
     BoundLLM,
+    CallResult,
     ContextWindowExceededError,
     DoNotRetry,
     EmptyTurnError,
@@ -44,6 +45,7 @@ from langchaint import (
     TextPart,
     TimedOutError,
     ToolCall,
+    ToolCallTurn,
     ToolManager,
     TransientError,
     UnfinishedTurnError,
@@ -1629,11 +1631,11 @@ def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_str
 
 
 def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> None:
-    """Pin every binding's static output type, the thing a caller writes `if output is None` against.
+    """Pin every binding's static BoundLLM type, the pair the request-method overloads key on.
 
-    output is optional on one binding only: structured plus a ToolManager, whose turn may be the tool
-    calls. A text binding never types it optional, a tool-call turn's text being "" and not None.
-    Every transition is exact, so dropping the ToolManager drops the None with it.
+    One binding returns a union: structured plus a ToolManager generates GenerateResult, whose
+    ToolCallTurn arm is the tool-call turn. Every other binding generates Response alone.
+    Every transition is exact, so dropping the ToolManager drops the ToolCallTurn arm with it.
     It also pins tool_manager's own type, which is what a tool loop dispatches through.
     """
     llm = LLM(_FakeAdapter())
@@ -1666,17 +1668,21 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
 async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) -> None:
     """Pin the return types the ToolManagerT overloads produce, which is what the parameter is for.
 
-    Never called: pyrefly checks this body, and the assertions are about types alone. Running it
-    would need a structured fake that sends, which _FakeStructuredBoundAdapter deliberately is not.
+    Never called: pyrefly checks this body, and the assertions are about types alone.
     """
     structured_with_tools = llm.bind(
         response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
     )
-    assert_type(await structured_with_tools.generate_one("hi"), Response[_Answer | None])
-    assert_type(structured_with_tools.stream_one("hi"), StreamHandle[_Answer | None])
+    assert_type(
+        await structured_with_tools.generate_one("hi"),
+        Response[_Answer] | ToolCallTurn[_Answer],
+    )
+    assert_type(
+        structured_with_tools.stream_one("hi"), StreamHandle[_Answer, ToolCallTurn[_Answer]]
+    )
     assert_type(
         await structured_with_tools.generate_many(["hi"]),
-        list[Response[_Answer | None] | GenerationError],
+        list[CallResult[_Answer]],
     )
     structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(await structured.generate_one("hi"), Response[_Answer])
@@ -1693,6 +1699,139 @@ def test_response_format_is_a_public_field_bind_and_rebind_carry_it() -> None:
     assert structured.response_format is _Answer
     assert structured.rebind(system_prompt="s2").response_format is _Answer
     assert structured.rebind(response_format=None).response_format is None
+
+
+def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> None:
+    """The split reads the binding: response_format and tool_manager must both be present."""
+    llm = LLM(_FakeAdapter())
+    tool_manager = ToolManager([])
+    assert not llm.bind(automatic_prompt_caching=True)._splits_tool_call_turns
+    assert not llm.bind(
+        tool_manager=tool_manager, automatic_prompt_caching=True
+    )._splits_tool_call_turns
+    assert not llm.bind(
+        response_format=_Answer, automatic_prompt_caching=True
+    )._splits_tool_call_turns
+    assert llm.bind(
+        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+    )._splits_tool_call_turns
+
+
+class _SendingStructuredBoundAdapter(BoundAdapter[_Answer | None]):
+    """A structured bound adapter handing every request one scripted outcome.
+
+    The ToolCallTurn split tests generate through it: _FakeStructuredBoundAdapter deliberately never
+    generates, and _FakeBoundAdapter is bound to str.
+    """
+
+    def __init__(self, outcome: ResponseOutcome[_Answer | None]) -> None:
+        """Store the one outcome interpret returns for every response, sent or streamed."""
+        self._outcome = outcome
+        self.stream = _FakeStream()
+
+    @override
+    def billing_from_raw(self, raw: BaseModel) -> Billing:
+        """Bill every response the fixed _USAGE."""
+        return stated_billing(_USAGE)
+
+    @override
+    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+        """Report a fixed identity; no split test reads it."""
+        return ResponseIdentity(
+            model_served="fake-model-served",
+            response_id="structured-response",
+            request_id=None,
+        )
+
+    @override
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[_Answer | None]:
+        """Return the scripted outcome, whichever raw the request path produced."""
+        return self._outcome
+
+    @override
+    def build_request(self, messages: Sequence[Message]) -> RequestParams:
+        """Carry the messages into the request."""
+        return _FakeRequest(messages=tuple(messages))
+
+    @override
+    async def send(self, request: RequestParams) -> BaseModel:
+        """Hand back a fresh raw; interpret ignores its id."""
+        return _FakeRawResponse(id="structured-response")
+
+    @override
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Hand back the stored fake stream; interpret ignores the raw it assembles."""
+        return self.stream
+
+
+_STRUCTURED_TOOL_CALL_TURN: AdapterResult[_Answer | None] = AdapterResult(
+    output=None,
+    assistant_message=AssistantMessage(turn=(_FAKE_TOOL_CALL,)),
+    stop_reason="tool_use",
+)
+"""A structured turn of tool calls alone: nothing parsed, one call to dispatch."""
+
+
+def _structured_tool_bound_llm(
+    outcome: ResponseOutcome[_Answer | None],
+) -> BoundLLM[_Answer, ToolManager]:
+    """Bind structured plus tools, then swap the sending fake in for bind's never-generating one.
+
+    Swapping only _bound_adapter keeps the binding LLM.bind built, so _splits_tool_call_turns reads
+    the real response_format and tool_manager and the retry loops run unchanged over the scripted outcome.
+    """
+    bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
+        response_format=_Answer, tool_manager=ToolManager([]), automatic_prompt_caching=True
+    )
+    bound_llm._bound_adapter = _SendingStructuredBoundAdapter(outcome)
+    return bound_llm
+
+
+def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_arm() -> None:
+    """A structured tool-bound turn that called tools reaches the caller as ToolCallTurn.
+
+    Its output is the unparsed None and its tool_calls are the turn's, what a tool loop dispatches;
+    a retry loop that dropped _splits_tool_call_turns would hand back a Response instead.
+    """
+
+    async def scenario() -> None:
+        result = await _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN).generate_one("hi")
+        assert isinstance(result, ToolCallTurn)
+        assert result.kind == "tool_call_turn"
+        assert result.output is None
+        assert result.tool_calls == (_FAKE_TOOL_CALL,)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_structured_tool_bound_generate_one_returns_the_response_arm_on_a_final_turn() -> None:
+    """A turn without tool calls reaches the caller as Response, the parsed instance on output."""
+
+    async def scenario() -> None:
+        answer = _Answer(value=7)
+        outcome: AdapterResult[_Answer | None] = AdapterResult(
+            output=answer,
+            assistant_message=AssistantMessage(turn=(TextPart(text=answer.model_dump_json()),)),
+            stop_reason="end_turn",
+        )
+        result = await _structured_tool_bound_llm(outcome).generate_one("hi")
+        assert isinstance(result, Response)
+        assert result.output is answer
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_arm() -> None:
+    """The stream path splits the same way: final() on a tool-call turn is the ToolCallTurn arm."""
+
+    async def scenario() -> None:
+        bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN)
+        async with bound_llm.stream_one("hi") as handle:
+            result = await handle.final()
+        assert isinstance(result, ToolCallTurn)
+        assert result.tool_calls == (_FAKE_TOOL_CALL,)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_unchanged_sentinel_reprs_as_its_name() -> None:

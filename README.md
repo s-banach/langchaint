@@ -61,7 +61,7 @@ A bare `str` generation_input is shorthand for `[UserMessage(content=generation_
 `openai_model(...)`, `anthropic_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.
 
 **One accounting contract for success and failure.**
-Success is a `Response[OutputT]` and a terminal failure is a `GenerationError`.
+Success is a `Response[OutputT]`, or a `GenerateResult[OutputT]` on a structured tool-bound binding, and a terminal failure is a `GenerationError`.
 Both carry `usage`, the paid total across every attempt.
 
 **Priced usage.**
@@ -77,7 +77,7 @@ Its `admitted()` block gates every request start; a rate limit pauses the whole 
 `cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part.
 
 **Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCall` items, with `await handle.final()` returning the assembled `Response`.
+`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCall` items, with `await handle.final()` returning the assembled result.
 
 **Tools under one protocol.**
 `PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` share the `Tool` protocol.

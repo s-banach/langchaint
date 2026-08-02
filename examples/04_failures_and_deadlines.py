@@ -1,11 +1,11 @@
 """What goes wrong and what bounds it: per-account SharedBackoff domains, terminal errors, and deadlines."""
 
 from langchaint import (
-    CallResult,
     GenerationError,
     GenerationInput,
     ImagePart,
     Message,
+    Response,
     SharedBackoff,
     TextPart,
     UserMessage,
@@ -14,7 +14,7 @@ from langchaint.anthropic import AnthropicMessagesAdapter, anthropic_model, pars
 from langchaint.openai import openai_model
 
 
-async def run_batch_and_handle_what_failed() -> list[CallResult[str]]:
+async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationError]:
     """Run a batch under a deadline, then send every failed item to a second provider.
 
     Raises:

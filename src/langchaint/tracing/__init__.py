@@ -80,7 +80,7 @@ from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, NoReturn, overload, override
+from typing import Any, Never, NoReturn, overload, override
 
 from pydantic import BaseModel
 
@@ -117,7 +117,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.response import CallResult, Response
+from langchaint.response import CallResult, GenerateResult, Response, ToolCallTurn
 from langchaint.shared_backoff import SharedBackoff
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (
@@ -145,8 +145,8 @@ type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
 """Maps one generate result to its span attributes.
 
 The parameter is CallResult[object]
-because the mapper reads the shared Response/GenerationError fields; Response[object] accepts any Response[OutputT]
-because Response's OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
+because the mapper reads the fields every CallResult arm shares; the object type argument accepts
+any OutputT because the success arms' OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
 No mapper receives the GenerationInput, so gen_ai_attributes cannot put a prompt on a span.
 A custom mapper is bounded only by what it reaches on the result, which includes raw, the SDK response object
 held by reference; openai 2.45.0's response model declares an instructions field,
@@ -310,7 +310,7 @@ def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     for the keys listed in the module docstring and can grow.
     A constant needs no mapper; extra_attributes sets one on every span.
     Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
-    Reads only the shared Response/GenerationError fields, so it cannot leak a prompt and cannot meaningfully fail.
+    Reads only the fields every CallResult arm shares, so it cannot leak a prompt and cannot meaningfully fail.
     A key stays under the langchaint.* prefix only where the GenAI convention defines no counterpart,
     which is langchaint.attempts and langchaint.cost_in_usd here.
     The cache counters are the convention's own: gen_ai.usage.input_tokens includes cached tokens
@@ -754,7 +754,7 @@ def _apply_result_attributes(
 ) -> None:
     """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
 
-    Called on the success and the GenerationError paths, both of which carry the shared Response/GenerationError fields;
+    Called on the success and the GenerationError paths, both of which carry the shared CallResult fields;
     never on the other-exception path, which has no such fields.
     Skipped entirely when the span is not recording (no TracerProvider configured, a sampler drop, or an ended span),
     the OTel guard for not computing attributes a non-recording span discards;
@@ -858,7 +858,7 @@ def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConf
     """Record the exception that concluded a stream, attributing the span by what it is.
 
     A GenerationError is that call's result, so the span takes the same result attributes, content,
-    and status a Response would give it; anything else is an exception the span only records.
+    and status a success arm would give it; anything else is an exception the span only records.
     One recorder for every method that can conclude a stream, so the same class produces the same
     span whether the failure surfaced from the open, an item pull, or final().
     """
@@ -1232,7 +1232,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> Response[OutputT | None]: ...
+    ) -> GenerateResult[OutputT]: ...
     @overload
     async def generate_one(
         self: "TracedBoundLLM[OutputT, None]",
@@ -1242,7 +1242,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> Response[OutputT]: ...
     async def generate_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> Response[Any]:
+    ) -> GenerateResult[Any]:
         """Open a span around the whole generate_one call, delegate, attribute, and end the span.
 
         The overloads mirror BoundLLM.generate_one's, so output is typed per binding.
@@ -1266,7 +1266,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     async def _generate_one_any_binding(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None
-    ) -> Response[Any]:
+    ) -> GenerateResult[Any]:
         """Run one call under a chat span of its own.
 
         The un-overloaded entry point, because a generic binding matches none of generate_one's
@@ -1290,8 +1290,8 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         )
 
     async def _under_chat_span(
-        self, generation_input: GenerationInput, call: Coroutine[Any, Any, Response[Any]]
-    ) -> Response[Any]:
+        self, generation_input: GenerationInput, call: Coroutine[Any, Any, GenerateResult[Any]]
+    ) -> GenerateResult[Any]:
         """Await one call inside a CLIENT chat span, attributing the span from however it ends.
 
         The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
@@ -1311,7 +1311,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, generation_input)
             try:
-                response = await call
+                result = await call
             except GenerationError as exc:
                 _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
                 _apply_output_content(span, exc, self._span_config)
@@ -1320,10 +1320,10 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             except Exception as exc:
                 _record_other_exception(span, exc)
                 raise
-            _apply_result_attributes(span, response, self._span_config.attribute_mapper)
-            _apply_output_content(span, response, self._span_config)
+            _apply_result_attributes(span, result, self._span_config.attribute_mapper)
+            _apply_output_content(span, result, self._span_config)
             _set_ok_status(span)
-            return response
+            return result
         finally:
             _end_span(span)
 
@@ -1334,7 +1334,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[str]]: ...
+    ) -> list[Response[str] | GenerationError]: ...
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, ToolManager]",
@@ -1342,7 +1342,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[OutputT | None]]: ...
+    ) -> list[CallResult[OutputT]]: ...
     @overload
     async def generate_many(
         self: "TracedBoundLLM[OutputT, None]",
@@ -1350,14 +1350,16 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[OutputT]]: ...
+    ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         timeout_seconds: float | None = None,
-    ) -> list[CallResult[Any]]:
+        # list is invariant, so no single element union is assignable from all three overloads;
+        # a union of list types would restate the overloads without replacing this Any.
+    ) -> list[Any]:
         """Order-aligned batch, traced as one chat span per item and nothing else.
 
         The overloads mirror BoundLLM.generate_many's, so each row's output is typed per binding.
@@ -1395,7 +1397,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> "TracedStreamHandle[OutputT | None]": ...
+    ) -> "TracedStreamHandle[OutputT, ToolCallTurn[OutputT]]": ...
     @overload
     def stream_one(
         self: "TracedBoundLLM[OutputT, None]",
@@ -1405,10 +1407,10 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> "TracedStreamHandle[OutputT]": ...
     def stream_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> "TracedStreamHandle[Any]":
+    ) -> "TracedStreamHandle[Any, Any]":
         """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle; no I/O and no span yet.
 
-        The overloads mirror BoundLLM.stream_one's, so output is typed per binding.
+        The overloads mirror BoundLLM.stream_one's, so final()'s result is typed per binding.
 
         The span opens when the handle is entered, matching StreamHandle's own contract that
         the request opens there.
@@ -1430,7 +1432,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         )
 
 
-class TracedStreamHandle[OutputT]:
+class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     """Wraps a StreamHandle, owning one span across the stream's life.
 
     Items pass through by reference;
@@ -1442,13 +1444,13 @@ class TracedStreamHandle[OutputT]:
     and ends exactly once.
     Under capture_message_content the input content attributes are set when the span starts,
     and gen_ai.output.messages when the call concludes carrying a turn, whether final() returned
-    a Response or any of the three methods raised a GenerationError.
+    a success arm or any of the three methods raised a GenerationError.
     """
 
     def __init__(
         self,
         *,
-        stream_handle: StreamHandle[OutputT],
+        stream_handle: StreamHandle[OutputT, ToolTurnT],
         span_config: _SpanConfig,
         span_name: str,
         binding: Binding,
@@ -1524,7 +1526,7 @@ class TracedStreamHandle[OutputT]:
                 time.monotonic() - self._span_started_at_monotonic_seconds,
             )
 
-    def __aiter__(self) -> "TracedStreamHandle[OutputT]":
+    def __aiter__(self) -> "TracedStreamHandle[OutputT, ToolTurnT]":
         """Return self; the wrapper is its own iterator."""
         return self
 
@@ -1558,7 +1560,7 @@ class TracedStreamHandle[OutputT]:
         self._mark_first_item(span)
         return item
 
-    async def __aenter__(self) -> "TracedStreamHandle[OutputT]":
+    async def __aenter__(self) -> "TracedStreamHandle[OutputT, ToolTurnT]":
         """Start the span, then open the inner handle's request.
 
         The span starts first so a failing open is recorded on it rather than escaping untraced.
@@ -1614,11 +1616,15 @@ class TracedStreamHandle[OutputT]:
                     _record_other_exception(self._span, exc)
                 self._end_span_once()
 
-    async def final(self) -> Response[OutputT]:
-        """Drain the inner stream, attribute the span from the Response, and end the span.
+    @overload
+    async def final(self: "TracedStreamHandle[OutputT, Never]") -> Response[OutputT]: ...
+    @overload
+    async def final(self) -> "Response[OutputT] | ToolTurnT": ...
+    async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
+        """Drain the inner stream, attribute the span from the result, and end the span.
 
         The span ends exactly once: if a prior final(), a mid-iteration failure, or __aexit__ already ended it,
-        this delegates to the inner final() (which re-raises or returns its cached Response)
+        this delegates to the inner final() (which re-raises or returns its cached result)
         without touching the span again.
 
         Raises:
@@ -1633,16 +1639,16 @@ class TracedStreamHandle[OutputT]:
             return await self._stream_handle.final()
         span = self._span
         try:
-            response = await self._stream_handle.final()
+            result = await self._stream_handle.final()
         except Exception as exc:
             _record_stream_conclusion(span, exc, self._span_config)
             self._end_span_once()
             raise
-        _apply_result_attributes(span, response, self._span_config.attribute_mapper)
-        _apply_output_content(span, response, self._span_config)
+        _apply_result_attributes(span, result, self._span_config.attribute_mapper)
+        _apply_output_content(span, result, self._span_config)
         _set_ok_status(span)
         self._end_span_once()
-        return response
+        return result
 
 
 def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:

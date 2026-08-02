@@ -1,7 +1,8 @@
-"""Response constructor invariants, the two usage scopes, and to_tables over both result types.
+"""The success arms' constructor invariants, the _success_arm split, the two usage scopes, and to_tables.
 
-The retry loops in llm.py and streaming.py are the only production constructors of Response,
-so these invariants are what stops a refactor of either loop from building a success row whose records disagree;
+The retry loops in llm.py and streaming.py construct every success arm through _success_arm,
+so these invariants are what stops a refactor of either loop from building a success row whose records disagree,
+and the _success_arm tests pin which arm a turn becomes;
 the retry tests in test_bound_llm.py pin the record values themselves.
 usage is the paid total folded from attempt_records and usage_successful_attempt is the last record's own,
 so a retried billed 200 makes them diverge; both are exercised here.
@@ -24,25 +25,22 @@ from langchaint import (
     AssistantMessage,
     AttemptRecord,
     Billing,
-    CallRecord,
     MaxCompletionTokensExceededError,
     RefusalError,
     Response,
     RetriesExhaustedError,
     StopReason,
     TextPart,
+    ToolCall,
+    ToolCallTurn,
     TransientError,
     Usage,
     to_tables,
 )
 from langchaint.adapter import RequestParams
 from langchaint.call import ResponseIdentity, _CallLedger
-from langchaint.response import _abandoned_call_error
-from tests.helpers import stated_billing
-
-
-class _Raw(BaseModel):
-    """Stand-in for the SDK's own response model held on Response.raw."""
+from langchaint.response import _abandoned_call_error, _success_arm
+from tests.helpers import CALL_STARTED_AT, StubRaw, attempt_record, call_record, stated_billing
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -81,84 +79,47 @@ _USAGE = Usage(
 """One attempt's billing: four category costs summing to 0.5."""
 
 
-_CALL_STARTED_AT = 1000.0
-"""The fixed time.monotonic() origin every record here is placed against."""
-
-
-def _record(
-    *,
-    error: TransientError | None,
-    usage: Usage = ZERO_USAGE,
-    reported_billing: bool = True,
-    input_cache_none_usd_per_million_tokens: float = math.nan,
-    usage_raw: BaseModel | None = None,
-    started_after_seconds: float = 0.0,
-    elapsed_seconds: float = 0.0,
-    seconds_to_first_item: float | None = None,
-    turn: AssistantMessage | None = None,
-    model_served: str | None = None,
-    response_id: str | None = None,
-    request_id: str | None = None,
-) -> AttemptRecord:
-    """Build one record on the fixed origin; reported_billing False is an attempt the provider never billed."""
-    started_at_monotonic_seconds = _CALL_STARTED_AT + started_after_seconds
-    return AttemptRecord(
-        started_at_monotonic_seconds=started_at_monotonic_seconds,
-        ended_at_monotonic_seconds=started_at_monotonic_seconds + elapsed_seconds,
-        first_item_at_monotonic_seconds=(
-            None
-            if seconds_to_first_item is None
-            else started_at_monotonic_seconds + seconds_to_first_item
-        ),
-        error=error,
-        billing=(
-            stated_billing(
-                usage,
-                input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
-                usage_raw=usage_raw,
-            )
-            if reported_billing
-            else None
-        ),
-        assistant_message=turn,
-        raw=None,
-        model_served=model_served,
-        response_id=response_id,
-        request_id=request_id,
-    )
-
-
-def _call(attempt_records: tuple[AttemptRecord, ...], *, elapsed_seconds: float) -> CallRecord:
-    """Build a CallRecord over the records under test; the identity fields are fixed filler."""
-    return CallRecord(
-        model="fake-model",
-        provider_name="fake",
-        attempt_records=attempt_records,
-        started_at_monotonic_seconds=_CALL_STARTED_AT,
-        elapsed_seconds=elapsed_seconds,
-    )
-
-
 def _response[OutputT](
     *,
     output: OutputT,
     attempt_records: tuple[AttemptRecord, ...],
-    stop_reason: StopReason = "end_turn",
 ) -> Response[OutputT]:
     """Build a Response with the fields under test; everything else is fixed filler."""
     return Response(
         output=output,
-        call=_call(attempt_records, elapsed_seconds=1.5),
-        raw=_Raw(),
-        stop_reason=stop_reason,
+        call=call_record(attempt_records, elapsed_seconds=1.5),
+        raw=StubRaw(),
+        stop_reason="end_turn",
         assistant_message=AssistantMessage(turn=(TextPart(text=str(output)),)),
+    )
+
+
+_TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": "tide"}')
+
+_TOOL_CALL_TURN_MESSAGE = AssistantMessage(turn=(_TOOL_CALL,))
+"""The turn a ToolCallTurn under test carries: one tool call and nothing else."""
+
+
+def _tool_call_turn[OutputT](
+    *,
+    output: OutputT | None,
+    attempt_records: tuple[AttemptRecord, ...],
+    assistant_message: AssistantMessage = _TOOL_CALL_TURN_MESSAGE,
+) -> ToolCallTurn[OutputT]:
+    """Build a ToolCallTurn with the fields under test; everything else is fixed filler."""
+    return ToolCallTurn(
+        output=output,
+        call=call_record(attempt_records, elapsed_seconds=1.5),
+        raw=StubRaw(),
+        stop_reason="tool_use",
+        assistant_message=assistant_message,
     )
 
 
 def _failure(*, attempt_records: tuple[AttemptRecord, ...]) -> RetriesExhaustedError:
     """Build a RetriesExhaustedError with the table fields set."""
     return RetriesExhaustedError(
-        call=_call(attempt_records, elapsed_seconds=2.5), request=_REQUEST
+        call=call_record(attempt_records, elapsed_seconds=2.5), request=_REQUEST
     )
 
 
@@ -173,22 +134,87 @@ def test_response_rejects_an_error_free_record_before_the_last() -> None:
     with pytest.raises(ValueError, match="only the last"):
         _ = _response(
             output="ok",
-            attempt_records=(_record(error=None), _record(error=TransientError("e"))),
+            attempt_records=(
+                attempt_record(error=None),
+                attempt_record(error=TransientError("e")),
+            ),
         )
 
 
 def test_response_rejects_a_failed_last_record() -> None:
     """A Response is a success, so its final record must be the one that succeeded."""
     with pytest.raises(ValueError, match="must be error-free"):
-        _ = _response(output="ok", attempt_records=(_record(error=TransientError("e")),))
+        _ = _response(output="ok", attempt_records=(attempt_record(error=TransientError("e")),))
+
+
+def test_tool_call_turn_rejects_a_turn_without_a_tool_call() -> None:
+    """The arm exists to say the turn called tools, so a turn without a call is a construction defect."""
+    with pytest.raises(ValueError, match="at least one tool call"):
+        _ = _tool_call_turn(
+            output=None,
+            attempt_records=(attempt_record(error=None),),
+            assistant_message=AssistantMessage(turn=(TextPart(text="no calls"),)),
+        )
+
+
+def test_tool_call_turn_enforces_the_shared_success_record_invariants() -> None:
+    """ToolCallTurn runs the shared checks before its own, so a failed last record is rejected."""
+    with pytest.raises(ValueError, match="must be error-free"):
+        _ = _tool_call_turn(
+            output=None, attempt_records=(attempt_record(error=TransientError("e")),)
+        )
+
+
+@pytest.mark.parametrize(
+    ("splits_tool_call_turns", "assistant_message", "output", "expected_class"),
+    [
+        (True, _TOOL_CALL_TURN_MESSAGE, None, ToolCallTurn),
+        (True, AssistantMessage(turn=(TextPart(text="done"),)), "done", Response),
+        (False, _TOOL_CALL_TURN_MESSAGE, None, Response),
+        (
+            True,
+            AssistantMessage(turn=(TextPart(text="parsed"), _TOOL_CALL)),
+            "parsed",
+            ToolCallTurn,
+        ),
+    ],
+    ids=[
+        "split_binding_tool_call_turn",
+        "split_binding_final_turn",
+        "unsplit_binding_tool_call_turn",
+        "split_binding_tool_call_turn_with_instance",
+    ],
+)
+def test_success_arm_is_tool_call_turn_only_where_a_split_bindings_turn_called_tools(
+    *,
+    splits_tool_call_turns: bool,
+    assistant_message: AssistantMessage,
+    output: str | None,
+    expected_class: type[Response[object] | ToolCallTurn[object]],
+) -> None:
+    """The split needs both: the binding splits and the turn called tools; either alone is a Response.
+
+    output rides whichever arm results, so a turn carrying both an instance and tool calls keeps it.
+    """
+    result = _success_arm(
+        splits_tool_call_turns=splits_tool_call_turns,
+        output=output,
+        call=call_record((attempt_record(error=None),), elapsed_seconds=1.0),
+        raw=StubRaw(),
+        stop_reason="tool_use",
+        assistant_message=assistant_message,
+    )
+    assert isinstance(result, expected_class)
+    assert result.assistant_message is assistant_message
+    assert result.output is output
 
 
 def test_retries_exhausted_error_derives_from_its_records() -> None:
     """errors_from_attempts, attempts, and error_text are folds over the records, not stored copies."""
     failure = _failure(
         attempt_records=(
-            _record(error=TransientError("e1")),
-            _record(error=TransientError("e2")),
+            attempt_record(error=TransientError("e1")),
+            attempt_record(error=TransientError("e2")),
         )
     )
     assert failure.attempts == 2
@@ -201,8 +227,8 @@ def test_usage_successful_attempt_is_the_last_record() -> None:
     response = _response(
         output="ok",
         attempt_records=(
-            _record(error=TransientError("e"), usage=ZERO_USAGE),
-            _record(error=None, usage=_USAGE),
+            attempt_record(error=TransientError("e"), usage=ZERO_USAGE),
+            attempt_record(error=None, usage=_USAGE),
         ),
     )
     assert response.usage_successful_attempt is response.attempt_records[-1].usage
@@ -225,8 +251,8 @@ def test_usage_is_the_paid_total_across_attempts(
     response = _response(
         output="ok",
         attempt_records=(
-            _record(error=TransientError("empty parse"), usage=failed_attempt_usage),
-            _record(error=None, usage=_USAGE),
+            attempt_record(error=TransientError("empty parse"), usage=failed_attempt_usage),
+            attempt_record(error=None, usage=_USAGE),
         ),
     )
     assert response.usage.cost_in_usd == pytest.approx(expected_cost_in_usd)
@@ -242,7 +268,9 @@ def test_to_tables_success_writes_one_call_row_and_one_attempt_row() -> None:
     """
     turn = AssistantMessage(turn=(TextPart(text="hello"),))
     calls, attempts = to_tables(
-        _response(output="hello", attempt_records=(_record(error=None, usage=_USAGE, turn=turn),))
+        _response(
+            output="hello", attempt_records=(attempt_record(error=None, usage=_USAGE, turn=turn),)
+        )
     )
     (call_row,) = calls
     assert call_row == {
@@ -284,8 +312,8 @@ def test_to_tables_bills_each_attempt_in_its_own_row() -> None:
         _response(
             output="ok",
             attempt_records=(
-                _record(error=TransientError("empty parse"), usage=_USAGE),
-                _record(error=None, usage=_USAGE),
+                attempt_record(error=TransientError("empty parse"), usage=_USAGE),
+                attempt_record(error=None, usage=_USAGE),
             ),
         )
     )
@@ -310,7 +338,7 @@ def test_to_tables_carries_an_unpriced_cost_as_nan() -> None:
         output_tokens_cost_in_usd=float("nan"),
     )
     calls, attempts = to_tables(
-        _response(output="hello", attempt_records=(_record(error=None, usage=unpriced),))
+        _response(output="hello", attempt_records=(attempt_record(error=None, usage=unpriced),))
     )
     assert calls[0]["output"] == "hello"
     assert isinstance(attempts[0]["cost_in_usd"], float)
@@ -327,7 +355,9 @@ def test_to_tables_nulls_every_billing_column_where_the_provider_reported_nothin
     """
     _, attempts = to_tables(
         _failure(
-            attempt_records=(_record(error=TransientError("no response"), reported_billing=False),)
+            attempt_records=(
+                attempt_record(error=TransientError("no response"), reported_billing=False),
+            )
         )
     )
     (attempt_row,) = attempts
@@ -345,7 +375,7 @@ def test_to_tables_pins_the_prices_that_applied_beside_the_counters() -> None:
         _response(
             output="ok",
             attempt_records=(
-                _record(
+                attempt_record(
                     error=None,
                     usage=_USAGE,
                     input_cache_none_usd_per_million_tokens=20.0,
@@ -368,7 +398,7 @@ def test_to_tables_dumps_the_provider_usage_object_the_neutral_counters_cannot_h
         _response(
             output="ok",
             attempt_records=(
-                _record(
+                attempt_record(
                     error=None,
                     usage=_USAGE,
                     usage_raw=_ProviderUsage(
@@ -393,10 +423,10 @@ def test_to_tables_places_each_attempt_on_the_calls_timeline() -> None:
     _, attempts = to_tables(
         _failure(
             attempt_records=(
-                _record(
+                attempt_record(
                     error=TransientError("e1"), started_after_seconds=3.0, elapsed_seconds=0.5
                 ),
-                _record(
+                attempt_record(
                     error=TransientError("e2"), started_after_seconds=9.0, elapsed_seconds=0.25
                 ),
             )
@@ -415,10 +445,10 @@ def test_to_tables_measures_time_to_first_item_from_the_attempts_own_start() -> 
     _, attempts = to_tables(
         _failure(
             attempt_records=(
-                _record(
+                attempt_record(
                     error=TransientError("e1"), started_after_seconds=3.0, elapsed_seconds=0.5
                 ),
-                _record(
+                attempt_record(
                     error=TransientError("e2"),
                     started_after_seconds=9.0,
                     elapsed_seconds=2.0,
@@ -439,8 +469,8 @@ def test_to_tables_writes_the_ids_and_served_model_each_attempt_carries() -> Non
     _, attempts = to_tables(
         _failure(
             attempt_records=(
-                _record(error=TransientError("e1"), request_id="req_1"),
-                _record(
+                attempt_record(error=TransientError("e1"), request_id="req_1"),
+                attempt_record(
                     error=TransientError("e2"),
                     model_served="fake-model-2026-01-01",
                     response_id="msg_9",
@@ -456,18 +486,18 @@ def test_to_tables_writes_the_ids_and_served_model_each_attempt_carries() -> Non
 
 def test_to_tables_structured_output_becomes_json() -> None:
     """A pydantic output instance is flattened to its JSON, not its repr."""
-    calls, _ = to_tables(_response(output=_USAGE, attempt_records=(_record(error=None),)))
+    calls, _ = to_tables(_response(output=_USAGE, attempt_records=(attempt_record(error=None),)))
     assert calls[0]["output"] == _USAGE.model_dump_json()
 
 
-def test_to_tables_writes_a_tool_call_success_as_a_null_output_with_no_error_summary() -> None:
-    """A structured tool-bound binding's tool-call turn is a success whose output cell is None.
+def test_to_tables_writes_a_tool_call_turn_as_a_null_output_with_no_error_summary() -> None:
+    """A ToolCallTurn that parsed no instance is a success whose output cell is None.
 
     str(None) would write the string "None" into a column readers scan for real output, and the
     error_summary and stop_reason cells are what tell this row from the failure row beside it.
     """
     calls, _ = to_tables(
-        _response(output=None, attempt_records=(_record(error=None),), stop_reason="tool_use")
+        _tool_call_turn(output=None, attempt_records=(attempt_record(error=None),))
     )
     assert calls[0]["output"] is None
     assert calls[0]["error_summary"] is None
@@ -483,8 +513,8 @@ def test_to_tables_failure_summarizes_the_call_and_rows_each_attempts_own_error(
     calls, attempts = to_tables(
         _failure(
             attempt_records=(
-                _record(error=TransientError("e1")),
-                _record(error=TransientError("e2")),
+                attempt_record(error=TransientError("e1")),
+                attempt_record(error=TransientError("e2")),
             )
         )
     )
@@ -502,7 +532,9 @@ def test_to_tables_writes_the_request_a_failed_call_sent_and_nothing_else() -> N
     The prompt reaches the table through this column alone: error_summary is the failure's own text,
     so a caller who drops request_json is left with no message content in the calls table.
     """
-    calls, _attempts = to_tables(_failure(attempt_records=(_record(error=TransientError("e1")),)))
+    calls, _attempts = to_tables(
+        _failure(attempt_records=(attempt_record(error=TransientError("e1")),))
+    )
     assert calls[0]["request_json"] == json.dumps({"prompt": "the-prompt-text"})
     assert "the-prompt-text" not in str(calls[0]["error_summary"])
 
@@ -511,7 +543,8 @@ def test_to_tables_writes_no_request_where_the_call_built_none() -> None:
     """A failure the adapter declared before building a request writes a null cell, not an empty one."""
     calls, _attempts = to_tables(
         RefusalError(
-            call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0), request=None
+            call=call_record((attempt_record(error=None, usage=_USAGE),), elapsed_seconds=1.0),
+            request=None,
         )
     )
     assert calls[0]["request_json"] is None
@@ -523,7 +556,7 @@ def test_a_failures_text_carries_no_part_of_the_request() -> None:
     A caller who set capture_message_content False would otherwise find the GenerationInput in a span
     anyway, through the error's own text.
     """
-    failure = _failure(attempt_records=(_record(error=TransientError("e1")),))
+    failure = _failure(attempt_records=(attempt_record(error=TransientError("e1")),))
     assert failure.request == _REQUEST
     assert "the-prompt-text" not in failure.error_text
     assert "the-prompt-text" not in str(failure)
@@ -557,7 +590,7 @@ def test_to_tables_a_failed_200_reports_its_billing_and_reason(
     """
     calls, attempts = to_tables(
         error_class(
-            call=_call((_record(error=None, usage=_USAGE),), elapsed_seconds=1.0),
+            call=call_record((attempt_record(error=None, usage=_USAGE),), elapsed_seconds=1.0),
             request=_REQUEST,
         )
     )
@@ -575,11 +608,11 @@ def test_to_tables_a_failed_200_reports_its_billing_and_reason(
 def test_to_tables_numbers_a_mixed_batch_and_joins_its_attempts_back() -> None:
     """Every attempt row names the call it belongs to, which is what the two tables join on."""
     calls, attempts = to_tables([
-        _response(output="ok", attempt_records=(_record(error=None, usage=_USAGE),)),
+        _response(output="ok", attempt_records=(attempt_record(error=None, usage=_USAGE),)),
         _failure(
             attempt_records=(
-                _record(error=TransientError("e1")),
-                _record(error=TransientError("e2")),
+                attempt_record(error=TransientError("e1")),
+                attempt_record(error=TransientError("e2")),
             )
         ),
     ])
@@ -597,12 +630,12 @@ def _abandoned(
 ) -> AbandonedCallError:
     """Build an AbandonedCallError placing its cut-off request on the fixed origin."""
     return AbandonedCallError(
-        call=_call(attempt_records, elapsed_seconds=3.0),
+        call=call_record(attempt_records, elapsed_seconds=3.0),
         billing_in_flight=billing_in_flight,
         in_flight_attempt_started_at_monotonic_seconds=(
             None
             if in_flight_started_after_seconds is None
-            else _CALL_STARTED_AT + in_flight_started_after_seconds
+            else CALL_STARTED_AT + in_flight_started_after_seconds
         ),
     )
 
@@ -616,7 +649,9 @@ def test_to_tables_rows_the_request_that_was_in_flight_when_the_call_was_cut_off
     """
     calls, attempts = to_tables(
         _abandoned(
-            attempt_records=(_record(error=TransientError("e1"), started_after_seconds=0.0),),
+            attempt_records=(
+                attempt_record(error=TransientError("e1"), started_after_seconds=0.0),
+            ),
             billing_in_flight=stated_billing(_USAGE),
             in_flight_started_after_seconds=2.0,
         )
@@ -655,7 +690,7 @@ def test_to_tables_writes_no_extra_row_for_a_call_cut_off_between_attempts() -> 
     """No request was in flight, so the settled records are the whole attempts table for the call."""
     _calls, attempts = to_tables(
         _abandoned(
-            attempt_records=(_record(error=TransientError("e1")),),
+            attempt_records=(attempt_record(error=TransientError("e1")),),
             billing_in_flight=None,
             in_flight_started_after_seconds=None,
         )
@@ -673,7 +708,7 @@ def test_a_cut_off_call_counts_a_staged_response_once() -> None:
     ledger.start_call()
     ledger.start_attempt()
     ledger.stage_response(
-        raw=_Raw(),
+        raw=StubRaw(),
         billing=stated_billing(_USAGE),
         identity=ResponseIdentity(
             model_served="fake-model", response_id="resp-1", request_id="req-1"

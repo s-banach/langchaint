@@ -96,7 +96,9 @@ def test_discovery_finds_the_known_unions_with_their_members_intact() -> None:
     one it found but flattened to a single member, so a walk that stops early has to fail here.
     A union of one member is not a union, which is what makes the lower bound safe to assert.
     """
-    assert {"Message", "Part", "TurnElement", "ResponseOutcome"} <= set(_TAGGED_UNIONS)
+    assert {"Message", "Part", "TurnElement", "ResponseOutcome", "GenerateResult"} <= set(
+        _TAGGED_UNIONS
+    )
     undersized = {
         name: [member.__name__ for member in members]
         for name, members in _TAGGED_UNIONS.items()

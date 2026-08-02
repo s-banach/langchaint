@@ -61,9 +61,11 @@ from langchaint.messages import (
 from langchaint.pricing import Billing, category_cost
 from langchaint.response import (
     CallResult,
+    GenerateResult,
     Response,
     RowValue,
     Tables,
+    ToolCallTurn,
     to_tables,
 )
 from langchaint.shared_backoff import (
@@ -122,6 +124,7 @@ __all__ = [
     "EmptyTurnError",
     "EscapedExceptionError",
     "GaveUpWaiting",
+    "GenerateResult",
     "GenerationError",
     "GenerationInput",
     "ImagePart",
@@ -161,6 +164,7 @@ __all__ = [
     "TimedOutError",
     "Tool",
     "ToolCall",
+    "ToolCallTurn",
     "ToolChoice",
     "ToolManager",
     "ToolMessage",

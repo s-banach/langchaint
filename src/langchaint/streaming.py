@@ -2,7 +2,7 @@
 
 A StreamHandle is three things at once:
 an async iterator of stream items (answer text chunks, reasoning text deltas, and completed tool calls),
-the source of the assembled Response via final(),
+the source of the assembled success arm via final(),
 and an async context manager whose entry opens the request and whose exit closes it.
 A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
 Assembling the turn and reading what it produced live behind AdapterStream.final();
@@ -24,7 +24,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
-from typing import Literal
+from typing import Literal, Never, overload
 
 from pydantic import BaseModel
 
@@ -59,7 +59,14 @@ from langchaint.exceptions import (
 )
 from langchaint.messages import Message
 from langchaint.pricing import Billing
-from langchaint.response import CallResult, Response, _abandoned_call_error
+from langchaint.response import (
+    CallResult,
+    GenerateResult,
+    Response,
+    ToolCallTurn,
+    _abandoned_call_error,
+    _success_arm,
+)
 from langchaint.shared_backoff import (
     Admission,
     PauseAll,
@@ -78,11 +85,15 @@ _FINISHED_MESSAGE = "stream is finished: call stream_one again for a new one"
 _ALREADY_ENTERED_MESSAGE = "stream already entered: call stream_one again for a new one"
 
 
-class StreamHandle[OutputT]:
-    """One stream: an item iterator, a Response source, a context manager.
+class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
+    """One stream: an item iterator, a final-result source, a context manager.
 
-    Iterate for items as they arrive; await final() at any point in the block to drain silently and get the Response.
+    Iterate for items as they arrive; await final() at any point in the block to drain silently and get the result.
     The request opens on entry, so open failures surface there rather than at the first item.
+
+    ToolTurnT is the type final() can return besides Response[OutputT]:
+    ToolCallTurn[OutputT] on a structured tool-bound binding, and the default Never everywhere else,
+    which stream_one's overloads state so only that binding's callers see the arm.
 
     max_attempts bounds one phase only: reaching the first item. Past it nothing is retried,
     whatever the budget still holds: a transient failure an item pull raises, and one the assembled
@@ -99,8 +110,13 @@ class StreamHandle[OutputT]:
         shared_backoff: SharedBackoff,
         max_attempts: int,
         timeout_seconds: float | None,
+        splits_tool_call_turns: bool,
     ) -> None:
-        """Store the request; called by BoundLLM.stream_one only."""
+        """Store the request; called by BoundLLM.stream_one only.
+
+        splits_tool_call_turns is whether the binding is structured and tool-bound, which is what
+        _success_arm needs to conclude a tool-call turn as ToolCallTurn.
+        """
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages
@@ -108,6 +124,7 @@ class StreamHandle[OutputT]:
         self._max_attempts = max_attempts
         self._private_backoff = PrivateBackoff(shared_backoff)
         self._timeout_seconds = timeout_seconds
+        self._splits_tool_call_turns = splits_tool_call_turns
         self._deadline: asyncio.Timeout | None = None
         """The deadline scope while the call is in progress, None once it is not.
 
@@ -125,7 +142,7 @@ class StreamHandle[OutputT]:
         propagating, so the caller reads it in its own except or finally. stream_one hands the
         handle back before anything suspends, so the caller holds it whenever a request is in
         flight, which is why this needs no log.
-        None where a Response or a GenerationError already gave the caller an account of the call,
+        None where a success arm or a GenerationError already gave the caller an account of the call,
         and None where timeout_seconds expired, which raises TimedOutError instead: both account for
         the same call, so reporting both would double what the archive says the call spent.
         """
@@ -135,8 +152,8 @@ class StreamHandle[OutputT]:
         self._admission: Admission | None = None
         self._yielded_any = False
         self._ended_at_monotonic_seconds: float | None = None
-        self._conclusion: Response[OutputT] | Exception | None = None
-        """What concluded the call: the Response, or the error that ended it; None until it ends."""
+        self._conclusion: GenerateResult[OutputT] | Exception | None = None
+        """What concluded the call: the success arm, or the error that ended it; None until it ends."""
         self._conclusion_carried_the_call = False
         """Whether that conclusion gave the caller an account of this call; see _set_abandoned."""
         self._state: _State = "unopened"
@@ -163,7 +180,7 @@ class StreamHandle[OutputT]:
             self._request = built
         return self._request
 
-    async def __aenter__(self) -> "StreamHandle[OutputT]":
+    async def __aenter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
         """Open the request and return self.
 
         Raises:
@@ -285,7 +302,7 @@ class StreamHandle[OutputT]:
     def _set_abandoned(self, billing_in_flight: Billing | None) -> None:
         """Set abandoned, unless the conclusion already accounted for the call.
 
-        A Response and a GenerationError each hand the caller this call's CallRecord, naming
+        A success arm and a GenerationError each hand the caller this call's CallRecord, naming
         the model and the attempts to reconcile against.
         Setting it after one would report the same call twice and mislabel a concluded call as an
         in-flight abandonment.
@@ -323,7 +340,7 @@ class StreamHandle[OutputT]:
         """Close the provider connection and exit the admitted() block, whatever the close does.
 
         A close failure is logged rather than raised, because the request it belonged to has already
-        ended and the exception would only displace the Response or the error the caller came for.
+        ended and the exception would only displace the result or the error the caller came for.
         The admission exit sits in a finally rather than after the handler, so a BaseException out
         of the close returns the capacity permit too.
         A failing path that already exited the block with its failure leaves this exit nothing to
@@ -468,7 +485,7 @@ class StreamHandle[OutputT]:
         invalid_request.__cause__ = cause
         return invalid_request
 
-    def __aiter__(self) -> "StreamHandle[OutputT]":
+    def __aiter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
         """Return self; the handle is its own iterator."""
         return self
 
@@ -608,8 +625,12 @@ class StreamHandle[OutputT]:
             self._yielded_any = True
             return item
 
-    async def final(self) -> Response[OutputT]:
-        """Drain any remaining items silently and return the Response.
+    @overload
+    async def final(self: "StreamHandle[OutputT, Never]") -> Response[OutputT]: ...
+    @overload
+    async def final(self) -> "Response[OutputT] | ToolTurnT": ...
+    async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
+        """Drain any remaining items silently and return the success arm.
 
         Idempotent once a conclusion exists: the call's conclusion is stored once, whether this
         method produced it, a caller's own iteration produced it, or the adapter stream raised it.
@@ -688,7 +709,7 @@ class StreamHandle[OutputT]:
             # account of the call whichever one it was.
             self._conclusion_carried_the_call = True
             await self._close_deadline(None)
-        if isinstance(self._conclusion, Response):
+        if isinstance(self._conclusion, (Response, ToolCallTurn)):
             return self._conclusion
         raise self._conclusion
 
@@ -699,7 +720,7 @@ class StreamHandle[OutputT]:
         raw: BaseModel,
         ended_at_monotonic_seconds: float,
     ) -> CallResult[OutputT]:
-        """Build what this outcome concludes the call with: the Response, or the error to raise.
+        """Build what this outcome concludes the call with: the success arm, or the error to raise.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
         Every outcome closes the staged response into this attempt's record before the result is
@@ -728,7 +749,8 @@ class StreamHandle[OutputT]:
         )
         match outcome.kind:
             case "adapter_result":
-                return Response(
+                return _success_arm(
+                    splits_tool_call_turns=self._splits_tool_call_turns,
                     output=outcome.output,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                     raw=raw,

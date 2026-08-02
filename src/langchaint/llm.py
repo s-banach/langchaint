@@ -53,8 +53,11 @@ from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.response import (
     CallResult,
+    GenerateResult,
     Response,
+    ToolCallTurn,
     _abandoned_call_error,
+    _success_arm,
 )
 from langchaint.shared_backoff import (
     Admission,
@@ -207,7 +210,7 @@ class GenerateItem[OutputT](Protocol):
 
     async def __call__(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None
-    ) -> Response[OutputT | None]:
+    ) -> GenerateResult[OutputT | None]:
         """Run the call, raising its GenerationError rather than returning it.
 
         Raises:
@@ -219,7 +222,7 @@ class GenerateItem[OutputT](Protocol):
 class _Interpretation[OutputT](NamedTuple):
     """One arrived response and what interpret read off it.
 
-    The two travel together because the retry loop needs both: raw is what a Response carries, and
+    The two travel together because the retry loop needs both: raw is what a success arm carries, and
     outcome is what decides the item's fate.
     """
 
@@ -372,10 +375,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     The tool_manager property returns it.
     A tool loop therefore dispatches through the binding it was handed.
     ToolManagerT is also what the request methods overload on.
-    A structured BoundLLM[Model, ToolManager] types its output OutputT | None.
-    That None is the tool-call turn; every other combination types the output OutputT.
-    Keeping the None out of OutputT is what lets rebind add and remove a tool_manager.
-    The output type is then right both ways.
+    A structured BoundLLM[Model, ToolManager] generates GenerateResult[Model]: a tool-call turn is
+    the ToolCallTurn arm, so the Response arm's output is never None.
+    Every other combination generates Response[OutputT] alone.
+    Keeping the arms out of OutputT is what lets rebind add and remove a tool_manager.
     The parameter defaults to None, so BoundLLM[Model] annotates the common binding.
     A tool-bound one names both, BoundLLM[Model, ToolManager].
     bind writes ToolManager as the type argument for every manager, subclasses included.
@@ -413,6 +416,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         A structured binding then named by a ToolManager subclass would match no request method.
         """
         return self._tool_manager
+
+    @property
+    def _splits_tool_call_turns(self) -> bool:
+        """Whether this binding's tool-call turns are ToolCallTurn: it is structured and tool-bound."""
+        return self.response_format is not None and self._tool_manager is not None
 
     @overload
     def rebind[NewModelT: BaseModel](
@@ -732,11 +740,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         ledger: _CallLedger,
         timeout_seconds: float | None,
-    ) -> Response[OutputT | None]:
+    ) -> GenerateResult[OutputT | None]:
         """Run the retry loop every generate method shares, under the caller's deadline.
 
         ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
-        into as each attempt settles. Every GenerationError and the Response are built from
+        into as each attempt settles. Every GenerationError and the success arm are built from
         ledger.freeze(), the one site a call's elapsed_seconds is computed.
 
         timeout_seconds bounds this whole loop, admission waits and backoff sleeps included, and
@@ -799,7 +807,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     async def _attempt_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _CallLedger
-    ) -> Response[OutputT | None]:
+    ) -> GenerateResult[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
 
         Runs inside the deadline opened by _generate_with_retries, its only caller.
@@ -856,7 +864,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 ledger.record(error=None, assistant_message=outcome.assistant_message)
                 match outcome.kind:
                     case "adapter_result":
-                        return Response(
+                        return _success_arm(
+                            splits_tool_call_turns=self._splits_tool_call_turns,
                             output=outcome.output,
                             call=ledger.freeze(),
                             raw=raw,
@@ -902,7 +911,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> Response[OutputT | None]: ...
+    ) -> GenerateResult[OutputT]: ...
     @overload
     async def generate_one(
         self: "BoundLLM[OutputT, None]",
@@ -912,12 +921,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> Response[OutputT]: ...
     async def generate_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> Response[Any]:
+    ) -> GenerateResult[Any]:
         """Generate one response under the retry loop.
 
-        output is None only on a structured tool-bound binding, where the turn parsed no instance;
-        the overloads type it away everywhere else, a text turn's output being "" and not None.
-        Response.output states what a None means and what to branch on for a pending tool call.
+        A structured tool-bound binding returns GenerateResult[OutputT], and a match on its kind
+        tells the final Response from the ToolCallTurn owing tool results.
+        Every other binding returns Response alone, its output never None, a text turn's being "".
         Every non-success outcome propagates, all of them sharing the GenerationError base a caller
         can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
         rejected request, ProviderDeclaredFinalError or UnknownExceptionError on an error the adapter
@@ -943,7 +952,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     async def _generate_one_any_binding(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None
-    ) -> Response[OutputT | None]:
+    ) -> GenerateResult[OutputT | None]:
         """Run one call under a ledger of its own, reporting every Exception as its failure.
 
         What generate_one does, at the widest output type, callable from a frame whose binding is not
@@ -977,7 +986,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generate_item: "GenerateItem[OutputT]",
         timeout_seconds: float | None,
     ) -> CallResult[OutputT | None]:
-        """One batch item: the Response or the GenerationError.
+        """One batch item: the success arm or the GenerationError.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
         into the gather and reaches a sibling. An expired timeout_seconds is one of them, so one
@@ -998,7 +1007,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[str]]: ...
+    ) -> list[Response[str] | GenerationError]: ...
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, ToolManager]",
@@ -1006,7 +1015,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[OutputT | None]]: ...
+    ) -> list[CallResult[OutputT]]: ...
     @overload
     async def generate_many(
         self: "BoundLLM[OutputT, None]",
@@ -1014,20 +1023,22 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = ...,
         timeout_seconds: float | None = ...,
-    ) -> list[CallResult[OutputT]]: ...
+    ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
         timeout_seconds: float | None = None,
-    ) -> list[CallResult[Any]]:
+        # list is invariant, so no single element union is assignable from all three overloads;
+        # a union of list types would restate the overloads without replacing this Any.
+    ) -> list[Any]:
         """Order-aligned batch: result i belongs to generation_inputs[i].
 
-        A Response's output is typed the way generate_one types it, per binding.
+        A success slot is typed the way generate_one types its result, per binding.
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
-        Every item ends in its own slot: a Response, or the GenerationError it failed with
+        Every item ends in its own slot: a success arm, or the GenerationError it failed with
         (retries exhausted, a rejected request, an error langchaint does not retry, a 200 that
         produced no output, or a defect in langchaint itself), which to_tables renders to a failure
         row so the batch stays table-ready.
@@ -1153,7 +1164,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
-    ) -> StreamHandle[OutputT | None]: ...
+    ) -> StreamHandle[OutputT, ToolCallTurn[OutputT]]: ...
     @overload
     def stream_one(
         self: "BoundLLM[OutputT, None]",
@@ -1163,10 +1174,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> StreamHandle[OutputT]: ...
     def stream_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> StreamHandle[Any]:
+    ) -> StreamHandle[Any, Any]:
         """Build the stream handle; entering it with `async with` opens the request.
 
-        The handle's final() Response types output the way generate_one types it, per binding.
+        The handle's final() result is typed the way generate_one types it, per binding.
         Sync because nothing suspends until the handle is entered;
         see StreamHandle for the retry, close, deadline, and abandoned contracts.
         timeout_seconds bounds the block from entry until the call concludes, so it covers the open,
@@ -1178,7 +1189,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     def _stream_one_any_binding(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None
-    ) -> StreamHandle[OutputT | None]:
+    ) -> StreamHandle[OutputT | None, ToolCallTurn[OutputT | None]]:
         """Build the handle at the widest output type; _generate_one_any_binding says why."""
         return StreamHandle(
             adapter=self.adapter,
@@ -1187,4 +1198,5 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             shared_backoff=self.shared_backoff,
             max_attempts=self.max_attempts,
             timeout_seconds=timeout_seconds,
+            splits_tool_call_turns=self._splits_tool_call_turns,
         )

@@ -1,18 +1,18 @@
-"""The generate results: the success Response and the terminal GenerationError.
+"""The generate results: the success arms Response and ToolCallTurn, and the terminal GenerationError.
 
-A generate that succeeds returns a Response; one that ends terminally (retries exhausted on transient errors, a refusal,
-a truncation at the token cap, or a provider error langchaint does not retry) raises or returns a GenerationError.
-Both carry the CallRecord their retry loop froze, because a call's history survives only if the
-result carries it: attempt_records is that history.
-On a Response every record but the last failed and the last succeeded;
-on a GenerationError the records describe the terminal outcome.
-to_tables flattens a list of results to two tables of scalars, one row per result and one row per
-attempt, joined on call_id.
+A generate that succeeds returns a GenerateResult arm.
+One that ends terminally raises or returns a GenerationError.
+Terminal ends: retries exhausted, a refusal, truncation at the token cap, or a provider error langchaint does not retry.
+All three carry the CallRecord their retry loop froze.
+A call's history survives only if the result carries it: attempt_records is that history.
+On a success arm every record but the last failed and the last succeeded.
+On a GenerationError the records describe the terminal outcome.
+to_tables flattens results to two tables of scalars, one row per result and one row per attempt, joined on call_id.
 """
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -22,46 +22,27 @@ from langchaint.messages import AssistantMessage, StopReason, ToolCall
 from langchaint.pricing import Billing
 from langchaint.usage import Usage
 
-type CallResult[OutputT] = Response[OutputT] | GenerationError
-"""One call's terminal result: the success carrier, or the failure carrier a batch returns in its slot."""
+type GenerateResult[OutputT] = Response[OutputT] | ToolCallTurn[OutputT]
+"""One successful generate result; a match on kind selects the arm without importing the classes.
+
+Only a structured tool-bound binding returns both arms.
+Every other binding returns Response alone, and its generate and stream overloads say so.
+"""
+
+type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
+"""One call's terminal result: a success arm, or the failure carrier a batch returns in its slot."""
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_tables emits."""
 
 
-@dataclass(frozen=True, kw_only=True)
-class Response[OutputT](_CallCarrier):
-    """One successful generate result.
+class _SuccessCarrier(_CallCarrier):
+    """The invariants and folds the success arms share; the fields stay on each arm.
 
-    output is the assistant text, or the response_format instance validated from the turn's text.
-    It is None when the turn parsed no instance, which on a structured tool-bound binding means the model called tools.
-    Only that binding types output optional, so no other caller has a None to handle.
-    A turn can both parse an instance and call tools, setting output and tool_calls at once.
-    tool_calls is therefore what says whether this turn owes the model a tool result.
-    call is this call's history: model, provider_name, attempt_records, started_at_monotonic_seconds,
-    and elapsed_seconds read off it.
-    attempts counts its records.
-    Every attempt record but the last failed and the last succeeded.
-    assistant_message is the adapter-built turn exactly as the provider produced it,
-    the whole ordered turn (reasoning, text, and tool calls in emission order),
-    held by reference for appending to a Sequence[Message].
-    Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
-    and is the rewrap this field exists to prevent.
-    The last attempt record holds the same object, because the record is where every attempt's turn
-    goes and this one is the attempt that succeeded.
-    raw is the SDK's own response model, held by reference (no dump, no copy; call raw.model_dump() for a dict);
-    on streams it comes from the SDK-assembled final message.
-    It is a live, mutable pydantic object shared with the adapter, so despite the frozen dataclass around it,
-    treat it read-only and raw.model_copy() before mutating.
-    usage and usage_successful_attempt are two scopes, both folded from attempt_records (see their docstrings):
-    usage is the paid total across every attempt, usage_successful_attempt the single kept answer's own.
+    A deriving frozen dataclass declares every field itself, assistant_message included, because this
+    class is not a dataclass and _CallCarrier explains why that split exists.
     """
 
-    output: OutputT
-    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
-    call: CallRecord
-    raw: BaseModel
-    stop_reason: StopReason
     assistant_message: AssistantMessage
 
     def __post_init__(self) -> None:
@@ -106,6 +87,108 @@ class Response[OutputT](_CallCarrier):
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """The turn's tool calls."""
         return self.assistant_message.tool_calls
+
+
+@dataclass(frozen=True, kw_only=True)
+class Response[OutputT](_SuccessCarrier):
+    """One successful generate result.
+
+    output is the assistant text, or the response_format instance validated from the turn's text.
+    It is never None: on a structured tool-bound binding a turn that called tools is a ToolCallTurn,
+    and a turn that produced no instance fails the call with a GenerationError.
+    On a text tool-bound binding every turn is a Response, so there tool_calls is what says whether
+    this turn owes the model a tool result.
+    call is this call's history: model, provider_name, attempt_records, started_at_monotonic_seconds,
+    and elapsed_seconds read off it.
+    attempts counts its records.
+    Every attempt record but the last failed and the last succeeded.
+    assistant_message is the adapter-built turn exactly as the provider produced it,
+    the whole ordered turn (reasoning, text, and tool calls in emission order),
+    held by reference for appending to a Sequence[Message].
+    Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
+    and is the rewrap this field exists to prevent.
+    The last attempt record holds the same object, because the record is where every attempt's turn
+    goes and this one is the attempt that succeeded.
+    raw is the SDK's own response model, held by reference (no dump, no copy; call raw.model_dump() for a dict);
+    on streams it comes from the SDK-assembled final message.
+    It is a live, mutable pydantic object shared with the adapter, so despite the frozen dataclass around it,
+    treat it read-only and raw.model_copy() before mutating.
+    usage and usage_successful_attempt are two scopes, both folded from attempt_records (see their docstrings):
+    usage is the paid total across every attempt, usage_successful_attempt the single kept answer's own.
+    """
+
+    output: OutputT
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    call: CallRecord
+    raw: BaseModel
+    stop_reason: StopReason
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _SuccessCarrier; same split as call
+    assistant_message: AssistantMessage
+    kind: Literal["response"] = "response"
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolCallTurn[OutputT](_SuccessCarrier):
+    """One successful generate result whose turn called tools, owing the model one ToolMessage per call.
+
+    Only the structured tool-bound binding returns this arm; a text binding's tool calls ride a
+    Response, whose str output always exists.
+    output is the response_format instance the turn's text also parsed to, None on a turn of tool
+    calls alone.
+    To continue the call, dispatch tool_calls (ToolManager.dispatch or dispatch_many), append
+    assistant_message and the tool results to the Sequence[Message], and generate again.
+    Every other field means what Response's field of the same name means; read it there.
+    """
+
+    output: OutputT | None
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    call: CallRecord
+    raw: BaseModel
+    stop_reason: StopReason
+    # pyrefly: ignore[bad-override]  # read-only here, read-write on _SuccessCarrier; same split as call
+    assistant_message: AssistantMessage
+    kind: Literal["tool_call_turn"] = "tool_call_turn"
+
+    def __post_init__(self) -> None:
+        """Enforce the shared success invariants, then this arm's own: the turn holds a tool call.
+
+        Raises:
+            ValueError: a shared success check failed (_SuccessCarrier.__post_init__ names them), or
+                the turn holds no tool call.
+        """
+        super().__post_init__()
+        if not self.assistant_message.tool_calls:
+            raise ValueError("a ToolCallTurn must hold at least one tool call")
+
+
+def _success_arm[OutputT](
+    *,
+    splits_tool_call_turns: bool,
+    output: OutputT,
+    call: CallRecord,
+    raw: BaseModel,
+    stop_reason: StopReason,
+    assistant_message: AssistantMessage,
+) -> GenerateResult[OutputT]:
+    """Build the success arm one adapter_result outcome concludes its call with.
+
+    splits_tool_call_turns is whether the binding is structured and tool-bound, the one binding
+    whose tool-call turns are ToolCallTurn; under False every turn is a Response.
+
+    Raises:
+        ValueError: the arm's __post_init__ rejected the records or the turn; both retry loops
+            construct from a freshly frozen success, so a raise here is a langchaint defect.
+    """
+    arm: type[Response[OutputT]] | type[ToolCallTurn[OutputT]] = (
+        ToolCallTurn if splits_tool_call_turns and assistant_message.tool_calls else Response
+    )
+    return arm(
+        output=output,
+        call=call,
+        raw=raw,
+        stop_reason=stop_reason,
+        assistant_message=assistant_message,
+    )
 
 
 def _abandoned_call_error[ErrorT: AbandonedCallError](
@@ -175,8 +258,8 @@ def _call_row(*, call_id: int, result: CallResult[object]) -> dict[str, RowValue
     error_summary is how the call ended, the carrier's own __str__, and None on a success. It is not
     error_text: RetriesExhaustedError.error_text folds every attempt's error into one string, and
     those errors have rows of their own in the attempts table.
-    output is the parsed result, None on a failure and None on the tool-call turn of a structured
-    tool-bound binding, which stop_reason "tool_use" tells apart.
+    output is the parsed result, None on a failure and None on a ToolCallTurn that parsed no
+    instance, which stop_reason "tool_use" tells apart.
     request_json is what every attempt of a failed call sent, rendered as a JSON object. It is None
     on a success, whose request is reconstructible from the Sequence[Message] and the binding the caller
     still holds, and None on a failure the adapter declared before building a request.
@@ -343,13 +426,13 @@ def to_tables[OutputT](results: CallResult[OutputT] | Iterable[CallResult[Output
     call_id is the result's position in the results given here, which is what joins an attempt row
     back to the call it belongs to. A caller concatenating the output of two to_tables calls offsets
     the second, since each numbers from zero.
-    kept marks the attempt whose turn became the answer: the last attempt of a Response, and no
+    kept marks the attempt whose turn became the answer: the last attempt of a success arm, and no
     attempt of a GenerationError.
     An AbandonedCallError cut off mid-request gets one attempts row past its records, for the
     request that was in flight, so summing cost_in_usd over the archive reaches the total the
     carriers report.
     A single result is accepted in place of an iterable, and is told apart by not being iterable,
-    which no Response or GenerationError is.
+    which no success arm or GenerationError is.
 
     Repricing held rows is a join against the caller's own rate table on model, provider_name, and
     service_tier: the first two are call columns and the third an attempt column.

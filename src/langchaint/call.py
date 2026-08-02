@@ -5,7 +5,7 @@ An attempt is one request inside that call. The adapter runs one attempt and rep
 only a retry loop sees the whole call, so only a retry loop builds a CallRecord.
 A loop accumulates its call into a _CallLedger and freezes that into the CallRecord it hands out.
 
-Response and GenerationError each hold one, and each derives _CallCarrier, so the call-level field
+Every success arm and GenerationError hold one, and each derives _CallCarrier, so the call-level field
 set is declared once and every carrier answers to the same names.
 Imports no error class at runtime: a success carries a CallRecord, so a dependency on the error
 vocabulary would run the wrong way.
@@ -148,11 +148,11 @@ class _CallCarrier:
     A deriving dataclass declares `call: CallRecord` itself: this class is not a dataclass, so its
     annotations are not fields, and without the declaration the subclass gets no such parameter.
     A frozen dataclass's re-declaration is read-only where this one is read-write, which pyrefly
-    reports as an inconsistent override; the two frozen carriers suppress it. Declaring `call` here
+    reports as an inconsistent override; the frozen carriers suppress it. Declaring `call` here
     as a read-only property instead would break at runtime: a property is a data descriptor, so it
     would shadow the instance attribute every deriving class sets.
 
-    No attempts count is forwarded: Response and GenerationError each define their own.
+    No attempts count is forwarded: _SuccessCarrier and GenerationError each define their own.
 
     CallRecord is the one declaration of the names it forwards, so a carrier adds none of them itself.
     """

@@ -3,6 +3,8 @@
 Each union gets a match on kind whose cases read a field only some arms carry: that body fails to
 type-check unless the tag narrows the subject, so a regressed discriminator is a check-time error
 rather than a runtime AttributeError.
+GenerateResult's arms share every field name, so its match asserts the narrowed type of output,
+which only the tag makes non-optional in the response case.
 Each union also gets a one-case match carrying a non-exhaustive-match suppression.
 pyrefly reports an unused suppression as an error, so if the tag ever stops driving exhaustiveness
 the suppression goes unused and the check fails; a union that gains an arm fails in the full match
@@ -11,6 +13,8 @@ The full matches are exercised at runtime too, so a subject reaching no case fai
 That no two arms share a tag, which is what keeps an arm out of a sibling's case, is checked in
 test_kind_tag_shape.py.
 """
+
+from typing import assert_type
 
 from langchaint import (
     AssistantMessage,
@@ -21,6 +25,7 @@ from langchaint import (
     DispatchPrecomputed,
     DispatchUnknownTool,
     DoNotRetry,
+    GenerateResult,
     ImagePart,
     InvalidToolArgsDetail,
     Message,
@@ -28,10 +33,12 @@ from langchaint import (
     PauseAll,
     ReasoningDelta,
     ReasoningTrace,
+    Response,
     RetryThisOne,
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallTurn,
     ToolMessage,
     TurnElement,
     UserMessage,
@@ -49,9 +56,14 @@ from langchaint.adapter import (
     SchemaViolation,
     UnfinishedTurn,
 )
+from tests.helpers import StubRaw, attempt_record, call_record
 
 _TURN = AssistantMessage(turn="hi")
 _TOOL_MESSAGE = ToolMessage(tool_call_id="c1", content="ok")
+
+
+_CALL = call_record((attempt_record(error=None),), elapsed_seconds=1.0)
+"""One successful attempt's history, the fixed filler both GenerateResult arms carry."""
 
 
 def _by_message_kind(message: Message) -> object:
@@ -167,6 +179,27 @@ def _by_response_outcome_kind_missing_an_arm(outcome: ResponseOutcome[str]) -> o
             return outcome.output
 
 
+def _by_generate_result_kind(result: GenerateResult[int]) -> object:
+    """Cover GenerateResult, whose arms share every field name.
+
+    The tag's work is output's optionality, so each case asserts the type the tag narrowed output
+    to, standing where the other functions read an arm-only field.
+    """
+    match result.kind:
+        case "response":
+            assert_type(result.output, int)
+            return result.output
+        case "tool_call_turn":
+            assert_type(result.output, int | None)
+            return result.tool_calls
+
+
+def _by_generate_result_kind_missing_an_arm(result: GenerateResult[int]) -> object:
+    match result.kind:  # pyrefly: ignore[non-exhaustive-match]
+        case "response":
+            return result.output
+
+
 def _by_stream_item_kind(item: StreamItem) -> object:
     """Cover StreamItem, whose str arm carries no tag because a builtin cannot hold one."""
     if isinstance(item, str):
@@ -273,6 +306,24 @@ def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_arm_carri
         expected for _, expected in outcomes
     ]
     assert _by_response_outcome_kind_missing_an_arm(Refusal(assistant_message=_TURN)) is None
+
+
+def test_a_generate_result_kind_narrows_the_output_type_the_arms_share_a_name_for() -> None:
+    """The response case returns the non-optional output; the tool_call_turn case reads tool_calls."""
+    tool_call = ToolCall(id="c1", name="probe", args_json="{}")
+    tool_call_turn: ToolCallTurn[int] = ToolCallTurn(
+        output=None,
+        call=_CALL,
+        raw=StubRaw(),
+        stop_reason="tool_use",
+        assistant_message=AssistantMessage(turn=(tool_call,)),
+    )
+    response = Response(
+        output=7, call=_CALL, raw=StubRaw(), stop_reason="end_turn", assistant_message=_TURN
+    )
+    assert _by_generate_result_kind(response) == 7
+    assert _by_generate_result_kind(tool_call_turn) == (tool_call,)
+    assert _by_generate_result_kind_missing_an_arm(tool_call_turn) is None
 
 
 def test_a_verdict_kind_selects_the_arm_that_carries_the_field_read() -> None:

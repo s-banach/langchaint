@@ -936,6 +936,7 @@ class TracedLLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[ModelT, ToolManager]": ...
     @overload
@@ -948,6 +949,7 @@ class TracedLLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[ModelT, None]": ...
     @overload
@@ -960,6 +962,7 @@ class TracedLLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
@@ -972,9 +975,10 @@ class TracedLLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[str, None]": ...
-    def bind(
+    def bind(  # noqa: PLR0913 (mirrors LLM.bind, which states every binding choice)
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
@@ -983,6 +987,7 @@ class TracedLLM:
         inference_params: InferenceParams | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
@@ -998,6 +1003,7 @@ class TracedLLM:
                 inference_params=inference_params,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
+                extra_body=extra_body,
                 automatic_prompt_caching=automatic_prompt_caching,
             ),
             span_config=self._span_config,
@@ -1073,6 +1079,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
     @overload
@@ -1085,6 +1092,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, None]": ...
     @overload
@@ -1097,6 +1105,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
     @overload
@@ -1109,6 +1118,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
@@ -1121,6 +1131,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, None]": ...
     @overload
@@ -1133,6 +1144,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManagerT]": ...
     @overload
@@ -1145,6 +1157,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
     @overload
@@ -1157,6 +1170,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, None]": ...
     @overload
@@ -1169,9 +1183,10 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def rebind(  # noqa: PLR0913 (mirrors BoundLLM.rebind, which takes every field bind takes)
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
@@ -1180,6 +1195,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror BoundLLM.rebind and re-wrap the plain BoundLLM in a TracedBoundLLM.
@@ -1197,6 +1213,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 inference_params=inference_params,
+                extra_body=extra_body,
                 automatic_prompt_caching=automatic_prompt_caching,
             ),
             span_config=self._span_config,

@@ -94,6 +94,7 @@ from langchaint.openai.responses_adapter import (
     _assistant_items,
     _assistant_message_from,
     _billing_from_response,
+    _BoundOpenAI,
     _BoundOpenAIStructured,
     _BoundOpenAIText,
     _normalized_stop_reason,
@@ -620,8 +621,9 @@ def _binding(
     automatic_prompt_caching: bool,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
-    """Assemble a toolless binding varying only caching, the system prompt, and reasoning effort."""
+    """Assemble a toolless binding with the fields these request tests vary."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=(),
@@ -629,6 +631,7 @@ def _binding(
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort=reasoning_effort),
         automatic_prompt_caching=automatic_prompt_caching,
+        extra_body=extra_body,
     )
 
 
@@ -759,6 +762,39 @@ def test_request_omits_tool_fields_without_tools() -> None:
     assert isinstance(precomputed_fields.parallel_tool_calls, openai.Omit)
 
 
+def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
+    """An extra_body key that send passes as its own keyword raises at bind time.
+
+    The SDK merges extra_body over the named request parameters with extra_body winning,
+    so admitting the key would silently override the binding.
+    """
+    with pytest.raises(ValueError, match="temperature"):
+        _ = _adapter()._precompute_fields(
+            _binding(automatic_prompt_caching=True, extra_body={"temperature": 0.5})
+        )
+
+
+def test_both_request_paths_send_extra_body_by_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both create and stream pass the binding's extra_body to the SDK's extra_body parameter.
+
+    A path that dropped it would silently send a request without the caller's wire fields,
+    which no offline round-trip test can catch.
+    """
+    adapter = _adapter()
+    extra_body = {"safety_identifier": "user-7"}
+    text_bound = _BoundOpenAIText(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(automatic_prompt_caching=True, extra_body=extra_body)
+        ),
+    )
+    bodies = _kwargs_sent_by_both_paths(monkeypatch, text_bound, "extra_body")
+    assert len(bodies) == 2
+    assert all(body is extra_body for body in bodies)
+
+
 class _FakeSDKStream(AsyncResponseStream[None]):
     """Replays constructed events without a connection.
 
@@ -792,6 +828,39 @@ def _stream(
 ) -> _OpenAIStream:
     """Build an adapter stream over replayed events, reading headers off a constructed response."""
     return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events, headers))
+
+
+def _kwargs_sent_by_both_paths[OutputT](
+    monkeypatch: pytest.MonkeyPatch, bound: _BoundOpenAI[OutputT], key: str
+) -> list[object]:
+    """Run send and open_stream through fakes, capturing the request kwarg key from each.
+
+    One capture per path, create first, so a caller asserts on exactly two values.
+    """
+    captured: list[object] = []
+
+    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
+        captured.append(request_kwargs[key])
+        return _response(usage=None)
+
+    class _FakeStreamManager:
+        async def __aenter__(self) -> _FakeSDKStream:
+            return _FakeSDKStream([])
+
+    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
+        captured.append(request_kwargs[key])
+        return _FakeStreamManager()
+
+    monkeypatch.setattr(bound._adapter.client.responses, "create", fake_create)
+    monkeypatch.setattr(bound._adapter.client.responses, "stream", fake_stream)
+
+    async def scenario() -> None:
+        messages = [UserMessage(content="q")]
+        await bound.send(bound.build_request(messages))
+        await bound.open_stream(bound.build_request(messages))
+
+    asyncio.run(scenario())
+    return captured
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
@@ -1553,35 +1622,13 @@ def test_every_request_carries_the_reasoning_include(
     """
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(_binding(automatic_prompt_caching=True))
-    includes: list[object] = []
-
-    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
-        includes.append(request_kwargs["include"])
-        return _response(usage=None)
-
-    class _FakeStreamManager:
-        async def __aenter__(self) -> _FakeSDKStream:
-            return _FakeSDKStream([])
-
-    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
-        includes.append(request_kwargs["include"])
-        return _FakeStreamManager()
-
-    monkeypatch.setattr(adapter.client.responses, "create", fake_create)
-    monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
     text_bound = _BoundOpenAIText(adapter=adapter, precomputed_fields=precomputed_fields)
     structured_bound = _BoundOpenAIStructured(
         adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
-
-    async def scenario() -> None:
-        messages = [UserMessage(content="q")]
-        await text_bound.send(text_bound.build_request(messages))
-        await text_bound.open_stream(text_bound.build_request(messages))
-        await structured_bound.send(structured_bound.build_request(messages))
-        await structured_bound.open_stream(structured_bound.build_request(messages))
-
-    asyncio.run(scenario())
+    includes = _kwargs_sent_by_both_paths(
+        monkeypatch, text_bound, "include"
+    ) + _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "include")
     assert includes == [["reasoning.encrypted_content"]] * 4
 
 
@@ -1595,33 +1642,12 @@ def test_both_structured_request_paths_send_the_text_parameter(
     request that omitted its schema.
     """
     adapter = _adapter()
-    precomputed_fields = adapter._precompute_fields(_binding(automatic_prompt_caching=True))
-    texts: list[object] = []
-
-    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
-        texts.append(request_kwargs["text"])
-        return _response(usage=None)
-
-    class _FakeStreamManager:
-        async def __aenter__(self) -> _FakeSDKStream:
-            return _FakeSDKStream([])
-
-    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
-        texts.append(request_kwargs["text"])
-        return _FakeStreamManager()
-
-    monkeypatch.setattr(adapter.client.responses, "create", fake_create)
-    monkeypatch.setattr(adapter.client.responses, "stream", fake_stream)
     structured_bound = _BoundOpenAIStructured(
-        adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(_binding(automatic_prompt_caching=True)),
+        response_format=_StructuredReport,
     )
-
-    async def scenario() -> None:
-        request = structured_bound.build_request([UserMessage(content="q")])
-        await structured_bound.send(request)
-        await structured_bound.open_stream(request)
-
-    asyncio.run(scenario())
+    texts = _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "text")
     assert texts == [{"format": type_to_text_format_param(_StructuredReport)}] * 2
 
 

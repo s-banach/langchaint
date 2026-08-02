@@ -968,6 +968,18 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
     asyncio.run(scenario())
 
 
+def test_traced_bind_and_rebind_carry_extra_body_by_reference() -> None:
+    """TracedLLM.bind forwards extra_body to LLM.bind; TracedBoundLLM.rebind keeps, replaces, or clears it."""
+    extra_body = {"safety_identifier": "user-7"}
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    bound = traced.bind(extra_body=extra_body, automatic_prompt_caching=True)
+    assert bound.binding.extra_body is extra_body
+    assert bound.rebind(system_prompt="s").binding.extra_body is extra_body
+    replacement = {"safety_identifier": "user-8"}
+    assert bound.rebind(extra_body=replacement).binding.extra_body is replacement
+    assert bound.rebind(extra_body=None).binding.extra_body is None
+
+
 def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
     """A custom attribute_mapper displaces every mapped gen_ai key, keeping only the required one.
 

@@ -84,7 +84,9 @@ from langchaint.anthropic.messages_adapter import (
     _assistant_content_blocks,
     _assistant_message_from,
     _billing_from_sdk_usage,
+    _BoundAnthropic,
     _BoundAnthropicStructured,
+    _BoundAnthropicText,
     _normalized_stop_reason,
     _NotSendableError,
     _user_content_blocks,
@@ -703,6 +705,7 @@ def _binding(
     system_prompt: str | tuple[TextPart, ...] | None,
     tool_schemas: tuple[ToolSchema, ...],
     automatic_prompt_caching: bool,
+    extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
     return Binding(
@@ -712,6 +715,7 @@ def _binding(
         parallel_tool_calls=False,
         inference_params=InferenceParams(reasoning_effort="high"),
         automatic_prompt_caching=automatic_prompt_caching,
+        extra_body=extra_body,
     )
 
 
@@ -1145,6 +1149,40 @@ _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
 
+def _kwargs_sent_by_both_paths[OutputT](
+    monkeypatch: pytest.MonkeyPatch, bound: _BoundAnthropic[OutputT], key: str
+) -> list[object]:
+    """Run send and open_stream through fakes, capturing the request kwarg key from each.
+
+    One capture per path, create first, so a caller asserts on exactly two values.
+    """
+    captured: list[object] = []
+
+    async def fake_create(**request_kwargs: object) -> at.Message:
+        captured.append(request_kwargs[key])
+        return _structured_message(_REPORT_JSON)
+
+    class _FakeStreamManager:
+        async def __aenter__(self) -> _FakeSDKMessageStream:
+            return _FakeSDKMessageStream([], _message_snapshot("end_turn"))
+
+    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
+        captured.append(request_kwargs[key])
+        return _FakeStreamManager()
+
+    monkeypatch.setattr(bound._adapter.client.messages, "create", fake_create)
+    monkeypatch.setattr(bound._adapter.client.messages, "stream", fake_stream)
+
+    async def scenario() -> None:
+        request = bound.build_request([UserMessage(content="q")])
+        assert not isinstance(request, InvalidRequest)
+        await bound.send(request)
+        await bound.open_stream(request)
+
+    asyncio.run(scenario())
+    return captured
+
+
 def test_identity_reads_the_messages_own_id_and_served_model() -> None:
     """Both values come off the message verbatim, neither from the id the binding sent.
 
@@ -1208,32 +1246,51 @@ def test_both_structured_request_paths_send_the_output_config(
     being wrong rather than as the request that omitted its schema.
     """
     structured_bound = _structured_bound()
-    output_configs: list[object] = []
-
-    async def fake_create(**request_kwargs: object) -> at.Message:
-        output_configs.append(request_kwargs["output_config"])
-        return _structured_message(_REPORT_JSON)
-
-    class _FakeStreamManager:
-        async def __aenter__(self) -> _FakeSDKMessageStream:
-            return _FakeSDKMessageStream([], _message_snapshot("end_turn"))
-
-    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
-        output_configs.append(request_kwargs["output_config"])
-        return _FakeStreamManager()
-
-    messages_resource = structured_bound._adapter.client.messages
-    monkeypatch.setattr(messages_resource, "create", fake_create)
-    monkeypatch.setattr(messages_resource, "stream", fake_stream)
-
-    async def scenario() -> None:
-        request = structured_bound.build_request([UserMessage(content="q")])
-        assert not isinstance(request, InvalidRequest)
-        await structured_bound.send(request)
-        await structured_bound.open_stream(request)
-
-    asyncio.run(scenario())
+    output_configs = _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "output_config")
     assert output_configs == [structured_bound._precomputed_fields.output_config] * 2
+
+
+def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
+    """An extra_body key that send passes as its own keyword raises at bind time.
+
+    The SDK merges extra_body over the named request parameters with extra_body winning,
+    so admitting the key would silently override the binding.
+    """
+    with pytest.raises(ValueError, match="max_tokens"):
+        _ = _adapter()._precompute_fields(
+            _binding(
+                system_prompt=None,
+                tool_schemas=(),
+                automatic_prompt_caching=True,
+                extra_body={"max_tokens": 10},
+            )
+        )
+
+
+def test_both_request_paths_send_extra_body_by_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both create and stream pass the binding's extra_body to the SDK's extra_body parameter.
+
+    A path that dropped it would silently send a request without the caller's wire fields,
+    which no offline round-trip test can catch.
+    """
+    adapter = _adapter()
+    extra_body = {"top_k": 5}
+    text_bound = _BoundAnthropicText(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(
+                system_prompt=None,
+                tool_schemas=(),
+                automatic_prompt_caching=True,
+                extra_body=extra_body,
+            )
+        ),
+    )
+    bodies = _kwargs_sent_by_both_paths(monkeypatch, text_bound, "extra_body")
+    assert len(bodies) == 2
+    assert all(body is extra_body for body in bodies)
 
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:

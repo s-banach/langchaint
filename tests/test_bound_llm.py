@@ -1712,6 +1712,18 @@ def test_automatic_prompt_caching_participates_in_binding_equality() -> None:
     assert unchanged._bound_adapter is not bound_llm._bound_adapter
 
 
+def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
+    """LLM.bind puts extra_body on the Binding unchanged; rebind keeps, replaces, or clears it."""
+    adapter = _FakeAdapter()
+    extra_body = {"safety_identifier": "user-7"}
+    bound_llm = LLM(adapter).bind(extra_body=extra_body, automatic_prompt_caching=True)
+    assert bound_llm.binding.extra_body is extra_body
+    assert bound_llm.rebind(system_prompt="s").binding.extra_body is extra_body
+    replacement = {"safety_identifier": "user-8"}
+    assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
+    assert bound_llm.rebind(extra_body=None).binding.extra_body is None
+
+
 def test_generate_many_aligns_results_with_inputs() -> None:
     """Result i belongs to generation_inputs[i], preserving input order."""
 

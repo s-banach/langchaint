@@ -122,6 +122,7 @@ from langchaint.adapter import (
     UnfinishedTurn,
     narrowed_request,
     record_parse_fallthrough,
+    reject_extra_body_keys_the_adapter_populates,
     request_id_from_raw,
     request_json,
     retry_after_seconds_from_headers,
@@ -341,6 +342,25 @@ class _AnthropicPrecomputedFields:
     message_mark_budget: int
     """What the binding's own markers (system marks, the frozen-prefix and last-message markers) leave
     of the API's 4-marker request limit for per-request marked parts."""
+
+    extra_body: Mapping[str, object] | None
+
+
+_ADAPTER_POPULATED_WIRE_KEYS = frozenset({
+    "model",
+    "max_tokens",
+    "temperature",
+    "system",
+    "tools",
+    "tool_choice",
+    "output_config",
+    "thinking",
+    "service_tier",
+    "messages",
+    "stream",
+})
+"""The wire keys an extra_body must not hold: every keyword send and open_stream pass,
+plus stream, which the SDK's stream method sets and its event parsing depends on."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -942,9 +962,13 @@ class AnthropicMessagesAdapter(Adapter):
         Raises:
             ValueError: the binding's markers alone (marked system parts plus the automatic markers)
                 exceed the API's 4-marker request limit; unmark some system parts.
-                Also raised on an empty tuple system_prompt,
+                Also raised on an extra_body key in _ADAPTER_POPULATED_WIRE_KEYS,
+                and on an empty tuple system_prompt,
                 which bind rejects and only a directly constructed Binding can carry.
         """
+        reject_extra_body_keys_the_adapter_populates(
+            binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
+        )
         max_tokens = binding.inference_params.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
         bind_marker_count = 0
@@ -1021,11 +1045,15 @@ class AnthropicMessagesAdapter(Adapter):
             automatic_prompt_caching=binding.automatic_prompt_caching,
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
+            extra_body=binding.extra_body,
         )
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O."""
+        """Bind for plain-text output; pure conversion, no I/O.
+
+        Propagates _precompute_fields' ValueError.
+        """
         return _BoundAnthropicText(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
         )
@@ -1034,7 +1062,10 @@ class AnthropicMessagesAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O."""
+        """Bind for structured output validated into response_format; pure conversion, no I/O.
+
+        Propagates _precompute_fields' ValueError.
+        """
         return _BoundAnthropicStructured(
             adapter=self,
             precomputed_fields=self._precompute_fields(binding),
@@ -1247,6 +1278,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             thinking=precomputed.thinking,
             service_tier=precomputed.service_tier,
             messages=params.messages,
+            extra_body=precomputed.extra_body,
         )
 
     @override
@@ -1270,6 +1302,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             thinking=precomputed.thinking,
             service_tier=precomputed.service_tier,
             messages=params.messages,
+            extra_body=precomputed.extra_body,
         )
         return _AnthropicStream(
             sdk_stream=await manager.__aenter__(), pricing=self._adapter.pricing

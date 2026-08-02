@@ -283,6 +283,36 @@ class Binding:
     which openai documents as gpt-5.6 and later; on any other model it raises at bind time.
     """
 
+    extra_body: Mapping[str, object] | None = None
+    """Provider wire-body fields sent verbatim on every request; None binds none.
+
+    Keys are the provider's own wire names, and values pass through by reference.
+    Both SDKs merge extra_body over the named request parameters, extra_body winning on a
+    duplicate key (openai 2.51.0, anthropic 0.120.2), so each adapter raises at bind time for a
+    key it populates itself instead of letting the merge silently override the binding.
+    """
+
+
+def reject_extra_body_keys_the_adapter_populates(
+    extra_body: Mapping[str, object] | None, *, populated_keys: frozenset[str]
+) -> None:
+    """Refuse a Binding.extra_body key the calling adapter populates itself.
+
+    An adapter's bind path calls this with the wire names it sets as explicit keywords,
+    because the SDK merge would let extra_body silently override them.
+
+    Raises:
+        ValueError: extra_body holds a key in populated_keys.
+    """
+    if extra_body is None:
+        return
+    colliding = sorted(populated_keys & extra_body.keys())
+    if colliding:
+        raise ValueError(
+            f"extra_body keys {colliding} collide with request fields the adapter populates; "
+            "the SDK merge would silently override the binding, so they are refused"
+        )
+
 
 @dataclass(frozen=True, kw_only=True)
 class AdapterResult[OutputT]:
@@ -784,7 +814,7 @@ class Adapter(ABC):
         Pure conversion of the binding to SDK keyword arguments; no I/O.
 
         Raises:
-            ValueError: the binding asks for something this adapter's model cannot be sent,
+            ValueError: the binding asks for something this adapter cannot send,
                 which is a defect to report before any request rather than a request to spend.
         """
         ...
@@ -802,7 +832,7 @@ class Adapter(ABC):
         Pure conversion of the binding to SDK keyword arguments; no I/O.
 
         Raises:
-            ValueError: the binding asks for something this adapter's model cannot be sent,
+            ValueError: the binding asks for something this adapter cannot send,
                 which is a defect to report before any request rather than a request to spend.
         """
         ...

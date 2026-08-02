@@ -16,7 +16,7 @@ and a DoNotRetry becomes the item's terminal GenerationError, named by Adapter.c
 """
 
 import asyncio
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol, SupportsIndex, overload
 
 from pydantic import BaseModel
@@ -152,6 +152,7 @@ def _build_binding(
     parallel_tool_calls: bool,
     inference_params: InferenceParams,
     automatic_prompt_caching: bool,
+    extra_body: Mapping[str, object] | None,
 ) -> Binding:
     """Convert bind arguments to the frozen Binding.
 
@@ -173,6 +174,7 @@ def _build_binding(
         parallel_tool_calls=parallel_tool_calls,
         inference_params=inference_params,
         automatic_prompt_caching=automatic_prompt_caching,
+        extra_body=extra_body,
     )
 
 
@@ -268,6 +270,7 @@ class LLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[ModelT, ToolManager]": ...
     @overload
@@ -280,6 +283,7 @@ class LLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[ModelT, None]": ...
     @overload
@@ -292,6 +296,7 @@ class LLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
@@ -304,9 +309,10 @@ class LLM:
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
+        extra_body: Mapping[str, object] | None = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[str, None]": ...
-    def bind(
+    def bind(  # noqa: PLR0913 (the binding states every choice: prompt, tools, format, params, caching, extra_body)
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
@@ -315,6 +321,7 @@ class LLM:
         inference_params: InferenceParams | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
+        extra_body: Mapping[str, object] | None = None,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
@@ -328,11 +335,12 @@ class LLM:
         automatic_prompt_caching has no default: caching changes billing,
         so langchaint never chooses a caching configuration for the caller.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
+        Binding.extra_body documents extra_body: the merge precedence and the colliding-key raise.
 
         Raises:
             ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
-                prompt. Also raised by the adapter for a binding its model cannot be sent, which is
-                where an automatic_prompt_caching the model cannot honor is refused.
+                prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
+                model cannot honor and an extra_body key the adapter itself populates.
         """
         binding = _build_binding(
             system_prompt=system_prompt,
@@ -343,6 +351,7 @@ class LLM:
                 inference_params if inference_params is not None else InferenceParams()
             ),
             automatic_prompt_caching=automatic_prompt_caching,
+            extra_body=extra_body,
         )
         return BoundLLM(
             adapter=self.adapter,
@@ -415,6 +424,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManager]": ...
     @overload
@@ -427,6 +437,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, None]": ...
     @overload
@@ -439,6 +450,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
     @overload
@@ -451,6 +463,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
@@ -463,6 +476,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, None]": ...
     @overload
@@ -475,6 +489,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManagerT]": ...
     @overload
@@ -487,6 +502,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManager]": ...
     @overload
@@ -499,6 +515,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, None]": ...
     @overload
@@ -511,9 +528,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
+        extra_body: Mapping[str, object] | None | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManagerT]": ...
-    def rebind(
+    def rebind(  # noqa: PLR0913 (rebind takes every field bind takes, each replaceable alone)
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
@@ -522,6 +540,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
+        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "BoundLLM[Any, Any]":
         """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
@@ -541,8 +560,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
-                prompt. Also raised by the adapter for a binding its model cannot be sent, which is
-                where an automatic_prompt_caching the model cannot honor is refused.
+                prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
+                model cannot honor and an extra_body key the adapter itself populates.
         """
         new_tool_manager = (
             self.tool_manager if isinstance(tool_manager, Unchanged) else tool_manager
@@ -571,6 +590,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 self.binding.automatic_prompt_caching
                 if isinstance(automatic_prompt_caching, Unchanged)
                 else automatic_prompt_caching
+            ),
+            extra_body=(
+                self.binding.extra_body if isinstance(extra_body, Unchanged) else extra_body
             ),
         )
         new_response_format = (

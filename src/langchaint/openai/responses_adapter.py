@@ -148,6 +148,7 @@ from langchaint.adapter import (
     UnfinishedTurn,
     narrowed_request,
     record_parse_fallthrough,
+    reject_extra_body_keys_the_adapter_populates,
     request_id_from_raw,
     request_json,
     retry_after_seconds_from_headers,
@@ -271,6 +272,29 @@ class _OpenAIPrecomputedFields:
     include: list[ResponseIncludable]
     text: ResponseTextConfigParam | Omit
     """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
+
+    extra_body: Mapping[str, object] | None
+
+
+_ADAPTER_POPULATED_WIRE_KEYS = frozenset({
+    "model",
+    "instructions",
+    "max_output_tokens",
+    "temperature",
+    "reasoning",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "prompt_cache_options",
+    "service_tier",
+    "include",
+    "text",
+    "store",
+    "input",
+    "stream",
+})
+"""The wire keys an extra_body must not hold: every keyword send and open_stream pass,
+plus stream, which the SDK's stream method sets and its event parsing depends on."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -962,8 +986,12 @@ class OpenAIResponsesAdapter(Adapter):
 
         Raises:
             ValueError: the binding declines automatic caching on a model built with
-                supports_prompt_cache_options False.
+                supports_prompt_cache_options False, or its extra_body holds a key in
+                _ADAPTER_POPULATED_WIRE_KEYS.
         """
+        reject_extra_body_keys_the_adapter_populates(
+            binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
+        )
         if not binding.automatic_prompt_caching and not self.supports_prompt_cache_options:
             raise ValueError(
                 f"model {self.model!r} was built with supports_prompt_cache_options False, "
@@ -1017,13 +1045,14 @@ class OpenAIResponsesAdapter(Adapter):
             service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],
             text=omit,
+            extra_body=binding.extra_body,
         )
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O.
 
-        Propagates _precompute_fields' ValueError for a binding this adapter's model cannot be sent.
+        Propagates _precompute_fields' ValueError.
         """
         return _BoundOpenAIText(adapter=self, precomputed_fields=self._precompute_fields(binding))
 
@@ -1033,7 +1062,7 @@ class OpenAIResponsesAdapter(Adapter):
     ) -> BoundAdapter[ModelT | None]:
         """Bind for structured output validated into response_format; pure conversion, no I/O.
 
-        Propagates _precompute_fields' ValueError for a binding this adapter's model cannot be sent.
+        Propagates _precompute_fields' ValueError.
         """
         return _BoundOpenAIStructured(
             adapter=self,
@@ -1271,6 +1300,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             text=precomputed.text,
             store=False,
             input=params.input,
+            extra_body=precomputed.extra_body,
         )
 
     @override
@@ -1298,6 +1328,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             text=precomputed.text,
             store=False,
             input=params.input,
+            extra_body=precomputed.extra_body,
         )
         return _OpenAIStream(sdk_stream=await manager.__aenter__())
 

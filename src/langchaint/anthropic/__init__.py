@@ -13,9 +13,10 @@ pricing come from ANTHROPIC_BEDROCK, so the application never names the client c
 Both Bedrock client classes construct offline from aws_region alone (anthropic 0.120.0),
 so building a model object needs no AWS credentials.
 pricing is a mapping from the service tier a response reports to the AnthropicPricingTable that
-prices it, merged over the model's public standard-tier prices from ANTHROPIC_PRICING, so a caller
-adds a tier or replaces the standard rates with a negotiated one and both constructors default to
-the public rates. A response served at a tier the mapping does not hold costs NaN.
+prices it, merged over a cataloged model's public standard-tier prices from ANTHROPIC_PRICING, so a
+caller adds a tier or replaces the standard rates with a negotiated one and both constructors
+default to the public rates. A response served at a tier the mapping does not hold costs NaN.
+anthropic_model requires pricing for an uncataloged id, having no table to fall back on.
 For a custom httpx.AsyncClient (loaded certs, a proxy), anthropic_model takes client=AsyncAnthropic(
 http_client=...) since its single client class makes that lossless, while anthropic_bedrock_model takes
 http_client= directly so it can still pick the model's Bedrock client class for you.
@@ -30,7 +31,7 @@ The catalog prices the standard tier; a priority-tier or batch-tier account stat
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, overload
 
 import httpx
 
@@ -119,6 +120,9 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
 }
 """Public prices per anthropic model; the default pricing lookup, shared by both constructors."""
 
+_PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items())
+"""ANTHROPIC_PRICING under a str key, so anthropic_model can look up a possibly-uncataloged model id."""
+
 
 type AnthropicBedrockModelName = Literal[
     "anthropic.claude-fable-5",
@@ -176,8 +180,32 @@ _BEDROCK_CLIENT_CLASS: dict[
 }
 
 
-def anthropic_model(  # noqa: PLR0913 (the ready-LLM constructor states every choice: client, pricing, caching, tier, and pacing)
+@overload
+def anthropic_model(
     model: AnthropicModelName,
+    *,
+    client: AsyncAnthropic | None = ...,
+    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = ...,
+    default_max_completion_tokens: int = ...,
+    cache_ttl: CacheTTL = ...,
+    service_tier: AnthropicServiceTier | None = ...,
+    shared_backoff: SharedBackoff | None = ...,
+    max_attempts: int = ...,
+) -> LLM: ...
+@overload
+def anthropic_model(
+    model: str,
+    *,
+    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    client: AsyncAnthropic | None = ...,
+    default_max_completion_tokens: int = ...,
+    cache_ttl: CacheTTL = ...,
+    service_tier: AnthropicServiceTier | None = ...,
+    shared_backoff: SharedBackoff | None = ...,
+    max_attempts: int = ...,
+) -> LLM: ...
+def anthropic_model(  # noqa: PLR0913 (the ready-LLM constructor states every choice: client, pricing, caching, tier, and pacing)
+    model: str,
     *,
     client: AsyncAnthropic | None = None,
     pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
@@ -187,12 +215,14 @@ def anthropic_model(  # noqa: PLR0913 (the ready-LLM constructor states every ch
     shared_backoff: SharedBackoff | None = None,
     max_attempts: int = 3,
 ) -> LLM:
-    """Build a ready LLM for one cataloged model on the Messages API.
+    """Build a ready LLM for one model on the Messages API.
 
+    model is sent verbatim.
     client None constructs AsyncAnthropic(), which reads ANTHROPIC_API_KEY from the environment.
-    pricing holds one table per service tier, keyed by the tier a response reports, and is merged
-    over {"standard": ANTHROPIC_PRICING[model]}, so a caller adds a tier or replaces the standard
-    rates with a negotiated one and omitting it prices at the public standard rates.
+    pricing holds one table per service tier, keyed by the tier a response reports.
+    On a cataloged id it is merged over {"standard": ANTHROPIC_PRICING[model]}, so a caller adds a
+    tier or replaces the standard rates with a negotiated one and omitting it prices at the public
+    standard rates; on any other id it is passed through and needs its "standard" key.
     A response served at a tier this mapping does not hold costs NaN.
     cache_ttl applies uniformly to every cache marker the adapter writes:
     "5m" is the API default; "1h" holds entries across longer gaps and bills writes at 2x instead of 1.25x,
@@ -204,17 +234,26 @@ def anthropic_model(  # noqa: PLR0913 (the ready-LLM constructor states every ch
     and note one instance serves one event loop.
 
     Raises:
-        ValueError: max_attempts is not a positive int (from LLM.__init__), or
-            client is a Bedrock client, which does not reach the "anthropic" provider this
-            constructor states (from Adapter.__init__; the narrowed client annotation already
-            excludes one at check time, since the Bedrock classes are siblings of AsyncAnthropic
-            rather than subclasses).
+        ValueError: model is outside the catalog and pricing is missing.
+            LLM.__init__ raises it when max_attempts is not a positive int, and
+            AnthropicMessagesAdapter.__init__ when pricing has no "standard" key or client is a
+            Bedrock client, which does not reach the "anthropic" provider this constructor states
+            (the narrowed client annotation already excludes one at check time, since the Bedrock
+            classes are siblings of AsyncAnthropic rather than subclasses).
     """
+    catalog_table = _PRICING_BY_MODEL_ID.get(model)
+    if catalog_table is None:
+        if pricing is None:
+            raise ValueError(
+                f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
+            )
+    else:
+        pricing = {"standard": catalog_table, **(pricing or {})}
     return LLM(
         AnthropicMessagesAdapter(
             client=client if client is not None else AsyncAnthropic(),
             model=model,
-            pricing={"standard": ANTHROPIC_PRICING[model], **(pricing or {})},
+            pricing=pricing,
             provider_name="anthropic",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,

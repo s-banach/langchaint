@@ -920,8 +920,9 @@ class OpenAIResponsesAdapter(Adapter):
         It has no default because a wrong value fails either way: True on a model without the
         parameter risks a rejected request, and False on one with it refuses a binding the model
         would have accepted.
-        openai_model reads the value from PROMPT_CACHE_OPTIONS_MODELS; openai_bedrock_model
-        requires it from its own caller, having no catalog of Bedrock ids to read.
+        openai_model defaults an unstated value from PROMPT_CACHE_OPTIONS_MODELS for a cataloged
+        id and requires it for any other; openai_bedrock_model always requires it,
+        having no catalog of Bedrock ids to read.
         It is a parameter here rather than a lookup on model because model is a str whose namespace
         this adapter cannot know: it serves the platforms provider_name_by_client_class maps and
         every OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.

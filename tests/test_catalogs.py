@@ -123,6 +123,89 @@ def test_openai_model_wires_prompt_cache_options_support(
 
 
 @pytest.mark.parametrize("supported", [True, False])
+def test_openai_model_accepts_a_model_id_outside_the_catalog(*, supported: bool) -> None:
+    """A non-catalog id (here a fine-tune) builds with caller-stated pricing and cache-options support.
+
+    Both facts are required because no catalog maps the id, and the pricing mapping is passed
+    through rather than merged, so the caller's "default" table is the one that prices.
+    Both flag values are asserted so a truthiness test of the flag cannot pass as the
+    is-None test that keeps a stated False.
+    """
+    llm = openai_model(
+        "ft:gpt-5.6-terra:acme::abc123",
+        pricing=_ARBITRARY_PRICING,
+        supports_prompt_cache_options=supported,
+        client=AsyncOpenAI(api_key="offline"),
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.model == "ft:gpt-5.6-terra:acme::abc123"
+    assert adapter.pricing is _ARBITRARY_PRICING
+    assert adapter.supports_prompt_cache_options is supported
+
+
+def test_openai_model_requires_both_facts_outside_the_catalog() -> None:
+    """Omitting pricing or supports_prompt_cache_options on a non-catalog id raises.
+
+    The overloads already reject both calls at check time, hence the suppressions;
+    the raises are what an untyped caller hits.
+    """
+    with pytest.raises(ValueError, match="OPENAI_PRICING"):
+        _ = openai_model(
+            "ft:gpt-5.6-terra:acme::abc123",  # pyrefly: ignore[bad-argument-type]
+            client=AsyncOpenAI(api_key="offline"),
+        )
+    with pytest.raises(ValueError, match="pass supports_prompt_cache_options"):
+        _ = openai_model(  # pyrefly: ignore[no-matching-overload]
+            "ft:gpt-5.6-terra:acme::abc123",
+            pricing=_ARBITRARY_PRICING,
+            client=AsyncOpenAI(api_key="offline"),
+        )
+
+
+def test_openai_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
+    """A stated supports_prompt_cache_options wins over PROMPT_CACHE_OPTIONS_MODELS.
+
+    The model is in that set, so the stated False proves the caller's value is kept
+    rather than overwritten from the catalog.
+    """
+    llm = openai_model(
+        "gpt-5.6-terra",
+        supports_prompt_cache_options=False,
+        client=AsyncOpenAI(api_key="offline"),
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIResponsesAdapter)
+    assert adapter.supports_prompt_cache_options is False
+
+
+def test_anthropic_model_accepts_a_model_id_outside_the_catalog() -> None:
+    """A non-catalog id builds with caller-stated pricing, passed through rather than merged."""
+    llm = anthropic_model(
+        "claude-next-preview",
+        pricing=_ARBITRARY_ANTHROPIC_PRICING,
+        client=AsyncAnthropic(api_key="offline"),
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, AnthropicMessagesAdapter)
+    assert adapter.model == "claude-next-preview"
+    assert adapter.pricing is _ARBITRARY_ANTHROPIC_PRICING
+
+
+def test_anthropic_model_requires_pricing_outside_the_catalog() -> None:
+    """Omitting pricing on a non-catalog id raises.
+
+    The overloads already reject the call at check time, hence the suppression;
+    the raise is what an untyped caller hits.
+    """
+    with pytest.raises(ValueError, match="ANTHROPIC_PRICING"):
+        _ = anthropic_model(  # pyrefly: ignore[no-matching-overload]
+            "claude-next-preview",
+            client=AsyncAnthropic(api_key="offline"),
+        )
+
+
+@pytest.mark.parametrize("supported", [True, False])
 def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported: bool) -> None:
     """The caller's value reaches the adapter, no Bedrock id being cataloged to derive it from.
 

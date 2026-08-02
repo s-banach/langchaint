@@ -18,11 +18,11 @@ openai_bedrock_model is the constructor for OpenAI models served by Bedrock;
 Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
 provider_name="azure.ai.openai", ...) wrapped in an LLM.
 pricing is a mapping from the service tier a response reports to the OpenAIPricingTable that prices it.
-openai_model merges it over the model's public default-tier prices from OPENAI_PRICING, so a caller
+openai_model merges it over a cataloged model's public default-tier prices from OPENAI_PRICING, so a caller
 adds a tier or replaces the default rates with a negotiated one and omitting it prices at the public
 rates. A response served at a tier the mapping does not hold costs NaN.
-openai_bedrock_model has no catalog to fall back on,
-so its pricing and supports_prompt_cache_options are required.
+An uncataloged id requires pricing and supports_prompt_cache_options,
+the same two facts openai_bedrock_model always requires, having no catalog to fall back on.
 
 Prices are USD per one million tokens,
 taken from the provider's official pricing page: https://developers.openai.com/api/docs/pricing.
@@ -36,7 +36,7 @@ The bare gpt-5.6 model identifier is an alias for gpt-5.6-sol; the catalog uses 
 """
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, overload
 
 try:
     from openai import AsyncBedrockOpenAI, AsyncOpenAI
@@ -122,6 +122,9 @@ OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
 }
 """Public prices per openai model; the default pricing lookup."""
 
+_PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](OPENAI_PRICING.items())
+"""OPENAI_PRICING under a str key, so openai_model can look up a possibly-uncataloged model id."""
+
 PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
     "gpt-5.6-luna",
     "gpt-5.6-terra",
@@ -130,8 +133,9 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
 """Cataloged models accepting the prompt_cache_options request parameter.
 
 openai documents the parameter as gpt-5.6-and-later (openai 2.45.0), and it is what carries a
-binding's automatic_prompt_caching False to the wire, so binding False on a model absent here
-raises instead of sending a parameter the model does not take.
+binding's automatic_prompt_caching False to the wire. openai_model defaults
+supports_prompt_cache_options from this set, and an adapter built with that False raises on a
+binding that declines caching, instead of sending a parameter the model does not take.
 Bind True on those models: every one of them bills zero for a cache write and reads cached input
 below its uncached rate, so leaving the provider's automatic caching in place costs nothing.
 Held apart from those rates rather than derived from them, because a price and a parameter's
@@ -139,25 +143,54 @@ availability are two facts openai can change independently.
 """
 
 
+@overload
 def openai_model(
     model: OpenAIModelName,
     *,
+    client: AsyncOpenAI | None = ...,
+    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = ...,
+    supports_prompt_cache_options: bool | None = ...,
+    shared_backoff: SharedBackoff | None = ...,
+    max_attempts: int = ...,
+    reasoning_summary: ReasoningSummary | None = ...,
+    service_tier: OpenAIServiceTier | None = ...,
+) -> LLM: ...
+@overload
+def openai_model(
+    model: str,
+    *,
+    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+    supports_prompt_cache_options: bool,
+    client: AsyncOpenAI | None = ...,
+    shared_backoff: SharedBackoff | None = ...,
+    max_attempts: int = ...,
+    reasoning_summary: ReasoningSummary | None = ...,
+    service_tier: OpenAIServiceTier | None = ...,
+) -> LLM: ...
+def openai_model(  # noqa: PLR0913 (the ready-LLM constructor states every choice: client, pricing, caching, tier, and pacing)
+    model: str,
+    *,
     client: AsyncOpenAI | None = None,
     pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = None,
+    supports_prompt_cache_options: bool | None = None,
     shared_backoff: SharedBackoff | None = None,
     max_attempts: int = 3,
     reasoning_summary: ReasoningSummary | None = None,
     service_tier: OpenAIServiceTier | None = None,
 ) -> LLM:
-    """Build a ready LLM for one cataloged model on the Responses API.
+    """Build a ready LLM for one model on the Responses API.
 
+    model is sent verbatim.
+    A stated supports_prompt_cache_options is honored for any id. Unstated, it comes from
+    PROMPT_CACHE_OPTIONS_MODELS, whose docstring gives what a model outside it does with
+    bind(automatic_prompt_caching=False); an id outside the catalog requires it,
+    the fact being openai's to state per model.
     client None constructs AsyncOpenAI(), which reads OPENAI_API_KEY from the environment.
-    pricing holds one table per service tier, keyed by the tier a response reports, and is merged
-    over {"default": OPENAI_PRICING[model]}, so a caller adds a tier or replaces the default rates
-    with a negotiated one and omitting it prices at the public default rates.
+    pricing holds one table per service tier, keyed by the tier a response reports.
+    On a cataloged id it is merged over {"default": OPENAI_PRICING[model]}, so a caller adds a
+    tier or replaces the default rates with a negotiated one and omitting it prices at the
+    public default rates; on any other id it is passed through and needs its "default" key.
     A response served at a tier this mapping does not hold costs NaN.
-    Whether the model takes prompt_cache_options comes from PROMPT_CACHE_OPTIONS_MODELS,
-    whose docstring gives what a model outside it does with bind(automatic_prompt_caching=False).
     shared_backoff and max_attempts have the LLM.__init__ meanings;
     pass one SharedBackoff across models on the same account so a rate limit pauses them together,
     and note one instance serves one event loop.
@@ -170,20 +203,37 @@ def openai_model(
     the response reports none: state service_tier on such a project, or state its rates in pricing.
 
     Raises:
-        ValueError: max_attempts is not a positive int (from LLM.__init__), or
-            client is an AsyncBedrockOpenAI or AsyncAzureOpenAI, raised by the adapter.
+        ValueError: model is outside the catalog and pricing or supports_prompt_cache_options is
+            missing.
+            LLM.__init__ raises it when max_attempts is not a positive int, and the adapter when
+            pricing has no "default" key or client is an AsyncBedrockOpenAI or AsyncAzureOpenAI.
             This constructor states provider_name="openai", which neither client reaches, and both
             subclass AsyncOpenAI, so the annotation alone accepts them. Reach those providers with
             openai_bedrock_model, or by building the adapter directly with the provider_name the
             client reaches.
     """
+    catalog_table = _PRICING_BY_MODEL_ID.get(model)
+    if catalog_table is None:
+        if pricing is None:
+            raise ValueError(
+                f"model {model!r} is not in OPENAI_PRICING; pass pricing= stating its rates"
+            )
+        if supports_prompt_cache_options is None:
+            raise ValueError(
+                f"model {model!r} is not cataloged, so langchaint cannot know whether it takes "
+                "prompt_cache_options; pass supports_prompt_cache_options= stating that"
+            )
+    else:
+        pricing = {"default": catalog_table, **(pricing or {})}
+        if supports_prompt_cache_options is None:
+            supports_prompt_cache_options = model in PROMPT_CACHE_OPTIONS_MODELS
     return LLM(
         OpenAIResponsesAdapter(
             client=client if client is not None else AsyncOpenAI(),
             model=model,
-            pricing={"default": OPENAI_PRICING[model], **(pricing or {})},
+            pricing=pricing,
             provider_name="openai",
-            supports_prompt_cache_options=model in PROMPT_CACHE_OPTIONS_MODELS,
+            supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         ),

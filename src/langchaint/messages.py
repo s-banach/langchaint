@@ -37,9 +37,14 @@ class ImagePart(CheckedCopyModel):
     """media_type is an IANA media type such as "image/png".
 
     cache_breakpoint has the same meaning as on TextPart: the reusable prompt prefix ends at this part.
+
+    In JSON, data is URL-safe base64 text.
+    Pydantic's default UTF-8 byte encoding fails on ordinary image bytes.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
+    )
 
     data: bytes
     media_type: str

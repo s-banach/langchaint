@@ -5,6 +5,8 @@ so a payload that re-validates to the wrong union member silently corrupts repla
 Every member carries a kind tag, and a payload without one is rejected rather than matched by shape.
 """
 
+import json
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -125,6 +127,34 @@ def test_tool_message_is_frozen() -> None:
     message = ToolMessage(tool_call_id="c1", content="ok")
     with pytest.raises(ValidationError):
         message.content = "changed"  # pyrefly: ignore[read-only]
+
+
+def test_binary_image_bytes_round_trip_through_json() -> None:
+    """A UserMessage and a ToolMessage holding non-UTF-8 image bytes survive the JSON round trip.
+
+    Real image bytes are rarely valid UTF-8, so a persisted conversation holding an image
+    depends on data having a JSON representation of its own.
+    """
+    image = ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png")
+    messages: tuple[Message, ...] = (
+        UserMessage(content=(image,)),
+        ToolMessage(tool_call_id="c1", content=(TextPart(text="saw"), image)),
+    )
+    restored = _MESSAGES_TYPE_ADAPTER.validate_json(_MESSAGES_TYPE_ADAPTER.dump_json(messages))
+    assert restored == messages
+
+
+def test_image_bytes_serialize_as_url_safe_base64_text() -> None:
+    """The JSON text of data is URL-safe base64, pinned exactly so the persisted form cannot drift."""
+    image = ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png")
+    assert json.loads(image.model_dump_json())["data"] == "iVBORwD_"
+
+
+def test_malformed_base64_image_data_is_rejected_on_json_validation() -> None:
+    """A JSON payload whose data is not base64 fails validation instead of decoding to wrong bytes."""
+    payload = '{"kind": "image", "data": "!!!not-base64!!!", "media_type": "image/png"}'
+    with pytest.raises(ValidationError):
+        _ = ImagePart.model_validate_json(payload)
 
 
 def test_cache_breakpoint_round_trips_and_defaults_false() -> None:

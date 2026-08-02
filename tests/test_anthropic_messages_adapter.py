@@ -37,6 +37,7 @@ from langchaint import (
     Billing,
     ImagePart,
     InferenceParams,
+    Message,
     PydanticTool,
     ReasoningDelta,
     ReasoningTrace,
@@ -513,6 +514,24 @@ def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     assert _assistant_content_blocks(assistant_message) == [
         {"type": "redacted_thinking", "data": "opaque-bytes"}
     ]
+
+
+def test_produced_traces_survive_the_message_json_round_trip() -> None:
+    """A produced turn holding thinking and redacted_thinking traces re-validates equal from JSON.
+
+    Persist/resume serializes a Sequence[Message] with a TypeAdapter,
+    and a raw that came back changed is a request the API rejects,
+    so the round trip must restore each trace's dump exactly.
+    """
+    message = _message_with_content([
+        at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
+        at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
+        at.TextBlock(type="text", text="hello"),
+    ])
+    messages_type_adapter: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
+    messages: tuple[Message, ...] = (_assistant_message_from(message),)
+    restored = messages_type_adapter.validate_json(messages_type_adapter.dump_json(messages))
+    assert restored == messages
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:

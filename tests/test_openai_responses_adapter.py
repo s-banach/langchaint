@@ -44,13 +44,14 @@ from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     LLM,
     AssistantMessage,
     ImagePart,
     InferenceParams,
+    Message,
     ReasoningDelta,
     ReasoningEffort,
     ReasoningTrace,
@@ -506,6 +507,22 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
     assistant_message = _assistant_message_from(_response(usage=None, output=[two_part_message]))
     assert assistant_message.turn == (TextPart(text="he"), TextPart(text="y"))
     assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
+
+
+def test_produced_traces_survive_the_message_json_round_trip() -> None:
+    """A produced turn holding a reasoning item's trace re-validates equal from JSON.
+
+    Persist/resume serializes a Sequence[Message] with a TypeAdapter,
+    and replay under store=False re-reads encrypted_content from raw,
+    so the round trip must restore the trace's dump exactly.
+    """
+    reasoning_item = _reasoning_item(summary=("thought it over",))
+    reasoning_item["encrypted_content"] = "enc-1"
+    response = _response(usage=None, output=[reasoning_item, _TEXT_OUTPUT_ITEM])
+    messages_type_adapter: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
+    messages: tuple[Message, ...] = (_assistant_message_from(response),)
+    restored = messages_type_adapter.validate_json(messages_type_adapter.dump_json(messages))
+    assert restored == messages
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:

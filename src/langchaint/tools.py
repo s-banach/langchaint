@@ -310,33 +310,16 @@ class _ToolDecorator:
     ) -> PydanticTool[ArgsT, AppDataT]:
         """Resolve args_model without reading the return annotation.
 
+        A string annotation evaluates in function.__globals__ plus the decorating scope's locals,
+        so a model defined in the decorating scope resolves.
+
         Raises:
-            TypeError: function is not async, has another parameter shape, or lacks a BaseModel annotation.
+            TypeError: the parameter annotation is not a BaseModel subclass, or did not resolve.
+                A name imported only under `if TYPE_CHECKING` does not exist at runtime.
         """
-        if not inspect.isfunction(function):
-            raise TypeError("@tool must decorate a function")
-        if not inspect.iscoroutinefunction(function):
-            raise TypeError(f"@tool function {function.__name__!r} must be async")
-        try:
-            signature = inspect.signature(function)
-        except (TypeError, ValueError) as error:
-            raise TypeError(f"@tool could not inspect function {function.__name__!r}") from error
-        parameters = tuple(signature.parameters.values())
-        if len(parameters) != 1:
-            raise TypeError(
-                f"@tool function {function.__name__!r} must have exactly one parameter"
-            )
-        parameter = parameters[0]
-        if parameter.kind not in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            raise TypeError(
-                f"@tool function {function.__name__!r} must accept its parameter positionally"
-            )
+        parameter = next(iter(inspect.signature(function).parameters.values()))
         args_model: object = parameter.annotation
         if isinstance(args_model, str):
-            resolved_annotations: set[str] = set()
             decorator_frame = inspect.currentframe()
             if decorator_frame is None or decorator_frame.f_back is None:
                 local_namespace = function.__globals__
@@ -344,21 +327,12 @@ class _ToolDecorator:
                 local_namespace = decorator_frame.f_back.f_locals
             del decorator_frame
             try:
-                while isinstance(args_model, str):
-                    if args_model in resolved_annotations:
-                        break
-                    resolved_annotations.add(args_model)
-                    args_model = eval(args_model, function.__globals__, local_namespace)
+                args_model = eval(args_model, function.__globals__, local_namespace)
             except Exception as error:
                 raise TypeError(
                     f"@tool function {function.__name__!r} parameter {parameter.name!r} "
                     "annotation could not resolve"
                 ) from error
-            if isinstance(args_model, str):
-                raise TypeError(
-                    f"@tool function {function.__name__!r} parameter {parameter.name!r} "
-                    "annotation could not resolve"
-                )
         if not _is_matching_args_model(args_model, function):
             raise TypeError(
                 f"@tool function {function.__name__!r} parameter {parameter.name!r} "

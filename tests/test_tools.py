@@ -87,10 +87,6 @@ class _LaterEchoRecord(BaseModel):
     text: str
 
 
-class _MissingAttributeNamespace:
-    """Provide a namespace without the annotation test's requested attribute."""
-
-
 @tool(description="Echo the text and record it.", name="record_echo")
 async def _decorated_record_echo(args: _EchoArgs) -> ToolOutputExplicit[_EchoRecord]:
     """Return model content and application data."""
@@ -161,17 +157,8 @@ def test_tool_decorator_resolves_quoted_local_args_model() -> None:
     assert _local_echo.args_model is _LocalArgs
 
 
-def test_tool_decorator_rejects_invalid_function_shapes() -> None:
-    """Verify tool rejects functions PydanticTool cannot call with one validated BaseModel."""
-
-    def _sync(args: _EchoArgs) -> str:
-        return args.text
-
-    async def _two_parameters(args: _EchoArgs, other: _EchoArgs) -> str:
-        return args.text + other.text
-
-    async def _keyword_only(*, args: _EchoArgs) -> str:
-        return args.text
+def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
+    """Verify tool rejects an annotation that does not resolve to a BaseModel subclass at runtime."""
 
     async def _plain_annotation(args: str) -> str:
         return args
@@ -180,24 +167,16 @@ def test_tool_decorator_rejects_invalid_function_shapes() -> None:
     async def _missing_annotation(args) -> str:  # noqa: ANN001
         return str(args)  # pyrefly: ignore[unknown-argument-type]
 
-    async def _missing_attribute_annotation(
-        args: "_MissingAttributeNamespace.Missing",  # pyrefly: ignore[missing-attribute]
-    ) -> str:
+    async def _type_checking_only_annotation(args: "Validator") -> str:
         return str(args)
 
     decorator = tool(description="Invalid test function.")
-    with pytest.raises(TypeError, match="must be async"):
-        _ = decorator(_sync)  # pyrefly: ignore[bad-argument-type]
-    with pytest.raises(TypeError, match="exactly one parameter"):
-        _ = decorator(_two_parameters)  # pyrefly: ignore[bad-argument-type]
-    with pytest.raises(TypeError, match="positionally"):
-        _ = decorator(_keyword_only)  # pyrefly: ignore[bad-argument-type]
     with pytest.raises(TypeError, match="BaseModel subclass"):
         _ = decorator(_plain_annotation)
     with pytest.raises(TypeError, match="BaseModel subclass"):
         _ = decorator(_missing_annotation)
     with pytest.raises(TypeError, match="annotation could not resolve"):
-        _ = decorator(_missing_attribute_annotation)
+        _ = decorator(_type_checking_only_annotation)
 
 
 def test_validate_and_run_returns_the_function_result() -> None:

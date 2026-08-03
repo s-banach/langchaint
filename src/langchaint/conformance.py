@@ -39,7 +39,13 @@ from langchaint.adapter import (
 from langchaint.call import AttemptRecord, CallRecord
 from langchaint.exceptions import AbandonedCallError, StreamProtocolError, TransientError
 from langchaint.inference_params import InferenceParams
-from langchaint.messages import ReasoningTrace, UserMessage
+from langchaint.messages import (
+    Message,
+    ReasoningTrace,
+    UserMessage,
+    messages_from_json,
+    messages_to_json,
+)
 from langchaint.pricing import Billing, category_cost
 from langchaint.response import RowValue, to_tables
 from langchaint.shared_backoff import Verdict
@@ -181,6 +187,17 @@ class AdapterConformance(ABC):
         """Bind a fresh adapter for plain text under the one binding these invariants use."""
         return self.make_adapter().bind_text(_PLAIN_TEXT_BINDING)
 
+    def _assistant_wire_elements_of(
+        self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
+    ) -> Sequence[object]:
+        """Build a request from messages and read its assistant turn's wire elements.
+
+        Asserts the request is valid, so callers compare elements without repeating the guard.
+        """
+        request = bound_adapter.build_request(messages)
+        assert not isinstance(request, InvalidRequest)
+        return self.assistant_wire_elements(request)
+
     def _billings(self) -> list[Billing]:
         """Return the billing of each fixture response the cost invariants price."""
         bound_adapter = self._bound_adapter()
@@ -276,14 +293,27 @@ class AdapterConformance(ABC):
             for index, element in enumerate(turn)
             if isinstance(element, ReasoningTrace)
         ]
-        request = bound_adapter.build_request([
-            UserMessage(content="hi"),
-            outcome.assistant_message,
-        ])
-        assert not isinstance(request, InvalidRequest)
-        elements = self.assistant_wire_elements(request)
+        elements = self._assistant_wire_elements_of(
+            bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
+        )
         assert len(elements) == len(turn)
         assert elements[index] == trace.raw
+
+    def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
+        """A turn restored by messages_from_json puts the same elements on the wire as the original.
+
+        This is what makes the round trip a persistence format: serialization must not lose or
+        reshape a raw payload the provider verifies, and every value this adapter puts in
+        ReasoningTrace.raw must serialize, which is where a non-JSON-representable value fails.
+        """
+        bound_adapter = self._bound_adapter()
+        outcome = bound_adapter.interpret(self.response_with_reasoning())
+        assert isinstance(outcome, AdapterResult)
+        original: list[Message] = [UserMessage(content="hi"), outcome.assistant_message]
+        restored = messages_from_json(messages_to_json(original))
+        assert self._assistant_wire_elements_of(
+            bound_adapter, restored
+        ) == self._assistant_wire_elements_of(bound_adapter, original)
 
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.

@@ -10,7 +10,7 @@ because providers place it in different request locations.
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BeforeValidator, ConfigDict, Field, TypeAdapter, model_validator
 
 from langchaint.checked_copy import CheckedCopyModel
 
@@ -240,8 +240,36 @@ class ToolMessage(CheckedCopyModel):
 type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="kind")]
 """Discriminated on kind: pydantic validation selects the member from the tag,
 never from which member's fields happen to match,
-so callers can persist a Sequence[Message] as JSON and re-validate it with a TypeAdapter.
+so messages_to_json and messages_from_json restore each message to its exact type.
 """
+
+_MESSAGES_JSON: TypeAdapter[list[Message]] = TypeAdapter(list[Message])
+"""Module-level so TypeAdapter construction compiles the schema once, not on every call."""
+
+
+def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) -> str:
+    """Serialize messages as JSON text that messages_from_json restores.
+
+    The output is compact; pass indent (pydantic's dump_json indent) for text a human reads or diffs.
+    Each ReasoningTrace.raw is embedded as the mapping the adapter replays,
+    so a restored conversation builds the same wire request as the original;
+    the conformance suite asserts that per adapter.
+
+    Raises:
+        pydantic_core.PydanticSerializationError: a ReasoningTrace.raw value is an object JSON
+            cannot represent.
+    """
+    return _MESSAGES_JSON.dump_json(list(messages), indent=indent).decode()
+
+
+def messages_from_json(messages_json: str) -> list[Message]:
+    """Restore the message list messages_to_json serialized.
+
+    Raises:
+        pydantic.ValidationError: messages_json does not hold a serialized message list.
+    """
+    return _MESSAGES_JSON.validate_json(messages_json)
+
 
 type StopReason = Literal[
     "end_turn", "tool_use", "max_tokens", "refusal", "context_window_exceeded", "other"

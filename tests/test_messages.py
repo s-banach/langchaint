@@ -9,6 +9,7 @@ import json
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
+from pydantic_core import PydanticSerializationError
 
 from langchaint import (
     AssistantMessage,
@@ -19,6 +20,8 @@ from langchaint import (
     ToolCall,
     ToolMessage,
     UserMessage,
+    messages_from_json,
+    messages_to_json,
 )
 
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
@@ -195,6 +198,62 @@ def test_assistant_turn_rejects_a_marked_text_part() -> None:
 def test_assistant_turn_still_accepts_unmarked_text() -> None:
     """The validator rejects only marked parts; the plain turn is untouched."""
     assert AssistantMessage(turn="hey").text == "hey"
+
+
+def _one_of_each_message() -> list[Message]:
+    """One conversation holding every message type and every turn element type."""
+    return [
+        UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
+        AssistantMessage(
+            turn=(
+                ReasoningTrace(raw={"type": "thinking", "thinking": "hm", "signature": "s"}),
+                TextPart(text="checking"),
+                ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
+            )
+        ),
+        ToolMessage(
+            tool_call_id="c1",
+            content=(
+                TextPart(text="saw"),
+                ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png"),
+            ),
+        ),
+    ]
+
+
+def test_messages_json_round_trip_restores_the_list() -> None:
+    """messages_from_json returns the list messages_to_json serialized, every type intact."""
+    messages = _one_of_each_message()
+    assert messages_from_json(messages_to_json(messages)) == messages
+
+
+def test_messages_to_json_is_compact_and_indent_passes_through() -> None:
+    """The default output holds no newlines; indent produces the same messages pretty-printed."""
+    messages = _one_of_each_message()
+    compact = messages_to_json(messages)
+    pretty = messages_to_json(messages, indent=2)
+    assert "\n" not in compact
+    assert "\n" in pretty
+    assert messages_from_json(pretty) == messages_from_json(compact)
+
+
+def test_messages_from_json_rejects_text_that_is_not_a_message_list() -> None:
+    """Text holding no serialized message list raises ValidationError, whether or not it is JSON."""
+    with pytest.raises(ValidationError):
+        _ = messages_from_json("not json")
+    with pytest.raises(ValidationError):
+        _ = messages_from_json('[{"content": "hi"}]')
+
+
+def test_messages_to_json_raises_on_a_raw_value_json_cannot_represent() -> None:
+    """A ReasoningTrace.raw holding a non-JSON-representable object raises, never silently reshapes.
+
+    This pins the failure mode for a hand-built trace: a raise, not a lossy fallback the replay
+    would send.
+    """
+    message = AssistantMessage(turn=(ReasoningTrace(raw={"payload": object()}),))
+    with pytest.raises(PydanticSerializationError):
+        _ = messages_to_json([message])
 
 
 def test_model_copy_rejects_a_derived_property_key() -> None:

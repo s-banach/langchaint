@@ -57,6 +57,8 @@ from langchaint.messages import (
     ToolMessage,
     TurnElement,
     UserMessage,
+    messages_from_json,
+    messages_to_json,
 )
 from langchaint.pricing import Billing, category_cost
 from langchaint.response import (
@@ -179,6 +181,8 @@ __all__ = [
     "UserMessage",
     "Verdict",
     "category_cost",
+    "messages_from_json",
+    "messages_to_json",
     "to_tables",
     "tool",
 ]

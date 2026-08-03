@@ -69,7 +69,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `call.py`: the per-call history: one attempt's record, the frozen `CallRecord` every result carries, and the ledger the retry loops drive.
 - `streaming.py`: the stream handle.
 - `tools.py`: the tool forms, the `Tool` protocol, `ToolManager`, and the dispatch outcome types.
-- `messages.py`: the provider-neutral message tree and content parts.
+- `messages.py`: the provider-neutral message tree and content parts, and their JSON round trip.
 - `usage.py`: token accounting and the per-category costs that travel with it.
 - `checked_copy.py`: the base of langchaint's pydantic models.
 - `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.

@@ -111,10 +111,11 @@ class UserMessage(CheckedCopyModel):
 class ReasoningTrace(CheckedCopyModel):
     """One reasoning element the model produced, round-tripped verbatim.
 
-    The core never inspects raw: raw is the producing SDK item's
-    model_dump(mode="python", exclude_none=True), and the consuming adapter re-feeds that dict
+    The core never inspects raw: raw is the producing SDK item's model_dump(exclude_none=True),
+    and the consuming adapter re-feeds it
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
-    thinking block; OpenAI re-reads encrypted_content).
+    thinking block; OpenAI re-reads encrypted_content; Gemini requires thought signatures resent
+    exactly as received).
     Replaying a trace through another provider is a malformed request that provider rejects.
     Switching providers therefore means first rebuilding assistant turns without their traces.
     Full reasoning history is the default; editing the Sequence[Message] is the only way to change it.
@@ -131,9 +132,7 @@ class ReasoningTrace(CheckedCopyModel):
     and adding nothing raw does not hold;
     raw alone is what the adapter replays, so editing text changes what telemetry and an
     application display and never changes the request.
-    None means no readable text came back: an anthropic redacted_thinking block (which carries only
-    an opaque string), an anthropic thinking block whose thinking is empty, or an openai response
-    holding neither a reasoning summary nor reasoning content.
+    None means no readable text came back.
     No adapter stores the empty string, so text-free is the single condition text is None.
     """
 

@@ -1,4 +1,4 @@
-"""Wiring in the langchaint.anthropic and langchaint.openai catalogs.
+"""Wiring in the langchaint.anthropic, langchaint.gemini, and langchaint.openai catalogs.
 
 The pricing values themselves are the one provider fact tests cannot verify;
 what tests can catch is a catalog function wiring the wrong model identifier, the wrong prices,
@@ -10,6 +10,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
+from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 
@@ -24,6 +25,15 @@ from langchaint.anthropic import (
     AnthropicPricingTable,
     anthropic_bedrock_model,
     anthropic_model,
+)
+from langchaint.gemini import (
+    GEMINI_PRICING,
+    GeminiGenerateContentAdapter,
+    GeminiModelName,
+    GeminiPricingTable,
+    GeminiRates,
+    gemini_model,
+    parse_gemini,
 )
 from langchaint.openai import (
     OPENAI_PRICING,
@@ -60,6 +70,17 @@ _ARBITRARY_ANTHROPIC_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingT
 }
 """The anthropic counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
+_ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
+    "ON_DEMAND": GeminiPricingTable(
+        rates=GeminiRates(
+            input_cache_none_usd_per_million_tokens=1.0,
+            cache_read_usd_per_million_tokens=1.0,
+            output_usd_per_million_tokens=1.0,
+        )
+    )
+}
+"""The gemini counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
+
 
 @pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
 def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> None:
@@ -69,6 +90,16 @@ def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> N
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing["standard"] is ANTHROPIC_PRICING[model]
+
+
+@pytest.mark.parametrize("model", list(GEMINI_PRICING))
+def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
+    """gemini_model returns an LLM whose adapter carries the model's prices."""
+    llm = gemini_model(model, client=genai.Client(api_key="offline", vertexai=False))
+    adapter = llm.adapter
+    assert isinstance(adapter, GeminiGenerateContentAdapter)
+    assert adapter.model == model
+    assert adapter.pricing["ON_DEMAND"] is GEMINI_PRICING[model]
 
 
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
@@ -203,6 +234,109 @@ def test_anthropic_model_requires_pricing_outside_the_catalog() -> None:
             "claude-next-preview",
             client=AsyncAnthropic(api_key="offline"),
         )
+
+
+def test_gemini_model_accepts_a_model_id_outside_the_catalog() -> None:
+    """A non-catalog id builds with caller-stated pricing, passed through rather than merged."""
+    llm = gemini_model(
+        "gemini-next-preview",
+        pricing=_ARBITRARY_GEMINI_PRICING,
+        client=genai.Client(api_key="offline", vertexai=False),
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, GeminiGenerateContentAdapter)
+    assert adapter.model == "gemini-next-preview"
+    assert adapter.pricing is _ARBITRARY_GEMINI_PRICING
+
+
+def test_gemini_model_requires_pricing_outside_the_catalog() -> None:
+    """Omitting pricing on a non-catalog id raises.
+
+    The overloads already reject the call at check time, hence the suppression;
+    the raise is what an untyped caller hits.
+    """
+    with pytest.raises(ValueError, match="GEMINI_PRICING"):
+        _ = gemini_model(  # pyrefly: ignore[no-matching-overload]
+            "gemini-next-preview",
+            client=genai.Client(api_key="offline", vertexai=False),
+        )
+
+
+def test_gemini_pricing_override_replaces_the_on_demand_rates() -> None:
+    """A caller-supplied "ON_DEMAND" table replaces the catalog's, and a caller's tier is added."""
+    custom = GeminiPricingTable(
+        rates=GeminiRates(
+            input_cache_none_usd_per_million_tokens=2.0,
+            cache_read_usd_per_million_tokens=0.2,
+            output_usd_per_million_tokens=20.0,
+        )
+    )
+    adapter = gemini_model(
+        "gemini-2.5-flash",
+        client=genai.Client(api_key="offline", vertexai=False),
+        pricing={"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom},
+    ).adapter
+    assert isinstance(adapter, GeminiGenerateContentAdapter)
+    assert adapter.pricing["ON_DEMAND"] is custom
+    assert adapter.pricing["ON_DEMAND_FLEX"] is custom
+
+
+def test_gemini_adapter_requires_on_demand_pricing() -> None:
+    """A pricing mapping without "ON_DEMAND" would price every tierless response NaN silently."""
+    with pytest.raises(ValueError, match="ON_DEMAND"):
+        _ = GeminiGenerateContentAdapter(
+            client=genai.Client(api_key="offline", vertexai=False),
+            model="gemini-2.5-flash",
+            pricing={},
+            provider_name="gcp.gemini",
+        )
+
+
+def test_gemini_model_raises_on_a_vertex_client() -> None:
+    """gemini_model states provider_name="gcp.gemini", so a vertexai client raises.
+
+    The client is built in Vertex express mode (vertexai=True with an API key), which constructs
+    offline; without the check every span of a Vertex-served request would report "gcp.gemini".
+    """
+    with pytest.raises(ValueError, match="contradicts the client"):
+        _ = gemini_model("gemini-2.5-flash", client=genai.Client(api_key="offline", vertexai=True))
+
+
+def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None:
+    """A vertexai client under provider_name "gcp.vertex_ai" is the stated Vertex construction."""
+    adapter = GeminiGenerateContentAdapter(
+        client=genai.Client(api_key="offline", vertexai=True),
+        model="gemini-2.5-flash",
+        pricing=_ARBITRARY_GEMINI_PRICING,
+        provider_name="gcp.vertex_ai",
+    )
+    assert adapter.provider_name == "gcp.vertex_ai"
+
+
+def test_gemini_model_forwards_service_tier_backoff_and_attempts() -> None:
+    """service_tier lands on the adapter, shared_backoff and max_attempts on the LLM."""
+    shared_backoff = SharedBackoff(
+        parse=parse_gemini, failure_types=(TransientError,), capacity=16
+    )
+    llm = gemini_model(
+        "gemini-2.5-flash",
+        client=genai.Client(api_key="offline", vertexai=False),
+        service_tier="flex",
+        shared_backoff=shared_backoff,
+        max_attempts=5,
+    )
+    adapter = llm.adapter
+    assert isinstance(adapter, GeminiGenerateContentAdapter)
+    assert adapter.service_tier == "flex"
+    assert llm.shared_backoff is shared_backoff
+    assert llm.max_attempts == 5
+    defaulted = gemini_model(
+        "gemini-2.5-flash", client=genai.Client(api_key="offline", vertexai=False)
+    )
+    defaulted_adapter = defaulted.adapter
+    assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
+    assert defaulted_adapter.service_tier is None
+    assert defaulted.max_attempts == 3
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -449,6 +583,12 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
             "aws.bedrock",
         ),
         (lambda: openai_model("gpt-5.6-terra", client=AsyncOpenAI(api_key="k")), "openai"),
+        (
+            lambda: gemini_model(
+                "gemini-2.5-flash", client=genai.Client(api_key="k", vertexai=False)
+            ),
+            "gcp.gemini",
+        ),
         (
             lambda: openai_bedrock_model(
                 "openai.gpt-oss-120b-1:0",

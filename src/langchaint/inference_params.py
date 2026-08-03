@@ -15,7 +15,9 @@ type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhig
 the union of both providers' vocabularies (verified against anthropic 0.120.0 / openai 2.45.0:
 openai accepts all seven, anthropic "low" through "max").
 Each adapter passes the value through as given (anthropic as output_config.effort with adaptive thinking,
-openai as reasoning_effort); a value or model the provider rejects surfaces as the provider's own error,
+openai as reasoning_effort,
+gemini as thinking_config.thinking_level upper-cased, except "none", which gemini sends as thinking_budget 0);
+a value or model the provider rejects surfaces as the provider's own error,
 per the provider-side-rules design rule, because the valid model-times-value combinations are too many to mirror.
 To send a tier this Literal lacks, suppress the type error on the InferenceParams(...) call:
 no runtime validation reads the value, so it reaches the wire as given.

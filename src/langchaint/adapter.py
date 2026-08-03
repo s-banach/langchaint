@@ -38,7 +38,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import ClassVar, Literal
 
@@ -291,26 +291,31 @@ class Binding:
     """Provider wire-body fields sent verbatim on every request; None binds none.
 
     Keys are the provider's own wire names, and values pass through by reference.
-    Both SDKs merge extra_body over the named request parameters, extra_body winning on a
-    duplicate key (openai 2.51.0, anthropic 0.120.2), so each adapter raises at bind time for a
+    Each SDK merges extra_body over the named request parameters, extra_body winning on a
+    duplicate key, so each adapter raises at bind time for a
     key it populates itself instead of letting the merge silently override the binding.
     """
 
 
 def reject_extra_body_keys_the_adapter_populates(
-    extra_body: Mapping[str, object] | None, *, populated_keys: frozenset[str]
+    extra_body: Mapping[str, object] | None,
+    *,
+    populated_keys: frozenset[str],
+    normalized_key: Callable[[str], str] = str,
 ) -> None:
     """Refuse a Binding.extra_body key the calling adapter populates itself.
 
     An adapter's bind path calls this with the wire names it sets as explicit keywords,
     because the SDK merge would let extra_body silently override them.
+    normalized_key maps a caller's key to the form populated_keys holds, for an SDK whose merge
+    matches extra_body keys to wire keys loosely; the default compares keys as written.
 
     Raises:
-        ValueError: extra_body holds a key in populated_keys.
+        ValueError: extra_body holds a key that normalizes into populated_keys.
     """
     if extra_body is None:
         return
-    colliding = sorted(populated_keys & extra_body.keys())
+    colliding = sorted(key for key in extra_body if normalized_key(key) in populated_keys)
     if colliding:
         raise ValueError(
             f"extra_body keys {colliding} collide with request fields the adapter populates; "
@@ -501,10 +506,7 @@ class RequestParams(ABC):
 
     @abstractmethod
     def as_json(self) -> str:
-        """Render the request as a JSON object, for an archive to hold as one cell. No I/O.
-
-        Adapters implement it by calling request_json with their own SDK's omit sentinel class.
-        """
+        """Render the request as a JSON object, for an archive to hold as one cell. No I/O."""
         ...
 
 
@@ -730,8 +732,8 @@ class Adapter(ABC):
     """Which provider served the request, recorded on every Response and GenerationError.
 
     The value comes from the OpenTelemetry GenAI convention's gen_ai.provider.name value set,
-    whose members include the three langchaint's own constructors write
-    ("anthropic", "openai", "aws.bedrock"), and the tracing subpackage emits it
+    whose members include the four langchaint's own constructors write
+    ("anthropic", "openai", "aws.bedrock", "gcp.gemini"), and the tracing subpackage emits it
     under that key, so a backend groups langchaint spans with any other instrumented client's.
     Whoever constructs the adapter states it, because the SDK client class does not determine it:
     one AsyncOpenAI carrying a base_url reaches any of several providers. For the client classes
@@ -764,8 +766,7 @@ class Adapter(ABC):
     def __init__(self, *, client: object, model: str, provider_name: str) -> None:
         """Check client against the stated provider_name, then store model and provider_name.
 
-        client is checked here and not stored;
-        each adapter stores its own with_options copy.
+        client is checked here and not stored.
         Its object annotation is the price of checking every adapter in one place.
 
         Rates are not stored here. Each provider's service tiers are its own words, so an adapter

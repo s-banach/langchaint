@@ -47,6 +47,7 @@ dev = [
     # jsonschema ships no stubs, so its callers in tools.py go unchecked without these.
     "types-jsonschema>=4.26.0.20260518",
     "typos>=1.48.0",
+    "google-genai>=2.16.0",
 ]
 
 [tool.pyrefly]

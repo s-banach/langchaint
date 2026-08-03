@@ -83,6 +83,21 @@ _FINISHED_MESSAGE = "stream is finished: call stream_one again for a new one"
 _ALREADY_ENTERED_MESSAGE = "stream already entered: call stream_one again for a new one"
 
 
+async def _close_stream_quietly(
+    adapter_stream: AdapterStream, *, failure_log_message: str
+) -> None:
+    """Close one attempt's stream, logging a close failure rather than raising it.
+
+    The request the stream belonged to has already ended, so an exception out of the close would
+    only displace the result or the error the caller came for; failure_log_message names what
+    stands despite the failure. A BaseException propagates.
+    """
+    try:
+        await adapter_stream.close()
+    except Exception:
+        _logger.warning(failure_log_message, exc_info=True)
+
+
 class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     """One stream: an item iterator, a final-result source, a context manager.
 
@@ -335,9 +350,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def _close_adapter_stream(self) -> None:
         """Close the provider connection and exit the admitted() block, whatever the close does.
 
-        A close failure is logged rather than raised, because the request it belonged to has already
-        ended and the exception would only displace the result or the error the caller came for.
-        The admission exit sits in a finally rather than after the handler, so a BaseException out
+        The admission exit sits in a finally rather than after the close, so a BaseException out
         of the close returns the capacity permit too.
         A failing path that already exited the block with its failure leaves this exit nothing to
         do, _exit_admission being idempotent.
@@ -350,12 +363,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._items = None
         try:
             if adapter_stream is not None:
-                await adapter_stream.close()
-        except Exception:
-            _logger.warning(
-                "closing the provider stream raised; the capacity permit was returned",
-                exc_info=True,
-            )
+                await _close_stream_quietly(
+                    adapter_stream,
+                    failure_log_message=(
+                        "closing the provider stream raised; the capacity permit was returned"
+                    ),
+                )
         finally:
             _ = await self._exit_admission(None)
 
@@ -648,17 +661,14 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             try:
                 raw = await adapter_stream.final()
-                identity = self._bound_adapter.identity_from_raw(raw)
-                if identity.request_id is None:
-                    # An assembled response need not carry the header its HTTP response did; the
-                    # stream is what still has it.
-                    identity = identity._replace(request_id=adapter_stream.request_id())
                 # Staged before interpret reads the response, so what the attempt billed and what
                 # the response says about itself are on the ledger from the moment they are known.
                 self._ledger.stage_response(
                     raw=raw,
                     billing=self._bound_adapter.billing_from_raw(raw),
-                    identity=identity,
+                    identity=self._bound_adapter.identity_from_raw(raw).with_request_id_fallback(
+                        adapter_stream.request_id()
+                    ),
                 )
                 self._conclusion = self._conclude(
                     self._bound_adapter.interpret(raw),

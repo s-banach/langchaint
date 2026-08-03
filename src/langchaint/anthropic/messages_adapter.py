@@ -180,6 +180,9 @@ _RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 504})
 408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 0.120.2 _should_retry).
 """
 
+_RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})
+"""The 500 and 504 error types, which retry at any status carrying them."""
+
 _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
 """The statuses anthropic's errors page lists as this request's rejection; a resend fails again."""
 
@@ -359,7 +362,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "messages",
     "stream",
 })
-"""The wire keys an extra_body must not hold: every keyword send and open_stream pass,
+"""The wire keys an extra_body must not hold: every keyword open_stream passes,
 plus stream, which the SDK's stream method sets and its event parsing depends on."""
 
 
@@ -682,8 +685,8 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
     """Narrow a raw response to the SDK message this adapter produces.
 
     The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own send or
-    stream, so another type is a defect in langchaint and not a provider behavior.
+    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
+    so another type is a defect in langchaint and not a provider behavior.
 
     Raises:
         TypeError: raw is not an anthropic Message.
@@ -820,10 +823,11 @@ def parse_anthropic(failure: Exception) -> Verdict:
     408 and 409 are in _RETRY_THIS_ONE_STATUSES from the SDK rather than the page: anthropic's SDK
     retries both, naming them request and lock timeouts (anthropic 0.120.2 _should_retry).
     Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    a _PAUSE_ERROR_TYPES type pauses at any status, because the type is the throttle signal
-    whatever status carried it; an unlisted 5xx is RetryThisOne, one attempt's server-side
-    failure; any other unlisted status is DoNotRetry, matching the page's rule that 400 covers
-    otherwise-unlisted 4xx errors.
+    a _PAUSE_ERROR_TYPES type pauses and a _RETRY_THIS_ONE_ERROR_TYPES type retries at any
+    status, because a mid-stream error event raises carrying the live response's 200 status
+    (anthropic 0.120.2 MessageStream), leaving the type as the failure's one signal; an unlisted
+    5xx is RetryThisOne, one attempt's server-side failure; any other unlisted status is
+    DoNotRetry, matching the page's rule that 400 covers otherwise-unlisted 4xx errors.
     The status and the error type pick the verdict; a retry-after header only fills its retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
     Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
@@ -839,17 +843,19 @@ def parse_anthropic(failure: Exception) -> Verdict:
         )
         return DoNotRetry()
     retry_after = retry_after_seconds_from_headers(failure.response.headers)
-    if failure.type in _PAUSE_ERROR_TYPES or failure.status_code in _PAUSE_STATUSES:
-        if failure.status_code not in _PAUSE_STATUSES:
-            record_parse_fallthrough(
-                PARSE_FALLTHROUGH_COUNTS,
-                parse_name="parse_anthropic",
-                status_code=failure.status_code,
-                error_type=failure.type,
-            )
-        return PauseAll(retry_after=retry_after)
-    if failure.status_code in _RETRY_THIS_ONE_STATUSES:
-        return RetryThisOne(retry_after=retry_after)
+    for error_types, statuses, verdict_class in (
+        (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, PauseAll),
+        (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, RetryThisOne),
+    ):
+        if failure.type in error_types or failure.status_code in statuses:
+            if failure.status_code not in statuses:
+                record_parse_fallthrough(
+                    PARSE_FALLTHROUGH_COUNTS,
+                    parse_name="parse_anthropic",
+                    status_code=failure.status_code,
+                    error_type=failure.type,
+                )
+            return verdict_class(retry_after=retry_after)
     if failure.status_code in _DO_NOT_RETRY_STATUSES:
         return DoNotRetry()
     record_parse_fallthrough(
@@ -866,7 +872,7 @@ def parse_anthropic(failure: Exception) -> Verdict:
 class AnthropicMessagesAdapter(Adapter):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
-    The three clients expose the same messages.create/parse/stream methods and with_options,
+    The three clients expose the same messages.stream method and with_options,
     so the adapter logic is identical across the first-party API and both Bedrock APIs.
     default_max_completion_tokens fills the API-required max_tokens
     when the binding's inference_params leave max_completion_tokens None.
@@ -1139,7 +1145,7 @@ class _AnthropicStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate the SDK stream into answer text chunks, reasoning text deltas, and completed tool calls.
 
-        A tool call is built from the SDK-accumulated block exactly like the non-streaming path.
+        A tool call is built from the SDK-accumulated block, never from raw partial-json deltas.
 
         A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
         is a block boundary, never text. That boundary reaches the caller as a
@@ -1255,30 +1261,6 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             return wire_messages
         return _AnthropicRequestParams(
             precomputed=self._precomputed_fields, messages=wire_messages
-        )
-
-    @override
-    async def send(self, request: RequestParams) -> anthropic.types.Message:
-        """Send one non-streaming messages.create with the request's fields as explicit keywords.
-
-        Raises:
-            TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
-        """
-        params = narrowed_request(request, _AnthropicRequestParams)
-        precomputed = params.precomputed
-        return await self._adapter.client.messages.create(
-            model=precomputed.model,
-            max_tokens=precomputed.max_tokens,
-            temperature=precomputed.temperature,
-            system=precomputed.system,
-            tools=precomputed.tools,
-            tool_choice=precomputed.tool_choice,
-            output_config=precomputed.output_config,
-            thinking=precomputed.thinking,
-            service_tier=precomputed.service_tier,
-            messages=params.messages,
-            extra_body=precomputed.extra_body,
         )
 
     @override

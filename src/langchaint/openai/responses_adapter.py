@@ -97,6 +97,7 @@ from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
     FunctionToolParam,
+    ResponseErrorEvent,
     ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCallParam,
     ResponseIncludable,
@@ -293,7 +294,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "input",
     "stream",
 })
-"""The wire keys an extra_body must not hold: every keyword send and open_stream pass,
+"""The wire keys an extra_body must not hold: every keyword open_stream passes,
 plus stream, which the SDK's stream method sets and its event parsing depends on."""
 
 
@@ -549,8 +550,8 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
     """Narrow a raw response to the SDK response this adapter produces.
 
     The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own send or
-    stream, so another type is a defect in langchaint and not a provider behavior.
+    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
+    so another type is a defect in langchaint and not a provider behavior.
 
     Raises:
         TypeError: raw is not an openai Response.
@@ -833,7 +834,7 @@ def _adapter_result[OutputT](
     )
 
 
-def parse_openai(failure: Exception) -> Verdict:
+def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return per documented row family, the status-200 error codes included)
     """Map one OpenAIResponsesAdapter.failure_types exception to its verdict.
 
     The listed rows come from openai's error-code guide,
@@ -845,6 +846,10 @@ def parse_openai(failure: Exception) -> Verdict:
     NotFoundError for it (openai 2.51.0), and a resend of an unknown model or path fails the same way.
     error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
     still read insufficient_quota, so the type separates nothing.
+    A status 200 is a mid-stream error event _OpenAIStream.items raised on the live response, so
+    its code picks the verdict through _DISPOSITION_BY_ERROR_CODE: rate_limit_exceeded is
+    PauseAll as a 429 is, any other transient code is RetryThisOne, and a terminal code is
+    DoNotRetry, as is a code outside the table, counted as a fallthrough.
     Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
     an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
     status is DoNotRetry.
@@ -872,6 +877,22 @@ def parse_openai(failure: Exception) -> Verdict:
         return RetryThisOne(retry_after=retry_after)
     if failure.status_code in _DO_NOT_RETRY_STATUSES:
         return DoNotRetry()
+    if failure.status_code == 200:
+        disposition = (
+            None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
+        )
+        if disposition == "transient":
+            if failure.code == "rate_limit_exceeded":
+                return PauseAll(retry_after=retry_after)
+            return RetryThisOne(retry_after=retry_after)
+        if disposition is None:
+            record_parse_fallthrough(
+                PARSE_FALLTHROUGH_COUNTS,
+                parse_name="parse_openai",
+                status_code=failure.status_code,
+                error_type=failure.code,
+            )
+        return DoNotRetry()
     record_parse_fallthrough(
         PARSE_FALLTHROUGH_COUNTS,
         parse_name="parse_openai",
@@ -886,7 +907,7 @@ def parse_openai(failure: Exception) -> Verdict:
 class OpenAIResponsesAdapter(Adapter):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
-    All three expose the same responses.create/parse/stream methods and with_options,
+    All three expose the same responses.stream method and with_options,
     so the adapter logic is identical across the first-party API, Bedrock, and Azure.
     The client parameter is annotated AsyncOpenAI because the other two subclass it;
     provider_name_by_client_class is what tells them apart.
@@ -1152,8 +1173,15 @@ class _OpenAIStream(AdapterStream):
             Stream items; SDK events langchaint does not model (built-in tool activity) are dropped.
 
         Raises:
-            StreamProtocolError: the stream ended without a terminal response.
+            openai.APIStatusError: the stream ended without a terminal response after an error
+                event; raised on the live response, so it carries the 200 status and the open
+                request's headers, with the event's code, message, and param as its body. The SDK
+                itself never raises on the event (openai 2.51.0 forwards it accumulated-only), so
+                this raise is what turns a mid-stream error into a failure parse can verdict.
+            StreamProtocolError: the stream ended with neither a terminal response nor an error
+                event.
         """
+        error_event: ResponseErrorEvent | None = None
         reasoning_delta_yielded = False
         separator_pending = False
         async for sdk_event in self._sdk_stream:
@@ -1189,7 +1217,19 @@ class _OpenAIStream(AdapterStream):
                 "response.failed",
             ):
                 self._terminal_response = sdk_event.response
+            elif sdk_event.type == "error":
+                error_event = sdk_event
         if self._terminal_response is None:
+            if error_event is not None:
+                raise openai.APIStatusError(
+                    error_event.message,
+                    response=self._sdk_stream._response,  # noqa: SLF001
+                    body={
+                        "code": error_event.code,
+                        "message": error_event.message,
+                        "param": error_event.param,
+                    },
+                )
             raise StreamProtocolError("stream ended without a terminal response")
 
     @override
@@ -1273,34 +1313,6 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         return _OpenAIRequestParams(
             precomputed=self._precomputed_fields,
             input=[*self._precomputed_fields.input_prefix, *_wire_input(messages)],
-        )
-
-    @override
-    async def send(self, request: RequestParams) -> OpenAIResponse:
-        """Send one non-streaming responses.create with the request's fields as explicit keywords.
-
-        Raises:
-            TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
-        """
-        params = narrowed_request(request, _OpenAIRequestParams)
-        precomputed = params.precomputed
-        return await self._adapter.client.responses.create(
-            model=precomputed.model,
-            instructions=precomputed.instructions,
-            max_output_tokens=precomputed.max_output_tokens,
-            temperature=precomputed.temperature,
-            reasoning=precomputed.reasoning,
-            tools=precomputed.tools,
-            tool_choice=precomputed.tool_choice,
-            parallel_tool_calls=precomputed.parallel_tool_calls,
-            prompt_cache_options=precomputed.prompt_cache_options,
-            service_tier=precomputed.service_tier,
-            include=precomputed.include,
-            text=precomputed.text,
-            store=False,
-            input=params.input,
-            extra_body=precomputed.extra_body,
         )
 
     @override

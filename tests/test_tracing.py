@@ -402,7 +402,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
     """A RefusalError yields an error span carrying the 200's real token counts and cost."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports Refusal, then inspect the error span."""
+        """Drive one generate_one whose attempt reports Refusal, then inspect the error span."""
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
@@ -426,7 +426,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
     """A MaxCompletionTokensExceededError yields an error span with the 200's tokens and max_tokens finish."""
 
     async def scenario() -> None:
-        """Drive one generate_one whose send reports MaxCompletionTokensExceeded, then inspect the error span."""
+        """Drive one generate_one whose attempt reports MaxCompletionTokensExceeded, then inspect the error span."""
         adapter = _FakeAdapter(
             failures=[_billed(MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN))]
         )
@@ -509,8 +509,8 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
     """A cancelled traced generate_one ends its span and sets no status: nothing decided the call."""
 
     async def scenario() -> None:
-        """Time out a traced call whose send hangs, then read the span."""
-        adapter = _FakeAdapter(hang_from_send=1)
+        """Time out a traced call whose open hangs, then read the span."""
+        adapter = _FakeAdapter(hang_from_open=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -613,8 +613,8 @@ def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
     """
 
     async def scenario() -> None:
-        """Time out a traced batch whose sends hang, then read the spans."""
-        adapter = _FakeAdapter(hang_from_send=1)
+        """Time out a traced batch whose opens hang, then read the spans."""
+        adapter = _FakeAdapter(hang_from_open=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -707,8 +707,8 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
         async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
-        assert "".join(texts) == "ab"
-        assert response.output == "ab"
+        assert "".join(texts) == "ok"
+        assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
         assert span.attributes is not None
@@ -877,7 +877,7 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
 
     async def scenario() -> None:
         """Enter a stream whose every open fails, and inspect the span it left."""
-        adapter = _FakeAdapter(open_failures=[TransientError("connection reset")] * 4)
+        adapter = _FakeAdapter(failures=[TransientError("connection reset")] * 4)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
@@ -1138,7 +1138,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
             async for _item in stream:
                 pass
             response = await stream.final()
-        assert response.output == "ab"
+        assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
 
@@ -1551,7 +1551,7 @@ def test_generate_many_passes_warm_cache_through() -> None:
 
     async def scenario() -> None:
         """Run a three-item batch on a slow fake with a wide capacity and read the recorded peak."""
-        adapter = _FakeAdapter(echo=True, send_seconds=0.01)
+        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)),
@@ -2418,7 +2418,7 @@ def test_unserializable_content_leaves_the_stream_and_its_span_intact(
             async with bound.stream_one("hi") as stream:
                 _ = [item async for item in stream]
                 response = await stream.final()
-        assert response.output == "ab"
+        assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.input.messages" not in span.attributes

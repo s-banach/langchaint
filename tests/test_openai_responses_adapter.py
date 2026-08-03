@@ -29,6 +29,7 @@ from openai.lib.streaming.responses._events import (
 )
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import (
+    ResponseErrorEvent,
     ResponseFailedEvent,
     ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
@@ -763,7 +764,7 @@ def test_request_omits_tool_fields_without_tools() -> None:
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
-    """An extra_body key that send passes as its own keyword raises at bind time.
+    """An extra_body key that open_stream passes as its own keyword raises at bind time.
 
     The SDK merges extra_body over the named request parameters with extra_body winning,
     so admitting the key would silently override the binding.
@@ -774,12 +775,12 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         )
 
 
-def test_both_request_paths_send_extra_body_by_reference(
+def test_the_request_sends_extra_body_by_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both create and stream pass the binding's extra_body to the SDK's extra_body parameter.
+    """open_stream passes the binding's extra_body to the SDK's extra_body parameter.
 
-    A path that dropped it would silently send a request without the caller's wire fields,
+    A request that dropped it would silently go out without the caller's wire fields,
     which no offline round-trip test can catch.
     """
     adapter = _adapter()
@@ -790,9 +791,7 @@ def test_both_request_paths_send_extra_body_by_reference(
             _binding(automatic_prompt_caching=True, extra_body=extra_body)
         ),
     )
-    bodies = _kwargs_sent_by_both_paths(monkeypatch, text_bound, "extra_body")
-    assert len(bodies) == 2
-    assert all(body is extra_body for body in bodies)
+    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
 
 
 class _FakeSDKStream(AsyncResponseStream[None]):
@@ -830,18 +829,11 @@ def _stream(
     return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events, headers))
 
 
-def _kwargs_sent_by_both_paths[OutputT](
+def _kwarg_sent[OutputT](
     monkeypatch: pytest.MonkeyPatch, bound: _BoundOpenAI[OutputT], key: str
-) -> list[object]:
-    """Run send and open_stream through fakes, capturing the request kwarg key from each.
-
-    One capture per path, create first, so a caller asserts on exactly two values.
-    """
+) -> object:
+    """Open one stream through a fake, capturing the request kwarg key it was passed."""
     captured: list[object] = []
-
-    async def fake_create(**request_kwargs: object) -> OpenAIResponse:
-        captured.append(request_kwargs[key])
-        return _response(usage=None)
 
     class _FakeStreamManager:
         async def __aenter__(self) -> _FakeSDKStream:
@@ -851,16 +843,10 @@ def _kwargs_sent_by_both_paths[OutputT](
         captured.append(request_kwargs[key])
         return _FakeStreamManager()
 
-    monkeypatch.setattr(bound._adapter.client.responses, "create", fake_create)
     monkeypatch.setattr(bound._adapter.client.responses, "stream", fake_stream)
-
-    async def scenario() -> None:
-        messages = [UserMessage(content="q")]
-        await bound.send(bound.build_request(messages))
-        await bound.open_stream(bound.build_request(messages))
-
-    asyncio.run(scenario())
-    return captured
+    _ = asyncio.run(bound.open_stream(bound.build_request([UserMessage(content="q")])))
+    (kwarg,) = captured
+    return kwarg
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
@@ -1306,6 +1292,47 @@ def test_final_before_items_are_exhausted_raises() -> None:
     asyncio.run(scenario())
 
 
+def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -> None:
+    """An error event with no terminal response ends the drain as an APIStatusError.
+
+    The SDK forwards the event without raising, so this raise is the only path a mid-stream
+    failure has into parse_openai. The error carries the live response's 200 status, the event's
+    code where parse reads it, and the event's message unabridged.
+    """
+
+    async def scenario() -> None:
+        adapter_stream = _stream([
+            ResponseErrorEvent(
+                type="error",
+                code="server_error",
+                message="The server had an error.",
+                param=None,
+                sequence_number=1,
+            ),
+        ])
+        with pytest.raises(openai.APIStatusError) as caught:
+            async for _item in adapter_stream.items():
+                pass
+        assert caught.value.status_code == 200
+        assert caught.value.code == "server_error"
+        assert "The server had an error." in str(caught.value)
+        assert parse_openai(caught.value) == RetryThisOne(retry_after=None)
+
+    asyncio.run(scenario())
+
+
+def test_stream_ending_with_no_terminal_and_no_error_event_raises() -> None:
+    """A stream that ends before any terminal event is a protocol failure, not an empty turn."""
+
+    async def scenario() -> None:
+        adapter_stream = _stream([_text_delta_event("he", 1)])
+        with pytest.raises(StreamProtocolError):
+            async for _item in adapter_stream.items():
+                pass
+
+    asyncio.run(scenario())
+
+
 class _StructuredReport(BaseModel):
     """The response_format the structured bind path parses into."""
 
@@ -1446,27 +1473,6 @@ def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
     response = _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
     result = _assert_result(_text_bound().interpret(response))
     assert result.output == "I can't help with that"
-
-
-def test_text_bind_send_hands_back_a_failed_status_for_interpret_to_report(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed status comes back from send rather than raising, and interpret reports the failure member.
-
-    The API answers 200 with a body saying the run failed, so the response reaches the retry loop,
-    which records it and its price before interpret reads it.
-    """
-    text_bound = _text_bound()
-
-    async def fake_create(**_request_kwargs: object) -> OpenAIResponse:
-        """Return a response the API reported as failed, with real usage on it."""
-        return _response(usage=_usage_with_cache(), status="failed", error=_SERVER_ERROR)
-
-    monkeypatch.setattr(text_bound._adapter.client.responses, "create", fake_create)
-    raw = asyncio.run(text_bound.send(text_bound.build_request([UserMessage(content="q")])))
-    assert isinstance(raw, OpenAIResponse)
-    assert isinstance(text_bound.interpret(raw), ProviderFailedTransiently)
-    assert text_bound.billing_from_raw(raw).usage.cost_in_usd > 0.0
 
 
 def test_identity_reads_the_responses_own_id_and_served_model() -> None:
@@ -1614,7 +1620,7 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
 def test_every_request_carries_the_reasoning_include(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Create and stream, on both bindings, all send include=["reasoning.encrypted_content"].
+    """Both bindings send include=["reasoning.encrypted_content"] on the request.
 
     The offline round-trip tests cannot catch a dropped include:
     the SDK documents include as what populates encrypted_content,
@@ -1626,20 +1632,21 @@ def test_every_request_carries_the_reasoning_include(
     structured_bound = _BoundOpenAIStructured(
         adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
     )
-    includes = _kwargs_sent_by_both_paths(
-        monkeypatch, text_bound, "include"
-    ) + _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "include")
-    assert includes == [["reasoning.encrypted_content"]] * 4
+    includes = [
+        _kwarg_sent(monkeypatch, text_bound, "include"),
+        _kwarg_sent(monkeypatch, structured_bound, "include"),
+    ]
+    assert includes == [["reasoning.encrypted_content"]] * 2
 
 
-def test_both_structured_request_paths_send_the_text_parameter(
+def test_the_structured_request_sends_the_text_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Send and open_stream both put the precomputed text parameter on the request.
+    """open_stream puts the precomputed text parameter on the request.
 
-    A path that dropped it would ask for no schema at all, and every turn would come back as prose
-    the response_format rejects, reported as the caller's model being wrong rather than as the
-    request that omitted its schema.
+    A request that dropped it would ask for no schema at all, and every turn would come back as
+    prose the response_format rejects, reported as the caller's model being wrong rather than as
+    the request that omitted its schema.
     """
     adapter = _adapter()
     structured_bound = _BoundOpenAIStructured(
@@ -1647,8 +1654,9 @@ def test_both_structured_request_paths_send_the_text_parameter(
         precomputed_fields=adapter._precompute_fields(_binding(automatic_prompt_caching=True)),
         response_format=_StructuredReport,
     )
-    texts = _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "text")
-    assert texts == [{"format": type_to_text_format_param(_StructuredReport)}] * 2
+    assert _kwarg_sent(monkeypatch, structured_bound, "text") == {
+        "format": type_to_text_format_param(_StructuredReport)
+    }
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
@@ -1709,6 +1717,32 @@ def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> No
     )
     tag = "status=599 type=None"
     assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
+
+
+def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
+    """A 200 is a mid-stream error event's raise, so the code picks the verdict the status cannot.
+
+    server_error resends one attempt; rate_limit_exceeded pauses every sharing task, as its 429
+    form does; a terminal code does not retry and, being a listed row, leaves the counter alone.
+    """
+    before = dict(PARSE_FALLTHROUGH_COUNTS)
+    server_error = _status_error(openai.APIStatusError, 200, error_code="server_error")
+    assert parse_openai(server_error) == RetryThisOne(retry_after=None)
+    throttled = _status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded")
+    assert parse_openai(throttled) == PauseAll(retry_after=None)
+    blocked = _status_error(openai.APIStatusError, 200, error_code="invalid_prompt")
+    assert parse_openai(blocked) == DoNotRetry()
+    assert dict(PARSE_FALLTHROUGH_COUNTS) == before
+
+
+def test_parse_openai_counts_a_status_200_code_outside_the_table_as_a_fallthrough() -> None:
+    """An unknown code and an absent code on a 200 each land DoNotRetry and one tagged count."""
+    before = dict(PARSE_FALLTHROUGH_COUNTS)
+    unknown = _status_error(openai.APIStatusError, 200, error_code="brand_new_code")
+    assert parse_openai(unknown) == DoNotRetry()
+    assert parse_openai(_status_error(openai.APIStatusError, 200)) == DoNotRetry()
+    for tag in ("status=200 type=brand_new_code", "status=200 type=None"):
+        assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
@@ -1951,6 +1985,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
         APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
         isinstance.
         A status row states the name a DoNotRetry failure takes, never whether it is retried:
+        a 200, a mid-stream error event's raise on the live response, is declared_final;
         every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
         declared_final, and any other status is unknown_exception.
         ValueError stands in for an exception the adapter cannot place.
@@ -1976,6 +2011,9 @@ class TestOpenAIResponsesConformance(AdapterConformance):
             _status_error(openai.InternalServerError, 500): "unknown_exception",
             _status_error(openai.InternalServerError, 503): "unknown_exception",
             _status_error(openai.APIStatusError, 302): "unknown_exception",
+            _status_error(
+                openai.APIStatusError, 200, error_code="invalid_prompt"
+            ): "declared_final",
             ValueError("boom"): "unknown_exception",
         }
 

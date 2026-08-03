@@ -143,7 +143,7 @@ class _OtherRequest(RequestParams):
 
 
 def test_narrowed_request_hands_back_the_adapters_own_and_refuses_every_other() -> None:
-    """A request another adapter built raises rather than reaching that adapter's own send.
+    """A request another adapter built raises rather than reaching that adapter's own open_stream.
 
     Mixing them is a defect in langchaint, not anything a provider did, so it stops before any I/O
     and names the class that arrived.

@@ -44,6 +44,7 @@ from langchaint.exceptions import (
     RefusalError,
     RetriesExhaustedError,
     SchemaViolationError,
+    StreamProtocolError,
     TimedOutError,
     TransientError,
     UnfinishedTurnError,
@@ -51,6 +52,7 @@ from langchaint.exceptions import (
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
+from langchaint.pricing import Billing
 from langchaint.response import (
     CallResult,
     GenerateResult,
@@ -65,8 +67,25 @@ from langchaint.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
 )
-from langchaint.streaming import StreamHandle
+from langchaint.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager
+
+
+class _StreamObservations(NamedTuple):
+    """What the retry loop saw of one attempt's stream, read before the close dropped it.
+
+    billing is what the provider had reported when a failure cut the stream off: None where the
+    stream never opened, where it reported nothing, and where it concluded normally, a staged
+    response then stating the attempt's billing itself. A counter the provider sends late is
+    missing from it.
+    request_id is the request-id header the stream carried, None where it had none or never opened.
+    opened says whether open_stream returned, which is what lets a failure nobody can classify
+    still record that the attempt reached the provider.
+    """
+
+    billing: Billing | None
+    request_id: str | None
+    opened: bool
 
 
 class Unchanged:
@@ -217,17 +236,6 @@ class GenerateItem[OutputT](Protocol):
             GenerationError: the call failed; the batch turns it into that item's row.
         """
         ...
-
-
-class _Interpretation[OutputT](NamedTuple):
-    """One arrived response and what interpret read off it.
-
-    The two travel together because the retry loop needs both: raw is what a success arm carries, and
-    outcome is what decides the item's fate.
-    """
-
-    raw: BaseModel
-    outcome: ResponseOutcome[OutputT]
 
 
 class LLM:
@@ -617,7 +625,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         )
 
     def _terminal_error(
-        self, exc: Exception, *, ledger: _CallLedger, request: RequestParams
+        self,
+        exc: Exception,
+        *,
+        ledger: _CallLedger,
+        request: RequestParams,
+        observations: _StreamObservations,
     ) -> GenerationError:
         """Name this item's terminal failure from the adapter's classification of exc.
 
@@ -625,26 +638,38 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         did not call transient, so the "transient" member cannot arrive; if a classify defect
         produces one anyway, it lands on the unknown_exception default with everything else out
         of place.
+        Every record written here bills observations.billing, what the failure's stream had
+        reported in flight, so a terminal failure's spend still reaches the caller; a staged
+        response's own billing wins where one arrived.
 
         StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
         """
         classification = self.adapter.classify(exc)
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out and gets a record. A rejection carries no response, so the record bills
-            # nothing unless a response was staged, which is the exception raised while reading one.
-            ledger.record(error=None, assistant_message=None)
+            # so it went out and gets a record.
+            ledger.record(error=None, assistant_message=None, billing=observations.billing)
             return InvalidRequestError(
                 reason=f"the provider rejected the request: {exc}",
                 call=ledger.freeze(),
                 request=request,
             )
         if classification == "declared_final":
-            # The provider answered, so the attempt gets a record; its answer was an error, which
-            # reports no billing, so the record bills nothing unless a response was staged.
-            ledger.record(error=None, assistant_message=None)
+            # The provider answered, so the attempt gets a record.
+            ledger.record(error=None, assistant_message=None, billing=observations.billing)
             return ProviderDeclaredFinalError(error=exc, call=ledger.freeze(), request=request)
+        if observations.opened:
+            # The stream was open, so langchaint can say the attempt reached the provider and
+            # what that provider reported for it; nothing is recorded where it cannot.
+            ledger.record(error=None, assistant_message=None, billing=observations.billing)
         return UnknownExceptionError(error=exc, call=ledger.freeze(), request=request)
+
+    def _request_id_for_failure(
+        self, exc: Exception, observations: _StreamObservations
+    ) -> str | None:
+        """Name the failed attempt's request id: the error's own header, else the open stream's."""
+        request_id = self.adapter.request_id_from_error(exc)
+        return request_id if request_id is not None else observations.request_id
 
     async def _pace_after_verdict(
         self,
@@ -655,6 +680,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         assistant_message: AssistantMessage | None,
         ledger: _CallLedger,
         request: RequestParams,
+        observations: _StreamObservations,
     ) -> None:
         """Record one verdicted attempt, then wait whatever the verdict asks before the next.
 
@@ -663,7 +689,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         exit parses every failure_types exception, so a None reaching here has no verdict to act
         on.
         The attempt's record carries a TransientError: exc itself when it is one, otherwise one
-        wrapping exc with the verdict's capped retry_after.
+        wrapping exc with the verdict's capped retry_after. It bills observations.billing, what
+        the attempt's stream had reported when the failure cut it off, so a retried attempt's
+        spend reaches the caller; a staged response's own billing wins where one arrived.
         On RetryThisOne the wait is the PrivateBackoff's, floored by the verdict's retry_after;
         on PauseAll there is no wait of our own, because the next admitted() entry already holds
         until the shared pause ends. Neither waits after the last attempt.
@@ -673,10 +701,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             GenerationError: the verdict is DoNotRetry; _terminal_error names which.
         """
-        ledger.note_request_id(self.adapter.request_id_from_error(exc))
+        ledger.note_request_id(self._request_id_for_failure(exc, observations))
         verdict = admission.verdict
         if verdict is None or isinstance(verdict, DoNotRetry):
-            raise self._terminal_error(exc, ledger=ledger, request=request) from exc
+            raise self._terminal_error(
+                exc, ledger=ledger, request=request, observations=observations
+            ) from exc
         if isinstance(exc, TransientError):
             error = exc
         else:
@@ -686,7 +716,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 is_rate_limit=verdict.kind == "pause_all",
             )
             error.__cause__ = exc
-        ledger.record(error=error, assistant_message=assistant_message)
+        ledger.record(
+            error=error, assistant_message=assistant_message, billing=observations.billing
+        )
         if verdict.kind == "retry_this_one" and ledger.attempts < self.max_attempts:
             await asyncio.sleep(private_backoff.next_wait(verdict.retry_after))
 
@@ -697,42 +729,53 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         private_backoff: PrivateBackoff,
         ledger: _CallLedger,
         request: RequestParams,
+        observations: _StreamObservations,
     ) -> GenerationError | None:
         """Record one transport failure and wait, or return the terminal error for it.
 
         exc is outside failure_types, so it exited the admitted() block unparsed and unrecorded
-        there. classify's "transient" is a transport failure that produced nothing parseable: the
-        loop retries it alone, as RetryThisOne with no retry_after, and does not wait after the
-        last attempt. For anything else this returns the GenerationError _terminal_error names,
+        there. Two failures are retried here, as RetryThisOne with no retry_after and with no wait
+        after the last attempt. One is a failure classify calls "transient", a transport failure
+        that produced nothing parseable. The other is a StreamProtocolError: a stream the
+        transport ended without its terminal event and without any provider-reported error, which
+        classify cannot place because the class is langchaint's own. No item from the drained
+        stream reached any caller, so a resend is safe, and a violation that persists ends as
+        RetriesExhaustedError whose attempt records each carry this text.
+        For anything else this returns the GenerationError _terminal_error names,
         and the caller raises it so the raise sits beside the except clause that caught exc.
         """
-        ledger.note_request_id(self.adapter.request_id_from_error(exc))
-        if self.adapter.classify(exc) != "transient":
-            return self._terminal_error(exc, ledger=ledger, request=request)
+        ledger.note_request_id(self._request_id_for_failure(exc, observations))
+        if not isinstance(exc, StreamProtocolError) and self.adapter.classify(exc) != "transient":
+            return self._terminal_error(
+                exc, ledger=ledger, request=request, observations=observations
+            )
         error = TransientError(str(exc))
         error.__cause__ = exc
-        ledger.record(error=error, assistant_message=None)
+        ledger.record(error=error, assistant_message=None, billing=observations.billing)
         if ledger.attempts < self.max_attempts:
             await asyncio.sleep(private_backoff.next_wait(None))
         return None
 
     def _staged_interpretation(
-        self, sent: BaseModel, *, ledger: _CallLedger
-    ) -> _Interpretation[OutputT | None]:
+        self, raw: BaseModel, *, request_id: str | None, ledger: _CallLedger
+    ) -> ResponseOutcome[OutputT | None]:
         """Stage an arrived response with its billing, then read what it produced.
 
         Staging first is what makes the attempt and its billing survive a raise from interpret:
         freeze closes a still-staged response, so the error that raise becomes carries the record.
+        request_id is the open stream's, filling in where the assembled response carries none.
 
         Raises:
             Exception: whatever interpret raises, for Adapter.classify to sort.
         """
         ledger.stage_response(
-            raw=sent,
-            billing=self._bound_adapter.billing_from_raw(sent),
-            identity=self._bound_adapter.identity_from_raw(sent),
+            raw=raw,
+            billing=self._bound_adapter.billing_from_raw(raw),
+            identity=self._bound_adapter.identity_from_raw(raw).with_request_id_fallback(
+                request_id
+            ),
         )
-        return _Interpretation(raw=sent, outcome=self._bound_adapter.interpret(sent))
+        return self._bound_adapter.interpret(raw)
 
     async def _generate_with_retries(
         self,
@@ -764,7 +807,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         backoff sleeps sit outside the block so a waiting task does not hold capacity.
         Each provider failure is raised inside the block, so the exit records its verdict before
         anyone else is admitted and a rate-limit error pauses the whole domain.
-        Every attempt is timed onto an AttemptRecord whose bracket is the send only,
+        Every attempt is timed onto an AttemptRecord whose bracket is the request only,
         excluding the admission wait and the backoff sleep,
         so a slow request is distinguishable from time spent rate limited.
 
@@ -803,14 +846,25 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         except TimeoutError:
             if not timeout_scope.expired():
                 raise
-            raise _abandoned_call_error(TimedOutError, ledger) from None
+            # The ledger's noted in-flight billing is what the cut-off attempt's stream had
+            # reported, noted before the loop's frame unwound; None where a record settled it.
+            raise _abandoned_call_error(TimedOutError, ledger, ledger.billing_in_flight) from None
 
-    async def _attempt_until_budget_runs_out(
+    async def _attempt_until_budget_runs_out(  # noqa: PLR0912 (the loop holds one attempt end to end: the drain, each failure family, and the exhaustive outcome match)
         self, messages: Sequence[Message], *, ledger: _CallLedger
     ) -> GenerateResult[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
 
         Runs inside the deadline opened by _generate_with_retries, its only caller.
+
+        Each attempt opens one adapter stream and drains it privately: no item reaches any caller,
+        which is what makes retrying a mid-stream failure safe, where stream_one, whose items do,
+        never retries an open stream. The drain runs inside the attempt's admitted() block, so a
+        mid-stream failure exits the block with its verdict exactly as an open failure does.
+        A failure that cuts the stream off has its billing_reported() and request_id() read before
+        the close drops them, into the _StreamObservations the failure handlers record from; the
+        billing is also noted on the ledger, where the deadline account finds it if this frame
+        unwinds instead.
 
         Raises:
             GenerationError: every failure _generate_with_retries names but TimedOutError, which its
@@ -825,11 +879,35 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         while ledger.attempts < self.max_attempts:
             admission = self.shared_backoff.admitted()
             assistant_message: AssistantMessage | None = None
+            observations = _StreamObservations(billing=None, request_id=None, opened=False)
             try:
                 async with admission:
                     ledger.start_attempt()
-                    raw, outcome = self._staged_interpretation(
-                        await self._bound_adapter.send(request), ledger=ledger
+                    adapter_stream = await self._bound_adapter.open_stream(request)
+                    observations = observations._replace(opened=True)
+                    try:
+                        async for _ in adapter_stream.items():
+                            pass
+                        raw = await adapter_stream.final()
+                        observations = observations._replace(
+                            request_id=adapter_stream.request_id()
+                        )
+                    except BaseException:
+                        observations = observations._replace(
+                            billing=adapter_stream.billing_reported(),
+                            request_id=adapter_stream.request_id(),
+                        )
+                        ledger.note_billing_in_flight(observations.billing)
+                        raise
+                    finally:
+                        await _close_stream_quietly(
+                            adapter_stream,
+                            failure_log_message=(
+                                "closing the provider stream raised; the attempt's outcome stands"
+                            ),
+                        )
+                    outcome = self._staged_interpretation(
+                        raw, request_id=observations.request_id, ledger=ledger
                     )
                     if outcome.kind == "provider_failed_transiently":
                         # Raised inside the block so the exit parses it: a billable 200 whose
@@ -851,10 +929,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     assistant_message=assistant_message,
                     ledger=ledger,
                     request=request,
+                    observations=observations,
                 )
             except Exception as exc:
                 terminal = await self._pace_after_transport_failure(
-                    exc, private_backoff=private_backoff, ledger=ledger, request=request
+                    exc,
+                    private_backoff=private_backoff,
+                    ledger=ledger,
+                    request=request,
+                    observations=observations,
                 )
                 if terminal is not None:
                     raise terminal from exc

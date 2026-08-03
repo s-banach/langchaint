@@ -1149,18 +1149,11 @@ _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
 
-def _kwargs_sent_by_both_paths[OutputT](
+def _kwarg_sent[OutputT](
     monkeypatch: pytest.MonkeyPatch, bound: _BoundAnthropic[OutputT], key: str
-) -> list[object]:
-    """Run send and open_stream through fakes, capturing the request kwarg key from each.
-
-    One capture per path, create first, so a caller asserts on exactly two values.
-    """
+) -> object:
+    """Open one stream through a fake, capturing the request kwarg key it was passed."""
     captured: list[object] = []
-
-    async def fake_create(**request_kwargs: object) -> at.Message:
-        captured.append(request_kwargs[key])
-        return _structured_message(_REPORT_JSON)
 
     class _FakeStreamManager:
         async def __aenter__(self) -> _FakeSDKMessageStream:
@@ -1170,17 +1163,16 @@ def _kwargs_sent_by_both_paths[OutputT](
         captured.append(request_kwargs[key])
         return _FakeStreamManager()
 
-    monkeypatch.setattr(bound._adapter.client.messages, "create", fake_create)
     monkeypatch.setattr(bound._adapter.client.messages, "stream", fake_stream)
 
     async def scenario() -> None:
         request = bound.build_request([UserMessage(content="q")])
         assert not isinstance(request, InvalidRequest)
-        await bound.send(request)
         await bound.open_stream(request)
 
     asyncio.run(scenario())
-    return captured
+    (kwarg,) = captured
+    return kwarg
 
 
 def test_identity_reads_the_messages_own_id_and_served_model() -> None:
@@ -1236,22 +1228,22 @@ def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config()
     }
 
 
-def test_both_structured_request_paths_send_the_output_config(
+def test_the_structured_request_sends_the_output_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Send and open_stream both put the precomputed output_config on the request.
+    """open_stream puts the precomputed output_config on the request.
 
-    A path that sent the binding's own output_config instead would ask for no schema at all, and
+    A request carrying the binding's own output_config instead would ask for no schema at all, and
     every turn would come back as prose the response_format rejects, reported as the caller's model
     being wrong rather than as the request that omitted its schema.
     """
     structured_bound = _structured_bound()
-    output_configs = _kwargs_sent_by_both_paths(monkeypatch, structured_bound, "output_config")
-    assert output_configs == [structured_bound._precomputed_fields.output_config] * 2
+    output_config = _kwarg_sent(monkeypatch, structured_bound, "output_config")
+    assert output_config == structured_bound._precomputed_fields.output_config
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
-    """An extra_body key that send passes as its own keyword raises at bind time.
+    """An extra_body key that open_stream passes as its own keyword raises at bind time.
 
     The SDK merges extra_body over the named request parameters with extra_body winning,
     so admitting the key would silently override the binding.
@@ -1267,12 +1259,12 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         )
 
 
-def test_both_request_paths_send_extra_body_by_reference(
+def test_the_request_sends_extra_body_by_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both create and stream pass the binding's extra_body to the SDK's extra_body parameter.
+    """open_stream passes the binding's extra_body to the SDK's extra_body parameter.
 
-    A path that dropped it would silently send a request without the caller's wire fields,
+    A request that dropped it would silently go out without the caller's wire fields,
     which no offline round-trip test can catch.
     """
     adapter = _adapter()
@@ -1288,9 +1280,7 @@ def test_both_request_paths_send_extra_body_by_reference(
             )
         ),
     )
-    bodies = _kwargs_sent_by_both_paths(monkeypatch, text_bound, "extra_body")
-    assert len(bodies) == 2
-    assert all(body is extra_body for body in bodies)
+    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
 
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
@@ -1420,6 +1410,20 @@ def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_sta
     """A rate-limit or overload error type pauses the domain whatever status carried it."""
     overloaded = _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error")
     assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
+
+
+def test_parse_anthropic_retries_a_transient_type_at_the_streams_200_status() -> None:
+    """api_error and timeout_error retry at any status, counted where the status is unlisted.
+
+    A mid-stream error event raises carrying the live response's 200 status, so the error type is
+    the failure's one signal; the count is what keeps the odd status-type pair visible.
+    """
+    before = dict(PARSE_FALLTHROUGH_COUNTS)
+    for transient_type in ("api_error", "timeout_error"):
+        failed = _status_error(anthropic.APIStatusError, 200, error_type=transient_type)
+        assert parse_anthropic(failed) == RetryThisOne(retry_after=None)
+        tag = f"status=200 type={transient_type}"
+        assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
@@ -1929,6 +1933,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
         isinstance, and RetryableError carries no response at all.
         A status row states the name a DoNotRetry failure takes, never whether it is retried:
+        a 200, a mid-stream error event's raise on the live response, is declared_final;
         every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
         declared_final, and any other status is unknown_exception.
         ValueError stands in for an exception the adapter cannot place.
@@ -1959,6 +1964,9 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             _status_error(anthropic.InternalServerError, 500): "unknown_exception",
             _status_error(anthropic.InternalServerError, 503): "unknown_exception",
             _status_error(anthropic.APIStatusError, 302): "unknown_exception",
+            _status_error(
+                anthropic.APIStatusError, 200, error_type="invalid_request_error"
+            ): "declared_final",
             ValueError("boom"): "unknown_exception",
         }
 

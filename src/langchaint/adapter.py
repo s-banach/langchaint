@@ -9,14 +9,14 @@ an exception carrying neither the response nor its billing, and an adapter that 
 frame answers a rejection with a member carrying both.
 
 Reporting model: an adapter reports one attempt; only the retry loop knows the call.
-So `send`, `open_stream`, and `AdapterStream.final` return what came back, and an adapter never
+So `open_stream` and `AdapterStream.final` return what came back, and an adapter never
 constructs a `GenerationError`, which is a verdict about a call it cannot see.
 What no member can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
 that propagate through the admitted() block, whose exit parses the `failure_types` ones.
 `AdapterStream.items` is the exception to the return contract, because an async iterator can only
-raise: a mid-stream failure reaches the stream handle as an exception and exits the block the same way.
+raise: a mid-stream failure reaches the retry loop as an exception and exits the block the same way.
 
-Billing before interpretation: `send` and `AdapterStream.final` hand back the SDK response object
+Billing before interpretation: `AdapterStream.final` hands back the SDK response object
 itself, and `billing_from_raw`, `identity_from_raw`, and `interpret` read it in separate calls the
 retry loop makes. The loop records the response, its `Billing`, and its `ResponseIdentity` the
 moment they arrive, so a raise from `interpret` still leaves the attempt and what it billed on the
@@ -25,8 +25,8 @@ call's record.
 Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
 (system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
 to precomputed SDK keyword arguments once;
-`BoundAdapter.build_request` adds the per-call `messages` to them, and `send` and `open_stream`
-take the `RequestParams` it built, so every attempt of one call sends the same request and a
+`BoundAdapter.build_request` adds the per-call `messages` to them, and `open_stream`
+takes the `RequestParams` it built, so every attempt of one call sends the same request and a
 `Sequence[Message]` the adapter will not put on the wire is found before the first attempt.
 The split into two bind methods is what fixes the output type at bind time:
 each method is monomorphic in its output type, so no sentinel value has to imply a type downstream.
@@ -67,8 +67,9 @@ one parse verdicted DoNotRetry.
 the retry loop retries it alone, as RetryThisOne with no retry_after.
 "invalid_request" is not retried: the provider rejected this request, so sending it again
 would be rejected again (the retry loop raises InvalidRequestError).
-"declared_final" is not retried: the provider answered with an error and declared it final, so a
-resend would fail the same way (the retry loop raises ProviderDeclaredFinalError).
+"declared_final" is not retried: the provider answered with an error and named it,
+whether on an error status marked final or on a mid-stream error event
+(the retry loop raises ProviderDeclaredFinalError).
 "unknown_exception" is not retried either, and says the adapter could not place the exception at all
 (the retry loop raises UnknownExceptionError).
 """
@@ -139,13 +140,16 @@ def terminal_classification_from_response(
     """Name the terminal error for one error response, by its status and its retry directive.
 
     Whether the failure is retried is Adapter.parse's verdict, so this only names what a
-    DoNotRetry failure becomes: a 4xx is this request's rejection, whoever issued it; a status the
-    non-standard x-should-retry header declared final is declared_final; and anything left is a
-    status langchaint has no account of.
-    The 4xx test comes before the declared_final test, so a rejected request the directive marked
+    DoNotRetry failure becomes: a 200 is a mid-stream error event raised on the live response, a
+    failure the provider named itself; a 4xx is this request's rejection, whoever issued it; a
+    status the non-standard x-should-retry header declared final is declared_final; and anything
+    left is a status langchaint has no account of.
+    The 4xx test comes before the header test, so a rejected request the directive marked
     final keeps the rejection name. declared_final states a disposition and never what failed,
-    because that is all the directive says.
+    which the carried exception's own text names.
     """
+    if status_code == 200:
+        return "declared_final"
     if 400 <= status_code < 500:
         return "invalid_request"
     if should_retry_from_headers(headers) is False:
@@ -411,9 +415,9 @@ class ProviderFailedTransiently(NoOutput):
     is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it
     through the admitted() block's exit, whose PauseAll verdict pauses the whole SharedBackoff
     domain, exactly as a 429 status does.
-    A stream sets no such pause, so a sibling task learns of the limit from its own next request:
-    this outcome arrives with the stream already over, concluded inside the handle rather than
-    raised through the block.
+    A stream handle sets no such pause, so a sibling task learns of the limit from its own next
+    request: this outcome arrives with the stream already over, concluded inside the handle rather
+    than raised through the block.
     """
 
     reason: str
@@ -507,7 +511,7 @@ class RequestParams(ABC):
 def narrowed_request[RequestT: RequestParams](
     request: RequestParams, request_class: type[RequestT]
 ) -> RequestT:
-    """Narrow the neutral request to the subclass one adapter builds, for its send and open_stream.
+    """Narrow the neutral request to the subclass one adapter builds, for its open_stream.
 
     Raises:
         TypeError: request was built by another adapter, which is a defect in langchaint.
@@ -584,7 +588,7 @@ class AdapterStream(ABC):
     The adapter translates SDK events into StreamItem values as they pass through;
     assembly stays in the SDK.
     Carries no output type: the stream yields items and hands back the assembled response, and what
-    that response produced is BoundAdapter.interpret's answer on either request path.
+    that response produced is BoundAdapter.interpret's answer.
     """
 
     @abstractmethod
@@ -601,8 +605,8 @@ class AdapterStream(ABC):
         """Return the SDK response the stream's events assembled into, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly to the SDK stream manager.
-        Handing back the response rather than what it produced is what lets the stream handle record
-        the billing before interpreting it, the same order the non-streaming path follows.
+        Handing back the response rather than what it produced is what lets the retry loop record
+        the billing before interpreting it.
         """
         ...
 
@@ -611,8 +615,8 @@ class AdapterStream(ABC):
         """Return what the provider has reported billing, or None where the SDK reports nothing yet.
 
         A counter the provider sends late is missing from it, so a caller that can still reach the
-        assembled response must read that instead. The callers are the two that cannot: a cancelled
-        stream, and one that broke before reaching its terminal event.
+        assembled response must read that instead. The callers are those that cannot: a stream cut
+        off by a cancellation, and one that broke before reaching its terminal event.
         Callable at any point in the stream's life, including before its first item. No I/O.
         """
         ...
@@ -637,7 +641,7 @@ class BoundAdapter[OutputT](ABC):
     """One adapter bound to a frozen prefix.
 
     Constructed by Adapter.bind_text or Adapter.bind_structured, which precompute the SDK keyword arguments once;
-    build_request adds the per-request messages, and send and open_stream take what it built.
+    build_request adds the per-request messages, and open_stream takes what it built.
     """
 
     @abstractmethod
@@ -647,21 +651,6 @@ class BoundAdapter[OutputT](ABC):
         Called once per call, before the first attempt, so messages the adapter will not put on
         the wire are found without a request going out and without a retry budget being spent on it.
         Returns InvalidRequest with the reason in that case. No I/O.
-        """
-        ...
-
-    @abstractmethod
-    async def send(self, request: RequestParams) -> BaseModel:
-        """Send one non-streaming request and return the SDK response object it got back.
-
-        Every 200 comes back this way, whatever it holds, so the retry loop records the response and
-        its billing before anything is read off it.
-
-        Raises:
-            TypeError: request is not the RequestParams subclass this bound adapter builds, which is
-                a defect in langchaint rather than anything a provider did.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
-                They are the attempts this adapter read no outcome from.
         """
         ...
 
@@ -699,8 +688,8 @@ class BoundAdapter[OutputT](ABC):
     def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
         """Read one SDK response as the turn it produced, or as the reason it produced none. No I/O.
 
-        Both request paths go through here, the streaming one on the response the SDK assembled from
-        the events, so one function per binding decides what a response means.
+        Every response goes through here, assembled by the SDK from its stream's events, so one
+        function per binding decides what a response means.
         A response that produced no output is a returned member, never a raise, so the retry loop
         decides the item's fate with the attempt already recorded.
 
@@ -723,6 +712,7 @@ class BoundAdapter[OutputT](ABC):
             TypeError: request is not the RequestParams subclass this bound adapter builds, which is
                 a defect in langchaint rather than anything a provider did.
             Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+                They are the attempts this adapter read no outcome from.
         """
         ...
 
@@ -843,7 +833,7 @@ class Adapter(ABC):
     Each concrete adapter states its own: its SDK's status-error class, whose response carries the
     status and error type parse reads, plus TransientError, which the retry loop raises for a 200
     whose body reports a transient failure. Transport failures that produced nothing parseable (a
-    connection drop, a timeout) stay out, propagating unrecorded for classify to sort.
+    connection drop, a timeout) stay out, propagating unparsed for classify to sort.
     Every member must be a strict subclass of Exception; SharedBackoff rejects anything else at
     construction.
     """

@@ -3,13 +3,13 @@
 A script is a list of turns keyed by a tag the binding carries in its system prompt,
 so one adapter serves every agent in the graph and each agent gets its own scripted turns.
 Each turn is either text (ends that agent's loop) or tool calls (the loop dispatches and comes back).
-delay_seconds on a turn makes send suspend, which is how the timeout layers get exercised.
+delay_seconds on a turn makes its open suspend, which is how the timeout layers get exercised.
 """
 
 import asyncio
 import itertools
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, override
 
@@ -22,6 +22,7 @@ from langchaint import (
     DoNotRetry,
     Message,
     SharedBackoff,
+    StreamItem,
     TextPart,
     ToolCall,
     TransientError,
@@ -97,7 +98,7 @@ class Turn:
     """One scripted assistant turn.
 
     text ends the agent loop; tool_calls make the loop dispatch and generate again.
-    delay_seconds suspends inside send, which is what a per-call timeout races against.
+    delay_seconds suspends inside open_stream, which is what a per-call timeout races against.
     error, when set, is raised instead of returning, after the delay.
     """
 
@@ -109,10 +110,10 @@ class Turn:
 
 @dataclass
 class Script:
-    """The turns one agent tag plays, in order, plus a count of sends it received."""
+    """The turns one agent tag plays, in order, plus a count of opens it received."""
 
     turns: list[Turn]
-    sends: int = 0
+    opens: int = 0
 
 
 class ScriptedAdapter(Adapter):
@@ -160,7 +161,7 @@ def _tag_of(binding: Binding) -> str:
 
 @dataclass(frozen=True, kw_only=True)
 class _ScriptedRequest(RequestParams):
-    """What a scripted send would have put on the wire, which is the messages and nothing else."""
+    """What a scripted attempt would have put on the wire, which is the messages and nothing else."""
 
     messages: tuple[Message, ...]
 
@@ -218,33 +219,63 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams:
-        """Build the request the scripted sends ignore; the script decides what comes back."""
+        """Build the request the scripted attempts ignore; the script decides what comes back."""
         return _ScriptedRequest(messages=tuple(messages))
 
     @override
-    async def send(self, request: RequestParams) -> FakeRaw:
-        """Return a response naming the next scripted turn for this tag, after its delay.
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Open a stream over the next scripted turn for this tag, after its delay.
 
         Raises:
             Exception: the turn's scripted error, whatever type it carries.
             RuntimeError: the script for this tag ran out of turns.
         """
         script = self._adapter.scripts[self._tag]
-        if script.sends >= len(script.turns):
-            raise RuntimeError(f"script {self._tag!r} exhausted after {script.sends} turns")
-        turn_index = script.sends
+        if script.opens >= len(script.turns):
+            raise RuntimeError(f"script {self._tag!r} exhausted after {script.opens} turns")
+        turn_index = script.opens
         turn = script.turns[turn_index]
-        script.sends += 1
+        script.opens += 1
         if turn.delay_seconds:
             await asyncio.sleep(turn.delay_seconds)
         if turn.error is not None:
             raise turn.error
-        return FakeRaw(turn_index=turn_index)
+        return _ScriptedTurnStream(raw=FakeRaw(turn_index=turn_index))
+
+
+class _ScriptedTurnStream(AdapterStream):
+    """One scripted attempt's stream: it yields no items and assembles the turn's response.
+
+    The example never iterates a stream itself; the retry loop drains this privately, so items()
+    yielding nothing loses nothing.
+    """
+
+    def __init__(self, *, raw: FakeRaw) -> None:
+        """Hold the response final() returns."""
+        self._raw = raw
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Reject a stream open: the example never streams."""
-        raise NotImplementedError
+    async def items(self) -> AsyncIterator[StreamItem]:
+        return
+        yield
+
+    @override
+    async def final(self) -> FakeRaw:
+        """Return the response naming the scripted turn."""
+        return self._raw
+
+    @override
+    def billing_reported(self) -> None:
+        """None: the scripted turn bills only through its assembled response."""
+
+    @override
+    def request_id(self) -> str | None:
+        """None: identity_from_raw derives the request id from the response itself."""
+        return None
+
+    @override
+    async def close(self) -> None:
+        """Nothing to release."""
 
 
 _CALL_IDS = itertools.count(1)

@@ -113,7 +113,7 @@ class GenerationError(_CallCarrier, Exception):
     UnfinishedTurnError (the 200 is not a finished turn, so langchaint cannot report it as the answer),
     ProviderFailedTerminallyError (the 200's body reports that generating the response failed),
     InvalidRequestError (the request was rejected, by the provider or by the adapter before sending),
-    ProviderDeclaredFinalError (the provider answered with an error and declared it final),
+    ProviderDeclaredFinalError (the provider answered with a final error),
     UnknownExceptionError (the adapter could not place the attempt's exception),
     EscapedExceptionError (an exception escaped langchaint's own machinery),
     AbandonedCallError (the call was cut off before its result reached the caller), and
@@ -457,11 +457,13 @@ class InvalidRequestError(GenerationError):
 
 
 class ProviderDeclaredFinalError(GenerationError):
-    """The provider answered with an error and declared it final; the item fails as a row.
+    """The provider answered with a final error; the item fails as a row.
 
-    The provider sent x-should-retry: false, which states the disposition and never what failed,
-    so the provider's own message is the only description of the condition.
-    Not retried: a resend would fail the same way, and the provider said so.
+    Two failures arrive this way: an error response the provider marked x-should-retry: false,
+    which states the disposition and never what failed,
+    and a mid-stream error event, raised carrying the live response's 200 status.
+    Either way the provider's own message is the only description of the condition.
+    Not retried: Adapter.parse verdicted DoNotRetry.
     error is the SDK exception carrying that message, also chained as __cause__.
     The attempt has a record: the request reached the provider, which answered.
     """
@@ -477,15 +479,15 @@ class ProviderDeclaredFinalError(GenerationError):
 
     @override
     def _summary(self) -> str:
-        return f"the provider declared this error final: {self.error}"
+        return f"a final error from the provider: {self.error}"
 
 
 class UnknownExceptionError(GenerationError):
     """An exception the adapter could not place; the item fails as a row.
 
     Adapter.classify's default: not a known transient or rate-limit condition (which retry), not a
-    rejection of this request (which is InvalidRequestError), and not an error the provider declared
-    final (which is ProviderDeclaredFinalError), so the safe treatment is to fail this item visibly.
+    rejection of this request (which is InvalidRequestError), and not a final error from the
+    provider (which is ProviderDeclaredFinalError), so the safe treatment is to fail this item visibly.
     It may be a defect, in langchaint, the SDK, or the provider.
     Not retried: a defect must surface rather than be retried silently at billing expense.
     error is the exception classify could not place, also chained as __cause__.
@@ -548,9 +550,9 @@ class AbandonedCallError(GenerationError):
     when that request started, and is None where the cut fell between attempts. That attempt gets no
     AttemptRecord: an ending nobody observed would make the ending fields conditional on every
     record.
-    billing_in_flight is what the provider had reported for that attempt by the time of the cut, and
-    is None wherever it had reported nothing, which is true of every non-stream call. A counter the
-    provider sends late is missing from it.
+    billing_in_flight is what the provider had reported for that attempt by the time of the cut,
+    and is None wherever it had reported nothing.
+    A counter the provider sends late is missing from it.
     usage is the settled records' fold plus billing_in_flight's usage, the paid total this call is
     known to have incurred, which is usage's scope on every carrier. What the cut-off attempt billed
     beyond the provider's last report is unobservable client-side and none of it is fabricated.

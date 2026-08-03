@@ -654,8 +654,8 @@ class PrivateBackoff:
     Draw next_wait once per RetryThisOne and sleep it between blocks, never inside one.
     A PauseAll costs no draw, because the next entry already waits out the shared pause.
     A wait here overlaps a running pause rather than stacking on it, for the same reason.
-    Keep one instance per logical request, across every attempt including reopens,
-    and discard it when the logical request ends.
+    Keep one instance across every attempt for one logical request.
+    Discard it when that logical request ends.
     """
 
     def __init__(self, shared_backoff: SharedBackoff) -> None:

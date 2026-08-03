@@ -439,8 +439,7 @@ def test_to_tables_places_each_attempt_on_the_calls_timeline() -> None:
 def test_to_tables_measures_time_to_first_item_from_the_attempts_own_start() -> None:
     """The column is the gap from this attempt's start, not from the call's, and null with no stamp.
 
-    Reading it against the call's start would charge a reopened stream with every earlier attempt
-    and the waits between them.
+    The attempt's own start excludes earlier attempts and their waits.
     """
     _, attempts = to_tables(
         _failure(

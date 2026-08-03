@@ -7,16 +7,14 @@ and an async context manager whose entry opens the request and whose exit closes
 A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
 Assembling the turn and reading what it produced live behind AdapterStream.final();
 the handle owns retry, pacing, and accounting.
-Connection failures before the first yielded item are retried;
-after the first yielded item nothing is retried,
-because replaying items the caller already consumed would duplicate output.
+Transient failures before open_stream() returns are retried.
+Failures from an open stream are never retried.
 Each open attempt is its own SharedBackoff admitted() block, and a successful open leaves the
 block held, so the admission spans the stream from opening until it closes or exhausts and a
 long-lived stream counts against capacity for its whole life.
-A failure the item iterator raises exits the block, so its verdict is recorded on both paths and
-a rate limit pauses the domain whether or not the stream that hit it could still reopen.
-A transient failure past the first item ends the call as RetryUnavailableError, as does one the
-assembled response reports.
+An iterator failure exits the block with its verdict.
+A transient iterator failure ends the call as RetryUnavailableError.
+An assembled response can also end the call that way.
 """
 
 import asyncio
@@ -95,10 +93,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     ToolCallTurn[OutputT] on a structured tool-bound binding, and the default Never everywhere else,
     which stream_one's overloads state so only that binding's callers see the arm.
 
-    max_attempts bounds one phase only: reaching the first item. Past it nothing is retried,
-    whatever the budget still holds: a transient failure an item pull raises, and one the assembled
-    response reports, each end the call as RetryUnavailableError. Reopening is the application's to
-    do, by calling stream_one again.
+    max_attempts bounds requests sent before open_stream() returns.
+    Failures from an open stream are never retried.
+    Transient iterator failures end the call as RetryUnavailableError.
+    Call stream_one again to retry after that error.
     """
 
     def __init__(
@@ -150,7 +148,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._items: AsyncIterator[StreamItem] | None = None
         self._ledger = _CallLedger(model=adapter.model, provider_name=adapter.provider_name)
         self._admission: Admission | None = None
-        self._yielded_any = False
         self._ended_at_monotonic_seconds: float | None = None
         self._conclusion: GenerateResult[OutputT] | Exception | None = None
         """What concluded the call: the success arm, or the error that ended it; None until it ends."""
@@ -166,8 +163,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     def _request_for_this_call(self) -> RequestParams:
         """Return the request every attempt of this call sends, building it on the first ask.
 
-        A reopen after a pre-first-item failure asks again and gets the same request, so one call
-        puts one request on the wire however many streams it opens.
+        Every open attempt gets the same request.
 
         Raises:
             InvalidRequestError: build_request returned InvalidRequest, so nothing
@@ -424,7 +420,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     def _terminal_error_or_none(
         self, exc: Exception, *, verdict: Verdict | None, stream_billing: Billing | None
     ) -> GenerationError | None:
-        """Map one attempt failure to the terminal error to propagate, or None when a retry may fix it.
+        """Map one attempt failure to its terminal error.
+
+        Return None when the adapter classifies the failure as transient.
 
         Reached only for exceptions, which by the adapter contract are attempts the adapter read no
         outcome from: what it did read it reports as a ResponseOutcome member, which this handle
@@ -435,14 +433,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         A terminal failure's name comes from classify, mapped exactly as BoundLLM._terminal_error
         maps it; anything classify cannot place lands on UnknownExceptionError.
 
-        stream_billing is what the open stream has reported, None where no stream is open and None
-        again where an open one has reported nothing. A provider that reports counters before its
-        first item has already billed by the time one of these errors arrives, so the reading is
-        what keeps that attempt accountable.
+        stream_billing is what the open stream has reported.
+        It is None when no stream is open.
+        It is also None when the open stream reported nothing.
 
-        The request id goes to the ledger before the retry decision, so an attempt this handle will
-        retry carries it too. An open stream is the second source: a connection that drops mid-turn
-        raises an error carrying no id, while the stream still holds the headers the 200 arrived with.
         """
         request_id = self._adapter.request_id_from_error(exc)
         if request_id is None and self._adapter_stream is not None:
@@ -533,19 +527,16 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def __anext__(self) -> StreamItem:
         """Return the next item.
 
-        Every error but StopAsyncIteration finishes the handle, so nothing later reopens the request,
-        and every such error but a cancellation is the call's conclusion, which final() replays.
+        Every error except StopAsyncIteration finishes the handle.
+        Every Exception becomes the conclusion final() replays.
 
         Raises:
-            RetryUnavailableError: the stream failed after items were yielded, so no retry was
-                available; __cause__ is the adapter's verdict on that failure.
-            InvalidRequestError: the adapter classified an item or reopen error as a rejection of
-                the request.
-            ProviderDeclaredFinalError: the provider declared an item or reopen error final.
-            UnknownExceptionError: the adapter could not place an item or reopen exception.
-            RetriesExhaustedError: a pre-first-item failure spent the retry budget.
+            RetryUnavailableError: an open stream failed transiently.
+            InvalidRequestError: the adapter classified an item error as an invalid request.
+            ProviderDeclaredFinalError: the provider declared an item error final.
+            UnknownExceptionError: the adapter could not classify an item exception.
             StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
-            ParserContractError: the adapter's parse violated its contract on an item or reopen failure.
+            ParserContractError: the adapter's parse violated its contract on an item failure.
             StopAsyncIteration: the stream is exhausted.
             RuntimeError: the handle is unopened or finished.
         """
@@ -568,62 +559,43 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             raise
 
     async def _next_item(self) -> StreamItem:
-        """Pull the next item, reopening for a transient failure that precedes the first item.
+        """Pull the next item without retrying the request.
 
         Raises what __anext__ documents.
         """
-        while True:
-            assert self._items is not None
-            try:
-                item = await self._items.__anext__()
-            except StopAsyncIteration:
-                if self._ended_at_monotonic_seconds is None:
-                    self._ended_at_monotonic_seconds = time.monotonic()
-                _ = await self._exit_admission(None)
-                raise
-            except StreamProtocolError:
+        assert self._items is not None
+        try:
+            item = await self._items.__anext__()
+        except StopAsyncIteration:
+            if self._ended_at_monotonic_seconds is None:
+                self._ended_at_monotonic_seconds = time.monotonic()
+            _ = await self._exit_admission(None)
+            raise
+        except StreamProtocolError:
+            await self._close_adapter_stream()
+            raise
+        except Exception as exc:
+            stream_billing = self._billing_reported()
+            verdict = await self._exit_admission(exc)
+            terminal = self._terminal_error_or_none(
+                exc, verdict=verdict, stream_billing=stream_billing
+            )
+            if terminal is not None:
                 await self._close_adapter_stream()
-                raise
-            except Exception as exc:
-                # Read before any close, which drops the stream that reports it. A provider that
-                # reports counters before its first item has already billed for this attempt,
-                # whichever of the paths below it takes.
-                stream_billing = self._billing_reported()
-                # The admission exits with the failure before the stream closes, so the verdict is
-                # recorded first and the close's own exit finds nothing left to do.
-                verdict = await self._exit_admission(exc)
-                terminal = self._terminal_error_or_none(
-                    exc, verdict=verdict, stream_billing=stream_billing
-                )
-                if terminal is not None:
-                    await self._close_adapter_stream()
-                    raise terminal from exc
-                if self._yielded_any:
-                    wrapped = self._transient_error(
-                        exc, f"stream failed after items were yielded: {exc}", verdict
-                    )
-                    self._record_transient_error(wrapped, stream_billing)
-                    await self._close_adapter_stream()
-                    raise RetryUnavailableError(
-                        call=self._ledger.freeze(), request=self._request
-                    ) from wrapped
-                self._record_transient_error(
-                    self._transient_error(exc, str(exc), verdict), stream_billing
-                )
-                await self._close_adapter_stream()
-                await self._backoff_or_exhaust(exc, verdict)
-                await self._open_stream_with_retries()
-                continue
-            except BaseException:
-                # CancelledError is a BaseException the clauses above do not catch.
-                # Cancelling an item pull in its own task leaves the block open, so waiting for the
-                # adapter stream's close would strand the permit. Exit the admission, then let the
-                # cancellation propagate.
-                _ = await self._exit_admission(None)
-                raise
-            self._ledger.stamp_first_item()
-            self._yielded_any = True
-            return item
+                raise terminal from exc
+            wrapped = self._transient_error(
+                exc, f"open stream failed during iteration: {exc}", verdict
+            )
+            self._record_transient_error(wrapped, stream_billing)
+            await self._close_adapter_stream()
+            raise RetryUnavailableError(
+                call=self._ledger.freeze(), request=self._request
+            ) from wrapped
+        except BaseException:
+            _ = await self._exit_admission(None)
+            raise
+        self._ledger.stamp_first_item()
+        return item
 
     @overload
     async def final(self: "StreamHandle[OutputT, Never]") -> Response[OutputT]: ...
@@ -643,11 +615,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         Raises:
             StreamProtocolError: the provider's event stream ended without a terminal event.
-            InvalidRequestError: draining the stream hit an item or reopen error the adapter
-                classified as a rejection of the request.
-            ProviderDeclaredFinalError: draining hit an item or reopen error the provider declared final.
-            UnknownExceptionError: draining hit an item or reopen exception the adapter could not place.
-            RetriesExhaustedError: draining the stream spent the retry budget on a pre-first-item failure.
+            InvalidRequestError: the adapter classified an item error as an invalid request.
+            ProviderDeclaredFinalError: the provider declared an item error final.
+            UnknownExceptionError: the adapter could not classify an item exception.
             RefusalError: the adapter reported the assembled response as Refusal,
                 carrying this handle's attempt records.
             MaxCompletionTokensExceededError: the adapter reported it as MaxCompletionTokensExceeded; likewise.
@@ -656,9 +626,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
             UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
             ProviderFailedTerminallyError: the adapter reported it as ProviderFailedTerminally; likewise.
-            RetryUnavailableError: the adapter reported the assembled response as
-                ProviderFailedTransiently; that response ends the stream, so no retry was available.
-                That 200's billing and turn are on its attempt record.
+            RetryUnavailableError: iteration failed transiently after open_stream() returned.
+                An assembled response can also report ProviderFailedTransiently.
             ParserContractError: draining hit a failure whose parse violated its contract.
             RuntimeError: the handle is unopened, or it is finished with no conclusion stored
                 (drained to exhaustion, then left the block).

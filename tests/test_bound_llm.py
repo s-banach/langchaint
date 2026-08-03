@@ -350,20 +350,6 @@ class _ProviderFailedTransientlyStream(_FakeStream):
         return _billed(_PROVIDER_FAILED_TRANSIENTLY)
 
 
-class _YieldsNothingThenFailsTransientlyStream(_ProviderFailedTransientlyStream):
-    """A stream whose run failed before emitting anything, so it yields no item at all."""
-
-    @override
-    async def items(self) -> AsyncIterator[StreamItem]:
-        """Emit no item at all, so the failure is visible only in the assembled response.
-
-        Yields:
-            Nothing: the unreachable yield below is what makes this an async generator.
-        """
-        return
-        yield  # pragma: no cover
-
-
 class _ProviderFailedTerminallyStream(_FakeStream):
     """A stream whose assembled response reports a provider failure a resend would hit again."""
 
@@ -435,7 +421,7 @@ class _UnnamedItemErrorStream(_FakeStream):
 
 
 class _FailsAfterFirstItemStream(_FakeStream):
-    """A stream that yields one item and then fails, past the point where reopening is allowed."""
+    """A stream that yields one item and then fails."""
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -473,46 +459,31 @@ class _SlowAfterFirstItemStream(_FakeStream):
 
 
 class _FailsBeforeFirstItemStream(_FakeStream):
-    """A stream whose first items() call fails transiently before yielding, then behaves normally.
+    """A stream whose items() fails transiently before yielding."""
 
-    One instance is reused across reopens, so the counter records which items() call is running.
-    """
-
-    def __init__(self) -> None:
-        """Start with no items() call made."""
-        super().__init__()
-        self.items_calls = 0
-
-    def _first_call_error(self) -> Exception:
-        """Return the error the first items() call raises."""
+    def _item_error(self) -> Exception:
+        """Return the error items() raises."""
         return TransientError("dropped before the first item")
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Fail before the first yield on the first call, else yield the base sequence.
+        """Fail before the first yield.
 
         Yields:
-            Nothing on the first call; the base class's items on every later call.
+            Nothing.
 
         Raises:
-            Exception: _first_call_error's, on the first call, before the first yield.
+            Exception: _item_error's result.
         """
-        self.items_calls += 1
-        if self.items_calls == 1:
-            raise self._first_call_error()
-        async for item in super().items():
-            yield item
+        raise self._item_error()
+        yield "unreachable"
 
 
 class _FailsWithARequestIdBeforeFirstItemStream(_FailsBeforeFirstItemStream):
-    """A stream whose first items() call fails on an error naming its own request.
-
-    That error is not a TransientError, so reopening it takes an adapter whose classify calls it
-    transient.
-    """
+    """A stream whose items() failure names its request."""
 
     @override
-    def _first_call_error(self) -> Exception:
+    def _item_error(self) -> Exception:
         """Name an error carrying the request id of the attempt it ends."""
         return _RequestIdError("dropped before the first item", "req-from-items-error")
 
@@ -609,7 +580,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
     ) -> None:
         """Store the failure scripts, echo mode, and the stream open_stream returns.
 
-        failures scripts send; open_failures scripts open_stream, exercising the pre-first-item stream retry path.
+        failures scripts send.
+        open_failures scripts open_stream() failures.
         invalid_requests scripts build_request, one entry per call, and an entry is reported
         instead of a request, so neither send nor open_stream is reached for that call.
         send_seconds > 0 makes each send suspend that long,
@@ -969,12 +941,10 @@ def test_retry_recovers_after_a_transient_failure() -> None:
 
 
 def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
-    """Two transient failures then a success is one build and three sends, on both request paths.
+    """Two transient failures produce one build and three sends.
 
-    Building per attempt would let a retry put different bytes on the wire than the attempt it
-    retries, so a failure's archived request would not be what the later attempts sent.
-    The third case is the stream's other opening site, the reopen after a failure before the first
-    item, which reaches open_stream without passing the entry that built the request.
+    build_request() runs once per call.
+    Every retry sends the same RequestParams.
     """
 
     async def streamed_counts(adapter: _FakeAdapter) -> tuple[int, int]:
@@ -988,7 +958,7 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
         return bound.build_count, bound.open_count
 
     async def scenario() -> None:
-        """Drive one generate_one and two streams, each through a failure that reopens or retries."""
+        """Drive generate_one and stream_one through two transient failures."""
         sent_adapter = _FakeAdapter(
             failures=[TransientError("boom"), TransientError("boom again")]
         )
@@ -1003,7 +973,6 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
             open_failures=[TransientError("boom"), TransientError("boom again")]
         )
         assert await streamed_counts(retried) == (1, 3)
-        assert await streamed_counts(_FakeAdapter(stream=_FailsBeforeFirstItemStream())) == (1, 2)
 
     asyncio.run(scenario())
 
@@ -2261,39 +2230,11 @@ def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_cancelled_during_a_reopen_releases_the_slot() -> None:
-    """A cancellation while the pre-first-item retry is reopening returns its permit.
-
-    The reopen runs inside _next_item's transient-failure handler, which no sibling except clause covers.
-    _open_stream_with_retries exits the admission in its own BaseException handler, so the handle
-    block's exit is not what returns the permit.
-    """
-
-    async def scenario() -> None:
-        """Time out an iteration whose second open never returns, then prove the permit is free."""
-        shared_backoff = _fast_shared_backoff(capacity=1)
-        adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream(), hang_from_open=2)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
-
-        async def drain() -> None:
-            """Enter and iterate; the first items() fails, so the retry reopens into the hang."""
-            async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-                async for _item in handle:
-                    pass
-
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(drain(), timeout=0.05)
-        async with shared_backoff.admitted(budget=1.0):
-            pass
-
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
 def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
     """A cancellation unwinding the block sets abandoned to what the stream could state.
 
     The record's attempt_records are empty because the streaming request is the in-flight attempt:
-    only pre-first-item open failures settle records on a stream.
+    only completed attempts settle records on a stream.
     This stream reports no running usage, which is what an openai stream does, so usage folds to
     ZERO_USAGE and billing_in_flight is None.
     """
@@ -2498,14 +2439,7 @@ _MID_STREAM_RETRY_AFTER_SECONDS = 30.0
 
 
 def test_a_mid_stream_rate_limit_pauses_the_domain() -> None:
-    """A rate limit that lands after the first item still pauses admission and reaches the caller.
-
-    This stream is past reopening, so nothing here retries; the admitted() block still exits with
-    the failure, so the pause protects every other caller sharing the domain, and dropping it
-    because this one stream is finished would leave them all sending into the limit. The
-    RetryUnavailableError's __cause__ carries the same verdict and the same server-stated wait, so
-    an application reading it sees the rate limit rather than an unclassified failure.
-    """
+    """An iterator rate limit pauses admission and reaches the caller."""
 
     async def scenario() -> None:
         """Let the iteration fail after one item, then read the domain's pause and the error."""
@@ -2689,7 +2623,7 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
                         pass
                 (record,) = raised.value.attempt_records
                 assert isinstance(record.error, TransientError)
-                assert "after items were yielded" in str(record.error)
+                assert "open stream failed during iteration" in str(record.error)
                 await asyncio.sleep(60)
 
         with pytest.raises(TimeoutError):
@@ -2957,29 +2891,6 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
     asyncio.run(scenario())
 
 
-def test_stream_that_yielded_nothing_still_fails_transiently_without_reopening() -> None:
-    """A stream that emitted no item and then reports the failure spends one attempt, not the budget.
-
-    The retry budget is untouched and the stream is not reopened: the outcome is read from the
-    assembled response, which arrives when the stream is over, whether or not it yielded anything.
-    """
-
-    async def scenario() -> None:
-        """Drain a stream that yields nothing, then read what final() raises."""
-        adapter = _FakeAdapter(stream=_YieldsNothingThenFailsTransientlyStream())
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=3).bind(
-            automatic_prompt_caching=True
-        )
-        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            assert [item async for item in handle] == []
-            with pytest.raises(RetryUnavailableError) as retry_unavailable:
-                await handle.final()
-        assert retry_unavailable.value.attempts == 1
-        assert adapter.bound_adapters[0].open_count == 1
-
-    asyncio.run(scenario())
-
-
 def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_reason() -> None:
     """The outcome fails the call once, and the provider's own text is the error's message."""
 
@@ -3039,17 +2950,17 @@ def test_a_stream_that_drops_mid_turn_records_the_id_its_open_response_carried()
     """
 
     async def scenario() -> None:
-        """Drain a stream whose first items() call fails before yielding."""
+        """Read a failure raised before the first item."""
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            _ = [item async for item in handle]
-            response = await handle.final()
-        failed, _succeeded = response.attempt_records
-        assert failed.response_id is None
-        assert failed.request_id == "req-fake-stream"
+            with pytest.raises(RetryUnavailableError) as raised:
+                await handle.final()
+        (record,) = raised.value.attempt_records
+        assert record.response_id is None
+        assert record.request_id == "req-fake-stream"
 
     asyncio.run(scenario())
 
@@ -3058,7 +2969,7 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
     """The error describes the failure, so its id wins where both channels have one."""
 
     async def scenario() -> None:
-        """Drain a stream whose first items() call fails with an error naming its request."""
+        """Read an item failure naming its request."""
         adapter = _FakeAdapter(
             stream=_FailsWithARequestIdBeforeFirstItemStream(), classify_result="transient"
         )
@@ -3066,10 +2977,10 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            _ = [item async for item in handle]
-            response = await handle.final()
-        failed, _succeeded = response.attempt_records
-        assert failed.request_id == "req-from-items-error"
+            with pytest.raises(RetryUnavailableError) as raised:
+                await anext(handle)
+        (record,) = raised.value.attempt_records
+        assert record.request_id == "req-from-items-error"
 
     asyncio.run(scenario())
 
@@ -3098,7 +3009,7 @@ def test_a_request_id_on_the_assembled_response_outranks_the_streams_own() -> No
 
 
 def test_stream_retry_populates_attempt_records() -> None:
-    """A pre-first-item connection failure lands as an errored record before the success record.
+    """An open_stream() failure precedes the successful attempt record.
 
     The stream path stages the assembled response's identity too, so the succeeding record carries
     what a sent one does, and the failed open carries the request id its error named.
@@ -3176,26 +3087,6 @@ def test_a_non_stream_attempt_leaves_its_first_item_stamp_unset() -> None:
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = response.attempt_records
         assert record.first_item_at_monotonic_seconds is None
-
-    asyncio.run(scenario())
-
-
-def test_a_reopened_stream_stamps_its_own_first_item() -> None:
-    """An attempt that reached no item stays null; the reopen that did stamps within its own bracket."""
-
-    async def scenario() -> None:
-        """Drain a stream whose first items() call fails before yielding."""
-        adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
-            automatic_prompt_caching=True
-        )
-        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            _ = [item async for item in handle]
-            response = await handle.final()
-        failed, succeeded = response.attempt_records
-        assert failed.first_item_at_monotonic_seconds is None
-        assert succeeded.first_item_at_monotonic_seconds is not None
-        assert succeeded.started_at_monotonic_seconds <= succeeded.first_item_at_monotonic_seconds
 
     asyncio.run(scenario())
 
@@ -3299,24 +3190,23 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
     asyncio.run(scenario())
 
 
-def test_stream_item_failure_before_the_first_item_reopens_and_retries() -> None:
-    """A transient failure from items() before any item reopens the stream and records both attempts."""
+def test_stream_item_failure_after_open_is_not_retried() -> None:
+    """A transient iterator failure ends the open stream."""
 
     async def scenario() -> None:
-        """Drain a stream whose first items() call fails before yielding."""
+        """Read a transient failure before the first item."""
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
         )
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            collected_items = [item async for item in handle]
-            response = await handle.final()
-        assert collected_items == ["a", "b", _FAKE_TOOL_CALL]
-        assert adapter.bound_adapters[0].open_count == 2
-        assert response.attempts == 2
-        failed, succeeded = response.attempt_records
-        assert str(failed.error) == "dropped before the first item"
-        assert succeeded.error is None
+            with pytest.raises(RetryUnavailableError) as raised:
+                await anext(handle)
+        assert adapter.bound_adapters[0].open_count == 1
+        assert raised.value.attempts == 1
+        (record,) = raised.value.attempt_records
+        assert str(record.error) == "dropped before the first item"
+        assert record.first_item_at_monotonic_seconds is None
 
     asyncio.run(scenario())
 
@@ -3383,34 +3273,6 @@ def test_an_unplaceable_mid_stream_error_records_the_attempt_with_nothing_report
         assert record.usage == ZERO_USAGE
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
-def test_a_stream_that_broke_before_its_first_item_records_what_the_provider_reported() -> None:
-    """A provider reporting counters before its first item has already billed for that attempt.
-
-    anthropic prices its running snapshot from the turn's first event, which carries no item, so
-    an attempt that reopens after failing there is not free. The whole call's usage folds both
-    records, so the reopened success does not erase what the failed attempt cost.
-    """
-
-    async def scenario() -> None:
-        """Drain a stream whose first items() call fails before yielding, then read both records."""
-        stream = _FailsBeforeFirstItemStream()
-        stream._usage_reported = _USAGE_STREAM
-        adapter = _FakeAdapter(stream=stream)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
-            automatic_prompt_caching=True
-        )
-        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            async for _item in handle:
-                pass
-            response = await handle.final()
-        failed, succeeded = response.attempt_records
-        assert failed.usage == _USAGE_STREAM
-        assert succeeded.usage == _USAGE_STREAM
-        assert response.usage == Usage.sum_of((_USAGE_STREAM, _USAGE_STREAM))
-
-    asyncio.run(scenario())
 
 
 def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
@@ -3699,7 +3561,7 @@ def test_stream_releases_its_permit_when_exhausted() -> None:
 
 
 def test_a_rate_limited_stream_open_pauses_the_domain_and_the_retry_succeeds() -> None:
-    """A rate-limited open pauses the domain, and the reopened stream completes normally."""
+    """A rate-limited open pauses the domain before its retry succeeds."""
 
     async def scenario() -> None:
         """Retry a stream open through a rate-limit failure, then finish the stream."""

@@ -1540,9 +1540,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
-            Exception: the inner stream raised (a transient failure past the first item, a rejected
-                request, an error langchaint does not retry, a protocol violation); the span is attributed by what the
-                exception is, takes error status, and ends before the re-raise.
+            Exception: the inner stream raised after open_stream() returned.
         """
         if self._span is None or self._span_ended:
             # Never entered, or the span already closed: the inner handle raises, and recording that
@@ -1628,9 +1626,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         without touching the span again.
 
         Raises:
-            GenerationError: the inner final() raised a terminal per-item result (a refusal or a truncation
-                on the structured path, retries exhausted while draining, a rejected reopen, or a
-                provider error langchaint does not retry); the span is attributed and closed first.
+            GenerationError: inner final() raised a terminal per-item result.
             StreamProtocolError: the provider's event stream ended without a terminal event;
                 the span records it and closes.
         """

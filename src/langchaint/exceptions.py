@@ -103,8 +103,7 @@ class GenerationError(_CallCarrier, Exception):
 
     The base for the non-retriable per-item outcomes:
     RetriesExhaustedError (the retry budget ran out on transient errors),
-    RetryUnavailableError (a transient failure on a stream, which retries only failures raised
-    before its first item),
+    RetryUnavailableError (a transient failure from an open stream),
     RefusalError (no structured output: the model refused or a provider filter blocked the turn),
     MaxCompletionTokensExceededError (the structured response hit the token cap before its JSON parsed),
     EmptyTurnError (the model finished the turn and produced nothing),
@@ -241,11 +240,11 @@ class RetriesExhaustedError(GenerationError):
 class RetryUnavailableError(GenerationError):
     """A transient failure a retry may have fixed, on a call where no retry was available.
 
-    Raised only inside a stream_one block, on the two transient failures a stream does not retry:
-    one an item pull raised after the caller already held part of the turn, and one the assembled
-    response reported, which arrives when the stream is already over. Either ends the call whatever
-    the retry budget still holds. A stream that failed before its first item is reopened instead,
-    under that budget. Reopen after this error by calling stream_one again with the same GenerationInput.
+    Raised only inside a stream_one block.
+    An iterator failure can raise it after open_stream() returns.
+    An assembled response can also report a transient failure.
+    Either ends the call regardless of the remaining retry budget.
+    Call stream_one again with the same GenerationInput to retry.
 
     The failure itself is the TransientError on the last attempt record, and is __cause__ as well:
     it carries the adapter's own message, retry_after_seconds, and is_rate_limit.

@@ -83,15 +83,13 @@ Mapping decisions:
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
 
-import base64
 from abc import ABC
-from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
 
 import openai
-from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI, Omit, omit
+from openai import AsyncOpenAI, Omit, omit
 from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
@@ -148,20 +146,15 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedTurn,
     narrowed_request,
-    record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     request_id_from_raw,
     request_json,
-    retry_after_seconds_from_headers,
-    terminal_classification_from_response,
-    verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.exceptions import StreamProtocolError, TransientError
+from langchaint.exceptions import StreamProtocolError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
-    ImagePart,
     Message,
     Part,
     ReasoningTrace,
@@ -172,56 +165,31 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import Billing, category_cost
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from langchaint.openai.shared import (
+    _DEFAULT_TIER,
+    _DISPOSITION_BY_ERROR_CODE,
+    _UNPRICED,
+    OPENAI_FAILURE_TYPES,
+    PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
+    OpenAIPricedServiceTier,
+    OpenAIPricingTable,
+    OpenAIServiceTier,
+    _image_data_uri,
+    _priced_tier,
+    classify_openai,
+    parse_openai,
+    request_id_from_openai_error,
+    require_prompt_cache_options_support,
+)
+from langchaint.pricing import Billing, require_pricing_key
+from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
-from langchaint.usage import Usage
-
-_PAUSE_STATUSES = frozenset({429, 503})
-"""429 rate limits and both documented 503 forms: the whole account is throttled, so all pause."""
-
-_SPEND_LIMIT_CODES = frozenset({
-    "credit_balance_exhausted",
-    "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded",
-    "organization_usage_limit_exceeded",
-})
-"""The error.code values whose 429 no wait restores: credits or a set spend limit ran out."""
-
-_RETRY_THIS_ONE_STATUSES = frozenset({500, 408, 409})
-"""One request's server-side failure or collision, retried without pausing siblings."""
-
-_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404})
-"""The statuses that reject this request; a resend fails the same way."""
-
-PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""How often parse_openai fell to a status-family default, keyed by status and error type.
-
-A diagnostic surface, read by no decision: a growing key names a status or error type the
-tables above should learn.
-"""
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
 
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
 """How much readable text to ask the API for, the values reasoning.summary takes."""
-
-type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
-"""What a request may ask for, and what a response reports (openai 2.45.0 types both with this literal).
-
-The API documents the response value as the processing mode actually used and says it may differ
-from the value the request set, so the tier is read off each response rather than assumed.
-"""
-
-type OpenAIPricedServiceTier = Literal["default", "flex", "scale", "priority", "fast"]
-"""The pricing mapping's key: the tiers a caller can hold rates for.
-
-"auto" is excluded. It is in the response literal only because request and response share one type,
-and it names no processing mode, so it is not a tier anyone has a rate for.
-"""
-
-_DEFAULT_TIER: OpenAIPricedServiceTier = "default"
 
 
 def _wire_reasoning(
@@ -310,11 +278,6 @@ class _OpenAIRequestParams(RequestParams):
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
         return request_json(self, omitted_class=Omit)
-
-
-def _image_data_uri(image_part: ImagePart) -> str:
-    encoded_data = base64.b64encode(image_part.data).decode("ascii")
-    return f"data:{image_part.media_type};base64,{encoded_data}"
 
 
 def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
@@ -468,41 +431,6 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]
         }
         for tool_schema in tool_schemas
     ]
-
-
-type _FailureDisposition = Literal["transient", "terminal"]
-
-_DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
-    "server_error": "transient",
-    "rate_limit_exceeded": "transient",
-    "vector_store_timeout": "transient",
-    "invalid_prompt": "terminal",
-    "data_residency_mismatch": "terminal",
-    "bio_policy": "terminal",
-    "invalid_image": "terminal",
-    "invalid_image_format": "terminal",
-    "invalid_base64_image": "terminal",
-    "invalid_image_url": "terminal",
-    "image_too_large": "terminal",
-    "image_too_small": "terminal",
-    "image_parse_error": "terminal",
-    "image_content_policy_violation": "terminal",
-    "invalid_image_mode": "terminal",
-    "image_file_too_large": "terminal",
-    "unsupported_image_media_type": "terminal",
-    "empty_image_file": "terminal",
-    "failed_to_download_image": "terminal",
-    "image_file_not_found": "terminal",
-}
-"""Whether a resend may get past the failure each ResponseError.code names (openai 2.48.0).
-
-Every member of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
-unknown-code path below is reached only by a code newer than the installed SDK.
-The three transient codes are read off their names: the SDK documents none of the codes, and these
-three name a condition of the moment while every other names a property of the request.
-failed_to_download_image is terminal for that reason: a URL the caller got wrong fails identically
-on every resend.
-"""
 
 
 def _provider_failure(
@@ -674,105 +602,6 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     return AssistantMessage(turn=tuple(turn))
 
 
-def _priced_tier(service_tier: OpenAIServiceTier | None) -> OpenAIPricedServiceTier:
-    """Which rates a response asks for: what it reports, or the default tier when it names none.
-
-    "auto" is a request word that names no processing mode, and the API documents the response
-    field as the mode actually used, so a response carrying it says nothing about what served it.
-    It prices at the default key like a response reporting no tier at all, rather than as NaN:
-    the account was most likely on the default tier, and a number that may be wrong by a tier
-    multiplier beats destroying the cost of a call that was paid for.
-    """
-    if service_tier is None or service_tier == "auto":
-        return _DEFAULT_TIER
-    return service_tier
-
-
-@dataclass(frozen=True, kw_only=True)
-class OpenAIPricingTable:
-    """One model's rates at one OpenAI service tier, one rate per priced category.
-
-    cache_write_usd_per_million_tokens applies because OpenAI bills cache writes (reported as
-    input_tokens_details.cache_write_tokens) starting with gpt-5.6.
-
-    An adapter holds one table per service tier it can price and selects by the tier the response
-    reports, so a response served at a tier the caller supplied no table for costs NaN
-    rather than these rates.
-    """
-
-    input_cache_none_usd_per_million_tokens: float
-    output_usd_per_million_tokens: float
-    cache_read_usd_per_million_tokens: float
-    cache_write_usd_per_million_tokens: float
-
-    def price(
-        self,
-        *,
-        service_tier: str,
-        usage_raw: BaseModel | None,
-        input_tokens_cache_read: int,
-        input_tokens_cache_write: int,
-        input_tokens_cache_none: int,
-        output_tokens: int,
-        output_tokens_reasoning: int,
-    ) -> Billing:
-        """Price one response's counters at these rates.
-
-        The counters arrive as arguments rather than in a counts object,
-        which would exist only to be unpacked again one call later.
-        output_tokens_reasoning buys no cost, being the reasoning share of output_tokens and billed
-        at the output rate; it is a parameter because the returned Usage carries it.
-
-        The total is the sum of the four category costs, so the parts are individually meaningful
-        and sum to cost_in_usd exactly; that association differs from a fused single-division chain
-        only at sub-ULP scale, immaterial once billing rounds to cents.
-
-        Raises:
-            pydantic.ValidationError: a counter is negative.
-        """
-        return Billing(
-            usage=Usage(
-                input_tokens_cache_read=input_tokens_cache_read,
-                input_tokens_cache_write=input_tokens_cache_write,
-                input_tokens_cache_none=input_tokens_cache_none,
-                output_tokens=output_tokens,
-                output_tokens_reasoning=output_tokens_reasoning,
-                input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read, self.cache_read_usd_per_million_tokens
-                ),
-                input_tokens_cache_write_cost_in_usd=category_cost(
-                    input_tokens_cache_write, self.cache_write_usd_per_million_tokens
-                ),
-                input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
-                ),
-                output_tokens_cost_in_usd=category_cost(
-                    output_tokens, self.output_usd_per_million_tokens
-                ),
-            ),
-            service_tier=service_tier,
-            usage_raw=usage_raw,
-            input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
-            cache_write_usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
-            output_usd_per_million_tokens=self.output_usd_per_million_tokens,
-        )
-
-
-_UNPRICED = OpenAIPricingTable(
-    input_cache_none_usd_per_million_tokens=float("nan"),
-    output_usd_per_million_tokens=float("nan"),
-    cache_read_usd_per_million_tokens=float("nan"),
-    cache_write_usd_per_million_tokens=float("nan"),
-)
-"""The table an adapter prices at when the response reports a service tier it holds no table for.
-
-Every nonzero counter costs NaN and every zero counter costs zero, so the response's own numbers
-survive and the cost says it is unknown. Pricing at some other tier's rates instead would report a
-number wrong by that tier's multiplier, and raising would destroy a response that was paid for.
-"""
-
-
 def _billing_from_response(
     response: OpenAIResponse, pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable]
 ) -> Billing:
@@ -834,76 +663,6 @@ def _adapter_result[OutputT](
     )
 
 
-def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return per documented row family, the status-200 error codes included)
-    """Map one OpenAIResponsesAdapter.failure_types exception to its verdict.
-
-    The listed rows come from openai's error-code guide,
-    https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
-    _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
-    DoNotRetry because the guide states retrying those will not restore access;
-    _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    404 is in _DO_NOT_RETRY_STATUSES from the SDK rather than the guide: the SDK raises
-    NotFoundError for it (openai 2.51.0), and a resend of an unknown model or path fails the same way.
-    error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
-    still read insufficient_quota, so the type separates nothing.
-    A status 200 is a mid-stream error event _OpenAIStream.items raised on the live response, so
-    its code picks the verdict through _DISPOSITION_BY_ERROR_CODE: rate_limit_exceeded is
-    PauseAll as a 429 is, any other transient code is RetryThisOne, and a terminal code is
-    DoNotRetry, as is a code outside the table, counted as a fallthrough.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
-    status is DoNotRetry.
-    The status and the error code pick the verdict; a retry-after header only fills its
-    retry_after.
-    A TransientError takes verdict_from_transient_error's shared mapping.
-    Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
-    """
-    if isinstance(failure, TransientError):
-        return verdict_from_transient_error(failure)
-    if not isinstance(failure, openai.APIStatusError):
-        record_parse_fallthrough(
-            PARSE_FALLTHROUGH_COUNTS,
-            parse_name="parse_openai",
-            status_code=None,
-            error_type=type(failure).__name__,
-        )
-        return DoNotRetry()
-    retry_after = retry_after_seconds_from_headers(failure.response.headers)
-    if failure.status_code in _PAUSE_STATUSES:
-        if failure.code in _SPEND_LIMIT_CODES:
-            return DoNotRetry()
-        return PauseAll(retry_after=retry_after)
-    if failure.status_code in _RETRY_THIS_ONE_STATUSES:
-        return RetryThisOne(retry_after=retry_after)
-    if failure.status_code in _DO_NOT_RETRY_STATUSES:
-        return DoNotRetry()
-    if failure.status_code == 200:
-        disposition = (
-            None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
-        )
-        if disposition == "transient":
-            if failure.code == "rate_limit_exceeded":
-                return PauseAll(retry_after=retry_after)
-            return RetryThisOne(retry_after=retry_after)
-        if disposition is None:
-            record_parse_fallthrough(
-                PARSE_FALLTHROUGH_COUNTS,
-                parse_name="parse_openai",
-                status_code=failure.status_code,
-                error_type=failure.code,
-            )
-        return DoNotRetry()
-    record_parse_fallthrough(
-        PARSE_FALLTHROUGH_COUNTS,
-        parse_name="parse_openai",
-        status_code=failure.status_code,
-        error_type=failure.type,
-    )
-    if failure.status_code >= 500:
-        return RetryThisOne(retry_after=retry_after)
-    return DoNotRetry()
-
-
 class OpenAIResponsesAdapter(Adapter):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
@@ -913,18 +672,10 @@ class OpenAIResponsesAdapter(Adapter):
     provider_name_by_client_class is what tells them apart.
     """
 
-    provider_name_by_client_class: ClassVar[Mapping[type, str]] = {
-        AsyncBedrockOpenAI: "aws.bedrock",
-        AsyncAzureOpenAI: "azure.ai.openai",
-    }
-    """AsyncOpenAI is deliberately absent: it reaches whatever its base_url points at.
-
-    The two classes here each speak one platform's auth and URL scheme, so the class fixes the
-    provider. A plain AsyncOpenAI does not: pointing its base_url at another vendor's
-    OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached, all of them
-    gen_ai.provider.name values.
-    Mapping AsyncOpenAI to "openai" would make __init__ raise for every one of them.
-    """
+    provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
+        PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
+    )
+    """The shared openai-SDK map, whose docstring states why AsyncOpenAI is absent from it."""
 
     def __init__(
         self,
@@ -985,11 +736,7 @@ class OpenAIResponsesAdapter(Adapter):
                 comes back unknown.
                 Also raised by Adapter.__init__ when provider_name contradicts the client's class.
         """
-        if _DEFAULT_TIER not in pricing:
-            raise ValueError(
-                f"pricing for model {model!r} has no {_DEFAULT_TIER!r} key; "
-                f"it prices every response that reports no service tier, so it is required"
-            )
+        require_pricing_key(pricing, key=_DEFAULT_TIER, model=model)
         super().__init__(client=client, model=model, provider_name=provider_name)
         self.client = client.with_options(max_retries=0)
         self.pricing = pricing
@@ -1013,14 +760,11 @@ class OpenAIResponsesAdapter(Adapter):
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
-        if not binding.automatic_prompt_caching and not self.supports_prompt_cache_options:
-            raise ValueError(
-                f"model {self.model!r} was built with supports_prompt_cache_options False, "
-                "so prompt_cache_options is never sent. "
-                "prompt_cache_options is what carries automatic_prompt_caching False to the wire. "
-                "Bind automatic_prompt_caching=True, or set supports_prompt_cache_options True "
-                "if the model accepts it."
-            )
+        require_prompt_cache_options_support(
+            model=self.model,
+            automatic_prompt_caching=binding.automatic_prompt_caching,
+            supports_prompt_cache_options=self.supports_prompt_cache_options,
+        )
         instructions: str | None = None
         input_prefix: list[ResponseInputItemParam] = []
         if isinstance(binding.system_prompt, str):
@@ -1091,17 +835,8 @@ class OpenAIResponsesAdapter(Adapter):
             response_format=response_format,
         )
 
-    failure_types: ClassVar[tuple[type[Exception], ...]] = (
-        openai.APIStatusError,
-        TransientError,
-    )
-    """The exceptions parse_openai maps to a verdict.
-
-    APIStatusError catches every error status, not only the ones with their own subclass:
-    _make_status_error returns a specific subclass only for the statuses it lists and the bare
-    APIStatusError for every other one (openai 2.51.0), so a subclass list would silently drop
-    413, which openai maps to no class, and whatever status the provider adds next.
-    """
+    failure_types: ClassVar[tuple[type[Exception], ...]] = OPENAI_FAILURE_TYPES
+    """The shared tuple, whose docstring states why the bare APIStatusError covers every status."""
 
     @override
     def parse(self, failure: Exception) -> Verdict:
@@ -1110,33 +845,13 @@ class OpenAIResponsesAdapter(Adapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
-
-        APIConnectionError, which APITimeoutError subclasses, carries no response: a transport
-        failure that produced nothing parseable, transient.
-        An APIStatusError only arrives here after parse verdicted DoNotRetry, since every one is
-        in failure_types; terminal_classification_from_response names what it becomes.
-        Anything else the SDK raises is unknown_exception, which fails this item without a retry.
-        """
-        if isinstance(error, openai.APIConnectionError):
-            return "transient"
-        if not isinstance(error, openai.APIStatusError):
-            return "unknown_exception"
-        return terminal_classification_from_response(
-            status_code=error.response.status_code,
-            headers=error.response.headers,
-        )
+        """Delegate to classify_openai, whose docstring names each row."""
+        return classify_openai(error)
 
     @override
     def request_id_from_error(self, error: Exception) -> str | None:
-        """Read the request-id header off the SDK exception.
-
-        APIStatusError is the only openai exception carrying request_id, which it reads off the
-        error response's headers, None where that response carried none (openai 2.48.0).
-        """
-        if isinstance(error, openai.APIStatusError):
-            return error.request_id
-        return None
+        """Delegate to request_id_from_openai_error, which reads the SDK exception's header."""
+        return request_id_from_openai_error(error)
 
 
 class _OpenAIStream(AdapterStream):

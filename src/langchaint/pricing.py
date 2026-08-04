@@ -13,11 +13,29 @@ This module imports no SDK and no error class: a category the caller supplied no
 so an unpriced category needs no error.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from pydantic import BaseModel
 
 from langchaint.usage import Usage
+
+
+def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, model: str) -> None:
+    """Require the pricing key every response reporting no tier of its own prices at.
+
+    An adapter constructor calls this with the key its provider's tierless responses select
+    ("default", "ON_DEMAND"), so a missing key raises before the first request instead of pricing
+    every such response as NaN, with nothing said until the cost comes back unknown.
+
+    Raises:
+        ValueError: key is not in pricing.
+    """
+    if key not in pricing:
+        raise ValueError(
+            f"pricing for model {model!r} has no {key!r} key; "
+            f"it prices every response that reports no tier of its own, so it is required"
+        )
 
 
 def category_cost(tokens: int, usd_per_million_tokens: float) -> float:

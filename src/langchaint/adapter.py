@@ -263,10 +263,10 @@ class Binding:
 
     The parts form exists to carry cache_breakpoint marks inside the system prompt:
     the anthropic adapter renders one system text block per part,
-    and the openai adapter sends the parts as a developer-role input message ahead of the Sequence[Message]
+    and the openai Responses adapter sends the parts as a developer-role input message ahead of the Sequence[Message]
     (the SDK documents `instructions` as "a system (or developer) message inserted into the model's context",
     and only input message parts carry prompt_cache_breakpoint).
-    A plain str renders as one anthropic system block and as the openai instructions parameter.
+    A plain str renders as one anthropic system block and as the Responses adapter's instructions parameter.
     """
 
     tool_schemas: tuple[ToolSchema, ...]

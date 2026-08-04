@@ -73,7 +73,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `usage.py`: token accounting and the per-category costs that travel with it.
 - `checked_copy.py`: the base of langchaint's pydantic models.
 - `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.
-- `anthropic/`, `gemini/`, `openai/`: the backend subpackages; importing one requires its SDK.
+- `anthropic/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires the SDK it wraps (deepseek wraps the openai SDK).
 - `inference_params.py`: the inference parameters.
 - `tracing/`: the OTel subpackage; importing it requires opentelemetry-api, and it is off the top-level `__all__`.
 

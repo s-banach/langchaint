@@ -40,7 +40,7 @@ from openai.types.responses.response_usage import InputTokensDetails, OutputToke
 from pydantic import BaseModel
 
 from langchaint.anthropic.messages_adapter import AnthropicPricedServiceTier
-from langchaint.openai.responses_adapter import _DISPOSITION_BY_ERROR_CODE
+from langchaint.openai.shared import _DISPOSITION_BY_ERROR_CODE
 
 
 def _field_annotation(model: type[BaseModel], name: str) -> object:

@@ -58,7 +58,7 @@ A bare `str` generation_input is shorthand for `[UserMessage(content=generation_
 `BoundLLM` has `generate_one`, `generate_many`, and `stream_one`.
 
 **A constructor per backend returning a ready `LLM`.**
-`openai_model(...)`, `anthropic_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.
+`openai_model(...)`, `anthropic_model(...)`, `gemini_model(...)`, `deepseek_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.
 
 **One accounting contract for success and failure.**
 Success is a `Response[OutputT]`, or a `GenerateResult[OutputT]` on a structured tool-bound binding, and a terminal failure is a `GenerationError`.
@@ -99,12 +99,12 @@ Every provider reasoning element is re-sent verbatim on later requests, so tool-
 - No client-side guessing at provider rules.
 - No document or PDF part: convert before sending, rasterizing pages to `ImagePart` or extracting the text layer to `TextPart`.
 
-No Chat Completions adapter is built yet; OpenAI support is the Responses API.
-
 ## Layout
 
     src/langchaint/           the neutral core; imports no SDK
     src/langchaint/anthropic/ the anthropic backend
+    src/langchaint/deepseek/  the deepseek backend, over the openai SDK
+    src/langchaint/gemini/    the gemini backend
     src/langchaint/openai/    the openai backend
     src/langchaint/tracing/   the OTel tracing subpackage
     examples/                 one snippet file per subject and MIGRATING_FROM_LANGCHAIN.md

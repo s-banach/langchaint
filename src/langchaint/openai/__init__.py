@@ -1,4 +1,4 @@
-"""The openai backend: the Responses adapter, its model catalog, and pricing.
+"""The openai backend: the Responses and Chat Completions adapters, the model catalog, and pricing.
 
 Importing this subpackage requires the openai package;
 the import below raises a ModuleNotFoundError naming the package to install.
@@ -12,8 +12,9 @@ which makes Adapter.__init__ raise for AsyncBedrockOpenAI and AsyncAzureOpenAI:
 both subclass AsyncOpenAI, so the annotation cannot exclude them on its own.
 A base AsyncOpenAI is accepted whatever its base_url,
 so reaching an OpenAI-compatible endpoint through openai_model labels it "openai";
-a binding that should report the provider it actually reaches (groq and deepseek are gen_ai.provider.name values)
-is OpenAIResponsesAdapter(client=..., provider_name="groq", ...) wrapped in an LLM.
+a compatible endpoint serves Chat Completions, so reach it through OpenAIChatCompletionsAdapter
+with the provider_name it reaches (groq and deepseek are gen_ai.provider.name values),
+wrapped in an LLM, as langchaint.deepseek does.
 openai_bedrock_model is the constructor for OpenAI models served by Bedrock;
 Azure is OpenAIResponsesAdapter(client=AsyncAzureOpenAI(...),
 provider_name="azure.ai.openai", ...) wrapped in an LLM.
@@ -48,12 +49,15 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.llm import LLM
+from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
+    OpenAIResponsesAdapter,
+    ReasoningSummary,
+)
+from langchaint.openai.shared import (
     OpenAIPricedServiceTier,
     OpenAIPricingTable,
-    OpenAIResponsesAdapter,
     OpenAIServiceTier,
-    ReasoningSummary,
     parse_openai,
 )
 from langchaint.shared_backoff import SharedBackoff
@@ -311,6 +315,7 @@ def openai_bedrock_model(  # noqa: PLR0913 (the ready-LLM constructor states eve
 __all__ = [
     "OPENAI_PRICING",
     "PROMPT_CACHE_OPTIONS_MODELS",
+    "OpenAIChatCompletionsAdapter",
     "OpenAIModelName",
     "OpenAIPricedServiceTier",
     "OpenAIPricingTable",

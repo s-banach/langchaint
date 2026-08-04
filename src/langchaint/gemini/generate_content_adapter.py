@@ -118,7 +118,7 @@ from langchaint.messages import (
     TurnElement,
     UserMessage,
 )
-from langchaint.pricing import Billing, category_cost
+from langchaint.pricing import Billing, category_cost, require_pricing_key
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.usage import Usage
 
@@ -890,11 +890,7 @@ class GeminiGenerateContentAdapter(Adapter):
                 A non-Vertex client takes the caller's value, since its base_url decides what it
                 reaches.
         """
-        if _ON_DEMAND_TIER not in pricing:
-            raise ValueError(
-                f"pricing for model {model!r} has no {_ON_DEMAND_TIER!r} key; "
-                f"it prices every response that reports no traffic_type, so it is required"
-            )
+        require_pricing_key(pricing, key=_ON_DEMAND_TIER, model=model)
         if client.vertexai and provider_name != _VERTEX_PROVIDER_NAME:
             raise ValueError(
                 f"provider_name={provider_name!r} contradicts the client: "

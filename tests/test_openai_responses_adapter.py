@@ -83,7 +83,7 @@ from langchaint.adapter import (
 )
 from langchaint.call import ResponseIdentity
 from langchaint.conformance import AdapterConformance
-from langchaint.exceptions import StreamProtocolError, TransientError
+from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
     OpenAIPricedServiceTier,
     OpenAIPricingTable,
@@ -91,7 +91,6 @@ from langchaint.openai import (
     ReasoningSummary,
 )
 from langchaint.openai.responses_adapter import (
-    PARSE_FALLTHROUGH_COUNTS,
     _assistant_items,
     _assistant_message_from,
     _billing_from_response,
@@ -103,9 +102,14 @@ from langchaint.openai.responses_adapter import (
     _OpenAIStream,
     _wire_input,
     _wire_tool_choice,
-    parse_openai,
 )
+from langchaint.openai.shared import PARSE_FALLTHROUGH_COUNTS, parse_openai
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from tests.helpers import (
+    openai_sdk_errors_and_classifications,
+    openai_sdk_errors_and_verdicts,
+    status_error,
+)
 
 _DEFAULT_RATES = OpenAIPricingTable(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -1692,29 +1696,27 @@ def test_parse_openai_reads_retry_after_from_the_headers_without_letting_it_pick
     """
     assert parse_openai(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(retry_after=1.5)
     assert parse_openai(_rate_limit_error({})) == PauseAll(retry_after=None)
-    bad_request = _status_error(openai.BadRequestError, 400, {"retry-after": "7"})
+    bad_request = status_error(openai.BadRequestError, 400, {"retry-after": "7"})
     assert parse_openai(bad_request) == DoNotRetry()
 
 
 def test_parse_openai_does_not_retry_a_429_naming_a_spend_limit_code() -> None:
     """error.code separates the 429 no wait restores from the rate limit a pause absorbs."""
-    exhausted = _status_error(openai.RateLimitError, 429, error_code="credit_balance_exhausted")
+    exhausted = status_error(openai.RateLimitError, 429, error_code="credit_balance_exhausted")
     assert parse_openai(exhausted) == DoNotRetry()
-    throttled = _status_error(openai.RateLimitError, 429, error_code="rate_limit_exceeded")
+    throttled = status_error(openai.RateLimitError, 429, error_code="rate_limit_exceeded")
     assert parse_openai(throttled) == PauseAll(retry_after=None)
 
 
 def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:
     """An unlisted status lands one tagged count; a listed status leaves the counter alone."""
     before = dict(PARSE_FALLTHROUGH_COUNTS)
-    assert parse_openai(_status_error(openai.InternalServerError, 500)) == RetryThisOne(
+    assert parse_openai(status_error(openai.InternalServerError, 500)) == RetryThisOne(
         retry_after=None
     )
-    assert parse_openai(_status_error(openai.NotFoundError, 404)) == DoNotRetry()
+    assert parse_openai(status_error(openai.NotFoundError, 404)) == DoNotRetry()
     assert dict(PARSE_FALLTHROUGH_COUNTS) == before
-    assert parse_openai(_status_error(openai.APIStatusError, 599)) == RetryThisOne(
-        retry_after=None
-    )
+    assert parse_openai(status_error(openai.APIStatusError, 599)) == RetryThisOne(retry_after=None)
     tag = "status=599 type=None"
     assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
@@ -1726,11 +1728,11 @@ def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
     form does; a terminal code does not retry and, being a listed row, leaves the counter alone.
     """
     before = dict(PARSE_FALLTHROUGH_COUNTS)
-    server_error = _status_error(openai.APIStatusError, 200, error_code="server_error")
+    server_error = status_error(openai.APIStatusError, 200, error_code="server_error")
     assert parse_openai(server_error) == RetryThisOne(retry_after=None)
-    throttled = _status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded")
+    throttled = status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded")
     assert parse_openai(throttled) == PauseAll(retry_after=None)
-    blocked = _status_error(openai.APIStatusError, 200, error_code="invalid_prompt")
+    blocked = status_error(openai.APIStatusError, 200, error_code="invalid_prompt")
     assert parse_openai(blocked) == DoNotRetry()
     assert dict(PARSE_FALLTHROUGH_COUNTS) == before
 
@@ -1738,9 +1740,9 @@ def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
 def test_parse_openai_counts_a_status_200_code_outside_the_table_as_a_fallthrough() -> None:
     """An unknown code and an absent code on a 200 each land DoNotRetry and one tagged count."""
     before = dict(PARSE_FALLTHROUGH_COUNTS)
-    unknown = _status_error(openai.APIStatusError, 200, error_code="brand_new_code")
+    unknown = status_error(openai.APIStatusError, 200, error_code="brand_new_code")
     assert parse_openai(unknown) == DoNotRetry()
-    assert parse_openai(_status_error(openai.APIStatusError, 200)) == DoNotRetry()
+    assert parse_openai(status_error(openai.APIStatusError, 200)) == DoNotRetry()
     for tag in ("status=200 type=brand_new_code", "status=200 type=None"):
         assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
@@ -1757,39 +1759,6 @@ def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else(
     )
     assert adapter.request_id_from_error(_rate_limit_error({})) is None
     assert adapter.request_id_from_error(ValueError("boom")) is None
-
-
-def _status_error[ErrorT: openai.APIStatusError](
-    error_class: type[ErrorT],
-    status_code: int,
-    headers: dict[str, str] | None = None,
-    error_code: str | None = None,
-) -> ErrorT:
-    """Build one of the SDK's status exceptions around a constructed httpx response.
-
-    error_code fills the body's code the way the SDK reads it onto the exception; the SDK gets
-    the body with the error envelope already unwrapped, so the dict here carries code directly.
-    The body's type is always insufficient_quota, the ambiguous value parse must not decide by.
-    None builds the exception a non-JSON body produces, whose code attribute is None.
-    """
-    response = httpx.Response(
-        status_code,
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
-        headers=headers,
-    )
-    body = (
-        None
-        if error_code is None
-        else {"code": error_code, "type": "insufficient_quota", "message": "boom"}
-    )
-    return error_class("boom", response=response, body=body)
-
-
-def _connection_error() -> openai.APIConnectionError:
-    """Build the SDK's transport-failure exception, which carries a request and no response."""
-    return openai.APIConnectionError(
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses")
-    )
 
 
 def test_adapter_pins_sdk_retries_off() -> None:
@@ -1977,72 +1946,10 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the adapter's whole exception table.
-
-        Each status code is the one the SDK raises that class for, read from openai 2.51.0;
-        the bare APIStatusError rows are the statuses the SDK maps to no class of its own, 413 among
-        them, which is why the adapter reads the status rather than the exception class.
-        APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
-        isinstance.
-        A status row states the name a DoNotRetry failure takes, never whether it is retried:
-        a 200, a mid-stream error event's raise on the live response, is declared_final;
-        every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
-        declared_final, and any other status is unknown_exception.
-        ValueError stands in for an exception the adapter cannot place.
-        """
-        return {
-            _connection_error(): "transient",
-            openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")): "transient",
-            _status_error(openai.RateLimitError, 429): "invalid_request",
-            _status_error(openai.ConflictError, 409): "invalid_request",
-            _status_error(openai.BadRequestError, 400): "invalid_request",
-            _status_error(openai.AuthenticationError, 401): "invalid_request",
-            _status_error(openai.PermissionDeniedError, 403): "invalid_request",
-            _status_error(openai.NotFoundError, 404): "invalid_request",
-            _status_error(openai.UnprocessableEntityError, 422): "invalid_request",
-            _status_error(openai.APIStatusError, 413): "invalid_request",
-            _status_error(openai.APIStatusError, 408): "invalid_request",
-            _status_error(
-                openai.BadRequestError, 400, {"x-should-retry": "false"}
-            ): "invalid_request",
-            _status_error(
-                openai.InternalServerError, 500, {"x-should-retry": "false"}
-            ): "declared_final",
-            _status_error(openai.InternalServerError, 500): "unknown_exception",
-            _status_error(openai.InternalServerError, 503): "unknown_exception",
-            _status_error(openai.APIStatusError, 302): "unknown_exception",
-            _status_error(
-                openai.APIStatusError, 200, error_code="invalid_prompt"
-            ): "declared_final",
-            ValueError("boom"): "unknown_exception",
-        }
+        """Return the table both openai adapters share; its builder's docstring states each row."""
+        return openai_sdk_errors_and_classifications()
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the parse rows: every listed status, both defaults, both TransientError forms.
-
-        The statuses and codes come from the error-code guide parse_openai's docstring cites,
-        plus the 404 it sources from the SDK's NotFoundError mapping;
-        the rows without an error_code exercise the exception a non-JSON body produces.
-        """
-        return {
-            _status_error(openai.RateLimitError, 429, {"retry-after": "7"}): PauseAll(
-                retry_after=7.0
-            ),
-            _status_error(
-                openai.RateLimitError, 429, error_code="organization_spend_limit_exceeded"
-            ): DoNotRetry(),
-            _status_error(openai.InternalServerError, 503): PauseAll(retry_after=None),
-            _status_error(openai.InternalServerError, 500): RetryThisOne(retry_after=None),
-            _status_error(openai.APIStatusError, 408): RetryThisOne(retry_after=None),
-            _status_error(openai.ConflictError, 409): RetryThisOne(retry_after=None),
-            _status_error(openai.BadRequestError, 400): DoNotRetry(),
-            _status_error(openai.AuthenticationError, 401): DoNotRetry(),
-            _status_error(openai.PermissionDeniedError, 403): DoNotRetry(),
-            _status_error(openai.NotFoundError, 404): DoNotRetry(),
-            _status_error(openai.InternalServerError, 599): RetryThisOne(retry_after=None),
-            TransientError(
-                "throttled body", retry_after_seconds=3.0, is_rate_limit=True
-            ): PauseAll(retry_after=3.0),
-            TransientError("failed body"): RetryThisOne(retry_after=None),
-        }
+        """Return the parse rows both openai adapters share; the builder's docstring names their sources."""
+        return openai_sdk_errors_and_verdicts()

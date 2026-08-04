@@ -1,4 +1,4 @@
-"""Wiring in the langchaint.anthropic, langchaint.gemini, and langchaint.openai catalogs.
+"""Wiring in the langchaint.anthropic, langchaint.deepseek, langchaint.gemini, and langchaint.openai catalogs.
 
 The pricing values themselves are the one provider fact tests cannot verify;
 what tests can catch is a catalog function wiring the wrong model identifier, the wrong prices,
@@ -26,6 +26,12 @@ from langchaint.anthropic import (
     anthropic_bedrock_model,
     anthropic_model,
 )
+from langchaint.deepseek import (
+    DEEPSEEK_PRICING,
+    DeepSeekModelName,
+    cache_read_tokens_from_usage_deepseek,
+    deepseek_model,
+)
 from langchaint.gemini import (
     GEMINI_PRICING,
     GeminiGenerateContentAdapter,
@@ -37,6 +43,7 @@ from langchaint.gemini import (
 )
 from langchaint.openai import (
     OPENAI_PRICING,
+    OpenAIChatCompletionsAdapter,
     OpenAIModelName,
     OpenAIPricedServiceTier,
     OpenAIPricingTable,
@@ -339,6 +346,85 @@ def test_gemini_model_forwards_service_tier_backoff_and_attempts() -> None:
     assert defaulted.max_attempts == 3
 
 
+def _deepseek_client() -> AsyncOpenAI:
+    """Return a keyless client pointed at DeepSeek, valid because no request is sent."""
+    return AsyncOpenAI(api_key="offline", base_url="https://api.deepseek.com")
+
+
+@pytest.mark.parametrize("model", list(DEEPSEEK_PRICING))
+def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
+    model: DeepSeekModelName,
+) -> None:
+    """deepseek_model returns an LLM whose adapter carries the model's prices and DeepSeek's usage reader.
+
+    The reader assertion is the billing-relevant wiring: over the openai default every DeepSeek
+    cache hit would price at the cache-miss rate.
+    """
+    llm = deepseek_model(model, client=_deepseek_client())
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIChatCompletionsAdapter)
+    assert adapter.model == model
+    assert adapter.pricing["default"] is DEEPSEEK_PRICING[model]
+    assert adapter.cache_read_tokens_from_usage is cache_read_tokens_from_usage_deepseek
+    assert adapter.supports_prompt_cache_options is False
+    assert adapter.provider_name == "deepseek"
+
+
+def test_deepseek_model_accepts_a_model_id_outside_the_catalog() -> None:
+    """A non-catalog id builds with caller-stated pricing, wrapped under the "default" tier."""
+    table = _ARBITRARY_PRICING["default"]
+    llm = deepseek_model("deepseek-next-preview", pricing=table, client=_deepseek_client())
+    adapter = llm.adapter
+    assert isinstance(adapter, OpenAIChatCompletionsAdapter)
+    assert adapter.model == "deepseek-next-preview"
+    assert adapter.pricing["default"] is table
+
+
+def test_deepseek_model_requires_pricing_outside_the_catalog() -> None:
+    """Omitting pricing on a non-catalog id raises.
+
+    The overloads already reject the call at check time, hence the suppression;
+    the raise is what an untyped caller hits.
+    """
+    with pytest.raises(ValueError, match="DEEPSEEK_PRICING"):
+        _ = deepseek_model(  # pyrefly: ignore[no-matching-overload]
+            "deepseek-next-preview", client=_deepseek_client()
+        )
+
+
+def test_deepseek_model_without_a_client_requires_the_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building without a client reads DEEPSEEK_API_KEY, raising when it is unset rather than falling back.
+
+    The SDK's own fallback reads OPENAI_API_KEY, which would silently send the OpenAI key to
+    api.deepseek.com.
+    """
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        _ = deepseek_model("deepseek-v4-flash")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline")
+    adapter = deepseek_model("deepseek-v4-flash").adapter
+    assert isinstance(adapter, OpenAIChatCompletionsAdapter)
+    assert adapter.client.api_key == "offline"
+    assert str(adapter.client.base_url).startswith("https://api.deepseek.com")
+
+
+def test_deepseek_model_forwards_shared_backoff_and_max_attempts() -> None:
+    """shared_backoff and max_attempts land on the LLM."""
+    shared_backoff = SharedBackoff(
+        parse=parse_openai, failure_types=(TransientError,), capacity=16
+    )
+    llm = deepseek_model(
+        "deepseek-v4-flash",
+        client=_deepseek_client(),
+        shared_backoff=shared_backoff,
+        max_attempts=5,
+    )
+    assert llm.shared_backoff is shared_backoff
+    assert llm.max_attempts == 5
+
+
 @pytest.mark.parametrize("supported", [True, False])
 def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported: bool) -> None:
     """The caller's value reaches the adapter, no Bedrock id being cataloged to derive it from.
@@ -597,6 +683,10 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
                 client=AsyncBedrockOpenAI(aws_region="us-east-1"),
             ),
             "aws.bedrock",
+        ),
+        (
+            lambda: deepseek_model("deepseek-v4-flash", client=_deepseek_client()),
+            "deepseek",
         ),
     ],
 )

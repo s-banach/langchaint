@@ -78,8 +78,8 @@ Mapping decisions:
   `_provider_failure` picks off `response.error.code`, carrying that response's billing, and a
   structured binding does so whether or not the fragment happened to validate.
 - Streaming yields the SDK's own answer delta strings unwrapped, each reasoning delta in a ReasoningDelta,
-  and each tool call once, complete, from its `response.output_item.done` event;
-  argument fragments are never surfaced.
+  each argument fragment in a ToolCallDelta, and each tool call once, complete, from its
+  `response.output_item.done` event.
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
 
@@ -143,6 +143,7 @@ from langchaint.adapter import (
     SchemaViolation,
     SpecificToolChoice,
     StreamItem,
+    ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
     narrowed_request,
@@ -863,10 +864,15 @@ class _OpenAIStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate the SDK stream into answer text chunks, reasoning text deltas, and completed tool calls.
+        """Translate the SDK stream into StreamItem values.
 
         The terminal event's response is kept for final(), which must not call the SDK's get_final_response():
         that raises RuntimeError unless the terminal event is response.completed.
+
+        forming_calls is keyed by output_index, the one identifier required on both of its event
+        types (the item's own id is optional).
+        The SDK's stream state asserts that the added event precedes the item's deltas, so the
+        lookup cannot miss.
 
         Reasoning arrives on two independent event types and both are forwarded:
         summary deltas, which the constructor's reasoning_summary asks for,
@@ -899,9 +905,22 @@ class _OpenAIStream(AdapterStream):
         error_event: ResponseErrorEvent | None = None
         reasoning_delta_yielded = False
         separator_pending = False
+        forming_calls: dict[int, tuple[str, str]] = {}
+        """Each forming function_call item's (call_id, name), keyed by output_index."""
         async for sdk_event in self._sdk_stream:
             if sdk_event.type == "response.output_text.delta":
                 yield sdk_event.delta
+            elif (
+                sdk_event.type == "response.output_item.added"
+                and sdk_event.item.type == "function_call"
+            ):
+                forming_calls[sdk_event.output_index] = (
+                    sdk_event.item.call_id,
+                    sdk_event.item.name,
+                )
+            elif sdk_event.type == "response.function_call_arguments.delta" and sdk_event.delta:
+                call_id, name = forming_calls[sdk_event.output_index]
+                yield ToolCallDelta(id=call_id, name=name, partial_args_json=sdk_event.delta)
             elif sdk_event.type in (
                 "response.reasoning_summary_text.delta",
                 "response.reasoning_text.delta",

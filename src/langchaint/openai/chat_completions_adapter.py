@@ -69,7 +69,10 @@ Mapping decisions:
   "tool_calls" is "tool_use", "length" is "max_tokens", "content_filter" is "refusal",
   and "function_call" or an unknown value is "other".
 - Streaming yields the SDK's own answer delta strings unwrapped, each `reasoning_content` delta
-  in a ReasoningDelta, and each tool call once, complete.
+  in a ReasoningDelta, each argument fragment in a ToolCallDelta, and each tool call once, complete.
+  A fragment arriving while the snapshot's id for that call is still None is held back.
+  It is prefixed to the next fragment that yields, so no delta carries a fabricated id.
+  An OpenAI-compatible provider may omit the id on early fragments.
   `reasoning_content` is one concatenated string, so no part separator ever applies.
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
@@ -123,6 +126,7 @@ from langchaint.adapter import (
     SchemaViolation,
     SpecificToolChoice,
     StreamItem,
+    ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
     narrowed_request,
@@ -779,8 +783,9 @@ class OpenAIChatCompletionsAdapter(Adapter):
 def _snapshot_tool_call_id(state: ChatCompletionStreamState, index: int) -> str:
     """Read the id of the assembled tool call at index, which the state's events do not carry.
 
-    A tool_calls.function.arguments.done event for index means the state assembled a call there,
-    and its id came from that call's first fragment, the only fragment carrying one.
+    A tool_calls.function.arguments.done event for index means the state assembled a call there.
+    The snapshot is built leniently (openai 2.51.0 construct_type).
+    The declared str therefore reads None until the fragment carrying the id arrives.
     """
     tool_calls = state.current_completion_snapshot.choices[0].message.tool_calls or ()
     return tool_calls[index].id
@@ -834,7 +839,7 @@ class _ChatCompletionsStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate chunks into answer text chunks, reasoning text deltas, and completed tool calls.
+        """Translate chunks into StreamItem values.
 
         Each chunk feeds the SDK's stream state, whose returned events carry the answer deltas and
         the completed tool calls; a reasoning_content delta is read off the chunk in hand, which
@@ -851,6 +856,8 @@ class _ChatCompletionsStream(AdapterStream):
                 stream ended without any choice reporting a finish_reason, so no turn closed.
         """
         finish_reason_seen = False
+        pending_args: dict[int, str] = {}
+        """Argument fragments held while their call's snapshot id is still None, keyed by index."""
         async for chunk in self._chunks():
             self._chunk_received = True
             if chunk.usage is not None:
@@ -872,6 +879,15 @@ class _ChatCompletionsStream(AdapterStream):
             for event in events:
                 if event.type == "content.delta":
                     yield event.delta
+                elif event.type == "tool_calls.function.arguments.delta" and event.arguments_delta:
+                    call_id = _snapshot_tool_call_id(self._state, event.index)
+                    held_args = pending_args.pop(event.index, "") + event.arguments_delta
+                    if call_id is None:
+                        pending_args[event.index] = held_args
+                    else:
+                        yield ToolCallDelta(
+                            id=call_id, name=event.name, partial_args_json=held_args
+                        )
                 elif event.type == "tool_calls.function.arguments.done":
                     yield ToolCall(
                         id=_snapshot_tool_call_id(self._state, event.index),

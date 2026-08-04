@@ -38,6 +38,7 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallDelta,
     ToolCallTurn,
     ToolMessage,
     TurnElement,
@@ -207,6 +208,8 @@ def _by_stream_item_kind(item: StreamItem) -> object:
     match item.kind:
         case "reasoning_delta":
             return item.text
+        case "tool_call_delta":
+            return item.partial_args_json
         case "tool_call":
             return item.args_json
 
@@ -335,9 +338,13 @@ def test_a_verdict_kind_selects_the_arm_that_carries_the_field_read() -> None:
 
 
 def test_a_stream_item_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """A str is selected by isinstance, and the tag selects between the two classes."""
+    """A str is selected by isinstance, and the tag selects among the three classes."""
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
     assert _by_stream_item_kind("hi") == "hi"
     assert _by_stream_item_kind(ReasoningDelta(text="weighing")) == "weighing"
+    assert (
+        _by_stream_item_kind(ToolCallDelta(id="c1", name="probe", partial_args_json='{"de'))
+        == '{"de'
+    )
     assert _by_stream_item_kind(tool_call) == "{}"
     assert _by_stream_item_kind_missing_an_arm(tool_call) is None

@@ -15,6 +15,7 @@ from langchaint.adapter import (
     ReasoningDelta,
     SpecificToolChoice,
     StreamItem,
+    ToolCallDelta,
     ToolChoice,
 )
 from langchaint.call import AttemptRecord, CallRecord
@@ -166,6 +167,7 @@ __all__ = [
     "TimedOutError",
     "Tool",
     "ToolCall",
+    "ToolCallDelta",
     "ToolCallTurn",
     "ToolChoice",
     "ToolManager",

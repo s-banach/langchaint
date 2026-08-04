@@ -9,7 +9,7 @@ A comment appears only where a fact is not readable off the code, at the line it
 | --- | --- |
 | [`01_basics.py`](01_basics.py) | `basics`: `bind`, `generate_one`, an `ImagePart` in a user turn, structured output via `response_format`, `rebind`, and `generate_many` + `to_tables` |
 | [`02_tool_loop.py`](02_tool_loop.py) | `run_agent`: the tool loop over `generate_one` and `dispatch_many`, an approval gate as `precomputed`, and a tool's `app_data` totalled as each call settles |
-| [`03_streaming.py`](03_streaming.py) | `stream_answer`: `stream_one` as a context manager, the `str \| ReasoningDelta \| ToolCall` iterator, and `final()` for usage and cost |
+| [`03_streaming.py`](03_streaming.py) | `stream_answer`: `stream_one` as a context manager, the `str \| ReasoningDelta \| ToolCallDelta \| ToolCall` iterator, and `final()` for usage and cost |
 | [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) | `run_batch_and_handle_what_failed`: one `SharedBackoff` per account, a batch item the adapter will not send, `timeout_seconds`, and each failed item failed over to a second provider |
 | [`05_prompt_caching.py`](05_prompt_caching.py) | `cache_a_long_prefix`: `cache_breakpoint` marks in the bound prefix and on a tool result, anthropic's `cache_ttl`, and the cache token counters with their costs |
 | [`06_required_choice.py`](06_required_choice.py) | `run_required_choice_agent`: a `tool_choice="required"` loop exiting through a `CaptureTool`, forced by `SpecificToolChoice` on the last turn |

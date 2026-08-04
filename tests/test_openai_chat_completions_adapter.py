@@ -37,6 +37,7 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallDelta,
     ToolMessage,
     UserMessage,
 )
@@ -1049,26 +1050,52 @@ def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concate
     )
 
 
-def test_stream_yields_one_complete_tool_call_carrying_the_snapshots_id() -> None:
-    """Fragment merging stays in the SDK, and the id comes off the assembled snapshot."""
+@pytest.mark.parametrize(
+    ("id_carrying_fragment_index", "expected_deltas"),
+    [
+        (
+            0,
+            [
+                ToolCallDelta(id="call1", name="lookup", partial_args_json='{"q"'),
+                ToolCallDelta(id="call1", name="lookup", partial_args_json=": 1"),
+                ToolCallDelta(id="call1", name="lookup", partial_args_json=', "r": 2}'),
+            ],
+        ),
+        (
+            1,
+            [
+                ToolCallDelta(id="call1", name="lookup", partial_args_json='{"q": 1'),
+                ToolCallDelta(id="call1", name="lookup", partial_args_json=', "r": 2}'),
+            ],
+        ),
+    ],
+    ids=["id_on_first_fragment", "id_on_second_fragment"],
+)
+def test_stream_yields_argument_fragments_then_one_complete_tool_call(
+    id_carrying_fragment_index: int, expected_deltas: list[ToolCallDelta]
+) -> None:
+    """Fragment merging stays in the SDK, and ids come off the assembled snapshot.
+
+    A fragment with the id known yields a ToolCallDelta at once.
+    A fragment before the id arrives is held back and prefixed to the next fragment that yields.
+    An OpenAI-compatible provider may omit the id on early fragments.
+    Either way the concatenated deltas are the completed call's args_json.
+    """
+    fragments: list[dict[str, object]] = [
+        {"index": 0, "type": "function", "function": {"name": "lookup", "arguments": '{"q"'}},
+        {"index": 0, "function": {"arguments": ": 1"}},
+        {"index": 0, "function": {"arguments": ', "r": 2}'}},
+    ]
+    fragments[id_carrying_fragment_index]["id"] = "call1"
     items = _collected_items([
         _chunk(delta={"role": "assistant"}),
-        _chunk(
-            delta={
-                "tool_calls": [
-                    {
-                        "index": 0,
-                        "id": "call1",
-                        "type": "function",
-                        "function": {"name": "lookup", "arguments": '{"q"'},
-                    }
-                ]
-            }
-        ),
-        _chunk(delta={"tool_calls": [{"index": 0, "function": {"arguments": ": 1}"}}]}),
+        _chunk(delta={"tool_calls": [fragments[0]]}),
+        _chunk(delta={"tool_calls": [fragments[1]]}),
+        _chunk(delta={"tool_calls": [fragments[2]]}),
         _chunk(finish_reason="tool_calls"),
     ])
-    assert items == [ToolCall(id="call1", name="lookup", args_json='{"q": 1}')]
+    expected_call = ToolCall(id="call1", name="lookup", args_json='{"q": 1, "r": 2}')
+    assert items == [*expected_deltas, expected_call]
 
 
 def test_a_sparse_tool_call_fragment_index_is_a_stream_protocol_error() -> None:

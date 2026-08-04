@@ -20,7 +20,11 @@ import pytest
 from openai import AsyncOpenAI
 from openai._models import construct_type_unchecked
 from openai.lib._parsing._responses import type_to_text_format_param
-from openai.lib.streaming.responses import AsyncResponseStream, ResponseStreamEvent
+from openai.lib.streaming.responses import (
+    AsyncResponseStream,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseStreamEvent,
+)
 from openai.lib.streaming.responses import (
     ResponseTextDeltaEvent as AccumulatedResponseTextDeltaEvent,
 )
@@ -61,6 +65,7 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallDelta,
     ToolMessage,
     UserMessage,
 )
@@ -1113,8 +1118,12 @@ def test_a_done_event_with_no_delta_after_it_streams_no_trailing_separator() -> 
     assert translated == [ReasoningDelta(text="thought it over"), "hey"]
 
 
-def test_stream_yields_one_complete_tool_call_and_ignores_message_items() -> None:
-    """A function_call done event yields one complete ToolCall; message item lifecycles are dropped."""
+def test_stream_yields_argument_fragments_then_one_complete_tool_call() -> None:
+    """A function_call's argument deltas yield ToolCallDelta items named through its added event.
+
+    The concatenated fragments are exactly the completed call's args_json, an empty fragment
+    yields nothing, and message item lifecycles are dropped.
+    """
     message_added = ResponseOutputItemAddedEvent.model_validate({
         "type": "response.output_item.added",
         "item": _TEXT_OUTPUT_ITEM,
@@ -1127,28 +1136,48 @@ def test_stream_yields_one_complete_tool_call_and_ignores_message_items() -> Non
         "output_index": 1,
         "sequence_number": 2,
     })
+
+    def args_fragment(
+        delta: str, snapshot: str, sequence_number: int
+    ) -> ResponseFunctionCallArgumentsDeltaEvent:
+        return ResponseFunctionCallArgumentsDeltaEvent.model_validate({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc1",
+            "output_index": 1,
+            "sequence_number": sequence_number,
+            "delta": delta,
+            "snapshot": snapshot,
+        })
+
     message_done = ResponseOutputItemDoneEvent.model_validate({
         "type": "response.output_item.done",
         "item": _TEXT_OUTPUT_ITEM,
         "output_index": 0,
-        "sequence_number": 3,
+        "sequence_number": 6,
     })
     function_call_done = ResponseOutputItemDoneEvent.model_validate({
         "type": "response.output_item.done",
         "item": _FUNCTION_CALL_OUTPUT_ITEM,
         "output_index": 1,
-        "sequence_number": 4,
+        "sequence_number": 7,
     })
     translated = _collected_items([
         message_added,
         function_call_added,
+        args_fragment("", "", 3),
+        args_fragment('{"q"', '{"q"', 4),
+        args_fragment(": 1}", '{"q": 1}', 5),
         message_done,
         function_call_done,
         _completed_event(
-            _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]), 5
+            _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]), 8
         ),
     ])
-    assert translated == [ToolCall(id="call1", name="lookup", args_json='{"q": 1}')]
+    assert translated == [
+        ToolCallDelta(id="call1", name="lookup", partial_args_json='{"q"'),
+        ToolCallDelta(id="call1", name="lookup", partial_args_json=": 1}"),
+        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    ]
 
 
 def test_stream_incomplete_terminal_still_assembles_final() -> None:

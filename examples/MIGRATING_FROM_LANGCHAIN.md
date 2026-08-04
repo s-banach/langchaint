@@ -13,7 +13,7 @@ It has no chains, no runnables, no middleware stack, and no agent class.
 | `model.bind_tools([...])` | decorate `get_weather` with `@tool(description=...)`, then pass `ToolManager([get_weather])` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)`, read `response.output` (a parsed `Model`) |
 | `model.batch([...])`, `model.abatch([...])` | `bound.generate_many([...])`, returns `list[Response \| GenerationError]` |
-| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)` gives a handle: iterate `str \| ReasoningDelta \| ToolCall`, then `await handle.final()` for the `Response` |
+| `model.stream(...)`, `model.astream(...)` | `bound.stream_one(...)` gives a handle: iterate `str \| ReasoningDelta \| ToolCallDelta \| ToolCall`, then `await handle.final()` for the `Response` |
 | `astream_events(...)` to catch tool calls | the same `stream_one` iterator yields each completed `ToolCall` |
 | `create_react_agent(...)`, `AgentExecutor` | own the loop over `generate_one` and `ToolManager.dispatch` (see `02_tool_loop.py`) |
 | a tool returning `Command(goto=/update=)` | a tool returns data; the app routes between turns |

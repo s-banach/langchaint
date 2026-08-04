@@ -69,8 +69,8 @@ class AttemptRecord:
     first_item_at_monotonic_seconds is langchaint's own stamp of the moment this attempt's stream
     yielded its first item to the caller, on the same clock as the two bracket stamps. Only
     stream_one yields items to a caller, so it is None on every generate attempt and on a stream
-    that yielded nothing. Any StreamItem stamps it, a ReasoningDelta or a ToolCall as much as a
-    text chunk.
+    that yielded nothing. Any StreamItem stamps it, a ReasoningDelta, a ToolCallDelta, or a
+    ToolCall as much as a text chunk.
     error is None on the attempt that succeeded, on a 200 that produced no output and is not
     retried (a refusal, a truncation, a context-window overflow), on a request the provider
     rejected, on an error response the provider declared final, and on an attempt ended by an

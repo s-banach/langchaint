@@ -1202,7 +1202,7 @@ class _GeminiStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate chunks into answer text chunks, reasoning text deltas, and completed tool calls.
 
-        Function calls arrive whole in one part, so each yields one complete ToolCall.
+        Function calls arrive whole in one part, so each yields one complete ToolCall and no ToolCallDelta.
         A turn's reasoning arrives as thought-part text slices, and a reasoning part ends where its
         thought_signature arrives or where another part follows it in the same chunk's list, the
         two boundaries _ResponseAccumulator.add's merge rule keeps. Each boundary between two

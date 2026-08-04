@@ -1,7 +1,7 @@
 """The stream handle.
 
 A StreamHandle is three things at once:
-an async iterator of stream items (answer text chunks, reasoning text deltas, and completed tool calls),
+an async iterator of StreamItem values,
 the source of the assembled success arm via final(),
 and an async context manager whose entry opens the request and whose exit closes it.
 A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.

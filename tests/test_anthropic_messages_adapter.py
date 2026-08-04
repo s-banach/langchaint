@@ -45,6 +45,7 @@ from langchaint import (
     StreamItem,
     TextPart,
     ToolCall,
+    ToolCallDelta,
     ToolChoice,
     ToolManager,
     ToolMessage,
@@ -950,58 +951,81 @@ def _streamed_reasoning(translated: Sequence[StreamItem]) -> str:
     return "".join(item.text for item in translated if isinstance(item, ReasoningDelta))
 
 
-def _collected_items(replay_events: Sequence[ParsedMessageStreamEvent]) -> list[StreamItem]:
-    """Drain the translated items into a list."""
+def _collected_items(
+    replay_events: Sequence[ParsedMessageStreamEvent],
+    message_snapshot: ParsedMessage[None] | None = None,
+) -> list[StreamItem]:
+    """Drain the translated items into a list; None means a bare end_turn snapshot."""
+    snapshot = message_snapshot if message_snapshot is not None else _message_snapshot("end_turn")
 
     async def scenario() -> list[StreamItem]:
-        adapter_stream = _anthropic_stream(replay_events, _message_snapshot("end_turn"))
+        adapter_stream = _anthropic_stream(replay_events, snapshot)
         return [item async for item in adapter_stream.items()]
 
     return asyncio.run(scenario())
 
 
-def test_stream_yields_bare_text_and_one_complete_tool_call() -> None:
+def test_stream_yields_bare_text_argument_fragments_and_one_complete_tool_call() -> None:
     """Text deltas pass through as the SDK's own strings.
 
+    Each non-empty argument fragment yields a ToolCallDelta carrying the id and name the
+    snapshot's tool_use block holds, and their concatenation is the completed call's args_json.
     A closing tool_use block yields one complete ToolCall whose args_json is the JSON text of the SDK-accumulated input;
-    argument fragments and text block closes yield nothing.
+    empty argument fragments and text block closes yield nothing.
     """
-    args_fragment = at.RawContentBlockDeltaEvent(
-        type="content_block_delta",
-        index=1,
-        delta=at.InputJSONDelta(type="input_json_delta", partial_json='{"city"'),
-    )
+
+    def args_fragment(partial_json: str) -> at.RawContentBlockDeltaEvent:
+        return at.RawContentBlockDeltaEvent(
+            type="content_block_delta",
+            index=1,
+            delta=at.InputJSONDelta(type="input_json_delta", partial_json=partial_json),
+        )
+
     text_block_stop = ParsedContentBlockStopEvent(
         type="content_block_stop",
         index=0,
         content_block=ParsedTextBlock(type="text", text="hey"),
     )
+    tool_use_block = at.ToolUseBlock(
+        type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}
+    )
     tool_use_block_stop = ParsedContentBlockStopEvent(
-        type="content_block_stop",
-        index=1,
-        content_block=at.ToolUseBlock(
-            type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}
-        ),
+        type="content_block_stop", index=1, content_block=tool_use_block
     )
 
-    async def scenario() -> list[StreamItem]:
-        adapter_stream = _anthropic_stream(
-            [
-                _text_delta_event("he", 0),
-                _text_delta_event("y", 0),
-                text_block_stop,
-                args_fragment,
-                tool_use_block_stop,
-            ],
-            _message_snapshot("tool_use"),
-        )
-        return [item async for item in adapter_stream.items()]
-
-    assert asyncio.run(scenario()) == [
+    translated = _collected_items(
+        [
+            _text_delta_event("he", 0),
+            _text_delta_event("y", 0),
+            text_block_stop,
+            args_fragment(""),
+            args_fragment('{"city"'),
+            args_fragment(': "Nairobi"}'),
+            tool_use_block_stop,
+        ],
+        _message_snapshot("tool_use", [at.TextBlock(type="text", text="hey"), tool_use_block]),
+    )
+    assert translated == [
         "he",
         "y",
+        ToolCallDelta(id="tu_1", name="get_weather", partial_args_json='{"city"'),
+        ToolCallDelta(id="tu_1", name="get_weather", partial_args_json=': "Nairobi"}'),
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
     ]
+
+
+def test_a_server_tool_use_blocks_argument_fragments_yield_nothing() -> None:
+    """input_json_delta also grows a server_tool_use block, which is not a langchaint tool call."""
+    fragment = at.RawContentBlockDeltaEvent(
+        type="content_block_delta",
+        index=0,
+        delta=at.InputJSONDelta(type="input_json_delta", partial_json='{"query": "x"}'),
+    )
+    snapshot = _message_snapshot(
+        "end_turn",
+        [at.ServerToolUseBlock(type="server_tool_use", id="st_1", name="web_search", input={})],
+    )
+    assert _collected_items([fragment], snapshot) == []
 
 
 def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:

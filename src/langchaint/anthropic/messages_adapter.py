@@ -118,6 +118,7 @@ from langchaint.adapter import (
     SchemaViolation,
     SpecificToolChoice,
     StreamItem,
+    ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
     narrowed_request,
@@ -1143,9 +1144,12 @@ class _AnthropicStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate the SDK stream into answer text chunks, reasoning text deltas, and completed tool calls.
+        """Translate the SDK stream into StreamItem values.
 
-        A tool call is built from the SDK-accumulated block, never from raw partial-json deltas.
+        An input_json_delta yields a ToolCallDelta only when the block it grows is a tool_use
+        block, whose id and name are read off the SDK's message snapshot; the SDK appended the
+        block there at content_block_start, before any of its deltas. A server_tool_use block
+        grows by the same delta type and is dropped with the block.
 
         A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
         is a block boundary, never text. That boundary reaches the caller as a
@@ -1176,6 +1180,14 @@ class _AnthropicStream(AdapterStream):
                         yield ReasoningDelta(text=REASONING_PART_SEPARATOR)
                     reasoning_delta_yielded = True
                     yield ReasoningDelta(text=event.delta.thinking)
+                elif event.delta.type == "input_json_delta" and event.delta.partial_json:
+                    block = self._sdk_stream.current_message_snapshot.content[event.index]
+                    if block.type == "tool_use":
+                        yield ToolCallDelta(
+                            id=block.id,
+                            name=block.name,
+                            partial_args_json=event.delta.partial_json,
+                        )
             elif event.type == "content_block_stop":
                 if event.content_block.type == "tool_use":
                     yield ToolCall(

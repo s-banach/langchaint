@@ -221,15 +221,34 @@ class ReasoningDelta:
     kind: Literal["reasoning_delta"] = "reasoning_delta"
 
 
-type StreamItem = str | ReasoningDelta | ToolCall
-"""What a stream yields: answer text chunks, reasoning text deltas, and completed tool calls.
+@dataclass(frozen=True, kw_only=True)
+class ToolCallDelta:
+    """A chunk of one forming tool call's argument JSON.
+
+    id and name are the values the completed ToolCall carries,
+    so a consumer keys a buffer by id and labels it by name from the first delta.
+    partial_args_json is literal characters to append to that buffer.
+    """
+
+    id: str
+    name: str
+    partial_args_json: str
+    kind: Literal["tool_call_delta"] = "tool_call_delta"
+
+
+type StreamItem = str | ReasoningDelta | ToolCallDelta | ToolCall
+"""What a stream yields: answer text chunks, reasoning text deltas, tool-call argument deltas, and completed tool calls.
 
 Answer text chunks are the provider SDK's own strings, passed through without a wrapper class or copy.
 Reasoning is wrapped because it is the turn's second kind of text and a bare string could not be told from the answer;
 a consumer routes the two to different places.
-Each tool call is yielded once, complete, when its block closes;
-there are no tool-call delta items because a consumer cannot act on partial argument JSON,
-and both SDKs accumulate the arguments and hand over the finished call.
+Each tool call is yielded once, complete, when its block closes.
+A call's ToolCallDelta items all precede its completed ToolCall.
+Two forming calls' deltas may interleave, so a consumer accumulates per id.
+Where the completed call's args_json is valid JSON, its concatenated deltas parse to the same JSON value;
+text equality is not promised, because an adapter may re-serialize the arguments it accumulated.
+Zero deltas for a call is allowed:
+an adapter whose provider delivers calls whole yields none, and empty arguments stream no fragments anywhere.
 Usage, cost, and stop reason are not streamed; they live on the Response from final().
 """
 
@@ -595,7 +614,7 @@ class AdapterStream(ABC):
 
     @abstractmethod
     def items(self) -> AsyncIterator[StreamItem]:
-        """Yield answer text chunks, reasoning text deltas, and completed tool calls in arrival order.
+        """Yield StreamItem values in arrival order; StreamItem's docstring enumerates them.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.

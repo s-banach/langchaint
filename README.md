@@ -77,7 +77,7 @@ Its `admitted()` block gates every request start; a rate limit pauses the whole 
 `cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part.
 
 **Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCall` items, with `await handle.final()` returning the assembled result.
+`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCallDelta | ToolCall` items, with `await handle.final()` returning the assembled result.
 
 **Tools under one protocol.**
 `PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` share the `Tool` protocol.

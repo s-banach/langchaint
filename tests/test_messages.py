@@ -200,31 +200,59 @@ def test_assistant_turn_still_accepts_unmarked_text() -> None:
     assert AssistantMessage(turn="hey").text == "hey"
 
 
-def _one_of_each_message() -> list[Message]:
-    """One conversation holding every message type and every turn element type."""
-    return [
-        UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
-        AssistantMessage(
-            turn=(
-                ReasoningTrace(raw={"type": "thinking", "thinking": "hm", "signature": "s"}),
-                TextPart(text="checking"),
-                ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
-            )
-        ),
-        ToolMessage(
-            tool_call_id="c1",
-            content=(
-                TextPart(text="saw"),
-                ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png"),
+_PINNED_MESSAGES: tuple[Message, ...] = (
+    UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
+    AssistantMessage(
+        turn=(
+            ReasoningTrace(
+                raw={"type": "thinking", "thinking": "hm", "signature": "s"}, text="hm"
             ),
+            TextPart(text="checking"),
+            ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
+            ToolCall(id="c2", name="fetch", args_json="{}"),
+        )
+    ),
+    ToolMessage(
+        tool_call_id="c1",
+        content=(
+            TextPart(text="saw"),
+            ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png"),
         ),
-    ]
+    ),
+    ToolMessage(tool_call_id="c2", content="fetch failed", is_error=True),
+    UserMessage(content="and then?"),
+)
+"""The conversation _PINNED_MESSAGES_JSON encodes. Changing an element invalidates that literal."""
+
+
+def _one_of_each_message() -> list[Message]:
+    """One conversation holding every message type, every turn element type, and both content forms.
+
+    Grow it by appending an element here, so _PINNED_MESSAGES stays pinned.
+    """
+    return list(_PINNED_MESSAGES)
 
 
 def test_messages_json_round_trip_restores_the_list() -> None:
     """messages_from_json returns the list messages_to_json serialized, every type intact."""
     messages = _one_of_each_message()
     assert messages_from_json(messages_to_json(messages)) == messages
+
+
+_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"turn":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_trace"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
+"""One messages_to_json output, pasted rather than computed.
+
+This is the persisted-text format applications hold on disk.
+Repasting it is a format break: do so only alongside the promised release-note entry.
+"""
+
+
+def test_a_pinned_serialization_still_loads() -> None:
+    """messages_from_json loads _PINNED_MESSAGES_JSON, enforcing messages_to_json's stability promise.
+
+    An added field with a default passes, which the promise permits.
+    """
+    assert messages_from_json(_PINNED_MESSAGES_JSON) == list(_PINNED_MESSAGES)
 
 
 def test_messages_to_json_is_compact_and_indent_passes_through() -> None:

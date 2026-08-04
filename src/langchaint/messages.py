@@ -55,7 +55,8 @@ class ImagePart(CheckedCopyModel):
 type Part = Annotated[TextPart | ImagePart, Field(discriminator="kind")]
 """One element of a message body.
 
-Send a document by converting it first: rasterize its pages to ImagePart, or extract its text layer to TextPart.
+Convert a document before sending it, into one form picked by its content.
+Extract the text layer to TextPart where words carry the meaning; rasterize the pages to ImagePart where layout does.
 The application owns that conversion,
 so it picks the resolution, which pages to send, and the text extractor, and can measure what each choice costs.
 """
@@ -248,6 +249,9 @@ _MESSAGES_JSON: TypeAdapter[list[Message]] = TypeAdapter(list[Message])
 
 def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) -> str:
     """Serialize messages as JSON text that messages_from_json restores.
+
+    messages_from_json loads this output under every later langchaint version.
+    A release that breaks loading says so in its release notes.
 
     The output is compact; pass indent (pydantic's dump_json indent) for text a human reads or diffs.
     Each ReasoningTrace.raw is embedded as the mapping the adapter replays,

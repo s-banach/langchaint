@@ -105,6 +105,11 @@ Each `TurnRecord` goes to the run's own `turn_log` at the moment it happens, and
 Any metric a consumer could possibly want is a post-run fold over the registered runs' ordered logs; a parent's subtree total is the fold filtered by path prefix.
 Nothing has to be carried, so nothing can be dropped, and nothing is stored twice, so there is no second copy to drift.
 
+To stop a run that has spent its cost ceiling, read the same fold while the run is going.
+`AgentRun.usage` is the prefix fold, and `Usage.cost_in_usd` adds up its four categories.
+Check that against the cost ceiling at the top of each turn, in the loop `max_turns` already bounds.
+Check `own_usage` instead for a cost ceiling that should not cover a run's sub-agents.
+
 **Ask langchaint for the deadline instead of wrapping the call in one.** A cancelled call carries
 nothing back: it returns no value and raises nothing the loop can keep, because the scope that
 converts the cancellation sits above the frame holding the call's account. Passing

@@ -318,7 +318,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     and that the stored details are the same conversion the content was rendered from.
 
     The match reads result.details with no assert, cast, or type ignore, which pyrefly checks and
-    which is the point of giving invalid args their own arm.
+    which is the point of giving invalid args their own variant.
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(InvalidToolArgsError) as caught:
@@ -336,12 +336,12 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
             pytest.fail("invalid args must return DispatchInvalidToolArgs")
 
 
-def test_dispatch_returns_unknown_tool_arm_for_off_list_name() -> None:
+def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     """A name the manager does not hold is model-correctable data: a DispatchUnknownTool, no raise.
 
-    The arm carries called_name and a default is_error ToolMessage naming held_names,
+    The variant carries called_name and a default is_error ToolMessage naming held_names,
     so the loop survives a hallucinated name or a tool_call stranded by a rebind and the model can retry.
-    Matching the arm narrows called_name, read with no assert.
+    Matching the variant narrows called_name, read with no assert.
     """
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
@@ -514,11 +514,11 @@ def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> N
     assert cites.citations == ["doc-1"]
 
 
-def test_tool_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
+def test_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
     """PydanticTool.dispatch is the same validate-then-wrap as the manager: bad args are a DispatchInvalidToolArgs.
 
     The manager delegates to PydanticTool.dispatch, so the argument-validation rendering must live here;
-    a bad payload comes back as the invalid-args arm holding the neutral details, not a raise.
+    a bad payload comes back as the invalid-args variant holding the neutral details, not a raise.
     """
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
     result = asyncio.run(_echo_tool().dispatch(call))
@@ -624,7 +624,7 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
 
     The payload violates the schema twice (city missing, town unexpected); details is exactly the
     absolute_path/message mapping of iter_errors and the content is render_invalid_tool_args of it,
-    so the JSONSchemaTool failure lands in the same arm through the same formatter as a PydanticTool failure.
+    so the JSONSchemaTool failure lands in the same variant through the same formatter as a PydanticTool failure.
     Draft202012Validator pins the default draft: _WEATHER_SCHEMA carries no $schema key,
     so dispatch must validate under Draft 2020-12.
     """
@@ -680,7 +680,7 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     ids=["schema_violation", "non_object_json", "malformed_json"],
 )
 def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_json: str) -> None:
-    """Each args_json a JSONSchemaTool rejects becomes the invalid-args arm, and the function never runs.
+    """Each args_json a JSONSchemaTool rejects becomes the invalid-args variant, and the function never runs.
 
     A scalar payload cannot be a tool's arguments and a truncated one cannot be decoded, so neither
     reaches jsonschema; a decoded object that violates the schema is what jsonschema itself rejects.
@@ -699,7 +699,7 @@ def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_
 
 
 def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None:
-    """An args_schema jsonschema cannot interpret raises jsonschema's own exception from dispatch, no arm.
+    """An args_schema jsonschema cannot interpret raises jsonschema's own exception from dispatch, no variant.
 
     "strng" is not a JSON Schema type, so validation can never mean anything; the raise propagates as a
     user-code defect like a function exception, rather than becoming a DispatchInvalidToolArgs that would
@@ -831,8 +831,8 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
     assert [outcome.tool_message.content for outcome in outcomes] == ["waited a", "set b"]
 
 
-def test_dispatch_many_returns_every_arm_in_call_order() -> None:
-    """A handled call, bad args, and an off-list name land as their outcome arms, in call order, no raise."""
+def test_dispatch_many_returns_every_variant_in_call_order() -> None:
+    """A handled call, bad args, and an off-list name land as their outcome variants, in call order, no raise."""
     tool_calls = [
         ToolCall(id="c1", name="echo", args_json='{"text": "hi"}'),
         ToolCall(id="c2", name="echo", args_json='{"wrong": "key"}'),
@@ -1200,7 +1200,7 @@ def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
 ) -> None:
     """A valid call returns DispatchCaptured: the acknowledgement tool_message plus the typed instance.
 
-    Matching the arm reads captured.answer directly, with no None guard and no isinstance beyond the arm match;
+    Matching the variant reads captured.answer directly, with no None guard and no isinstance beyond the variant match;
     pyrefly checks that this typechecks, which is the point of the required field.
     A CaptureTool built without an acknowledgement answers "Acknowledged".
     """
@@ -1233,8 +1233,8 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     assert outcome.details == expected_details
 
 
-def test_capture_malformed_and_non_object_json_return_the_invalid_args_arm() -> None:
-    """Malformed JSON and a non-object JSON value land in the same DispatchInvalidToolArgs arm, no raise.
+def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant() -> None:
+    """Malformed JSON and a non-object JSON value land in the same DispatchInvalidToolArgs variant, no raise.
 
     args_model.model_validate_json raises ValidationError for both shapes,
     so capture returns rendered corrections exactly as it does for a well-formed object with wrong fields.
@@ -1266,7 +1266,7 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
     assert result.app_data == _CapturedAnswer(answer="tide")
 
 
-def test_capture_tool_dispatch_returns_invalid_args_arm_for_invalid_args() -> None:
+def test_capture_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
     """A manager-routed invalid call comes back as the same DispatchInvalidToolArgs capture returns."""
     call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
     result = asyncio.run(ToolManager([_answer_capture_tool()]).dispatch(call))

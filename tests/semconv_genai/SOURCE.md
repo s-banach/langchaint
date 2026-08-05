@@ -10,7 +10,7 @@ structured payload. Nothing publishes them to a package registry, so the copies
 here are the pin. `tests/test_tracing.py` validates against them every payload the
 tracing module emits, less the paths its `_UNVALIDATED_PAYLOAD_ATTRIBUTES` exempts
 and documents. What these schemas do and do not enforce is recorded there too:
-each `anyOf` over element types ends in a catch-all arm, so a green run means less
+each `anyOf` over element types ends in a catch-all variant, so a green run means less
 than full conformance.
 
 Refresh with `uv run python -m scripts.refresh_semconv_genai`, then read `git diff`.

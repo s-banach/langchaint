@@ -179,7 +179,7 @@ def _billed(outcome: ResponseOutcome[str]) -> _ScriptedResponse:
 
 
 _REJECTED_TURN = AssistantMessage(turn=(TextPart(text="what the rejected 200 carried"),))
-"""The turn a 200 that produced no output still carried, which every such member takes."""
+"""The turn a 200 that produced no output still carried, which every such variant takes."""
 
 
 def _success_result(content: str) -> AdapterResult[str]:
@@ -250,7 +250,7 @@ class _RefusingStream(_FakeStream):
     """A stream that yields items normally but whose assembled response holds a refusal.
 
     Mirrors an adapter that reads the assembled message and finds a refusal, reporting the Refusal
-    member carrying the turn the model wrote to refuse.
+    variant carrying the turn the model wrote to refuse.
     """
 
     @override
@@ -1160,7 +1160,7 @@ def test_refusal_outcome_raises_row_shaped_without_retry() -> None:
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose attempt reports the Refusal member."""
+        """Drive one generate_one whose attempt reports the Refusal variant."""
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             automatic_prompt_caching=True
@@ -1766,8 +1766,8 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
     """Pin every binding's static BoundLLM type, the pair the request-method overloads key on.
 
     One binding returns a union: structured plus a ToolManager generates GenerateResult, whose
-    ToolCallTurn arm is the tool-call turn. Every other binding generates Response alone.
-    Every transition is exact, so dropping the ToolManager drops the ToolCallTurn arm with it.
+    ToolCallTurn variant is the tool-call turn. Every other binding generates Response alone.
+    Every transition is exact, so dropping the ToolManager drops the ToolCallTurn variant with it.
     It also pins tool_manager's own type, which is what a tool loop dispatches through.
     """
     llm = LLM(_FakeAdapter())
@@ -1914,7 +1914,7 @@ def _structured_tool_bound_llm(
     return bound_llm
 
 
-def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_arm() -> None:
+def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_variant() -> None:
     """A structured tool-bound turn that called tools reaches the caller as ToolCallTurn.
 
     Its output is the unparsed None and its tool_calls are the turn's, what a tool loop dispatches;
@@ -1931,7 +1931,7 @@ def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_arm() -> 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_structured_tool_bound_generate_one_returns_the_response_arm_on_a_final_turn() -> None:
+def test_structured_tool_bound_generate_one_returns_the_response_variant_on_a_final_turn() -> None:
     """A turn without tool calls reaches the caller as Response, the parsed instance on output."""
 
     async def scenario() -> None:
@@ -1948,8 +1948,8 @@ def test_structured_tool_bound_generate_one_returns_the_response_arm_on_a_final_
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_arm() -> None:
-    """The stream path splits the same way: final() on a tool-call turn is the ToolCallTurn arm."""
+def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_variant() -> None:
+    """The stream path splits the same way: final() on a tool-call turn is the ToolCallTurn variant."""
 
     async def scenario() -> None:
         bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN)
@@ -2931,7 +2931,7 @@ def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
 def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> None:
     """An UnfinishedTurn from the stream's final() fails the call, carrying the adapter's reason.
 
-    The stream loop builds this error separately from the generate loop, and it is the one member
+    The stream loop builds this error separately from the generate loop, and it is the one variant
     with a field of its own, so the reason must survive the trip through both.
     """
 

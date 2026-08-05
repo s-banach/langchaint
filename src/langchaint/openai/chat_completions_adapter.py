@@ -1096,19 +1096,19 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the response and its text in scope when
-        the text is rejected: the member returned for a rejection is one the retry loop can place
+        the text is rejected: the variant returned for a rejection is one the retry loop can place
         against the attempt it already recorded, where a raise from inside the SDK is not.
 
         The text validated is message.content alone: a refusal is the model declining, so its
         sentences are never a candidate instance, and the turn carrying them reaches the caller on
-        the Refusal member.
+        the Refusal variant.
         The finish reason is read before the rejection, so text the token cap cut mid-object is
         reported as the truncation and not as a violation of the schema it was closing.
 
         None is the tool-call turn and nothing else: a turn _normalized_stop_reason calls
         tool_use, whose calls the turn kept, selects it. A refusal beside a call, a call the
         token cap cut mid-arguments, and a "tool_calls" finish leaving no call in the turn each
-        fall to their own member below rather than dispatch as a completed turn.
+        fall to their own variant below rather than dispatch as a completed turn.
         The instance wins where a turn carries both, because a turn that produced the instance
         answered the request whether or not it also called a tool.
         """

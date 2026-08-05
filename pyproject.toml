@@ -189,7 +189,7 @@ lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
 lint.pylint.max-args = 7
 
-# The retry loops match ResponseOutcome one case per member, so these three counts track the union's
+# The retry loops match ResponseOutcome one case per variant, so these three counts track the union's
 # size rather than any nesting.
 # The design rule that gives each outcome its own type is what sets that size, so capping the counts
 # at a default would be capping the union.

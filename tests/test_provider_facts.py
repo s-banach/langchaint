@@ -54,18 +54,18 @@ def _field_annotation(model: type[BaseModel], name: str) -> object:
 
 
 def _type_literals_of_union(annotation: object) -> set[str]:
-    """Collect the value of each member's `type` field literal, over a union or an Annotated one.
+    """Collect the value of each variant's `type` field literal, over a union or an Annotated one.
 
     Both SDKs discriminate their event unions on a `type` field holding a one-value Literal, which
     is the string the adapters branch on.
 
     Raises:
-        AssertionError: a member has no `type` field.
+        AssertionError: a variant has no `type` field.
     """
-    members = typing.get_args(annotation)
+    variants = typing.get_args(annotation)
     if typing.get_origin(annotation) is typing.Annotated:
-        members = typing.get_args(members[0])
-    return {typing.get_args(_field_annotation(member, "type"))[0] for member in members}
+        variants = typing.get_args(variants[0])
+    return {typing.get_args(_field_annotation(variant, "type"))[0] for variant in variants}
 
 
 def _is_required(model: type[BaseModel], name: str) -> bool:
@@ -143,7 +143,7 @@ def test_openai_usage_details_objects_are_not_optional() -> None:
 
 
 def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
-    """A member the provider adds fails here; _normalized_stop_reason would map it to "other" unnoticed."""
+    """A value the provider adds fails here; _normalized_stop_reason would map it to "other" unnoticed."""
     annotation = _field_annotation(AnthropicMessage, "stop_reason")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "end_turn",
@@ -157,7 +157,7 @@ def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
 
 
 def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
-    """Response.status members the adapter branches on: completed, failed, and incomplete."""
+    """Response.status values the adapter branches on: completed, failed, and incomplete."""
     annotation = _field_annotation(OpenAIResponse, "status")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "completed",
@@ -170,7 +170,7 @@ def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
 
 
 def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
-    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not; a third member would fall through."""
+    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not; a third value would fall through."""
     annotation = _field_annotation(IncompleteDetails, "reason")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "max_output_tokens",
@@ -179,11 +179,11 @@ def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
 
 
 def test_every_openai_error_code_has_a_disposition() -> None:
-    """Every ResponseError.code member is a key of the table saying whether a resend may get past it.
+    """Every ResponseError.code value is a key of the table saying whether a resend may get past it.
 
     A code openai adds and the table lacks is reported as ProviderFailedTerminally, so the item
     fails once at the cost of one attempt rather than being retried; this test is what says whether
-    that fallback was reached by a genuinely new code or by a member the table forgot.
+    that fallback was reached by a genuinely new code or by a value the table forgot.
     The check is one-directional because langchaint supports a range of openai versions: the table
     keeps a code an older SDK in that range does not declare, which costs a dict entry that cannot
     be reached and nothing else.
@@ -193,10 +193,10 @@ def test_every_openai_error_code_has_a_disposition() -> None:
     assert codes <= set(_DISPOSITION_BY_ERROR_CODE)
 
 
-def test_anthropic_service_tier_members_are_the_pricing_mapping_keys() -> None:
+def test_anthropic_service_tier_values_are_the_pricing_mapping_keys() -> None:
     """The tier words a response can report are exactly AnthropicPricedServiceTier.
 
-    An adapter's pricing mapping is keyed by that alias, so a member the SDK adds and the alias
+    An adapter's pricing mapping is keyed by that alias, so a value the SDK adds and the alias
     lacks would price NaN with no table a caller could supply for it.
     """
     annotation = _field_annotation(AnthropicUsage, "service_tier")
@@ -263,7 +263,7 @@ def test_openai_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
     413 is the named case: openai raises the bare APIStatusError for it, so a class list would drop
     it, and would drop whatever status the provider adds next the same way.
     529 is listed to pin the other half of the anthropic comparison: openai has no class of its own
-    for it and reaches InternalServerError through the 5xx arm.
+    for it and reaches InternalServerError through the 5xx branch.
     """
     client = openai.OpenAI(api_key="k")
     listed = {
@@ -318,9 +318,9 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
 
 def test_anthropic_content_block_deltas_carry_the_two_kinds_of_text_the_stream_yields() -> None:
     """The stream branches on these two delta types; a rename drops that text from the stream unnoticed."""
-    members = _type_literals_of_union(_field_annotation(RawContentBlockDeltaEvent, "delta"))
-    assert "text_delta" in members
-    assert "thinking_delta" in members
+    type_values = _type_literals_of_union(_field_annotation(RawContentBlockDeltaEvent, "delta"))
+    assert "text_delta" in type_values
+    assert "thinking_delta" in type_values
 
 
 def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches_on() -> None:
@@ -330,12 +330,12 @@ def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches
     A renamed delta type drops that text from the stream; a renamed done type drops every separator
     between reasoning parts, leaving them concatenated into one run.
     """
-    members = _type_literals_of_union(ResponseStreamEvent)
-    assert "response.output_text.delta" in members
-    assert "response.reasoning_summary_text.delta" in members
-    assert "response.reasoning_text.delta" in members
-    assert "response.reasoning_summary_text.done" in members
-    assert "response.reasoning_text.done" in members
+    type_values = _type_literals_of_union(ResponseStreamEvent)
+    assert "response.output_text.delta" in type_values
+    assert "response.reasoning_summary_text.delta" in type_values
+    assert "response.reasoning_text.delta" in type_values
+    assert "response.reasoning_summary_text.done" in type_values
+    assert "response.reasoning_text.done" in type_values
 
 
 def test_the_schema_builders_both_adapters_call_are_still_where_they_were() -> None:

@@ -159,7 +159,7 @@ _REASONING_OUTPUT_ITEM: dict[str, object] = {
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
-    """Narrow a ResponseOutcome to its success arm, failing the test on any other arm."""
+    """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
     assert isinstance(outcome, AdapterResult)
     return outcome
 
@@ -1458,7 +1458,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """An incomplete turn whose JSON stopped mid-object is the truncation, not a schema violation.
 
-    This is the response the SDK's own parse raised on; reporting it as a member is what lets the
+    This is the response the SDK's own parse raised on; reporting it as a variant is what lets the
     retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
     """
     outcome = _structured_parse(
@@ -1534,14 +1534,14 @@ def test_identity_reads_the_request_id_the_sdk_attached_to_the_response() -> Non
 
 
 def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_validates() -> None:
-    """A failed run is the failure member even when its fragment validates: it is not the answer."""
+    """A failed run is the failure variant even when its fragment validates: it is not the answer."""
     outcome = _structured_parse(
         _structured_response(_REPORT_JSON, status="failed", error=_SERVER_ERROR)
     )
     assert isinstance(outcome, ProviderFailedTransiently)
 
 
-def test_a_failed_run_carrying_a_refusal_takes_the_failure_member_under_both_bindings() -> None:
+def test_a_failed_run_carrying_a_refusal_takes_the_failure_variant_under_both_bindings() -> None:
     """A failed status wins over the refusal test, so one response does not split by binding.
 
     Were the refusal tested first, the structured binding would report Refusal (a terminal

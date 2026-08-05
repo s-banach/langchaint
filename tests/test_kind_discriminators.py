@@ -1,16 +1,16 @@
 """The kind tag as a type-checked contract, on every union whose classes carry one.
 
-Each union gets a match on kind whose cases read a field only some arms carry: that body fails to
+Each union gets a match on kind whose cases read a field only some variants carry: that body fails to
 type-check unless the tag narrows the subject, so a regressed discriminator is a check-time error
 rather than a runtime AttributeError.
-GenerateResult's arms share every field name, so its match asserts the narrowed type of output,
+GenerateResult's variants share every field name, so its match asserts the narrowed type of output,
 which only the tag makes non-optional in the response case.
 Each union also gets a one-case match carrying a non-exhaustive-match suppression.
 pyrefly reports an unused suppression as an error, so if the tag ever stops driving exhaustiveness
-the suppression goes unused and the check fails; a union that gains an arm fails in the full match
+the suppression goes unused and the check fails; a union that gains a variant fails in the full match
 beside it.
 The full matches are exercised at runtime too, so a subject reaching no case fails an assertion.
-That no two arms share a tag, which is what keeps an arm out of a sibling's case, is checked in
+That no two variants share a tag, which is what keeps a variant out of a sibling's case, is checked in
 test_kind_tag_shape.py.
 """
 
@@ -64,7 +64,7 @@ _TOOL_MESSAGE = ToolMessage(tool_call_id="c1", content="ok")
 
 
 _CALL = call_record((attempt_record(error=None),), elapsed_seconds=1.0)
-"""One successful attempt's history, the fixed filler both GenerateResult arms carry."""
+"""One successful attempt's history, the fixed filler both GenerateResult variants carry."""
 
 
 def _by_message_kind(message: Message) -> object:
@@ -77,7 +77,7 @@ def _by_message_kind(message: Message) -> object:
             return message.tool_call_id
 
 
-def _by_message_kind_missing_an_arm(message: Message) -> object:
+def _by_message_kind_missing_a_variant(message: Message) -> object:
     match message.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "user":
             return message.content
@@ -91,7 +91,7 @@ def _by_part_kind(part: Part) -> object:
             return part.media_type
 
 
-def _by_part_kind_missing_an_arm(part: Part) -> object:
+def _by_part_kind_missing_a_variant(part: Part) -> object:
     match part.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "text":
             return part.text
@@ -107,7 +107,7 @@ def _by_turn_element_kind(element: TurnElement) -> object:
             return element.args_json
 
 
-def _by_turn_element_kind_missing_an_arm(element: TurnElement) -> object:
+def _by_turn_element_kind_missing_a_variant(element: TurnElement) -> object:
     match element.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "reasoning_trace":
             return element.raw
@@ -123,7 +123,7 @@ def _by_dispatch_outcome_kind(outcome: DispatchOutcome) -> object:
             return outcome.called_name
 
 
-def _by_dispatch_outcome_kind_missing_an_arm(outcome: DispatchOutcome) -> object:
+def _by_dispatch_outcome_kind_missing_a_variant(outcome: DispatchOutcome) -> object:
     match outcome.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "handled":
             return outcome.app_data
@@ -141,7 +141,7 @@ def _by_dispatch_many_outcome_kind(outcome: DispatchManyOutcome) -> object:
             return outcome.tool_message
 
 
-def _by_dispatch_many_outcome_kind_missing_an_arm(outcome: DispatchManyOutcome) -> object:
+def _by_dispatch_many_outcome_kind_missing_a_variant(outcome: DispatchManyOutcome) -> object:
     match outcome.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "handled":
             return outcome.app_data
@@ -151,7 +151,7 @@ def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
     """Cover ResponseOutcome, the union every retry loop matches an attempt's outcome over.
 
     A match over it is exhaustive only if a match over NoOutputOutcome is, since those are its
-    no-output arms.
+    no-output variants.
     """
     match outcome.kind:
         case "adapter_result":
@@ -174,17 +174,17 @@ def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
             return outcome.is_rate_limit
 
 
-def _by_response_outcome_kind_missing_an_arm(outcome: ResponseOutcome[str]) -> object:
+def _by_response_outcome_kind_missing_a_variant(outcome: ResponseOutcome[str]) -> object:
     match outcome.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "adapter_result":
             return outcome.output
 
 
 def _by_generate_result_kind(result: GenerateResult[int]) -> object:
-    """Cover GenerateResult, whose arms share every field name.
+    """Cover GenerateResult, whose variants share every field name.
 
     The tag's work is output's optionality, so each case asserts the type the tag narrowed output
-    to, standing where the other functions read an arm-only field.
+    to, standing where the other functions read a variant-only field.
     """
     match result.kind:
         case "response":
@@ -195,14 +195,14 @@ def _by_generate_result_kind(result: GenerateResult[int]) -> object:
             return result.tool_calls
 
 
-def _by_generate_result_kind_missing_an_arm(result: GenerateResult[int]) -> object:
+def _by_generate_result_kind_missing_a_variant(result: GenerateResult[int]) -> object:
     match result.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "response":
             return result.output
 
 
 def _by_stream_item_kind(item: StreamItem) -> object:
-    """Cover StreamItem, whose str arm carries no tag because a builtin cannot hold one."""
+    """Cover StreamItem, whose str variant carries no tag because a builtin cannot hold one."""
     if isinstance(item, str):
         return item
     match item.kind:
@@ -214,7 +214,7 @@ def _by_stream_item_kind(item: StreamItem) -> object:
             return item.args_json
 
 
-def _by_stream_item_kind_missing_an_arm(item: StreamItem) -> object:
+def _by_stream_item_kind_missing_a_variant(item: StreamItem) -> object:
     if isinstance(item, str):
         return item
     match item.kind:  # pyrefly: ignore[non-exhaustive-match]
@@ -223,7 +223,7 @@ def _by_stream_item_kind_missing_an_arm(item: StreamItem) -> object:
 
 
 def _by_verdict_kind(verdict: Verdict) -> object:
-    """Cover Verdict, whose DoNotRetry arm is the one carrying no retry_after."""
+    """Cover Verdict, whose DoNotRetry variant is the one carrying no retry_after."""
     match verdict.kind:
         case "pause_all":
             return verdict.retry_after
@@ -233,38 +233,38 @@ def _by_verdict_kind(verdict: Verdict) -> object:
             return verdict.kind
 
 
-def _by_verdict_kind_missing_an_arm(verdict: Verdict) -> object:
+def _by_verdict_kind_missing_a_variant(verdict: Verdict) -> object:
     match verdict.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "pause_all":
             return verdict.retry_after
 
 
-def test_a_message_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """Each Message arm's tag reaches a field the other arms do not carry."""
+def test_a_message_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each Message variant's tag reaches a field the other variants do not carry."""
     assert _by_message_kind(UserMessage(content="hi")) == "hi"
     assert _by_message_kind(_TURN) == (TextPart(text="hi"),)
     assert _by_message_kind(_TOOL_MESSAGE) == "c1"
-    assert _by_message_kind_missing_an_arm(_TOOL_MESSAGE) is None
+    assert _by_message_kind_missing_a_variant(_TOOL_MESSAGE) is None
 
 
-def test_a_part_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """Each Part arm's tag reaches a field the other arm does not carry."""
+def test_a_part_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each Part variant's tag reaches a field the other variant does not carry."""
     assert _by_part_kind(TextPart(text="hi")) == "hi"
     assert _by_part_kind(ImagePart(data=b"png", media_type="image/png")) == "image/png"
-    assert _by_part_kind_missing_an_arm(ImagePart(data=b"png", media_type="image/png")) is None
+    assert _by_part_kind_missing_a_variant(ImagePart(data=b"png", media_type="image/png")) is None
 
 
-def test_a_turn_element_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """Each TurnElement arm's tag reaches a field the other arms do not carry."""
+def test_a_turn_element_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each TurnElement variant's tag reaches a field the other variants do not carry."""
     assert _by_turn_element_kind(ReasoningTrace(raw={"id": "rs_1"})) == {"id": "rs_1"}
     assert _by_turn_element_kind(TextPart(text="hi")) is False
     assert _by_turn_element_kind(ToolCall(id="c1", name="probe", args_json="{}")) == "{}"
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
-    assert _by_turn_element_kind_missing_an_arm(tool_call) is None
+    assert _by_turn_element_kind_missing_a_variant(tool_call) is None
 
 
-def test_a_dispatch_outcome_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """Each DispatchOutcome arm's tag reaches a field the other arms do not carry."""
+def test_a_dispatch_outcome_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each DispatchOutcome variant's tag reaches a field the other variants do not carry."""
     detail = InvalidToolArgsDetail(path=("city",), message="required")
     unknown_tool = DispatchUnknownTool(tool_message=_TOOL_MESSAGE, called_name="off_list")
     handled = DispatchHandled(tool_message=_TOOL_MESSAGE, app_data={"seen": 1})
@@ -273,11 +273,11 @@ def test_a_dispatch_outcome_kind_selects_the_arm_that_carries_the_field_read() -
         DispatchInvalidToolArgs(tool_message=_TOOL_MESSAGE, details=(detail,))
     ) == (detail,)
     assert _by_dispatch_outcome_kind(unknown_tool) == "off_list"
-    assert _by_dispatch_outcome_kind_missing_an_arm(unknown_tool) is None
+    assert _by_dispatch_outcome_kind_missing_a_variant(unknown_tool) is None
 
 
-def test_a_dispatch_many_outcome_kind_selects_its_own_extra_arm() -> None:
-    """DispatchManyOutcome's precomputed arm has its own tag, and the shared arms keep theirs."""
+def test_a_dispatch_many_outcome_kind_selects_its_own_extra_variant() -> None:
+    """DispatchManyOutcome's precomputed variant has its own tag, and the shared variants keep theirs."""
     precomputed = DispatchPrecomputed(tool_message=_TOOL_MESSAGE)
     assert _by_dispatch_many_outcome_kind(precomputed) is _TOOL_MESSAGE
     assert (
@@ -286,11 +286,11 @@ def test_a_dispatch_many_outcome_kind_selects_its_own_extra_arm() -> None:
         )
         == "off_list"
     )
-    assert _by_dispatch_many_outcome_kind_missing_an_arm(precomputed) is None
+    assert _by_dispatch_many_outcome_kind_missing_a_variant(precomputed) is None
 
 
-def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_arm_carries() -> None:
-    """Each ResponseOutcome arm reaches a case that reads a field the arm carries."""
+def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_variant_carries() -> None:
+    """Each ResponseOutcome variant reaches a case that reads a field the variant carries."""
     outcomes: list[tuple[ResponseOutcome[str], object]] = [
         (AdapterResult(output="hi", assistant_message=_TURN, stop_reason="end_turn"), "hi"),
         (Refusal(assistant_message=_TURN), _TURN),
@@ -308,10 +308,10 @@ def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_arm_carri
     assert [_by_response_outcome_kind(outcome) for outcome, _ in outcomes] == [
         expected for _, expected in outcomes
     ]
-    assert _by_response_outcome_kind_missing_an_arm(Refusal(assistant_message=_TURN)) is None
+    assert _by_response_outcome_kind_missing_a_variant(Refusal(assistant_message=_TURN)) is None
 
 
-def test_a_generate_result_kind_narrows_the_output_type_the_arms_share_a_name_for() -> None:
+def test_a_generate_result_kind_narrows_the_output_type_the_variants_share_a_name_for() -> None:
     """The response case returns the non-optional output; the tool_call_turn case reads tool_calls."""
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
     tool_call_turn: ToolCallTurn[int] = ToolCallTurn(
@@ -326,18 +326,18 @@ def test_a_generate_result_kind_narrows_the_output_type_the_arms_share_a_name_fo
     )
     assert _by_generate_result_kind(response) == 7
     assert _by_generate_result_kind(tool_call_turn) == (tool_call,)
-    assert _by_generate_result_kind_missing_an_arm(tool_call_turn) is None
+    assert _by_generate_result_kind_missing_a_variant(tool_call_turn) is None
 
 
-def test_a_verdict_kind_selects_the_arm_that_carries_the_field_read() -> None:
-    """The two retrying arms' tags reach retry_after, which DoNotRetry does not carry."""
+def test_a_verdict_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """The two retrying variants' tags reach retry_after, which DoNotRetry does not carry."""
     assert _by_verdict_kind(PauseAll(retry_after=7.0)) == 7.0
     assert _by_verdict_kind(RetryThisOne(retry_after=2.0)) == 2.0
     assert _by_verdict_kind(DoNotRetry()) == "do_not_retry"
-    assert _by_verdict_kind_missing_an_arm(DoNotRetry()) is None
+    assert _by_verdict_kind_missing_a_variant(DoNotRetry()) is None
 
 
-def test_a_stream_item_kind_selects_the_arm_that_carries_the_field_read() -> None:
+def test_a_stream_item_kind_selects_the_variant_that_carries_the_field_read() -> None:
     """A str is selected by isinstance, and the tag selects among the three classes."""
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
     assert _by_stream_item_kind("hi") == "hi"
@@ -347,4 +347,4 @@ def test_a_stream_item_kind_selects_the_arm_that_carries_the_field_read() -> Non
         == '{"de'
     )
     assert _by_stream_item_kind(tool_call) == "{}"
-    assert _by_stream_item_kind_missing_an_arm(tool_call) is None
+    assert _by_stream_item_kind_missing_a_variant(tool_call) is None

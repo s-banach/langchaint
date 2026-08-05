@@ -59,7 +59,7 @@ from langchaint.response import (
     Response,
     ToolCallTurn,
     _abandoned_call_error,
-    _success_arm,
+    _success_variant,
 )
 from langchaint.shared_backoff import (
     Admission,
@@ -384,9 +384,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     A tool loop therefore dispatches through the binding it was handed.
     ToolManagerT is also what the request methods overload on.
     A structured BoundLLM[Model, ToolManager] generates GenerateResult[Model]: a tool-call turn is
-    the ToolCallTurn arm, so the Response arm's output is never None.
+    the ToolCallTurn variant, so the Response variant's output is never None.
     Every other combination generates Response[OutputT] alone.
-    Keeping the arms out of OutputT is what lets rebind add and remove a tool_manager.
+    Keeping the variants out of OutputT is what lets rebind add and remove a tool_manager.
     The parameter defaults to None, so BoundLLM[Model] annotates the common binding.
     A tool-bound one names both, BoundLLM[Model, ToolManager].
     bind writes ToolManager as the type argument for every manager, subclasses included.
@@ -635,7 +635,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Name this item's terminal failure from the adapter's classification of exc.
 
         Reached on a DoNotRetry verdict and on an exception outside failure_types that classify
-        did not call transient, so the "transient" member cannot arrive; if a classify defect
+        did not call transient, so the "transient" value cannot arrive; if a classify defect
         produces one anyway, it lands on the unknown_exception default with everything else out
         of place.
         Every record written here bills observations.billing, what the failure's stream had
@@ -787,7 +787,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Run the retry loop every generate method shares, under the caller's deadline.
 
         ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
-        into as each attempt settles. Every GenerationError and the success arm are built from
+        into as each attempt settles. Every GenerationError and the success variant are built from
         ledger.freeze(), the one site a call's elapsed_seconds is computed.
 
         timeout_seconds bounds this whole loop, admission waits and backoff sleeps included, and
@@ -798,8 +798,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         came from under the loop unclassified, and re-raising it hands it to the same wrapping every
         other unclassified exception gets.
 
-        The adapter reports one attempt as a ResponseOutcome member and never as a GenerationError,
-        so this loop matches the member and constructs the item's GenerationError here, where the
+        The adapter reports one attempt as a ResponseOutcome variant and never as a GenerationError,
+        so this loop matches the variant and constructs the item's GenerationError here, where the
         attempts and the timing are known.
         Each arrived response is staged on the ledger with its billing before anything is read off it,
         so an exception from that read still leaves the attempt and its billing on the record.
@@ -942,12 +942,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 if terminal is not None:
                     raise terminal from exc
             else:
-                # error is None on every member reaching here: the request succeeded, and what the
+                # error is None on every variant reaching here: the request succeeded, and what the
                 # adapter made of the response is the item's outcome, not this attempt's failure.
                 ledger.record(error=None, assistant_message=outcome.assistant_message)
                 match outcome.kind:
                     case "adapter_result":
-                        return _success_arm(
+                        return _success_variant(
                             splits_tool_call_turns=self._splits_tool_call_turns,
                             output=outcome.output,
                             call=ledger.freeze(),
@@ -1069,7 +1069,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generate_item: "GenerateItem[OutputT]",
         timeout_seconds: float | None,
     ) -> CallResult[OutputT | None]:
-        """One batch item: the success arm or the GenerationError.
+        """One batch item: the success variant or the GenerationError.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
         into the gather and reaches a sibling. An expired timeout_seconds is one of them, so one
@@ -1121,7 +1121,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         A success slot is typed the way generate_one types its result, per binding.
         A bare str as the whole batch is rejected: str satisfies the item Sequence type,
         so it would silently become one request per character.
-        Every item ends in its own slot: a success arm, or the GenerationError it failed with
+        Every item ends in its own slot: a success variant, or the GenerationError it failed with
         (retries exhausted, a rejected request, an error langchaint does not retry, a 200 that
         produced no output, or a defect in langchaint itself), which to_tables renders to a failure
         row so the batch stays table-ready.

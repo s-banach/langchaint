@@ -346,7 +346,7 @@ class AdapterConformance(ABC):
     def test_failure_types_names_only_exception_subclasses_and_carries_transient_error(
         self,
     ) -> None:
-        """failure_types members are strict Exception subclasses, and TransientError is one.
+        """failure_types entries are strict Exception subclasses, and TransientError is one.
 
         SharedBackoff rejects anything else at construction, so a violation here fails before any
         request. TransientError is required because the retry loop raises it inside the admitted()

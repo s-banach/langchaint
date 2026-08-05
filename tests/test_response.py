@@ -1,14 +1,14 @@
-"""The success arms' constructor invariants, the _success_arm split, the two usage scopes, and to_tables.
+"""The success variants' constructor invariants, the _success_variant split, the two usage scopes, and to_tables.
 
-The retry loops in llm.py and streaming.py construct every success arm through _success_arm,
+The retry loops in llm.py and streaming.py construct every success variant through _success_variant,
 so these invariants are what stops a refactor of either loop from building a success row whose records disagree,
-and the _success_arm tests pin which arm a turn becomes;
+and the _success_variant tests pin which variant a turn becomes;
 the retry tests in test_bound_llm.py pin the record values themselves.
 usage is the paid total folded from attempt_records and usage_successful_attempt is the last record's own,
 so a retried billed 200 makes them diverge; both are exercised here.
-to_tables is the table boundary, exercised here over a success and over each GenerationError arm,
-because what each arm puts in the shared columns (output, error_summary, stop_reason, and the
-per-attempt billing columns) differs per arm and is what a mixed batch's tables show.
+to_tables is the table boundary, exercised here over a success and over each GenerationError variant,
+because what each variant puts in the shared columns (output, error_summary, stop_reason, and the
+per-attempt billing columns) differs per variant and is what a mixed batch's tables show.
 """
 
 import json
@@ -39,7 +39,7 @@ from langchaint import (
 )
 from langchaint.adapter import RequestParams
 from langchaint.call import ResponseIdentity, _CallLedger
-from langchaint.response import _abandoned_call_error, _success_arm
+from langchaint.response import _abandoned_call_error, _success_variant
 from tests.helpers import CALL_STARTED_AT, StubRaw, attempt_record, call_record, stated_billing
 
 
@@ -148,7 +148,7 @@ def test_response_rejects_a_failed_last_record() -> None:
 
 
 def test_tool_call_turn_rejects_a_turn_without_a_tool_call() -> None:
-    """The arm exists to say the turn called tools, so a turn without a call is a construction defect."""
+    """The variant exists to say the turn called tools, so a turn without a call is a construction defect."""
     with pytest.raises(ValueError, match="at least one tool call"):
         _ = _tool_call_turn(
             output=None,
@@ -185,7 +185,7 @@ def test_tool_call_turn_enforces_the_shared_success_record_invariants() -> None:
         "split_binding_tool_call_turn_with_instance",
     ],
 )
-def test_success_arm_is_tool_call_turn_only_where_a_split_bindings_turn_called_tools(
+def test_success_variant_is_tool_call_turn_only_where_a_split_bindings_turn_called_tools(
     *,
     splits_tool_call_turns: bool,
     assistant_message: AssistantMessage,
@@ -194,9 +194,9 @@ def test_success_arm_is_tool_call_turn_only_where_a_split_bindings_turn_called_t
 ) -> None:
     """The split needs both: the binding splits and the turn called tools; either alone is a Response.
 
-    output rides whichever arm results, so a turn carrying both an instance and tool calls keeps it.
+    output rides whichever variant results, so a turn carrying both an instance and tool calls keeps it.
     """
-    result = _success_arm(
+    result = _success_variant(
         splits_tool_call_turns=splits_tool_call_turns,
         output=output,
         call=call_record((attempt_record(error=None),), elapsed_seconds=1.0),

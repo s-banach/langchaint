@@ -69,12 +69,12 @@ Mapping decisions:
   status "incomplete" means max_tokens or refusal by its reason ("max_output_tokens" or
   "content_filter", the only two the SDK types), and anything else is "other".
 - A `ResponseOutputRefusal` content part becomes a TextPart, so the refusal the model wrote is the
-  turn's text and replays as text. anthropic's ContentBlock union has no refusal member
+  turn's text and replays as text. anthropic's ContentBlock union has no refusal variant
   (anthropic 0.120.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
   mapping openai's part to a TextPart gives the two providers one neutral shape and leaves the stop
   reason as the signal on both.
 - Status "failed" is the API reporting that the run did not finish (`response.error` names why), so
-  whatever it emitted is a fragment rather than the turn. Both bindings report it as the member
+  whatever it emitted is a fragment rather than the turn. Both bindings report it as the variant
   `_provider_failure` picks off `response.error.code`, carrying that response's billing, and a
   structured binding does so whether or not the fragment happened to validate.
 - Streaming yields the SDK's own answer delta strings unwrapped, each reasoning delta in a ReasoningDelta,
@@ -437,10 +437,10 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]
 def _provider_failure(
     response: OpenAIResponse, *, assistant_message: AssistantMessage
 ) -> ProviderFailedTransiently | ProviderFailedTerminally:
-    """Report a failed status as the member its error code's disposition selects.
+    """Report a failed status as the variant its error code's disposition selects.
 
     A failed status is the API saying no generation completed, so whatever output items the response
-    holds are a fragment rather than the turn. Both members carry that fragment as their turn.
+    holds are a fragment rather than the turn. Both variants carry that fragment as their turn.
 
     reason is response.error.message verbatim, the only description of a condition langchaint does
     not model; a response reporting the failure with no error object at all gets langchaint's own
@@ -449,7 +449,7 @@ def _provider_failure(
     classified fails the item rather than being resent at full price.
     rate_limit_exceeded sets is_rate_limit, which the retry loop's TransientError carries into the
     admitted() block's exit, where parse maps it to PauseAll and pauses admission the way a 429
-    status does. Neither member carries a server-stated wait, so the pause runs for the drawn wait.
+    status does. Neither variant carries a server-stated wait, so the pause runs for the drawn wait.
     """
     error = response.error
     if error is None:
@@ -1094,7 +1094,7 @@ class _BoundOpenAIText(_BoundOpenAI[str]):
 
         A failed status means the run did not finish, and response.error names why, so the output
         items hold whatever had been emitted rather than the turn; reporting that as a Response would
-        present a fragment as the answer. _provider_failure states which member the error code picks.
+        present a fragment as the answer. _provider_failure states which variant the error code picks.
         An incomplete status is deliberately not this case: a turn cut off at the token cap or by a
         content filter is the answer as far as it got, and stop_reason ("max_tokens" or "refusal")
         is how the caller sees that.
@@ -1147,9 +1147,9 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         text to validate. On a completed turn the two answers are SchemaViolation and EmptyTurn;
         everywhere else the status names the failure and the rejection adds nothing.
 
-        Each member carries assistant_message, so the turn a rejected 200 did produce reaches the
+        Each variant carries assistant_message, so the turn a rejected 200 did produce reaches the
         caller on the failure.
-        No member carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
+        No variant carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
         here only to detect the refusal, tests a function_call item ahead of the response status,
         which is right for what a Response reports and wrong for a truncated turn.
         A failed status is tested first, ahead of the refusal and the truncation: the API is reporting
@@ -1192,12 +1192,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the response and its text in scope when
-        the text is rejected: the member returned for a rejection is one the retry loop can place
+        the text is rejected: the variant returned for a rejection is one the retry loop can place
         against the attempt it already recorded, where a raise from inside the SDK is not.
 
         A failed status is rejected even when the text validates: the run did not finish, and
         response.error names why, so an instance built from the fragment it had emitted would be
-        presented as the answer. _no_instance reports it as the failure member _provider_failure chose.
+        presented as the answer. _no_instance reports it as the failure variant _provider_failure chose.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
         message carries, so a turn whose text is not the instance yields no instance without anything

@@ -732,7 +732,7 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
 
     A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
     model_dump for verbatim replay; server tool blocks are dropped (built-in tools are out of scope).
-    The two reasoning block types get an arm each because only thinking carries readable text:
+    The two reasoning block types get a branch each because only thinking carries readable text:
     a redacted_thinking block holds an opaque string under data and nothing a reader can display,
     so its trace has no text.
     """
@@ -1364,21 +1364,21 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the message and its text in scope when
-        the text is rejected: the member returned for a rejection is one the retry loop can place
+        the text is rejected: the variant returned for a rejection is one the retry loop can place
         against the attempt it already recorded, where a raise from inside the SDK is not.
 
         None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
         message carries, so a turn whose text is not the instance yields no instance without anything
         having gone wrong.
 
-        Every other stop reason has a named member, and none of them is retried, because no stop reason
+        Every other stop reason has a named variant, and none of them is retried, because no stop reason
         states an error: the model finished on the terms it reports, so a resend is a fresh sample.
         The stop reason is read before the rejection, so text the token cap cut mid-object is
         reported as the truncation and not as a violation of the schema it was closing.
 
-        Each member carries assistant_message, so the turn a rejected 200 did produce reaches the
+        Each variant carries assistant_message, so the turn a rejected 200 did produce reaches the
         caller on the failure.
-        The stop reason chooses the member and is not carried on it: what such a 200 reports is fixed
+        The stop reason chooses the variant and is not carried on it: what such a 200 reports is fixed
         by its GenerationError subclass.
         """
         validation_error: ValidationError | None = None

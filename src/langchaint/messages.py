@@ -92,7 +92,7 @@ class UserMessage(CheckedCopyModel):
 
     kind discriminates the Message union,
     so a persisted Sequence[Message] re-validates to the same message types by construction
-    instead of by union member order.
+    instead of by variant order.
 
     content is keyword-only, as on every model here; CheckedCopyModel's module docstring says why a
     positional UserMessage("Hello") is rejected. A Sequence[Message] that is one user turn goes to
@@ -146,7 +146,7 @@ class ReasoningTrace(CheckedCopyModel):
 
 type TurnElement = Annotated[ReasoningTrace | TextPart | ToolCall, Field(discriminator="kind")]
 """One element of an assistant turn, ordered as the provider emitted them.
-Discriminated on kind, so re-validating a persisted turn selects each element's member from its tag.
+Discriminated on kind, so re-validating a persisted turn selects each element's variant from its tag.
 TextPart, not Part: assistant turns still return no images.
 """
 
@@ -238,8 +238,8 @@ class ToolMessage(CheckedCopyModel):
 
 
 type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="kind")]
-"""Discriminated on kind: pydantic validation selects the member from the tag,
-never from which member's fields happen to match,
+"""Discriminated on kind: pydantic validation selects the variant from the tag,
+never from which variant's fields happen to match,
 so messages_to_json and messages_from_json restore each message to its exact type.
 """
 
@@ -280,6 +280,6 @@ type StopReason = Literal[
 """Provider stop reasons normalized to one vocabulary;
 adapters map unrecognized provider values to "other" so a new provider value cannot break callers.
 context_window_exceeded carries no provider prefix because this vocabulary is langchaint's own;
-it earns a member rather than "other" because it names a terminal condition a caller acts on,
+it earns a value rather than "other" because it names a terminal condition a caller acts on,
 by shortening the GenerationInput or moving to a model with a larger window.
 """

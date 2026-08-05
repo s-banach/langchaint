@@ -458,7 +458,7 @@ class ReActAgent(AgentRun):
 
         app_data is read here, at its type.
         A Usage is spend the tool reported, carried only by DispatchHandled:
-        the invalid-args, unknown-tool, and budget-declined arms are calls that billed nothing,
+        the invalid-args, unknown-tool, and budget-declined variants are calls that billed nothing,
         and delegate reports None, because a sub-run wrote its own turn_log
         and folding a reported total would count the whole subtree twice.
         An approving CritiqueVerdict is what releases a self-correcting run to answer.

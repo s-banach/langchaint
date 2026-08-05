@@ -249,7 +249,7 @@ class SharedBackoff:
                 minimum_wait_ceiling; longest_wait / minimum_wait_ceiling is not a finite float,
                 which the decay arithmetic assumes; capacity is not None and not a positive
                 non-bool int; on_parse_error is neither accepted string; failure_types is empty,
-                which would make the exit parse nothing and record nothing; a failure_types member
+                which would make the exit parse nothing and record nothing; a failure_types entry
                 is not a strict subclass of Exception (Exception itself would convert nearly every
                 application bug into an apparent provider failure, and a type outside Exception,
                 such as asyncio.CancelledError, would pause the domain over a Ctrl-C); or parse is
@@ -294,7 +294,7 @@ class SharedBackoff:
                 or failure_type is Exception
             ):
                 raise ValueError(
-                    f"every failure_types member must be a strict subclass of Exception, "
+                    f"every failure_types entry must be a strict subclass of Exception, "
                     f"got {failure_type!r}"
                 )
         if inspect.iscoroutinefunction(parse):

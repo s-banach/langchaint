@@ -1,11 +1,11 @@
-"""The generate results: the success arms Response and ToolCallTurn, and the terminal GenerationError.
+"""The generate results: the success variants Response and ToolCallTurn, and the terminal GenerationError.
 
-A generate that succeeds returns a GenerateResult arm.
+A generate that succeeds returns a GenerateResult variant.
 One that ends terminally raises or returns a GenerationError.
 Terminal ends: retries exhausted, a refusal, truncation at the token cap, or a provider error langchaint does not retry.
 All three carry the CallRecord their retry loop froze.
 A call's history survives only if the result carries it: attempt_records is that history.
-On a success arm every record but the last failed and the last succeeded.
+On a success variant every record but the last failed and the last succeeded.
 On a GenerationError the records describe the terminal outcome.
 to_tables flattens results to two tables of scalars, one row per result and one row per attempt, joined on call_id.
 """
@@ -23,21 +23,21 @@ from langchaint.pricing import Billing
 from langchaint.usage import Usage
 
 type GenerateResult[OutputT] = Response[OutputT] | ToolCallTurn[OutputT]
-"""One successful generate result; a match on kind selects the arm without importing the classes.
+"""One successful generate result; a match on kind selects the variant without importing the classes.
 
-Only a structured tool-bound binding returns both arms.
+Only a structured tool-bound binding returns both variants.
 Every other binding returns Response alone, and its generate and stream overloads say so.
 """
 
 type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
-"""One call's terminal result: a success arm, or the failure carrier a batch returns in its slot."""
+"""One call's terminal result: a success variant, or the failure carrier a batch returns in its slot."""
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_tables emits."""
 
 
 class _SuccessCarrier(_CallCarrier):
-    """The invariants and folds the success arms share; the fields stay on each arm.
+    """The invariants and folds the success variants share; the fields stay on each variant.
 
     A deriving frozen dataclass declares every field itself, assistant_message included, because this
     class is not a dataclass and _CallCarrier explains why that split exists.
@@ -131,7 +131,7 @@ class Response[OutputT](_SuccessCarrier):
 class ToolCallTurn[OutputT](_SuccessCarrier):
     """One successful generate result whose turn called tools, owing the model one ToolMessage per call.
 
-    Only the structured tool-bound binding returns this arm; a text binding's tool calls ride a
+    Only the structured tool-bound binding returns this variant; a text binding's tool calls ride a
     Response, whose str output always exists.
     output is the response_format instance the turn's text also parsed to, None on a turn of tool
     calls alone.
@@ -150,7 +150,7 @@ class ToolCallTurn[OutputT](_SuccessCarrier):
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     def __post_init__(self) -> None:
-        """Enforce the shared success invariants, then this arm's own: the turn holds a tool call.
+        """Enforce the shared success invariants, then this variant's own: the turn holds a tool call.
 
         Raises:
             ValueError: a shared success check failed (_SuccessCarrier.__post_init__ names them), or
@@ -161,7 +161,7 @@ class ToolCallTurn[OutputT](_SuccessCarrier):
             raise ValueError("a ToolCallTurn must hold at least one tool call")
 
 
-def _success_arm[OutputT](
+def _success_variant[OutputT](
     *,
     splits_tool_call_turns: bool,
     output: OutputT,
@@ -170,19 +170,19 @@ def _success_arm[OutputT](
     stop_reason: StopReason,
     assistant_message: AssistantMessage,
 ) -> GenerateResult[OutputT]:
-    """Build the success arm one adapter_result outcome concludes its call with.
+    """Build the success variant one adapter_result outcome concludes its call with.
 
     splits_tool_call_turns is whether the binding is structured and tool-bound, the one binding
     whose tool-call turns are ToolCallTurn; under False every turn is a Response.
 
     Raises:
-        ValueError: the arm's __post_init__ rejected the records or the turn; both retry loops
+        ValueError: the variant's __post_init__ rejected the records or the turn; both retry loops
             construct from a freshly frozen success, so a raise here is a langchaint defect.
     """
-    arm: type[Response[OutputT]] | type[ToolCallTurn[OutputT]] = (
+    result_class: type[Response[OutputT]] | type[ToolCallTurn[OutputT]] = (
         ToolCallTurn if splits_tool_call_turns and assistant_message.tool_calls else Response
     )
-    return arm(
+    return result_class(
         output=output,
         call=call,
         raw=raw,
@@ -426,13 +426,13 @@ def to_tables[OutputT](results: CallResult[OutputT] | Iterable[CallResult[Output
     call_id is the result's position in the results given here, which is what joins an attempt row
     back to the call it belongs to. A caller concatenating the output of two to_tables calls offsets
     the second, since each numbers from zero.
-    kept marks the attempt whose turn became the answer: the last attempt of a success arm, and no
+    kept marks the attempt whose turn became the answer: the last attempt of a success variant, and no
     attempt of a GenerationError.
     An AbandonedCallError cut off mid-request gets one attempts row past its records, for the
     request that was in flight, so summing cost_in_usd over the archive reaches the total the
     carriers report.
     A single result is accepted in place of an iterable, and is told apart by not being iterable,
-    which no success arm or GenerationError is.
+    which no success variant or GenerationError is.
 
     Repricing held rows is a join against the caller's own rate table on model, provider_name, and
     service_tier: the first two are call columns and the third an attempt column.

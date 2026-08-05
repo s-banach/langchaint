@@ -84,7 +84,7 @@ def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
 def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
     """Report whether every capacity permit is free: none held, none leaked, no live waiter queued.
 
-    Reads the semaphore's _value, which is CPython-private, because no public member exposes the
+    Reads the semaphore's _value, which is CPython-private, because no public attribute exposes the
     count; a stdlib rename breaks these tests visibly, not the shipped code.
     """
     permits = shared_backoff._capacity_permits

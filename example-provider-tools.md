@@ -51,7 +51,7 @@ A `ProviderTool` carries a wire entry and nothing langchaint calls.
 
 ## The response side
 
-A new member of the `TurnElement` union, opaque for the same reason `ReasoningTrace` is:
+A new variant of the `TurnElement` union, opaque for the same reason `ReasoningTrace` is:
 
 ```python
 class ProviderToolTrace(CheckedCopyModel):
@@ -92,7 +92,7 @@ messages.append(UserMessage(content="Which of those are C API changes?"))
 second = await bound.generate_one(messages)
 ```
 
-Without the new member, the first `assistant_message` holds only the text, and anthropic 400s the second request.
+Without the new variant, the first `assistant_message` holds only the text, and anthropic 400s the second request.
 
 Cross-provider replay fails exactly as it does for `ReasoningTrace`:
 a trace one provider produced is a malformed request at another.
@@ -107,7 +107,7 @@ The counter is reachable on the raw SDK usage. Whether a per-tool fee is one of 
 **Reading the result.** `Response.raw` already holds the SDK response, so a caller who wants the search results reads them there.
 If that is the answer, say it in the `ProviderToolTrace` docstring and add nothing.
 
-**openai and gemini blocks.** openai's `web_search_call` item and gemini's `executable_code` part need the same member.
+**openai and gemini blocks.** openai's `web_search_call` item and gemini's `executable_code` part need the same variant.
 Gemini's case overlaps the existing `thought_signature` branch, so the part-level ordering there needs care.
 
 ## Conformance

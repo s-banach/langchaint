@@ -122,11 +122,11 @@ test_every_payload_attribute_reaches_validation reads this set to fail instead.
 _UNVALIDATED_PAYLOAD_ATTRIBUTES = frozenset({"gen_ai.tool.call.arguments"})
 """Payload attributes whose schema the module deliberately does not satisfy.
 
-gen_ai.tool.call.arguments is typed `type: object` with no alternative arm, and its convention note
+gen_ai.tool.call.arguments is typed `type: object` with no alternative variant, and its convention note
 says only "It's expected to be an object - in case a serialized string is available to the
 instrumentation, the instrumentation SHOULD do the best effort to deserialize it to an object".
 Both are silent on what to emit when a model's arguments are not a JSON object, which is a routine
-outcome the DispatchInvalidToolArgs arm exists to report. The module shows the text the model
+outcome the DispatchInvalidToolArgs variant exists to report. The module shows the text the model
 actually sent (_tool_call_arguments), so the payload is a JSON string on that path and does not
 conform. The gap is the convention's: it models no representation for malformed tool arguments,
 so conforming here would mean dropping evidence of the failure from the span.
@@ -161,8 +161,8 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
 
     What the upstream schemas enforce is weaker than "the payload is correct", and the difference
     matters when a green run is read as the convention having moved compatibly. Every schema that
-    lists element types ends its anyOf in a catch-all arm constraining almost nothing, so an element
-    whose type is unrecognized or whose required fields are missing matches that arm and passes:
+    lists element types ends its anyOf in a catch-all variant constraining almost nothing, so an element
+    whose type is unrecognized or whose required fields are missing matches that variant and passes:
     GenericPart (requiring only a string type) for gen_ai.input.messages, gen_ai.output.messages,
     and gen_ai.system_instructions, and GenericToolDefinition (type and name) for
     gen_ai.tool.definitions. What survives for the message attributes is the message envelope,
@@ -1388,8 +1388,8 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     """Every dispatch emits one INTERNAL execute_tool span carrying the call's identity keys.
 
     error.type is the one attribute the outcome decides, and its absence is what makes the span OK.
-    The function_authored_failure row shares the DispatchHandled arm with the handled row and
-    differs only in the ToolMessage's is_error, so classifying by arm alone fails it. The
+    The function_authored_failure row shares the DispatchHandled variant with the handled row and
+    differs only in the ToolMessage's is_error, so classifying by variant alone fails it. The
     unknown_tool row names a tool the manager does not hold, so the span is named for the name the
     model called rather than for a tool that exists.
     """
@@ -1888,7 +1888,7 @@ def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:
 
     An exemption that outlives the disagreement it was written for is dead weight nothing reports,
     so this asserts the violation rather than the conformance: it fails when upstream gives
-    gen_ai.tool.call.arguments an arm that admits a non-object, which is the moment to delete the
+    gen_ai.tool.call.arguments a variant that admits a non-object, which is the moment to delete the
     exemption and let the payload validate like every other.
     It reads the attribute off a real dispatch, so what is checked is the value the module emits.
     Producing a violating payload takes a scenario written for the one attribute, so the exempt set
@@ -2510,7 +2510,7 @@ def test_tool_span_arguments_fall_back_when_the_parse_cannot_re_serialize_as_jso
     Python's json accepts and emits Infinity and NaN, which JSON has no syntax for, and reaches them
     from ordinary input too (1e400 overflows to inf). Emitting the parsed value would put a bare
     Infinity or NaN token on the span, which a strict consumer rejects, so these route to the
-    raw-text arm and go out as a JSON string instead.
+    raw-text fallback and go out as a JSON string instead.
     """
 
     async def scenario() -> None:
@@ -2529,7 +2529,7 @@ def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_pa
     """Malformed argument text is preserved on the span, as a JSON string rather than as raw bytes.
 
     The deserialization is best effort, so the span still shows what the model emitted rather than
-    dropping the key or raising; the outcome is the DispatchInvalidToolArgs arm reporting the same input.
+    dropping the key or raising; the outcome is the DispatchInvalidToolArgs variant reporting the same input.
     The attribute goes out through the same re-serialization as a parsed value, so the text arrives
     quoted and escaped; a consumer decodes the attribute and gets the original back.
     """
@@ -2600,7 +2600,7 @@ def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
 
     The convention expects an object here and every other argument test feeds one, so an implementation
     that parsed and then kept the text unless the result was a dict would pass all of them.
-    A model producing a non-object is what the DispatchInvalidToolArgs arm reports; the span records
+    A model producing a non-object is what the DispatchInvalidToolArgs variant reports; the span records
     the value it produced.
     """
 
@@ -2675,12 +2675,12 @@ def test_tool_span_capture_off_omits_both_content_keys() -> None:
     asyncio.run(scenario())
 
 
-def test_tool_span_captures_the_result_on_both_arms_where_no_tool_ran() -> None:
-    """gen_ai.tool.call.result is recorded on both failure arms, beside the error.type saying why.
+def test_tool_span_captures_the_result_on_both_variants_where_no_tool_ran() -> None:
+    """gen_ai.tool.call.result is recorded on both failure variants, beside the error.type saying why.
 
     The convention defines the key as the result "if any and if execution was successful", so recording it
     here is the deliberate departure the TracedToolManager docstring states.
-    Pinned in both directions on each arm: the langchaint-rendered correction is what the model reads and
+    Pinned in both directions on each variant: the langchaint-rendered correction is what the model reads and
     adapts to, and error.type on the same span is what tells a consumer no tool produced it.
     """
 

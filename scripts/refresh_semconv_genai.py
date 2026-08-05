@@ -30,7 +30,7 @@ there means the schemas have not moved, whatever SOURCE_DOC's sha now says, beca
 advances on every upstream commit including the many that touch no schema. A failing `scripts/CI.sh`
 over a diff in the .json files names the payload that no longer conforms; a passing one means every
 payload still validates, which is weaker than full conformance because each anyOf over element types
-ends in a catch-all arm that admits a renamed type (the limits are in _validate_payload_attributes).
+ends in a catch-all variant that admits a renamed type (the limits are in _validate_payload_attributes).
 The monthly .github/workflows/refresh_semconv_genai.yml runs exactly this, applies that same
 schemas-only test, and opens a pull request when they moved, so the diff reaches review without
 anyone remembering to look.
@@ -106,7 +106,7 @@ def render_source_doc(sha: str) -> str:
         "here are the pin. `tests/test_tracing.py` validates against them every payload the",
         "tracing module emits, less the paths its `_UNVALIDATED_PAYLOAD_ATTRIBUTES` exempts",
         "and documents. What these schemas do and do not enforce is recorded there too:",
-        "each `anyOf` over element types ends in a catch-all arm, so a green run means less",
+        "each `anyOf` over element types ends in a catch-all variant, so a green run means less",
         "than full conformance.",
         "",
         "Refresh with `uv run python -m scripts.refresh_semconv_genai`, then read `git diff`.",

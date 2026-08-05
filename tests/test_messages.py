@@ -1,8 +1,8 @@
 """The kind discriminator on the Message, Part, and TurnElement unions.
 
 Persist/resume serializes a Sequence[Message] with a TypeAdapter and re-validates it,
-so a payload that re-validates to the wrong union member silently corrupts replay.
-Every member carries a kind tag, and a payload without one is rejected rather than matched by shape.
+so a payload that re-validates to the wrong variant silently corrupts replay.
+Every variant carries a kind tag, and a payload without one is rejected rather than matched by shape.
 """
 
 import json
@@ -27,10 +27,10 @@ from langchaint import (
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
-def test_turn_elements_validate_to_the_member_their_tag_names() -> None:
-    """A persisted turn re-validates to the member each element's kind names, raw byte-identical.
+def test_turn_elements_validate_to_the_variant_their_tag_names() -> None:
+    """A persisted turn re-validates to the variant each element's kind names, raw byte-identical.
 
-    A turn whose dicts re-validate to the wrong member would silently corrupt replay, and a trace
+    A turn whose dicts re-validate to the wrong variant would silently corrupt replay, and a trace
     whose raw came back changed is a request the producing provider rejects.
     """
     raw = {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc-1"}
@@ -58,9 +58,9 @@ def test_turn_elements_validate_to_the_member_their_tag_names() -> None:
 
 
 def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
-    """An element carrying a member's fields but no kind fails, located at the element index.
+    """An element carrying a variant's fields but no kind fails, located at the element index.
 
-    The tag selects the member before any field is read, so no element is matched by its shape.
+    The tag selects the variant before any field is read, so no element is matched by its shape.
     """
     with pytest.raises(ValidationError) as caught:
         _ = AssistantMessage.model_validate({"kind": "assistant", "turn": [{"text": "hi"}]})
@@ -70,7 +70,7 @@ def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
 
 
 def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> None:
-    """A tagged element is validated against that member alone, so one bad field is one error."""
+    """A tagged element is validated against that variant alone, so one bad field is one error."""
     with pytest.raises(ValidationError) as caught:
         _ = AssistantMessage.model_validate({
             "kind": "assistant",

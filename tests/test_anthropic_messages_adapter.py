@@ -504,8 +504,7 @@ def test_empty_thinking_text_normalizes_to_none() -> None:
 def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire.
 
-    Its trace carries no text: the block holds an opaque string under data and nothing readable,
-    which is the arm that exists because a redacted block has no text to carry.
+    Its trace carries no text: the block holds an opaque string under data and nothing readable.
     """
     message = _message_with_content([
         at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes")
@@ -1357,7 +1356,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """A max_tokens turn whose JSON stopped mid-object is the truncation, not a schema violation.
 
-    This is the response the SDK's own parse raised on; reporting it as a member is what lets the
+    This is the response the SDK's own parse raised on; reporting it as a variant is what lets the
     retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
     """
     outcome = _structured_parse(_structured_message('{"city": "Nair', stop_reason="max_tokens"))
@@ -1615,7 +1614,7 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
 
 
 def test_build_request_reports_an_unsendable_sequence_as_invalid_request() -> None:
-    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest arm.
+    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest variant.
 
     Nothing is sent: the retry loop takes this answer before its first attempt.
     """

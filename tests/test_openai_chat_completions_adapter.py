@@ -120,7 +120,7 @@ _CUSTOM_TOOL_CALL_WIRE: dict[str, object] = {
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
-    """Narrow a ResponseOutcome to its success arm, failing the test on any other arm."""
+    """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
     assert isinstance(outcome, AdapterResult)
     return outcome
 

@@ -6,12 +6,12 @@ and reading failures (`parse` for the retry-or-pause verdict, `classify` for the
 Adapters delegate stream assembly to the SDK and validate a structured response's text themselves:
 the SDKs validate inside the call that returns the response, where a rejection reaches the caller as
 an exception carrying neither the response nor its billing, and an adapter that validates in its own
-frame answers a rejection with a member carrying both.
+frame answers a rejection with a variant carrying both.
 
 Reporting model: an adapter reports one attempt; only the retry loop knows the call.
 So `open_stream` and `AdapterStream.final` return what came back, and an adapter never
 constructs a `GenerationError`, which is a verdict about a call it cannot see.
-What no member can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
+What no variant can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
 that propagate through the admitted() block, whose exit parses the `failure_types` ones.
 `AdapterStream.items` is the exception to the return contract, because an async iterator can only
 raise: a mid-stream failure reaches the retry loop as an exception and exits the block the same way.
@@ -174,7 +174,7 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
 def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
     """Map a TransientError raised inside an admitted() block to its verdict.
 
-    The shared rule both provider parse functions apply to the one failure_types member langchaint
+    The shared rule both provider parse functions apply to the one failure_types entry langchaint
     itself raises: a billable 200 whose body reports a transient provider-side failure, which the
     retry loop re-raises as a TransientError so the block's exit records it.
     is_rate_limit says the provider named a rate limit, so the whole domain pauses; anything else is
@@ -369,11 +369,11 @@ class NoOutput:
     """The shared shape of a 200 that produced no output: the turn it produced instead.
 
     Declares assistant_message once, and is the runtime test that narrows to NoOutputOutcome:
-    isinstance rejects a type alias, so an adapter helper whose result is an output value or a member
-    tests against this base and annotates the members as NoOutputOutcome.
-    Every subclass must be a member of that alias; that is what makes the test sound.
+    isinstance rejects a type alias, so an adapter helper whose result is an output value or a variant
+    tests against this base and annotates the variants as NoOutputOutcome.
+    Every subclass must be a variant of that alias; that is what makes the test sound.
 
-    assistant_message is whatever turn the response carried, which every member has one of and none
+    assistant_message is whatever turn the response carried, which every variant has one of and none
     of them can return as the output: the sentences a refusal wrote, the text a schema violation
     rejected, the fragment a run that failed had emitted. The retry loop puts it on the attempt's
     record, so what the request bought reaches the caller even where the item fails. A response
@@ -588,10 +588,10 @@ type NoOutputOutcome = (
 """Every outcome of a billable 200 that produced no output.
 
 The type an adapter helper returns beside its output value, tested at runtime with
-isinstance(x, NoOutput). Spelled as the concrete members rather than as NoOutput so that a match on
-kind over it, or over ResponseOutcome, is provably exhaustive: a member added here without a match
+isinstance(x, NoOutput). Spelled as the concrete variants rather than as NoOutput so that a match on
+kind over it, or over ResponseOutcome, is provably exhaustive: a variant added here without a match
 case in each retry loop is a type error rather than a silent fall-through.
-The members differ in what the retry loop does with them, which is why they are separate types rather
+The variants differ in what the retry loop does with them, which is why they are separate types rather
 than one type carrying a reason: see each class.
 """
 
@@ -711,7 +711,7 @@ class BoundAdapter[OutputT](ABC):
 
         Every response goes through here, assembled by the SDK from its stream's events, so one
         function per binding decides what a response means.
-        A response that produced no output is a returned member, never a raise, so the retry loop
+        A response that produced no output is a returned variant, never a raise, so the retry loop
         decides the item's fate with the attempt already recorded.
 
         raw is typed BaseModel rather than the SDK response type because BoundAdapter is what
@@ -751,7 +751,7 @@ class Adapter(ABC):
     """Which provider served the request, recorded on every Response and GenerationError.
 
     The value comes from the OpenTelemetry GenAI convention's gen_ai.provider.name value set,
-    whose members include the four langchaint's own constructors write
+    whose values include the four langchaint's own constructors write
     ("anthropic", "openai", "aws.bedrock", "gcp.gemini"), and the tracing subpackage emits it
     under that key, so a backend groups langchaint spans with any other instrumented client's.
     Whoever constructs the adapter states it, because the SDK client class does not determine it:
@@ -837,7 +837,7 @@ class Adapter(ABC):
 
         The output type admits None because a turn holding tool calls parses to no instance while
         being a success: the tool calls are the turn. Both SDKs type their parsed instance Optional
-        for the same reason. Every other turn that yields no instance is a NoOutputOutcome member.
+        for the same reason. Every other turn that yields no instance is a NoOutputOutcome variant.
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
 
@@ -854,7 +854,7 @@ class Adapter(ABC):
     status and error type parse reads, plus TransientError, which the retry loop raises for a 200
     whose body reports a transient failure. Transport failures that produced nothing parseable (a
     connection drop, a timeout) stay out, propagating unparsed for classify to sort.
-    Every member must be a strict subclass of Exception; SharedBackoff rejects anything else at
+    Every entry must be a strict subclass of Exception; SharedBackoff rejects anything else at
     construction.
     """
 

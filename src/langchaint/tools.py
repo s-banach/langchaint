@@ -42,7 +42,7 @@ from langchaint.messages import MessageContent, ToolCall, ToolMessage
 
 @dataclass(frozen=True, kw_only=True)
 class ToolOutputExplicit[AppDataT = None]:
-    """The explicit arm of ToolOutput: the model-visible outcome plus app_data.
+    """The explicit variant of ToolOutput: the model-visible outcome plus app_data.
 
     content is what the model reads, the same shape as a bare function return and as ToolMessage.content:
     MessageContent, a str or a Sequence[Part] (text and images the model sees) and nothing else, because
@@ -58,7 +58,8 @@ class ToolOutputExplicit[AppDataT = None]:
     and the app reads that concrete type back off DispatchHandled with no isinstance.
     A function that authors its own app_data uses a pydantic model with a named field, e.g. citations: list[Citation],
     which is self-documenting and typed at the read site;
-    a Mapping arm on app_data supports MCP tools whose result schema is unknown at typecheck time, riding through as-is.
+    a Mapping variant on app_data supports MCP tools whose result schema is unknown at typecheck time.
+    Such a result rides through as-is.
     A function that returns bare content is sugar for ToolOutputExplicit(content=..., is_error=False,
     app_data=None) and never constructs this.
     """
@@ -72,7 +73,7 @@ type ToolOutput[AppDataT = None] = MessageContent | ToolOutputExplicit[AppDataT]
 """What a tool function returns.
 
 Bare MessageContent is sugar for ToolOutputExplicit(content=..., is_error=False, app_data=None).
-AppDataT is the explicit arm's app_data type, defaulting to None for a function that returns bare content.
+AppDataT is the explicit variant's app_data type, defaulting to None for a function that returns bare content.
 """
 
 
@@ -83,7 +84,7 @@ class DispatchHandled[AppDataT = None]:
     Covers success and a tool-authored failure; tool_message.is_error distinguishes them, the same bool the tool set.
     tool_message is the ToolMessage the application appends to the Sequence[Message] and the provider sees.
     app_data is what the tool routed to the application, passed through live and read back at its concrete type.
-    PydanticTool.dispatch carries the tool's own AppDataT onto this arm, so a known-tool caller needs no isinstance.
+    PydanticTool.dispatch carries the tool's own AppDataT onto this variant, so a known-tool caller needs no isinstance.
     For the function-bearing forms app_data is the function's, None when the function returned bare content.
     For CaptureTool it is the capture, present on every valid manager-routed call.
     It never reaches the provider: only tool_message enters the Sequence[Message] the adapters convert.
@@ -123,7 +124,7 @@ class DispatchInvalidToolArgs:
 
     tool_message is a default is_error ToolMessage rendered from details for the model to read and correct;
     the application appends it as-is or authors its own reply.
-    details is the neutral per-failure detail, a required field: matching this arm narrows it,
+    details is the neutral per-failure detail, a required field: matching this variant narrows it,
     so the application reads it with no assert, cast, or type ignore, and reads no pydantic type.
     Every dispatch-produced outcome carries at least one detail; construction does not enforce that,
     the emptiness guard lives in render_invalid_tool_args, which every dispatch path renders through.
@@ -142,7 +143,7 @@ class DispatchUnknownTool:
     tool_message is a default is_error ToolMessage naming the held tools for the model to read and correct,
     symmetric with DispatchInvalidToolArgs; the application appends it as-is or authors its own reply.
     called_name is the off-list name the model produced, a required field:
-    matching this arm narrows it, so the application reads it with no assert.
+    matching this variant narrows it, so the application reads it with no assert.
     An off-list name is model data the model can correct: a provider can emit a name outside the sent schemas,
     and rebinding to a different tool set can strand an earlier turn's tool_call.
     There is no app_data field because no function ran to produce any.
@@ -161,7 +162,7 @@ class DispatchPrecomputed:
     tool_message is the application-supplied ToolMessage,
     carried through unread except for the tool_call_id pairing check,
     so the application appends it exactly as it wrote it.
-    Matching this arm tells a consumer the reply is the application's own:
+    Matching this variant tells a consumer the reply is the application's own:
     langchaint validated no arguments and ran no function.
     There is no app_data field because no function ran to produce any.
     """
@@ -178,10 +179,10 @@ type DispatchOutcome = (
 """The three outcomes of ToolManager.dispatch on one tool call.
 
 The manager dispatches a heterogeneous tool set, so app_data is the widest the channel allows,
-BaseModel | Mapping[str, object] | None (a bare-content function leaves it None, hence the None arm in the parameter).
+BaseModel | Mapping[str, object] | None (a bare-content function leaves it None, hence the None variant).
 A caller that knows the single tool it dispatched keeps the tool's own app_data type by calling that tool's
 own dispatch instead.
-Every arm carries tool_message, so a consumer that only appends the reply reads result.tool_message with no match.
+Every variant carries tool_message, so a consumer that only appends the reply reads result.tool_message with no match.
 A consumer that reads the field-level failure detail matches DispatchInvalidToolArgs;
 one that reads the off-list name matches DispatchUnknownTool.
 """
@@ -190,12 +191,12 @@ one that reads the off-list name matches DispatchUnknownTool.
 type DispatchManyOutcome = DispatchOutcome | DispatchPrecomputed
 """One position's outcome of ToolManager.dispatch_many.
 
-The DispatchPrecomputed arm exists only here:
+The DispatchPrecomputed variant exists only here:
 it marks a call the application answered through dispatch_many's precomputed argument,
 which only dispatch_many takes,
 so ToolManager.dispatch keeps the narrower DispatchOutcome
-and a match on its result never handles an arm it cannot return.
-Every arm carries tool_message, so a consumer that only appends the replies reads it with no match.
+and a match on its result never handles a variant it cannot return.
+Every variant carries tool_message, so a consumer that only appends the replies reads it with no match.
 """
 
 
@@ -363,7 +364,7 @@ class DispatchCaptured[CapturedT: BaseModel]:
     tool_message is the acknowledgement ToolMessage the application appends to the Sequence[Message]
     for the model to read.
     captured is the validated args_model instance, a required field.
-    Matching this arm proves the capture happened, so no consumer revalidates or None-guards captured.
+    Matching this variant proves the capture happened, so no consumer revalidates or None-guards captured.
     Returned only by CaptureTool.capture; a manager-routed call erases the capture onto DispatchHandled.app_data.
     """
 
@@ -744,7 +745,7 @@ class ToolManager:
         Cancellation is never grouped: cancelling the enclosing task cancels the sibling dispatches
         and re-raises the CancelledError only after they finish unwinding,
         and a CancelledError (or any other non-Exception BaseException) a sibling produces re-raises bare,
-        both because ExceptionGroup rejects such members and because grouping one would swallow cancellation.
+        both because ExceptionGroup rejects such entries and because grouping one would swallow cancellation.
         Defects co-occurring with such a bare re-raise still surface: they chain as its __cause__,
         a DispatchExceptionGroup carrying them and completed_outcomes as usual.
 

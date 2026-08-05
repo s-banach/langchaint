@@ -134,7 +134,7 @@ type SpanAttributeValue = str | bool | int | float | Sequence[str]
 """One span attribute's value.
 
 The union is the subset of OTel's AttributeValue langchaint emits;
-the Sequence[str] arm exists because OTel attribute values include homogeneous string arrays
+the Sequence[str] variant exists because OTel attribute values include homogeneous string arrays
 and the GenAI convention's finish-reason key gen_ai.response.finish_reasons is one.
 """
 
@@ -145,8 +145,8 @@ type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
 """Maps one generate result to its span attributes.
 
 The parameter is CallResult[object]
-because the mapper reads the fields every CallResult arm shares; the object type argument accepts
-any OutputT because the success arms' OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
+because the mapper reads the fields every CallResult variant shares; the object type argument accepts
+any OutputT because the success variants' OutputT is inferred covariant (frozen dataclass, PEP 695 inference).
 No mapper receives the GenerationInput, so gen_ai_attributes cannot put a prompt on a span.
 A custom mapper is bounded only by what it reaches on the result, which includes raw, the SDK response object
 held by reference; openai 2.45.0's response model declares an instructions field,
@@ -310,7 +310,7 @@ def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     for the keys listed in the module docstring and can grow.
     A constant needs no mapper; extra_attributes sets one on every span.
     Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
-    Reads only the fields every CallResult arm shares, so it cannot leak a prompt and cannot meaningfully fail.
+    Reads only the fields every CallResult variant shares, so it cannot leak a prompt and cannot meaningfully fail.
     A key stays under the langchaint.* prefix only where the GenAI convention defines no counterpart,
     which is langchaint.attempts and langchaint.cost_in_usd here.
     The cache counters are the convention's own: gen_ai.usage.input_tokens includes cached tokens
@@ -489,7 +489,7 @@ def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
     so a content-carrying key holds one shape on every call and no consumer sniffs the type before reading it.
     An ImagePart becomes {"type": "blob", "mime_type": ...} with the bytes dropped:
     an image is routinely megabytes and base64 in a span attribute can dwarf the span itself,
-    and the schema's GenericPart arm permits it (it requires only type and allows additional properties).
+    and the schema's GenericPart variant permits it (it requires only type and allows additional properties).
     Image bytes therefore never appear in a trace.
     """
     if isinstance(content, str):
@@ -511,7 +511,7 @@ def _finite_float(number_text: str) -> float:
 
     Raises:
         ValueError: the text parses to a non-finite float (1e400 overflows to inf).
-            _tool_call_arguments catches this type to reach its raw-text arm.
+            _tool_call_arguments catches this type to reach its raw-text fallback.
     """
     value = float(number_text)
     if not math.isfinite(value):
@@ -526,7 +526,7 @@ def _reject_non_json_constant(token: str) -> NoReturn:
 
     Raises:
         ValueError: always; json.loads calls this only for those three literals.
-            _tool_call_arguments catches this type to reach its raw-text arm.
+            _tool_call_arguments catches this type to reach its raw-text fallback.
     """
     raise ValueError(f"not a JSON constant: {token}")
 
@@ -541,7 +541,7 @@ def _tool_call_arguments(args_json: str) -> object:
     Best effort covers any JSON value, an object or not, and text that does not parse is returned
     unchanged, to be emitted as a JSON string by the caller.
     That fallback is why a parse failure is neither raised nor logged here: a malformed or non-object
-    args_json is what the DispatchInvalidToolArgs arm reports, and the span should show the text that
+    args_json is what the DispatchInvalidToolArgs variant reports, and the span should show the text that
     produced it.
 
     The two parse hooks narrow json.loads to what json.dumps can write back as JSON.
@@ -550,7 +550,7 @@ def _tool_call_arguments(args_json: str) -> object:
     a strict consumer rejects.
     Inside gen_ai.input.messages the cost is not one field, since the value is nested into a structure
     serialized as a whole, so one such number would make the entire attribute unparseable.
-    Routing these to the raw-text arm keeps every emitted payload standard JSON.
+    Routing these to the raw-text fallback keeps every emitted payload standard JSON.
 
     Only ValueError is caught, the parse failure this fallback is for.
     json.loads can also exhaust the stack on deeply nested input, and that RecursionError propagates to
@@ -858,7 +858,7 @@ def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConf
     """Record the exception that concluded a stream, attributing the span by what it is.
 
     A GenerationError is that call's result, so the span takes the same result attributes, content,
-    and status a success arm would give it; anything else is an exception the span only records.
+    and status a success variant would give it; anything else is an exception the span only records.
     One recorder for every method that can conclude a stream, so the same class produces the same
     span whether the failure surfaced from the open, an item pull, or final().
     """
@@ -1444,7 +1444,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     and ends exactly once.
     Under capture_message_content the input content attributes are set when the span starts,
     and gen_ai.output.messages when the call concludes carrying a turn, whether final() returned
-    a success arm or any of the three methods raised a GenerationError.
+    a success variant or any of the three methods raised a GenerationError.
     """
 
     def __init__(
@@ -1692,7 +1692,7 @@ class TracedToolManager(ToolManager):
 
     invalid_tool_args and unknown_tool are the two values meaning the tool function never ran.
     A tool returning is_error True is designed control flow here, not a malfunction: the model reads the failure
-    and corrects, and the same holds for the other two failure arms.
+    and corrects, and the same holds for the other two failure variants.
     So a healthy agent doing one argument-validation retry emits ERROR spans as a matter of routine,
     and a dashboard reading span status as a health signal will show that.
     That is accepted rather than worked around: error.type is the field an operator filters on,
@@ -1716,18 +1716,18 @@ class TracedToolManager(ToolManager):
     JSON string the convention permits when structured form is unsupported.
     On this key the effect is therefore normalization; the nesting matters on the generate span,
     whose gen_ai.input.messages embeds the same arguments in a structure serialized as a whole.
-    Text that does not parse is preserved, so the value that produced the DispatchInvalidToolArgs arm
+    Text that does not parse is preserved, so the value that produced the DispatchInvalidToolArgs variant
     is still readable, and it goes out through that same re-serialization:
     it reaches the span as a JSON string, quoted and escaped, and a consumer decoding the attribute
     gets the model's text back.
 
-    gen_ai.tool.call.result is recorded on every arm, including the two where the tool function never ran.
+    gen_ai.tool.call.result is recorded on every variant, including the two where the tool function never ran.
     The convention defines that key as the result "if any and if execution was successful",
-    so this is a deliberate departure: on those arms the value is the langchaint-rendered correction the model
+    so this is a deliberate departure: on those variants the value is the langchaint-rendered correction the model
     reads and adapts to, which is the payload a reader debugging a tool loop wants, and error.type on the
     same span already says no tool produced it, so a consumer reading both is not misled.
     gen_ai.tool.call.result is what dispatch returned, which is not necessarily what the model read:
-    the application owns the loop, so on any arm it may rewrite, replace, or drop the tool_message it
+    the application owns the loop, so on any variant it may rewrite, replace, or drop the tool_message it
     received before appending it to the Sequence[Message].
     The generate span's gen_ai.input.messages then carries different text for that call, and both spans are
     correct, each reporting its own boundary; the difference is the application's edit made visible.

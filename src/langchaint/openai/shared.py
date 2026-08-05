@@ -95,7 +95,7 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
 }
 """Whether a resend may get past the failure each ResponseError.code names (openai 2.48.0).
 
-Every member of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
+Every value of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
 unknown-code path below is reached only by a code newer than the installed SDK.
 The three transient codes are read off their names: the SDK documents none of the codes, and these
 three name a condition of the moment while every other names a property of the request.

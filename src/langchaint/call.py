@@ -5,7 +5,7 @@ An attempt is one request inside that call. The adapter runs one attempt and rep
 only a retry loop sees the whole call, so only a retry loop builds a CallRecord.
 A loop accumulates its call into a _CallLedger and freezes that into the CallRecord it hands out.
 
-Every success arm and GenerationError hold one, and each derives _CallCarrier, so the call-level field
+Every success variant and GenerationError hold one, and each derives _CallCarrier, so the call-level field
 set is declared once and every carrier answers to the same names.
 Imports no error class at runtime: a success carries a CallRecord, so a dependency on the error
 vocabulary would run the wrong way.

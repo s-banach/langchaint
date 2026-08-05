@@ -21,7 +21,7 @@ UnknownExceptionError, EscapedExceptionError, AbandonedCallError, and TimedOutEr
 
 Classification of raw SDK exceptions into these lives in the adapter (Adapter.classify);
 a 200 that produced no output is a normal response that never reaches classify,
-so the adapter reports it as a ResponseOutcome member where it reads the response.
+so the adapter reports it as a ResponseOutcome variant where it reads the response.
 Every GenerationError is constructed by a scope holding the call's ledger, the only scope that knows
 its attempts and timing; an adapter reports one attempt and never a GenerationError.
 
@@ -59,7 +59,7 @@ class TransientError(Exception):
 
     __cause__ holds the original provider exception when one exists.
     It plays two parts around the SharedBackoff admitted() block.
-    As a failure_types member, one raised inside the block is parsed by
+    As a failure_types entry, one raised inside the block is parsed by
     verdict_from_transient_error: is_rate_limit True becomes PauseAll and pauses the domain,
     False becomes RetryThisOne, and retry_after_seconds is the wait the verdict carries.
     As the attempt record's error, each retry loop wraps a parsed provider failure in one holding
@@ -141,7 +141,7 @@ class GenerationError(_CallCarrier, Exception):
 
     Only a scope holding the call's ledger constructs one of these, because only it knows the
     attempts and the timing, and every field is set in the constructor. An adapter reports what one
-    attempt produced (a ResponseOutcome member) and never a GenerationError, so none exists in a
+    attempt produced (a ResponseOutcome variant) and never a GenerationError, so none exists in a
     half-built state.
     """
 
@@ -646,7 +646,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     The grouped exceptions are user-code defects, dispatch's exceptions-propagate rule extended to a batch,
     ordered by tool_calls position; the ExceptionGroup base keeps every traceback in the report
     and supports except* handling.
-    A CancelledError is never a member: ExceptionGroup rejects a BaseException that is not an Exception,
+    A CancelledError is never grouped here: ExceptionGroup rejects a BaseException that is not an Exception,
     and dispatch_many re-raises cancellation bare to keep its semantics.
     When defects co-occur with such a bare re-raise, this group still carries them,
     chained as the re-raised exception's __cause__ instead of being the raise itself.

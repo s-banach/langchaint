@@ -559,7 +559,7 @@ def test_marked_message_parts_are_invalid() -> None:
 
 
 def test_a_cross_provider_trace_is_invalid() -> None:
-    """A trace another provider produced does not restore to a Part, so the item fails its own row."""
+    """A trace another provider produced does not restore to a Part, so the item fails on its own."""
     invalid = _invalid_request([
         AssistantMessage(
             turn=(

@@ -119,10 +119,10 @@ async def _fail_one_attempt(shared_backoff: SharedBackoff) -> Admission:
 
 
 def test_constructor_rejects_invalid_capacity() -> None:
-    """Reject every capacity outside None and the positive non-bool ints."""
-    for capacity in (True, False, 0, -1, 1.0, "8"):
+    """Reject a bool capacity and an int below 1."""
+    for capacity in (True, False, 0, -1):
         with pytest.raises(ValueError, match="capacity"):
-            _ = _shared_backoff(capacity=capacity)  # pyrefly: ignore[bad-argument-type]
+            _ = _shared_backoff(capacity=capacity)
     _ = _shared_backoff(capacity=None)
     _ = _shared_backoff(capacity=8)
 
@@ -170,7 +170,7 @@ def test_constructor_rejects_empty_failure_types() -> None:
 
 
 def test_constructor_rejects_invalid_numeric_settings() -> None:
-    """Every numeric setting shares one acceptance rule: exactly int or float, finite, positive."""
+    """Every numeric setting shares one acceptance rule: not a bool, finite, positive."""
     valid = {
         "minimum_wait_ceiling": 1.0,
         "longest_wait": 60.0,
@@ -178,7 +178,7 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
         "quiet_per_decay_step": 60.0,
         "admission_gap": 0.02,
     }
-    for invalid_value in (True, 0, -1.0, float("inf"), float("nan"), "1"):
+    for invalid_value in (True, 0, -1.0, float("inf"), float("nan")):
         for name in valid:
             settings = {**valid, name: invalid_value}
             with pytest.raises(ValueError, match=name):
@@ -186,15 +186,10 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
                     parse=_retry_verdict,
                     failure_types=(ProviderFailure,),
                     capacity=1,
-                    # pyrefly: ignore[bad-argument-type]  # the rejection under test
                     minimum_wait_ceiling=settings["minimum_wait_ceiling"],
-                    # pyrefly: ignore[bad-argument-type]
                     longest_wait=settings["longest_wait"],
-                    # pyrefly: ignore[bad-argument-type]
                     wait_multiplier=settings["wait_multiplier"],
-                    # pyrefly: ignore[bad-argument-type]
                     quiet_per_decay_step=settings["quiet_per_decay_step"],
-                    # pyrefly: ignore[bad-argument-type]
                     admission_gap=settings["admission_gap"],
                 )
 
@@ -543,11 +538,11 @@ def test_entry_is_immediate_when_nothing_blocks_it() -> None:
 
 
 def test_admitted_rejects_invalid_budgets_before_acquiring_anything() -> None:
-    """Booleans, zero, negatives, non-finite values, strings, and unrepresentable ints raise."""
+    """Booleans, zero, negatives, non-finite values, and unrepresentable ints raise."""
     shared_backoff = _shared_backoff()
-    for budget in (True, False, 0, -1, float("inf"), float("nan"), "5", 10**1000):
+    for budget in (True, False, 0, -1, float("inf"), float("nan"), 10**1000):
         with pytest.raises(ValueError, match="budget"):
-            _ = shared_backoff.admitted(budget=budget)  # pyrefly: ignore[bad-argument-type]
+            _ = shared_backoff.admitted(budget=budget)
     assert _all_permits_free(shared_backoff)
 
 

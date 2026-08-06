@@ -87,28 +87,28 @@ def _random_up_to(ceiling: float) -> float:
     return ceiling * (1.0 - random.random())
 
 
-def _validated_positive_seconds(name: str, value: object) -> float:
+def _validated_positive_seconds(name: str, value: float) -> float:
     """Return value as a positive finite float, under the acceptance rule that the numeric settings and budget share.
 
-    The type must be exactly int or float, which excludes bool and numeric subclasses.
+    bool is rejected explicitly because it subclasses int, so a type checker admits True here.
 
     Raises:
-        ValueError: value is not exactly an int or float, is not finite, is not greater than zero,
-            or is an int too large to convert to float.
+        ValueError: value is a bool, is not finite, is not greater than zero, or is an int too
+            large to convert to float.
     """
-    if type(value) is int:
+    if isinstance(value, int):
         try:
             converted = float(value)
         except OverflowError:
             raise ValueError(
                 f"{name} must be representable as a float, got an int of {value.bit_length()} bits"
             ) from None
-    elif type(value) is float:
-        converted = value
     else:
-        raise ValueError(f"{name} must be an int or float, got {type(value).__name__}")
-    if not math.isfinite(converted) or converted <= 0.0:
-        raise ValueError(f"{name} must be finite and greater than zero, got {value!r}")
+        converted = value
+    if isinstance(value, bool) or not math.isfinite(converted) or converted <= 0.0:
+        raise ValueError(
+            f"{name} must be a non-bool finite number greater than zero, got {value!r}"
+        )
     return converted
 
 
@@ -244,11 +244,11 @@ class SharedBackoff:
         ParserContractError, and "retry_this_one" corrects it to RetryThisOne with no retry_after.
 
         Raises:
-            ValueError: a numeric setting fails the acceptance rule (exactly int or float, finite,
+            ValueError: a numeric setting fails the acceptance rule (not a bool, finite,
                 greater than zero); wait_multiplier is not greater than 1; longest_wait is below
                 minimum_wait_ceiling; longest_wait / minimum_wait_ceiling is not a finite float,
-                which the decay arithmetic assumes; capacity is not None and not a positive
-                non-bool int; on_parse_error is neither accepted string; failure_types is empty,
+                which the decay arithmetic assumes; capacity is a bool or an int below 1;
+                on_parse_error is neither accepted string; failure_types is empty,
                 which would make the exit parse nothing and record nothing; a failure_types entry
                 is not a strict subclass of Exception (Exception itself would convert nearly every
                 application bug into an apparent provider failure, and a type outside Exception,
@@ -277,7 +277,7 @@ class SharedBackoff:
                 "longest_wait / minimum_wait_ceiling must be a finite float, "
                 f"got {ceiling_ratio!r} from {longest_wait!r} / {minimum_wait_ceiling!r}"
             )
-        if capacity is not None and (type(capacity) is not int or capacity < 1):
+        if capacity is not None and (isinstance(capacity, bool) or capacity < 1):
             raise ValueError(f"capacity must be None or a positive int, got {capacity!r}")
         if on_parse_error not in ("raise", "retry_this_one"):
             raise ValueError(
@@ -354,8 +354,8 @@ class SharedBackoff:
         subtracts what each attempt spent and passes the remainder to the next call.
 
         Raises:
-            ValueError: budget is not None and fails the acceptance rule (exactly int or float,
-                finite, greater than zero); nothing was acquired.
+            ValueError: budget is not None and fails the acceptance rule (not a bool, finite,
+                greater than zero); nothing was acquired.
         """
         budget_seconds = None if budget is None else _validated_positive_seconds("budget", budget)
         return Admission(self, budget_seconds)

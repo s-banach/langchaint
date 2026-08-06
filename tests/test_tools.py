@@ -868,7 +868,7 @@ def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
     )
 
 
-def test_dispatch_many_precomputed_slots_the_supplied_message_at_its_position() -> None:
+def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None:
     """A call precomputed answers is not dispatched: its ToolMessage rides a DispatchPrecomputed at the call's index.
 
     The middle call is answered, its neighbors dispatch normally (precomputed returned None for them),

@@ -234,7 +234,7 @@ class GenerateItem[OutputT](Protocol):
         """Run the call, raising its GenerationError rather than returning it.
 
         Raises:
-            GenerationError: the call failed; the batch turns it into that item's row.
+            GenerationError: the call failed; the batch turns it into that item's result.
         """
         ...
 
@@ -257,10 +257,10 @@ class LLM:
         max_attempts counts requests sent including the first, so 1 means no retrying.
 
         Raises:
-            ValueError: max_attempts is not a positive non-bool int, a defect to report before
+            ValueError: max_attempts is a bool, or an int below 1, a defect to report before
                 any request rather than a retry budget to misread.
         """
-        if type(max_attempts) is not int or max_attempts < 1:
+        if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
         self.adapter = adapter
         self.shared_backoff = (
@@ -1151,9 +1151,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         timeout_seconds is each item's own deadline, started when that item starts, so an item
         waiting on max_pending has no deadline running yet.
-        An item that expires gets a TimedOutError row while its siblings run on.
+        An item that expires is returned as a TimedOutError while its siblings run on.
         Bound the batch this way rather than with a scope of your own: a cancellation from outside
-        discards the returned list, settled rows and all, because the list is this frame's and the
+        discards the returned list, settled results and all, because the list is this frame's and the
         frame is what unwinds.
         Neither an outer cancellation nor an item's BaseException starts an item that had not
         started.

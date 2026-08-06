@@ -481,7 +481,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return UnknownExceptionError(error=exc, call=self._ledger.freeze(), request=self._request)
 
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
-        """Build the row-shaped InvalidRequestError for this handle, chained to cause when there is one.
+        """Build this handle's InvalidRequestError, chained to cause when there is one.
 
         cause is None where build_request returned InvalidRequest: nothing went out
         and no exception was involved.

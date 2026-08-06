@@ -850,6 +850,15 @@ class _InterpretRaisesAdapter(_FakeAdapter):
     _bound_adapter_class = _InterpretRaisesBoundAdapter
 
 
+def test_llm_rejects_invalid_max_attempts() -> None:
+    """A bool max_attempts would otherwise mean one silent attempt, and an int below 1 no attempt."""
+    for max_attempts in (True, False, 0, -1):
+        with pytest.raises(ValueError, match="max_attempts"):
+            _ = LLM(
+                _FakeAdapter(), shared_backoff=_fast_shared_backoff(), max_attempts=max_attempts
+            )
+
+
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
     """The attempt keeps the response it received and what that response billed, with no turn.
 
@@ -982,7 +991,7 @@ def test_a_failed_attempt_records_the_request_id_off_its_error() -> None:
     """An attempt that received no response still carries the request id its error named.
 
     The three attempts name three different requests: the second failure names none, so an id on its
-    row would be the first attempt's outliving the attempt that read it, and the third attempt's own
+    record would be the first attempt's outliving the attempt that read it, and the third attempt's own
     id comes from the response rather than from either error.
     """
 
@@ -1094,7 +1103,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
 
     classify returns "transient" here and is never reached: a returned outcome is not an exception,
     so no classify verdict can turn this into an attempt.
-    The InvalidRequestError the loop builds carries the reason and the row-shape fields, and no
+    The InvalidRequestError the loop builds carries the reason and the per-item failure fields, and no
     request, there being none to carry.
     """
 
@@ -1153,7 +1162,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
     asyncio.run(scenario())
 
 
-def test_refusal_outcome_raises_row_shaped_without_retry() -> None:
+def test_refusal_outcome_raises_without_retry() -> None:
     """A Refusal outcome becomes a RefusalError carrying the attempt record, never retried.
 
     The record carries the turn the refusal arrived on and the response it was read from.
@@ -1199,7 +1208,7 @@ def test_refusal_outcome_raises_row_shaped_without_retry() -> None:
     ],
     ids=["max_completion_tokens_exceeded", "empty_turn", "context_window_exceeded"],
 )
-def test_a_no_output_outcome_raises_row_shaped_without_retry(
+def test_a_no_output_outcome_raises_without_retry(
     outcome: ResponseOutcome[str],
     expected_error: type[GenerationError],
     expected_stop_reason: StopReason,
@@ -1227,7 +1236,7 @@ def test_a_no_output_outcome_raises_row_shaped_without_retry(
     asyncio.run(scenario())
 
 
-def test_schema_violation_outcome_raises_row_shaped_without_retry() -> None:
+def test_schema_violation_outcome_raises_without_retry() -> None:
     """A SchemaViolation outcome fails the item, and pydantic's rejection travels on the error.
 
     error_text carries none of the rejection, whose msg embeds the value a caller's own validator
@@ -1351,7 +1360,7 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
     asyncio.run(scenario())
 
 
-def test_provider_failed_terminally_raises_row_shaped_without_retry() -> None:
+def test_provider_failed_terminally_raises_without_retry() -> None:
     """A terminal provider failure fails the item once, with the provider's own text as the reason.
 
     Never retried: what the body names is a property of the request, so the retry budget would buy
@@ -1405,7 +1414,7 @@ def test_a_plain_exception_classified_transient_is_retried() -> None:
 def test_exception_classified_invalid_request_fails_the_item_without_retry() -> None:
     """A plain exception classified invalid_request raises InvalidRequestError on the first attempt.
 
-    InvalidRequestError is a GenerationError, so in a batch it becomes the item's failure row
+    InvalidRequestError is a GenerationError, so in a batch it becomes the item's own failure
     rather than touching the siblings; the classified exception stays reachable as __cause__.
     """
 
@@ -1427,7 +1436,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
 def test_exception_classified_unknown_exception_fails_the_item_without_retry() -> None:
     """A plain exception classified unknown_exception raises UnknownExceptionError on the first attempt.
 
-    UnknownExceptionError is a GenerationError, so in a batch it becomes the item's failure row
+    UnknownExceptionError is a GenerationError, so in a batch it becomes the item's own failure
     and the siblings run on. Nothing arrived, so the attempt it ends has no record.
     """
 
@@ -1483,7 +1492,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
 
 
 def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -> None:
-    """An attempt cut off mid-drain is a retried row billing the stream's in-flight report.
+    """An attempt cut off mid-drain is a retried attempt billing the stream's in-flight report.
 
     The assembled response that would state the attempt's billing never arrived, so the record's
     usage and request id are what the stream had reported when the failure cut it off.
@@ -1644,8 +1653,11 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_attempt() -> N
     asyncio.run(scenario())
 
 
-def test_an_unplaceable_exception_becomes_the_items_failure_row_and_siblings_continue() -> None:
-    """A classify-unknown_exception item comes back as its UnknownExceptionError row; the sibling succeeds."""
+def test_an_unplaceable_exception_fails_only_its_item() -> None:
+    """A classify-unknown_exception item comes back as its UnknownExceptionError at its index.
+
+    The sibling succeeds.
+    """
 
     async def scenario() -> None:
         """Serialize a two-item batch (capacity=1) whose first attempt is unplaceable."""
@@ -2007,7 +2019,7 @@ def test_generate_many_aligns_results_with_inputs() -> None:
 
 
 def test_generate_many_aligns_a_failure_among_successes() -> None:
-    """A mixed batch keeps each result in its input slot: the failure where it failed, successes elsewhere."""
+    """A mixed batch keeps each result at its input index: the failure where it failed, successes elsewhere."""
 
     async def scenario() -> None:
         """Serialize a three-item batch (capacity=1) whose first attempt fails under a one-attempt budget.
@@ -2036,8 +2048,8 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
     asyncio.run(scenario())
 
 
-def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
-    """An item whose attempt reports Refusal comes back as the RefusalError in its slot, siblings succeed."""
+def test_generate_many_returns_a_refusal_at_its_index() -> None:
+    """An item whose attempt reports Refusal comes back as the RefusalError at its index, siblings succeed."""
 
     async def scenario() -> None:
         """Serialize a two-item batch (capacity=1) whose first attempt reports Refusal."""
@@ -2061,8 +2073,8 @@ def test_generate_many_returns_a_refusal_as_a_failure_row() -> None:
     asyncio.run(scenario())
 
 
-def test_invalid_request_becomes_the_items_failure_row_and_siblings_continue() -> None:
-    """A rejected item comes back as its InvalidRequestError row; the sibling still succeeds.
+def test_invalid_request_fails_only_its_item() -> None:
+    """A rejected item comes back as its InvalidRequestError at its index; the sibling still succeeds.
 
     Nothing a single item does reaches a sibling, so the batch returns one outcome per generation_input.
     """
@@ -2117,7 +2129,7 @@ def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_togeth
 
 
 def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
-    """A first item ending in a GenerationError stays in its slot and the siblings still run."""
+    """A first item ending in a GenerationError stays at its index and the siblings still run."""
 
     async def scenario() -> None:
         """Fail the deterministic first attempt under a one-attempt budget; the other two succeed."""
@@ -2182,7 +2194,7 @@ class _ClassifyRaisesAdapter(_FakeAdapter):
         raise RuntimeError("classify defect")
 
 
-def test_a_defect_becomes_one_items_row_and_leaves_the_batch_complete() -> None:
+def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> None:
     """An Exception from langchaint's own machinery fails its item and no sibling.
 
     Propagating it instead would discard the whole returned list, so a sibling that had already
@@ -2217,7 +2229,7 @@ def test_a_defect_becomes_one_items_row_and_leaves_the_batch_complete() -> None:
 def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
     """generate_one's caller sees the defect as an EscapedExceptionError, not the bare exception.
 
-    Its callers match on GenerationError to write a failure row, so a defect arriving as anything
+    Its callers match on GenerationError to handle the failure, so a defect arriving as anything
     else escapes past their handling entirely.
     """
 
@@ -2240,7 +2252,7 @@ def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provide
     """generate_one raises EscapedExceptionError whose error is the ParserContractError.
 
     A parse contract violation must not take the transport-failure path,
-    where classify would report it as an UnknownExceptionError failure row, a provider outcome.
+    where classify would report it as an UnknownExceptionError, a provider outcome.
     """
 
     async def scenario() -> None:
@@ -2376,7 +2388,7 @@ def test_stream_cancelled_mid_iteration_releases_the_permit() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_stream_cancelled_during_the_open_releases_the_slot() -> None:
+def test_stream_cancelled_during_the_open_returns_the_permit() -> None:
     """A cancellation while the open is in flight returns its permit.
 
     __aexit__ never runs when __aenter__ raises, so only __aenter__ itself can exit the admission here.
@@ -2915,8 +2927,8 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
     asyncio.run(scenario())
 
 
-def test_stream_final_refusal_raises_row_shaped_without_retry() -> None:
-    """A structured refusal detected in the stream's final() surfaces as a row-shaped RefusalError.
+def test_stream_final_refusal_raises_without_retry() -> None:
+    """A structured refusal detected in the stream's final() surfaces as a RefusalError.
 
     final() records the one 200 that produced no output and raises the RefusalError carrying that record.
     """
@@ -3393,10 +3405,10 @@ def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
 ) -> None:
     """An open stream accounts for its attempt whatever verdict the adapter reaches on the error.
 
-    unknown_exception is the row that has to work with no verdict at all: anthropic reports a
+    unknown_exception is the classification that has to work with no verdict at all: anthropic reports a
     mid-stream failure as an error event on the 200 that carried the turn, so the adapter reads a
-    status the retry policy cannot place. The stream is open in every row, so what the provider
-    reported for that attempt is readable and belongs on its record.
+    status the retry policy cannot place. The stream is open under every classification, so what the
+    provider reported for that attempt is readable and belongs on its record.
     """
 
     async def scenario() -> None:

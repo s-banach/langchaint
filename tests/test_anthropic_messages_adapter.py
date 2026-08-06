@@ -1628,7 +1628,7 @@ def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> 
     """A replayed tool call whose args_json is not JSON is an InvalidRequest, not a raise.
 
     args_json is caller data that nothing validates on the way in, so a batch item carrying one must
-    fail as its own row rather than escape the retry loop and cancel its siblings.
+    fail on its own rather than escape the retry loop and cancel its siblings.
     """
     messages = [
         AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
@@ -1668,7 +1668,7 @@ def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cachi
     assert all(block["cache_control"] == {"type": "ephemeral"} for block in blocks[1:])
 
 
-def test_wire_messages_reserves_two_slots_for_automatic_markers() -> None:
+def test_wire_messages_reserves_two_of_the_four_markers_for_automatic_caching() -> None:
     """With automatic caching, only the latest two marks are written beside the last-block marker."""
     messages = [
         UserMessage(
@@ -1737,8 +1737,8 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
         )
 
 
-def test_request_str_system_budget_leaves_two_slots_for_message_marks() -> None:
-    """A str system prompt under automatic caching leaves two slots for message marks."""
+def test_request_str_system_leaves_a_message_mark_budget_of_two() -> None:
+    """A str system prompt under automatic caching leaves a message_mark_budget of two."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )

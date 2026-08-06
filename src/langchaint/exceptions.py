@@ -120,7 +120,7 @@ class GenerationError(_CallCarrier, Exception):
     TimedOutError (the call was cut off by the timeout_seconds the caller asked for).
     generate_one raises every one of them but two: RetryUnavailableError, which comes only from a
     stream_one block, and AbandonedCallError itself, which is never raised.
-    generate_many returns each of the ones generate_one raises in the slot of the item it belongs to,
+    generate_many returns each of the ones generate_one raises at that item's index,
     so to_tables renders a uniform failure row.
 
     call is this call's history; model, provider_name, attempt_records, started_at_monotonic_seconds,
@@ -214,8 +214,8 @@ class RetriesExhaustedError(GenerationError):
     """Every attempt failed with a transient error, and the budget ran out.
 
     generate_one raises it;
-    generate_many returns it in the row where an item exhausted its retries,
-    so the same object is both the raised failure and the failure row of a batch.
+    generate_many returns it at the index of the item that exhausted its retries,
+    so the same object is both the raised failure and the failure result of a batch.
     errors_from_attempts is derived from attempt_records.
     """
 
@@ -422,7 +422,7 @@ class ProviderFailedTerminallyError(GenerationError):
 
 
 class InvalidRequestError(GenerationError):
-    """The provider or the adapter rejected this one request; the item fails as a row.
+    """The provider or the adapter rejected this one request; the item fails on its own.
 
     Two sources, both meaning the request as sent (or as it would have been sent) is not acceptable:
     the provider's own rejection, which Adapter.classify returns "invalid_request" for, and
@@ -437,7 +437,7 @@ class InvalidRequestError(GenerationError):
     Both shipped adapters return "invalid_request" only for an APIStatusError (anthropic 0.120.0, openai 2.45.0).
     __cause__ is None on the InvalidRequest source, where nothing went out.
 
-    Behaviorally this is UnknownExceptionError (one row, no retry); it is a separate class because
+    Behaviorally this is UnknownExceptionError (one failed item, no retry); it is a separate class because
     Adapter.classify's contract is that "unknown_exception" means the adapter could not place the
     exception, and a rejection it does place is not that.
 
@@ -457,7 +457,7 @@ class InvalidRequestError(GenerationError):
 
 
 class ProviderDeclaredFinalError(GenerationError):
-    """The provider answered with a final error; the item fails as a row.
+    """The provider answered with a final error; the item fails on its own.
 
     Two failures arrive this way: an error response the provider marked x-should-retry: false,
     which states the disposition and never what failed,
@@ -483,7 +483,7 @@ class ProviderDeclaredFinalError(GenerationError):
 
 
 class UnknownExceptionError(GenerationError):
-    """An exception the adapter could not place; the item fails as a row.
+    """An exception the adapter could not place; the item fails on its own.
 
     Adapter.classify's default: not a known transient or rate-limit condition (which retry), not a
     rejection of this request (which is InvalidRequestError), and not a final error from the
@@ -512,11 +512,11 @@ class UnknownExceptionError(GenerationError):
 
 
 class EscapedExceptionError(GenerationError):
-    """An exception escaped langchaint's own machinery; the item fails as a row.
+    """An exception escaped langchaint's own machinery; the item fails on its own.
 
     The outermost guard around one call, so a defect anywhere between the caller and the adapter
     ends as that call's failure rather than as a raise past it. In a batch that is what keeps one
-    item's defect from discarding the settled rows and billing of its siblings.
+    item's defect from discarding the settled results and billing of its siblings.
     Report it as a defect in langchaint.
     Nothing is silenced: error is the escaped exception, also chained as __cause__, and error_text
     carries its text, which is the only description of a condition langchaint does not model.

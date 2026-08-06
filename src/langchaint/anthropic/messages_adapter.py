@@ -38,11 +38,12 @@ so a breakpoint can sit inside the frozen prefix (stable instructions marked, se
 The API allows at most 4 cache_control markers per request.
 The SDK documents no such limit, so the source is the provider's prompt-caching page, read 2026-07-25:
 https://platform.claude.com/docs/en/build-with-claude/prompt-caching
-The binding's own markers (marked system parts, the automatic frozen-prefix and last-message markers)
-spend slots first; a binding whose markers alone exceed the limit fails at bind with ValueError.
-The remainder is the per-request budget for marked message parts:
-the latest marks up to that budget are written and older ones left unwritten,
-mirroring openai's documented latest-N rule so a Sequence[Message] that accrues one mark per turn keeps working.
+message_mark_budget is what the limit leaves after the binding's own markers.
+Those are the system parts with cache_breakpoint set, plus whichever markers automatic_prompt_caching adds.
+A binding whose own markers exceed the limit fails at bind with ValueError.
+Where more message parts carry cache_breakpoint than that budget allows, the latest ones get markers.
+Older ones go unmarked, mirroring openai's documented latest-N rule.
+A Sequence[Message] accruing one cache_breakpoint per turn therefore keeps working.
 Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
 "1h" writes ttl "1h", whose writes bill at each table's cache_write_1h_usd_per_million_tokens).
 
@@ -195,7 +196,7 @@ tables above should learn.
 """
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
-"""The API allows at most 4 cache_control markers per request; bind-time markers spend slots first."""
+"""The API allows at most 4 cache_control markers per request, the binding's own included."""
 
 type CacheTTL = Literal["5m", "1h"]
 """A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
@@ -400,7 +401,7 @@ def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
 
     Raises:
         _NotSendableError: an ImagePart's media_type is outside the API's accepted set,
-            so the API would reject this request; the item fails its own row.
+            so the API would reject this request; the item fails on its own.
     """
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
@@ -502,7 +503,7 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
         _NotSendableError: a part other than the message's last sets cache_breakpoint.
             The API accepts such a request, and the enclosing block's marker silently moves the
             boundary to the block's end, so the wire form would not mean what the message says;
-            build_request returns InvalidRequest and the item fails its own row.
+            build_request returns InvalidRequest and the item fails on its own.
     """
     if isinstance(tool_message.content, str):
         return False

@@ -194,7 +194,7 @@ class _CallCarrier:
 
     @property
     def elapsed_seconds(self) -> float:
-        """The call's wall time, slot waits and backoff sleeps included."""
+        """The call's wall time, permit waits and backoff sleeps included."""
         return self.call.elapsed_seconds
 
 

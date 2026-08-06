@@ -176,7 +176,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Every failure row this adapter's parse maps, against the exact verdict it returns.
+        """Every failure this adapter's parse maps, against the exact verdict it returns.
 
         Cover at least one exception per verdict kind, one carrying a server-stated retry_after,
         and one status the provider's table does not list.

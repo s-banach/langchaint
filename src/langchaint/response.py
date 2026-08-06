@@ -30,7 +30,7 @@ Every other binding returns Response alone, and its generate and stream overload
 """
 
 type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
-"""One call's terminal result: a success variant, or the failure carrier a batch returns in its slot."""
+"""One call's terminal result: a success variant, or the failure carrier a batch returns at its item's index."""
 
 type RowValue = str | int | float | bool | None
 """The scalar cell types to_tables emits."""
@@ -196,7 +196,7 @@ def _abandoned_call_error[ErrorT: AbandonedCallError](
 ) -> ErrorT:
     """Freeze a cut-off call's ledger into the error that accounts for it.
 
-    Call while the exception that cut the call off unwinds, after the in-flight slot has been
+    Call while the exception that cut the call off unwinds, after the in-flight permit has been
     returned and, on the stream path, after the connection has closed, so nothing the ledger reports
     is still moving.
     billing_in_flight defaults to None, which is what a caller with no channel for observing an

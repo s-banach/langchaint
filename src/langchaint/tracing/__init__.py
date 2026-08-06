@@ -1247,7 +1247,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         The overloads mirror BoundLLM.generate_one's, so output is typed per binding.
 
-        The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
+        The span brackets the same interval as elapsed_seconds (permit waits and backoff included).
         Under capture_message_content the input attributes are set at span start, so they are present on the
         failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
         a GenerationError's last recorded one included.
@@ -1277,7 +1277,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             GenerationError: the call failed; the span is attributed and closed first, and a batch
-                turns the error into that item's row. TimedOutError is one of them, so a call that
+                turns the error into that item's result. TimedOutError is one of them, so a call that
                 ran out of time closes its span like any other failure.
             asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
                 status set.
@@ -1294,7 +1294,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> GenerateResult[Any]:
         """Await one call inside a CLIENT chat span, attributing the span from however it ends.
 
-        The span brackets the same interval as elapsed_seconds (slot waits and backoff included).
+        The span brackets the same interval as elapsed_seconds (permit waits and backoff included).
         Under capture_message_content the input attributes are set at span start, so they are present on the
         failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
         a GenerationError's last recorded one included.
@@ -1366,7 +1366,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[Any]:
         """Order-aligned batch, traced as one chat span per started item and nothing else.
 
-        The overloads mirror BoundLLM.generate_many's, so each row's output is typed per binding.
+        The overloads mirror BoundLLM.generate_many's, so each result's output is typed per binding.
 
         warm_cache, max_pending, and timeout_seconds pass through to BoundLLM.generate_many, which
         documents them.

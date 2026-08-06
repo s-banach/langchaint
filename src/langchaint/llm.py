@@ -61,6 +61,7 @@ from langchaint.response import (
     _abandoned_call_error,
     _success_variant,
 )
+from langchaint.run_many import run_many, validate_max_pending
 from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
@@ -1072,7 +1073,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """One batch item: the success variant or the GenerationError.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
-        into the gather and reaches a sibling. An expired timeout_seconds is one of them, so one
+        into run_many and reaches a sibling. An expired timeout_seconds is one of them, so one
         item's deadline never cuts a sibling.
 
         Raises:
@@ -1089,6 +1090,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[str] | GenerationError]: ...
     @overload
@@ -1097,6 +1099,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     @overload
@@ -1105,6 +1108,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
@@ -1112,49 +1116,60 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
+        max_pending: int | None = None,
         timeout_seconds: float | None = None,
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
     ) -> list[Any]:
-        """Order-aligned batch: result i belongs to generation_inputs[i].
+        """Run an order-aligned batch: result i belongs to generation_inputs[i].
 
-        A success slot is typed the way generate_one types its result, per binding.
-        A bare str as the whole batch is rejected: str satisfies the item Sequence type,
-        so it would silently become one request per character.
-        Every item ends in its own slot: a success variant, or the GenerationError it failed with
-        (retries exhausted, a rejected request, an error langchaint does not retry, a 200 that
-        produced no output, or a defect in langchaint itself), which to_tables renders to a failure
-        row so the batch stays table-ready.
-        No item's failure reaches a sibling, so the returned list is always complete.
-        Concurrency is bounded by shared_backoff.capacity, which gates every request start and is
-        shared with everything else using the same SharedBackoff instance;
-        a capacity of None leaves the bound to whatever spawns the work.
+        Each success uses generate_one's result type for this binding.
+        A bare str batch is rejected: str satisfies the item Sequence type, so it would silently
+        become one request per character.
 
-        warm_cache runs generation_inputs[0] to completion before starting the rest,
-        because a provider cache entry is readable only after the response that writes it begins,
-        so a batch sharing a cached prefix otherwise pays one cold cache write per in-flight item.
-        It costs one item of serial latency and warms unconditionally,
-        whether or not the binding places any cache marker.
-        A first item ending in a GenerationError still admits the rest:
-        a 200 that produced no output (a refusal, a truncation) wrote the prefix on the provider side,
-        and after a transport failure the rest simply run against a cold cache; there is no second warmer.
-        There is no warmup ladder: after the first item settles, every remaining item is admitted at once.
+        A GenerationError is returned in place of that item's result and never cancels a sibling.
+        It names retries exhausted, a rejected request, an error langchaint does not retry, a 200
+        that produced no output, or a defect in langchaint itself.
+        to_tables renders each GenerationError as one failure row, so the batch stays table-ready.
+        The returned list is therefore always complete.
 
-        timeout_seconds is each item's own deadline, started when that item starts, and an item that
-        expires gets a TimedOutError row while its siblings run on. Bound the batch this way rather
-        than with a scope of your own: a cancellation from outside discards the returned list,
-        settled rows and all, because the list is this frame's and the frame is what unwinds.
+        max_pending caps the items that have started and not finished, so a large batch does not
+        hold one live task per item.
+        None starts every item at once.
+        SharedBackoff.capacity separately gates every request start, across everything sharing that
+        instance.
+
+        warm_cache runs generation_inputs[0] to completion before starting the rest, because a
+        provider cache entry is readable only once the response that writes it begins.
+        Without warming, a batch sharing a cached prefix pays one cold cache write per pending item.
+        Warming costs one item of serial latency, and it runs whether or not the binding places a
+        cache marker.
+        A first item ending in a GenerationError still admits the rest: a 200 that produced no
+        output (a refusal, a truncation) wrote the prefix on the provider side, and after a
+        transport failure the rest simply run against a cold cache.
+        There is no second warmer, and after warming max_pending bounds the remaining items alone.
+
+        timeout_seconds is each item's own deadline, started when that item starts, so an item
+        waiting on max_pending has no deadline running yet.
+        An item that expires gets a TimedOutError row while its siblings run on.
+        Bound the batch this way rather than with a scope of your own: a cancellation from outside
+        discards the returned list, settled rows and all, because the list is this frame's and the
+        frame is what unwinds.
+        Neither an outer cancellation nor an item's BaseException starts an item that had not
+        started.
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
+            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
-                does not catch; _gather cancels the remaining items and it propagates.
+                does not catch; the started items are cancelled and awaited, and it propagates.
         """
         return await self._generate_many_any_binding(
             generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
+            max_pending=max_pending,
             timeout_seconds=timeout_seconds,
         )
 
@@ -1164,75 +1179,78 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool,
         generate_item: "GenerateItem[OutputT]",
+        max_pending: int | None,
         timeout_seconds: float | None,
     ) -> list[CallResult[OutputT | None]]:
         """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
 
         generate_item runs one item, so a caller that wraps each call wraps every item of a batch
         alike, whichever branch below started it.
+        max_pending is validated here, so an invalid one raises before warm_cache sends its request.
         timeout_seconds is each item's own deadline, started when that item starts.
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
+            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled the batch.
-            BaseException: an item raised a BaseException that is not an Exception; _gather cancels
-                the remaining items and it propagates.
+            BaseException: an item raised a BaseException that is not an Exception; the started
+                items are cancelled and awaited, and it propagates.
         """
         _reject_bare_str_batch(generation_inputs)
-        # The slices also convert the SequenceNotStr protocol to the Sequence _gather takes.
+        validate_max_pending(max_pending)
+        # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
             first_result = await self._generate_or_failure(
                 generation_inputs[0],
                 generate_item=generate_item,
                 timeout_seconds=timeout_seconds,
             )
-            rest = await self._gather(
+            rest = await self._run_items(
                 generation_inputs[1:],
                 generate_item=generate_item,
+                max_pending=max_pending,
                 timeout_seconds=timeout_seconds,
             )
             return [first_result, *rest]
-        return await self._gather(
+        return await self._run_items(
             generation_inputs[0:],
             generate_item=generate_item,
+            max_pending=max_pending,
             timeout_seconds=timeout_seconds,
         )
 
-    async def _gather(
+    async def _run_items(
         self,
         generation_inputs: Sequence[GenerationInput],
         *,
         generate_item: "GenerateItem[OutputT]",
+        max_pending: int | None,
         timeout_seconds: float | None,
     ) -> list[CallResult[OutputT | None]]:
-        """Run the items concurrently and return the settled list, order-aligned.
-
-        The cancelled tasks are awaited before it raises, because gather returns here with siblings
-        still running on both paths: a KeyboardInterrupt or a SystemExit from an item propagates
-        immediately, and a cancellation propagates as soon as the first item completes as cancelled.
+        """Run the items through run_many, which returns them in input order.
 
         Raises:
+            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled generate_many.
-            BaseException: an item raised a BaseException that is not an Exception, which langchaint
-                does not catch; the remaining tasks are cancelled and it propagates.
+            BaseException: an item raised a BaseException that is not an Exception; run_many cancels
+                and awaits the started items, and it propagates.
         """
-        tasks = [
-            asyncio.create_task(
-                self._generate_or_failure(
-                    generation_input,
-                    generate_item=generate_item,
-                    timeout_seconds=timeout_seconds,
-                )
+
+        async def run_one(
+            generation_input: GenerationInput,
+        ) -> CallResult[OutputT | None]:
+            """Run one batch item.
+
+            Raises:
+                BaseException: _generate_or_failure propagated it.
+            """
+            return await self._generate_or_failure(
+                generation_input,
+                generate_item=generate_item,
+                timeout_seconds=timeout_seconds,
             )
-            for generation_input in generation_inputs
-        ]
-        try:
-            return list(await asyncio.gather(*tasks))
-        except BaseException:
-            for task in tasks:
-                _ = task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
+
+        return await run_many(generation_inputs, run_one, max_pending=max_pending)
 
     @overload
     def stream_one(

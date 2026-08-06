@@ -54,6 +54,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Keep the SDKs optional dependencies the application pins directly; declare no extras. The import path is the boundary: the neutral core imports no SDK; each backend subpackage imports its SDK at module top, guarded so a missing package raises a `ModuleNotFoundError` naming what to install.
 - Give each backend subpackage a constructor named for the models it selects, returning a ready `LLM`. Send a model id verbatim with no aliases, so one string appears in application code, on the wire, and in traces. Require only the model, plus `pricing` where no carried table maps to the model id; document each parameter and each cross-provider asymmetry on the function. Prices are the one provider fact not verifiable by introspection; each subpackage docstring carries the source URL.
 - Tier the public surface by audience: applications import from top-level `langchaint` and the backend subpackages; adapter authors import from `langchaint.adapter` and `langchaint.conformance`. Top-level `__all__` re-exports only the SDK-free application surface.
+- Check only what a type checker cannot. Applications are expected to run a strict one, so a runtime check that an argument has its annotated type duplicates it; check what a correctly-typed argument can still get wrong, such as a value out of range. `bool` is the case worth stating: it subclasses `int`, so a checker admits `True` wherever an `int` is annotated. A test that suppresses the type checker to reach a runtime check is a test of the type checker, so delete it rather than the suppression.
 - Ship OTel tracing in-tree as a thin, guarded-import subpackage off the top-level `__all__`. Premises: never fake an event boundary a span measures; the mapper gets attribute names and values, never the `GenerationInput`; catch and log telemetry failures, never propagate; wrap unconditionally, and leave enable/disable/routing to OTel SDK configuration. Record message content only through `capture_message_content`, a required keyword with no default. Use a convention key wherever one exists; reserve `langchaint.*` for what the convention lacks.
 
 ## Module map
@@ -75,6 +76,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.
 - `anthropic/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires the SDK it wraps (deepseek wraps the openai SDK).
 - `inference_params.py`: the inference parameters.
+- `run_many.py`: runs a sequence of inputs under a bound on how many are pending; imports nothing from langchaint and models nothing about LLMs.
 - `tracing/`: the OTel subpackage; importing it requires opentelemetry-api, and it is off the top-level `__all__`.
 
 ## Checks

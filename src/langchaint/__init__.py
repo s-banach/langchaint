@@ -9,6 +9,8 @@ Internal helpers (SequenceNotStr) are importable but off __all__.
 Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
 schema() returns, are on __all__: both appear in signatures application code writes against.
 The tool decorator builds PydanticTool from an async function's parameter annotation.
+run_many is on __all__ because generate_many's max_pending is its bound, and an application that
+batches anything else the same way can call it directly.
 """
 
 from langchaint.adapter import (
@@ -71,6 +73,7 @@ from langchaint.response import (
     ToolCallTurn,
     to_tables,
 )
+from langchaint.run_many import run_many
 from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
@@ -185,6 +188,7 @@ __all__ = [
     "category_cost",
     "messages_from_json",
     "messages_to_json",
+    "run_many",
     "to_tables",
     "tool",
 ]

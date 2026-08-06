@@ -1333,6 +1333,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[str] | GenerationError]: ...
     @overload
@@ -1341,6 +1342,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     @overload
@@ -1349,6 +1351,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
+        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
@@ -1356,31 +1359,36 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
+        max_pending: int | None = None,
         timeout_seconds: float | None = None,
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
     ) -> list[Any]:
-        """Order-aligned batch, traced as one chat span per item and nothing else.
+        """Order-aligned batch, traced as one chat span per started item and nothing else.
 
         The overloads mirror BoundLLM.generate_many's, so each row's output is typed per binding.
 
-        warm_cache and timeout_seconds pass through to BoundLLM.generate_many, which documents them.
+        warm_cache, max_pending, and timeout_seconds pass through to BoundLLM.generate_many, which
+        documents them.
 
         A batch large enough for one span per item to be too many spans is what an OTel sampler is
         for, configured on the SDK where every other tracing volume decision is made.
 
         Raises:
-            TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated method).
+            TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated
+                method).
+            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
                 ended.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
-                does not catch; the remaining items are cancelled and it propagates.
+                does not catch; the started items are cancelled and awaited, and it propagates.
         """
         # The un-overloaded entry point; _generate_one_any_binding says why.
         return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
             generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
+            max_pending=max_pending,
             timeout_seconds=timeout_seconds,
         )
 

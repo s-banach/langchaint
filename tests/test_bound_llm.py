@@ -2150,6 +2150,20 @@ def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
     asyncio.run(scenario())
 
 
+def test_generate_many_validates_max_pending_before_warm_cache_starts() -> None:
+    """Invalid max_pending starts no warm_cache request."""
+
+    async def scenario() -> None:
+        """Pass invalid max_pending with warm_cache enabled."""
+        adapter = _FakeAdapter()
+        bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
+        with pytest.raises(ValueError, match="max_pending"):
+            _ = await bound_llm.generate_many(["a"], warm_cache=True, max_pending=0)
+        assert adapter.bound_adapters[0].build_count == 0
+
+    asyncio.run(scenario())
+
+
 class _ClassifyRaisesAdapter(_FakeAdapter):
     """A _FakeAdapter whose classify raises, standing in for a defect anywhere in langchaint.
 
@@ -3620,6 +3634,23 @@ def test_capacity_bounds_batch_concurrency() -> None:
         )
         generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
         results = await bound_llm.generate_many(generation_inputs)
+        assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
+        assert adapter.bound_adapters[0].peak_in_flight == 2
+
+    asyncio.run(scenario())
+
+
+def test_max_pending_bounds_generate_many_pending_items() -> None:
+    """max_pending=2 limits a five-item batch to two pending items."""
+
+    async def scenario() -> None:
+        """Run five slow requests with max_pending=2."""
+        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)).bind(
+            automatic_prompt_caching=True
+        )
+        generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
+        results = await bound_llm.generate_many(generation_inputs, max_pending=2)
         assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
         assert adapter.bound_adapters[0].peak_in_flight == 2
 

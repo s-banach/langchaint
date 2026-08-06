@@ -56,6 +56,8 @@ A bare `str` generation_input is shorthand for `[UserMessage(content=generation_
 **Generation only via binding.**
 `LLM.bind(...)` freezes everything that determines the cacheable prompt prefix into a `BoundLLM[OutputT]`, and changing parameters is `rebind(...)`.
 `BoundLLM` has `generate_one`, `generate_many`, and `stream_one`.
+`generate_many` takes `max_pending`, which caps the items that have started and not finished, so a batch of a million inputs does not hold a million live tasks.
+`run_many`, the function behind it, is exported for batching anything else the same way.
 
 **A constructor per backend returning a ready `LLM`.**
 `openai_model(...)`, `anthropic_model(...)`, `gemini_model(...)`, `deepseek_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.

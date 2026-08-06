@@ -1569,6 +1569,28 @@ def test_generate_many_passes_warm_cache_through() -> None:
     asyncio.run(scenario())
 
 
+def test_generate_many_passes_max_pending_through() -> None:
+    """max_pending reaches BoundLLM.generate_many and bounds pending traced items."""
+
+    async def scenario() -> None:
+        """Run four slow items with max_pending=2."""
+        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        results = await traced.bind(automatic_prompt_caching=True).generate_many(
+            [[UserMessage(content=str(index))] for index in range(4)], max_pending=2
+        )
+        assert all(isinstance(result, Response) for result in results)
+        assert adapter.bound_adapters[0].peak_in_flight == 2
+        assert len(exporter.get_finished_spans()) == 4
+
+    asyncio.run(scenario())
+
+
 def test_each_convention_defined_span_kind_carries_the_required_operation_name() -> None:
     """gen_ai.operation.name is set on every span this module opens.
 

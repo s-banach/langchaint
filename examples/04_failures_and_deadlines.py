@@ -27,7 +27,7 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     anthropic_backoff = SharedBackoff(
         parse=parse_anthropic,
         failure_types=AnthropicMessagesAdapter.failure_types,
-        capacity=16,
+        max_concurrent_requests=16,
     )
 
     summarizer = anthropic_model(

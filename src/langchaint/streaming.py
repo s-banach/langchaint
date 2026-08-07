@@ -11,7 +11,7 @@ Transient failures before open_stream() returns are retried.
 Failures from an open stream are never retried.
 Each open attempt is its own SharedBackoff admitted() block, and a successful open leaves the
 block held, so the admission spans the stream from opening until it closes or exhausts and a
-long-lived stream counts against capacity for its whole life.
+long-lived stream holds its permit for its whole life.
 An iterator failure exits the block with its verdict.
 A transient iterator failure ends the call as RetryUnavailableError.
 An assembled response can also end the call that way.
@@ -330,7 +330,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Exit the held admitted() block and return the verdict it recorded, None without one.
 
         exc is what the block ends with: a failure_types entry is parsed and its verdict
-        recorded, and anything else, None included, only returns the capacity permit.
+        recorded, and anything else, None included, only returns the permit.
         Idempotent: a later call finds no admission and returns None, which is what lets every
         closing path exit without checking what the others did.
 
@@ -351,7 +351,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Close the provider connection and exit the admitted() block, whatever the close does.
 
         The admission exit sits in a finally rather than after the close, so a BaseException out
-        of the close returns the capacity permit too.
+        of the close returns the permit too.
         A failing path that already exited the block with its failure leaves this exit nothing to
         do, _exit_admission being idempotent.
         The stream is dropped before the close is awaited, so a teardown that fails is attempted
@@ -366,7 +366,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 await _close_stream_quietly(
                     adapter_stream,
                     failure_log_message=(
-                        "closing the provider stream raised; the capacity permit was returned"
+                        "closing the provider stream raised; the permit was returned"
                     ),
                 )
         finally:
@@ -500,10 +500,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Take the call's request, then open one adapter stream, retrying transient failures.
 
         Each attempt is its own admitted() block, exited with the failure before any wait,
-        so a waiting task never holds capacity while this one backs off and the failure's
+        so a waiting task never holds a permit while this one backs off and the failure's
         verdict reaches the shared domain either way.
         A successful open leaves the block held for the stream's whole life,
-        so the stream counts against capacity until it closes or exhausts.
+        so the stream holds its permit until it closes or exhausts.
         Every failing path out of an attempt exits the block, cancellation included.
 
         Raises:

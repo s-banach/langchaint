@@ -668,7 +668,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
             echo=True,
             failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=shared_backoff),
@@ -688,7 +688,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         assert all(span.kind == SpanKind.CLIENT for span in spans)
         assert all(_attribute(span, "gen_ai.operation.name") == "chat" for span in spans)
         assert all(_attribute(span, "langchaint.cost_in_usd") is not None for span in spans)
-        # capacity=1 serializes the batch, so the refused item is the first span to end.
+        # max_concurrent_requests=1 serializes the batch, so the refused item is the first span to end.
         refused, *succeeded = spans
         assert refused.status.status_code == StatusCode.ERROR
         assert _attribute(refused, "error.type") == "RefusalError"
@@ -1092,7 +1092,10 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
 
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
+            LLM(
+                _FakeAdapter(echo=True),
+                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
+            ),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -1217,7 +1220,10 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
         """Rebind, then stream and batch under one extra_attributes mapping; every span carries it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
+            LLM(
+                _FakeAdapter(echo=True),
+                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
+            ),
             extra_attributes={"gen_ai.agent.name": "agent_a"},
             tracer=tracer,
             capture_message_content=False,
@@ -1550,11 +1556,11 @@ def test_generate_many_passes_warm_cache_through() -> None:
     """warm_cache reaches BoundLLM.generate_many: the warming item never overlaps a sibling."""
 
     async def scenario() -> None:
-        """Run a three-item batch on a slow fake with a wide capacity and read the recorded peak."""
+        """Run a three-item batch on a slow fake with a wide concurrency bound and read the recorded peak."""
         adapter = _FakeAdapter(echo=True, open_seconds=0.01)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)),
+            LLM(adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)),
             tracer=tracer,
             capture_message_content=False,
         )
@@ -1565,28 +1571,6 @@ def test_generate_many_passes_warm_cache_through() -> None:
         assert adapter.bound_adapters[0].peak_in_flight == 2
         # The warming item is traced like every other item, so three items are three spans.
         assert len(exporter.get_finished_spans()) == 3
-
-    asyncio.run(scenario())
-
-
-def test_generate_many_passes_max_pending_through() -> None:
-    """max_pending reaches BoundLLM.generate_many and bounds pending traced items."""
-
-    async def scenario() -> None:
-        """Run four slow items with max_pending=2."""
-        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        results = await traced.bind(automatic_prompt_caching=True).generate_many(
-            [[UserMessage(content=str(index))] for index in range(4)], max_pending=2
-        )
-        assert all(isinstance(result, Response) for result in results)
-        assert adapter.bound_adapters[0].peak_in_flight == 2
-        assert len(exporter.get_finished_spans()) == 4
 
     asyncio.run(scenario())
 
@@ -2367,7 +2351,10 @@ def test_generate_many_captures_each_items_own_generation_input_under_capture() 
         """Run a two-item batch under capture and read the content off each item's span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True), shared_backoff=_fast_shared_backoff(capacity=1)),
+            LLM(
+                _FakeAdapter(echo=True),
+                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
+            ),
             tracer=tracer,
             capture_message_content=True,
         )

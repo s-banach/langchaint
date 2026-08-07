@@ -3,7 +3,7 @@
 SharedBackoff has one control action: holding a request from starting until a deadline its whole domain shares.
 A domain is the set of requests the caller routes through one instance, usually one model on one account.
 A request enters `admitted()`, the async-with block spanning one attempt.
-Entry acquires a capacity permit when `capacity` is set, then admission; normally both are immediate.
+Entry acquires a permit when `max_concurrent_requests` is set, then admission; normally both are immediate.
 After the provider pushes back, every request in the domain waits at entry until the shared pause ends.
 When the pause ends, waiting requests are released in the order they joined, spaced by `admission_gap`.
 Exit parses a provider failure into a verdict, records it, then returns the permit, in that order by position.
@@ -127,7 +127,7 @@ class Admission:
         self.verdict: Verdict | None = None
 
     async def __aenter__(self) -> "Admission":
-        """Acquire a capacity permit when capacity is set, then admission; normally both are immediate.
+        """Acquire a permit when max_concurrent_requests is set, then admission; normally both are immediate.
 
         Once this returns, the request is admitted, and a pause starting afterwards does not revoke that admission.
         Cancellation during entry leaves nothing held: the request leaves the queue and any acquired permit returns.
@@ -185,7 +185,7 @@ class Admission:
 
 
 class SharedBackoff:
-    """The shared pause, the admission queue, and the capacity permits of one domain.
+    """The shared pause, the admission queue, and the permits of one domain.
 
     Route every request in the domain through one instance, first attempts and retries alike.
 
@@ -211,12 +211,12 @@ class SharedBackoff:
       block, invisible to SharedBackoff.
     """
 
-    def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, capacity, on_parse_error)
+    def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests, on_parse_error)
         self,
         *,
         parse: Callable[[Exception], Verdict],
         failure_types: tuple[type[Exception], ...],
-        capacity: int | None,
+        max_concurrent_requests: int | None,
         minimum_wait_ceiling: float = 1.0,
         longest_wait: float = 60.0,
         wait_multiplier: float = 2.0,
@@ -231,9 +231,9 @@ class SharedBackoff:
         parse is synchronous, so the raised failure must already carry what parse needs; await any
         body reading inside the block before raising.
         failure_types are the exception types the exit parses; provide narrow provider-failure classes.
-        capacity is the number of requests allowed inside admitted() blocks at once, or None when a
-        fixed worker pool upstream already bounds concurrency; a permit held idle through a pause is
-        acceptable because every other request in the domain is paused too.
+        max_concurrent_requests is the number of requests allowed inside admitted() blocks at once,
+        or None when a fixed worker pool upstream already bounds concurrency; a permit held idle
+        through a pause is acceptable because every other request in the domain is paused too.
         minimum_wait_ceiling is where the wait ceiling starts and decays back to.
         longest_wait caps the wait ceiling and any retry_after.
         wait_multiplier is how much the ceiling grows or shrinks in one step.
@@ -247,7 +247,7 @@ class SharedBackoff:
             ValueError: a numeric setting fails the acceptance rule (not a bool, finite,
                 greater than zero); wait_multiplier is not greater than 1; longest_wait is below
                 minimum_wait_ceiling; longest_wait / minimum_wait_ceiling is not a finite float,
-                which the decay arithmetic assumes; capacity is a bool or an int below 1;
+                which the decay arithmetic assumes; max_concurrent_requests is a bool or an int below 1;
                 on_parse_error is neither accepted string; failure_types is empty,
                 which would make the exit parse nothing and record nothing; a failure_types entry
                 is not a strict subclass of Exception (Exception itself would convert nearly every
@@ -277,8 +277,13 @@ class SharedBackoff:
                 "longest_wait / minimum_wait_ceiling must be a finite float, "
                 f"got {ceiling_ratio!r} from {longest_wait!r} / {minimum_wait_ceiling!r}"
             )
-        if capacity is not None and (isinstance(capacity, bool) or capacity < 1):
-            raise ValueError(f"capacity must be None or a positive int, got {capacity!r}")
+        if max_concurrent_requests is not None and (
+            isinstance(max_concurrent_requests, bool) or max_concurrent_requests < 1
+        ):
+            raise ValueError(
+                f"max_concurrent_requests must be None or a positive int, "
+                f"got {max_concurrent_requests!r}"
+            )
         if on_parse_error not in ("raise", "retry_this_one"):
             raise ValueError(
                 f'on_parse_error must be "raise" or "retry_this_one", got {on_parse_error!r}'
@@ -301,7 +306,7 @@ class SharedBackoff:
             raise ValueError("parse must be synchronous, got a coroutine function")
         self.parse = parse
         self.failure_types = tuple(failure_types)
-        self.capacity = capacity
+        self._max_concurrent_requests = max_concurrent_requests
         self.on_parse_error: Literal["raise", "retry_this_one"] = on_parse_error
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
         """Quiet steps after which the ceiling has reached the floor, whatever it started at.
@@ -323,8 +328,10 @@ class SharedBackoff:
         """
         self._queue: deque[asyncio.Future[None]] = deque()
         """Requests waiting for admission, released in the order they joined."""
-        self._capacity_permits = None if capacity is None else asyncio.Semaphore(capacity)
-        """The capacity permits; None when capacity is None.
+        self._permits = (
+            None if max_concurrent_requests is None else asyncio.Semaphore(max_concurrent_requests)
+        )
+        """The permits; None when max_concurrent_requests is None.
 
         asyncio.Semaphore grants waiters in the order they joined and keeps the permit count whole
         under cancellation: acquire's CancelledError branch passes a granted-but-unclaimed permit
@@ -344,6 +351,15 @@ class SharedBackoff:
         A metric, read by no decision.
         """
 
+    @property
+    def max_concurrent_requests(self) -> int | None:
+        """The number of requests allowed inside admitted() blocks at once, or None for no bound.
+
+        Read-only: the permits are sized once in __init__, so assigning this would move what
+        callers read while leaving the permit count they contend for unchanged.
+        """
+        return self._max_concurrent_requests
+
     def admitted(self, *, budget: float | None = None) -> Admission:
         """Return the block spanning one attempt; enter it to wait, exit it to report.
 
@@ -361,20 +377,20 @@ class SharedBackoff:
         return Admission(self, budget_seconds)
 
     async def _acquire_permit(self) -> None:
-        """Hold one capacity permit, waiting behind earlier waiters; no-op when capacity is None.
+        """Hold one permit, waiting behind earlier waiters; no-op when there is no bound.
 
         Raises:
             asyncio.CancelledError: the wait was cancelled; no permit is held.
         """
-        if self._capacity_permits is None:
+        if self._permits is None:
             return
-        _ = await self._capacity_permits.acquire()
+        _ = await self._permits.acquire()
 
     def _release_permit(self) -> None:
-        """Return one permit, waking the longest-waiting live waiter; no-op when capacity is None."""
-        if self._capacity_permits is None:
+        """Return one permit, waking the longest-waiting live waiter; no-op when there is no bound."""
+        if self._permits is None:
             return
-        self._capacity_permits.release()
+        self._permits.release()
 
     async def _wait_turn(self) -> None:
         """Wait in the admission queue until the shared pause and admission_gap admit this request.
@@ -436,9 +452,9 @@ class SharedBackoff:
     def _log_pause_end(self) -> None:
         """Log the ended pause's length and the queue depth, on the first admission after its end.
 
-        Queue depth here cannot exceed capacity, or the worker pool's size when capacity is None,
-        so a full queue means every permit or worker is idle; it says nothing about work waiting
-        further upstream, which whatever bounds that work has to report.
+        Queue depth here cannot exceed max_concurrent_requests, or the worker pool's size when it
+        is None, so a full queue means every permit or worker is idle; it says nothing about work
+        waiting further upstream, which whatever bounds that work has to report.
         """
         if self._pause_until == _NEVER or self._last_admission_at > self._pause_until:
             return

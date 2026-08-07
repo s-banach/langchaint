@@ -2,7 +2,7 @@
 
 An input is pending from the moment run_many starts its task until that task settles.
 max_pending caps the pending count, creating each task as an earlier one settles.
-A batch of a million inputs therefore never holds a million live tasks.
+A batch of a million inputs therefore never holds a million pending tasks.
 This module models nothing about LLMs and imports nothing from langchaint.
 """
 
@@ -28,20 +28,6 @@ class RunOne[InputT, OutputT](Protocol):
         ...
 
 
-def validate_max_pending(max_pending: int | None) -> None:
-    """Reject a max_pending that run_many would reject.
-
-    Call this before work that a later run_many rejection would waste, such as a request sent
-    ahead of the batch.
-    bool is rejected explicitly because it subclasses int, so a type checker admits True here.
-
-    Raises:
-        ValueError: max_pending is a bool, or an int below 1.
-    """
-    if max_pending is not None and (isinstance(max_pending, bool) or max_pending < 1):
-        raise ValueError(f"max_pending must be None or a positive int, got {max_pending!r}")
-
-
 async def run_many[InputT, OutputT](
     inputs: Sequence[InputT],
     run_one: RunOne[InputT, OutputT],
@@ -62,7 +48,9 @@ async def run_many[InputT, OutputT](
         asyncio.CancelledError: an outer scope cancelled this call.
         BaseException: a run_one call raised it.
     """
-    validate_max_pending(max_pending)
+    # bool is rejected explicitly because it subclasses int, so a type checker admits True here.
+    if max_pending is not None and (isinstance(max_pending, bool) or max_pending < 1):
+        raise ValueError(f"max_pending must be None or a positive int, got {max_pending!r}")
     input_snapshot = tuple(inputs)
     if max_pending is None:
         max_pending = len(input_snapshot)

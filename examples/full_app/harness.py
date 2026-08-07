@@ -294,7 +294,7 @@ def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
         shared_backoff=SharedBackoff(
             parse=adapter.parse,
             failure_types=adapter.failure_types,
-            capacity=16,
+            max_concurrent_requests=16,
             minimum_wait_ceiling=0.001,
             longest_wait=0.01,
         ),

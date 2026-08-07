@@ -40,7 +40,7 @@ def _retry_verdict(_failure: Exception) -> Verdict:
 def _shared_backoff(
     *,
     parse: Callable[[Exception], Verdict] = _retry_verdict,
-    capacity: int | None = 1,
+    max_concurrent_requests: int | None = 1,
     minimum_wait_ceiling: float = 1.0,
     longest_wait: float = 60.0,
     wait_multiplier: float = 2.0,
@@ -52,7 +52,7 @@ def _shared_backoff(
     return SharedBackoff(
         parse=parse,
         failure_types=(ProviderFailure,),
-        capacity=capacity,
+        max_concurrent_requests=max_concurrent_requests,
         minimum_wait_ceiling=minimum_wait_ceiling,
         longest_wait=longest_wait,
         wait_multiplier=wait_multiplier,
@@ -67,7 +67,7 @@ class _RecordingSharedBackoff(SharedBackoff):
     """SharedBackoff that keeps every verdict _record received, for identity assertions."""
 
     def __init__(self, *, parse: Callable[[Exception], Verdict]) -> None:
-        super().__init__(parse=parse, failure_types=(ProviderFailure,), capacity=1)
+        super().__init__(parse=parse, failure_types=(ProviderFailure,), max_concurrent_requests=1)
         self.recorded: list[Verdict] = []
 
     @override
@@ -82,14 +82,14 @@ def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
 
 
 def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
-    """Report whether every capacity permit is free: none held, none leaked, no live waiter queued.
+    """Report whether every permit is free: none held, none leaked, no live waiter queued.
 
     Reads the semaphore's _value, which is CPython-private, because no public attribute exposes the
     count; a stdlib rename breaks these tests visibly, not the shipped code.
     """
-    permits = shared_backoff._capacity_permits
+    permits = shared_backoff._permits
     assert permits is not None
-    return permits._value == shared_backoff.capacity and not permits.locked()
+    return permits._value == shared_backoff.max_concurrent_requests and not permits.locked()
 
 
 async def _raise_in_block(admission: Admission, failure: Exception) -> None:
@@ -118,13 +118,13 @@ async def _fail_one_attempt(shared_backoff: SharedBackoff) -> Admission:
 # --- construction ---
 
 
-def test_constructor_rejects_invalid_capacity() -> None:
-    """Reject a bool capacity and an int below 1."""
-    for capacity in (True, False, 0, -1):
-        with pytest.raises(ValueError, match="capacity"):
-            _ = _shared_backoff(capacity=capacity)
-    _ = _shared_backoff(capacity=None)
-    _ = _shared_backoff(capacity=8)
+def test_constructor_rejects_invalid_max_concurrent_requests() -> None:
+    """Reject a bool max_concurrent_requests and an int below 1."""
+    for max_concurrent_requests in (True, False, 0, -1):
+        with pytest.raises(ValueError, match="max_concurrent_requests"):
+            _ = _shared_backoff(max_concurrent_requests=max_concurrent_requests)
+    _ = _shared_backoff(max_concurrent_requests=None)
+    _ = _shared_backoff(max_concurrent_requests=8)
 
 
 def test_constructor_rejects_unknown_on_parse_error() -> None:
@@ -153,20 +153,20 @@ def test_constructor_rejects_failure_types_wider_than_exception() -> None:
                 parse=_retry_verdict,
                 # pyrefly: ignore[bad-argument-type]  # the rejection under test
                 failure_types=(failure_type,),
-                capacity=1,
+                max_concurrent_requests=1,
             )
     with pytest.raises(ValueError, match="failure_types"):
         _ = SharedBackoff(
             parse=_retry_verdict,
             failure_types=(asyncio.CancelledError,),  # pyrefly: ignore[bad-argument-type]
-            capacity=1,
+            max_concurrent_requests=1,
         )
 
 
 def test_constructor_rejects_empty_failure_types() -> None:
     """An empty failure_types would make the exit parse nothing and record nothing."""
     with pytest.raises(ValueError, match="failure_types"):
-        _ = SharedBackoff(parse=_retry_verdict, failure_types=(), capacity=1)
+        _ = SharedBackoff(parse=_retry_verdict, failure_types=(), max_concurrent_requests=1)
 
 
 def test_constructor_rejects_invalid_numeric_settings() -> None:
@@ -185,7 +185,7 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
                 _ = SharedBackoff(
                     parse=_retry_verdict,
                     failure_types=(ProviderFailure,),
-                    capacity=1,
+                    max_concurrent_requests=1,
                     minimum_wait_ceiling=settings["minimum_wait_ceiling"],
                     longest_wait=settings["longest_wait"],
                     wait_multiplier=settings["wait_multiplier"],
@@ -291,7 +291,7 @@ def test_a_do_not_retry_verdict_changes_no_shared_state() -> None:
 
 
 def test_a_raising_record_still_returns_the_permit() -> None:
-    """The release sits in a finally, so a raise out of recording cannot leak capacity."""
+    """The release sits in a finally, so a raise out of recording cannot leak a permit."""
 
     class _BrokenRecordSharedBackoff(SharedBackoff):
         @override
@@ -300,7 +300,7 @@ def test_a_raising_record_still_returns_the_permit() -> None:
 
     async def scenario() -> None:
         shared_backoff = _BrokenRecordSharedBackoff(
-            parse=_retry_verdict, failure_types=(ProviderFailure,), capacity=1
+            parse=_retry_verdict, failure_types=(ProviderFailure,), max_concurrent_requests=1
         )
         with pytest.raises(RuntimeError, match="record broke"):
             await _raise_in_block(shared_backoff.admitted(), ProviderFailure("boom"))
@@ -488,7 +488,7 @@ def test_admissions_are_spaced_by_the_admission_gap() -> None:
     """Two requests entering together are admitted one gap apart."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(capacity=None, admission_gap=0.05)
+        shared_backoff = _shared_backoff(max_concurrent_requests=None, admission_gap=0.05)
         admitted_at: list[float] = []
 
         async def request() -> None:
@@ -505,7 +505,7 @@ def test_waiters_are_released_in_the_order_they_joined() -> None:
     """A pause ending with several requests queued releases them in arrival order."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(capacity=None, admission_gap=0.01)
+        shared_backoff = _shared_backoff(max_concurrent_requests=None, admission_gap=0.01)
         shared_backoff._record(PauseAll(retry_after=0.1))
         admitted_order: list[int] = []
 

@@ -61,7 +61,7 @@ from langchaint.response import (
     _abandoned_call_error,
     _success_variant,
 )
-from langchaint.run_many import run_many, validate_max_pending
+from langchaint.run_many import run_many
 from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
@@ -106,6 +106,20 @@ UNCHANGED = Unchanged()
 
 type GenerationInput = str | Sequence[Message]
 """What one request is generated from: a bare str is shorthand for a Sequence[Message] of one UserMessage."""
+
+
+_MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST = 100
+"""The most pending tasks generate_many holds per request its SharedBackoff allows at once.
+
+A task holds no permit while it sleeps between attempts, so permits stay fed only when pending
+tasks outnumber them.
+"""
+
+_MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND = 1000
+"""The most pending tasks generate_many holds when max_concurrent_requests is None.
+
+Nothing bounds request concurrency in that configuration, so this bounds memory alone.
+"""
 
 
 class SequenceNotStr[T_co](Protocol):
@@ -252,8 +266,9 @@ class LLM:
         """Store the shared pieces.
 
         shared_backoff None builds a private domain from the adapter's parse and failure_types,
-        at the SharedBackoff defaults with capacity 8. One instance is one backpressure domain,
-        so pass the same instance to every LLM whose requests share a provider quota.
+        at the SharedBackoff defaults with max_concurrent_requests 8. One instance is one
+        backpressure domain, so pass the same instance to every LLM whose requests share a
+        provider quota.
         max_attempts counts requests sent including the first, so 1 means no retrying.
 
         Raises:
@@ -267,7 +282,7 @@ class LLM:
             shared_backoff
             if shared_backoff is not None
             else SharedBackoff(
-                parse=adapter.parse, failure_types=adapter.failure_types, capacity=8
+                parse=adapter.parse, failure_types=adapter.failure_types, max_concurrent_requests=8
             )
         )
         self.max_attempts = max_attempts
@@ -805,7 +820,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Each arrived response is staged on the ledger with its billing before anything is read off it,
         so an exception from that read still leaves the attempt and its billing on the record.
         Each attempt spans one admitted() block, held for the request only;
-        backoff sleeps sit outside the block so a waiting task does not hold capacity.
+        backoff sleeps sit outside the block so a waiting task does not hold a permit.
         Each provider failure is raised inside the block, so the exit records its verdict before
         anyone else is admitted and a rate-limit error pauses the whole domain.
         Every attempt is timed onto an AttemptRecord whose bracket is the request only,
@@ -1090,7 +1105,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[str] | GenerationError]: ...
     @overload
@@ -1099,7 +1113,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     @overload
@@ -1108,7 +1121,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        max_pending: int | None = ...,
         timeout_seconds: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
@@ -1116,7 +1128,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
-        max_pending: int | None = None,
         timeout_seconds: float | None = None,
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
@@ -1133,11 +1144,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         to_tables renders each GenerationError as one failure row, so the batch stays table-ready.
         The returned list is therefore always complete.
 
-        max_pending caps the items that have started and not finished, so a large batch does not
-        hold one live task per item.
-        None starts every item at once.
-        SharedBackoff.capacity separately gates every request start, across everything sharing that
-        instance.
+        SharedBackoff.max_concurrent_requests sets the batch's throughput, gating every request
+        start across everything sharing that instance.
+        The batch separately bounds how many items are pending, meaning started and not settled,
+        so a batch of a million inputs does not hold a million tasks.
 
         warm_cache runs generation_inputs[0] to completion before starting the rest, because a
         provider cache entry is readable only once the response that writes it begins.
@@ -1147,10 +1157,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         A first item ending in a GenerationError still admits the rest: a 200 that produced no
         output (a refusal, a truncation) wrote the prefix on the provider side, and after a
         transport failure the rest simply run against a cold cache.
-        There is no second warmer, and after warming max_pending bounds the remaining items alone.
+        There is no second warmer, and after warming the pending bound covers the remaining items
+        alone.
 
         timeout_seconds is each item's own deadline, started when that item starts, so an item
-        waiting on max_pending has no deadline running yet.
+        waiting for a pending slot has no deadline running yet.
         An item that expires is returned as a TimedOutError while its siblings run on.
         Bound the batch this way rather than with a scope of your own: a cancellation from outside
         discards the returned list, settled results and all, because the list is this frame's and the
@@ -1160,7 +1171,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
-            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
                 does not catch; the started items are cancelled and awaited, and it propagates.
@@ -1169,7 +1179,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
-            max_pending=max_pending,
             timeout_seconds=timeout_seconds,
         )
 
@@ -1179,25 +1188,21 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool,
         generate_item: "GenerateItem[OutputT]",
-        max_pending: int | None,
         timeout_seconds: float | None,
     ) -> list[CallResult[OutputT | None]]:
         """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
 
         generate_item runs one item, so a caller that wraps each call wraps every item of a batch
         alike, whichever branch below started it.
-        max_pending is validated here, so an invalid one raises before warm_cache sends its request.
         timeout_seconds is each item's own deadline, started when that item starts.
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
-            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception; the started
                 items are cancelled and awaited, and it propagates.
         """
         _reject_bare_str_batch(generation_inputs)
-        validate_max_pending(max_pending)
         # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
             first_result = await self._generate_or_failure(
@@ -1208,14 +1213,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             rest = await self._run_items(
                 generation_inputs[1:],
                 generate_item=generate_item,
-                max_pending=max_pending,
                 timeout_seconds=timeout_seconds,
             )
             return [first_result, *rest]
         return await self._run_items(
             generation_inputs[0:],
             generate_item=generate_item,
-            max_pending=max_pending,
             timeout_seconds=timeout_seconds,
         )
 
@@ -1224,13 +1227,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: Sequence[GenerationInput],
         *,
         generate_item: "GenerateItem[OutputT]",
-        max_pending: int | None,
         timeout_seconds: float | None,
     ) -> list[CallResult[OutputT | None]]:
         """Run the items through run_many, which returns them in input order.
 
+        The pending bound follows the domain's max_concurrent_requests, which is read-only, so
+        run_many always receives a positive int here.
+
         Raises:
-            ValueError: max_pending is a bool, or an int below 1.
             asyncio.CancelledError: an outer scope cancelled generate_many.
             BaseException: an item raised a BaseException that is not an Exception; run_many cancels
                 and awaits the started items, and it propagates.
@@ -1250,6 +1254,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 timeout_seconds=timeout_seconds,
             )
 
+        max_concurrent_requests = self.shared_backoff.max_concurrent_requests
+        max_pending = (
+            _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
+            if max_concurrent_requests is None
+            else max_concurrent_requests * _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST
+        )
         return await run_many(generation_inputs, run_one, max_pending=max_pending)
 
     @overload

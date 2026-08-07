@@ -54,6 +54,7 @@ from langchaint import (
     UserMessage,
     Verdict,
 )
+from langchaint import llm as llm_module
 from langchaint import shared_backoff as shared_backoff_module
 from langchaint.adapter import (
     Adapter,
@@ -76,7 +77,13 @@ from langchaint.adapter import (
     verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.llm import UNCHANGED, Unchanged
+from langchaint.llm import (
+    _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST,
+    _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND,
+    UNCHANGED,
+    Unchanged,
+)
+from langchaint.run_many import RunOne
 from langchaint.shared_backoff import _NEVER
 from langchaint.streaming import StreamHandle
 from tests.helpers import random_returns_zero, stated_billing
@@ -115,13 +122,13 @@ def _parse_raises(_failure: Exception) -> Verdict:
 
 
 def _fast_shared_backoff(
-    *, capacity: int | None = 8, parse: Callable[[Exception], Verdict] = _parse_fake
+    *, max_concurrent_requests: int | None = 8, parse: Callable[[Exception], Verdict] = _parse_fake
 ) -> SharedBackoff:
     """Build a fresh near-zero-wait SharedBackoff; one instance serves one event loop."""
     return SharedBackoff(
         parse=parse,
         failure_types=(TransientError,),
-        capacity=capacity,
+        max_concurrent_requests=max_concurrent_requests,
         minimum_wait_ceiling=0.001,
         longest_wait=0.002,
         admission_gap=0.0001,
@@ -1082,7 +1089,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
         shared_backoff = SharedBackoff(
             parse=_parse_fake,
             failure_types=(TransientError,),
-            capacity=8,
+            max_concurrent_requests=8,
             minimum_wait_ceiling=0.05,
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
@@ -1660,11 +1667,11 @@ def test_an_unplaceable_exception_fails_only_its_item() -> None:
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (capacity=1) whose first attempt is unplaceable."""
+        """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt is unplaceable."""
         adapter = _FakeAdapter(
             echo=True, failures=[ValueError("boom")], classify_result="unknown_exception"
         )
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
@@ -1688,9 +1695,9 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
     async def scenario() -> None:
         """Settle one item, then cancel the batch while the other's open hangs."""
         adapter = _FakeAdapter(hang_from_open=2)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=1)).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=1)
+        ).bind(automatic_prompt_caching=True)
         call = asyncio.create_task(
             bound_llm.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
         )
@@ -2022,14 +2029,14 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
     """A mixed batch keeps each result at its input index: the failure where it failed, successes elsewhere."""
 
     async def scenario() -> None:
-        """Serialize a three-item batch (capacity=1) whose first attempt fails under a one-attempt budget.
+        """Serialize a three-item batch at one concurrent request, failing the first under a one-attempt budget.
 
         One permit runs the items in submission order,
         so the single scripted failure lands on the first item and the other two succeed,
         which is exactly the mixed-outcome alignment under test.
         """
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=1).bind(
             automatic_prompt_caching=True
         )
@@ -2052,12 +2059,12 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
     """An item whose attempt reports Refusal comes back as the RefusalError at its index, siblings succeed."""
 
     async def scenario() -> None:
-        """Serialize a two-item batch (capacity=1) whose first attempt reports Refusal."""
+        """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
             failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
         )
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
@@ -2080,11 +2087,11 @@ def test_invalid_request_fails_only_its_item() -> None:
     """
 
     async def scenario() -> None:
-        """Serialize a two-item batch (capacity=1) whose first build_request refuses."""
+        """Serialize a two-item batch (max_concurrent_requests=1) whose first build_request refuses."""
         adapter = _FakeAdapter(
             echo=True, invalid_requests=[InvalidRequest(reason="misconfigured")]
         )
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
@@ -2112,14 +2119,14 @@ def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_togeth
         generation_inputs = [[UserMessage(content=str(index))] for index in range(3)]
         warmed_adapter = _FakeAdapter(echo=True, open_seconds=0.01)
         warmed_bound_llm = LLM(
-            warmed_adapter, shared_backoff=_fast_shared_backoff(capacity=8)
+            warmed_adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)
         ).bind(automatic_prompt_caching=True)
         warmed = await warmed_bound_llm.generate_many(generation_inputs, warm_cache=True)
         assert _batch_outputs(warmed) == ["0", "1", "2"]
         assert warmed_adapter.bound_adapters[0].peak_in_flight == 2
         control_adapter = _FakeAdapter(echo=True, open_seconds=0.01)
         control_bound_llm = LLM(
-            control_adapter, shared_backoff=_fast_shared_backoff(capacity=8)
+            control_adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)
         ).bind(automatic_prompt_caching=True)
         control = await control_bound_llm.generate_many(generation_inputs)
         assert _batch_outputs(control) == ["0", "1", "2"]
@@ -2158,20 +2165,6 @@ def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
         """Run the empty batch."""
         bound_llm = LLM(_FakeAdapter()).bind(automatic_prompt_caching=True)
         assert await bound_llm.generate_many([], warm_cache=True) == []
-
-    asyncio.run(scenario())
-
-
-def test_generate_many_validates_max_pending_before_warm_cache_starts() -> None:
-    """Invalid max_pending starts no warm_cache request."""
-
-    async def scenario() -> None:
-        """Pass invalid max_pending with warm_cache enabled."""
-        adapter = _FakeAdapter()
-        bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
-        with pytest.raises(ValueError, match="max_pending"):
-            _ = await bound_llm.generate_many(["a"], warm_cache=True, max_pending=0)
-        assert adapter.bound_adapters[0].build_count == 0
 
     asyncio.run(scenario())
 
@@ -2373,7 +2366,7 @@ def test_stream_cancelled_mid_iteration_releases_the_permit() -> None:
     async def scenario() -> None:
         """Cancel a suspended item pull inside the block, then prove the permit is free."""
         adapter = _FakeAdapter(stream=_HangingStream())
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             consumer = asyncio.create_task(anext(handle))
@@ -2396,7 +2389,7 @@ def test_stream_cancelled_during_the_open_returns_the_permit() -> None:
 
     async def scenario() -> None:
         """Time out an entry whose open_stream never returns, then prove the permit is free."""
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(_FakeAdapter(hang_from_open=1), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
@@ -2485,13 +2478,13 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
 def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
     """A failed teardown does not cost the shared budget a permit, and does not reach the caller.
 
-    A permit the close skips is gone for the process's life, so the domain's capacity shrinks
+    A permit the close skips is gone for the process's life, so the domain's concurrency shrinks
     by one on every such stream.
     """
 
     async def scenario() -> None:
         """Leave the block early over a stream whose close raises, then check both permits are free."""
-        shared_backoff = _fast_shared_backoff(capacity=2)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=2)
         bound_llm = LLM(
             _FakeAdapter(stream=_FailingCloseStream()), shared_backoff=shared_backoff
         ).bind(automatic_prompt_caching=True)
@@ -2628,7 +2621,7 @@ def test_a_mid_stream_rate_limit_pauses_the_domain() -> None:
     async def scenario() -> None:
         """Let the iteration fail after one item, then read the domain's pause and the error."""
         shared_backoff = SharedBackoff(
-            parse=_parse_fake, failure_types=(TransientError,), capacity=8
+            parse=_parse_fake, failure_types=(TransientError,), max_concurrent_requests=8
         )
         bound_llm = LLM(
             _FakeAdapter(stream=_RaisesItsOwnTransientErrorStream()),
@@ -3615,7 +3608,7 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
         shared_backoff = SharedBackoff(
             parse=_parse_fake,
             failure_types=(TransientError,),
-            capacity=8,
+            max_concurrent_requests=8,
             minimum_wait_ceiling=0.001,
             longest_wait=1.0,
             admission_gap=0.0001,
@@ -3635,15 +3628,15 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_capacity_bounds_batch_concurrency() -> None:
-    """A five-item batch under capacity=2 never overlaps more than two requests."""
+def test_max_concurrent_requests_bounds_batch_concurrency() -> None:
+    """A five-item batch under max_concurrent_requests=2 never overlaps more than two requests."""
 
     async def scenario() -> None:
         """Run the batch on a slow fake and read the recorded peak."""
         adapter = _FakeAdapter(echo=True, open_seconds=0.01)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=2)).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=2)
+        ).bind(automatic_prompt_caching=True)
         generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
         results = await bound_llm.generate_many(generation_inputs)
         assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
@@ -3652,25 +3645,56 @@ def test_capacity_bounds_batch_concurrency() -> None:
     asyncio.run(scenario())
 
 
-def test_max_pending_bounds_generate_many_pending_items() -> None:
-    """max_pending=2 limits a five-item batch to two pending items."""
+def _recorded_max_pending(
+    monkeypatch: pytest.MonkeyPatch, *, max_concurrent_requests: int | None
+) -> list[int | None]:
+    """Run a two-item batch at the given max_concurrent_requests, returning each max_pending run_many received."""
+    recorded: list[int | None] = []
+    real_run_many = llm_module.run_many
+
+    async def recording_run_many[InputT, OutputT](
+        inputs: Sequence[InputT],
+        run_one: RunOne[InputT, OutputT],
+        *,
+        max_pending: int | None,
+    ) -> list[OutputT]:
+        """Record max_pending, then run the batch through the real run_many."""
+        recorded.append(max_pending)
+        return await real_run_many(inputs, run_one, max_pending=max_pending)
+
+    monkeypatch.setattr(llm_module, "run_many", recording_run_many)
 
     async def scenario() -> None:
-        """Run five slow requests with max_pending=2."""
-        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=8)).bind(
-            automatic_prompt_caching=True
-        )
-        generation_inputs = [[UserMessage(content=str(index))] for index in range(5)]
-        results = await bound_llm.generate_many(generation_inputs, max_pending=2)
-        assert _batch_outputs(results) == ["0", "1", "2", "3", "4"]
-        assert adapter.bound_adapters[0].peak_in_flight == 2
+        """Run two items so the derivation runs once."""
+        adapter = _FakeAdapter(echo=True)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=max_concurrent_requests)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        generation_inputs = [[UserMessage(content=str(index))] for index in range(2)]
+        results = await bound_llm.generate_many(generation_inputs)
+        assert _batch_outputs(results) == ["0", "1"]
 
     asyncio.run(scenario())
+    return recorded
 
 
-def test_backoff_sleep_does_not_hold_the_capacity_permit() -> None:
-    """With capacity=1, a task backing off lets another request run.
+def test_generate_many_derives_max_pending_from_max_concurrent_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """max_pending is max_concurrent_requests times _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST."""
+    recorded = _recorded_max_pending(monkeypatch, max_concurrent_requests=8)
+    assert recorded == [8 * _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST]
+
+
+def test_generate_many_sets_max_pending_without_a_concurrency_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """max_pending is _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND when max_concurrent_requests is None."""
+    recorded = _recorded_max_pending(monkeypatch, max_concurrent_requests=None)
+    assert recorded == [_MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND]
+
+
+def test_backoff_sleep_does_not_hold_the_permit() -> None:
+    """With max_concurrent_requests=1, a task backing off lets another request run.
 
     The failure is not a rate limit, so nothing pauses admission.
     Only a held permit could delay the second request.
@@ -3692,7 +3716,7 @@ def test_backoff_sleep_does_not_hold_the_capacity_permit() -> None:
         shared_backoff = SharedBackoff(
             parse=_parse_fake,
             failure_types=(TransientError,),
-            capacity=1,
+            max_concurrent_requests=1,
             minimum_wait_ceiling=0.001,
             longest_wait=1.0,
             admission_gap=0.0001,
@@ -3721,7 +3745,7 @@ def test_stream_protocol_error_releases_the_permit() -> None:
     async def scenario() -> None:
         """Drive final() into the protocol error, then re-admit inside the still-open block."""
         stream = _ProtocolErrorStream()
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
@@ -3736,15 +3760,15 @@ def test_stream_protocol_error_releases_the_permit() -> None:
 
 
 def test_stream_releases_its_permit_when_exhausted() -> None:
-    """Exhausting a stream returns its capacity permit before the handle's block exits.
+    """Exhausting a stream returns its permit before the handle's block exits.
 
     The re-admission sits inside the still-open block, so only the release on exhaustion can
     satisfy it; after the block it would be satisfied by the release on block exit instead.
     """
 
     async def scenario() -> None:
-        """Drain one stream under capacity=1, then re-admit inside the still-open block."""
-        shared_backoff = _fast_shared_backoff(capacity=1)
+        """Drain one stream under max_concurrent_requests=1, then re-admit inside the still-open block."""
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(_FakeAdapter(), shared_backoff=shared_backoff).bind(
             automatic_prompt_caching=True
         )
@@ -3832,16 +3856,16 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
 def test_a_deadline_expiring_before_admission_reports_no_attempts() -> None:
     """A call that never got admitted reports attempts == 0, so a caller can tell it never sent.
 
-    capacity is 1 and the holder never returns its permit, so the second call spends its whole
+    max_concurrent_requests is 1 and the holder never returns its permit, so the second call spends its whole
     deadline waiting for admission and sends nothing.
     """
 
     async def scenario() -> None:
         """Hold the only permit, then run a second call under a deadline it cannot outlast."""
         adapter = _FakeAdapter(hang_from_open=1)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(capacity=1)).bind(
-            automatic_prompt_caching=True
-        )
+        bound_llm = LLM(
+            adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=1)
+        ).bind(automatic_prompt_caching=True)
         holder = asyncio.create_task(bound_llm.generate_one([UserMessage(content="held")]))
         await asyncio.sleep(0.02)
         with pytest.raises(TimedOutError) as raised:

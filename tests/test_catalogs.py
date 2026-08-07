@@ -323,7 +323,7 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
 def test_gemini_model_forwards_service_tier_backoff_and_attempts() -> None:
     """service_tier lands on the adapter, shared_backoff and max_attempts on the LLM."""
     shared_backoff = SharedBackoff(
-        parse=parse_gemini, failure_types=(TransientError,), capacity=16
+        parse=parse_gemini, failure_types=(TransientError,), max_concurrent_requests=16
     )
     llm = gemini_model(
         "gemini-2.5-flash",
@@ -413,7 +413,7 @@ def test_deepseek_model_without_a_client_requires_the_deepseek_key(
 def test_deepseek_model_forwards_shared_backoff_and_max_attempts() -> None:
     """shared_backoff and max_attempts land on the LLM."""
     shared_backoff = SharedBackoff(
-        parse=parse_openai, failure_types=(TransientError,), capacity=16
+        parse=parse_openai, failure_types=(TransientError,), max_concurrent_requests=16
     )
     llm = deepseek_model(
         "deepseek-v4-flash",
@@ -612,7 +612,7 @@ def test_service_tier_reaches_the_adapter_from_both_first_party_constructors() -
 def test_shared_backoff_and_max_attempts_land_on_the_llm() -> None:
     """A caller-supplied SharedBackoff and max_attempts are the LLM's; omitting them means the LLM defaults."""
     shared_backoff = SharedBackoff(
-        parse=parse_openai, failure_types=(TransientError,), capacity=16
+        parse=parse_openai, failure_types=(TransientError,), max_concurrent_requests=16
     )
     llm = openai_model(
         "gpt-5.6-terra",

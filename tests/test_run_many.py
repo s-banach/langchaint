@@ -6,7 +6,7 @@ from enum import IntEnum
 
 import pytest
 
-from langchaint.run_many import run_many, validate_max_pending
+from langchaint.run_many import run_many
 
 
 class _RunManyFailure(BaseException):
@@ -34,15 +34,24 @@ def test_run_many_validates_max_pending_before_running_items() -> None:
     asyncio.run(scenario())
 
 
-def test_validate_max_pending_accepts_an_int_subclass_that_is_not_bool() -> None:
-    """An IntEnum is a positive non-bool int, so validate_max_pending accepts it."""
+def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
+    """An IntEnum is a positive non-bool int, so run_many accepts it as max_pending."""
 
     class Concurrency(IntEnum):
         """Stand in for an application's own bound, spelled as an enum."""
 
         LOW = 2
 
-    validate_max_pending(Concurrency.LOW)
+    async def scenario() -> None:
+        """Run two inputs under an IntEnum bound."""
+
+        async def run_one(input_value: int) -> int:
+            """Return the input."""
+            return input_value
+
+        assert await run_many([1, 2], run_one, max_pending=Concurrency.LOW) == [1, 2]
+
+    asyncio.run(scenario())
 
 
 def test_run_many_empty_inputs_start_no_task() -> None:

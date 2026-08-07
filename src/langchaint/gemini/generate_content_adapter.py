@@ -239,6 +239,7 @@ class GeminiPricingTable:
         *,
         service_tier: str,
         usage_raw: BaseModel | None,
+        prompt_token_count: int,
         input_tokens_cache_read: int,
         input_tokens_cache_none: int,
         output_tokens: int,
@@ -246,9 +247,9 @@ class GeminiPricingTable:
     ) -> Billing:
         """Price one response's counters, at the long-prompt rates when the prompt crosses the threshold.
 
-        The prompt length the threshold compares is the cache categories' sum, which is
-        prompt_token_count. The cache-write counter is zero with a NaN price: no write is ever
-        billed, and _NO_CACHE_WRITE_RATE says why that poisons nothing.
+        prompt_token_count excludes the tool-execution input the categories include.
+        The cache-write counter is zero with a NaN price: no write is ever billed, and
+        _NO_CACHE_WRITE_RATE says why that poisons nothing.
 
         Raises:
             pydantic.ValidationError: a counter is negative.
@@ -257,8 +258,7 @@ class GeminiPricingTable:
         if (
             self.long_prompt_threshold_tokens is not None
             and self.long_prompt_rates is not None
-            and input_tokens_cache_read + input_tokens_cache_none
-            > self.long_prompt_threshold_tokens
+            and prompt_token_count > self.long_prompt_threshold_tokens
         ):
             rates = self.long_prompt_rates
         return Billing(
@@ -323,31 +323,36 @@ def _billing_from_usage(
     implicit reads landing in the same counter), so cache_none is their difference.
     thoughts_token_count sits outside candidates_token_count (the SDK's total_token_count
     description sums them beside prompt), so output is their sum and reasoning is the thoughts
-    share. tool_use_prompt_token_count is server-side tool input, which Usage scopes out; it stays
-    readable on usage_raw.
+    share. tool_use_prompt_token_count counts tool-execution results fed back as input and sits
+    outside prompt_token_count (same total_token_count description); it joins cache_none, where the
+    uncached input rate prices it.
     None usage_metadata bills zero counters at the "ON_DEMAND" table's prices.
 
     Raises:
-        pydantic.ValidationError: the counters leave a category negative
-            (cached_content_token_count above prompt_token_count).
+        pydantic.ValidationError: the counters leave a category negative.
     """
     if usage_metadata is None:
         return pricing.get(_ON_DEMAND_TIER, _UNPRICED).price(
             service_tier=_ON_DEMAND_TIER,
             usage_raw=None,
+            prompt_token_count=0,
             input_tokens_cache_read=0,
             input_tokens_cache_none=0,
             output_tokens=0,
             output_tokens_reasoning=0,
         )
     service_tier = _priced_tier(usage_metadata.traffic_type)
+    prompt_token_count = usage_metadata.prompt_token_count or 0
     input_tokens_cache_read = usage_metadata.cached_content_token_count or 0
     output_tokens_reasoning = usage_metadata.thoughts_token_count or 0
     return pricing.get(service_tier, _UNPRICED).price(
         service_tier=service_tier,
         usage_raw=usage_metadata,
+        prompt_token_count=prompt_token_count,
         input_tokens_cache_read=input_tokens_cache_read,
-        input_tokens_cache_none=(usage_metadata.prompt_token_count or 0) - input_tokens_cache_read,
+        input_tokens_cache_none=prompt_token_count
+        - input_tokens_cache_read
+        + (usage_metadata.tool_use_prompt_token_count or 0),
         output_tokens=(usage_metadata.candidates_token_count or 0) + output_tokens_reasoning,
         output_tokens_reasoning=output_tokens_reasoning,
     )

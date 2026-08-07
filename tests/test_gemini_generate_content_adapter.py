@@ -74,6 +74,17 @@ _ON_DEMAND_RATES = GeminiRates(
 _PRICING: dict[str, GeminiPricingTable] = {"ON_DEMAND": GeminiPricingTable(rates=_ON_DEMAND_RATES)}
 """The on-demand tier alone, so a response reporting another traffic_type prices NaN."""
 
+_LONG_PROMPT_TABLE = GeminiPricingTable(
+    rates=_ON_DEMAND_RATES,
+    long_prompt_threshold_tokens=200,
+    long_prompt_rates=GeminiRates(
+        input_cache_none_usd_per_million_tokens=2.0,
+        cache_read_usd_per_million_tokens=0.2,
+        output_usd_per_million_tokens=20.0,
+    ),
+)
+"""Every long rate is twice its base rate, so a test tells the two tiers apart by one factor."""
+
 
 def _adapter() -> GeminiGenerateContentAdapter:
     """Build the adapter under test on an offline client."""
@@ -135,6 +146,7 @@ def _usage_metadata(
     *,
     prompt_token_count: int = 100,
     cached_content_token_count: int | None = 40,
+    tool_use_prompt_token_count: int | None = 20,
     candidates_token_count: int | None = 50,
     thoughts_token_count: int | None = 10,
     traffic_type: types.TrafficType | None = None,
@@ -143,6 +155,7 @@ def _usage_metadata(
     return types.GenerateContentResponseUsageMetadata(
         prompt_token_count=prompt_token_count,
         cached_content_token_count=cached_content_token_count,
+        tool_use_prompt_token_count=tool_use_prompt_token_count,
         candidates_token_count=candidates_token_count,
         thoughts_token_count=thoughts_token_count,
         traffic_type=traffic_type,
@@ -773,16 +786,16 @@ def test_identity_reads_the_response_fields() -> None:
 
 
 def test_the_usage_partition() -> None:
-    """cache_read is the cached counter, cache_none the remainder, output includes thoughts."""
+    """cache_read is the cached counter, cache_none the remainder plus tool-use, output includes thoughts."""
     billing = _billing_from_usage(_usage_metadata(), _PRICING)
     usage = billing.usage
     assert usage.input_tokens_cache_read == 40
-    assert usage.input_tokens_cache_none == 60
+    assert usage.input_tokens_cache_none == 80
     assert usage.input_tokens_cache_write == 0
     assert usage.output_tokens == 60
     assert usage.output_tokens_reasoning == 10
     assert usage.input_tokens_cache_read_cost_in_usd == pytest.approx(40 * 0.1 / 1_000_000)
-    assert usage.input_tokens_cache_none_cost_in_usd == pytest.approx(60 * 1.0 / 1_000_000)
+    assert usage.input_tokens_cache_none_cost_in_usd == pytest.approx(80 * 1.0 / 1_000_000)
     assert usage.input_tokens_cache_write_cost_in_usd == 0.0
     assert usage.output_tokens_cost_in_usd == pytest.approx(60 * 10.0 / 1_000_000)
     assert billing.service_tier == "ON_DEMAND"
@@ -790,27 +803,20 @@ def test_the_usage_partition() -> None:
 
 def test_the_long_prompt_threshold_reprices_every_category() -> None:
     """Above the threshold the long rates price; at or below it the base rates do."""
-    table = GeminiPricingTable(
-        rates=_ON_DEMAND_RATES,
-        long_prompt_threshold_tokens=200,
-        long_prompt_rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=2.0,
-            cache_read_usd_per_million_tokens=0.2,
-            output_usd_per_million_tokens=20.0,
-        ),
-    )
-    short = table.price(
+    short = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
         usage_raw=None,
+        prompt_token_count=200,
         input_tokens_cache_read=100,
         input_tokens_cache_none=100,
         output_tokens=10,
         output_tokens_reasoning=0,
     )
     assert short.input_cache_none_usd_per_million_tokens == 1.0
-    long = table.price(
+    long = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
         usage_raw=None,
+        prompt_token_count=201,
         input_tokens_cache_read=100,
         input_tokens_cache_none=101,
         output_tokens=10,
@@ -819,6 +825,16 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
     assert long.input_cache_none_usd_per_million_tokens == 2.0
     assert long.cache_read_usd_per_million_tokens == 0.2
     assert long.output_usd_per_million_tokens == 20.0
+
+
+def test_tool_execution_input_does_not_cross_the_long_prompt_threshold() -> None:
+    """The threshold reads prompt_token_count, which excludes the tool-execution input priced beside it."""
+    billing = _billing_from_usage(
+        _usage_metadata(prompt_token_count=200, tool_use_prompt_token_count=50),
+        {"ON_DEMAND": _LONG_PROMPT_TABLE},
+    )
+    assert billing.usage.input_tokens_cache_none == 210
+    assert billing.input_cache_none_usd_per_million_tokens == 1.0
 
 
 def test_the_long_prompt_fields_are_required_together() -> None:

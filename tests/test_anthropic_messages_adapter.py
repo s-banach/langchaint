@@ -1998,8 +1998,10 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         """Return the parse rows: every listed status, both defaults, both TransientError forms.
 
         The statuses and error types come from the errors page parse_anthropic's docstring cites,
-        plus the 408 and 409 timeouts it sources from the SDK's own retry predicate;
+        plus the rows each table's docstring sources from the SDK;
         the rows without an error_type exercise the exception a non-JSON body produces.
+        451 and 502 are the unlisted statuses, one per default: 451 takes the sub-500 DoNotRetry
+        and 502 the 5xx RetryThisOne.
         """
         return {
             _status_error(
@@ -2034,6 +2036,8 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             ): DoNotRetry(),
             _status_error(anthropic.UnprocessableEntityError, 422): DoNotRetry(),
             _status_error(anthropic.InternalServerError, 503): RetryThisOne(retry_after=None),
+            _status_error(anthropic.APIStatusError, 451): DoNotRetry(),
+            _status_error(anthropic.InternalServerError, 502): RetryThisOne(retry_after=None),
             TransientError(
                 "throttled body", retry_after_seconds=3.0, is_rate_limit=True
             ): PauseAll(retry_after=3.0),

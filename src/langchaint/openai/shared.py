@@ -43,8 +43,12 @@ _SPEND_LIMIT_CODES = frozenset({
 _RETRY_THIS_ONE_STATUSES = frozenset({500, 408, 409})
 """One request's server-side failure or collision, retried without pausing siblings."""
 
-_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404})
-"""The statuses that reject this request; a resend fails the same way."""
+_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404, 422})
+"""The statuses that reject this request; a resend fails the same way.
+
+404 and 422 are not in the error-code guide: AsyncOpenAI raises NotFoundError and
+UnprocessableEntityError for them (openai 2.51.0).
+"""
 
 PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
 """How often parse_openai fell to a status-family default, keyed by status and error type.
@@ -239,8 +243,7 @@ def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return pe
     _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
     DoNotRetry because the guide states retrying those will not restore access;
     _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    404 is in _DO_NOT_RETRY_STATUSES from the SDK rather than the guide: the SDK raises
-    NotFoundError for it (openai 2.51.0), and a resend of an unknown model or path fails the same way.
+    Some rows come from the SDK rather than the guide; each table's docstring names which and why.
     error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
     still read insufficient_quota, so the type separates nothing.
     A status 200 is a mid-stream error an adapter stream raised on the live response, so

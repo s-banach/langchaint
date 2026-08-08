@@ -4,7 +4,8 @@ Both SDKs' response models are pydantic models configured extra="allow", so a re
 field arrives as an extra rather than as an error: the adapters keep reading the name they were
 written for, get None or a default, and every other test in this suite keeps passing on the stale
 literal. Nothing else here can fail on that drift, which is what these tests are for. They capture
-no defect present at the version they were written against (anthropic 0.120.0, openai 2.45.0).
+no defect present at the version they were written against (anthropic 0.120.0, openai 2.45.0,
+google-genai 2.16.0).
 """
 
 import typing
@@ -12,6 +13,7 @@ import typing
 import anthropic
 import httpx
 import openai
+from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from anthropic.types import (
     ImageBlockParam,
     RawContentBlockDeltaEvent,
@@ -24,6 +26,8 @@ from anthropic.types import Message as AnthropicMessage
 from anthropic.types import Usage as AnthropicUsage
 from anthropic.types.cache_creation import CacheCreation
 from anthropic.types.output_tokens_details import OutputTokensDetails as AnthropicOutputDetails
+from google.genai import _api_client
+from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from openai.lib._parsing._responses import type_to_text_format_param
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import (
@@ -39,8 +43,37 @@ from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 from pydantic import BaseModel
 
-from langchaint.anthropic.messages_adapter import AnthropicPricedServiceTier
-from langchaint.openai.shared import _DISPOSITION_BY_ERROR_CODE
+from langchaint.anthropic import messages_adapter
+from langchaint.gemini import generate_content_adapter
+from langchaint.openai import shared as openai_shared
+
+_ANTHROPIC_LISTED_STATUSES = (
+    messages_adapter._PAUSE_STATUSES
+    | messages_adapter._RETRY_THIS_ONE_STATUSES
+    | messages_adapter._DO_NOT_RETRY_STATUSES
+)
+"""Every status parse_anthropic's three tables list, whatever verdict each gives it."""
+
+_OPENAI_LISTED_STATUSES = (
+    openai_shared._PAUSE_STATUSES
+    | openai_shared._RETRY_THIS_ONE_STATUSES
+    | openai_shared._DO_NOT_RETRY_STATUSES
+)
+"""Every status parse_openai's three tables list, whatever verdict each gives it."""
+
+type _SupportedClient = (
+    AsyncAnthropic
+    | AsyncAnthropicBedrock
+    | AsyncAnthropicBedrockMantle
+    | AsyncOpenAI
+    | AsyncAzureOpenAI
+    | AsyncBedrockOpenAI
+)
+"""Every client class the anthropic and openai adapters accept.
+
+The gemini adapter's genai.Client is absent: google-genai has no _make_status_error and gives no
+status its own exception class, so its tables are checked against the SDK's retryable set instead.
+"""
 
 
 def _field_annotation(model: type[BaseModel], name: str) -> object:
@@ -190,7 +223,7 @@ def test_every_openai_error_code_has_a_disposition() -> None:
     """
     annotation = _field_annotation(ResponseError, "code")
     codes = set(typing.get_args(annotation))
-    assert codes <= set(_DISPOSITION_BY_ERROR_CODE)
+    assert codes <= set(openai_shared._DISPOSITION_BY_ERROR_CODE)
 
 
 def test_anthropic_service_tier_values_are_the_pricing_mapping_keys() -> None:
@@ -201,7 +234,7 @@ def test_anthropic_service_tier_values_are_the_pricing_mapping_keys() -> None:
     """
     annotation = _field_annotation(AnthropicUsage, "service_tier")
     reported = typing.get_args(typing.get_args(annotation)[0])
-    assert reported == typing.get_args(AnthropicPricedServiceTier.__value__)
+    assert reported == typing.get_args(messages_adapter.AnthropicPricedServiceTier.__value__)
     assert reported == ("standard", "priority", "batch")
 
 
@@ -314,6 +347,72 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
         assert type(error) is error_class, status_code
     unlisted = client._make_status_error("boom", body=None, response=_response_with(451, {}))
     assert type(unlisted) is anthropic.APIStatusError
+
+
+def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
+    """Return every status this client's own _make_status_error gives a status-specific class.
+
+    APIStatusError and InternalServerError are the catch-alls and carry no status_code class
+    attribute at all, so the getattr default is what tells them from a named status.
+    """
+    named: set[int] = set()
+    for status_code in range(400, 600):
+        error = client._make_status_error(
+            "boom", body=None, response=_response_with(status_code, {})
+        )
+        if getattr(type(error), "status_code", None) is not None:
+            named.add(status_code)
+    return named
+
+
+def test_every_status_a_supported_client_names_is_in_one_of_the_verdict_tables() -> None:
+    """Every status a supported client gives its own error class is a row of that parse's tables.
+
+    A status in no table takes a status-family default and records a fallthrough entry, and that
+    entry exists to name a status the tables should learn; one the SDK already names teaches an
+    operator nothing.
+    Which statuses get a dedicated class depends on the client class, not the package.
+    anthropic's three clients each define their own _make_status_error; openai's three inherit
+    AsyncOpenAI's (anthropic 0.120.2, openai 2.51.0).
+    Sweeping every client class the two SDKs' adapters accept covers a release that overrides one more.
+    The check is one-directional, for the reason test_every_openai_error_code_has_a_disposition
+    gives: a table legitimately holds a status no client class names, 500 and 504 among them.
+    """
+    clients_and_listed_statuses = (
+        (AsyncAnthropic(api_key="k"), _ANTHROPIC_LISTED_STATUSES),
+        (
+            AsyncAnthropicBedrock(aws_region="us-east-1", aws_access_key="k", aws_secret_key="s"),
+            _ANTHROPIC_LISTED_STATUSES,
+        ),
+        (AsyncAnthropicBedrockMantle(aws_region="us-east-1"), _ANTHROPIC_LISTED_STATUSES),
+        (AsyncOpenAI(api_key="k"), _OPENAI_LISTED_STATUSES),
+        (
+            AsyncAzureOpenAI(
+                api_key="k", api_version="2024-10-01", azure_endpoint="https://example.invalid"
+            ),
+            _OPENAI_LISTED_STATUSES,
+        ),
+        (
+            AsyncBedrockOpenAI(
+                aws_region="us-east-1", aws_access_key_id="k", aws_secret_access_key="s"
+            ),
+            _OPENAI_LISTED_STATUSES,
+        ),
+    )
+    for client, listed_statuses in clients_and_listed_statuses:
+        assert _statuses_with_a_dedicated_class(client) <= listed_statuses, type(client).__name__
+
+
+def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
+    """Every status google-genai's own default retry policy retries, langchaint retries or pauses.
+
+    This set is the evidence gemini's _RETRY_THIS_ONE_STATUSES cites for its 408 and 502 rows, so a
+    set the SDK narrows leaves that citation naming statuses it no longer holds.
+    """
+    assert set(_api_client._RETRY_HTTP_STATUS_CODES) <= (
+        generate_content_adapter._PAUSE_STATUSES
+        | generate_content_adapter._RETRY_THIS_ONE_STATUSES
+    )
 
 
 def test_anthropic_content_block_deltas_carry_the_two_kinds_of_text_the_stream_yields() -> None:

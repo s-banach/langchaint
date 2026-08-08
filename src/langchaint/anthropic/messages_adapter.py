@@ -175,18 +175,25 @@ _PAUSE_STATUSES = frozenset({429, 529})
 _PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error"})
 """The two _PAUSE_STATUSES error types, which pause at any status carrying them."""
 
-_RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 504})
+_RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 503, 504})
 """One request's failure, retried without pausing siblings.
 
 500 api_error and 504 timeout_error come from the errors page.
 408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 0.120.2 _should_retry).
+503 is the status AsyncAnthropicBedrock raises ServiceUnavailableError for (anthropic 0.120.2).
+No errors page states that a Bedrock 503 throttles the account, so it retries rather than pauses.
 """
 
 _RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})
 """The 500 and 504 error types, which retry at any status carrying them."""
 
-_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413})
-"""The statuses anthropic's errors page lists as this request's rejection; a resend fails again."""
+_DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
+"""The statuses that reject this request; a resend fails again.
+
+Every one but 422 is on anthropic's errors page.
+422 is not: every client the adapter supports raises UnprocessableEntityError for it
+(anthropic 0.120.2).
+"""
 
 PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
 """How often parse_anthropic fell to a status-family default, keyed by status and error type.
@@ -822,8 +829,7 @@ def parse_anthropic(failure: Exception) -> Verdict:
     https://platform.claude.com/docs/en/api/errors (read 2026-08-01):
     _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne,
     and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    408 and 409 are in _RETRY_THIS_ONE_STATUSES from the SDK rather than the page: anthropic's SDK
-    retries both, naming them request and lock timeouts (anthropic 0.120.2 _should_retry).
+    Some rows come from the SDK rather than the page; each table's docstring names which and why.
     Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
     a _PAUSE_ERROR_TYPES type pauses and a _RETRY_THIS_ONE_ERROR_TYPES type retries at any
     status, because a mid-stream error event raises carrying the live response's 200 status

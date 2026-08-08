@@ -463,7 +463,7 @@ class ProviderDeclaredFinalError(GenerationError):
     which states the disposition and never what failed,
     and a mid-stream error event, raised carrying the live response's 200 status.
     Either way the provider's own message is the only description of the condition.
-    Not retried: Adapter.parse verdicted DoNotRetry.
+    Not retried: Adapter.parse returned a terminal verdict.
     error is the SDK exception carrying that message, also chained as __cause__.
     The attempt has a record: the request reached the provider, which answered.
     """

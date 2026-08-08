@@ -130,6 +130,7 @@ from langchaint.adapter import (
     retry_after_seconds_from_headers,
     terminal_classification_from_response,
     verdict_from_transient_error,
+    verdict_under_retry_directive,
 )
 from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError, TransientError
@@ -825,18 +826,12 @@ def _adapter_result[OutputT](
 def parse_anthropic(failure: Exception) -> Verdict:
     """Map one AnthropicMessagesAdapter.failure_types exception to its verdict.
 
-    The listed rows come from anthropic's errors page,
-    https://platform.claude.com/docs/en/api/errors (read 2026-08-01):
-    _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne,
-    and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    Some rows come from the SDK rather than the page; each table's docstring names which and why.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    a _PAUSE_ERROR_TYPES type pauses and a _RETRY_THIS_ONE_ERROR_TYPES type retries at any
-    status, because a mid-stream error event raises carrying the live response's 200 status
-    (anthropic 0.120.2 MessageStream), leaving the type as the failure's one signal; an unlisted
-    5xx is RetryThisOne, one attempt's server-side failure; any other unlisted status is
-    DoNotRetry, matching the page's rule that 400 covers otherwise-unlisted 4xx errors.
-    The status and the error type pick the verdict; a retry-after header only fills its retry_after.
+    _verdict_from_anthropic_tables reads the status and the error type.
+    On every status but 200 the provider's own x-should-retry directive then overrides that verdict,
+    through verdict_under_retry_directive, which states the rule.
+    A status 200 is a mid-stream error event raised on a response the provider accepted, so its
+    headers say nothing about this failure and the tables' verdict stands.
+    A retry-after header only fills a verdict's retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
     Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
     """
@@ -851,6 +846,31 @@ def parse_anthropic(failure: Exception) -> Verdict:
         )
         return DoNotRetry()
     retry_after = retry_after_seconds_from_headers(failure.response.headers)
+    verdict = _verdict_from_anthropic_tables(failure, retry_after)
+    if failure.status_code == 200:
+        return verdict
+    return verdict_under_retry_directive(
+        verdict, headers=failure.response.headers, retry_after=retry_after
+    )
+
+
+def _verdict_from_anthropic_tables(
+    failure: anthropic.APIStatusError, retry_after: float | None
+) -> Verdict:
+    """Return the verdict the status and the error type alone give one failure.
+
+    The listed rows come from anthropic's errors page,
+    https://platform.claude.com/docs/en/api/errors (read 2026-08-01):
+    _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne,
+    and _DO_NOT_RETRY_STATUSES are DoNotRetry.
+    Some rows come from the SDK rather than the page; each table's docstring names which and why.
+    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
+    a _PAUSE_ERROR_TYPES type pauses and a _RETRY_THIS_ONE_ERROR_TYPES type retries at any
+    status, because a mid-stream error event raises carrying the live response's 200 status
+    (anthropic 0.120.2 MessageStream), leaving the type as the failure's one signal; an unlisted
+    5xx is RetryThisOne, one attempt's server-side failure; any other unlisted status is
+    DoNotRetry, matching the page's rule that 400 covers otherwise-unlisted 4xx errors.
+    """
     for error_types, statuses, verdict_class in (
         (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, PauseAll),
         (_RETRY_THIS_ONE_ERROR_TYPES, _RETRY_THIS_ONE_STATUSES, RetryThisOne),

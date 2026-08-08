@@ -49,7 +49,13 @@ from langchaint.exceptions import TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
 from langchaint.pricing import Billing
-from langchaint.shared_backoff import PauseAll, RetryThisOne, Verdict
+from langchaint.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    PauseAllDoNotRetry,
+    RetryThisOne,
+    Verdict,
+)
 from langchaint.tools import ToolSchema
 
 _logger = logging.getLogger(__name__)
@@ -169,6 +175,32 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     if should_retry_header == "false":
         return False
     return None
+
+
+def verdict_under_retry_directive(
+    verdict: Verdict, *, headers: Mapping[str, str], retry_after: float | None
+) -> Verdict:
+    """Let the provider's own x-should-retry directive override the verdict the status tables gave.
+
+    Both SDK clients read x-should-retry ahead of every status rule, so on an error response the
+    provider itself would judge, the directive decides whether this request is retried and no status
+    overrides it (anthropic 0.120.2, openai 2.51.0 BaseClient._should_retry).
+    It decides nothing about the account: _should_retry returns a bool, and the status is what says
+    the whole domain is throttled. So "false" over a pausing verdict gives PauseAllDoNotRetry, which
+    stops this request and still pauses the domain, and "true" promotes DoNotRetry to RetryThisOne,
+    the other verdicts already retrying.
+    retry_after is the wait the same response's headers named, which a promoted RetryThisOne carries.
+    Callers exclude a status-200 failure before calling: that is a mid-stream error event raised on
+    a response the provider accepted, whose headers the SDK never consults _should_retry about.
+    """
+    directive = should_retry_from_headers(headers)
+    if directive is False:
+        if isinstance(verdict, PauseAll | PauseAllDoNotRetry):
+            return PauseAllDoNotRetry(retry_after=verdict.retry_after)
+        return DoNotRetry()
+    if directive is True and isinstance(verdict, DoNotRetry):
+        return RetryThisOne(retry_after=retry_after)
+    return verdict
 
 
 def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
@@ -862,10 +894,10 @@ class Adapter(ABC):
     def parse(self, failure: Exception) -> Verdict:
         """Map one failure_types exception to its verdict, for SharedBackoff's parse.
 
-        The verdict comes from the status and the error type, never from a retry-after header,
-        which only sets the verdict's retry_after. Return a verdict for every input without
-        raising, unknown statuses and error types included, falling through to documented
-        defaults; each provider's parse function names its table and its defaults.
+        A retry-after header never sets the verdict, only its retry_after.
+        Return a verdict for every input without raising, unknown statuses and error types
+        included, falling through to documented defaults; each provider's parse function names
+        its table and its defaults.
         """
         ...
 

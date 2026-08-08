@@ -31,6 +31,7 @@ from langchaint import (
     Message,
     Part,
     PauseAll,
+    PauseAllDoNotRetry,
     ReasoningDelta,
     ReasoningTrace,
     Response,
@@ -227,6 +228,8 @@ def _by_verdict_kind(verdict: Verdict) -> object:
     match verdict.kind:
         case "pause_all":
             return verdict.retry_after
+        case "pause_all_do_not_retry":
+            return verdict.retry_after
         case "retry_this_one":
             return verdict.retry_after
         case "do_not_retry":
@@ -330,8 +333,9 @@ def test_a_generate_result_kind_narrows_the_output_type_the_variants_share_a_nam
 
 
 def test_a_verdict_kind_selects_the_variant_that_carries_the_field_read() -> None:
-    """The two retrying variants' tags reach retry_after, which DoNotRetry does not carry."""
+    """Three variants' tags reach retry_after, which DoNotRetry alone does not carry."""
     assert _by_verdict_kind(PauseAll(retry_after=7.0)) == 7.0
+    assert _by_verdict_kind(PauseAllDoNotRetry(retry_after=5.0)) == 5.0
     assert _by_verdict_kind(RetryThisOne(retry_after=2.0)) == 2.0
     assert _by_verdict_kind(DoNotRetry()) == "do_not_retry"
     assert _by_verdict_kind_missing_a_variant(DoNotRetry()) is None

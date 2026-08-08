@@ -21,6 +21,7 @@ from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
     PauseAll,
+    PauseAllDoNotRetry,
     PrivateBackoff,
     RetryThisOne,
     SharedBackoff,
@@ -274,6 +275,38 @@ def test_a_failure_is_parsed_recorded_and_propagated() -> None:
         assert shared_backoff.recorded[0] is admission.verdict
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until > shared_backoff._clock()
+
+    _run(scenario)
+
+
+def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
+    """The verdict that stops one request still holds the domain, which is why it is not DoNotRetry.
+
+    _record returns early on every verdict but the two pausing ones, so demoting this failure to
+    DoNotRetry would drop the account-wide pause the failure is evidence for.
+    """
+
+    async def scenario() -> None:
+        shared_backoff = _RecordingSharedBackoff(
+            parse=lambda _failure: PauseAllDoNotRetry(retry_after=0.25)
+        )
+        admission = await _fail_one_attempt(shared_backoff)
+        assert admission.verdict == PauseAllDoNotRetry(retry_after=0.25)
+        assert shared_backoff.recorded == [admission.verdict]
+        assert shared_backoff._pause_until > shared_backoff._clock()
+
+    _run(scenario)
+
+
+def test_a_pause_all_do_not_retry_retry_after_is_capped_like_any_other() -> None:
+    """The wrapper normalizes this variant's retry_after, since it carries one."""
+
+    async def scenario() -> None:
+        shared_backoff = _shared_backoff(
+            parse=lambda _failure: PauseAllDoNotRetry(retry_after=10_000.0)
+        )
+        admission = await _fail_one_attempt(shared_backoff)
+        assert admission.verdict == PauseAllDoNotRetry(retry_after=shared_backoff.longest_wait)
 
     _run(scenario)
 

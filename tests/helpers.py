@@ -24,7 +24,13 @@ from langchaint import (
     Usage,
 )
 from langchaint.adapter import ErrorClassification
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from langchaint.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    PauseAllDoNotRetry,
+    RetryThisOne,
+    Verdict,
+)
 
 CALL_STARTED_AT = 1000.0
 """The fixed time.monotonic() origin every record attempt_record and call_record build sits on."""
@@ -215,6 +221,7 @@ def openai_sdk_errors_and_verdicts() -> Mapping[Exception, Verdict]:
     the rows without an error_code exercise the exception a non-JSON body produces.
     451 and 599 are the unlisted statuses, one per default: 451 takes the sub-500 DoNotRetry
     and 599 the 5xx RetryThisOne.
+    The PauseAllDoNotRetry row is a 429 the provider's own x-should-retry marked final.
     """
     return {
         status_error(openai.RateLimitError, 429, {"retry-after": "7"}): PauseAll(retry_after=7.0),
@@ -232,6 +239,9 @@ def openai_sdk_errors_and_verdicts() -> Mapping[Exception, Verdict]:
         status_error(openai.UnprocessableEntityError, 422): DoNotRetry(),
         status_error(openai.APIStatusError, 451): DoNotRetry(),
         status_error(openai.InternalServerError, 599): RetryThisOne(retry_after=None),
+        status_error(openai.RateLimitError, 429, {"x-should-retry": "false"}): PauseAllDoNotRetry(
+            retry_after=None
+        ),
         TransientError("throttled body", retry_after_seconds=3.0, is_rate_limit=True): PauseAll(
             retry_after=3.0
         ),

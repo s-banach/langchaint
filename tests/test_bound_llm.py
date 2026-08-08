@@ -31,6 +31,7 @@ from langchaint import (
     MaxCompletionTokensExceededError,
     Message,
     ParserContractError,
+    PauseAllDoNotRetry,
     ProviderDeclaredFinalError,
     ProviderFailedTerminallyError,
     RefusalError,
@@ -115,6 +116,14 @@ def _parse_fake(failure: Exception) -> Verdict:
     if isinstance(failure, TransientError):
         return verdict_from_transient_error(failure)
     return DoNotRetry()
+
+
+def _parse_pause_all_do_not_retry(_failure: Exception) -> Verdict:
+    """Verdict every failure the way a 429 the provider marked x-should-retry: false parses.
+
+    retry_after is None, the provider having named no wait, so the pause takes a drawn one.
+    """
+    return PauseAllDoNotRetry(retry_after=None)
 
 
 def _parse_raises(_failure: Exception) -> Verdict:
@@ -1502,6 +1511,31 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
         assert record.raw is None
         assert record.usage == ZERO_USAGE
         assert failure.usage == ZERO_USAGE
+
+    asyncio.run(scenario())
+
+
+def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_domain() -> None:
+    """The terminal half ends the retry loop, and the pausing half still holds every other request.
+
+    Both halves matter: a verdict that only stopped would leave the siblings sending into the limit,
+    and one that only paused would spend the whole retry budget against the provider's own "false".
+    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, which is the
+    verdict naming the failure: the real classify calls a 429 invalid_request off its status.
+    """
+
+    async def scenario() -> None:
+        """Drive one generate_one whose only failure parses to PauseAllDoNotRetry."""
+        shared_backoff = _fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
+        adapter = _FakeAdapter(
+            failures=[TransientError("throttled")], classify_result="invalid_request"
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        with pytest.raises(ProviderDeclaredFinalError):
+            await bound_llm.generate_one([UserMessage(content="hi")])
+        assert adapter.bound_adapters[0].open_count == 1
+        # Only a pausing record moves _pause_until off the sentinel, so this is the pause arriving.
+        assert shared_backoff._pause_until != _NEVER
 
     asyncio.run(scenario())
 
@@ -3367,6 +3401,59 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
         (record,) = declared_final.value.attempt_records
         assert record.error is None
         assert record.usage == ZERO_USAGE
+
+    asyncio.run(scenario())
+
+
+def test_a_pause_all_do_not_retry_verdict_stops_a_stream_open_and_pauses_the_domain() -> None:
+    """A stream open the provider gave up on raises the item's failure instead of reopening.
+
+    The open loop retries every verdict _terminal_error_or_none does not name terminal, so treating
+    this one as a retry would spend the whole budget reopening a request the provider ended.
+    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, the same
+    naming the non-streaming loop does.
+    """
+
+    async def scenario() -> None:
+        """Enter a handle whose open failure parses to PauseAllDoNotRetry."""
+        shared_backoff = _fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
+        adapter = _FakeAdapter(
+            failures=[TransientError("throttled")], classify_result="invalid_request"
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        with pytest.raises(ProviderDeclaredFinalError):
+            async with bound_llm.stream_one([UserMessage(content="hi")]):
+                pass
+        assert adapter.bound_adapters[0].open_count == 1
+        # Only a pausing record moves _pause_until off the sentinel, so this is the pause arriving.
+        assert shared_backoff._pause_until != _NEVER
+
+    asyncio.run(scenario())
+
+
+def test_a_pause_all_do_not_retry_verdict_ends_an_open_stream_with_the_items_failure() -> None:
+    """A mid-stream failure the provider gave up on names the item's failure, not a retriable one.
+
+    test_stream_item_failure_after_open_is_not_retried is the same pull under a RetryThisOne
+    verdict, which raises RetryUnavailableError instead.
+    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, the same
+    naming the non-streaming loop does.
+    """
+
+    async def scenario() -> None:
+        """Read a first-item failure that parses to PauseAllDoNotRetry."""
+        adapter = _FakeAdapter(
+            stream=_FailsBeforeFirstItemStream(), classify_result="invalid_request"
+        )
+        bound_llm = LLM(
+            adapter, shared_backoff=_fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
+        ).bind(automatic_prompt_caching=True)
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(ProviderDeclaredFinalError) as declared_final:
+                _ = await anext(handle)
+        assert declared_final.value.error_text == (
+            "a final error from the provider: dropped before the first item"
+        )
 
     asyncio.run(scenario())
 

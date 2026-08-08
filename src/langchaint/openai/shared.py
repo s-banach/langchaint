@@ -22,6 +22,7 @@ from langchaint.adapter import (
     retry_after_seconds_from_headers,
     terminal_classification_from_response,
     verdict_from_transient_error,
+    verdict_under_retry_directive,
 )
 from langchaint.exceptions import TransientError
 from langchaint.messages import ImagePart
@@ -235,26 +236,16 @@ def require_prompt_cache_options_support(
         )
 
 
-def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return per documented row family, the status-200 error codes included)
+def parse_openai(failure: Exception) -> Verdict:
     """Map one OPENAI_FAILURE_TYPES exception to its verdict.
 
-    The listed rows come from openai's error-code guide,
-    https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
-    _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
-    DoNotRetry because the guide states retrying those will not restore access;
-    _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    Some rows come from the SDK rather than the guide; each table's docstring names which and why.
-    error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
-    still read insufficient_quota, so the type separates nothing.
-    A status 200 is a mid-stream error an adapter stream raised on the live response, so
-    its code picks the verdict through _DISPOSITION_BY_ERROR_CODE: rate_limit_exceeded is
-    PauseAll as a 429 is, any other transient code is RetryThisOne, and a terminal code is
-    DoNotRetry, as is a code outside the table, counted as a fallthrough.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
-    status is DoNotRetry.
-    The status and the error code pick the verdict; a retry-after header only fills its
-    retry_after.
+    A status 200 is a mid-stream error an adapter stream raised on a response the provider
+    accepted, so _verdict_from_openai_error_code reads its code and the response's headers say
+    nothing about this failure.
+    Every other status goes to _verdict_from_openai_status, and the provider's own x-should-retry
+    directive then overrides that verdict, through verdict_under_retry_directive, which states the
+    rule.
+    A retry-after header only fills a verdict's retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
     Never raises: an Exception outside OPENAI_FAILURE_TYPES is DoNotRetry, counted as a fallthrough.
     """
@@ -269,6 +260,32 @@ def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return pe
         )
         return DoNotRetry()
     retry_after = retry_after_seconds_from_headers(failure.response.headers)
+    if failure.status_code == 200:
+        return _verdict_from_openai_error_code(failure, retry_after)
+    return verdict_under_retry_directive(
+        _verdict_from_openai_status(failure, retry_after),
+        headers=failure.response.headers,
+        retry_after=retry_after,
+    )
+
+
+def _verdict_from_openai_status(
+    failure: openai.APIStatusError, retry_after: float | None
+) -> Verdict:
+    """Return the verdict the status and the error code alone give one error-status failure.
+
+    The listed rows come from openai's error-code guide,
+    https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
+    _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
+    DoNotRetry because the guide states retrying those will not restore access;
+    _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
+    Some rows come from the SDK rather than the guide; each table's docstring names which and why.
+    error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
+    still read insufficient_quota, so the type separates nothing.
+    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
+    an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
+    status is DoNotRetry.
+    """
     if failure.status_code in _PAUSE_STATUSES:
         if failure.code in _SPEND_LIMIT_CODES:
             return DoNotRetry()
@@ -276,22 +293,6 @@ def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return pe
     if failure.status_code in _RETRY_THIS_ONE_STATUSES:
         return RetryThisOne(retry_after=retry_after)
     if failure.status_code in _DO_NOT_RETRY_STATUSES:
-        return DoNotRetry()
-    if failure.status_code == 200:
-        disposition = (
-            None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
-        )
-        if disposition == "transient":
-            if failure.code == "rate_limit_exceeded":
-                return PauseAll(retry_after=retry_after)
-            return RetryThisOne(retry_after=retry_after)
-        if disposition is None:
-            record_parse_fallthrough(
-                PARSE_FALLTHROUGH_COUNTS,
-                parse_name="parse_openai",
-                status_code=failure.status_code,
-                error_type=failure.code,
-            )
         return DoNotRetry()
     record_parse_fallthrough(
         PARSE_FALLTHROUGH_COUNTS,
@@ -301,6 +302,30 @@ def parse_openai(failure: Exception) -> Verdict:  # noqa: PLR0911 (one return pe
     )
     if failure.status_code >= 500:
         return RetryThisOne(retry_after=retry_after)
+    return DoNotRetry()
+
+
+def _verdict_from_openai_error_code(
+    failure: openai.APIStatusError, retry_after: float | None
+) -> Verdict:
+    """Return the verdict a status-200 mid-stream error's code gives it.
+
+    The code picks the verdict through _DISPOSITION_BY_ERROR_CODE: rate_limit_exceeded is
+    PauseAll as a 429 is, any other transient code is RetryThisOne, and a terminal code is
+    DoNotRetry, as is a code outside the table, counted in PARSE_FALLTHROUGH_COUNTS and logged.
+    """
+    disposition = None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
+    if disposition == "transient":
+        if failure.code == "rate_limit_exceeded":
+            return PauseAll(retry_after=retry_after)
+        return RetryThisOne(retry_after=retry_after)
+    if disposition is None:
+        record_parse_fallthrough(
+            PARSE_FALLTHROUGH_COUNTS,
+            parse_name="parse_openai",
+            status_code=failure.status_code,
+            error_type=failure.code,
+        )
     return DoNotRetry()
 
 

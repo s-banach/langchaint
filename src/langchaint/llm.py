@@ -12,7 +12,9 @@ The retry loop raises each provider failure inside the block, so the exit parses
 and acts on the verdict the block leaves on Admission.verdict:
 a PauseAll holds every request in the domain at entry until the shared pause ends,
 a RetryThisOne waits out a PrivateBackoff between blocks,
-and a DoNotRetry becomes the item's terminal GenerationError, named by Adapter.classify.
+and a DoNotRetry becomes the item's GenerationError, named by Adapter.classify.
+PauseAllDoNotRetry is both: the pause it recorded holds the domain, and this item stops as
+ProviderDeclaredFinalError.
 """
 
 import asyncio
@@ -25,6 +27,7 @@ from langchaint.adapter import (
     Adapter,
     Binding,
     BoundAdapter,
+    ErrorClassification,
     InvalidRequest,
     RequestParams,
     ResponseOutcome,
@@ -65,8 +68,10 @@ from langchaint.run_many import run_many
 from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
+    PauseAllDoNotRetry,
     PrivateBackoff,
     SharedBackoff,
+    Verdict,
 )
 from langchaint.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager
@@ -722,23 +727,32 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         exc: Exception,
         *,
+        verdict: Verdict | None,
         ledger: _CallLedger,
         request: RequestParams,
         observations: _StreamObservations,
     ) -> GenerationError:
-        """Name this item's terminal failure from the adapter's classification of exc.
+        """Name this item's terminal failure from the verdict, else from classify's reading of exc.
 
-        Reached on a DoNotRetry verdict and on an exception outside failure_types that classify
-        did not call transient, so the "transient" value cannot arrive; if a classify defect
-        produces one anyway, it lands on the unknown_exception default with everything else out
-        of place.
+        A PauseAllDoNotRetry is declared_final without consulting classify: only a provider
+        directive that this request will not succeed produces one, which is what
+        ProviderDeclaredFinalError names. Reading the status instead would call a throttled
+        account's 429 a rejection of the request.
+        Every other failure takes classify. Reached on a terminal verdict and on an exception
+        outside failure_types that classify did not call transient, so the "transient" value cannot
+        arrive; if a classify defect produces one anyway, it lands on the unknown_exception default
+        with everything else out of place.
         Every record written here bills observations.billing, what the failure's stream had
         reported in flight, so a terminal failure's spend still reaches the caller; a staged
         response's own billing wins where one arrived.
 
         StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
         """
-        classification = self.adapter.classify(exc)
+        classification: ErrorClassification = (
+            "declared_final"
+            if isinstance(verdict, PauseAllDoNotRetry)
+            else self.adapter.classify(exc)
+        )
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
             # so it went out and gets a record.
@@ -793,13 +807,19 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         None where the attempt received no response.
 
         Raises:
-            GenerationError: the verdict is DoNotRetry; _terminal_error names which.
+            GenerationError: the verdict is terminal; _terminal_error names which. A
+                PauseAllDoNotRetry raises like any other terminal verdict, its pause already
+                recorded by the block's exit, so the domain keeps waiting while this item stops.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         verdict = admission.verdict
-        if verdict is None or isinstance(verdict, DoNotRetry):
+        if verdict is None or isinstance(verdict, DoNotRetry | PauseAllDoNotRetry):
             raise self._terminal_error(
-                exc, ledger=ledger, request=request, observations=observations
+                exc,
+                verdict=verdict,
+                ledger=ledger,
+                request=request,
+                observations=observations,
             ) from exc
         if isinstance(exc, TransientError):
             error = exc
@@ -841,7 +861,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         if not isinstance(exc, StreamProtocolError) and self.adapter.classify(exc) != "transient":
             return self._terminal_error(
-                exc, ledger=ledger, request=request, observations=observations
+                exc, verdict=None, ledger=ledger, request=request, observations=observations
             )
         error = TransientError(str(exc))
         error.__cause__ = exc

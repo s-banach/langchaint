@@ -30,6 +30,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     BoundAdapter,
+    ErrorClassification,
     InvalidRequest,
     RequestParams,
     ResponseOutcome,
@@ -68,6 +69,7 @@ from langchaint.response import (
 from langchaint.shared_backoff import (
     Admission,
     PauseAll,
+    PauseAllDoNotRetry,
     PrivateBackoff,
     RetryThisOne,
     SharedBackoff,
@@ -441,10 +443,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         outcome from: what it did read it reports as a ResponseOutcome variant, which this handle
         matches instead.
         verdict is what the failure's admitted() block recorded: a failure_types exc is terminal
-        only on DoNotRetry, and an exc outside failure_types has no verdict and is terminal unless
+        on a terminal verdict, and an exc outside failure_types has no verdict and is terminal unless
         classify calls it transient (a transport failure that produced nothing parseable).
-        A terminal failure's name comes from classify, mapped exactly as BoundLLM._terminal_error
-        maps it; anything classify cannot place lands on UnknownExceptionError.
+        A terminal failure's name is mapped exactly as BoundLLM._terminal_error maps it; anything
+        classify cannot place lands on UnknownExceptionError.
 
         stream_billing is what the open stream has reported.
         It is None when no stream is open.
@@ -456,11 +458,19 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             request_id = self._adapter_stream.request_id()
         self._ledger.note_request_id(request_id)
         if verdict is not None:
-            if verdict.kind != "do_not_retry":
+            if verdict.kind not in ("do_not_retry", "pause_all_do_not_retry"):
                 return None
         elif isinstance(exc, TransientError) or self._adapter.classify(exc) == "transient":
             return None
-        classification = self._adapter.classify(exc)
+        # A PauseAllDoNotRetry is declared_final without consulting classify: only a provider
+        # directive that this request will not succeed produces one, which is what
+        # ProviderDeclaredFinalError names. Reading the status instead would call a throttled
+        # account's 429 a rejection of the request.
+        classification: ErrorClassification = (
+            "declared_final"
+            if isinstance(verdict, PauseAllDoNotRetry)
+            else self._adapter.classify(exc)
+        )
         if classification == "invalid_request":
             # Adapter.classify returns invalid_request only for a request the provider rejected,
             # so it went out and gets a record.

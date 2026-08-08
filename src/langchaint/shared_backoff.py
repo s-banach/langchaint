@@ -11,8 +11,10 @@ SharedBackoff decides no retries and counts no tokens.
 It also bounds no pending work: it cannot tell an unadmitted request from one that has not entered yet.
 The bound on pending work belongs to whatever spawns the work.
 
-The three verdicts are PauseAll, RetryThisOne, and DoNotRetry; only PauseAll changes shared state.
-The verdict comes from the status and the error type; a `retry-after` header never sets it.
+The verdicts are PauseAll, PauseAllDoNotRetry, RetryThisOne, and DoNotRetry; only the two pausing
+ones change shared state.
+The verdict comes from the status, the error type, and the provider's own retry directive; a
+`retry-after` header never sets it.
 The header says how long to wait, not who has to wait.
 
 Every deadline here uses a forward-only clock (`time.monotonic`), never wall-clock time.
@@ -75,7 +77,27 @@ class DoNotRetry:
     kind: Literal["do_not_retry"] = "do_not_retry"
 
 
-type Verdict = PauseAll | RetryThisOne | DoNotRetry
+@dataclass(frozen=True, kw_only=True)
+class PauseAllDoNotRetry:
+    """The provider told us to stop sending for a while, and told this request not to come back.
+
+    retry_after is the wait the provider named in seconds, None where it named none.
+    It serves the shared pause rather than this request, which is why this variant carries one and
+    DoNotRetry does not.
+    Recording this verdict starts the shared pause, or extends a running one, exactly as PauseAll
+    does; the caller stops retrying this request, exactly as on DoNotRetry.
+    """
+
+    retry_after: float | None
+    kind: Literal["pause_all_do_not_retry"] = "pause_all_do_not_retry"
+
+
+type Verdict = PauseAll | PauseAllDoNotRetry | RetryThisOne | DoNotRetry
+"""What one parsed provider failure means for this request and for the domain.
+
+"Terminal verdict" names DoNotRetry and PauseAllDoNotRetry, on either of which the caller stops
+retrying this request.
+"""
 
 
 def _random_up_to(ceiling: float) -> float:
@@ -490,7 +512,7 @@ class SharedBackoff:
                 "parse_returned_non_verdict",
                 None,
             )
-        if not isinstance(result, PauseAll | RetryThisOne | DoNotRetry):
+        if not isinstance(result, PauseAll | PauseAllDoNotRetry | RetryThisOne | DoNotRetry):
             return self._parse_defect_outcome(
                 f"parse returned {result!r} instead of a verdict",
                 "parse_returned_non_verdict",
@@ -566,7 +588,7 @@ class SharedBackoff:
         _logger.warning("corrected a parse verdict: %s", tag)
 
     def _record(self, verdict: Verdict) -> None:
-        """Record one parsed failure; only PauseAll changes shared state.
+        """Record one parsed failure; only the two pausing verdicts change shared state.
 
         A report during a pause starts a fresh pause of its own, at most longest_wait long, and the
         two merge by keeping the later end; the ceiling is untouched, because one burst of trouble
@@ -579,7 +601,7 @@ class SharedBackoff:
         merged-in wait is capped there, by the wrapper for a retry_after and by the ceiling for a
         chosen wait.
         """
-        if not isinstance(verdict, PauseAll):
+        if not isinstance(verdict, PauseAll | PauseAllDoNotRetry):
             return
         now = self._clock()
         if now < self._pause_until:
@@ -609,7 +631,7 @@ class SharedBackoff:
             len(self._queue),
         )
 
-    def _chosen_wait(self, verdict: PauseAll) -> float:
+    def _chosen_wait(self, verdict: PauseAll | PauseAllDoNotRetry) -> float:
         """Return how long this report proposes to pause.
 
         `is None`, not truthiness: the wrapper guarantees a present retry_after is finite and

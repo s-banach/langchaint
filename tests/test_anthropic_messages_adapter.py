@@ -98,7 +98,13 @@ from langchaint.anthropic.messages_adapter import (
 from langchaint.call import ResponseIdentity
 from langchaint.conformance import AdapterConformance
 from langchaint.exceptions import TransientError
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from langchaint.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    PauseAllDoNotRetry,
+    RetryThisOne,
+    Verdict,
+)
 from langchaint.tools import ToolSchema
 
 _STANDARD_RATES = AnthropicPricingTable(
@@ -1435,6 +1441,59 @@ def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_sta
     assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
 
 
+def test_parse_anthropic_obeys_a_retry_directive_over_the_status_tables() -> None:
+    """x-should-retry overrides the table verdict, which is what both SDK clients do with it.
+
+    "false" on a 500 stops a status the table retries, and "true" on a 400 retries one it stops.
+    "true" over a pausing verdict leaves it pausing: the directive speaks for this request, and
+    dropping the pause would leave every sibling sending into the same rate limit.
+    """
+    final_500 = _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"})
+    assert parse_anthropic(final_500) == DoNotRetry()
+    retryable_400 = _status_error(
+        anthropic.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
+    )
+    assert parse_anthropic(retryable_400) == RetryThisOne(retry_after=3.0)
+    retryable_429 = _status_error(
+        anthropic.RateLimitError, 429, {"x-should-retry": "true"}, "rate_limit_error"
+    )
+    assert parse_anthropic(retryable_429) == PauseAll(retry_after=None)
+
+
+def test_parse_anthropic_pauses_the_domain_on_a_directive_that_gives_this_request_up() -> None:
+    """A "false" directive over a pausing verdict stops this request and still pauses the domain.
+
+    The 429 says the account is throttled and the directive says this request will not come back,
+    which is the state PauseAllDoNotRetry carries and neither PauseAll nor DoNotRetry can.
+    The second row is at status 418, in no table: the pause comes from the error type there, so a
+    guard written on the status instead of the verdict would drop it.
+    """
+    throttled = _status_error(
+        anthropic.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
+    )
+    assert parse_anthropic(throttled) == PauseAllDoNotRetry(retry_after=7.0)
+    overloaded = _status_error(
+        anthropic.APIStatusError, 418, {"x-should-retry": "false"}, "overloaded_error"
+    )
+    assert parse_anthropic(overloaded) == PauseAllDoNotRetry(retry_after=None)
+
+
+def test_parse_anthropic_ignores_a_retry_directive_on_the_streams_200_status() -> None:
+    """A 200's headers belong to a request the provider accepted, so they judge no failure.
+
+    The failure is a mid-stream error event raised on that live response, which the SDK never
+    consults its retry predicate about, so the error type alone decides.
+    """
+    overloaded = _status_error(
+        anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
+    )
+    assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
+    rejected = _status_error(
+        anthropic.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_request_error"
+    )
+    assert parse_anthropic(rejected) == DoNotRetry()
+
+
 def test_parse_anthropic_retries_a_transient_type_at_the_streams_200_status() -> None:
     """api_error and timeout_error retry at any status, counted where the status is unlisted.
 
@@ -2002,6 +2061,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         the rows without an error_type exercise the exception a non-JSON body produces.
         451 and 502 are the unlisted statuses, one per default: 451 takes the sub-500 DoNotRetry
         and 502 the 5xx RetryThisOne.
+        The PauseAllDoNotRetry row is a 429 the provider's own x-should-retry marked final.
         """
         return {
             _status_error(
@@ -2038,6 +2098,9 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             _status_error(anthropic.InternalServerError, 503): RetryThisOne(retry_after=None),
             _status_error(anthropic.APIStatusError, 451): DoNotRetry(),
             _status_error(anthropic.InternalServerError, 502): RetryThisOne(retry_after=None),
+            _status_error(
+                anthropic.RateLimitError, 429, {"x-should-retry": "false"}, "rate_limit_error"
+            ): PauseAllDoNotRetry(retry_after=None),
             TransientError(
                 "throttled body", retry_after_seconds=3.0, is_rate_limit=True
             ): PauseAll(retry_after=3.0),

@@ -109,7 +109,13 @@ from langchaint.openai.responses_adapter import (
     _wire_tool_choice,
 )
 from langchaint.openai.shared import PARSE_FALLTHROUGH_COUNTS, parse_openai
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from langchaint.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    PauseAllDoNotRetry,
+    RetryThisOne,
+    Verdict,
+)
 from tests.helpers import (
     openai_sdk_errors_and_classifications,
     openai_sdk_errors_and_verdicts,
@@ -1735,6 +1741,62 @@ def test_parse_openai_does_not_retry_a_429_naming_a_spend_limit_code() -> None:
     assert parse_openai(exhausted) == DoNotRetry()
     throttled = status_error(openai.RateLimitError, 429, error_code="rate_limit_exceeded")
     assert parse_openai(throttled) == PauseAll(retry_after=None)
+
+
+def test_parse_openai_obeys_a_retry_directive_over_the_status_tables() -> None:
+    """x-should-retry overrides the table verdict, which is what the SDK client does with it.
+
+    "false" on a 500 stops a status the table retries, and "true" on a 400 retries one it stops.
+    """
+    final_500 = status_error(openai.InternalServerError, 500, {"x-should-retry": "false"})
+    assert parse_openai(final_500) == DoNotRetry()
+    retryable_400 = status_error(
+        openai.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
+    )
+    assert parse_openai(retryable_400) == RetryThisOne(retry_after=3.0)
+
+
+def test_parse_openai_pauses_the_domain_on_a_directive_that_gives_this_request_up() -> None:
+    """A "false" directive over a pausing verdict stops this request and still pauses the domain."""
+    throttled = status_error(
+        openai.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
+    )
+    assert parse_openai(throttled) == PauseAllDoNotRetry(retry_after=7.0)
+
+
+def test_parse_openai_applies_a_directive_to_a_spend_limit_429_by_its_verdict() -> None:
+    """A spend-limit 429 is already DoNotRetry, so the directive moves it like any other one.
+
+    "false" leaves it DoNotRetry and starts no pause, since the guide's reason for the terminal
+    verdict is that the credits ran out rather than that the account is throttled.
+    "true" promotes it to RetryThisOne, which is what openai's own client does: _should_retry reads
+    the header ahead of everything and never reads error.code, so it retries this response.
+    A guard written on the status instead of the verdict would pause here.
+    """
+    exhausted = status_error(
+        openai.RateLimitError, 429, {"x-should-retry": "false"}, "credit_balance_exhausted"
+    )
+    assert parse_openai(exhausted) == DoNotRetry()
+    retryable = status_error(
+        openai.RateLimitError, 429, {"x-should-retry": "true"}, "credit_balance_exhausted"
+    )
+    assert parse_openai(retryable) == RetryThisOne(retry_after=None)
+
+
+def test_parse_openai_ignores_a_retry_directive_on_the_streams_200_status() -> None:
+    """A 200's headers belong to a request the provider accepted, so they judge no failure.
+
+    The failure is a mid-stream error event raised on that live response, which the SDK never
+    consults its retry predicate about, so the error code alone decides.
+    """
+    throttled = status_error(
+        openai.APIStatusError, 200, {"x-should-retry": "false"}, "rate_limit_exceeded"
+    )
+    assert parse_openai(throttled) == PauseAll(retry_after=None)
+    blocked = status_error(
+        openai.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_prompt"
+    )
+    assert parse_openai(blocked) == DoNotRetry()
 
 
 def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:

@@ -78,8 +78,9 @@ from langchaint.adapter import (
 )
 from langchaint.call import ResponseIdentity
 from langchaint.llm import (
-    _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST,
     _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND,
+    _PENDING_TASKS_PER_CONCURRENT_REQUEST,
+    _SPARE_PENDING_TASKS,
     UNCHANGED,
     Unchanged,
 )
@@ -122,16 +123,23 @@ def _parse_raises(_failure: Exception) -> Verdict:
 
 
 def _fast_shared_backoff(
-    *, max_concurrent_requests: int | None = 8, parse: Callable[[Exception], Verdict] = _parse_fake
+    *,
+    max_concurrent_requests: int | None = 8,
+    parse: Callable[[Exception], Verdict] = _parse_fake,
+    longest_wait: float = 0.002,
+    admission_gap: float = 0.0001,
 ) -> SharedBackoff:
-    """Build a fresh near-zero-wait SharedBackoff; one instance serves one event loop."""
+    """Build a fresh near-zero-wait SharedBackoff; one instance serves one event loop.
+
+    Raise longest_wait and admission_gap in a test that needs a wait long enough to observe.
+    """
     return SharedBackoff(
         parse=parse,
         failure_types=(TransientError,),
         max_concurrent_requests=max_concurrent_requests,
         minimum_wait_ceiling=0.001,
-        longest_wait=0.002,
-        admission_gap=0.0001,
+        longest_wait=longest_wait,
+        admission_gap=admission_gap,
     )
 
 
@@ -3605,14 +3613,7 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
         adapter = _FakeAdapter(
             failures=[TransientError("slow down", retry_after_seconds=retry_after_seconds)]
         )
-        shared_backoff = SharedBackoff(
-            parse=_parse_fake,
-            failure_types=(TransientError,),
-            max_concurrent_requests=8,
-            minimum_wait_ceiling=0.001,
-            longest_wait=1.0,
-            admission_gap=0.0001,
-        )
+        shared_backoff = _fast_shared_backoff(longest_wait=1.0)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
             automatic_prompt_caching=True
         )
@@ -3680,9 +3681,9 @@ def _recorded_max_pending(
 def test_generate_many_derives_max_pending_from_max_concurrent_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """max_pending is max_concurrent_requests times _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST."""
+    """max_pending is max_concurrent_requests at the ratio, plus _SPARE_PENDING_TASKS."""
     recorded = _recorded_max_pending(monkeypatch, max_concurrent_requests=8)
-    assert recorded == [8 * _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST]
+    assert recorded == [8 * _PENDING_TASKS_PER_CONCURRENT_REQUEST + _SPARE_PENDING_TASKS]
 
 
 def test_generate_many_sets_max_pending_without_a_concurrency_bound(
@@ -3713,14 +3714,7 @@ def test_backoff_sleep_does_not_hold_the_permit() -> None:
         adapter = _FakeAdapter(
             failures=[TransientError("boom", retry_after_seconds=retry_after_seconds)]
         )
-        shared_backoff = SharedBackoff(
-            parse=_parse_fake,
-            failure_types=(TransientError,),
-            max_concurrent_requests=1,
-            minimum_wait_ceiling=0.001,
-            longest_wait=1.0,
-            admission_gap=0.0001,
-        )
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1, longest_wait=1.0)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
             automatic_prompt_caching=True
         )
@@ -3914,7 +3908,7 @@ def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
         )
         results = await bound_llm.generate_many(
             [[UserMessage(content="fast")], [UserMessage(content="slow")]],
-            timeout_seconds=0.05,
+            max_working_seconds_per_item=0.05,
         )
         first, second = results
         assert isinstance(first, Response)
@@ -3922,6 +3916,128 @@ def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
         assert isinstance(second, TimedOutError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_a_batch_item_spends_no_budget_waiting_for_a_permit() -> None:
+    """One permit and four items: the last waits past its whole budget to start, and still succeeds.
+
+    Each open takes 0.15 seconds and only one item holds a permit at a time, so the fourth item
+    starts 0.45 seconds after the batch does, against a budget of 0.30. A deadline running from
+    when its task was created would have expired before it sent anything.
+    """
+
+    async def scenario() -> None:
+        """Queue four items behind one permit, each item working well inside its budget."""
+        adapter = _FakeAdapter(echo=True, open_seconds=0.15)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many(
+            [[UserMessage(content=str(index))] for index in range(4)],
+            max_working_seconds_per_item=0.30,
+        )
+        assert _batch_outputs(results) == ["0", "1", "2", "3"]
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
+
+
+def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
+    """The budget still expires on an item that is admitted and gets nothing back.
+
+    The second item waits 0.15 seconds for the one permit, which costs it nothing, then hangs.
+    It is the hang that expires the budget, so the clock does run once the item is admitted.
+    """
+
+    async def scenario() -> None:
+        """Let the first item answer, then hang the second one after it is admitted."""
+        adapter = _FakeAdapter(echo=True, open_seconds=0.15, hang_from_open=2)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many(
+            [[UserMessage(content="answered")], [UserMessage(content="hangs")]],
+            max_working_seconds_per_item=0.30,
+        )
+        first, second = results
+        assert isinstance(first, Response)
+        assert first.output == "answered"
+        assert isinstance(second, TimedOutError)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
+
+
+def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
+    """No permit gates entry, so admission_gap alone paces the batch, and it is not charged.
+
+    With max_concurrent_requests None every item passes the permit at once and queues on
+    admission_gap. At 0.1 seconds per admission the fourth item is admitted 0.3 seconds in,
+    against a budget of 0.1 that only its own request may spend.
+    """
+
+    async def scenario() -> None:
+        """Pace four items through the admission queue on a budget shorter than the queue."""
+        adapter = _FakeAdapter(echo=True)
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=None, admission_gap=0.1)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many(
+            [[UserMessage(content=str(index))] for index in range(4)],
+            max_working_seconds_per_item=0.1,
+        )
+        assert _batch_outputs(results) == ["0", "1", "2", "3"]
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
+
+
+def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
+    """A pause blocks admission, so the item it holds up is not charged for the wait.
+
+    A rate-limit TransientError pauses the domain for 0.3 seconds, and PauseAll is the one verdict
+    the retry loop does not sleep on, so the whole 0.3 is spent waiting to be admitted. Each of the
+    two attempts opens for 0.05, which is what the 0.15 second budget pays for; charging the pause
+    as well would leave the retry no budget to run in.
+    longest_wait sits above the pause because a retry_after reaching a SharedBackoff is capped
+    there, so a shorter one would put this test outside what a pause can be.
+    """
+
+    async def scenario() -> None:
+        """Fail one attempt into a pause longer than the budget, then let the retry answer."""
+        adapter = _FakeAdapter(
+            echo=True,
+            open_seconds=0.05,
+            failures=[TransientError("slow down", retry_after_seconds=0.3, is_rate_limit=True)],
+        )
+        shared_backoff = _fast_shared_backoff(max_concurrent_requests=None, longest_wait=0.5)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
+        results = await bound_llm.generate_many(
+            [[UserMessage(content="paused")]], max_working_seconds_per_item=0.15
+        )
+        assert _batch_outputs(results) == ["paused"]
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
+
+
+def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
+    """Two attempts draw on one budget, so a retrying item does not get the budget twice.
+
+    Each attempt's open burns 0.12 seconds of a 0.20 second budget. Re-arming with the full
+    budget on the second admission would let both attempts finish; banking the remainder leaves
+    0.08 seconds, so the second attempt runs out and the item ends as a TimedOutError.
+    """
+
+    async def scenario() -> None:
+        """Fail the first attempt transiently, then time out inside the retry."""
+        adapter = _FakeAdapter(
+            echo=True,
+            open_seconds=0.12,
+            failures=[TransientError("try again")],
+        )
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True
+        )
+        results = await bound_llm.generate_many(
+            [[UserMessage(content="retries")]], max_working_seconds_per_item=0.20
+        )
+        assert isinstance(results[0], TimedOutError)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 
 
 def test_a_stream_deadline_raises_and_leaves_abandoned_unset() -> None:

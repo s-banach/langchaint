@@ -117,7 +117,7 @@ class GenerationError(_CallCarrier, Exception):
     UnknownExceptionError (the adapter could not place the attempt's exception),
     EscapedExceptionError (an exception escaped langchaint's own machinery),
     AbandonedCallError (the call was cut off before its result reached the caller), and
-    TimedOutError (the call was cut off by the timeout_seconds the caller asked for).
+    TimedOutError (the call was cut off by the deadline the caller asked for).
     generate_one raises every one of them but two: RetryUnavailableError, which comes only from a
     stream_one block, and AbandonedCallError itself, which is never raised.
     generate_many returns each of the ones generate_one raises at that item's index,
@@ -596,16 +596,20 @@ class AbandonedCallError(GenerationError):
 
 
 class TimedOutError(AbandonedCallError):
-    """The timeout_seconds the caller asked for expired before the call produced a result.
+    """The deadline the caller asked for expired before the call produced a result.
 
     Raised, where its base is only ever stored: langchaint owns the scope that expired, so the
     expiry surfaces inside the frame holding the call's ledger and leaves as an ordinary
     GenerationError. A scope the caller owns ends the call from outside that frame, so whatever it
     raises there carries no account of what the call spent.
 
-    The deadline covers the whole call, so it can expire while a request is in flight, during a
-    backoff sleep, or while waiting for SharedBackoff admission. The last of those reports attempts == 0,
-    which is how a caller tells an item that never sent from one the provider answered slowly.
+    generate_one's timeout_seconds covers the whole call, so it can expire while a request is in
+    flight, during a backoff sleep, or while waiting for SharedBackoff admission. That last case
+    reports attempts == 0, which is how a caller tells a call that never sent from one the provider
+    answered slowly.
+    generate_many's max_working_seconds_per_item stops for the wait for admission, so it expires
+    only with a request in flight or during a backoff sleep, and a batch item carrying it has
+    always sent at least once.
     """
 
     @override

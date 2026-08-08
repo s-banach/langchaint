@@ -58,6 +58,7 @@ A bare `str` generation_input is shorthand for `[UserMessage(content=generation_
 `BoundLLM` has `generate_one`, `generate_many`, and `stream_one`.
 `generate_many` bounds how many items are pending, meaning started and not settled, so a batch of a million inputs does not hold a million tasks.
 That bound follows `SharedBackoff.max_concurrent_requests`, so one number sets the batch's throughput and nothing else needs sizing.
+A deadline on one call is `timeout_seconds` and covers everything the call waits on; a deadline on one batch item is `max_working_seconds_per_item` and stops while that item queues behind its siblings.
 `run_many`, the function behind it, is exported for batching anything else the same way.
 
 **A constructor per backend returning a ready `LLM`.**

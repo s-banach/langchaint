@@ -108,18 +108,96 @@ type GenerationInput = str | Sequence[Message]
 """What one request is generated from: a bare str is shorthand for a Sequence[Message] of one UserMessage."""
 
 
-_MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST = 100
-"""The most pending tasks generate_many holds per request its SharedBackoff allows at once.
+_PENDING_TASKS_PER_CONCURRENT_REQUEST = 2
+"""Pending tasks generate_many holds for each request its SharedBackoff admits at once.
 
-A task holds no permit while it sleeps between attempts, so permits stay fed only when pending
-tasks outnumber them.
+A task holds no permit while it sleeps between attempts, so permits stay fed only while the awake
+tasks outnumber the permits. The share of tasks that may sleep at once without leaving a permit
+idle is at least one minus the reciprocal of this ratio, so 2 tolerates half of them asleep.
+A transient failure rate puts far fewer than half to sleep, so this ratio is a margin rather than
+a measured rate.
+"""
+
+_SPARE_PENDING_TASKS = 8
+"""Pending tasks generate_many holds on top of what _PENDING_TASKS_PER_CONCURRENT_REQUEST gives.
+
+That ratio holds in the steady state, and a small max_concurrent_requests leaves too few tasks for
+the sleeping count to vary within: at one permit the ratio gives one spare, whose sleep idles the
+permit. A pending task costs a coroutine frame, so spares are cheap where the ratio is thin.
 """
 
 _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND = 1000
 """The most pending tasks generate_many holds when max_concurrent_requests is None.
 
-Nothing bounds request concurrency in that configuration, so this bounds memory alone.
+No permit gates a request start in that configuration, so this is what caps requests in flight.
 """
+
+
+class Deadline(Protocol):
+    """The scope one call runs inside, told when the call waits to be admitted and when it is.
+
+    Waiting to be admitted is waiting behind everything else sharing the SharedBackoff, first for a
+    permit and then for the admission queue. Whether that time counts against the call is the only
+    thing the implementations disagree on.
+    """
+
+    @property
+    def scope(self) -> asyncio.Timeout:
+        """The scope to enter around the retry loop, expiring when the call is out of time."""
+        ...
+
+    def suspend_until_admitted(self) -> None:
+        """Answer an attempt about to wait for admission."""
+        ...
+
+    def resume_on_admission(self) -> None:
+        """Answer an attempt now admitted, free to send its request."""
+        ...
+
+
+class WallClockDeadline:
+    """A deadline that runs from construction to the result, whatever the call waits on.
+
+    This is what generate_one's timeout_seconds asks for: a caller blocked on one call wants an
+    answer or a failure within that many seconds, and a wait for admission is time it spent waiting.
+    """
+
+    def __init__(self, timeout_seconds: float | None) -> None:
+        """Arm the scope now, or open one that never expires when timeout_seconds is None."""
+        self.scope = asyncio.timeout(timeout_seconds)
+
+    def suspend_until_admitted(self) -> None:
+        """Keep the clock running."""
+
+    def resume_on_admission(self) -> None:
+        """Keep the clock running."""
+
+
+class WorkingTimeDeadline:
+    """A deadline that stops while the call waits to be admitted and runs the rest of the time.
+
+    This is what generate_many's max_working_seconds_per_item asks for.
+    """
+
+    def __init__(self, max_working_seconds: float | None) -> None:
+        """Open the scope unarmed; the first resume_on_admission arms it with the budget."""
+        self.scope = asyncio.timeout(None)
+        self._seconds_left = max_working_seconds
+
+    def suspend_until_admitted(self) -> None:
+        """Stop the clock, banking what is left for the resume that follows."""
+        if self._seconds_left is None:
+            return
+        expires_at = self.scope.when()
+        if expires_at is not None:
+            self._seconds_left = expires_at - asyncio.get_running_loop().time()
+        self.scope.reschedule(None)
+
+    def resume_on_admission(self) -> None:
+        """Start the clock again with what is banked, which on the first attempt is the budget."""
+        if self._seconds_left is None:
+            return
+        self.scope.reschedule(asyncio.get_running_loop().time() + self._seconds_left)
 
 
 class SequenceNotStr[T_co](Protocol):
@@ -238,12 +316,12 @@ class GenerateItem[OutputT](Protocol):
     BoundLLM.generate_many passes its own _generate_one_any_binding. A wrapper passes an
     implementation that calls the same method and does its own work around it, which is how one call
     of a batch gets treated exactly as generate_one treats one call.
-    Pass timeout_seconds through: an implementation that dropped it would silently give its items no
-    deadline at all.
+    Pass deadline through: an implementation that dropped it would silently give its items no
+    deadline at all. It belongs to this item alone, so hand it to one call and no other.
     """
 
     async def __call__(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
         """Run the call, raising its GenerationError rather than returning it.
 
@@ -798,7 +876,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         messages: Sequence[Message],
         *,
         ledger: _CallLedger,
-        timeout_seconds: float | None,
+        deadline: Deadline,
     ) -> GenerateResult[OutputT | None]:
         """Run the retry loop every generate method shares, under the caller's deadline.
 
@@ -806,9 +884,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         into as each attempt settles. Every GenerationError and the success variant are built from
         ledger.freeze(), the one site a call's elapsed_seconds is computed.
 
-        timeout_seconds bounds this whole loop, admission waits and backoff sleeps included, and
-        None opens a scope that never expires. Expiring raises TimedOutError, whose docstring says
-        why the scope has to sit in this frame.
+        deadline bounds this whole loop, and which of the loop's waits spend it is the deadline's
+        own question to answer. Expiring raises TimedOutError, whose docstring says why the scope
+        has to sit in this frame.
         A cancellation from any scope but this one is the caller's own order and propagates
         untouched. expired() is what tells the two apart: a TimeoutError this scope did not raise
         came from under the loop unclassified, and re-raising it hands it to the same wrapping every
@@ -851,14 +929,16 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 (the 200's body reports that generating the response failed, for a reason a resend
                 would hit again); terminal for this item, without a retry.
             RetriesExhaustedError: every attempt failed transiently and the budget ran out.
-            TimedOutError: timeout_seconds expired before the call produced a result.
+            TimedOutError: the deadline expired before the call produced a result.
             ParserContractError: the adapter's parse violated its contract on an attempt's failure.
         """
         ledger.start_call()
-        timeout_scope = asyncio.timeout(timeout_seconds)
+        timeout_scope = deadline.scope
         try:
             async with timeout_scope:
-                return await self._attempt_until_budget_runs_out(messages, ledger=ledger)
+                return await self._attempt_until_budget_runs_out(
+                    messages, ledger=ledger, deadline=deadline
+                )
         except TimeoutError:
             if not timeout_scope.expired():
                 raise
@@ -867,7 +947,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             raise _abandoned_call_error(TimedOutError, ledger, ledger.billing_in_flight) from None
 
     async def _attempt_until_budget_runs_out(  # noqa: PLR0912 (the loop holds one attempt end to end: the drain, each failure family, and the exhaustive outcome match)
-        self, messages: Sequence[Message], *, ledger: _CallLedger
+        self, messages: Sequence[Message], *, ledger: _CallLedger, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
 
@@ -893,11 +973,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         request = built
         private_backoff = PrivateBackoff(self.shared_backoff)
         while ledger.attempts < self.max_attempts:
+            deadline.suspend_until_admitted()
             admission = self.shared_backoff.admitted()
             assistant_message: AssistantMessage | None = None
             observations = _StreamObservations(billing=None, request_id=None, opened=False)
             try:
                 async with admission:
+                    # Entering the block is the admission, so the clock starts on the first
+                    # statement inside it.
+                    deadline.resume_on_admission()
                     ledger.start_attempt()
                     adapter_stream = await self._bound_adapter.open_stream(request)
                     observations = observations._replace(opened=True)
@@ -1046,11 +1130,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             asyncio.CancelledError: an outer scope cancelled this call.
         """
         return await self._generate_one_any_binding(
-            generation_input, timeout_seconds=timeout_seconds
+            generation_input, deadline=WallClockDeadline(timeout_seconds)
         )
 
     async def _generate_one_any_binding(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
         """Run one call under a ledger of its own, reporting every Exception as its failure.
 
@@ -1071,7 +1155,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
             return await self._generate_with_retries(
-                _as_messages(generation_input), ledger=ledger, timeout_seconds=timeout_seconds
+                _as_messages(generation_input), ledger=ledger, deadline=deadline
             )
         except GenerationError:
             raise
@@ -1083,19 +1167,19 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_input: GenerationInput,
         *,
         generate_item: "GenerateItem[OutputT]",
-        timeout_seconds: float | None,
+        deadline: Deadline,
     ) -> CallResult[OutputT | None]:
         """One batch item: the success variant or the GenerationError.
 
         Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
-        into run_many and reaches a sibling. An expired timeout_seconds is one of them, so one
-        item's deadline never cuts a sibling.
+        into run_many and reaches a sibling. An expired deadline is one of them, so one item's
+        deadline never cuts a sibling.
 
         Raises:
             BaseException: whatever cut the item off, propagating unobserved.
         """
         try:
-            return await generate_item(generation_input, timeout_seconds=timeout_seconds)
+            return await generate_item(generation_input, deadline=deadline)
         except GenerationError as failure:
             return failure
 
@@ -1105,7 +1189,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[str] | GenerationError]: ...
     @overload
     async def generate_many(
@@ -1113,7 +1197,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     @overload
     async def generate_many(
@@ -1121,14 +1205,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
-        timeout_seconds: float | None = None,
+        max_working_seconds_per_item: float | None = None,
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
     ) -> list[Any]:
@@ -1157,11 +1241,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         A first item ending in a GenerationError still admits the rest: a 200 that produced no
         output (a refusal, a truncation) wrote the prefix on the provider side, and after a
         transport failure the rest simply run against a cold cache.
-        There is no second warmer, and after warming the pending bound covers the remaining items
-        alone.
+        There is no second warmer.
 
-        timeout_seconds is each item's own deadline, started when that item starts, so an item
-        waiting for a pending slot has no deadline running yet.
+        max_working_seconds_per_item is how long one item may spend able to work, its clock stopped
+        for as long as that item waits to be admitted. An item waits behind the batch's other items
+        for a permit and then for its turn in the admission queue, and it waits out a shared pause
+        without being free to send anything, so charging any of that to the item would expire items
+        that never ran. What spends it is the request and the sleeps between attempts.
+        Use generate_one's timeout_seconds when what you need bounded is wall clock.
         An item that expires is returned as a TimedOutError while its siblings run on.
         Bound the batch this way rather than with a scope of your own: a cancellation from outside
         discards the returned list, settled results and all, because the list is this frame's and the
@@ -1179,7 +1266,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
-            timeout_seconds=timeout_seconds,
+            max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
     async def _generate_many_any_binding(
@@ -1188,13 +1275,13 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool,
         generate_item: "GenerateItem[OutputT]",
-        timeout_seconds: float | None,
+        max_working_seconds_per_item: float | None,
     ) -> list[CallResult[OutputT | None]]:
         """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
 
         generate_item runs one item, so a caller that wraps each call wraps every item of a batch
         alike, whichever branch below started it.
-        timeout_seconds is each item's own deadline, started when that item starts.
+        Every item gets a WorkingTimeDeadline of its own, built where that item starts.
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
@@ -1208,18 +1295,18 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             first_result = await self._generate_or_failure(
                 generation_inputs[0],
                 generate_item=generate_item,
-                timeout_seconds=timeout_seconds,
+                deadline=WorkingTimeDeadline(max_working_seconds_per_item),
             )
             rest = await self._run_items(
                 generation_inputs[1:],
                 generate_item=generate_item,
-                timeout_seconds=timeout_seconds,
+                max_working_seconds_per_item=max_working_seconds_per_item,
             )
             return [first_result, *rest]
         return await self._run_items(
             generation_inputs[0:],
             generate_item=generate_item,
-            timeout_seconds=timeout_seconds,
+            max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
     async def _run_items(
@@ -1227,7 +1314,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: Sequence[GenerationInput],
         *,
         generate_item: "GenerateItem[OutputT]",
-        timeout_seconds: float | None,
+        max_working_seconds_per_item: float | None,
     ) -> list[CallResult[OutputT | None]]:
         """Run the items through run_many, which returns them in input order.
 
@@ -1243,7 +1330,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         async def run_one(
             generation_input: GenerationInput,
         ) -> CallResult[OutputT | None]:
-            """Run one batch item.
+            """Run one batch item under a deadline of its own.
 
             Raises:
                 BaseException: _generate_or_failure propagated it.
@@ -1251,15 +1338,17 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             return await self._generate_or_failure(
                 generation_input,
                 generate_item=generate_item,
-                timeout_seconds=timeout_seconds,
+                deadline=WorkingTimeDeadline(max_working_seconds_per_item),
             )
 
         max_concurrent_requests = self.shared_backoff.max_concurrent_requests
-        max_pending = (
-            _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
-            if max_concurrent_requests is None
-            else max_concurrent_requests * _MAX_PENDING_TASKS_PER_CONCURRENT_REQUEST
-        )
+        if max_concurrent_requests is None:
+            max_pending = _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
+        else:
+            max_pending = (
+                max_concurrent_requests * _PENDING_TASKS_PER_CONCURRENT_REQUEST
+                + _SPARE_PENDING_TASKS
+            )
         return await run_many(generation_inputs, run_one, max_pending=max_pending)
 
     @overload

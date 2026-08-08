@@ -101,9 +101,11 @@ from langchaint.llm import (
     LLM,
     UNCHANGED,
     BoundLLM,
+    Deadline,
     GenerationInput,
     SequenceNotStr,
     Unchanged,
+    WallClockDeadline,
 )
 from langchaint.messages import (
     AssistantMessage,
@@ -1261,19 +1263,19 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 status set.
         """
         return await self._generate_one_any_binding(
-            generation_input, timeout_seconds=timeout_seconds
+            generation_input, deadline=WallClockDeadline(timeout_seconds)
         )
 
     async def _generate_one_any_binding(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None
+        self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> GenerateResult[Any]:
         """Run one call under a chat span of its own.
 
         The un-overloaded entry point, because a generic binding matches none of generate_one's
         overloads, which are keyed on a concrete one. Same request, widest type.
         It is also the GenerateItem passed to the wrapped BoundLLM, so a batch of n generation_inputs
-        traces as n chat spans, exactly as n generate_one calls do. timeout_seconds passes through
-        unread, so a traced batch gets the deadline an untraced one gets.
+        traces as n chat spans, exactly as n generate_one calls do. deadline passes through unread,
+        so a traced call gets the deadline an untraced one gets, of whichever kind its caller built.
 
         Raises:
             GenerationError: the call failed; the span is attributed and closed first, and a batch
@@ -1285,7 +1287,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         return await self._under_chat_span(
             generation_input,
             self._bound_llm._generate_one_any_binding(  # noqa: SLF001
-                generation_input, timeout_seconds=timeout_seconds
+                generation_input, deadline=deadline
             ),
         )
 
@@ -1333,7 +1335,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[str] | GenerationError]: ...
     @overload
     async def generate_many(
@@ -1341,7 +1343,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[CallResult[OutputT]]: ...
     @overload
     async def generate_many(
@@ -1349,14 +1351,14 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
-        timeout_seconds: float | None = ...,
+        max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = False,
-        timeout_seconds: float | None = None,
+        max_working_seconds_per_item: float | None = None,
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
     ) -> list[Any]:
@@ -1364,7 +1366,8 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         The overloads mirror BoundLLM.generate_many's, so each result's output is typed per binding.
 
-        warm_cache and timeout_seconds pass through to BoundLLM.generate_many, which documents them.
+        warm_cache and max_working_seconds_per_item pass through to BoundLLM.generate_many, which
+        documents them.
 
         A batch large enough for one span per item to be too many spans is what an OTel sampler is
         for, configured on the SDK where every other tracing volume decision is made.
@@ -1382,7 +1385,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             generation_inputs,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
-            timeout_seconds=timeout_seconds,
+            max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
     @overload

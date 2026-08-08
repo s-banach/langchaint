@@ -2,7 +2,6 @@
 
 An input is pending from the moment run_many starts its task until that task settles.
 max_pending caps the pending count, creating each task as an earlier one settles.
-A batch of a million inputs therefore never holds a million pending tasks.
 This module models nothing about LLMs and imports nothing from langchaint.
 """
 

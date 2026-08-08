@@ -53,9 +53,10 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
         "The new compiler release cuts build times roughly in half.",
     ]
 
-    # timeout_seconds is per-item wall time, starting when it is first attempted.
+    # max_working_seconds_per_item is how long one item may spend working; its clock stops while
+    # that item waits behind the others to be admitted.
     # generate_many returns errors as results, rather than raising.
-    results = await summarizer.generate_many(documents, timeout_seconds=30)
+    results = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
 
     for index, result in enumerate(results):
         if not isinstance(result, GenerationError):

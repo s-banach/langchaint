@@ -54,7 +54,9 @@ from pydantic import BaseModel, TypeAdapter
 from langchaint import (
     LLM,
     AssistantMessage,
+    AudioPart,
     ImagePart,
+    ImageUrlPart,
     InferenceParams,
     Message,
     RawPart,
@@ -77,6 +79,7 @@ from langchaint.adapter import (
     Binding,
     EmptyTurn,
     ErrorClassification,
+    InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutputOutcome,
     ProviderFailedTerminally,
@@ -623,6 +626,49 @@ def test_wire_input_converts_tool_result_parts_to_structured_output_content() ->
     ]
 
 
+def test_wire_input_sends_image_url_parts_unchanged() -> None:
+    """ImageUrlPart reaches both Responses image_url fields unchanged."""
+    image_url = ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True)
+    wire = _wire_input([
+        UserMessage(content=(image_url,)),
+        ToolMessage(tool_call_id="call1", content=(image_url,)),
+    ])
+    expected_image = {
+        "type": "input_image",
+        "image_url": "https://example.com/image.png",
+        "detail": "auto",
+        "prompt_cache_breakpoint": {"mode": "explicit"},
+    }
+    assert wire == [
+        {"role": "user", "content": [expected_image]},
+        {
+            "type": "function_call_output",
+            "call_id": "call1",
+            "output": [expected_image],
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        UserMessage(content=(AudioPart(data=b"wav", media_type="audio/wav"),)),
+        ToolMessage(
+            tool_call_id="call1",
+            content=(AudioPart(data=b"wav", media_type="audio/wav"),),
+        ),
+    ],
+)
+def test_build_request_reports_audio_as_invalid_request(message: Message) -> None:
+    """OpenAIResponsesAdapter returns InvalidRequest for AudioPart."""
+    request = (
+        _adapter().bind_text(_binding(automatic_prompt_caching=True)).build_request([message])
+    )
+    assert isinstance(request, InvalidRequest)
+    assert "AudioPart" in request.reason
+    assert type(message).__name__ in request.reason
+
+
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
     """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"
@@ -881,7 +927,9 @@ def _kwarg_sent[OutputT](
         return _FakeStreamManager()
 
     monkeypatch.setattr(bound._adapter.client.responses, "stream", fake_stream)
-    _ = asyncio.run(bound.open_stream(bound.build_request([UserMessage(content="q")])))
+    request = bound.build_request([UserMessage(content="q")])
+    assert isinstance(request, RequestParams)
+    _ = asyncio.run(bound.open_stream(request))
     (kwarg,) = captured
     return kwarg
 

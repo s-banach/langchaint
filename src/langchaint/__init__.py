@@ -49,8 +49,10 @@ from langchaint.inference_params import InferenceParams, ReasoningEffort
 from langchaint.llm import LLM, BoundLLM, GenerationInput
 from langchaint.messages import (
     AssistantMessage,
+    AudioPart,
     ContentPart,
     ImagePart,
+    ImageUrlPart,
     Message,
     MessageContent,
     RawPart,
@@ -114,6 +116,7 @@ __all__ = [
     "Admission",
     "AssistantMessage",
     "AttemptRecord",
+    "AudioPart",
     "Billing",
     "BoundLLM",
     "CallRecord",
@@ -137,6 +140,7 @@ __all__ = [
     "GenerationError",
     "GenerationInput",
     "ImagePart",
+    "ImageUrlPart",
     "InferenceParams",
     "InvalidRequestError",
     "InvalidToolArgsDetail",

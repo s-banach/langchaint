@@ -48,6 +48,11 @@ A Sequence[Message] accruing one cache_breakpoint per turn therefore keeps worki
 Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
 "1h" writes ttl "1h", whose writes bill at each table's cache_write_1h_usd_per_million_tokens).
 
+ContentPart mappings verified against anthropic 0.121.0:
+- `ImagePart` becomes `Base64ImageSourceParam`.
+- `ImageUrlPart` becomes `URLImageSourceParam`.
+- `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
+
 Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
   consecutive tool results group into one user message because the API requires alternating roles.
@@ -95,6 +100,7 @@ from anthropic.types import (
     ToolParam,
     ToolResultBlockParam,
     ToolUseBlockParam,
+    URLImageSourceParam,
 )
 from anthropic.types.json_output_format_param import JSONOutputFormatParam
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -406,35 +412,55 @@ class _NotSendableError(Exception):
         self.reason = reason
 
 
-def _part_block(part: ContentPart) -> TextBlockParam | ImageBlockParam:
+def _part_block(
+    part: ContentPart, *, message_class: type[UserMessage] | type[ToolMessage]
+) -> TextBlockParam | ImageBlockParam:
     """Convert one ContentPart to its wire block.
 
     Raises:
-        _NotSendableError: an ImagePart's media_type is outside the API's accepted set,
-            so the API would reject this request; the item fails on its own.
+        _NotSendableError: ContentPart has no wire form for message_class.
     """
-    if isinstance(part, TextPart):
-        return {"type": "text", "text": part.text}
-    if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
-        raise _NotSendableError(
-            f"the Anthropic API accepts image media types "
-            f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
-        )
-    image_source: Base64ImageSourceParam = {
-        "type": "base64",
-        "media_type": part.media_type,
-        "data": base64.b64encode(part.data).decode("ascii"),
-    }
-    return {"type": "image", "source": image_source}
+    match part.kind:
+        case "text":
+            return {"type": "text", "text": part.text}
+        case "image":
+            if part.media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
+                raise _NotSendableError(
+                    f"AnthropicMessagesAdapter cannot send ImagePart inside "
+                    f"{message_class.__name__}.content: the Anthropic API accepts media types "
+                    f"{_ANTHROPIC_IMAGE_MEDIA_TYPES}, not {part.media_type!r}"
+                )
+            image_source: Base64ImageSourceParam = {
+                "type": "base64",
+                "media_type": part.media_type,
+                "data": base64.b64encode(part.data).decode("ascii"),
+            }
+            return {"type": "image", "source": image_source}
+        case "image_url":
+            url_image_source: URLImageSourceParam = {"type": "url", "url": part.url}
+            return {"type": "image", "source": url_image_source}
+        case "audio":
+            missing_audio_type = (
+                "the Anthropic API has no audio input content type"
+                if message_class is UserMessage
+                else "ToolResultBlockParam.content has no audio variant"
+            )
+            raise _NotSendableError(
+                f"AnthropicMessagesAdapter cannot send AudioPart inside "
+                f"{message_class.__name__}.content: {missing_audio_type}"
+            )
 
 
 def _user_content_blocks(
     user_message: UserMessage,
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
-    """Convert one UserMessage's content to wire blocks; an image part propagates _part_block's _NotSendableError.
+    """Convert one UserMessage.content value to wire blocks.
 
     The second element holds the blocks whose part sets cache_breakpoint, in content order;
     the caller applies the request-wide marker budget, so no marker is written here.
+
+    Raises:
+        _NotSendableError: _part_block rejects one ContentPart.
     """
     blocks: list[_ContentBlockParam] = []
     marked: list[TextBlockParam | ImageBlockParam] = []
@@ -442,7 +468,7 @@ def _user_content_blocks(
         blocks.append({"type": "text", "text": user_message.content})
         return blocks, marked
     for part in user_message.content:
-        block = _part_block(part)
+        block = _part_block(part, message_class=UserMessage)
         blocks.append(block)
         if part.cache_breakpoint:
             marked.append(block)
@@ -454,12 +480,15 @@ def _tool_result_content(
 ) -> str | list[TextBlockParam | ImageBlockParam]:
     """Convert one ToolMessage's content to the tool_result content field.
 
-    A bare string passes through; a sequence of parts becomes wire text and image blocks,
-    an image part propagating _part_block's _NotSendableError.
+    A bare string passes through.
+    A ContentPart tuple becomes TextBlockParam and ImageBlockParam values.
+
+    Raises:
+        _NotSendableError: _part_block rejects one ContentPart.
     """
     if isinstance(content, str):
         return content
-    return [_part_block(part) for part in content]
+    return [_part_block(part, message_class=ToolMessage) for part in content]
 
 
 def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
@@ -571,9 +600,9 @@ def _wire_messages(
     computed once in _precompute_fields; at 0, every mark goes unwritten.
 
     Raises:
-        _NotSendableError: an image part's media_type is outside the API's set (from _part_block),
-            or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking),
-            or a stored payload names no type key (from _assistant_content_blocks).
+        _NotSendableError: A ContentPart lacks a wire form.
+            A ContentPart inside ToolMessage may set cache_breakpoint before the final index.
+            ReasoningPart.raw or RawPart.raw may omit type.
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
     wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []

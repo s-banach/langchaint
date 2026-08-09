@@ -44,11 +44,17 @@ Verified against openai 2.51.0:
 - `CompletionUsage` requires `prompt_tokens`, `completion_tokens`, and `total_tokens`;
   `prompt_tokens_details` (`cached_tokens`, `cache_write_tokens`) and
   `completion_tokens_details` (`reasoning_tokens`) are Optional, each counter included.
-- `ChatCompletionToolMessageParam.content` is text-only,
-  so an ImagePart inside ToolMessage.content is an InvalidRequest.
+- `ChatCompletionToolMessageParam.content` is text-only.
 - `prompt_cache_options` and part-level `prompt_cache_breakpoint` take the same values as on the
   Responses API, and the adapter maps `automatic_prompt_caching` and marked parts exactly as
   Binding.automatic_prompt_caching's docstring states for the openai adapters.
+
+ContentPart mappings verified against openai 2.53.0:
+- `ImagePart` becomes `image_url.url` containing a data URL.
+- `ImageUrlPart.url` becomes `image_url.url` unchanged.
+- `AudioPart` supports `audio/wav` and `audio/mpeg` inside `UserMessage`.
+- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `InvalidRequest`.
+- `ChatCompletionMessage.audio` remains available through `Response.raw`.
 
 Mapping decisions:
 - A str system_prompt becomes one system-role message first in every request;
@@ -77,6 +83,7 @@ Mapping decisions:
   Usage, cost, and stop reason arrive only on final()'s AdapterResult.
 """
 
+import base64
 from abc import ABC
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -89,6 +96,7 @@ from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
     ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartInputAudioParam,
     ChatCompletionContentPartParam,
     ChatCompletionContentPartTextParam,
     ChatCompletionFunctionToolParam,
@@ -139,7 +147,7 @@ from langchaint.exceptions import StreamProtocolError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
-    ImagePart,
+    ContentPart,
     Message,
     RawPart,
     ReasoningPart,
@@ -171,6 +179,12 @@ from langchaint.tools import ToolSchema
 
 type _WireToolChoice = Literal["none", "auto", "required"] | ChatCompletionNamedToolChoiceParam
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
+
+_AUDIO_FORMAT_BY_MEDIA_TYPE: Mapping[str, Literal["wav", "mp3"]] = {
+    "audio/wav": "wav",
+    "audio/mpeg": "mp3",
+}
+"""AudioPart.media_type values mapped to input_audio.format."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -274,25 +288,66 @@ def _text_part_param(part: TextPart) -> ChatCompletionContentPartTextParam:
     return wire_text
 
 
+def _image_part_param(
+    image_url: str, *, cache_breakpoint: bool
+) -> ChatCompletionContentPartImageParam:
+    wire_image: ChatCompletionContentPartImageParam = {
+        "type": "image_url",
+        "image_url": {"url": image_url, "detail": "auto"},
+    }
+    if cache_breakpoint:
+        wire_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
+    return wire_image
+
+
+def _text_only_tool_message_error(part: ContentPart) -> _NotSendableError:
+    return _NotSendableError(
+        f"OpenAIChatCompletionsAdapter cannot send {type(part).__name__} inside "
+        "ToolMessage.content: the tool message param's content is text-only"
+    )
+
+
 def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
     """Convert one UserMessage to a user-role message param.
 
     A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part.
+
+    Raises:
+        _NotSendableError: AudioPart.media_type has no input_audio.format mapping.
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
     parts: list[ChatCompletionContentPartParam] = []
     for part in user_message.content:
-        if isinstance(part, TextPart):
-            parts.append(_text_part_param(part))
-        else:
-            wire_image: ChatCompletionContentPartImageParam = {
-                "type": "image_url",
-                "image_url": {"url": _image_data_uri(part), "detail": "auto"},
-            }
-            if part.cache_breakpoint:
-                wire_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
-            parts.append(wire_image)
+        match part.kind:
+            case "text":
+                parts.append(_text_part_param(part))
+            case "image":
+                parts.append(
+                    _image_part_param(
+                        _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
+                    )
+                )
+            case "image_url":
+                parts.append(_image_part_param(part.url, cache_breakpoint=part.cache_breakpoint))
+            case "audio":
+                audio_format = _AUDIO_FORMAT_BY_MEDIA_TYPE.get(part.media_type)
+                if audio_format is None:
+                    raise _NotSendableError(
+                        "OpenAIChatCompletionsAdapter cannot send AudioPart inside "
+                        f"UserMessage.content: AudioPart.media_type must be 'audio/wav' or "
+                        f"'audio/mpeg', not {part.media_type!r}"
+                    )
+                wire_audio: ChatCompletionContentPartInputAudioParam = {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(part.data).decode("ascii"),
+                        "format": audio_format,
+                    },
+                }
+                if part.cache_breakpoint:
+                    wire_audio["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                parts.append(wire_audio)
     return {"role": "user", "content": parts}
 
 
@@ -302,8 +357,7 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
     The API has no is_error flag, so the error text in content is the only error signal.
 
     Raises:
-        _NotSendableError: content holds an ImagePart, which the text-only tool message param
-            cannot carry; dropping it silently would misstate the request.
+        _NotSendableError: content holds ImagePart, ImageUrlPart, or AudioPart.
     """
     if isinstance(tool_message.content, str):
         return {
@@ -313,12 +367,15 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
         }
     parts: list[ChatCompletionContentPartTextParam] = []
     for part in tool_message.content:
-        if isinstance(part, ImagePart):
-            raise _NotSendableError(
-                "an ImagePart inside ToolMessage.content has no Chat Completions wire form: "
-                "the tool message param's content is text-only"
-            )
-        parts.append(_text_part_param(part))
+        match part.kind:
+            case "text":
+                parts.append(_text_part_param(part))
+            case "image":
+                raise _text_only_tool_message_error(part)
+            case "image_url":
+                raise _text_only_tool_message_error(part)
+            case "audio":
+                raise _text_only_tool_message_error(part)
     return {
         "role": "tool",
         "tool_call_id": tool_message.tool_call_id,
@@ -382,7 +439,8 @@ def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessagePar
     """Keep the bound system prompt outside messages.
 
     Raises:
-        _NotSendableError: ToolMessage contains ImagePart, or RawPart.raw has no wire form.
+        _NotSendableError: ToolMessage contains ImagePart, ImageUrlPart, or AudioPart.
+            RawPart.raw may also have no wire form.
     """
     wire: list[ChatCompletionMessageParam] = []
     for message in messages:

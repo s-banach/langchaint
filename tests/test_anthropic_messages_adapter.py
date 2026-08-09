@@ -34,8 +34,10 @@ from pydantic import BaseModel, TypeAdapter
 from langchaint import (
     LLM,
     AssistantMessage,
+    AudioPart,
     Billing,
     ImagePart,
+    ImageUrlPart,
     InferenceParams,
     Message,
     PydanticTool,
@@ -677,6 +679,52 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
             },
         },
     ]
+
+
+def test_wire_messages_sends_image_url_part_unchanged() -> None:
+    """ImageUrlPart uses URLImageSourceParam in UserMessage and ToolMessage."""
+    image_url = ImageUrlPart(
+        url="https://example.com/image.png",
+        media_type="image/png",
+        cache_breakpoint=True,
+    )
+    wire = _wire_messages(
+        [
+            UserMessage(content=(image_url,)),
+            ToolMessage(tool_call_id="tu_1", content=(image_url,)),
+        ],
+        automatic_prompt_caching=False,
+        cache_ttl="5m",
+        message_mark_budget=4,
+    )
+    expected_unmarked_block = {
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.com/image.png"},
+    }
+    assert _content_blocks(wire[0]) == [
+        {**expected_unmarked_block, "cache_control": {"type": "ephemeral"}}
+    ]
+    tool_result = _content_blocks(wire[1])[0]
+    assert tool_result["content"] == [expected_unmarked_block]
+    assert tool_result["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        UserMessage(content=(AudioPart(data=b"wav", media_type="audio/wav"),)),
+        ToolMessage(
+            tool_call_id="tu_1",
+            content=(AudioPart(data=b"wav", media_type="audio/wav"),),
+        ),
+    ],
+)
+def test_build_request_reports_audio_part_as_invalid_request(message: Message) -> None:
+    """AnthropicMessagesAdapter returns InvalidRequest for AudioPart."""
+    request = _structured_bound().build_request([message])
+    assert isinstance(request, InvalidRequest)
+    assert "AudioPart" in request.reason
+    assert type(message).__name__ in request.reason
 
 
 def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -> None:

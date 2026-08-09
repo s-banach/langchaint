@@ -40,9 +40,17 @@ from langchaint.call import AttemptRecord, CallRecord
 from langchaint.exceptions import AbandonedCallError, StreamProtocolError, TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import (
+    AssistantMessage,
+    AudioPart,
+    ContentPart,
+    ImagePart,
+    ImageUrlPart,
     Message,
     RawPart,
     ReasoningPart,
+    TextPart,
+    ToolCall,
+    ToolMessage,
     UserMessage,
     messages_from_json,
     messages_to_json,
@@ -61,6 +69,14 @@ _PLAIN_TEXT_BINDING = Binding(
     automatic_prompt_caching=True,
 )
 """The binding every invariant here binds under: text output and nothing else stated."""
+
+_CONTENT_PART_CASES: tuple[ContentPart, ...] = (
+    TextPart(text="text"),
+    ImagePart(data=b"image", media_type="image/png"),
+    ImageUrlPart(url="https://example.com/image.png", media_type="image/png"),
+    AudioPart(data=b"audio", media_type="audio/wav"),
+)
+"""Representative values for every ContentPart variant."""
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
@@ -349,6 +365,39 @@ class AdapterConformance(ABC):
         assert self._assistant_wire_parts_of(
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
+
+    def test_each_content_part_builds_or_returns_invalid_request(self) -> None:
+        """Each ContentPart has an explicit UserMessage and ToolMessage result."""
+        content_part_types = get_args(get_args(ContentPart.__value__)[0])
+        assert {type(part) for part in _CONTENT_PART_CASES} == set(content_part_types)
+        bound_adapter = self._bound_adapter()
+        tool_call = ToolCall(id="media_call", name="media", args_json="{}")
+        for part in _CONTENT_PART_CASES:
+            messages_and_message_class: tuple[
+                tuple[list[Message], type[UserMessage] | type[ToolMessage]], ...
+            ] = (
+                ([UserMessage(content=(part,))], UserMessage),
+                (
+                    [
+                        AssistantMessage(turn=(tool_call,)),
+                        ToolMessage(tool_call_id=tool_call.id, content=(part,)),
+                    ],
+                    ToolMessage,
+                ),
+            )
+            for messages, message_class in messages_and_message_class:
+                request = bound_adapter.build_request(messages)
+                assert isinstance(request, RequestParams | InvalidRequest)
+                if isinstance(request, InvalidRequest):
+                    assert type(part).__name__ in request.reason
+                    assert message_class.__name__ in request.reason
+
+    def test_image_url_part_in_a_user_message_builds(self) -> None:
+        """Every adapter sends ImageUrlPart inside UserMessage.content."""
+        request = self._bound_adapter().build_request([
+            UserMessage(content=(ImageUrlPart(url="https://example.com/image.png"),))
+        ])
+        assert isinstance(request, RequestParams)
 
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.

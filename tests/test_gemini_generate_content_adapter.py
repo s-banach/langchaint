@@ -20,8 +20,11 @@ from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     AssistantMessage,
+    AudioPart,
     Billing,
+    ContentPart,
     ImagePart,
+    ImageUrlPart,
     InferenceParams,
     Message,
     RawPart,
@@ -465,11 +468,19 @@ def test_extra_body_passes_unpopulated_keys_through() -> None:
 
 
 def test_user_message_forms() -> None:
-    """A str is one text part; a parts tuple maps text to text and images to inline_data blobs."""
+    """UserMessage maps ImagePart and AudioPart to Part.inline_data.
+
+    ImageUrlPart maps to Part.file_data.
+    """
     request = _built_request([
         UserMessage(content="hi"),
         UserMessage(
-            content=(TextPart(text="look:"), ImagePart(data=b"\x89PNG", media_type="image/png"))
+            content=(
+                TextPart(text="look:"),
+                ImagePart(data=b"\x89PNG", media_type="image/png"),
+                ImageUrlPart(url="gs://bucket/image.png", media_type="image/png"),
+                AudioPart(data=b"WAV", media_type="audio/wav"),
+            )
         ),
     ])
     assert request.contents[0] == types.Content(role="user", parts=[types.Part(text="hi")])
@@ -478,6 +489,13 @@ def test_user_message_forms() -> None:
         parts=[
             types.Part(text="look:"),
             types.Part(inline_data=types.Blob(data=b"\x89PNG", mime_type="image/png")),
+            types.Part(
+                file_data=types.FileData(
+                    file_uri="gs://bucket/image.png",
+                    mime_type="image/png",
+                )
+            ),
+            types.Part(inline_data=types.Blob(data=b"WAV", mime_type="audio/wav")),
         ],
     )
 
@@ -512,8 +530,8 @@ def test_tool_results_group_and_recover_names() -> None:
     )
 
 
-def test_tool_result_parts_split_text_and_media() -> None:
-    """TextPart texts concatenate into the response dict; each ImagePart becomes an inline blob."""
+def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
+    """ToolMessage maps ContentPart values to FunctionResponsePart fields."""
     request = _built_request([
         AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(
@@ -521,6 +539,8 @@ def test_tool_result_parts_split_text_and_media() -> None:
             content=(
                 TextPart(text="a"),
                 ImagePart(data=b"IMG", media_type="image/png"),
+                ImageUrlPart(url="gs://bucket/image.png", media_type="image/png"),
+                AudioPart(data=b"WAV", media_type="audio/wav"),
                 TextPart(text="b"),
             ),
         ),
@@ -533,7 +553,16 @@ def test_tool_result_parts_split_text_and_media() -> None:
     assert function_response.parts == [
         types.FunctionResponsePart(
             inline_data=types.FunctionResponseBlob(data=b"IMG", mime_type="image/png")
-        )
+        ),
+        types.FunctionResponsePart(
+            file_data=types.FunctionResponseFileData(
+                file_uri="gs://bucket/image.png",
+                mime_type="image/png",
+            )
+        ),
+        types.FunctionResponsePart(
+            inline_data=types.FunctionResponseBlob(data=b"WAV", mime_type="audio/wav")
+        ),
     ]
 
 
@@ -559,17 +588,43 @@ def test_non_object_args_json_is_invalid() -> None:
     assert "JSON object" in invalid.reason
 
 
-def test_marked_message_parts_are_invalid() -> None:
-    """cache_breakpoint has no Gemini wire form, on user parts and tool-result parts alike."""
-    marked_user = _invalid_request([
-        UserMessage(content=(TextPart(text="a", cache_breakpoint=True),))
-    ])
-    assert "cache_breakpoint" in marked_user.reason
-    marked_tool = _invalid_request([
-        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
-        ToolMessage(tool_call_id="c", content=(TextPart(text="a", cache_breakpoint=True),)),
-    ])
-    assert "cache_breakpoint" in marked_tool.reason
+@pytest.mark.parametrize(
+    ("part", "message_class"),
+    [
+        (TextPart(text="a", cache_breakpoint=True), UserMessage),
+        (TextPart(text="a", cache_breakpoint=True), ToolMessage),
+        (
+            ImageUrlPart(
+                url="gs://bucket/image.png",
+                cache_breakpoint=True,
+            ),
+            UserMessage,
+        ),
+        (
+            AudioPart(
+                data=b"WAV",
+                media_type="audio/wav",
+                cache_breakpoint=True,
+            ),
+            UserMessage,
+        ),
+    ],
+)
+def test_cache_breakpoint_on_content_part_is_invalid(
+    part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
+) -> None:
+    """cache_breakpoint has no Gemini wire form in UserMessage or ToolMessage."""
+    if message_class is UserMessage:
+        messages: Sequence[Message] = [UserMessage(content=(part,))]
+    else:
+        messages = [
+            AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
+            ToolMessage(tool_call_id="c", content=(part,)),
+        ]
+    invalid = _invalid_request(messages)
+    assert "cache_breakpoint" in invalid.reason
+    assert type(part).__name__ in invalid.reason
+    assert message_class.__name__ in invalid.reason
 
 
 def test_a_cross_provider_reasoning_part_is_invalid() -> None:

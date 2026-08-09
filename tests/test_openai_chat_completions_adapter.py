@@ -28,7 +28,10 @@ from pydantic import BaseModel
 
 from langchaint import (
     AssistantMessage,
+    AudioPart,
+    ContentPart,
     ImagePart,
+    ImageUrlPart,
     InferenceParams,
     RawPart,
     ReasoningDelta,
@@ -587,6 +590,62 @@ def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
     ]
 
 
+def test_wire_messages_maps_image_url_part_and_audio_part_in_user_message() -> None:
+    """UserMessage maps ImageUrlPart and supported AudioPart.media_type values."""
+    wire = _wire_messages([
+        UserMessage(
+            content=(
+                ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
+                AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
+                AudioPart(data=b"mp3", media_type="audio/mpeg"),
+            )
+        )
+    ])
+    assert wire == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/image.png",
+                        "detail": "auto",
+                    },
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(b"wav").decode("ascii"),
+                        "format": "wav",
+                    },
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(b"mp3").decode("ascii"),
+                        "format": "mp3",
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_build_request_rejects_audio_part_media_type_without_input_audio_format() -> None:
+    """AudioPart.media_type without an input_audio.format mapping returns InvalidRequest."""
+    request = (
+        _adapter()
+        .bind_text(_binding())
+        .build_request([UserMessage(content=(AudioPart(data=b"audio", media_type="audio/ogg"),))])
+    )
+    assert isinstance(request, InvalidRequest)
+    assert "AudioPart" in request.reason
+    assert "UserMessage" in request.reason
+    assert "audio/ogg" in request.reason
+
+
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
     """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"
@@ -675,17 +734,29 @@ def test_build_request_places_the_prefix_ahead_of_the_converted_messages() -> No
     ]
 
 
-def test_build_request_reports_an_image_inside_a_tool_message_as_invalid_request() -> None:
-    """The tool message param is text-only, so the defect fails the item before any request is sent."""
+@pytest.mark.parametrize(
+    "part",
+    [
+        ImagePart(data=b"png", media_type="image/png"),
+        ImageUrlPart(url="https://example.com/image.png"),
+        AudioPart(data=b"wav", media_type="audio/wav"),
+    ],
+)
+def test_build_request_reports_image_part_image_url_part_and_audio_part_in_tool_message(
+    part: ContentPart,
+) -> None:
+    """ImagePart, ImageUrlPart, and AudioPart return InvalidRequest before sending."""
     bound = _adapter().bind_text(_binding())
     request = bound.build_request([
         ToolMessage(
             tool_call_id="c1",
-            content=(TextPart(text="saw"), ImagePart(data=b"png", media_type="image/png")),
+            content=(TextPart(text="saw"), part),
         )
     ])
     assert isinstance(request, InvalidRequest)
     assert "text-only" in request.reason
+    assert type(part).__name__ in request.reason
+    assert "ToolMessage" in request.reason
 
 
 def test_build_request_reports_a_raw_part_in_a_turn_as_invalid_request() -> None:

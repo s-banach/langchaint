@@ -41,6 +41,13 @@ the cache-read rate under either value, and no cache write is ever billed. A use
 so a marked system part raises ValueError at bind and a marked message part returns InvalidRequest.
 An explicit cache resource is reachable through extra_body as `{"cachedContent": ...}`.
 
+ContentPart mappings verified against google-genai 2.17.0:
+- `ImagePart` becomes `Part.inline_data`.
+- `ImageUrlPart` becomes `Part.file_data`.
+- `AudioPart` becomes `Part.inline_data`.
+- `ImagePart` and `AudioPart` become `FunctionResponsePart.inline_data` inside `ToolMessage`.
+- `ImageUrlPart` becomes `FunctionResponsePart.file_data` inside `ToolMessage`.
+
 Mapping decisions:
 - ToolMessage becomes a `function_response` part inside a user-role Content; consecutive tool
   messages group into one Content. The FunctionResponse `name` is recovered from the ToolCall whose
@@ -536,27 +543,57 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
     return parts
 
 
+def _cache_breakpoint_reason(
+    part: ContentPart, *, message_class: type[UserMessage] | type[ToolMessage]
+) -> str:
+    """Name the marked ContentPart and message_class Gemini cannot send."""
+    return (
+        f"GeminiGenerateContentAdapter cannot send {type(part).__name__} inside "
+        f"{message_class.__name__}.content: cache_breakpoint has no Gemini wire form"
+    )
+
+
+def _inline_part(data: bytes, media_type: str) -> types.Part:
+    return types.Part(inline_data=types.Blob(data=data, mime_type=media_type))
+
+
+def _inline_function_response_part(data: bytes, media_type: str) -> types.FunctionResponsePart:
+    return types.FunctionResponsePart(
+        inline_data=types.FunctionResponseBlob(data=data, mime_type=media_type)
+    )
+
+
 def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
     """Convert one UserMessage's content to wire parts.
 
-    An ImagePart's media_type passes through verbatim: no accepted set is introspectable, so a type
-    the provider rejects surfaces as its own error.
+    ImagePart and AudioPart use Part.inline_data.
+    ImageUrlPart uses Part.file_data.
 
     Raises:
-        _NotSendableError: a part sets cache_breakpoint, which has no Gemini wire form.
+        _NotSendableError: A ContentPart sets cache_breakpoint.
     """
     if isinstance(content, str):
         return [types.Part(text=content)]
     parts: list[types.Part] = []
     for part in content:
         if part.cache_breakpoint:
-            raise _NotSendableError(_NO_CACHE_BREAKPOINT_WIRE_FORM)
-        if isinstance(part, TextPart):
-            parts.append(types.Part(text=part.text))
-        else:
-            parts.append(
-                types.Part(inline_data=types.Blob(data=part.data, mime_type=part.media_type))
-            )
+            raise _NotSendableError(_cache_breakpoint_reason(part, message_class=UserMessage))
+        match part.kind:
+            case "text":
+                parts.append(types.Part(text=part.text))
+            case "image":
+                parts.append(_inline_part(part.data, part.media_type))
+            case "image_url":
+                parts.append(
+                    types.Part(
+                        file_data=types.FileData(
+                            file_uri=part.url,
+                            mime_type=part.media_type,
+                        )
+                    )
+                )
+            case "audio":
+                parts.append(_inline_part(part.data, part.media_type))
     return parts
 
 
@@ -565,15 +602,15 @@ def _function_response_part(
 ) -> types.Part:
     """Convert one ToolMessage to its function_response part.
 
-    The response dict carries the content's text under "output", or under "error" when is_error:
-    the two keys the SDK documents as function output and error details. A parts-tuple content
-    contributes its concatenated TextPart texts there, and each ImagePart becomes an inline
-    FunctionResponsePart blob. The id is sent only when it differs from the recovered name,
-    mirroring _function_call_from's synthesized-id omission.
+    FunctionResponse.response stores concatenated TextPart.text under "output" or "error".
+    ImagePart and AudioPart use FunctionResponsePart.inline_data.
+    ImageUrlPart uses FunctionResponsePart.file_data.
+    FunctionResponse.id is omitted when it equals the recovered ToolCall.name.
 
     Raises:
-        _NotSendableError: tool_call_id matches no ToolCall in an earlier assistant turn, so the
-            required FunctionResponse name cannot be recovered; or a part sets cache_breakpoint.
+        _NotSendableError: ToolMessage.tool_call_id matches no earlier ToolCall.id.
+            FunctionResponse.name cannot be recovered in that case.
+            cache_breakpoint on any ContentPart also raises.
     """
     name = tool_call_names.get(tool_message.tool_call_id)
     if name is None:
@@ -581,31 +618,41 @@ def _function_response_part(
             f"tool_call_id {tool_message.tool_call_id!r} matches no ToolCall in an earlier "
             f"assistant turn, so the FunctionResponse name the wire requires cannot be recovered"
         )
-    media_parts: list[types.FunctionResponsePart] = []
+    function_response_parts: list[types.FunctionResponsePart] = []
     if isinstance(tool_message.content, str):
         text = tool_message.content
     else:
         texts: list[str] = []
         for part in tool_message.content:
             if part.cache_breakpoint:
-                raise _NotSendableError(_NO_CACHE_BREAKPOINT_WIRE_FORM)
-            if isinstance(part, TextPart):
-                texts.append(part.text)
-            else:
-                media_parts.append(
-                    types.FunctionResponsePart(
-                        inline_data=types.FunctionResponseBlob(
-                            data=part.data, mime_type=part.media_type
+                raise _NotSendableError(_cache_breakpoint_reason(part, message_class=ToolMessage))
+            match part.kind:
+                case "text":
+                    texts.append(part.text)
+                case "image":
+                    function_response_parts.append(
+                        _inline_function_response_part(part.data, part.media_type)
+                    )
+                case "image_url":
+                    function_response_parts.append(
+                        types.FunctionResponsePart(
+                            file_data=types.FunctionResponseFileData(
+                                file_uri=part.url,
+                                mime_type=part.media_type,
+                            )
                         )
                     )
-                )
+                case "audio":
+                    function_response_parts.append(
+                        _inline_function_response_part(part.data, part.media_type)
+                    )
         text = "".join(texts)
     return types.Part(
         function_response=types.FunctionResponse(
             id=None if tool_message.tool_call_id == name else tool_message.tool_call_id,
             name=name,
             response={"error" if tool_message.is_error else "output": text},
-            parts=media_parts or None,
+            parts=function_response_parts or None,
         )
     )
 

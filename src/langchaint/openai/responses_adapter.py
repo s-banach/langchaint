@@ -52,6 +52,11 @@ the Usage partition is checked against. That one is verified by docs rather than
 the SDK documents no relationship among the input counters,
 so `_billing_from_response` carries the page that does.
 
+ContentPart mappings verified against openai 2.53.0:
+- `ImagePart` becomes `image_url` containing a data URL.
+- `ImageUrlPart.url` becomes `image_url` unchanged.
+- `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
+
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;
   a parts system_prompt travels as a developer-role input message first in every request's input,
@@ -65,7 +70,6 @@ Mapping decisions:
   and a maximal run of adjacent TextParts one assistant message item;
   ToolMessage becomes a `function_call_output` item keyed by call_id.
   The API has no is_error flag, so the error text in output is the only error signal.
-- ImagePart becomes an `input_image` item with a data: URI and `detail="auto"`.
 - The API reports no finish reason; stop_reason is derived: a `ResponseOutputRefusal` content block means refusal,
   else any `function_call` output item means tool_use, otherwise status "completed" means end_turn,
   status "incomplete" means max_tokens or refusal by its reason ("max_output_tokens" or
@@ -130,6 +134,7 @@ from langchaint.adapter import (
     BoundAdapter,
     EmptyTurn,
     ErrorClassification,
+    InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutput,
     NoOutputOutcome,
@@ -281,31 +286,70 @@ class _OpenAIRequestParams(RequestParams):
         return request_json(self, omitted_class=Omit)
 
 
+class _NotSendableError(Exception):
+    """A Sequence[Message] this adapter cannot send."""
+
+    def __init__(self, reason: str) -> None:
+        """Store the InvalidRequest.reason."""
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _user_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInputImageParam:
+    wire_image: ResponseInputImageParam = {
+        "type": "input_image",
+        "image_url": image_url,
+        "detail": "auto",
+    }
+    if cache_breakpoint:
+        wire_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
+    return wire_image
+
+
+def _tool_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInputImageContentParam:
+    output_image: ResponseInputImageContentParam = {
+        "type": "input_image",
+        "image_url": image_url,
+        "detail": "auto",
+    }
+    if cache_breakpoint:
+        output_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
+    return output_image
+
+
 def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
     """Convert one UserMessage to a user message item.
 
     A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part;
     the API writes up to the latest four breakpoints per request (three in implicit mode)
     and treats older ones as read-only, so every mark is sent and no client-side cap applies.
+
+    Raises:
+        _NotSendableError: content holds AudioPart.
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
     parts: ResponseInputMessageContentListParam = []
     for part in user_message.content:
-        if isinstance(part, TextPart):
-            wire_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
-            if part.cache_breakpoint:
-                wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
-            parts.append(wire_text)
-        else:
-            wire_image: ResponseInputImageParam = {
-                "type": "input_image",
-                "image_url": _image_data_uri(part),
-                "detail": "auto",
-            }
-            if part.cache_breakpoint:
-                wire_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
-            parts.append(wire_image)
+        match part.kind:
+            case "text":
+                wire_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
+                if part.cache_breakpoint:
+                    wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                parts.append(wire_text)
+            case "image":
+                parts.append(
+                    _user_image_param(
+                        _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
+                    )
+                )
+            case "image_url":
+                parts.append(_user_image_param(part.url, cache_breakpoint=part.cache_breakpoint))
+            case "audio":
+                raise _NotSendableError(
+                    "OpenAIResponsesAdapter cannot send AudioPart inside UserMessage.content: "
+                    "ResponseInputContentParam has no audio variant"
+                )
     return {"role": "user", "content": parts}
 
 
@@ -314,32 +358,45 @@ def _function_call_output(
 ) -> str | ResponseFunctionCallOutputItemListParam:
     """Convert one ToolMessage's content to the function_call_output output field.
 
-    The installed openai SDK's function_call_output output field is `str | ResponseFunctionCallOutputItemListParam`,
-    a list of input_text and input_image content params, so parts carry images to this provider.
+    The output field accepts str or ResponseFunctionCallOutputItemListParam.
+    ResponseFunctionCallOutputItemListParam accepts text and image content.
     A bare string passes through; a sequence of parts becomes that structured content list.
     The image content param is a distinct wire type from the user-message input_image param,
     so this builds its own dict rather than reusing _user_item's list, sharing only the data: URI encoding.
     A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part,
     under the same latest-N server rule _user_item's docstring states.
+
+    Raises:
+        _NotSendableError: content holds AudioPart.
     """
     if isinstance(content, str):
         return content
     output_content: ResponseFunctionCallOutputItemListParam = []
     for part in content:
-        if isinstance(part, TextPart):
-            output_text: ResponseInputTextContentParam = {"type": "input_text", "text": part.text}
-            if part.cache_breakpoint:
-                output_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
-            output_content.append(output_text)
-        else:
-            output_image: ResponseInputImageContentParam = {
-                "type": "input_image",
-                "image_url": _image_data_uri(part),
-                "detail": "auto",
-            }
-            if part.cache_breakpoint:
-                output_image["prompt_cache_breakpoint"] = {"mode": "explicit"}
-            output_content.append(output_image)
+        match part.kind:
+            case "text":
+                output_text: ResponseInputTextContentParam = {
+                    "type": "input_text",
+                    "text": part.text,
+                }
+                if part.cache_breakpoint:
+                    output_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                output_content.append(output_text)
+            case "image":
+                output_content.append(
+                    _tool_image_param(
+                        _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
+                    )
+                )
+            case "image_url":
+                output_content.append(
+                    _tool_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
+                )
+            case "audio":
+                raise _NotSendableError(
+                    "OpenAIResponsesAdapter cannot send AudioPart inside ToolMessage.content: "
+                    "ResponseFunctionCallOutputItemListParam has no audio variant"
+                )
     return output_content
 
 
@@ -400,7 +457,11 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
 
 
 def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
-    """Convert messages to input items; the system prompt is not one."""
+    """Convert messages to input items; the system prompt is separate.
+
+    Raises:
+        _NotSendableError: A ContentPart has no Responses wire form.
+    """
     wire: list[ResponseInputItemParam] = []
     for message in messages:
         if isinstance(message, ToolMessage):
@@ -1051,14 +1112,15 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         return _identity_from_response(raw)
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams:
-        """Convert messages into the input every attempt of this call sends.
-
-        Returns no InvalidRequest: this adapter puts every Sequence[Message] on the wire.
-        """
+    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+        """Convert messages into each attempt's input."""
+        try:
+            wire_input = _wire_input(messages)
+        except _NotSendableError as not_sendable:
+            return InvalidRequest(reason=not_sendable.reason)
         return _OpenAIRequestParams(
             precomputed=self._precomputed_fields,
-            input=[*self._precomputed_fields.input_prefix, *_wire_input(messages)],
+            input=[*self._precomputed_fields.input_prefix, *wire_input],
         )
 
     @override

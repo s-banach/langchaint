@@ -45,9 +45,6 @@ Undecided, and billing-relevant, so the user decides: whether the anthropic rate
 
 Stop when a constructed anthropic usage reporting `web_search_requests` prices at the table's per-invocation rate, and reports NaN where the table holds no rate for that tool.
 
-## Two capabilities langchaint has no binding for
+## Embeddings
 
-State the answer for each where a reader reaches for it, so a reader stops looking.
-
-- Embeddings. The pydantic-ai RAG example needs them, and langchaint generates text only.
-- Media beyond images. `ImagePart` carries bytes and a media type. `plan-richer-content-blocks.md` specifies `AudioPart` and `ImageUrlPart`. Documents stay outside `ContentPart`. Its docstring specifies the application conversion.
+The pydantic-ai RAG example needs embeddings, and langchaint generates text only.

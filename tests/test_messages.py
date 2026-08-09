@@ -6,6 +6,7 @@ Every variant carries a kind tag, and a payload without one is rejected rather t
 """
 
 import json
+from collections.abc import Callable
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -13,7 +14,9 @@ from pydantic_core import PydanticSerializationError
 
 from langchaint import (
     AssistantMessage,
+    AudioPart,
     ImagePart,
+    ImageUrlPart,
     Message,
     RawPart,
     ReasoningPart,
@@ -167,11 +170,42 @@ def test_image_bytes_serialize_as_url_safe_base64_text() -> None:
     assert json.loads(image.model_dump_json())["data"] == "iVBORwD_"
 
 
-def test_malformed_base64_image_data_is_rejected_on_json_validation() -> None:
-    """A JSON payload whose data is not base64 fails validation instead of decoding to wrong bytes."""
-    payload = '{"kind": "image", "data": "!!!not-base64!!!", "media_type": "image/png"}'
+@pytest.mark.parametrize(
+    ("validate_json", "payload"),
+    [
+        (
+            ImagePart.model_validate_json,
+            '{"kind":"image","data":"!!!not-base64!!!","media_type":"image/png"}',
+        ),
+        (
+            AudioPart.model_validate_json,
+            '{"kind":"audio","data":"!!!not-base64!!!","media_type":"audio/wav"}',
+        ),
+    ],
+)
+def test_malformed_base64_data_is_rejected_on_json_validation(
+    validate_json: Callable[[str], object], payload: str
+) -> None:
+    """Malformed base64 fails JSON validation."""
     with pytest.raises(ValidationError):
-        _ = ImagePart.model_validate_json(payload)
+        _ = validate_json(payload)
+
+
+def test_image_url_part_json_is_pinned_exactly() -> None:
+    """ImageUrlPart JSON pins url, media_type, cache_breakpoint, and kind."""
+    image_url = ImageUrlPart(url="https://example.com/a.png", media_type="image/png")
+    assert image_url.model_dump_json() == (
+        '{"url":"https://example.com/a.png","media_type":"image/png",'
+        '"cache_breakpoint":false,"kind":"image_url"}'
+    )
+
+
+def test_audio_part_json_is_pinned_exactly() -> None:
+    """AudioPart JSON stores data as URL-safe base64 text."""
+    audio = AudioPart(data=b"\xfb\xff", media_type="audio/wav")
+    assert audio.model_dump_json() == (
+        '{"data":"-_8=","media_type":"audio/wav","cache_breakpoint":false,"kind":"audio"}'
+    )
 
 
 def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
@@ -238,7 +272,7 @@ _PINNED_MESSAGES: tuple[Message, ...] = (
 
 
 def _one_of_each_message() -> list[Message]:
-    """One conversation holding every Message and TurnPart variant.
+    """One conversation holding every Message, ContentPart, and TurnPart variant.
 
     Append a part here, so _PINNED_MESSAGES stays pinned.
     """
@@ -249,6 +283,19 @@ def _one_of_each_message() -> list[Message]:
                 RawPart(raw={"type": "web_search_call", "id": "ws_1"}),
                 TextPart(text="ok"),
             )
+        ),
+        UserMessage(
+            content=(
+                ImageUrlPart(url="https://example.com/a.png", media_type="image/png"),
+                AudioPart(data=b"wav", media_type="audio/wav"),
+            )
+        ),
+        ToolMessage(
+            tool_call_id="media_call",
+            content=(
+                ImageUrlPart(url="https://example.com/tool.png"),
+                AudioPart(data=b"mp3", media_type="audio/mpeg"),
+            ),
         ),
     ]
 

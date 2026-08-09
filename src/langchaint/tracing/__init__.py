@@ -487,21 +487,26 @@ def _apply_agent_exit_attributes(
 def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, object]]:
     """Render a MessageContent as the convention's parts array.
 
-    A str becomes a one-element text array rather than staying a bare string,
-    so a content-carrying key holds one shape on every call and no consumer sniffs the type before reading it.
-    An ImagePart becomes {"type": "blob", "mime_type": ...} with the bytes dropped:
-    an image is routinely megabytes and base64 in a span attribute can dwarf the span itself,
-    and the schema's GenericPart variant permits it (it requires only type and allows additional properties).
-    Image bytes therefore never appear in a trace.
+    A str becomes one text part.
+    ImagePart and AudioPart become blob metadata without data.
+    ImageUrlPart keeps url and its optional media_type.
     """
     if isinstance(content, str):
         return [{"type": "text", "content": content}]
     parts: list[dict[str, object]] = []
     for part in content:
-        if isinstance(part, TextPart):
-            parts.append({"type": "text", "content": part.text})
-        else:
-            parts.append({"type": "blob", "mime_type": part.media_type})
+        match part.kind:
+            case "text":
+                parts.append({"type": "text", "content": part.text})
+            case "image":
+                parts.append({"type": "blob", "mime_type": part.media_type})
+            case "image_url":
+                image_url: dict[str, object] = {"type": "image_url", "url": part.url}
+                if part.media_type is not None:
+                    image_url["mime_type"] = part.media_type
+                parts.append(image_url)
+            case "audio":
+                parts.append({"type": "blob", "mime_type": part.media_type})
     return parts
 
 

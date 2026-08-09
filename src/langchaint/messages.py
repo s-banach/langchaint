@@ -52,7 +52,43 @@ class ImagePart(CheckedCopyModel):
     kind: Literal["image"] = "image"
 
 
-type ContentPart = Annotated[TextPart | ImagePart, Field(discriminator="kind")]
+class ImageUrlPart(CheckedCopyModel):
+    """langchaint sends url unchanged and never fetches it.
+
+    media_type is an optional IANA media type.
+    Gemini receives media_type when present.
+    Other adapters receive url without media_type.
+    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str
+    media_type: str | None = None
+    cache_breakpoint: bool = False
+    kind: Literal["image_url"] = "image_url"
+
+
+class AudioPart(CheckedCopyModel):
+    """media_type is an IANA media type, such as "audio/wav".
+
+    JSON stores data as URL-safe base64 text.
+    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
+    """
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
+    )
+
+    data: bytes
+    media_type: str
+    cache_breakpoint: bool = False
+    kind: Literal["audio"] = "audio"
+
+
+type ContentPart = Annotated[
+    TextPart | ImagePart | ImageUrlPart | AudioPart, Field(discriminator="kind")
+]
 """One model-facing value inside message content.
 
 Convert a document before sending it, into one form picked by its content.
@@ -62,7 +98,7 @@ so it picks the resolution, which pages to send, and the text extractor, and can
 """
 
 type MessageContent = str | Sequence[ContentPart]
-"""A model-facing message body (text and images the model reads).
+"""A model-facing message body the model reads.
 This is the constructor-facing form a caller or tool provides;
 the pydantic message models store it as str | tuple[ContentPart, ...], coercing the sequence to a frozen tuple,
 so their fields spell that tuple form out rather than aliasing it.

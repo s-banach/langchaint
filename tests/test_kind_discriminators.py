@@ -18,6 +18,7 @@ from typing import assert_type
 
 from langchaint import (
     AssistantMessage,
+    AudioPart,
     ContentPart,
     DispatchHandled,
     DispatchInvalidToolArgs,
@@ -28,6 +29,7 @@ from langchaint import (
     DoNotRetry,
     GenerateResult,
     ImagePart,
+    ImageUrlPart,
     InvalidToolArgsDetail,
     Message,
     PauseAll,
@@ -91,6 +93,10 @@ def _by_content_part_kind(part: ContentPart) -> object:
             return part.text
         case "image":
             return part.media_type
+        case "image_url":
+            return part.url
+        case "audio":
+            return part.data
 
 
 def _by_content_part_kind_missing_a_variant(part: ContentPart) -> object:
@@ -257,6 +263,10 @@ def test_a_content_part_kind_selects_the_variant_that_carries_the_field_read() -
     """Each ContentPart tag reaches a variant-specific field."""
     assert _by_content_part_kind(TextPart(text="hi")) == "hi"
     assert _by_content_part_kind(ImagePart(data=b"png", media_type="image/png")) == "image/png"
+    assert _by_content_part_kind(ImageUrlPart(url="https://example.com/a.png")) == (
+        "https://example.com/a.png"
+    )
+    assert _by_content_part_kind(AudioPart(data=b"wav", media_type="audio/wav")) == b"wav"
     assert (
         _by_content_part_kind_missing_a_variant(ImagePart(data=b"png", media_type="image/png"))
         is None

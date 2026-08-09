@@ -36,12 +36,14 @@ import langchaint.tracing
 from langchaint import (
     LLM,
     AssistantMessage,
+    AudioPart,
     CallResult,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
     ImagePart,
+    ImageUrlPart,
     InvalidRequestError,
     JSONSchemaTool,
     MaxCompletionTokensExceededError,
@@ -2159,11 +2161,11 @@ def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
     asyncio.run(scenario())
 
 
-def test_image_parts_are_captured_without_their_bytes() -> None:
-    """An ImagePart records its media type and never its base64 payload."""
+def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data() -> None:
+    """ImagePart and AudioPart omit data; ImageUrlPart records URL metadata."""
 
     async def scenario() -> None:
-        """Generate over a Sequence[Message] holding an image and read the input messages back."""
+        """Generate over Sequence[Message] containing ImagePart, ImageUrlPart, and AudioPart."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         await traced.bind(automatic_prompt_caching=True).generate_one([
@@ -2171,6 +2173,12 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
                 content=(
                     TextPart(text="what is this"),
                     ImagePart(data=b"\x89PNGsecret", media_type="image/png"),
+                    ImageUrlPart(
+                        url="https://example.com/image.png",
+                        media_type="image/png",
+                    ),
+                    ImageUrlPart(url="https://example.com/unknown"),
+                    AudioPart(data=b"WAVsecret", media_type="audio/wav"),
                 )
             )
         ])
@@ -2180,12 +2188,20 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
                 "parts": [
                     {"type": "text", "content": "what is this"},
                     {"type": "blob", "mime_type": "image/png"},
+                    {
+                        "type": "image_url",
+                        "url": "https://example.com/image.png",
+                        "mime_type": "image/png",
+                    },
+                    {"type": "image_url", "url": "https://example.com/unknown"},
+                    {"type": "blob", "mime_type": "audio/wav"},
                 ],
             }
         ]
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "PNGsecret" not in str(span.attributes["gen_ai.input.messages"])
+        assert "WAVsecret" not in str(span.attributes["gen_ai.input.messages"])
 
     asyncio.run(scenario())
 

@@ -132,13 +132,8 @@ from langchaint.tools import (
 )
 from langchaint.usage import Usage
 
-type SpanAttributeValue = str | bool | int | float | Sequence[str]
-"""One span attribute's value.
-
-The union is the subset of OTel's AttributeValue langchaint emits;
-the Sequence[str] variant exists because OTel attribute values include homogeneous string arrays
-and the GenAI convention's finish-reason key gen_ai.response.finish_reasons is one.
-"""
+type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
+"""One span attribute's value."""
 
 type SpanAttributes = Mapping[str, SpanAttributeValue]
 """A span's attributes, keyed by name."""
@@ -335,7 +330,7 @@ def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     usage = result.usage
     records = result.attempt_records
     model_served = records[-1].model_served if records else None
-    attributes: dict[str, str | bool | int | float | Sequence[str]] = {
+    attributes: dict[str, SpanAttributeValue] = {
         "gen_ai.provider.name": result.provider_name,
         "gen_ai.request.model": result.model,
         "gen_ai.usage.input_tokens": usage.input_tokens_total,
@@ -671,7 +666,7 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
 
 def _input_content_attributes(
     binding: Binding, generation_input: GenerationInput
-) -> dict[str, str | bool | int | float | Sequence[str]]:
+) -> dict[str, SpanAttributeValue]:
     """Build the input-side content attributes for one call, each a JSON string.
 
     OTel attribute values cannot nest, and the schemas say a span MAY record these as a JSON string
@@ -681,7 +676,7 @@ def _input_content_attributes(
     gen_ai.tool.definitions; a backend consequently cannot tell "no tools bound" from "capture off"
     by the attribute alone.
     """
-    attributes: dict[str, str | bool | int | float | Sequence[str]] = {}
+    attributes: dict[str, SpanAttributeValue] = {}
     if binding.system_prompt is not None:
         attributes["gen_ai.system_instructions"] = json.dumps(
             _system_instructions(binding.system_prompt)
@@ -696,7 +691,7 @@ def _input_content_attributes(
 
 def _output_content_attributes(
     assistant_message: AssistantMessage, stop_reason: StopReason | None
-) -> dict[str, str | bool | int | float | Sequence[str]]:
+) -> dict[str, SpanAttributeValue]:
     """Build gen_ai.output.messages from one assistant turn.
 
     One function for the success and the failure paths, so one turn renders the same whichever reported it.

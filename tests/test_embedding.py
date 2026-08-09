@@ -12,6 +12,7 @@ from langchaint import EmbeddingModel, EmbeddingOutputError, Float2D
 from langchaint.account_state import AccountState
 from langchaint.adapter import ErrorClassification
 from langchaint.embedding import EmbeddingTask, _validated_embeddings
+from langchaint.sequence_not_str import SequenceNotStr
 from langchaint.shared_backoff import DoNotRetry, RetryThisOne, SharedBackoff, Verdict
 
 
@@ -87,7 +88,7 @@ class _PartitioningEmbeddingAdapter:
     dimension = 2
     failure_types: ClassVar[tuple[type[Exception], ...]] = (_ProviderError,)
 
-    def __init__(self, inputs: Sequence[str], *, fail_once: set[str] | None = None) -> None:
+    def __init__(self, inputs: SequenceNotStr[str], *, fail_once: set[str] | None = None) -> None:
         """Create one start and release event per input."""
         self.started = {input_text: asyncio.Event() for input_text in inputs}
         self.release = {input_text: asyncio.Event() for input_text in inputs}

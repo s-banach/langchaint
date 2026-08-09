@@ -15,7 +15,6 @@ dropped are not a function of any single union's membership.
 
 import inspect
 import re
-from collections.abc import Sequence
 from types import UnionType
 from typing import Union, get_args, get_origin
 
@@ -78,7 +77,7 @@ def _words(class_name: str) -> list[str]:
     return [word.lower() for word in re.findall(r"[A-Z][a-z0-9]*", class_name)]
 
 
-def _is_word_subsequence(tag_words: Sequence[str], class_words: Sequence[str]) -> bool:
+def _is_word_subsequence(tag_words: list[str], class_words: list[str]) -> bool:
     """Report whether every tag word appears in the class words, in order."""
     remaining = list(class_words)
     for word in tag_words:

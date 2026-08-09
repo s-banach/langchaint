@@ -5,9 +5,8 @@ OpenAI accepts at most 2048 inputs and 300,000 tokens per request.
 This adapter counts tokens with `cl100k_base` through tiktoken 0.13.0.
 """
 
-from collections.abc import Sequence
 from functools import partial
-from typing import override
+from typing import TYPE_CHECKING, override
 
 import tiktoken
 from openai import AsyncOpenAI, omit
@@ -27,13 +26,17 @@ from langchaint.openai.shared import (
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     classify_openai,
 )
+from langchaint.sequence_not_str import SequenceNotStr
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _MAX_INPUTS_PER_REQUEST = 2048
 _MAX_TOKENS_PER_REQUEST = 300_000
 _TOKEN_ENCODING = "cl100k_base"
 
 
-def _partition_inputs_sync(inputs: Sequence[str]) -> tuple[tuple[str, ...], ...]:
+def _partition_inputs_sync(inputs: SequenceNotStr[str]) -> tuple[tuple[str, ...], ...]:
     """Partition inputs under OpenAI's request count and token limits.
 
     Raises:

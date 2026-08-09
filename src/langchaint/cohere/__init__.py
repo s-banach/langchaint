@@ -52,9 +52,11 @@ from langchaint.exceptions import EmbeddingOutputError
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Sequence
+    from collections.abc import AsyncGenerator
 
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
+
+    from langchaint.sequence_not_str import SequenceNotStr
 
 
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]
@@ -293,7 +295,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
 
     def _request_body(
         self,
-        inputs: Sequence[str],
+        inputs: SequenceNotStr[str],
         *,
         task: EmbeddingTask,
     ) -> bytes:

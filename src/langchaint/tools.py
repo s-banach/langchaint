@@ -38,6 +38,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.exceptions import DispatchExceptionGroup, InvalidToolArgsError
 from langchaint.messages import MessageContent, ToolCall, ToolMessage
+from langchaint.sequence_not_str import SequenceNotStr
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -563,7 +564,7 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
     return "\n".join(lines)
 
 
-def render_unknown_tool(called_name: str, held_names: Sequence[str]) -> str:
+def render_unknown_tool(called_name: str, held_names: SequenceNotStr[str]) -> str:
     """Build the model-facing content for a call naming a tool the manager does not hold.
 
     Names the off-list tool and lists the held tool names so the model can retry with a valid one.

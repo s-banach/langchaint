@@ -25,7 +25,7 @@ so the adapter reports it as a ResponseOutcome variant where it reads the respon
 Every GenerationError is constructed by a scope holding the call's ledger, the only scope that knows
 its attempts and timing; an adapter reports one attempt and never a GenerationError.
 
-Five exceptions sit outside this axis, none of them a GenerationError.
+The following exceptions sit outside this axis and are not `GenerationError` subclasses.
 DispatchExceptionGroup and InvalidToolArgsError belong to the tool layer, not the generate loop.
 ToolManager.dispatch_many raises the group after every sibling dispatch settled.
 It groups the tool-function defects and carries the settled calls' outcomes.
@@ -33,6 +33,7 @@ PydanticTool.validate_and_run raises InvalidToolArgsError when a tool call's arg
 StreamProtocolError says a stream did not follow the event contract.
 GaveUpWaiting and ParserContractError belong to SharedBackoff.
 The first reports an admitted() entry whose budget expired; the second reports a parse that violated its contract.
+EmbeddingOutputError reports a malformed successful embedding response.
 """
 
 from collections.abc import Sequence
@@ -79,6 +80,10 @@ class TransientError(Exception):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.is_rate_limit = is_rate_limit
+
+
+class EmbeddingOutputError(RuntimeError):
+    """A provider returned unusable embedding vectors."""
 
 
 def _extract_transient_errors(

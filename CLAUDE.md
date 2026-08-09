@@ -31,7 +31,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Never stutter with the holder (`tool.name`, not `tool.tool_name`); carry the full name on cross-object references (`tool_call_id` on `ToolMessage`).
 - Give the plain noun to the interface, because the protocol name is read far more often than any concrete name is written; name concrete forms by the technology their argument spec is written in, except a form distinguished by its fixed behavior, which is named for that behavior.
 - Use `cache_breakpoint` as the neutral name for a user-placed prompt-cache boundary: True on a part means the reusable prompt prefix ends there.
-- Count `max_attempts` as requests sent, including the first. Put `max_attempts` on `bind`. Configure SDK clients with no internal retries.
+- Count `max_attempts` as requests sent, including the first. Configure SDK clients with no internal retries.
 - Keep `content`, `output`, and `raw` three concepts, never one word: a model-facing message body, the generation result payload, and provider data langchaint models nothing inside and hands back unchanged. `reasoning` names what the model produced, never a fourth name for one of those three.
 
 ## Design rules
@@ -52,7 +52,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Honor user inputs faithfully, even invalid ones, and make no promise about how a provider will respond: never probe an endpoint to learn its errors, never add client-side guards guessing at provider-side rules, and do not restate this per case. Reserve client-side raises for documented provider facts and for defects that would otherwise produce a silently wrong result.
 - Use pydantic only where serde plus validation pay for themselves; everything else is a frozen dataclass or NamedTuple, and each qualifying model's docstring states what its validation buys. Derive every pydantic model from the checked-copy base, on which a key that is not a field is an error.
 - Keep the SDKs optional dependencies the application pins directly; declare no extras. The import path is the boundary: the neutral core imports no SDK; each backend subpackage imports its SDK at module top, guarded so a missing package raises a `ModuleNotFoundError` naming what to install.
-- Give each backend subpackage an `Account` class named for its provider. Each account owns its default SDK clients and one `SharedBackoff`. Its `model` method returns an `LLM`. Send each model id verbatim. Require `pricing` where no carried table maps the model id. Document every parameter and cross-provider difference. Each subpackage docstring carries the pricing source URL.
+- Give each backend subpackage an `Account` class named for its provider. Each account owns its default SDK clients and one `SharedBackoff`. Send each model id verbatim. Require `pricing` where no carried table maps the model id. Document every parameter and cross-provider difference. Each subpackage docstring carries the pricing source URL.
 - Tier the public surface by audience: applications import from top-level `langchaint` and the backend subpackages; adapter authors import from `langchaint.adapter` and `langchaint.conformance`. Top-level `__all__` re-exports only the SDK-free application surface.
 - Check only what a type checker cannot. Applications are expected to run a strict one, so a runtime check that an argument has its annotated type duplicates it; check what a correctly-typed argument can still get wrong, such as a value out of range. `bool` is the case worth stating: it subclasses `int`, so a checker admits `True` wherever an `int` is annotated. A test that suppresses the type checker to reach a runtime check is a test of the type checker, so delete it rather than the suppression.
 - Ship OTel tracing in-tree as a thin, guarded-import subpackage off the top-level `__all__`. Premises: never fake an event boundary a span measures; the mapper gets attribute names and values, never the `GenerationInput`; catch and log telemetry failures, never propagate; wrap unconditionally, and leave enable/disable/routing to OTel SDK configuration. Record message content only through `capture_message_content`, a required keyword with no default. Use a convention key wherever one exists; reserve `langchaint.*` for what the convention lacks.
@@ -63,10 +63,12 @@ One line per module saying what it is for; the module docstring is the spec of w
 
 - `llm.py`: the client `LLM` and the `BoundLLM` its `bind` returns.
 - `account.py`: the SDK-free `Account` protocol.
-- `account_base.py`: shared account lifecycle and `SharedBackoff` construction.
-- `account_state.py`: account state shared with account-created `LLM` values.
+- `account_base.py`: shared lifecycle and `SharedBackoff` construction for account-created request clients.
+- `account_state.py`: account state shared with account-created request clients.
 - `adapter.py`: the neutral base contract, dual-audience; imports no SDK.
+- `cancellation.py`: cancellation-safe execution of synchronous provider work.
 - `conformance.py`: the invariants every adapter holds to, as a test class an adapter author inherits; imports no SDK and no test runner.
+- `embedding.py`: provider-neutral embedding execution and output validation.
 - `shared_backoff.py`: the `SharedBackoff` backpressure domain, its `admitted()` block, the verdicts, and `PrivateBackoff`.
 - `exceptions.py`: the error vocabulary.
 - `response.py`: the generate results and their flattening to a calls table and an attempts table.
@@ -77,9 +79,10 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `usage.py`: token accounting and the per-category costs that travel with it.
 - `checked_copy.py`: the base of langchaint's pydantic models.
 - `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.
-- `anthropic/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires the SDK it wraps (deepseek wraps the openai SDK).
+- `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires its SDK.
 - `inference_params.py`: the inference parameters.
 - `run_many.py`: runs a sequence of inputs under a bound on how many are pending; imports nothing from langchaint and models nothing about LLMs.
+- `sequence_not_str.py`: the sequence protocol excluding bare `str` values.
 - `tracing/`: the OTel subpackage; importing it requires opentelemetry-api, and it is off the top-level `__all__`.
 
 ## Checks

@@ -9,9 +9,11 @@ from openai import AsyncOpenAI
 from langchaint import Account
 from langchaint.account_base import AccountBase
 from langchaint.anthropic import AnthropicAccount, AnthropicBedrockAccount
+from langchaint.cohere import CohereBedrockAccount
 from langchaint.deepseek import DeepSeekAccount
 from langchaint.gemini import GeminiAccount
 from langchaint.openai import OpenAIAccount, OpenAIBedrockAccount, OpenAIResponsesAdapter
+from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 from langchaint.shared_backoff import DoNotRetry
 
 
@@ -29,6 +31,7 @@ def _primary_accounts_satisfy_protocol(
     anthropic_account: AnthropicAccount,
     deepseek_account: DeepSeekAccount,
     gemini_account: GeminiAccount,
+    cohere_bedrock_account: CohereBedrockAccount,
     openai_bedrock_account: OpenAIBedrockAccount,
     anthropic_bedrock_account: AnthropicBedrockAccount,
 ) -> tuple[Account, ...]:
@@ -38,6 +41,7 @@ def _primary_accounts_satisfy_protocol(
         anthropic_account,
         deepseek_account,
         gemini_account,
+        cohere_bedrock_account,
         openai_bedrock_account,
         anthropic_bedrock_account,
     )
@@ -57,8 +61,10 @@ def test_models_share_the_accounts_request_policy() -> None:
     )
     first = account.model("gpt-5.4-mini")
     second = account.model("gpt-5.6-terra")
+    embedding_model = account.embedding_model("text-embedding-3-small")
 
     assert first.shared_backoff is second.shared_backoff
+    assert first.shared_backoff is embedding_model._shared_backoff
     shared_backoff = first.shared_backoff
     assert shared_backoff.max_concurrent_requests == 3
     assert shared_backoff.max_request_starts_per_second == 7.5
@@ -76,11 +82,14 @@ def test_models_share_the_accounts_sdk_client() -> None:
     account = OpenAIAccount(client=passed_client)
     first = account.model("gpt-5.4-mini")
     second = account.model("gpt-5.6-terra")
+    embedding_model = account.embedding_model("text-embedding-3-small")
 
     assert isinstance(first.adapter, OpenAIResponsesAdapter)
     assert isinstance(second.adapter, OpenAIResponsesAdapter)
+    assert isinstance(embedding_model._adapter, _OpenAIEmbeddingAdapter)
     assert first.adapter.client is account.client
     assert second.adapter.client is account.client
+    assert embedding_model._adapter.client is account.client
     assert account.client.max_retries == 0
 
     asyncio.run(passed_client.close())
@@ -234,16 +243,21 @@ def test_closed_account_rejects_models_and_created_bindings() -> None:
     client = AsyncOpenAI(api_key="offline")
     account = OpenAIAccount(client=client)
     bound = account.model("gpt-5.4-mini").bind(automatic_prompt_caching=True)
+    embedding_model = account.embedding_model("text-embedding-3-small")
 
     async def scenario() -> None:
         await account.aclose()
         with pytest.raises(RuntimeError, match="closed"):
             _ = account.model("gpt-5.4-mini")
         with pytest.raises(RuntimeError, match="closed"):
+            _ = account.embedding_model("text-embedding-3-small")
+        with pytest.raises(RuntimeError, match="closed"):
             _ = await bound.generate_one([])
         with pytest.raises(RuntimeError, match="closed"):
             async with bound.stream_one([]):
                 pass
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = await embedding_model.embed(["text"], task="classification")
         await client.close()
 
     asyncio.run(scenario())

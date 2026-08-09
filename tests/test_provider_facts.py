@@ -1,16 +1,16 @@
-"""Pins the SDK facts langchaint's arithmetic and classification are written against.
+"""Pin SDK facts used by langchaint arithmetic and request mapping.
 
-Both SDKs' response models are pydantic models configured extra="allow", so a renamed or withdrawn
-field arrives as an extra rather than as an error: the adapters keep reading the name they were
-written for, get None or a default, and every other test in this suite keeps passing on the stale
-literal. Nothing else here can fail on that drift, which is what these tests are for. They capture
-no defect present at the version they were written against (anthropic 0.120.0, openai 2.45.0,
-google-genai 2.16.0).
+These tests inspect declared fields, method signatures, and Bedrock service models.
+Current facts target anthropic 0.120.0 and openai 2.53.0.
+They also target google-genai 2.16.0 and botocore 1.43.67.
 """
 
+import inspect
 import typing
 
 import anthropic
+import boto3
+import botocore.session
 import httpx
 import openai
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
@@ -26,9 +26,13 @@ from anthropic.types import Message as AnthropicMessage
 from anthropic.types import Usage as AnthropicUsage
 from anthropic.types.cache_creation import CacheCreation
 from anthropic.types.output_tokens_details import OutputTokensDetails as AnthropicOutputDetails
+from botocore.exceptions import ClientError
 from google.genai import _api_client
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from openai.lib._parsing._responses import type_to_text_format_param
+from openai.resources.embeddings import AsyncEmbeddings
+from openai.types import CreateEmbeddingResponse
+from openai.types import Embedding as OpenAIEmbedding
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses import (
     ResponseInputImageContentParam,
@@ -173,6 +177,79 @@ def test_openai_usage_details_objects_are_not_optional() -> None:
         assert _is_required(ResponseUsage, name), name
     assert _field_annotation(ResponseUsage, "input_tokens_details") is InputTokensDetails
     assert _field_annotation(ResponseUsage, "output_tokens_details") is OutputTokensDetails
+
+
+def test_openai_embeddings_create_accepts_the_adapter_parameters() -> None:
+    """Pin the keyword parameters sent by `_OpenAIEmbeddingAdapter`."""
+    signature = inspect.signature(AsyncEmbeddings.create)
+    for name in ("input", "model", "dimensions", "encoding_format"):
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    hints = typing.get_type_hints(AsyncEmbeddings.create)
+    assert hints["return"] is CreateEmbeddingResponse
+
+
+def test_openai_embedding_response_keeps_the_fields_the_adapter_reads() -> None:
+    """Pin required response fields read by `_OpenAIEmbeddingAdapter`."""
+    data_annotation = _field_annotation(CreateEmbeddingResponse, "data")
+    assert typing.get_origin(data_annotation) is list
+    assert typing.get_args(data_annotation) == (OpenAIEmbedding,)
+    embedding_annotation = _field_annotation(OpenAIEmbedding, "embedding")
+    assert typing.get_origin(embedding_annotation) is list
+    assert typing.get_args(embedding_annotation) == (float,)
+    assert _field_annotation(OpenAIEmbedding, "index") is int
+    for name in ("embedding", "index"):
+        assert _is_required(OpenAIEmbedding, name)
+
+
+def test_bedrock_invoke_model_keeps_the_adapter_request_shape() -> None:
+    """Pin request fields and the exact `body` byte limit."""
+    service = botocore.session.get_session().get_service_model("bedrock-runtime")
+    operation = service.operation_model("InvokeModel")
+    input_shape = operation.input_shape
+    assert input_shape is not None
+    assert {"body", "modelId", "accept", "contentType"} <= set(input_shape.members)
+    body = input_shape.members["body"]
+    assert body.type_name == "blob"
+    assert body.metadata["max"] == 25_000_000
+    assert operation.has_streaming_output
+
+
+def test_bedrock_invoke_model_error_statuses_match_retry_parsing() -> None:
+    """Pin the retryable statuses parsed by the Cohere adapter."""
+    service = botocore.session.get_session().get_service_model("bedrock-runtime")
+    operation = service.operation_model("InvokeModel")
+    status_by_error = {
+        shape.name: shape.metadata["error"]["httpStatusCode"] for shape in operation.error_shapes
+    }
+    assert {
+        "ThrottlingException": 429,
+        "ModelNotReadyException": 429,
+        "ModelTimeoutException": 408,
+        "InternalServerException": 500,
+        "ServiceUnavailableException": 503,
+    }.items() <= status_by_error.items()
+    model_not_ready = next(
+        shape for shape in operation.error_shapes if shape.name == "ModelNotReadyException"
+    )
+    assert model_not_ready.metadata["retryable"] == {"throttling": False}
+
+
+def test_bedrock_modeled_exceptions_remain_client_errors() -> None:
+    """Pin the exception type caught by the Cohere adapter."""
+    service = botocore.session.get_session().get_service_model("bedrock-runtime")
+    operation = service.operation_model("InvokeModel")
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name="us-east-1",
+        aws_access_key_id="offline",
+        aws_secret_access_key="offline",
+    )
+    try:
+        for shape in operation.error_shapes:
+            error_class = getattr(client.exceptions, shape.name)
+            assert issubclass(error_class, ClientError)
+    finally:
+        client.close()
 
 
 def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:

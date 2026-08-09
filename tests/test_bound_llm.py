@@ -55,7 +55,6 @@ from langchaint import (
     UserMessage,
     Verdict,
 )
-from langchaint import llm as llm_module
 from langchaint import shared_backoff as shared_backoff_module
 from langchaint.account_state import AccountState
 from langchaint.adapter import (
@@ -79,14 +78,7 @@ from langchaint.adapter import (
     verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.llm import (
-    _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND,
-    _PENDING_TASKS_PER_CONCURRENT_REQUEST,
-    _SPARE_PENDING_TASKS,
-    UNCHANGED,
-    Unchanged,
-)
-from langchaint.run_many import RunOne
+from langchaint.llm import UNCHANGED, Unchanged
 from langchaint.shared_backoff import _NEVER
 from langchaint.streaming import StreamHandle
 from tests.helpers import random_returns_zero, stated_billing
@@ -3780,54 +3772,6 @@ def test_max_concurrent_requests_bounds_batch_concurrency() -> None:
         assert adapter.bound_adapters[0].peak_in_flight == 2
 
     asyncio.run(scenario())
-
-
-def _recorded_max_pending(
-    monkeypatch: pytest.MonkeyPatch, *, max_concurrent_requests: int | None
-) -> list[int | None]:
-    """Run a two-item batch at the given max_concurrent_requests, returning each max_pending run_many received."""
-    recorded: list[int | None] = []
-    real_run_many = llm_module.run_many
-
-    async def recording_run_many[InputT, OutputT](
-        inputs: Sequence[InputT],
-        run_one: RunOne[InputT, OutputT],
-        *,
-        max_pending: int | None,
-    ) -> list[OutputT]:
-        """Record max_pending, then run the batch through the real run_many."""
-        recorded.append(max_pending)
-        return await real_run_many(inputs, run_one, max_pending=max_pending)
-
-    monkeypatch.setattr(llm_module, "run_many", recording_run_many)
-
-    async def scenario() -> None:
-        """Run two items so the derivation runs once."""
-        adapter = _FakeAdapter(echo=True)
-        shared_backoff = _fast_shared_backoff(max_concurrent_requests=max_concurrent_requests)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
-        generation_inputs = [[UserMessage(content=str(index))] for index in range(2)]
-        results = await bound_llm.generate_many(generation_inputs)
-        assert _batch_outputs(results) == ["0", "1"]
-
-    asyncio.run(scenario())
-    return recorded
-
-
-def test_generate_many_derives_max_pending_from_max_concurrent_requests(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """max_pending is max_concurrent_requests at the ratio, plus _SPARE_PENDING_TASKS."""
-    recorded = _recorded_max_pending(monkeypatch, max_concurrent_requests=8)
-    assert recorded == [8 * _PENDING_TASKS_PER_CONCURRENT_REQUEST + _SPARE_PENDING_TASKS]
-
-
-def test_generate_many_sets_max_pending_without_a_concurrency_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """max_pending is _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND when max_concurrent_requests is None."""
-    recorded = _recorded_max_pending(monkeypatch, max_concurrent_requests=None)
-    assert recorded == [_MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND]
 
 
 def test_backoff_sleep_does_not_hold_the_permit() -> None:

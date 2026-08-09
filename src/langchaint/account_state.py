@@ -1,4 +1,4 @@
-"""The lifecycle state shared by an account and its `LLM` values."""
+"""The lifecycle state shared by an account and its request clients."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ class AccountClosedError(RuntimeError):
 
 
 class AccountState:
-    """The lifecycle state shared by an account and its `LLM` values."""
+    """Share account closure state with every account-created request client."""
 
     def __init__(self) -> None:
         """Start open and outside a context manager."""

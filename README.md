@@ -1,24 +1,38 @@
 # langchaint
 
-Provider-neutral async LLM client over the official anthropic and openai SDKs.
+Provider-neutral async LLM and embedding clients over official SDKs.
 Alpha: the API is unstable and may change without notice.
 
 ## The point
 
-langchaint is the layer between an application's own agent loop and the provider SDKs.
-Across providers it gives one message tree, one error taxonomy, one priced `Usage`, and one `SharedBackoff` that owns pacing.
-The application keeps the agent loop and states every billing-relevant choice itself, starting with prompt caching; langchaint defaults none of them.
+langchaint sits between application workflows and provider SDKs.
+Generation uses one message tree, error taxonomy, priced `Usage`, and `SharedBackoff`.
+Embeddings return normalized NumPy matrices directly.
+Applications keep agent loops, caching choices, and vector persistence.
 
 ## Install
 
-Requires Python >= 3.13.
-The hard dependencies are `pydantic` and `jsonschema`; the provider SDKs are optional dependencies the application pins directly, and langchaint declares no extras.
+langchaint requires Python 3.13 or newer.
+Its core dependencies are `pydantic`, `jsonschema`, and NumPy.
+Applications pin every provider SDK directly.
+langchaint declares no dependency extras.
 
-    pip install langchaint openai        # or anthropic, or both
+Install OpenAI generation support:
 
-`import langchaint` needs neither SDK; importing `langchaint.openai` without the openai package raises a `ModuleNotFoundError` naming the package to install.
+    pip install langchaint openai
 
-## Example
+Install OpenAI embedding support:
+
+    pip install langchaint openai tiktoken
+
+Install Cohere embedding support through Amazon Bedrock:
+
+    pip install langchaint boto3
+
+Top-level `import langchaint` requires no provider SDK.
+Backend imports report missing SDK dependencies through `ModuleNotFoundError`.
+
+## Generation example
 
 ```python
 import asyncio
@@ -34,89 +48,137 @@ class Sentiment(BaseModel):
 
 
 async def main() -> None:
-    async with OpenAIAccount() as openai:
-        classifier = openai.model("gpt-5.6-terra").bind(
+    async with OpenAIAccount() as account:
+        classifier = account.model("gpt-5.6-terra").bind(
             system_prompt="Classify the sentiment of the user's message.",
             response_format=Sentiment,
             automatic_prompt_caching=False,
         )
-        response = await classifier.generate_one("This is the best day I have had in months.")
+        response = await classifier.generate_one("This is the best day in months.")
         print(response.output.label, response.usage.cost_in_usd)
 
 
 asyncio.run(main())
 ```
 
-`bind(response_format=Sentiment)` returns a `BoundLLM[Sentiment]`, so `response.output` is a validated `Sentiment` instance; without `response_format`, `output` is the assistant text.
-A bare `str` generation_input is shorthand for `[UserMessage(content=generation_input)]`.
-`examples/` holds one snippet file per subject and `MIGRATING_FROM_LANGCHAIN.md`, the LangChain call-for-call map.
+`bind(response_format=Sentiment)` returns `BoundLLM[Sentiment]`.
+Its `response.output` is a validated `Sentiment` instance.
+Without `response_format`, `response.output` is assistant text.
+A bare generation `str` becomes one `UserMessage`.
+
+## Embedding example
+
+```python
+import asyncio
+
+from langchaint.openai import OpenAIAccount
+
+
+async def main() -> None:
+    async with OpenAIAccount() as account:
+        embedding_model = account.embedding_model(
+            "text-embedding-3-small",
+            dimension=1024,
+        )
+        documents = await embedding_model.embed(
+            ["The Moon orbits Earth.", "Mars has two small moons."],
+            task="retrieval_document",
+        )
+        query = await embedding_model.embed(
+            ["Which object circles Earth?"],
+            task="retrieval_query",
+        )
+        print(documents.shape, query.shape)
+
+
+asyncio.run(main())
+```
+
+OpenAI accepts `task` for interface consistency.
+It sends no corresponding OpenAI request field.
+
+Use this construction for Cohere through Amazon Bedrock:
+
+```python
+from langchaint.cohere import CohereBedrockAccount
+
+async with CohereBedrockAccount(aws_region="us-east-1") as account:
+    embedding_model = account.embedding_model("cohere.embed-v4:0", dimension=1024)
+```
+
+Each result has shape `(len(inputs), dimension)` and dtype `np.float32`.
+Every row has L2 norm one.
+Each result owns writable, C-contiguous storage.
+langchaint performs no vector persistence.
 
 ## What it has
 
-**Generation only via binding.**
-`LLM.bind(...)` freezes everything that determines the cacheable prompt prefix into a `BoundLLM[OutputT]`, and changing parameters is `rebind(...)`.
-`BoundLLM` has `generate_one`, `generate_many`, and `stream_one`.
-`generate_many` bounds how many items are pending, meaning started and not settled, so a batch of a million inputs does not hold a million tasks.
-That bound follows `SharedBackoff.max_concurrent_requests`, so one number sets the batch's throughput and nothing else needs sizing.
-A deadline on one call is `timeout_seconds` and covers everything the call waits on; a deadline on one batch item is `max_working_seconds_per_item` and stops while that item queues behind its siblings.
-`run_many`, the function behind it, is exported for batching anything else the same way.
+**Generation only through binding.**
+`LLM.bind()` returns `BoundLLM[OutputT]` with frozen inference configuration.
+`BoundLLM` provides `generate_one`, `generate_many`, and `stream_one`.
+Changing generation parameters uses `rebind()`.
+
+**Embeddings without binding.**
+`EmbeddingModel.embed()` takes texts and one required `task`.
+It returns `Float2D` directly.
+Provider adapters maximize ordered batches under documented request limits.
 
 **One `Account` per SDK client configuration.**
-`OpenAIAccount`, `AnthropicAccount`, `GeminiAccount`, and `DeepSeekAccount` serve direct providers.
-`OpenAIBedrockAccount` and `AnthropicBedrockAccount` serve Bedrock.
-Each account shares SDK clients and one `SharedBackoff` across its `LLM` values.
-Each account closes its owned resources.
+Accounts share SDK clients and one `SharedBackoff` across request clients.
+Each account closes resources it created.
 
-**One accounting contract for success and failure.**
-Success is a `Response[OutputT]`, or a `GenerateResult[OutputT]` on a structured tool-bound binding, and a terminal failure is a `GenerationError`.
-Both carry `usage`, the paid total across every attempt.
+**One accounting contract for generation.**
+Generation success and `GenerationError` both carry paid usage across attempts.
 
-**Priced usage.**
-`Usage` partitions input tokens by cache outcome and carries one cost per priced category; `cost_in_usd` is their sum.
+**Priced generation usage.**
+`Usage` partitions input tokens by cache outcome.
+It carries one cost per priced category.
 
 **One `SharedBackoff` owning pacing.**
-One instance is one backpressure domain for the account it guards.
-Its `admitted()` block gates every request start; a rate limit pauses the whole domain.
-`max_attempts` on `bind` bounds retrying for that `BoundLLM`.
+Its `admitted()` block gates every request start.
+Rate limits pause the complete account request domain.
 
 **User-stated prompt caching.**
-`automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.
-`cache_breakpoint=True` on a content part places a prompt-cache boundary at exactly that part.
+`automatic_prompt_caching` is required because caching changes billing.
+`cache_breakpoint=True` places a prompt-cache boundary on that content part.
 
-**Streaming as a handle.**
-`stream_one` returns a `StreamHandle`: an async context manager that iterates `str | ReasoningDelta | ToolCallDelta | ToolCall` items, with `await handle.final()` returning the assembled result.
+**Streaming through a handle.**
+`stream_one` returns a `StreamHandle` async context manager.
+Its `final()` method returns the assembled result.
 
 **Tools under one protocol.**
-`PydanticTool`, `JSONSchemaTool` (for tools discovered at run time, such as MCP tools), and `CaptureTool` share the `Tool` protocol.
-Use `@tool(description=...)` for an async function with one `BaseModel` parameter.
-The parameter annotation supplies `args_model`.
-`name` defaults to `function.__name__`; pass `name` to override it.
-Construct `PydanticTool(...)` directly when its fields come from runtime data.
-One `ToolManager` holds a mix, and an application adds its own form by implementing `Tool`.
+`PydanticTool`, `JSONSchemaTool`, and `CaptureTool` implement `Tool`.
+Applications may implement additional `Tool` forms.
 
 **Reasoning preserved across turns.**
-Every provider reasoning element is re-sent verbatim on later requests, so tool-use continuations satisfy each provider's replay rules without application code.
+langchaint re-emits provider reasoning elements verbatim on later requests.
 
 **OTel tracing as a wrapper.**
-`langchaint.tracing` wraps `LLM`, `BoundLLM`, `StreamHandle`, and `ToolManager` in Traced counterparts; `capture_message_content` is a required keyword with no default, because recording prompts is a privacy choice.
+`langchaint.tracing` wraps generation clients and `ToolManager`.
+`capture_message_content` is required because prompt recording affects privacy.
 
 ## What it does not have
 
-- No agent class and no agent loop: the loop is ~15 lines of application code, shown in `examples/02_tool_loop.py`, and a tool returns data, never a control-flow signal.
-- No client-side guessing at provider rules.
-- No document or PDF part: convert before sending, rasterizing pages to `ImagePart` or extracting the text layer to `TextPart`.
+- No agent class or agent loop.
+- No vector storage or retrieval index.
+- No client-side guessing at undocumented provider rules.
+- No document or PDF content part.
+
+Convert documents before generation requests.
+Use `ImagePart` for rasterized pages or `TextPart` for extracted text.
 
 ## Layout
 
-    src/langchaint/           the neutral core; imports no SDK
-    src/langchaint/anthropic/ the anthropic backend
-    src/langchaint/deepseek/  the deepseek backend, over the openai SDK
-    src/langchaint/gemini/    the gemini backend
-    src/langchaint/openai/    the openai backend
+    src/langchaint/           the provider-neutral core
+    src/langchaint/anthropic/ the Anthropic backend
+    src/langchaint/cohere/    the Cohere Bedrock embedding backend
+    src/langchaint/deepseek/  the DeepSeek backend using the OpenAI SDK
+    src/langchaint/gemini/    the Gemini backend
+    src/langchaint/openai/    the OpenAI backend
     src/langchaint/tracing/   the OTel tracing subpackage
-    examples/                 one snippet file per subject and MIGRATING_FROM_LANGCHAIN.md
+    examples/                 focused examples and migration guidance
 
 ## Verification
 
 Run `scripts/CI.sh`.
-The tests are offline and need no API keys.
+The tests are offline and require no API keys.

@@ -16,6 +16,10 @@ Web-search prices use USD per invocation.
 File-search prices use USD per invocation.
 Source: https://developers.openai.com/api/docs/pricing.
 Recheck that page before relying on a table.
+Embedding request limits and parameters come from the OpenAI embeddings guide.
+Source: https://developers.openai.com/api/docs/guides/embeddings.
+Cataloged embedding model dimensions come from the OpenAI model catalog.
+Source: https://developers.openai.com/api/docs/models/all.
 `OPENAI_PRICING` covers the default service tier.
 Its web-search rates are public list-price estimates.
 `OpenAIAccount.model(pricing=...)` replaces cataloged estimates.
@@ -38,6 +42,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.account_base import AccountBase
+from langchaint.embedding import EmbeddingModel
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
@@ -63,6 +68,20 @@ type OpenAIModelName = Literal[
     "gpt-5.6-sol",
 ]
 """Model identifiers with public prices in OPENAI_PRICING."""
+
+type OpenAIEmbeddingModelName = Literal[
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+]
+"""Cataloged OpenAI model identifiers accepted by `embedding_model()`."""
+
+OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelName] = frozenset({
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+})
+"""Cataloged OpenAI embedding model identifiers."""
 
 OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
     "gpt-5.1": OpenAIPricingTable(
@@ -270,6 +289,84 @@ class OpenAIAccount(AccountBase):
         )
         return self._llm(adapter)
 
+    @overload
+    def embedding_model(
+        self,
+        model: Literal["text-embedding-3-small"],
+        *,
+        dimension: int = 1536,
+        max_attempts: int = 3,
+    ) -> EmbeddingModel: ...
+
+    @overload
+    def embedding_model(
+        self,
+        model: Literal["text-embedding-3-large"],
+        *,
+        dimension: int = 3072,
+        max_attempts: int = 3,
+    ) -> EmbeddingModel: ...
+
+    @overload
+    def embedding_model(
+        self,
+        model: Literal["text-embedding-ada-002"],
+        *,
+        max_attempts: int = 3,
+    ) -> EmbeddingModel: ...
+
+    def embedding_model(
+        self,
+        model: OpenAIEmbeddingModelName,
+        *,
+        dimension: int | None = None,
+        max_attempts: int = 3,
+    ) -> EmbeddingModel:
+        """Build an `EmbeddingModel` for one cataloged OpenAI model.
+
+        Third-generation models accept their documented dimension range.
+        `text-embedding-ada-002` has dimension 1536 and accepts no dimension argument.
+        Every model counts batching tokens with tiktoken's `cl100k_base` encoding.
+
+        Raises:
+            RuntimeError: This account is closed.
+            ValueError: `model`, `dimension`, or `max_attempts` is invalid.
+            ModuleNotFoundError: tiktoken is unavailable.
+        """
+        self._state.ensure_open()
+        if model not in OPENAI_EMBEDDING_MODELS:
+            raise ValueError(f"model {model!r} is not in OPENAI_EMBEDDING_MODELS")
+        if model == "text-embedding-ada-002":
+            if dimension is not None:
+                raise ValueError("text-embedding-ada-002 accepts no dimension argument")
+            validated_dimension = 1536
+        else:
+            maximum_dimension = 1536 if model == "text-embedding-3-small" else 3072
+            validated_dimension = maximum_dimension if dimension is None else dimension
+            if isinstance(validated_dimension, bool) or not (
+                1 <= validated_dimension <= maximum_dimension
+            ):
+                raise ValueError(
+                    f"dimension for {model!r} must be an int from 1 through "
+                    f"{maximum_dimension}, got {validated_dimension!r}"
+                )
+        try:
+            from langchaint.openai.embedding_adapter import (  # noqa: PLC0415 (keep tiktoken outside ordinary imports)
+                _OpenAIEmbeddingAdapter,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "tiktoken":
+                raise
+            raise ModuleNotFoundError(
+                "OpenAI embeddings require the tiktoken package; install tiktoken."
+            ) from exc
+        adapter = _OpenAIEmbeddingAdapter(
+            client=self.client,
+            model=model,
+            dimension=validated_dimension,
+        )
+        return self._embedding_model(adapter, max_attempts=max_attempts)
+
 
 class OpenAIBedrockAccount(AccountBase):
     """Bedrock SDK client and `SharedBackoff` shared by OpenAI models."""
@@ -356,11 +453,13 @@ class OpenAIBedrockAccount(AccountBase):
 
 
 __all__ = [
+    "OPENAI_EMBEDDING_MODELS",
     "OPENAI_PRICING",
     "PROMPT_CACHE_OPTIONS_MODELS",
     "OpenAIAccount",
     "OpenAIBedrockAccount",
     "OpenAIChatCompletionsAdapter",
+    "OpenAIEmbeddingModelName",
     "OpenAIModelName",
     "OpenAIPricedServiceTier",
     "OpenAIPricingTable",

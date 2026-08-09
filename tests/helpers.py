@@ -123,8 +123,9 @@ def call_record(
 def package_modules() -> Iterator[ModuleType]:
     """Import every module under langchaint, backend subpackages included.
 
-    Importing the backend subpackages and tracing requires both SDKs and opentelemetry-api,
-    which the dev environment installs for the adapter and tracing tests.
+    Backend imports require their provider SDKs.
+    Tracing imports require opentelemetry-api.
+    The development environment installs those dependencies.
 
     Yields:
         Each imported module, the package itself first.

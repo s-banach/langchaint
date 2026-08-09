@@ -7,6 +7,7 @@ from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Self
 
 from langchaint.account_state import AccountState
+from langchaint.embedding import EmbeddingModel
 from langchaint.llm import LLM
 from langchaint.shared_backoff import SharedBackoff, Verdict
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from langchaint.adapter import Adapter
+    from langchaint.embedding import _EmbeddingAdapter
 
 
 class AccountBase:
@@ -62,6 +64,24 @@ class AccountBase:
         llm = LLM(adapter, shared_backoff=self._shared_backoff)
         llm._account_state = self._state  # noqa: SLF001 (account-to-LLM boundary)
         return llm
+
+    def _embedding_model(
+        self,
+        adapter: _EmbeddingAdapter,
+        *,
+        max_attempts: int,
+    ) -> EmbeddingModel:
+        """Build an `EmbeddingModel` sharing this account's request policy.
+
+        Raises:
+            ValueError: `max_attempts` is boolean or below one.
+        """
+        return EmbeddingModel(
+            adapter=adapter,
+            shared_backoff=self._shared_backoff,
+            max_attempts=max_attempts,
+            account_state=self._state,
+        )
 
     async def aclose(self) -> None:
         """Close this account and its owned resources once.

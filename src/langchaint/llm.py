@@ -18,8 +18,8 @@ ProviderDeclaredFinalError.
 """
 
 import asyncio
-from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, NamedTuple, Protocol, SupportsIndex, overload
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
@@ -65,7 +65,8 @@ from langchaint.response import (
     _abandoned_call_error,
     _success_variant,
 )
-from langchaint.run_many import run_many
+from langchaint.run_many import max_pending_for_requests, run_many
+from langchaint.sequence_not_str import SequenceNotStr
 from langchaint.shared_backoff import (
     Admission,
     DoNotRetry,
@@ -112,31 +113,6 @@ UNCHANGED = Unchanged()
 
 type GenerationInput = str | Sequence[Message]
 """What one request is generated from: a bare str is shorthand for a Sequence[Message] of one UserMessage."""
-
-
-_PENDING_TASKS_PER_CONCURRENT_REQUEST = 2
-"""Pending tasks generate_many holds for each request its SharedBackoff admits at once.
-
-A task holds no permit while it sleeps between attempts, so permits stay fed only while the awake
-tasks outnumber the permits. The share of tasks that may sleep at once without leaving a permit
-idle is at least one minus the reciprocal of this ratio, so 2 tolerates half of them asleep.
-A transient failure rate puts far fewer than half to sleep, so this ratio is a margin rather than
-a measured rate.
-"""
-
-_SPARE_PENDING_TASKS = 8
-"""Pending tasks generate_many holds on top of what _PENDING_TASKS_PER_CONCURRENT_REQUEST gives.
-
-That ratio holds in the steady state, and a small max_concurrent_requests leaves too few tasks for
-the sleeping count to vary within: at one permit the ratio gives one spare, whose sleep idles the
-permit. A pending task costs a coroutine frame, so spares are cheap where the ratio is thin.
-"""
-
-_MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND = 1000
-"""The most pending tasks generate_many holds when max_concurrent_requests is None.
-
-No permit gates a request start in that configuration, so this is what caps requests in flight.
-"""
 
 
 class Deadline(Protocol):
@@ -204,43 +180,6 @@ class WorkingTimeDeadline:
         if self._seconds_left is None:
             return
         self.scope.reschedule(asyncio.get_running_loop().time() + self._seconds_left)
-
-
-class SequenceNotStr[T_co](Protocol):
-    """A Sequence that a type checker rejects a bare str for.
-
-    str satisfies Sequence[GenerationInput] (a str is a sequence of str),
-    so a plain Sequence batch parameter statically accepts generate_many("hi"),
-    which would run one request per character.
-    This protocol structurally matches list and tuple but not str,
-    because typeshed's str.__contains__ accepts only str while the protocol requires __contains__(value: object).
-    Being covariant, it also accepts a caller's list[str] or list[list[UserMessage]],
-    which the invariant list[GenerationInput] would reject.
-    Same shape as openai._types.SequenceNotStr, originally from the useful_types library;
-    index() and count() are omitted deliberately, matching it.
-    If typeshed ever widens str.__contains__,
-    the static rejection lapses and _reject_bare_str_batch remains the backstop.
-    """
-
-    @overload
-    def __getitem__(self, index: SupportsIndex, /) -> T_co: ...
-    @overload
-    def __getitem__(self, index: slice, /) -> Sequence[T_co]: ...
-    def __contains__(self, value: object, /) -> bool:
-        """Accept object, which str's str-only __contains__ cannot satisfy."""
-        ...
-
-    def __len__(self) -> int:
-        """Match Sequence."""
-        ...
-
-    def __iter__(self) -> Iterator[T_co]:
-        """Match Sequence."""
-        ...
-
-    def __reversed__(self) -> Iterator[T_co]:
-        """Match Sequence."""
-        ...
 
 
 def _reject_bare_str_batch(generation_inputs: SequenceNotStr[GenerationInput]) -> None:
@@ -1443,14 +1382,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 deadline=WorkingTimeDeadline(max_working_seconds_per_item),
             )
 
-        max_concurrent_requests = self.shared_backoff.max_concurrent_requests
-        if max_concurrent_requests is None:
-            max_pending = _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
-        else:
-            max_pending = (
-                max_concurrent_requests * _PENDING_TASKS_PER_CONCURRENT_REQUEST
-                + _SPARE_PENDING_TASKS
-            )
+        max_pending = max_pending_for_requests(self.shared_backoff.max_concurrent_requests)
         return await run_many(generation_inputs, run_one, max_pending=max_pending)
 
     @overload

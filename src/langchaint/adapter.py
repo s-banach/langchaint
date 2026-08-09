@@ -796,6 +796,32 @@ class BoundAdapter[OutputT](ABC):
         ...
 
 
+def _require_provider_name(
+    client: object,
+    *,
+    provider_name: str,
+    provider_name_by_client_class: Mapping[type, str],
+) -> None:
+    """Reject a client whose class fixes another provider name.
+
+    Raises:
+        ValueError: The client class contradicts `provider_name`.
+    """
+    reached = next(
+        (
+            name
+            for client_class, name in provider_name_by_client_class.items()
+            if isinstance(client, client_class)
+        ),
+        None,
+    )
+    if reached is not None and reached != provider_name:
+        raise ValueError(
+            f"provider_name={provider_name!r} contradicts the client: "
+            f"{type(client).__name__} reaches {reached!r}"
+        )
+
+
 class Adapter(ABC):
     """Base class for one adapter per provider SDK.
 
@@ -859,19 +885,11 @@ class Adapter(ABC):
                 a defect nothing surfaces until telemetry is grouped by provider,
                 so the constructor raises before the first request.
         """
-        reached = next(
-            (
-                name
-                for client_class, name in self.provider_name_by_client_class.items()
-                if isinstance(client, client_class)
-            ),
-            None,
+        _require_provider_name(
+            client,
+            provider_name=provider_name,
+            provider_name_by_client_class=self.provider_name_by_client_class,
         )
-        if reached is not None and reached != provider_name:
-            raise ValueError(
-                f"provider_name={provider_name!r} contradicts the client: "
-                f"{type(client).__name__} reaches {reached!r}"
-            )
         self.model = model
         self.provider_name = provider_name
 

@@ -6,11 +6,30 @@ from enum import IntEnum
 
 import pytest
 
-from langchaint.run_many import run_many
+from langchaint.run_many import max_pending_for_requests, run_many
 
 
 class _RunManyFailure(BaseException):
     """Identify a run_many task failure."""
+
+
+@pytest.mark.parametrize(
+    ("max_concurrent_requests", "expected"),
+    [(None, 1000), (1, 10), (8, 24)],
+)
+def test_max_pending_for_requests_derives_a_finite_bound(
+    max_concurrent_requests: int | None,
+    expected: int,
+) -> None:
+    """Derive the pending task bound from request concurrency."""
+    assert max_pending_for_requests(max_concurrent_requests) == expected
+
+
+@pytest.mark.parametrize("invalid", [True, False, 0, -1])
+def test_max_pending_for_requests_rejects_invalid_concurrency(invalid: int) -> None:
+    """Reject values that cannot represent request concurrency."""
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        _ = max_pending_for_requests(invalid)
 
 
 def test_run_many_validates_max_pending_before_running_items() -> None:

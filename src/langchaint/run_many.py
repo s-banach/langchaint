@@ -9,6 +9,29 @@ import asyncio
 from collections.abc import Sequence
 from typing import Protocol
 
+_PENDING_TASKS_PER_CONCURRENT_REQUEST = 2
+_SPARE_PENDING_TASKS = 8
+_MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND = 1000
+
+
+def max_pending_for_requests(max_concurrent_requests: int | None) -> int:
+    """Derive the pending task bound from the request concurrency bound.
+
+    The extra tasks keep permits supplied while retries wait privately.
+    An absent concurrency bound still receives a finite pending task bound.
+
+    Raises:
+        ValueError: `max_concurrent_requests` is boolean or below one.
+    """
+    if max_concurrent_requests is None:
+        return _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND
+    if isinstance(max_concurrent_requests, bool) or max_concurrent_requests < 1:
+        raise ValueError(
+            "max_concurrent_requests must be None or a positive int, "
+            f"got {max_concurrent_requests!r}"
+        )
+    return max_concurrent_requests * _PENDING_TASKS_PER_CONCURRENT_REQUEST + _SPARE_PENDING_TASKS
+
 
 class RunOne[InputT, OutputT](Protocol):
     """Produce one result from one input.

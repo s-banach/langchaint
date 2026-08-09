@@ -1,16 +1,11 @@
-"""langchaint: a provider-neutral LLM client.
+"""Provide provider-neutral LLM and embedding clients.
 
-Adapters wrap the official anthropic/openai SDK clients; generation happens only through LLM.bind(...) -> BoundLLM.
-__all__ re-exports only the SDK-free application surface.
-The backend constructors, their price catalogs, and the adapters stay in their subpackages:
-re-exporting them here would force import langchaint through both SDKs.
-The adapter-author contract stays in langchaint.adapter.
-Internal helpers (SequenceNotStr) are importable but off __all__.
-Tool, the protocol an application implements to add its own tool form, and ToolSchema, which that protocol's
-schema() returns, are on __all__: both appear in signatures application code writes against.
-The tool decorator builds PydanticTool from an async function's parameter annotation.
-run_many is on __all__ so an application can run its own batch under a bound on how many items are
-pending at once, the way generate_many runs a batch of generations.
+Generation uses `LLM.bind()` and the returned `BoundLLM`.
+Embedding generation uses `EmbeddingModel.embed()`.
+`__all__` exports only the SDK-free application surface.
+`Tool` and `ToolSchema` support application-defined tool forms.
+The `tool` decorator builds `PydanticTool` from an async function annotation.
+`run_many` exposes bounded concurrent batching for application work.
 """
 
 from langchaint.account import Account
@@ -22,10 +17,12 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.call import AttemptRecord, CallRecord
+from langchaint.embedding import EmbeddingModel, EmbeddingTask, Float2D
 from langchaint.exceptions import (
     AbandonedCallError,
     ContextWindowExceededError,
     DispatchExceptionGroup,
+    EmbeddingOutputError,
     EmptyTurnError,
     EscapedExceptionError,
     GaveUpWaiting,
@@ -135,8 +132,12 @@ __all__ = [
     "DispatchPrecomputed",
     "DispatchUnknownTool",
     "DoNotRetry",
+    "EmbeddingModel",
+    "EmbeddingOutputError",
+    "EmbeddingTask",
     "EmptyTurnError",
     "EscapedExceptionError",
+    "Float2D",
     "GaveUpWaiting",
     "GenerateResult",
     "GenerationError",

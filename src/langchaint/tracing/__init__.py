@@ -103,7 +103,6 @@ from langchaint.llm import (
     BoundLLM,
     Deadline,
     GenerationInput,
-    SequenceNotStr,
     Unchanged,
     WallClockDeadline,
 )
@@ -120,6 +119,7 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.response import CallResult, GenerateResult, Response, ToolCallTurn
+from langchaint.sequence_not_str import SequenceNotStr
 from langchaint.shared_backoff import SharedBackoff
 from langchaint.streaming import StreamHandle
 from langchaint.tools import (

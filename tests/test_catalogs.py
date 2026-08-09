@@ -630,12 +630,15 @@ def test_each_account_model_states_a_convention_provider_name(
         ),
     ],
 )
-def test_openai_account_model_rejects_a_client_reaching_another_provider(
+def test_openai_account_rejects_a_client_reaching_another_provider(
     client: AsyncOpenAI,
 ) -> None:
-    """Reject another provider's SDK client from `OpenAIAccount.model`."""
+    """Reject another provider's client from both OpenAI request APIs."""
     with pytest.raises(ValueError, match="contradicts the client"):
         _ = OpenAIAccount(client=client).model("gpt-5.6-terra")
+    with pytest.raises(ValueError, match="contradicts the client"):
+        _ = OpenAIAccount(client=client).embedding_model("text-embedding-3-small")
+    asyncio.run(client.close())
 
 
 def test_deepseek_account_model_rejects_a_bedrock_client() -> None:

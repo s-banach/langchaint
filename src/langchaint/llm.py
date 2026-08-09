@@ -23,6 +23,7 @@ from typing import Any, NamedTuple, Protocol, SupportsIndex, overload
 
 from pydantic import BaseModel
 
+from langchaint.account_state import AccountClosedError, AccountState
 from langchaint.adapter import (
     Adapter,
     Binding,
@@ -344,7 +345,6 @@ class LLM:
         adapter: Adapter,
         *,
         shared_backoff: SharedBackoff | None = None,
-        max_attempts: int = 3,
     ) -> None:
         """Store the shared pieces.
 
@@ -352,14 +352,7 @@ class LLM:
         at the SharedBackoff defaults with max_concurrent_requests 8. One instance is one
         backpressure domain, so pass the same instance to every LLM whose requests share a
         provider quota.
-        max_attempts counts requests sent including the first, so 1 means no retrying.
-
-        Raises:
-            ValueError: max_attempts is a bool, or an int below 1, a defect to report before
-                any request rather than a retry budget to misread.
         """
-        if isinstance(max_attempts, bool) or max_attempts < 1:
-            raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
         self.adapter = adapter
         self.shared_backoff = (
             shared_backoff
@@ -368,7 +361,7 @@ class LLM:
                 parse=adapter.parse, failure_types=adapter.failure_types, max_concurrent_requests=8
             )
         )
-        self.max_attempts = max_attempts
+        self._account_state: AccountState | None = None
 
     @overload
     def bind[ModelT: BaseModel](
@@ -381,6 +374,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[ModelT, ToolManager]": ...
     @overload
@@ -394,6 +388,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[ModelT, None]": ...
     @overload
@@ -407,6 +402,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
@@ -420,6 +416,7 @@ class LLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[str, None]": ...
     def bind(  # noqa: PLR0913 (the binding states every choice: prompt, tools, format, params, caching, extra_body)
@@ -432,6 +429,7 @@ class LLM:
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
+        max_attempts: int = 3,
         automatic_prompt_caching: bool,
     ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
@@ -444,13 +442,15 @@ class LLM:
         return the optional type, which is what a caller who does not know can act on.
         automatic_prompt_caching has no default: caching changes billing,
         so langchaint never chooses a caching configuration for the caller.
+        max_attempts counts requests sent including the first, so 1 means no retrying.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
         Binding.extra_body documents extra_body: the merge precedence and the colliding-key raise.
 
         Raises:
             ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
                 prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
-                model cannot honor and an extra_body key the adapter itself populates.
+                model cannot honor and an extra_body key the adapter itself populates. Also raised
+                when max_attempts is a bool or an int below 1.
         """
         binding = _build_binding(
             system_prompt=system_prompt,
@@ -470,7 +470,8 @@ class LLM:
             binding=binding,
             tool_manager=tool_manager,
             shared_backoff=self.shared_backoff,
-            max_attempts=self.max_attempts,
+            max_attempts=max_attempts,
+            account_state=self._account_state,
         )
 
 
@@ -494,7 +495,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     the provider only ever sees the converted schemas inside the binding.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (the binding carries every bound field and account state)
         self,
         *,
         adapter: Adapter,
@@ -504,13 +505,21 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_manager: ToolManagerT,
         shared_backoff: SharedBackoff,
         max_attempts: int,
+        account_state: AccountState | None,
     ) -> None:
-        """Store the frozen pieces; called by LLM.bind and rebind only."""
+        """Store the frozen pieces; called by `LLM.bind` and `rebind` only.
+
+        Raises:
+            ValueError: `max_attempts` is a bool or below one.
+        """
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
         self.adapter = adapter
         self.binding = binding
         self.response_format = response_format
         self.shared_backoff = shared_backoff
         self.max_attempts = max_attempts
+        self._account_state = account_state
         self._bound_adapter = bound_adapter
         self._tool_manager = tool_manager
 
@@ -529,6 +538,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Whether this binding's tool-call turns are ToolCallTurn: it is structured and tool-bound."""
         return self.response_format is not None and self._tool_manager is not None
 
+    def _ensure_account_open(self) -> None:
+        """Raise when this binding's account is closed.
+
+        Raises:
+            RuntimeError: This binding's account is closed.
+        """
+        if self._account_state is not None:
+            self._account_state.ensure_open()
+
     @overload
     def rebind[NewModelT: BaseModel](
         self,
@@ -540,6 +558,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManager]": ...
     @overload
@@ -553,6 +572,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, None]": ...
     @overload
@@ -566,6 +586,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
     @overload
@@ -579,6 +600,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
@@ -592,6 +614,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, None]": ...
     @overload
@@ -605,6 +628,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManagerT]": ...
     @overload
@@ -618,6 +642,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManager]": ...
     @overload
@@ -631,6 +656,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, None]": ...
     @overload
@@ -644,6 +670,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManagerT]": ...
     def rebind(  # noqa: PLR0913 (rebind takes every field bind takes, each replaceable alone)
@@ -656,6 +683,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_attempts: int | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "BoundLLM[Any, Any]":
         """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
@@ -676,7 +704,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
                 prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
-                model cannot honor and an extra_body key the adapter itself populates.
+                model cannot honor and an extra_body key the adapter itself populates. Also raised
+                when max_attempts is a bool or an int below 1.
         """
         new_tool_manager = (
             self.tool_manager if isinstance(tool_manager, Unchanged) else tool_manager
@@ -713,6 +742,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         new_response_format = (
             self.response_format if isinstance(response_format, Unchanged) else response_format
         )
+        new_max_attempts = (
+            self.max_attempts if isinstance(max_attempts, Unchanged) else max_attempts
+        )
         return BoundLLM(
             adapter=self.adapter,
             bound_adapter=_bind_adapter(self.adapter, new_binding, new_response_format),
@@ -720,7 +752,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             binding=new_binding,
             tool_manager=new_tool_manager,
             shared_backoff=self.shared_backoff,
-            max_attempts=self.max_attempts,
+            max_attempts=new_max_attempts,
+            account_state=self._account_state,
         )
 
     def _terminal_error(
@@ -926,6 +959,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         so a slow request is distinguishable from time spent rate limited.
 
         Raises:
+            RuntimeError: This binding's account closes before a request starts.
             InvalidRequestError: build_request returned InvalidRequest, or the adapter classified
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
             ProviderDeclaredFinalError: the adapter classified an attempt's error as one the provider
@@ -966,7 +1000,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             # reported, noted before the loop's frame unwound; None where a record settled it.
             raise _abandoned_call_error(TimedOutError, ledger, ledger.billing_in_flight) from None
 
-    async def _attempt_until_budget_runs_out(  # noqa: PLR0912 (the loop holds one attempt end to end: the drain, each failure family, and the exhaustive outcome match)
+    async def _attempt_until_budget_runs_out(  # noqa: PLR0912 (account closure bypasses provider error handling)
         self, messages: Sequence[Message], *, ledger: _CallLedger, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
@@ -986,11 +1020,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             GenerationError: every failure _generate_with_retries names but TimedOutError, which its
                 scope raises.
             ParserContractError: the adapter's parse violated its contract on an attempt's failure.
+            RuntimeError: This binding's account closed before an admitted request started.
         """
-        built = self._bound_adapter.build_request(messages)
-        if isinstance(built, InvalidRequest):
-            raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
-        request = built
+        request = self._request_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
         while ledger.attempts < self.max_attempts:
             deadline.suspend_until_admitted()
@@ -999,6 +1031,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             observations = _StreamObservations(billing=None, request_id=None, opened=False)
             try:
                 async with admission:
+                    self._ensure_account_open()
                     # Entering the block is the admission, so the clock starts on the first
                     # statement inside it.
                     deadline.resume_on_admission()
@@ -1037,6 +1070,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                         raise TransientError(  # noqa: TRY301 (the admitted() block's exit is the parser, so the raise must sit inside it)
                             outcome.reason, is_rate_limit=outcome.is_rate_limit
                         )
+            except AccountClosedError:
+                raise
             except ParserContractError:
                 # A parse contract violation is langchaint's defect, not the attempt's failure:
                 # it skips the verdict handling below and reaches the caller inside EscapedExceptionError.
@@ -1101,6 +1136,21 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                         )
         raise RetriesExhaustedError(call=ledger.freeze(), request=request)
 
+    def _request_for_messages(
+        self, messages: Sequence[Message], *, ledger: _CallLedger
+    ) -> RequestParams:
+        """Build one request after confirming its account remains open.
+
+        Raises:
+            RuntimeError: This binding's account is closed.
+            InvalidRequestError: The adapter rejects `messages` before any request.
+        """
+        self._ensure_account_open()
+        built = self._bound_adapter.build_request(messages)
+        if isinstance(built, InvalidRequest):
+            raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
+        return built
+
     @overload
     async def generate_one(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1147,6 +1197,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         with the frame. Ask for the deadline here to keep that account.
 
         Raises:
+            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled this call.
         """
         return await self._generate_one_any_binding(
@@ -1170,13 +1221,17 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             GenerationError: whatever _generate_with_retries failed the call with, or
                 EscapedExceptionError wrapping any other Exception that reached here.
+            RuntimeError: This binding's account is closed.
             BaseException: whatever cut the call off, propagating unobserved.
         """
+        self._ensure_account_open()
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
             return await self._generate_with_retries(
                 _as_messages(generation_input), ledger=ledger, deadline=deadline
             )
+        except AccountClosedError:
+            raise
         except GenerationError:
             raise
         except Exception as escaped:
@@ -1278,6 +1333,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
+            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
                 does not catch; the started items are cancelled and awaited, and it propagates.
@@ -1305,10 +1361,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
+            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception; the started
                 items are cancelled and awaited, and it propagates.
         """
+        self._ensure_account_open()
         _reject_bare_str_batch(generation_inputs)
         # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
@@ -1343,6 +1401,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             asyncio.CancelledError: an outer scope cancelled generate_many.
+            RuntimeError: This binding's account closes before a request starts.
             BaseException: an item raised a BaseException that is not an Exception; run_many cancels
                 and awaits the started items, and it propagates.
         """
@@ -1417,6 +1476,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             messages=_as_messages(generation_input),
             shared_backoff=self.shared_backoff,
             max_attempts=self.max_attempts,
+            account_state=self._account_state,
             timeout_seconds=timeout_seconds,
             splits_tool_call_turns=self._splits_tool_call_turns,
         )

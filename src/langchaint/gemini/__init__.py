@@ -1,27 +1,21 @@
-"""The gemini backend: the generateContent adapter, its model catalog, and pricing.
+"""The gemini backend provides an account, adapter, model catalog, and pricing.
 
-Importing this subpackage requires the google-genai package;
-the import below raises a ModuleNotFoundError naming the package to install.
+Importing this subpackage requires `google-genai`.
+`GeminiAccount.model` sends the stated model identifier verbatim.
+It reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
+Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
+Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
 
-gemini_model takes the provider's own model identifier, the same string the wire accepts,
-so switching models never changes an import; it constructs the generateContent adapter and wraps it
-in an LLM reaching the Gemini Developer API.
-Vertex AI callers construct GeminiGenerateContentAdapter directly with genai.Client(vertexai=True)
-and provider_name "gcp.vertex_ai"; Vertex prices differ from this catalog, so pass pricing with it.
-pricing is a mapping from the traffic_type a response reports to the GeminiPricingTable that prices
-it, merged over a cataloged model's public prices under "ON_DEMAND", so a caller adds a tier or
-replaces the on-demand rates and omitting it prices at the public rates. A response served at a
-traffic_type the mapping does not hold costs NaN.
-gemini_model requires pricing for an uncataloged id, having no table to fall back on.
+Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
+Uncataloged Gemini models require `pricing`.
+Responses from uncataloged traffic types cost NaN.
 
-Prices are USD per one million tokens,
-taken from the provider's official pricing page: https://ai.google.dev/gemini-api/docs/pricing
-(read 2026-08-03).
-Prices are the one provider fact langchaint cannot verify by SDK introspection;
-re-check the page before relying on a table for billing.
-The catalog carries the text, image, and video rates; langchaint sends no audio, whose rates differ.
-Cache storage per token-hour is a charge on an explicit cache resource, not on a request, so no
-table field carries it.
+Prices use USD per one million tokens.
+Source: https://ai.google.dev/gemini-api/docs/pricing, read 2026-08-03.
+Recheck that page before relying on a table.
+The catalog carries text, image, and video rates.
+langchaint sends no audio.
+Explicit cache-resource storage charges have no request `Usage` field.
 """
 
 from collections.abc import Mapping
@@ -36,6 +30,7 @@ except ModuleNotFoundError as exc:
         "langchaint's gemini backend requires the google-genai package; install google-genai."
     ) from exc
 
+from langchaint.account_base import AccountBase
 from langchaint.gemini.generate_content_adapter import (
     GeminiGenerateContentAdapter,
     GeminiPricedServiceTier,
@@ -46,7 +41,6 @@ from langchaint.gemini.generate_content_adapter import (
     parse_gemini,
 )
 from langchaint.llm import LLM
-from langchaint.shared_backoff import SharedBackoff
 
 type GeminiModelName = Literal[
     "gemini-3.6-flash",
@@ -134,86 +128,116 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
 """Public on-demand prices per gemini model; the default pricing lookup."""
 
 _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
-"""GEMINI_PRICING under a str key, so gemini_model can look up a possibly-uncataloged model id."""
+"""`GEMINI_PRICING` with `str` keys for runtime model lookup."""
 
 
-@overload
-def gemini_model(
-    model: GeminiModelName,
-    *,
-    client: genai.Client | None = ...,
-    pricing: Mapping[str, GeminiPricingTable] | None = ...,
-    service_tier: GeminiServiceTier | None = ...,
-    shared_backoff: SharedBackoff | None = ...,
-    max_attempts: int = ...,
-) -> LLM: ...
-@overload
-def gemini_model(
-    model: str,
-    *,
-    pricing: Mapping[str, GeminiPricingTable],
-    client: genai.Client | None = ...,
-    service_tier: GeminiServiceTier | None = ...,
-    shared_backoff: SharedBackoff | None = ...,
-    max_attempts: int = ...,
-) -> LLM: ...
-def gemini_model(
-    model: str,
-    *,
-    client: genai.Client | None = None,
-    pricing: Mapping[str, GeminiPricingTable] | None = None,
-    service_tier: GeminiServiceTier | None = None,
-    shared_backoff: SharedBackoff | None = None,
-    max_attempts: int = 3,
-) -> LLM:
-    """Build a ready LLM for one model on the Gemini Developer API's generateContent.
+class GeminiAccount(AccountBase):
+    """Gemini SDK client and `SharedBackoff` shared by Gemini models."""
 
-    model is sent verbatim.
-    client None constructs genai.Client(vertexai=False), which reads GOOGLE_API_KEY or
-    GEMINI_API_KEY from the environment; construction is offline.
-    pricing holds one table per traffic_type word a response reports
-    (GeminiPricedServiceTier names the vocabulary).
-    On a cataloged id it is merged over {"ON_DEMAND": GEMINI_PRICING[model]}, so a caller adds a
-    tier or replaces the on-demand rates and omitting it prices at the public rates; on any other
-    id it is passed through and needs its "ON_DEMAND" key.
-    A response served at a traffic_type this mapping does not hold costs NaN.
-    service_tier is what the request asks for, None sending nothing; it is not what prices the
-    response, since the request and response tier vocabularies share no word, so a "flex" request
-    needs a pricing entry for the traffic_type its responses report ("ON_DEMAND_FLEX").
-    shared_backoff and max_attempts have the LLM.__init__ meanings;
-    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
-    and note one instance serves one event loop.
+    def __init__(
+        self,
+        *,
+        client: genai.Client | None = None,
+        max_concurrent_requests: int | None = 8,
+        max_request_starts_per_second: float = 50.0,
+        minimum_wait_ceiling_seconds: float = 1.0,
+        longest_wait_seconds: float = 60.0,
+        wait_multiplier: float = 2.0,
+        quiet_seconds_per_decay_step: float = 60.0,
+    ) -> None:
+        """Build a Gemini account without sending a request.
 
-    Raises:
-        ValueError: model is outside the catalog and pricing is missing.
-            LLM.__init__ raises it when max_attempts is not a positive int, and
-            GeminiGenerateContentAdapter.__init__ when pricing has no "ON_DEMAND" key or client
-            was constructed with vertexai=True, which reaches "gcp.vertex_ai" rather than the
-            "gcp.gemini" provider this constructor states.
-    """
-    catalog_table = _PRICING_BY_MODEL_ID.get(model)
-    if catalog_table is None:
-        if pricing is None:
-            raise ValueError(
-                f"model {model!r} is not in GEMINI_PRICING; pass pricing= stating its rates"
-            )
-    else:
-        pricing = {"ON_DEMAND": catalog_table, **(pricing or {})}
-    return LLM(
-        GeminiGenerateContentAdapter(
-            client=client if client is not None else genai.Client(vertexai=False),
+        `client=None` constructs `genai.Client(vertexai=False)`.
+        A passed `client` remains caller-owned.
+        A passed `client` must reach the Gemini Developer API.
+        `max_concurrent_requests` limits concurrent admitted requests.
+        `max_request_starts_per_second` limits starts during queued demand.
+        `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
+        `longest_wait_seconds` caps adaptive and provider-stated waits.
+        `wait_multiplier` scales wait-ceiling changes.
+        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+
+        Raises:
+            ValueError: `client` is absent and no API key is available.
+                Also raised when a `SharedBackoff` setting is invalid.
+        """
+        super().__init__(
+            parse=parse_gemini,
+            failure_types=GeminiGenerateContentAdapter.failure_types,
+            max_concurrent_requests=max_concurrent_requests,
+            max_request_starts_per_second=max_request_starts_per_second,
+            minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
+            longest_wait_seconds=longest_wait_seconds,
+            wait_multiplier=wait_multiplier,
+            quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
+        )
+        self.client = client if client is not None else genai.Client(vertexai=False)
+        if client is None:
+            self._register_owned_sync_close(self.client.close)
+            self._register_owned_close(self.client.aio.aclose)
+
+    @overload
+    def model(
+        self,
+        model: GeminiModelName,
+        *,
+        pricing: Mapping[str, GeminiPricingTable] | None = ...,
+        service_tier: GeminiServiceTier | None = ...,
+    ) -> LLM: ...
+
+    @overload
+    def model(
+        self,
+        model: str,
+        *,
+        pricing: Mapping[str, GeminiPricingTable],
+        service_tier: GeminiServiceTier | None = ...,
+    ) -> LLM: ...
+
+    def model(
+        self,
+        model: str,
+        *,
+        pricing: Mapping[str, GeminiPricingTable] | None = None,
+        service_tier: GeminiServiceTier | None = None,
+    ) -> LLM:
+        """Build an `LLM` for one Gemini Developer API model.
+
+        `model` is sent verbatim.
+        Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
+        Stated `pricing` extends or replaces catalog pricing.
+        Uncataloged models require `pricing` with an `"ON_DEMAND"` entry.
+        `service_tier` sets the requested Gemini service tier.
+        The reported traffic type selects pricing.
+
+        Raises:
+            RuntimeError: This account is closed.
+            ValueError: An uncataloged model lacks `pricing`.
+                Also raised when `pricing` lacks `"ON_DEMAND"`.
+                Also raised when `client` reaches Vertex AI.
+        """
+        self._state.ensure_open()
+        catalog_table = _PRICING_BY_MODEL_ID.get(model)
+        if catalog_table is None:
+            if pricing is None:
+                raise ValueError(
+                    f"model {model!r} is not in GEMINI_PRICING; pass pricing= stating its rates"
+                )
+        else:
+            pricing = {"ON_DEMAND": catalog_table, **(pricing or {})}
+        adapter = GeminiGenerateContentAdapter(
+            client=self.client,
             model=model,
             pricing=pricing,
             provider_name="gcp.gemini",
             service_tier=service_tier,
-        ),
-        shared_backoff=shared_backoff,
-        max_attempts=max_attempts,
-    )
+        )
+        return self._llm(adapter)
 
 
 __all__ = [
     "GEMINI_PRICING",
+    "GeminiAccount",
     "GeminiGenerateContentAdapter",
     "GeminiModelName",
     "GeminiPricedServiceTier",
@@ -221,6 +245,5 @@ __all__ = [
     "GeminiRates",
     "GeminiServiceTier",
     "assembled_response",
-    "gemini_model",
     "parse_gemini",
 ]

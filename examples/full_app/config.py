@@ -21,6 +21,7 @@ class AgentConfig:
     max_tool_calls is a budget across the whole run, not per turn: calls beyond it are declined with an
     is_error tool message the model reads and adapts to, rather than dropped or raised on,
     so the model gets a chance to finish with what it already has.
+    `max_attempts` bounds one `generate_one` call's requests, including the first.
     self_correction_enabled sends every final answer back for critique until some critique has returned an
     approval, so a run whose critiques keep saying "revise" keeps bouncing and max_turns is what bounds it;
     an agent with it off answers on its first text turn.
@@ -30,6 +31,7 @@ class AgentConfig:
     system_prompt: str
     max_turns: int = 8
     max_tool_calls: int = 12
+    max_attempts: int = 2
     timeout_seconds: float = 10.0
     self_correction_enabled: bool = False
 

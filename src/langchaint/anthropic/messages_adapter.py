@@ -234,6 +234,16 @@ response field carries no precondition on the request, so the tier is read off e
 
 _STANDARD_TIER: AnthropicPricedServiceTier = "standard"
 
+type AnthropicClient = AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
+
+
+def client_without_retries[ClientT: AnthropicClient](client: ClientT) -> ClientT:
+    """Return one client whose SDK retries are disabled."""
+    if client.max_retries == 0:
+        return client
+    # Bedrock copy() drops custom transports unless http_client is passed again.
+    return client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
+
 
 @dataclass(frozen=True, kw_only=True)
 class AnthropicPricingTable:
@@ -988,19 +998,14 @@ class AnthropicMessagesAdapter(Adapter):
 
         provider_name says which provider the client reaches: "anthropic" for AsyncAnthropic,
         "aws.bedrock" for either Bedrock client class.
-        anthropic_model and anthropic_bedrock_model each pass the one value their client serves.
         Both Bedrock classes are in provider_name_by_client_class, so a value contradicting either
         makes Adapter.__init__ raise; an AsyncAnthropic takes the value its caller states, since
         its base_url decides what it reaches.
 
-        The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
-        counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
-        so the SDK must never retry beneath it.
-        The copy re-feeds client._client (the caller's httpx.AsyncClient) explicitly:
-        the two Bedrock client classes override copy() without the "http_client or self._client" reuse the
-        base AsyncAnthropic.copy has (anthropic 0.120.0), so a plain with_options rebuilds a fresh default
-        transport and drops a custom transport (loaded certs, proxy). Passing it back keeps it; the value is
-        the SDK client's own httpx client, re-entering the same SDK's copy, so the private read is known-true.
+        The stored client disables SDK retries.
+        langchaint's retry loop owns retrying and counts every request.
+        Anthropic 0.120.0 Bedrock copies otherwise drop custom transports.
+        `client_without_retries` passes the SDK client's transport back into its copy.
         cache_ttl applies uniformly to every cache_control marker this adapter writes,
         automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
         "1h" holds entries across longer gaps and writes bill 2x
@@ -1032,9 +1037,7 @@ class AnthropicMessagesAdapter(Adapter):
                 f"it prices every response that reports no service tier, so it is required"
             )
         super().__init__(client=client, model=model, provider_name=provider_name)
-        # client._client is the SDK client's own httpx transport, re-fed to the same SDK's copy to keep
-        # a custom transport the Bedrock copy() override would otherwise drop (see the docstring above).
-        self.client = client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
+        self.client = client_without_retries(client)
         self.pricing = pricing
         self.default_max_completion_tokens = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl

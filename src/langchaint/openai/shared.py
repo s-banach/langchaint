@@ -76,6 +76,14 @@ _DEFAULT_TIER: OpenAIPricedServiceTier = "default"
 
 type _FailureDisposition = Literal["transient", "terminal"]
 
+
+def client_without_retries[ClientT: openai.AsyncOpenAI](client: ClientT) -> ClientT:
+    """Return one client whose SDK retries are disabled."""
+    if client.max_retries == 0:
+        return client
+    return client.with_options(max_retries=0)
+
+
 _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
     "server_error": "transient",
     "rate_limit_exceeded": "transient",

@@ -19,7 +19,7 @@ from langchaint import (
     UserMessage,
     tool,
 )
-from langchaint.openai import openai_model
+from langchaint.openai import OpenAIAccount
 
 
 # pydantic puts this docstring in model_json_schema, which PydanticTool sends as args_schema.
@@ -119,30 +119,33 @@ async def run_agent(
     """Run the tool loop, returning the answer and what the tools charged.
 
     Raises:
+        openai.OpenAIError: OpenAI credentials are unavailable during account construction.
+        Exception: An owned resource close operation fails.
         RuntimeError: the model called tools for max_turns turns without a final answer.
         GenerationError: a bound.generate_one call failed.
         DispatchExceptionGroup: a tool function raised.
     """
-    discovered = [tool_from_mcp_entry(entry) for entry in await list_mcp_tools()]
-    bound = openai_model("gpt-5.6-terra").bind(
-        system_prompt="Use tools to answer the user's question.",
-        tool_manager=ToolManager([get_weather, *discovered]),
-        automatic_prompt_caching=True,
-    )
-
-    messages: list[Message] = [UserMessage(content=prompt)]
-    fees_in_usd = 0.0
-    for _ in range(max_turns):
-        response = await bound.generate_one(messages)
-        messages.append(response.assistant_message)
-        if not response.tool_calls:
-            return response.output, fees_in_usd
-
-        outcomes = await bound.tool_manager.dispatch_many(
-            response.tool_calls, precomputed=approve_or_deny
+    async with OpenAIAccount() as openai:
+        discovered = [tool_from_mcp_entry(entry) for entry in await list_mcp_tools()]
+        bound = openai.model("gpt-5.6-terra").bind(
+            system_prompt="Use tools to answer the user's question.",
+            tool_manager=ToolManager([get_weather, *discovered]),
+            automatic_prompt_caching=True,
         )
-        for outcome in outcomes:
-            if outcome.kind == "handled" and isinstance(outcome.app_data, ApiFee):
-                fees_in_usd += outcome.app_data.fee_in_usd
-            messages.append(outcome.tool_message)
-    raise RuntimeError(f"agent did not finish within {max_turns} turns")
+
+        messages: list[Message] = [UserMessage(content=prompt)]
+        fees_in_usd = 0.0
+        for _ in range(max_turns):
+            response = await bound.generate_one(messages)
+            messages.append(response.assistant_message)
+            if not response.tool_calls:
+                return response.output, fees_in_usd
+
+            outcomes = await bound.tool_manager.dispatch_many(
+                response.tool_calls, precomputed=approve_or_deny
+            )
+            for outcome in outcomes:
+                if outcome.kind == "handled" and isinstance(outcome.app_data, ApiFee):
+                    fees_in_usd += outcome.app_data.fee_in_usd
+                messages.append(outcome.tool_message)
+        raise RuntimeError(f"agent did not finish within {max_turns} turns")

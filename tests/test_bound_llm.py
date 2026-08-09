@@ -57,6 +57,7 @@ from langchaint import (
 )
 from langchaint import llm as llm_module
 from langchaint import shared_backoff as shared_backoff_module
+from langchaint.account_state import AccountState
 from langchaint.adapter import (
     Adapter,
     AdapterResult,
@@ -135,20 +136,20 @@ def _fast_shared_backoff(
     *,
     max_concurrent_requests: int | None = 8,
     parse: Callable[[Exception], Verdict] = _parse_fake,
-    longest_wait: float = 0.002,
-    admission_gap: float = 0.0001,
+    longest_wait_seconds: float = 0.002,
+    max_request_starts_per_second: float = 10_000.0,
 ) -> SharedBackoff:
-    """Build a fresh near-zero-wait SharedBackoff; one instance serves one event loop.
+    """Build a fresh near-zero-wait `SharedBackoff`.
 
-    Raise longest_wait and admission_gap in a test that needs a wait long enough to observe.
+    One instance serves one event loop.
     """
     return SharedBackoff(
         parse=parse,
         failure_types=(TransientError,),
         max_concurrent_requests=max_concurrent_requests,
-        minimum_wait_ceiling=0.001,
-        longest_wait=longest_wait,
-        admission_gap=admission_gap,
+        minimum_wait_ceiling_seconds=0.001,
+        longest_wait_seconds=longest_wait_seconds,
+        max_request_starts_per_second=max_request_starts_per_second,
     )
 
 
@@ -875,12 +876,23 @@ class _InterpretRaisesAdapter(_FakeAdapter):
 
 
 def test_llm_rejects_invalid_max_attempts() -> None:
-    """A bool max_attempts would otherwise mean one silent attempt, and an int below 1 no attempt."""
+    """Reject `max_attempts` values below one and boolean values."""
     for max_attempts in (True, False, 0, -1):
         with pytest.raises(ValueError, match="max_attempts"):
-            _ = LLM(
-                _FakeAdapter(), shared_backoff=_fast_shared_backoff(), max_attempts=max_attempts
+            _ = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
+                automatic_prompt_caching=True,
+                max_attempts=max_attempts,
             )
+
+
+def test_rebind_rejects_invalid_max_attempts() -> None:
+    """Reject replacement `max_attempts` values below one and boolean values."""
+    bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
+        automatic_prompt_caching=True
+    )
+    for max_attempts in (True, False, 0, -1):
+        with pytest.raises(ValueError, match="max_attempts"):
+            _ = bound_llm.rebind(max_attempts=max_attempts)
 
 
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
@@ -1075,8 +1087,9 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
     async def scenario() -> None:
         """Drive one generate_one to exhaustion under a two-attempt budget."""
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1107,10 +1120,11 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
             parse=_parse_fake,
             failure_types=(TransientError,),
             max_concurrent_requests=8,
-            minimum_wait_ceiling=0.05,
+            minimum_wait_ceiling_seconds=0.05,
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         failed, succeeded = response.attempt_records
@@ -1370,8 +1384,9 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
                 )
             ]
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=1).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+            automatic_prompt_caching=True,
+            max_attempts=1,
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1552,8 +1567,9 @@ def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -
         stream = _FailsAfterFirstItemStream()
         stream._usage_reported = _USAGE_STREAM
         adapter = _FakeAdapter(stream=stream, classify_result="transient")
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=1).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True,
+            max_attempts=1,
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1650,8 +1666,9 @@ def test_a_stream_protocol_error_is_retried_to_exhaustion() -> None:
     async def scenario() -> None:
         """Exhaust a two-attempt budget on a stream that violates the protocol every time."""
         adapter = _FakeAdapter(stream=_ProtocolErrorStream())
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -2079,8 +2096,9 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
         """
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=1).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+            automatic_prompt_caching=True,
+            max_attempts=1,
         )
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
@@ -2183,8 +2201,9 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
     async def scenario() -> None:
         """Fail the deterministic first attempt under a one-attempt budget; the other two succeed."""
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=1).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True,
+            max_attempts=1,
         )
         results = await bound_llm.generate_many(
             [[UserMessage(content="a")], [UserMessage(content="b")], [UserMessage(content="c")]],
@@ -2654,7 +2673,7 @@ def test_a_stream_cancelled_after_a_protocol_error_sets_its_abandoned() -> None:
 
 
 _MID_STREAM_RETRY_AFTER_SECONDS = 30.0
-"""The server-stated wait the failing stream reports, under the default longest_wait cap so it passes through."""
+"""The failing stream's wait, below the default `longest_wait_seconds`."""
 
 
 def test_a_mid_stream_rate_limit_pauses_the_domain() -> None:
@@ -3549,8 +3568,9 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
     async def scenario() -> None:
         """Open a stream under a two-attempt budget whose every open_stream fails transiently."""
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2).bind(
-            automatic_prompt_caching=True
+        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         with pytest.raises(RetriesExhaustedError) as exhausted:
             async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -3688,10 +3708,10 @@ def test_stream_closes_on_context_exit() -> None:
 
 
 def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
-    """A server-stated wait on a retried failure floors the private wait and pauses nothing shared.
+    """A server-stated wait floors private backoff without pausing shared admission.
 
-    The private draw is at most minimum_wait_ceiling, here 0.001 seconds.
-    So only the floor can push the measured wait past retry_after_seconds.
+    `minimum_wait_ceiling_seconds` is 0.001 seconds here.
+    Only `retry_after_seconds` can produce the measured delay.
     """
 
     async def scenario() -> None:
@@ -3700,9 +3720,10 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
         adapter = _FakeAdapter(
             failures=[TransientError("slow down", retry_after_seconds=retry_after_seconds)]
         )
-        shared_backoff = _fast_shared_backoff(longest_wait=1.0)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
-            automatic_prompt_caching=True
+        shared_backoff = _fast_shared_backoff(longest_wait_seconds=1.0)
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         started_at = time.monotonic()
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -3801,9 +3822,13 @@ def test_backoff_sleep_does_not_hold_the_permit() -> None:
         adapter = _FakeAdapter(
             failures=[TransientError("boom", retry_after_seconds=retry_after_seconds)]
         )
-        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1, longest_wait=1.0)
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff, max_attempts=2).bind(
-            automatic_prompt_caching=True
+        shared_backoff = _fast_shared_backoff(
+            max_concurrent_requests=1,
+            longest_wait_seconds=1.0,
+        )
+        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
+            automatic_prompt_caching=True,
+            max_attempts=2,
         )
         first_task = asyncio.create_task(bound_llm.generate_one([UserMessage(content="a")]))
         await asyncio.sleep(0.01)
@@ -4052,17 +4077,20 @@ def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
 
 
 def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
-    """No permit gates entry, so admission_gap alone paces the batch, and it is not charged.
+    """Admission pacing spends none of an item's working-time budget.
 
-    With max_concurrent_requests None every item passes the permit at once and queues on
-    admission_gap. At 0.1 seconds per admission the fourth item is admitted 0.3 seconds in,
-    against a budget of 0.1 that only its own request may spend.
+    `max_concurrent_requests=None` lets every item reach admission immediately.
+    `max_request_starts_per_second=10.0` starts one request every 0.1 seconds.
+    The fourth request starts after its 0.1-second working-time budget.
     """
 
     async def scenario() -> None:
         """Pace four items through the admission queue on a budget shorter than the queue."""
         adapter = _FakeAdapter(echo=True)
-        shared_backoff = _fast_shared_backoff(max_concurrent_requests=None, admission_gap=0.1)
+        shared_backoff = _fast_shared_backoff(
+            max_concurrent_requests=None,
+            max_request_starts_per_second=10.0,
+        )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content=str(index))] for index in range(4)],
@@ -4073,15 +4101,49 @@ def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 
 
-def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
-    """A pause blocks admission, so the item it holds up is not charged for the wait.
+def test_account_closure_during_stream_admission_releases_the_permit() -> None:
+    """Stream admission rejects closure and releases its request permit."""
 
-    A rate-limit TransientError pauses the domain for 0.3 seconds, and PauseAll is the one verdict
-    the retry loop does not sleep on, so the whole 0.3 is spent waiting to be admitted. Each of the
-    two attempts opens for 0.05, which is what the 0.15 second budget pays for; charging the pause
-    as well would leave the retry no budget to run in.
-    longest_wait sits above the pause because a retry_after reaching a SharedBackoff is capped
-    there, so a shorter one would put this test outside what a pause can be.
+    async def scenario() -> None:
+        """Close account state while the second request awaits pacing."""
+        account_state = AccountState()
+        adapter = _FakeAdapter(echo=True)
+        llm = LLM(
+            adapter,
+            shared_backoff=_fast_shared_backoff(
+                max_concurrent_requests=1,
+                max_request_starts_per_second=2.0,
+            ),
+        )
+        llm._account_state = account_state
+        bound_llm = llm.bind(automatic_prompt_caching=True)
+        first = await bound_llm.generate_one("first")
+        assert first.output == "first"
+
+        handle = bound_llm.stream_one("second")
+        second_task = asyncio.create_task(handle.__aenter__())
+        await asyncio.sleep(0.05)
+        account_state.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = await second_task
+        assert adapter.bound_adapters[0].open_count == 1
+
+        control = LLM(adapter, shared_backoff=llm.shared_backoff).bind(
+            automatic_prompt_caching=True
+        )
+        response = await control.generate_one("control")
+        assert response.output == "control"
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
+    """A shared pause spends none of an item's working-time budget.
+
+    A rate-limit `TransientError` pauses admission for 0.3 seconds.
+    `PauseAll` adds no private sleep.
+    Each request spends 0.05 seconds from the 0.15-second budget.
+    `longest_wait_seconds=0.5` keeps the stated pause unchanged.
     """
 
     async def scenario() -> None:
@@ -4091,7 +4153,10 @@ def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
             open_seconds=0.05,
             failures=[TransientError("slow down", retry_after_seconds=0.3, is_rate_limit=True)],
         )
-        shared_backoff = _fast_shared_backoff(max_concurrent_requests=None, longest_wait=0.5)
+        shared_backoff = _fast_shared_backoff(
+            max_concurrent_requests=None,
+            longest_wait_seconds=0.5,
+        )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(automatic_prompt_caching=True)
         results = await bound_llm.generate_many(
             [[UserMessage(content="paused")]], max_working_seconds_per_item=0.15

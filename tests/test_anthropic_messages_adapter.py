@@ -73,12 +73,12 @@ from langchaint.adapter import (
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
+    AnthropicAccount,
+    AnthropicBedrockAccount,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
     AnthropicPricedServiceTier,
     AnthropicPricingTable,
-    anthropic_bedrock_model,
-    anthropic_model,
 )
 from langchaint.anthropic.messages_adapter import (
     PARSE_FALLTHROUGH_COUNTS,
@@ -358,11 +358,10 @@ def test_pricing_without_the_standard_key_raises_at_construction() -> None:
 
 
 def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None:
-    """anthropic_model merges the caller's mapping over the catalog's standard-tier table."""
+    """AnthropicAccount.model merges stated pricing over catalog pricing."""
     adapter = _anthropic_adapter_of(
-        anthropic_model(
+        AnthropicAccount(client=AsyncAnthropic(api_key="test")).model(
             "claude-sonnet-5",
-            client=AsyncAnthropic(api_key="test"),
             pricing={"priority": _PRIORITY_RATES},
         )
     )
@@ -371,19 +370,21 @@ def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None
 
 
 def test_cache_ttl_is_stored_on_the_adapter() -> None:
-    """Both constructors carry cache_ttl through to the adapter that writes the markers."""
+    """Both Account.model methods carry cache_ttl to their adapter."""
     assert (
         _anthropic_adapter_of(
-            anthropic_model(
-                "claude-sonnet-5", client=AsyncAnthropic(api_key="test"), cache_ttl="1h"
+            AnthropicAccount(client=AsyncAnthropic(api_key="test")).model(
+                "claude-sonnet-5",
+                cache_ttl="1h",
             )
         ).cache_ttl
         == "1h"
     )
     assert (
         _anthropic_adapter_of(
-            anthropic_bedrock_model(
-                "anthropic.claude-sonnet-5", aws_region="us-east-1", cache_ttl="1h"
+            AnthropicBedrockAccount(aws_region="us-east-1").model(
+                "anthropic.claude-sonnet-5",
+                cache_ttl="1h",
             )
         ).cache_ttl
         == "1h"
@@ -1646,40 +1647,40 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
     expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     """Each Bedrock wire model id reaches its API's client class unchanged, retries pinned off."""
-    adapter = _anthropic_adapter_of(anthropic_bedrock_model(model, aws_region="us-east-1"))
+    adapter = _anthropic_adapter_of(AnthropicBedrockAccount(aws_region="us-east-1").model(model))
     assert adapter.model == model
     assert isinstance(adapter.client, expected_client_class)
     assert adapter.client.max_retries == 0
 
 
 def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
-    """The Bedrock standard-tier table is the same object anthropic_model uses, not a copy."""
+    """The Bedrock standard-tier table shares AnthropicAccount.model pricing."""
     adapter = _anthropic_adapter_of(
-        anthropic_bedrock_model("us.anthropic.claude-opus-4-6-v1", aws_region="us-east-1")
+        AnthropicBedrockAccount(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
     )
     assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-6"]
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
-    """A supplied client whose class serves the model's Bedrock API passes through, retries pinned off."""
+    """Use a matching supplied client with SDK retries disabled."""
     adapter = _anthropic_adapter_of(
-        anthropic_bedrock_model(
-            "anthropic.claude-opus-4-8", client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")
+        AnthropicBedrockAccount(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).model(
+            "anthropic.claude-opus-4-8"
         )
     )
     assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
     assert adapter.model == "anthropic.claude-opus-4-8"
     assert adapter.client.max_retries == 0
-    # aws_region survives with_options; the supplied client's distinctive region proves it is the one
-    # used, not a default rebuilt from the constructor's own aws_region (which is None here).
+    # The distinctive region proves the supplied client reaches the adapter.
+    # The account's aws_region is None.
     assert adapter.client.aws_region == "eu-west-1"
 
 
 def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_api() -> None:
-    """A legacy client for a mantle-only model fails at construction, naming the model and required class."""
+    """Reject a legacy client for a mantle model."""
     legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
     with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
-        _ = anthropic_bedrock_model("anthropic.claude-sonnet-5", client=legacy_client)
+        _ = AnthropicBedrockAccount(client=legacy_client).model("anthropic.claude-sonnet-5")
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
 
 

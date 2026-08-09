@@ -5,7 +5,8 @@ A domain is the set of requests the caller routes through one instance, usually 
 A request enters `admitted()`, the async-with block spanning one attempt.
 Entry acquires a permit when `max_concurrent_requests` is set, then admission; normally both are immediate.
 After the provider pushes back, every request in the domain waits at entry until the shared pause ends.
-When the pause ends, waiting requests are released in the order they joined, spaced by `admission_gap`.
+When the pause ends, waiting requests remain ordered by arrival.
+`max_request_starts_per_second` spaces their request starts.
 Exit parses a provider failure into a verdict, records it, then returns the permit, in that order by position.
 SharedBackoff decides no retries and counts no tokens.
 It also bounds no pending work: it cannot tell an unadmitted request from one that has not entered yet.
@@ -109,8 +110,8 @@ def _random_up_to(ceiling: float) -> float:
     return ceiling * (1.0 - random.random())
 
 
-def _validated_positive_seconds(name: str, value: float) -> float:
-    """Return value as a positive finite float, under the acceptance rule that the numeric settings and budget share.
+def _validated_positive_float(name: str, value: float) -> float:
+    """Return value as a positive finite float.
 
     bool is rejected explicitly because it subclasses int, so a type checker admits True here.
 
@@ -212,7 +213,8 @@ class SharedBackoff:
     Route every request in the domain through one instance, first attempts and retries alike.
 
     The wait ceiling is a ceiling, not a wait: each pause of our own choosing lasts a fresh random
-    number greater than zero and no larger than it, so one wait can fall far below minimum_wait_ceiling.
+    number greater than zero and no larger than it.
+    One wait can fall far below minimum_wait_ceiling_seconds.
     There is no setting for how many requests may wait; the bound on pending work belongs to
     whatever spawns the work.
 
@@ -239,65 +241,72 @@ class SharedBackoff:
         parse: Callable[[Exception], Verdict],
         failure_types: tuple[type[Exception], ...],
         max_concurrent_requests: int | None,
-        minimum_wait_ceiling: float = 1.0,
-        longest_wait: float = 60.0,
+        minimum_wait_ceiling_seconds: float = 1.0,
+        longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
-        quiet_per_decay_step: float = 60.0,
-        admission_gap: float = 0.02,
+        quiet_seconds_per_decay_step: float = 60.0,
+        max_request_starts_per_second: float = 50.0,
         on_parse_error: Literal["raise", "retry_this_one"] = "raise",
     ) -> None:
-        """Validate the configuration and start with no pause, no queue, and every permit free.
+        """Validate the configuration and initialize an unpaused domain.
 
-        parse maps each failure_types exception to a verdict; the exit calls it only through the
-        checking wrapper, so nothing else in the object sees a status code or an exception's contents.
-        parse is synchronous, so the raised failure must already carry what parse needs; await any
-        body reading inside the block before raising.
-        failure_types are the exception types the exit parses; provide narrow provider-failure classes.
-        max_concurrent_requests is the number of requests allowed inside admitted() blocks at once,
-        or None when a fixed worker pool upstream already bounds concurrency; a permit held idle
-        through a pause is acceptable because every other request in the domain is paused too.
-        minimum_wait_ceiling is where the wait ceiling starts and decays back to.
-        longest_wait caps the wait ceiling and any retry_after.
-        wait_multiplier is how much the ceiling grows or shrinks in one step.
-        quiet_per_decay_step is how long without a pause earns one shrink of the ceiling.
-        admission_gap is the smallest interval between two admissions, so it caps the rate of
-        request starts while demand is queued; check that cap against your own workload.
-        on_parse_error is what a parse contract violation becomes: "raise" (the default) raises
-        ParserContractError, and "retry_this_one" corrects it to RetryThisOne with no retry_after.
+        `parse` synchronously maps each provider failure to a `Verdict`.
+        `failure_types` identifies the exceptions passed to `parse`.
+        `max_concurrent_requests=None` delegates concurrency limits to the caller.
+        `minimum_wait_ceiling_seconds` is the initial and minimum wait ceiling.
+        `longest_wait_seconds` caps the wait ceiling and `retry_after`.
+        `wait_multiplier` changes the wait ceiling by one step.
+        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `max_request_starts_per_second` limits request starts during queued demand.
+        `on_parse_error="raise"` raises `ParserContractError`.
+        `on_parse_error="retry_this_one"` produces `RetryThisOne` without `retry_after`.
 
         Raises:
-            ValueError: a numeric setting fails the acceptance rule (not a bool, finite,
-                greater than zero); wait_multiplier is not greater than 1; longest_wait is below
-                minimum_wait_ceiling; longest_wait / minimum_wait_ceiling is not a finite float,
-                which the decay arithmetic assumes; max_concurrent_requests is a bool or an int below 1;
-                on_parse_error is neither accepted string; failure_types is empty,
-                which would make the exit parse nothing and record nothing; a failure_types entry
-                is not a strict subclass of Exception (Exception itself would convert nearly every
-                application bug into an apparent provider failure, and a type outside Exception,
-                such as asyncio.CancelledError, would pause the domain over a Ctrl-C); or parse is
-                a coroutine function, which the synchronous exit could never await.
+            ValueError: A numeric setting is boolean, non-finite, or non-positive.
+                Also raised when the request-rate reciprocal is non-finite.
+                Also raised when `wait_multiplier` is at most one.
+                Also raised when `longest_wait_seconds` is below `minimum_wait_ceiling_seconds`.
+                Also raised when their ratio is non-finite.
+                Also raised when `max_concurrent_requests` is boolean or below one.
+                Also raised when `on_parse_error` is unsupported.
+                Also raised when `failure_types` is empty.
+                Also raised when a failure type is not an `Exception` subclass.
+                Also raised when a failure type equals `Exception`.
+                Also raised when `inspect.iscoroutinefunction(parse)` is true.
         """
-        self.minimum_wait_ceiling = _validated_positive_seconds(
-            "minimum_wait_ceiling", minimum_wait_ceiling
+        self.minimum_wait_ceiling_seconds = _validated_positive_float(
+            "minimum_wait_ceiling_seconds", minimum_wait_ceiling_seconds
         )
-        self.longest_wait = _validated_positive_seconds("longest_wait", longest_wait)
-        self.wait_multiplier = _validated_positive_seconds("wait_multiplier", wait_multiplier)
-        self.quiet_per_decay_step = _validated_positive_seconds(
-            "quiet_per_decay_step", quiet_per_decay_step
+        self.longest_wait_seconds = _validated_positive_float(
+            "longest_wait_seconds", longest_wait_seconds
         )
-        self.admission_gap = _validated_positive_seconds("admission_gap", admission_gap)
+        self.wait_multiplier = _validated_positive_float("wait_multiplier", wait_multiplier)
+        self.quiet_seconds_per_decay_step = _validated_positive_float(
+            "quiet_seconds_per_decay_step", quiet_seconds_per_decay_step
+        )
+        self.max_request_starts_per_second = _validated_positive_float(
+            "max_request_starts_per_second", max_request_starts_per_second
+        )
+        self._seconds_between_request_starts = 1.0 / self.max_request_starts_per_second
+        if not math.isfinite(self._seconds_between_request_starts):
+            raise ValueError(
+                "1 / max_request_starts_per_second must be finite, "
+                f"got {self._seconds_between_request_starts!r} from "
+                f"{max_request_starts_per_second!r}"
+            )
         if self.wait_multiplier <= 1.0:
             raise ValueError(f"wait_multiplier must be greater than 1, got {wait_multiplier!r}")
-        if self.longest_wait < self.minimum_wait_ceiling:
+        if self.longest_wait_seconds < self.minimum_wait_ceiling_seconds:
             raise ValueError(
-                f"longest_wait must be at least minimum_wait_ceiling, "
-                f"got {longest_wait!r} < {minimum_wait_ceiling!r}"
+                "longest_wait_seconds must be at least minimum_wait_ceiling_seconds, "
+                f"got {longest_wait_seconds!r} < {minimum_wait_ceiling_seconds!r}"
             )
-        ceiling_ratio = self.longest_wait / self.minimum_wait_ceiling
+        ceiling_ratio = self.longest_wait_seconds / self.minimum_wait_ceiling_seconds
         if not math.isfinite(ceiling_ratio):
             raise ValueError(
-                "longest_wait / minimum_wait_ceiling must be a finite float, "
-                f"got {ceiling_ratio!r} from {longest_wait!r} / {minimum_wait_ceiling!r}"
+                "longest_wait_seconds / minimum_wait_ceiling_seconds must be finite, "
+                f"got {ceiling_ratio!r} from {longest_wait_seconds!r} / "
+                f"{minimum_wait_ceiling_seconds!r}"
             )
         if max_concurrent_requests is not None and (
             isinstance(max_concurrent_requests, bool) or max_concurrent_requests < 1
@@ -333,20 +342,21 @@ class SharedBackoff:
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
         """Quiet steps after which the ceiling has reached the floor, whatever it started at.
 
-        Bounds the decay exponent, since the ceiling never exceeds longest_wait: past this many
-        steps the answer is minimum_wait_ceiling by definition, and below it
-        wait_multiplier ** steps cannot exceed the ceiling ratio checked finite above.
+        This bounds the decay exponent because the ceiling never exceeds longest_wait_seconds.
+        Afterward, the answer is minimum_wait_ceiling_seconds.
+        For fewer steps, wait_multiplier ** steps cannot exceed the checked ceiling ratio.
         """
         self._pause_until = _NEVER
         """When the current pause ends; once it is over, still the end of the previous pause."""
         self._pause_started_at = _NEVER
         """When the current pause began; a metric for logging, read by no decision."""
-        self._wait_ceiling = self.minimum_wait_ceiling
+        self._wait_ceiling = self.minimum_wait_ceiling_seconds
         """Longest pause this object will currently choose for itself."""
         self._last_admission_at = _NEVER
         """When a request was last admitted.
 
-        Enforces admission_gap, and answers whether traffic resumed after the previous pause.
+        Enforces _seconds_between_request_starts.
+        Also answers whether traffic resumed after the previous pause.
         """
         self._queue: deque[asyncio.Future[None]] = deque()
         """Requests waiting for admission, released in the order they joined."""
@@ -395,7 +405,7 @@ class SharedBackoff:
             ValueError: budget is not None and fails the acceptance rule (not a bool, finite,
                 greater than zero); nothing was acquired.
         """
-        budget_seconds = None if budget is None else _validated_positive_seconds("budget", budget)
+        budget_seconds = None if budget is None else _validated_positive_float("budget", budget)
         return Admission(self, budget_seconds)
 
     async def _acquire_permit(self) -> None:
@@ -415,11 +425,11 @@ class SharedBackoff:
         self._permits.release()
 
     async def _wait_turn(self) -> None:
-        """Wait in the admission queue until the shared pause and admission_gap admit this request.
+        """Wait until the shared pause and request-start interval permit admission.
 
         Cancellation before the grant removes the request from the queue.
-        Cancellation after the grant may have consumed one admission_gap, which is wasted but
-        harmless; the caller returns the permit.
+        Cancellation after the grant may consume one request-start interval.
+        The caller returns the permit.
 
         Raises:
             asyncio.CancelledError: the wait was cancelled; the request is out of the queue.
@@ -440,9 +450,9 @@ class SharedBackoff:
     def _admit_waiting(self) -> None:
         """Admit the front of the queue while nothing blocks it, else arm the timer for when it will.
 
-        Admission requires that no pause is running and at least admission_gap has passed since the
-        previous admission; granting records the moment in _last_admission_at, so a burst released
-        after a pause is spread one admission per gap.
+        Admission requires no active pause and one elapsed request-start interval.
+        Granting records the moment in _last_admission_at.
+        A queued burst starts at max_request_starts_per_second.
         Spent entries (cancelled waiters) at the front are dropped, never granted.
         """
         while self._queue:
@@ -450,7 +460,10 @@ class SharedBackoff:
                 _ = self._queue.popleft()
                 continue
             now = self._clock()
-            admissible_at = max(self._pause_until, self._last_admission_at + self.admission_gap)
+            admissible_at = max(
+                self._pause_until,
+                self._last_admission_at + self._seconds_between_request_starts,
+            )
             if now < admissible_at:
                 self._arm_admit_timer(admissible_at - now)
                 return
@@ -540,7 +553,7 @@ class SharedBackoff:
         return RetryThisOne(retry_after=None)
 
     def _normalized(self, verdict: Verdict) -> Verdict:
-        """Return the verdict with its retry_after validated and capped at longest_wait.
+        """Return the verdict with retry_after validated and capped at longest_wait_seconds.
 
         Runs before either _record or Admission.verdict sees the verdict, so both sides work from
         the same number whatever parse returned.
@@ -555,7 +568,7 @@ class SharedBackoff:
         return replace(verdict, retry_after=self._normalized_retry_after(verdict.retry_after))
 
     def _normalized_retry_after(self, stated: object) -> float | None:
-        """Return the stated retry_after as a positive finite float capped at longest_wait, or None.
+        """Return a valid retry_after capped at longest_wait_seconds, or None.
 
         The type must be exactly int or float, which excludes bool; anything else becomes None,
         counted, because a much larger or malformed value is more likely a bug or something hostile
@@ -567,17 +580,17 @@ class SharedBackoff:
             if stated <= 0:
                 self._count_correction("retry_after_invalid")
                 return None
-            if stated > self.longest_wait:
+            if stated > self.longest_wait_seconds:
                 self._count_correction("retry_after_over_cap")
-                return self.longest_wait
+                return self.longest_wait_seconds
             return float(stated)
         if type(stated) is float:
             if not math.isfinite(stated) or stated <= 0.0:
                 self._count_correction("retry_after_invalid")
                 return None
-            if stated > self.longest_wait:
+            if stated > self.longest_wait_seconds:
                 self._count_correction("retry_after_over_cap")
-                return self.longest_wait
+                return self.longest_wait_seconds
             return stated
         self._count_correction("retry_after_invalid")
         return None
@@ -588,18 +601,15 @@ class SharedBackoff:
         _logger.warning("corrected a parse verdict: %s", tag)
 
     def _record(self, verdict: Verdict) -> None:
-        """Record one parsed failure; only the two pausing verdicts change shared state.
+        """Record one parsed failure.
 
-        A report during a pause starts a fresh pause of its own, at most longest_wait long, and the
-        two merge by keeping the later end; the ceiling is untouched, because one burst of trouble
-        usually produces several reports within a second, and treating each as fresh evidence would
-        multiply the wait for a single event.
-        The merged pause never shrinks, which is one of the properties letting a PauseAll carry no
-        per-request floor: the failing request's own wait is one of the proposals the pause end is
-        the running maximum of, so waiting for admission already satisfies it.
-        So at every moment the pause ends at most longest_wait after the most recent report: every
-        merged-in wait is capped there, by the wrapper for a retry_after and by the ceiling for a
-        chosen wait.
+        Only PauseAll and PauseAllDoNotRetry change shared state.
+        A report during a pause proposes another capped pause.
+        The pauses merge by keeping the later end.
+        Reports during one pause do not increase _wait_ceiling.
+        The merged pause never shrinks.
+        Waiting for admission satisfies every PauseAll.retry_after.
+        The pause ends within longest_wait_seconds after the most recent report.
         """
         if not isinstance(verdict, PauseAll | PauseAllDoNotRetry):
             return
@@ -642,45 +652,33 @@ class SharedBackoff:
         return _random_up_to(self._wait_ceiling)
 
     def _set_wait_ceiling(self, now: float, previous_pause_end: float) -> None:
-        """Set the ceiling a fresh pause draws under, from what happened since the previous pause.
+        """Set _wait_ceiling from activity since previous_pause_end.
 
-        Nothing has gone wrong yet, so guess small: until the first pause the ceiling sits at
-        minimum_wait_ceiling.
-        Time has passed without trouble, so give back what the trouble cost us: the ceiling shrinks
-        one step per full quiet_per_decay_step since the previous pause ended, never below the
-        floor, so a stray refusal after a busy afternoon does not cost the afternoon's whole ceiling.
-        Quiet time also accrues while we send nothing, deliberately: requiring traffic first would
-        leave an idle application holding a longest_wait ceiling indefinitely.
-        Traffic resumed and we were refused again, so the last guess was too small: grow the
-        ceiling, capped at longest_wait.
-        The guard is on traffic having resumed, not on which request reported: a refusal is
-        evidence about the provider's present state and counts whoever observed it, but one
-        arriving before any traffic resumed is most likely another delayed result of the burst that
-        caused the previous pause.
-        When a full quiet step has passed and traffic has also resumed, decay wins, deliberately: a
-        refusal after a full quiet step is a fresh incident, priced by the pause it starts, and not
-        evidence that a guess made a step or more ago was too small.
-        The short-circuit past _steps_to_floor is what keeps wait_multiplier ** steps from
-        overflowing after a long quiet spell.
-        The ceiling is only read at the instant a pause begins, so computing the decay here gives
-        the same answer as decaying continuously, with no timer to run.
+        The first pause uses minimum_wait_ceiling_seconds.
+        Each full quiet_seconds_per_decay_step shrinks _wait_ceiling by wait_multiplier.
+        _wait_ceiling never falls below minimum_wait_ceiling_seconds.
+        Quiet time includes periods without requests.
+        Resumed traffic without a full quiet step grows _wait_ceiling by wait_multiplier.
+        _wait_ceiling never exceeds longest_wait_seconds.
+        A full quiet step takes precedence over resumed traffic.
+        _steps_to_floor prevents wait_multiplier ** steps from overflowing.
         """
         if previous_pause_end == _NEVER:
-            self._wait_ceiling = self.minimum_wait_ceiling
+            self._wait_ceiling = self.minimum_wait_ceiling_seconds
             return
-        steps = int((now - previous_pause_end) // self.quiet_per_decay_step)
+        steps = int((now - previous_pause_end) // self.quiet_seconds_per_decay_step)
         if steps >= 1:
             if steps >= self._steps_to_floor:
-                self._wait_ceiling = self.minimum_wait_ceiling
+                self._wait_ceiling = self.minimum_wait_ceiling_seconds
             else:
                 self._wait_ceiling = max(
                     self._wait_ceiling / self.wait_multiplier**steps,
-                    self.minimum_wait_ceiling,
+                    self.minimum_wait_ceiling_seconds,
                 )
         elif self._last_admission_at > previous_pause_end:
             self._wait_ceiling = min(
                 self._wait_ceiling * self.wait_multiplier,
-                self.longest_wait,
+                self.longest_wait_seconds,
             )
 
 
@@ -697,21 +695,22 @@ class PrivateBackoff:
     """
 
     def __init__(self, shared_backoff: SharedBackoff) -> None:
-        """Start the private ceiling at the domain's minimum_wait_ceiling."""
-        self._ceiling = shared_backoff.minimum_wait_ceiling
+        """Start the private ceiling at minimum_wait_ceiling_seconds."""
+        self._ceiling = shared_backoff.minimum_wait_ceiling_seconds
         self._wait_multiplier = shared_backoff.wait_multiplier
-        self._longest_wait = shared_backoff.longest_wait
+        self._longest_wait_seconds = shared_backoff.longest_wait_seconds
 
     def next_wait(self, retry_after: float | None) -> float:
         """Return one failure's wait in seconds, then grow the ceiling one step.
 
-        The wait is a fresh random draw greater than zero and no larger than the private ceiling,
-        raised to retry_after where the verdict carried one, so a server-stated floor is honored.
-        Read retry_after off Admission.verdict, which is normalized, so it is already capped at
-        longest_wait; the ceiling grows by wait_multiplier under the same cap.
+        The wait is a positive random draw bounded by _ceiling.
+        retry_after raises that wait when present.
+        Admission.verdict provides a normalized retry_after.
+        The normalized retry_after is capped at longest_wait_seconds.
+        _ceiling grows by wait_multiplier under the same cap.
         """
         wait = _random_up_to(self._ceiling)
         if retry_after is not None:
             wait = max(wait, retry_after)
-        self._ceiling = min(self._ceiling * self._wait_multiplier, self._longest_wait)
+        self._ceiling = min(self._ceiling * self._wait_multiplier, self._longest_wait_seconds)
         return wait

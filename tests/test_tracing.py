@@ -65,6 +65,7 @@ from langchaint import (
     UserMessage,
     to_tables,
 )
+from langchaint.account_state import AccountState
 from langchaint.adapter import (
     AdapterResult,
     Binding,
@@ -457,12 +458,12 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
         with pytest.raises(RetriesExhaustedError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=2, automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -722,6 +723,35 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
     asyncio.run(scenario())
 
 
+def test_tracing_records_closed_account_failures() -> None:
+    """Closed-account generation and stream failures end error spans."""
+
+    async def scenario() -> None:
+        """Close the account state before both traced request starts."""
+        tracer, exporter = _in_memory_tracer()
+        account_state = AccountState()
+        llm = LLM(_FakeAdapter())
+        llm._account_state = account_state
+        traced = TracedLLM(llm, tracer=tracer, capture_message_content=False)
+        bound = traced.bind(automatic_prompt_caching=True)
+        account_state.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = await bound.generate_one("hi")
+        with pytest.raises(RuntimeError, match="closed"):
+            async with bound.stream_one("hi"):
+                pass
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        assert all(span.status.status_code == StatusCode.ERROR for span in spans)
+        for span in spans:
+            assert span.attributes is not None
+            assert span.attributes["error.type"] == "AccountClosedError"
+
+    asyncio.run(scenario())
+
+
 def test_stream_final_is_idempotent_and_ends_the_span_once() -> None:
     """A second final() returns the same Response and does not end a second span."""
 
@@ -882,12 +912,12 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
         adapter = _FakeAdapter(failures=[TransientError("connection reset")] * 4)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=False,
         )
         with pytest.raises(RetriesExhaustedError):
-            async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
+            async with traced.bind(max_attempts=2, automatic_prompt_caching=True).stream_one("hi"):
                 pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -980,6 +1010,16 @@ def test_traced_bind_and_rebind_carry_extra_body_by_reference() -> None:
     replacement = {"safety_identifier": "user-8"}
     assert bound.rebind(extra_body=replacement).binding.extra_body is replacement
     assert bound.rebind(extra_body=None).binding.extra_body is None
+
+
+def test_traced_bind_and_rebind_forward_max_attempts() -> None:
+    """TracedLLM.bind and TracedBoundLLM.rebind forward max_attempts."""
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    assert traced.bind(automatic_prompt_caching=True).max_attempts == 3
+    bound = traced.bind(max_attempts=2, automatic_prompt_caching=True)
+    assert bound.max_attempts == 2
+    assert bound.rebind().max_attempts == 2
+    assert bound.rebind(max_attempts=4).max_attempts == 4
 
 
 def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
@@ -2344,12 +2384,12 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
         adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=2),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=True,
         )
         with pytest.raises(RetriesExhaustedError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=2, automatic_prompt_caching=True).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
@@ -2762,12 +2802,12 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
         )
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(), max_attempts=3),
+            LLM(adapter, shared_backoff=_fast_shared_backoff()),
             tracer=tracer,
             capture_message_content=capture_message_content,
         )
         with pytest.raises(RefusalError) as raised:
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=3, automatic_prompt_caching=True).generate_one("hi")
 
         error = raised.value
         assert error.attempts == 2

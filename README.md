@@ -25,7 +25,7 @@ import asyncio
 
 from pydantic import BaseModel
 
-from langchaint.openai import openai_model
+from langchaint.openai import OpenAIAccount
 
 
 class Sentiment(BaseModel):
@@ -34,14 +34,14 @@ class Sentiment(BaseModel):
 
 
 async def main() -> None:
-    llm = openai_model("gpt-5.6-terra")
-    classifier = llm.bind(
-        system_prompt="Classify the sentiment of the user's message.",
-        response_format=Sentiment,
-        automatic_prompt_caching=False,
-    )
-    response = await classifier.generate_one("This is the best day I have had in months.")
-    print(response.output.label, response.usage.cost_in_usd)
+    async with OpenAIAccount() as openai:
+        classifier = openai.model("gpt-5.6-terra").bind(
+            system_prompt="Classify the sentiment of the user's message.",
+            response_format=Sentiment,
+            automatic_prompt_caching=False,
+        )
+        response = await classifier.generate_one("This is the best day I have had in months.")
+        print(response.output.label, response.usage.cost_in_usd)
 
 
 asyncio.run(main())
@@ -61,8 +61,11 @@ That bound follows `SharedBackoff.max_concurrent_requests`, so one number sets t
 A deadline on one call is `timeout_seconds` and covers everything the call waits on; a deadline on one batch item is `max_working_seconds_per_item` and stops while that item queues behind its siblings.
 `run_many`, the function behind it, is exported for batching anything else the same way.
 
-**A constructor per backend returning a ready `LLM`.**
-`openai_model(...)`, `anthropic_model(...)`, `gemini_model(...)`, `deepseek_model(...)`, `anthropic_bedrock_model(...)`, and `openai_bedrock_model(...)`.
+**One `Account` per SDK client configuration.**
+`OpenAIAccount`, `AnthropicAccount`, `GeminiAccount`, and `DeepSeekAccount` serve direct providers.
+`OpenAIBedrockAccount` and `AnthropicBedrockAccount` serve Bedrock.
+Each account shares SDK clients and one `SharedBackoff` across its `LLM` values.
+Each account closes its owned resources.
 
 **One accounting contract for success and failure.**
 Success is a `Response[OutputT]`, or a `GenerateResult[OutputT]` on a structured tool-bound binding, and a terminal failure is a `GenerationError`.
@@ -74,7 +77,7 @@ Both carry `usage`, the paid total across every attempt.
 **One `SharedBackoff` owning pacing.**
 One instance is one backpressure domain for the account it guards.
 Its `admitted()` block gates every request start; a rate limit pauses the whole domain.
-`max_attempts` on the `LLM` bounds retrying.
+`max_attempts` on `bind` bounds retrying for that `BoundLLM`.
 
 **User-stated prompt caching.**
 `automatic_prompt_caching` is a required keyword of `bind` with no default, because caching changes billing.

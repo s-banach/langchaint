@@ -91,7 +91,7 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
     (anthropic 0.120.2, openai 2.51.0).
     The HTTP-date reading is the one place langchaint reads wall-clock time, because a timestamp can
     only be compared against wall-clock time; a clock skewed against the provider's misreads it, and
-    SharedBackoff caps whatever this returns at its longest_wait.
+    `SharedBackoff` caps this value at `longest_wait_seconds`.
     None means no usable server-stated delay; non-positive values are treated as absent.
     """
     retry_after_ms_header = headers.get("retry-after-ms")

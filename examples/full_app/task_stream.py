@@ -577,6 +577,7 @@ def build_delegate_tool(
             bound=llm.bind(
                 system_prompt=sub_config.system_prompt,
                 tool_manager=tool_manager,
+                max_attempts=sub_config.max_attempts,
                 automatic_prompt_caching=True,
             ),
             prompt=args.question,
@@ -664,6 +665,7 @@ class App:
             bound=self._llm.bind(
                 system_prompt=config.system_prompt,
                 tool_manager=tool_manager,
+                max_attempts=config.max_attempts,
                 automatic_prompt_caching=True,
             ),
             prompt=prompt,

@@ -26,6 +26,7 @@ from typing import Literal, Never, overload
 
 from pydantic import BaseModel
 
+from langchaint.account_state import AccountState
 from langchaint.adapter import (
     Adapter,
     AdapterStream,
@@ -116,7 +117,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     Call stream_one again to retry after that error.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (the handle carries request, retry, lifecycle, and deadline state)
         self,
         *,
         adapter: Adapter,
@@ -124,6 +125,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         messages: Sequence[Message],
         shared_backoff: SharedBackoff,
         max_attempts: int,
+        account_state: AccountState | None,
         timeout_seconds: float | None,
         splits_tool_call_turns: bool,
     ) -> None:
@@ -137,6 +139,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._messages = messages
         self._shared_backoff = shared_backoff
         self._max_attempts = max_attempts
+        self._account_state = account_state
         self._private_backoff = PrivateBackoff(shared_backoff)
         self._timeout_seconds = timeout_seconds
         self._splits_tool_call_turns = splits_tool_call_turns
@@ -199,12 +202,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Raises:
             InvalidRequestError: build_request returned InvalidRequest, or the open
                 failure was classified as a rejection of the request.
+            RuntimeError: This stream's account is closed or this handle was already entered.
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the opens spent the retry budget.
             TimedOutError: timeout_seconds expired before the request opened.
             ParserContractError: the adapter's parse violated its contract on a failed open.
-            RuntimeError: this handle was already entered; build a new one with stream_one.
         """
         if self._state != "unopened":
             raise RuntimeError(_ALREADY_ENTERED_MESSAGE)
@@ -519,14 +522,23 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Raises:
             InvalidRequestError: build_request returned InvalidRequest, or the open
                 failure was classified as a rejection of the request.
+            RuntimeError: This stream's account is closed.
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.
             RetriesExhaustedError: the attempts spent the retry budget.
             ParserContractError: the adapter's parse violated its contract on a failed open.
         """
+        if self._account_state is not None:
+            self._account_state.ensure_open()
         request = self._request_for_this_call()
         while self._adapter_stream is None:
             self._admission = await self._shared_backoff.admitted().__aenter__()
+            if self._account_state is not None:
+                try:
+                    self._account_state.ensure_open()
+                except RuntimeError:
+                    _ = await self._exit_admission(None)
+                    raise
             self._ledger.start_attempt()
             try:
                 opened = await self._bound_adapter.open_stream(request)

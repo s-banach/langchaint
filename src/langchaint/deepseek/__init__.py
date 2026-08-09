@@ -1,22 +1,17 @@
-"""The deepseek backend: deepseek_model, its model catalog, and pricing.
+"""The deepseek backend provides an account, model catalog, and pricing.
 
-DeepSeek serves an OpenAI-compatible Chat Completions endpoint at https://api.deepseek.com,
-so deepseek_model wraps OpenAIChatCompletionsAdapter over an AsyncOpenAI pointed there.
-Importing this subpackage requires the openai package;
-the import below raises a ModuleNotFoundError naming the package to install.
+Importing this subpackage requires `openai`.
+DeepSeek serves Chat Completions at https://api.deepseek.com.
+`DeepSeekAccount` configures `AsyncOpenAI` for that endpoint.
 
-Prices are USD per one million tokens,
-taken from the provider's official pricing page: https://api-docs.deepseek.com/quick_start/pricing
-(read 2026-08-03).
-The catalog is the off-peak list price: DeepSeek doubles both models' prices during 09:00-12:00
-and 14:00-18:00 Beijing time, so a request served in those windows costs twice what langchaint
-reports.
-Prices are the one provider fact langchaint cannot verify by SDK introspection;
-re-check the page before relying on a table for billing.
-The page prices cache hits and cache misses: the cache-hit price is the table's cache_read rate
-and the cache-miss price its cache_none rate.
-Nothing is billed as a cache write, so the cache-write rate is 0.0, and
-cache_read_tokens_from_usage_deepseek leaves that counter 0.
+Prices use USD per one million tokens.
+Source: https://api-docs.deepseek.com/quick_start/pricing, read 2026-08-03.
+Recheck that page before relying on a table.
+`DEEPSEEK_PRICING` contains off-peak list prices.
+DeepSeek charges twice those prices during its documented peak windows.
+Cache hits use `cache_read_usd_per_million_tokens`.
+Cache misses use `input_cache_none_usd_per_million_tokens`.
+Cache writes cost zero.
 """
 
 import os
@@ -33,10 +28,10 @@ except ModuleNotFoundError as exc:
 
 from openai.types.completion_usage import CompletionUsage
 
+from langchaint.account_base import AccountBase
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
-from langchaint.openai.shared import OpenAIPricingTable
-from langchaint.shared_backoff import SharedBackoff
+from langchaint.openai.shared import OpenAIPricingTable, client_without_retries, parse_openai
 
 type DeepSeekModelName = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
@@ -58,7 +53,7 @@ DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIPricingTable] = {
 """Public off-peak prices per deepseek model; the default pricing lookup."""
 
 _PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](DEEPSEEK_PRICING.items())
-"""DEEPSEEK_PRICING under a str key, so deepseek_model can look up a possibly-uncataloged model id."""
+"""`DEEPSEEK_PRICING` with `str` keys for runtime model lookup."""
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
@@ -66,14 +61,15 @@ _API_KEY_ENVIRONMENT_VARIABLE = "DEEPSEEK_API_KEY"
 
 
 def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
-    """Read the cache-read counter DeepSeek reports: the prompt_cache_hit_tokens extra field, 0 absent.
+    """Return DeepSeek's `prompt_cache_hit_tokens` value, or zero when absent.
 
-    DeepSeek reports prompt_cache_hit_tokens and prompt_cache_miss_tokens, which sum to
-    prompt_tokens (https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03).
-    Neither is a field of the installed SDK's CompletionUsage, so the counter is read from the
-    model's extra fields, where the SDK lands every response field it does not model.
-    deepseek_model passes this as the adapter's cache_read_tokens_from_usage; without it, every
-    cache hit would price at the cache-miss rate, a 50x over-report on deepseek-v4-flash.
+    DeepSeek documents cache-hit and cache-miss counters.
+    Their sum equals `prompt_tokens`.
+    Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
+    `CompletionUsage` models neither counter in openai 2.53.0.
+    The SDK therefore stores both counters in `model_extra`.
+    `DeepSeekAccount.model` passes this as `cache_read_tokens_from_usage`.
+    Missing this reader prices cache hits as cache misses.
     """
     extra = usage.model_extra
     if extra is None:
@@ -84,89 +80,114 @@ def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
     return 0
 
 
-@overload
-def deepseek_model(
-    model: DeepSeekModelName,
-    *,
-    client: AsyncOpenAI | None = ...,
-    pricing: OpenAIPricingTable | None = ...,
-    shared_backoff: SharedBackoff | None = ...,
-    max_attempts: int = ...,
-) -> LLM: ...
-@overload
-def deepseek_model(
-    model: str,
-    *,
-    pricing: OpenAIPricingTable,
-    client: AsyncOpenAI | None = ...,
-    shared_backoff: SharedBackoff | None = ...,
-    max_attempts: int = ...,
-) -> LLM: ...
-def deepseek_model(
-    model: str,
-    *,
-    client: AsyncOpenAI | None = None,
-    pricing: OpenAIPricingTable | None = None,
-    shared_backoff: SharedBackoff | None = None,
-    max_attempts: int = 3,
-) -> LLM:
-    """Build a ready LLM for one model on DeepSeek's Chat Completions endpoint.
+class DeepSeekAccount(AccountBase):
+    """DeepSeek SDK client and `SharedBackoff` shared by DeepSeek models."""
 
-    model is sent verbatim.
-    client None constructs AsyncOpenAI(base_url="https://api.deepseek.com", api_key=...) with the
-    key read from DEEPSEEK_API_KEY.
-    The key is read here rather than left to the SDK because the SDK's own fallback reads
-    OPENAI_API_KEY, which would silently send the OpenAI key to api.deepseek.com.
-    A passed client is used as constructed, so its base_url must point at DeepSeek itself.
-    pricing is one table rather than a tier mapping: DeepSeek reports no service_tier, so every
-    response prices at the "default" key this constructor wraps the table under.
-    On a cataloged id, omitting it prices at the public off-peak rates in DEEPSEEK_PRICING, which
-    the module docstring states peak windows double; an uncataloged id requires it, there being no
-    table to fall back on.
-    The adapter is built with supports_prompt_cache_options False: DeepSeek's caching is always on
-    and it documents no parameter declining it, so bind(automatic_prompt_caching=False) raises at
-    bind time.
-    shared_backoff and max_attempts have the LLM.__init__ meanings;
-    pass one SharedBackoff across models on the same account so a rate limit pauses them together,
-    and note one instance serves one event loop.
+    def __init__(
+        self,
+        *,
+        client: AsyncOpenAI | None = None,
+        max_concurrent_requests: int | None = 8,
+        max_request_starts_per_second: float = 50.0,
+        minimum_wait_ceiling_seconds: float = 1.0,
+        longest_wait_seconds: float = 60.0,
+        wait_multiplier: float = 2.0,
+        quiet_seconds_per_decay_step: float = 60.0,
+    ) -> None:
+        """Build a DeepSeek account without sending a request.
 
-    Raises:
-        ValueError: model is outside the catalog and pricing is missing, or client is None and
-            DEEPSEEK_API_KEY is unset, so there is no credential to reach api.deepseek.com with.
-            LLM.__init__ raises it when max_attempts is not a positive int.
-    """
-    table = pricing if pricing is not None else _PRICING_BY_MODEL_ID.get(model)
-    if table is None:
-        raise ValueError(
-            f"model {model!r} is not in DEEPSEEK_PRICING; pass pricing= stating its rates"
+        A passed `client` remains caller-owned.
+        A passed `client` must reach DeepSeek.
+        `max_concurrent_requests` limits concurrent admitted requests.
+        `max_request_starts_per_second` limits starts during queued demand.
+        `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
+        `longest_wait_seconds` caps adaptive and provider-stated waits.
+        `wait_multiplier` scales wait-ceiling changes.
+        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+
+        Raises:
+            ValueError: `client` is absent and `DEEPSEEK_API_KEY` is unset.
+                Also raised when a `SharedBackoff` setting is invalid.
+        """
+        super().__init__(
+            parse=parse_openai,
+            failure_types=OpenAIChatCompletionsAdapter.failure_types,
+            max_concurrent_requests=max_concurrent_requests,
+            max_request_starts_per_second=max_request_starts_per_second,
+            minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
+            longest_wait_seconds=longest_wait_seconds,
+            wait_multiplier=wait_multiplier,
+            quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-    if client is None:
-        api_key = os.environ.get(_API_KEY_ENVIRONMENT_VARIABLE)
-        if api_key is None:
-            raise ValueError(
-                f"client is None and {_API_KEY_ENVIRONMENT_VARIABLE} is unset; set it, or pass "
-                f"client=AsyncOpenAI(base_url={_DEEPSEEK_BASE_URL!r}, api_key=...). "
-                "Leaving the key to the SDK would read OPENAI_API_KEY instead and silently send "
-                "the OpenAI key to api.deepseek.com."
+        if client is None:
+            api_key = os.environ.get(_API_KEY_ENVIRONMENT_VARIABLE)
+            if api_key is None:
+                raise ValueError(
+                    f"client is None and {_API_KEY_ENVIRONMENT_VARIABLE} is unset; set it, or pass "
+                    f"client=AsyncOpenAI(base_url={_DEEPSEEK_BASE_URL!r}, api_key=...)."
+                )
+            client = AsyncOpenAI(
+                base_url=_DEEPSEEK_BASE_URL,
+                api_key=api_key,
+                max_retries=0,
             )
-        client = AsyncOpenAI(base_url=_DEEPSEEK_BASE_URL, api_key=api_key)
-    return LLM(
-        OpenAIChatCompletionsAdapter(
-            client=client,
+            self._register_owned_close(client.close)
+        self.client = client_without_retries(client)
+
+    @overload
+    def model(
+        self,
+        model: DeepSeekModelName,
+        *,
+        pricing: OpenAIPricingTable | None = ...,
+    ) -> LLM: ...
+
+    @overload
+    def model(
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable,
+    ) -> LLM: ...
+
+    def model(
+        self,
+        model: str,
+        *,
+        pricing: OpenAIPricingTable | None = None,
+    ) -> LLM:
+        """Build an `LLM` for one DeepSeek Chat Completions model.
+
+        `model` is sent verbatim.
+        Cataloged models receive `DEEPSEEK_PRICING`.
+        Stated `pricing` replaces catalog pricing.
+        Uncataloged models require `pricing`.
+
+        Raises:
+            RuntimeError: This account is closed.
+            ValueError: An uncataloged model lacks `pricing`.
+                Also raised when the SDK client contradicts the DeepSeek provider.
+        """
+        self._state.ensure_open()
+        table = pricing if pricing is not None else _PRICING_BY_MODEL_ID.get(model)
+        if table is None:
+            raise ValueError(
+                f"model {model!r} is not in DEEPSEEK_PRICING; pass pricing= stating its rates"
+            )
+        adapter = OpenAIChatCompletionsAdapter(
+            client=self.client,
             model=model,
             pricing={"default": table},
             provider_name="deepseek",
             supports_prompt_cache_options=False,
             cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
-        ),
-        shared_backoff=shared_backoff,
-        max_attempts=max_attempts,
-    )
+        )
+        return self._llm(adapter)
 
 
 __all__ = [
     "DEEPSEEK_PRICING",
+    "DeepSeekAccount",
     "DeepSeekModelName",
     "cache_read_tokens_from_usage_deepseek",
-    "deepseek_model",
 ]

@@ -7,7 +7,7 @@ It has no chains, no runnables, no middleware stack, and no agent class.
 
 | LangChain | langchaint |
 | --- | --- |
-| `ChatOpenAI(...)`, `init_chat_model(...)` | `openai_model("gpt-5.6-terra")` (or `anthropic_model("claude-sonnet-5")`), returns an `LLM` |
+| `ChatOpenAI(...)`, `init_chat_model(...)` | `OpenAIAccount`, then `openai.model("gpt-5.6-terra")` |
 | `model.invoke(messages)` | `llm.bind(...).generate_one(messages)`, returns a `Response` |
 | `model.ainvoke(...)` | `generate_one` is already async; there is no sync API |
 | `model.bind_tools([...])` | decorate `get_weather` with `@tool(description=...)`, then pass `ToolManager([get_weather])` |
@@ -17,8 +17,8 @@ It has no chains, no runnables, no middleware stack, and no agent class.
 | `astream_events(...)` to catch tool calls | the same `stream_one` iterator yields each completed `ToolCall` |
 | `create_react_agent(...)`, `AgentExecutor` | own the loop over `generate_one` and `ToolManager.dispatch` (see `02_tool_loop.py`) |
 | a tool returning `Command(goto=/update=)` | a tool returns data; the app routes between turns |
-| `RunnableRetry`, per-model `max_retries` | `max_attempts` on `LLM` and the backend constructors |
-| `InMemoryRateLimiter`, rate-limit middleware | `SharedBackoff(admission_gap=..., max_concurrent_requests=...)`, one instance shared across `LLM`s on the same account |
+| `RunnableRetry`, per-model `max_retries` | `max_attempts` on `bind` |
+| `InMemoryRateLimiter`, rate-limit middleware | account `max_request_starts_per_second` and `max_concurrent_requests` |
 | `.with_fallbacks([...])` | app-level `try`/`except` over two bindings (see below) |
 | `set_llm_cache(...)` client-side cache | provider prompt caching via `automatic_prompt_caching`, required on `bind` (no client cache) |
 | callbacks, LangSmith tracing | `langchaint.tracing.TracedLLM` over any OTel exporter (see `08_tracing.py`) |
@@ -58,13 +58,26 @@ The middleware table above covers the `create_agent` hooks.
 ## Retries and rate limiting: one SharedBackoff
 
 There is no retry setting on a generate call and no rate-limit middleware.
-`max_attempts` on the `LLM` bounds retrying, and one `SharedBackoff` owns pacing: its `admitted()` block gates every request start, a rate limit pauses every request in the domain, and `max_concurrent_requests` bounds how many requests are inside those blocks at once.
-Pass one instance to every `LLM` hitting the same account.
-A second account gets a second instance, as in `04_failures_and_deadlines.py`.
+`max_attempts` on `bind` bounds retrying for that `BoundLLM`.
+One account constructs one `SharedBackoff` for every `LLM` it creates.
+`max_concurrent_requests` bounds requests inside `admitted()` blocks.
+A provider rate limit pauses every request using that account.
 
-There is no requests-per-minute parameter.
-`admission_gap` is the smallest interval between two request starts.
-A gap of `60 / N` seconds caps starts at `N` per minute while demand queues.
+`max_request_starts_per_second` limits request starts while demand is queued.
+Set it with `max_concurrent_requests` when constructing an account.
+
+```python
+from langchaint.openai import OpenAIAccount
+
+async with OpenAIAccount(
+    max_concurrent_requests=16,
+    max_request_starts_per_second=5,
+) as openai:
+    bound = openai.model("gpt-5.6-terra").bind(
+        max_attempts=5,
+        automatic_prompt_caching=False,
+    )
+```
 
 ## Fallbacks: a try/except over two bindings
 

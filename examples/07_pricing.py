@@ -1,15 +1,15 @@
-"""Pricing: state rates for a model outside the catalog, and read what a response cost."""
+"""Price an uncataloged model and read its response cost."""
 
-from openai import AsyncOpenAI
-
-from langchaint import LLM, Response
-from langchaint.openai import OpenAIPricingTable, OpenAIResponsesAdapter
+from langchaint import Response
+from langchaint.openai import OpenAIAccount, OpenAIPricingTable
 
 
 async def price_at_negotiated_rates() -> Response[str]:
     """Price a model id outside the catalog at contract rates, and read both billing scopes.
 
     Raises:
+        openai.OpenAIError: OpenAI credentials are unavailable during account construction.
+        Exception: An owned resource close operation fails.
         GenerationError: any terminal outcome of the generate call.
     """
     negotiated_default_rates = OpenAIPricingTable(
@@ -18,17 +18,13 @@ async def price_at_negotiated_rates() -> Response[str]:
         cache_read_usd_per_million_tokens=0.10,
         cache_write_usd_per_million_tokens=0.00,
     )
-    llm = LLM(
-        OpenAIResponsesAdapter(
-            client=AsyncOpenAI(),
-            model="gpt-5.6",
+    async with OpenAIAccount() as openai:
+        bound = openai.model(
+            "gpt-5.6",
             pricing={"default": negotiated_default_rates},
-            provider_name="openai",
             supports_prompt_cache_options=True,
-        )
-    )
-    bound = llm.bind(system_prompt="Be terse.", automatic_prompt_caching=False)
-    response = await bound.generate_one("Name three primary colors.")
-    print(f"bill this call at {response.usage.cost_in_usd} USD")
-    print(f"the kept answer alone cost {response.usage_successful_attempt.cost_in_usd} USD")
-    return response
+        ).bind(system_prompt="Be terse.", automatic_prompt_caching=False)
+        response = await bound.generate_one("Name three primary colors.")
+        print(f"bill this call at {response.usage.cost_in_usd} USD")
+        print(f"the kept answer alone cost {response.usage_successful_attempt.cost_in_usd} USD")
+        return response

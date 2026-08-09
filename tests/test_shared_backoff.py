@@ -42,11 +42,11 @@ def _shared_backoff(
     *,
     parse: Callable[[Exception], Verdict] = _retry_verdict,
     max_concurrent_requests: int | None = 1,
-    minimum_wait_ceiling: float = 1.0,
-    longest_wait: float = 60.0,
+    minimum_wait_ceiling_seconds: float = 1.0,
+    longest_wait_seconds: float = 60.0,
     wait_multiplier: float = 2.0,
-    quiet_per_decay_step: float = 60.0,
-    admission_gap: float = 0.005,
+    quiet_seconds_per_decay_step: float = 60.0,
+    max_request_starts_per_second: float = 200.0,
     on_parse_error: str = "raise",
 ) -> SharedBackoff:
     """Build a SharedBackoff with test-friendly defaults, overridable per test."""
@@ -54,11 +54,11 @@ def _shared_backoff(
         parse=parse,
         failure_types=(ProviderFailure,),
         max_concurrent_requests=max_concurrent_requests,
-        minimum_wait_ceiling=minimum_wait_ceiling,
-        longest_wait=longest_wait,
+        minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
+        longest_wait_seconds=longest_wait_seconds,
         wait_multiplier=wait_multiplier,
-        quiet_per_decay_step=quiet_per_decay_step,
-        admission_gap=admission_gap,
+        quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
+        max_request_starts_per_second=max_request_starts_per_second,
         # pyrefly: ignore[bad-argument-type]  # str, so tests can pass invalid values
         on_parse_error=on_parse_error,
     )
@@ -173,11 +173,11 @@ def test_constructor_rejects_empty_failure_types() -> None:
 def test_constructor_rejects_invalid_numeric_settings() -> None:
     """Every numeric setting shares one acceptance rule: not a bool, finite, positive."""
     valid = {
-        "minimum_wait_ceiling": 1.0,
-        "longest_wait": 60.0,
+        "minimum_wait_ceiling_seconds": 1.0,
+        "longest_wait_seconds": 60.0,
         "wait_multiplier": 2.0,
-        "quiet_per_decay_step": 60.0,
-        "admission_gap": 0.02,
+        "quiet_seconds_per_decay_step": 60.0,
+        "max_request_starts_per_second": 50.0,
     }
     for invalid_value in (True, 0, -1.0, float("inf"), float("nan")):
         for name in valid:
@@ -187,12 +187,23 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
                     parse=_retry_verdict,
                     failure_types=(ProviderFailure,),
                     max_concurrent_requests=1,
-                    minimum_wait_ceiling=settings["minimum_wait_ceiling"],
-                    longest_wait=settings["longest_wait"],
+                    minimum_wait_ceiling_seconds=settings["minimum_wait_ceiling_seconds"],
+                    longest_wait_seconds=settings["longest_wait_seconds"],
                     wait_multiplier=settings["wait_multiplier"],
-                    quiet_per_decay_step=settings["quiet_per_decay_step"],
-                    admission_gap=settings["admission_gap"],
+                    quiet_seconds_per_decay_step=settings["quiet_seconds_per_decay_step"],
+                    max_request_starts_per_second=settings["max_request_starts_per_second"],
                 )
+
+
+def test_constructor_derives_seconds_between_request_starts_from_a_valid_rate() -> None:
+    """Validate max_request_starts_per_second before deriving its reciprocal."""
+    with pytest.raises(ValueError, match="max_request_starts_per_second"):
+        _ = _shared_backoff(max_request_starts_per_second=10**1000)
+    with pytest.raises(ValueError, match="max_request_starts_per_second"):
+        _ = _shared_backoff(max_request_starts_per_second=5e-324)
+    shared_backoff = _shared_backoff(max_request_starts_per_second=20.0)
+    assert shared_backoff.max_request_starts_per_second == 20.0
+    assert shared_backoff._seconds_between_request_starts == 0.05
 
 
 def test_constructor_rejects_wait_multiplier_at_or_below_one() -> None:
@@ -201,27 +212,35 @@ def test_constructor_rejects_wait_multiplier_at_or_below_one() -> None:
         _ = _shared_backoff(wait_multiplier=1.0)
 
 
-def test_constructor_rejects_longest_wait_below_the_floor() -> None:
-    """longest_wait must be at least minimum_wait_ceiling."""
-    with pytest.raises(ValueError, match="longest_wait"):
-        _ = _shared_backoff(minimum_wait_ceiling=10.0, longest_wait=1.0)
+def test_constructor_rejects_longest_wait_seconds_below_the_floor() -> None:
+    """longest_wait_seconds must be at least minimum_wait_ceiling_seconds."""
+    with pytest.raises(ValueError, match="longest_wait_seconds"):
+        _ = _shared_backoff(
+            minimum_wait_ceiling_seconds=10.0,
+            longest_wait_seconds=1.0,
+        )
 
 
 def test_constructor_rejects_an_unrepresentable_ceiling_ratio() -> None:
     """A ratio the decay arithmetic cannot hold raises ValueError, never OverflowError.
 
-    5e-324 under 1e308 makes longest_wait / minimum_wait_ceiling infinite, and 10**1000 is an int
-    float() cannot represent; unchecked, each surfaced as OverflowError out of construction.
+    5e-324 under 1e308 makes the ceiling ratio infinite, and 10**1000 cannot become a float.
     """
     with pytest.raises(ValueError, match="finite"):
-        _ = _shared_backoff(minimum_wait_ceiling=5e-324, longest_wait=1e308)
-    with pytest.raises(ValueError, match="minimum_wait_ceiling"):
-        _ = _shared_backoff(minimum_wait_ceiling=10**1000, longest_wait=1e308)
+        _ = _shared_backoff(minimum_wait_ceiling_seconds=5e-324, longest_wait_seconds=1e308)
+    with pytest.raises(ValueError, match="minimum_wait_ceiling_seconds"):
+        _ = _shared_backoff(
+            minimum_wait_ceiling_seconds=10**1000,
+            longest_wait_seconds=1e308,
+        )
 
 
-def test_constructor_accepts_longest_wait_equal_to_the_floor() -> None:
+def test_constructor_accepts_longest_wait_seconds_equal_to_the_floor() -> None:
     """A one-value ceiling range is legal; the ceiling then never moves."""
-    shared_backoff = _shared_backoff(minimum_wait_ceiling=2.0, longest_wait=2.0)
+    shared_backoff = _shared_backoff(
+        minimum_wait_ceiling_seconds=2.0,
+        longest_wait_seconds=2.0,
+    )
     assert shared_backoff._wait_ceiling == 2.0
 
 
@@ -306,7 +325,9 @@ def test_a_pause_all_do_not_retry_retry_after_is_capped_like_any_other() -> None
             parse=lambda _failure: PauseAllDoNotRetry(retry_after=10_000.0)
         )
         admission = await _fail_one_attempt(shared_backoff)
-        assert admission.verdict == PauseAllDoNotRetry(retry_after=shared_backoff.longest_wait)
+        assert admission.verdict == PauseAllDoNotRetry(
+            retry_after=shared_backoff.longest_wait_seconds
+        )
 
     _run(scenario)
 
@@ -422,7 +443,7 @@ def test_the_retry_this_one_fallback_corrects_a_parse_defect() -> None:
 
 
 def test_retry_after_normalization() -> None:
-    """Accept exactly a positive finite int or float, capped at longest_wait; anything else is None.
+    """Accept a positive finite number capped at longest_wait_seconds.
 
     The wrapper normalizes before either _record or Admission.verdict sees the verdict.
     """
@@ -517,11 +538,15 @@ def test_recording_happens_before_the_permit_is_released() -> None:
     _run(scenario)
 
 
-def test_admissions_are_spaced_by_the_admission_gap() -> None:
-    """Two requests entering together are admitted one gap apart."""
+def test_request_starts_respect_max_request_starts_per_second() -> None:
+    """Two queued requests start at the configured maximum rate."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(max_concurrent_requests=None, admission_gap=0.05)
+        shared_backoff = _shared_backoff(
+            max_concurrent_requests=None,
+            max_request_starts_per_second=20.0,
+        )
+        assert shared_backoff._seconds_between_request_starts == 0.05
         admitted_at: list[float] = []
 
         async def request() -> None:
@@ -538,7 +563,10 @@ def test_waiters_are_released_in_the_order_they_joined() -> None:
     """A pause ending with several requests queued releases them in arrival order."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(max_concurrent_requests=None, admission_gap=0.01)
+        shared_backoff = _shared_backoff(
+            max_concurrent_requests=None,
+            max_request_starts_per_second=100.0,
+        )
         shared_backoff._record(PauseAll(retry_after=0.1))
         admitted_order: list[int] = []
 
@@ -651,8 +679,8 @@ def test_reports_during_a_pause_extend_it_and_never_shrink_it() -> None:
     assert shared_backoff._pause_until == 237.0
 
 
-def test_the_pause_never_ends_more_than_longest_wait_after_the_most_recent_report() -> None:
-    """Every merged-in wait is capped, so the remaining pause never exceeds longest_wait."""
+def test_pause_ends_within_longest_wait_seconds_after_the_most_recent_report() -> None:
+    """Every merged wait keeps the remaining pause within longest_wait_seconds."""
     shared_backoff = _shared_backoff()
     moment = [0.0]
     shared_backoff._clock = lambda: moment[0]
@@ -668,7 +696,7 @@ def test_the_pause_never_ends_more_than_longest_wait_after_the_most_recent_repor
 
 
 def test_the_first_pause_starts_from_the_floor() -> None:
-    """Nothing has gone wrong yet, so the first pause draws under minimum_wait_ceiling."""
+    """The first pause draws under minimum_wait_ceiling_seconds."""
     shared_backoff = _shared_backoff()
     shared_backoff._set_wait_ceiling(10.0, _NEVER)
     assert shared_backoff._wait_ceiling == 1.0
@@ -686,8 +714,8 @@ def test_the_ceiling_grows_only_after_traffic_resumed() -> None:
     assert shared_backoff._wait_ceiling == 8.0
 
 
-def test_the_ceiling_growth_caps_at_longest_wait() -> None:
-    """Growth never passes longest_wait."""
+def test_the_ceiling_growth_caps_at_longest_wait_seconds() -> None:
+    """Growth never passes longest_wait_seconds."""
     shared_backoff = _shared_backoff()
     shared_backoff._wait_ceiling = 40.0
     shared_backoff._last_admission_at = 5.0
@@ -742,9 +770,13 @@ def test_chosen_waits_are_positive_and_bounded_by_the_ceiling() -> None:
 
 
 def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor() -> None:
-    """Each wait lies in (0, ceiling], the ceiling doubles to longest_wait, and retry_after floors a wait."""
+    """Waits respect the growing ceiling and retry_after floor."""
     private_backoff = PrivateBackoff(
-        _shared_backoff(minimum_wait_ceiling=1.0, wait_multiplier=2.0, longest_wait=4.0)
+        _shared_backoff(
+            minimum_wait_ceiling_seconds=1.0,
+            wait_multiplier=2.0,
+            longest_wait_seconds=4.0,
+        )
     )
     ceilings = (1.0, 2.0, 4.0, 4.0)
     for ceiling in ceilings:

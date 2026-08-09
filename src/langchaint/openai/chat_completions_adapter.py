@@ -169,6 +169,7 @@ from langchaint.openai.shared import (
     _image_data_uri,
     _priced_tier,
     classify_openai,
+    client_without_retries,
     parse_openai,
     request_id_from_openai_error,
     require_prompt_cache_options_support,
@@ -712,9 +713,8 @@ class OpenAIChatCompletionsAdapter(Adapter):
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
-        The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
-        counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
-        so the SDK must never retry beneath it.
+        The stored client disables SDK retries.
+        langchaint's retry loop owns retrying and counts every request.
 
         provider_name says which provider the client reaches: "openai" for OpenAI's own endpoint,
         "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI, and the
@@ -756,7 +756,7 @@ class OpenAIChatCompletionsAdapter(Adapter):
         """
         require_pricing_key(pricing, key=_DEFAULT_TIER, model=model)
         super().__init__(client=client, model=model, provider_name=provider_name)
-        self.client = client.with_options(max_retries=0)
+        self.client = client_without_retries(client)
         self.pricing = pricing
         self.supports_prompt_cache_options = supports_prompt_cache_options
         self.cache_read_tokens_from_usage = cache_read_tokens_from_usage

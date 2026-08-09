@@ -183,6 +183,7 @@ from langchaint.openai.shared import (
     _image_data_uri,
     _priced_tier,
     classify_openai,
+    client_without_retries,
     parse_openai,
     request_id_from_openai_error,
     require_prompt_cache_options_support,
@@ -763,9 +764,8 @@ class OpenAIResponsesAdapter(Adapter):
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
-        The stored client is a with_options(max_retries=0) copy: langchaint's retry loop owns all retrying,
-        counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
-        so the SDK must never retry beneath it.
+        The stored client disables SDK retries.
+        langchaint's retry loop owns retrying and counts every request.
 
         reasoning_summary asks the API for readable text, which reaches ReasoningPart.text where the
         reasoning item carries no reasoning text of its own;
@@ -776,7 +776,8 @@ class OpenAIResponsesAdapter(Adapter):
 
         provider_name says which provider the client reaches: "openai" for AsyncOpenAI,
         "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI.
-        openai_model passes "openai" and openai_bedrock_model "aws.bedrock".
+        `OpenAIAccount.model` passes "openai".
+        `OpenAIBedrockAccount.model` passes "aws.bedrock".
         The two platform classes are in provider_name_by_client_class, so a value contradicting
         either makes Adapter.__init__ raise; an AsyncOpenAI takes the provider_name its caller
         states, since its base_url decides what it reaches.
@@ -789,8 +790,9 @@ class OpenAIResponsesAdapter(Adapter):
         It has no default because a wrong value fails either way: True on a model without the
         parameter risks a rejected request, and False on one with it refuses a binding the model
         would have accepted.
-        openai_model defaults an unstated value from PROMPT_CACHE_OPTIONS_MODELS for a cataloged
-        id and requires it for any other; openai_bedrock_model always requires it,
+        `OpenAIAccount.model` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
+        It requires the parameter for uncataloged identifiers.
+        `OpenAIBedrockAccount.model` always requires it.
         having no catalog of Bedrock ids to read.
         It is a parameter here rather than a lookup on model because model is a str whose namespace
         this adapter cannot know: it serves the platforms provider_name_by_client_class maps and
@@ -811,7 +813,7 @@ class OpenAIResponsesAdapter(Adapter):
         """
         require_pricing_key(pricing, key=_DEFAULT_TIER, model=model)
         super().__init__(client=client, model=model, provider_name=provider_name)
-        self.client = client.with_options(max_retries=0)
+        self.client = client_without_retries(client)
         self.pricing = pricing
         self.supports_prompt_cache_options = supports_prompt_cache_options
         self.reasoning_summary = reasoning_summary

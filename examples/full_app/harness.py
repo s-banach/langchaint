@@ -295,8 +295,7 @@ def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
             parse=adapter.parse,
             failure_types=adapter.failure_types,
             max_concurrent_requests=16,
-            minimum_wait_ceiling=0.001,
-            longest_wait=0.01,
+            minimum_wait_ceiling_seconds=0.001,
+            longest_wait_seconds=0.01,
         ),
-        max_attempts=2,
     )

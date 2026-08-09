@@ -6,65 +6,62 @@ from langchaint import (
     ImagePart,
     Message,
     Response,
-    SharedBackoff,
     TextPart,
     UserMessage,
 )
-from langchaint.anthropic import AnthropicMessagesAdapter, anthropic_model, parse_anthropic
-from langchaint.openai import openai_model
+from langchaint.anthropic import AnthropicAccount
+from langchaint.openai import OpenAIAccount
 
 
 async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationError]:
     """Run a batch under a deadline, then send every failed item to a second provider.
 
     Raises:
+        openai.OpenAIError: OpenAI credentials are unavailable during account construction.
+        Exception: An owned resource close operation fails.
         GenerationError: a fallback call failed too.
     """
-    # max_attempts counts requests sent including the first.
-    # Only transient errors are retried.
-    # Construct a SharedBackoff explicitly to override the default settings; one instance is one
-    # account's backpressure domain, shared by passing it to every constructor on that account.
-    anthropic_backoff = SharedBackoff(
-        parse=parse_anthropic,
-        failure_types=AnthropicMessagesAdapter.failure_types,
-        max_concurrent_requests=16,
-    )
-
-    summarizer = anthropic_model(
-        "claude-sonnet-5", shared_backoff=anthropic_backoff, max_attempts=5
-    ).bind(system_prompt="Summarize in one sentence.", automatic_prompt_caching=False)
-    fallback = openai_model("gpt-5.6-terra").bind(
-        system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
-    )
-
-    # The following ImagePart uses a media_type anthropic does not accept, to make one item fail.
-    # Its request raises InvalidRequestError in the anthropic adapter, before reaching the wire.
-    scanned_page: list[Message] = [
-        UserMessage(
-            content=[
-                TextPart(text="Summarize the attached page."),
-                ImagePart(data=b"<scan bytes>", media_type="image/tiff"),
-            ]
+    async with (
+        AnthropicAccount(
+            max_concurrent_requests=16,
+            max_request_starts_per_second=5,
+        ) as anthropic,
+        OpenAIAccount() as openai,
+    ):
+        summarizer = anthropic.model("claude-sonnet-5").bind(
+            system_prompt="Summarize in one sentence.",
+            max_attempts=5,
+            automatic_prompt_caching=False,
         )
-    ]
-    documents: list[GenerationInput] = [
-        "Revenue rose twelve percent on strong subscription growth.",
-        scanned_page,
-        "The new compiler release cuts build times roughly in half.",
-    ]
+        fallback = openai.model("gpt-5.6-terra").bind(
+            system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
+        )
 
-    # max_working_seconds_per_item is how long one item may spend working; its clock stops while
-    # that item waits behind the others to be admitted.
-    # generate_many returns errors as results, rather than raising.
-    results = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
+        # This media_type is invalid for anthropic.
+        scanned_page: list[Message] = [
+            UserMessage(
+                content=[
+                    TextPart(text="Summarize the attached page."),
+                    ImagePart(data=b"<scan bytes>", media_type="image/tiff"),
+                ]
+            )
+        ]
+        documents: list[GenerationInput] = [
+            "Revenue rose twelve percent on strong subscription growth.",
+            scanned_page,
+            "The new compiler release cuts build times roughly in half.",
+        ]
 
-    for index, result in enumerate(results):
-        if not isinstance(result, GenerationError):
-            continue
+        # The item clock stops during admission waits.
+        results = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
 
-        print(f"item {index} failed with {type(result).__name__}: {result.error_text}")
-        print(f"item {index} billed {result.usage.cost_in_usd} USD before failing")
+        for index, result in enumerate(results):
+            if not isinstance(result, GenerationError):
+                continue
 
-        # generate_one raises on error, unlike generate_many.
-        results[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
-    return results
+            print(f"item {index} failed with {type(result).__name__}: {result.error_text}")
+            print(f"item {index} billed {result.usage.cost_in_usd} USD before failing")
+
+            # generate_one raises on error.
+            results[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
+        return results

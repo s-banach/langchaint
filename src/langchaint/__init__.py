@@ -13,6 +13,7 @@ run_many is on __all__ so an application can run its own batch under a bound on 
 pending at once, the way generate_many runs a batch of generations.
 """
 
+from langchaint.account import Account
 from langchaint.adapter import (
     ReasoningDelta,
     SpecificToolChoice,
@@ -113,6 +114,7 @@ __all__ = [
     "LLM",
     "ZERO_USAGE",
     "AbandonedCallError",
+    "Account",
     "Admission",
     "AssistantMessage",
     "AttemptRecord",

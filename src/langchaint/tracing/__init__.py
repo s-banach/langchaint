@@ -945,6 +945,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[ModelT, ToolManager]": ...
     @overload
@@ -958,6 +959,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[ModelT, None]": ...
     @overload
@@ -971,6 +973,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
@@ -984,6 +987,7 @@ class TracedLLM:
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
+        max_attempts: int = ...,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[str, None]": ...
     def bind(  # noqa: PLR0913 (mirrors LLM.bind, which states every binding choice)
@@ -996,12 +1000,17 @@ class TracedLLM:
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
+        max_attempts: int = 3,
         automatic_prompt_caching: bool,
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
         The overloads re-declare LLM.bind's response_format and tool_manager splits, so each binding
         gets the output type and the tool marker LLM.bind gives it.
+        max_attempts counts requests sent including the first, so 1 means no retrying.
+
+        Raises:
+            ValueError: system_prompt is empty, max_attempts is invalid, or the adapter rejects the binding.
         """
         return TracedBoundLLM(
             bound_llm=self._llm.bind(
@@ -1012,6 +1021,7 @@ class TracedLLM:
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 extra_body=extra_body,
+                max_attempts=max_attempts,
                 automatic_prompt_caching=automatic_prompt_caching,
             ),
             span_config=self._span_config,
@@ -1077,6 +1087,11 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """The wrapped BoundLLM's SharedBackoff."""
         return self._bound_llm.shared_backoff
 
+    @property
+    def max_attempts(self) -> int:
+        """max_attempts counts requests sent including the first."""
+        return self._bound_llm.max_attempts
+
     @overload
     def rebind[NewModelT: BaseModel](
         self,
@@ -1088,6 +1103,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
     @overload
@@ -1101,6 +1117,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, None]": ...
     @overload
@@ -1114,6 +1131,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
     @overload
@@ -1127,6 +1145,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
@@ -1140,6 +1159,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, None]": ...
     @overload
@@ -1153,6 +1173,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManagerT]": ...
     @overload
@@ -1166,6 +1187,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
     @overload
@@ -1179,6 +1201,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, None]": ...
     @overload
@@ -1192,6 +1215,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = ...,
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
+        max_attempts: int | Unchanged = ...,
         automatic_prompt_caching: bool | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
     def rebind(  # noqa: PLR0913 (mirrors BoundLLM.rebind, which takes every field bind takes)
@@ -1204,6 +1228,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
+        max_attempts: int | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror BoundLLM.rebind and re-wrap the plain BoundLLM in a TracedBoundLLM.
@@ -1212,6 +1237,8 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         a traced object whose rebind returned an untraced one would silently drop tracing,
         the worst failure mode available here.
         The overloads re-declare BoundLLM.rebind's response_format and tool_manager splits.
+        Raises:
+            ValueError: system_prompt is empty, max_attempts is invalid, or the adapter rejects the binding.
         """
         return TracedBoundLLM(
             bound_llm=self._bound_llm.rebind(
@@ -1222,6 +1249,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 parallel_tool_calls=parallel_tool_calls,
                 inference_params=inference_params,
                 extra_body=extra_body,
+                max_attempts=max_attempts,
                 automatic_prompt_caching=automatic_prompt_caching,
             ),
             span_config=self._span_config,
@@ -1261,6 +1289,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         a GenerationError's last recorded one included.
 
         Raises:
+            RuntimeError: The wrapped account is closed before a request starts.
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
                 a refusal, a truncation, a rejected request, a provider error langchaint does not
                 retry, or an Exception that escaped langchaint's own machinery); the span is
@@ -1284,6 +1313,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         so a traced call gets the deadline an untraced one gets, of whichever kind its caller built.
 
         Raises:
+            RuntimeError: The wrapped account is closed before a request starts.
             GenerationError: the call failed; the span is attributed and closed first, and a batch
                 turns the error into that item's result. TimedOutError is one of them, so a call that
                 ran out of time closes its span like any other failure.
@@ -1381,6 +1411,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated
                 method).
+            RuntimeError: The wrapped account is closed before a request starts.
             asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
                 ended.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
@@ -1576,7 +1607,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         A second entry raises before the span is touched, so it cannot mark the first stream's span failed.
 
         Raises:
-            RuntimeError: this handle was already entered; build a new one with stream_one.
+            RuntimeError: The wrapped account is closed or this handle was already entered.
             Exception: the inner handle failed to open; the span is attributed by what the exception
                 is, takes error status, and ends.
         """

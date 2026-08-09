@@ -87,6 +87,7 @@ import base64
 from abc import ABC
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import nan
 from typing import ClassVar, Literal, cast, override
 
 import openai
@@ -639,6 +640,9 @@ def _billing_from_chat_completion(
     """
     service_tier = _priced_tier(completion.service_tier)
     table = pricing.get(service_tier, _UNPRICED)
+    provider_executed_tool_cost_in_usd = (
+        nan if any(choice.message.annotations for choice in completion.choices) else 0.0
+    )
     usage = completion.usage
     if usage is None:
         return table.price(
@@ -649,6 +653,7 @@ def _billing_from_chat_completion(
             input_tokens_cache_none=0,
             output_tokens=0,
             output_tokens_reasoning=0,
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     prompt_details = usage.prompt_tokens_details
     completion_details = usage.completion_tokens_details
@@ -666,6 +671,7 @@ def _billing_from_chat_completion(
         output_tokens_reasoning=(
             completion_details.reasoning_tokens or 0 if completion_details is not None else 0
         ),
+        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
     )
 
 
@@ -768,8 +774,19 @@ class OpenAIChatCompletionsAdapter(Adapter):
         Raises:
             ValueError: the binding declines automatic caching on a model built with
                 supports_prompt_cache_options False, or its extra_body holds a key in
-                _ADAPTER_POPULATED_WIRE_KEYS.
+                _ADAPTER_POPULATED_WIRE_KEYS. Also raised when provider_executed_tools is nonempty.
+                Also raised when extra_body contains web_search_options.
         """
+        if binding.provider_executed_tools:
+            raise ValueError(
+                "OpenAIChatCompletionsAdapter cannot send provider_executed_tools. "
+                "Use OpenAIResponsesAdapter for provider-executed tools."
+            )
+        if binding.extra_body is not None and "web_search_options" in binding.extra_body:
+            raise ValueError(
+                "OpenAIChatCompletionsAdapter cannot price web_search_options. "
+                "Use OpenAIResponsesAdapter for web search."
+            )
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )

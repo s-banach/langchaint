@@ -399,6 +399,9 @@ def _billing_cells(billing: Billing | None) -> dict[str, RowValue]:
         "output_tokens": None if usage is None else usage.output_tokens,
         "output_tokens_cost_in_usd": None if usage is None else usage.output_tokens_cost_in_usd,
         "output_tokens_reasoning": None if usage is None else usage.output_tokens_reasoning,
+        "provider_executed_tool_cost_in_usd": (
+            None if usage is None else usage.provider_executed_tool_cost_in_usd
+        ),
         "cost_in_usd": None if usage is None else usage.cost_in_usd,
         "input_cache_none_usd_per_million_tokens": (
             None if billing is None else billing.input_cache_none_usd_per_million_tokens

@@ -10,10 +10,15 @@ Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
 Uncataloged Gemini models require `pricing`.
 Responses from uncataloged traffic types cost NaN.
 
-Prices use USD per one million tokens.
+Token prices use USD per one million tokens.
+Google Search prices use USD per query.
+Google Maps prices use USD per query.
 Source: https://ai.google.dev/gemini-api/docs/pricing, read 2026-08-03.
+Maps source: https://ai.google.dev/gemini-api/docs/maps-grounding.
 Recheck that page before relying on a table.
 The catalog carries text, image, and video rates.
+Catalog tool rates estimate post-quota list prices.
+`GeminiAccount.model(pricing=...)` replaces cataloged estimates.
 langchaint sends no audio.
 Explicit cache-resource storage charges have no request `Usage` field.
 """
@@ -48,9 +53,6 @@ type GeminiModelName = Literal[
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
 ]
 """Model identifiers with public prices in GEMINI_PRICING."""
 
@@ -60,14 +62,18 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
             input_cache_none_usd_per_million_tokens=1.50,
             cache_read_usd_per_million_tokens=0.15,
             output_usd_per_million_tokens=7.50,
-        )
+        ),
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     ),
     "gemini-3.5-flash": GeminiPricingTable(
         rates=GeminiRates(
             input_cache_none_usd_per_million_tokens=1.50,
             cache_read_usd_per_million_tokens=0.15,
             output_usd_per_million_tokens=9.00,
-        )
+        ),
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     ),
     # the pricing page lists no cache-read price for gemini-3.5-flash-lite, so it is NaN
     "gemini-3.5-flash-lite": GeminiPricingTable(
@@ -75,14 +81,18 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
             input_cache_none_usd_per_million_tokens=0.30,
             cache_read_usd_per_million_tokens=float("nan"),
             output_usd_per_million_tokens=2.50,
-        )
+        ),
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-flash-lite": GeminiPricingTable(
         rates=GeminiRates(
             input_cache_none_usd_per_million_tokens=0.25,
             cache_read_usd_per_million_tokens=0.025,
             output_usd_per_million_tokens=1.50,
-        )
+        ),
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     ),
     "gemini-3.1-pro-preview": GeminiPricingTable(
         rates=GeminiRates(
@@ -96,33 +106,8 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
             cache_read_usd_per_million_tokens=0.40,
             output_usd_per_million_tokens=18.00,
         ),
-    ),
-    "gemini-2.5-pro": GeminiPricingTable(
-        rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=1.25,
-            cache_read_usd_per_million_tokens=0.125,
-            output_usd_per_million_tokens=10.00,
-        ),
-        long_prompt_threshold_tokens=200_000,
-        long_prompt_rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=2.50,
-            cache_read_usd_per_million_tokens=0.25,
-            output_usd_per_million_tokens=15.00,
-        ),
-    ),
-    "gemini-2.5-flash": GeminiPricingTable(
-        rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=0.30,
-            cache_read_usd_per_million_tokens=0.03,
-            output_usd_per_million_tokens=2.50,
-        )
-    ),
-    "gemini-2.5-flash-lite": GeminiPricingTable(
-        rates=GeminiRates(
-            input_cache_none_usd_per_million_tokens=0.10,
-            cache_read_usd_per_million_tokens=0.01,
-            output_usd_per_million_tokens=0.40,
-        )
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     ),
 }
 """Public on-demand prices per gemini model; the default pricing lookup."""

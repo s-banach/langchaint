@@ -265,10 +265,11 @@ def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
     return generation_input
 
 
-def _build_binding(
+def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
     *,
     system_prompt: str | Sequence[TextPart] | None,
     tool_manager: ToolManager | None,
+    provider_executed_tools: Sequence[Mapping[str, object]],
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     inference_params: InferenceParams,
@@ -291,6 +292,7 @@ def _build_binding(
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=() if tool_manager is None else tool_manager.schemas(),
+        provider_executed_tools=tuple(provider_executed_tools),
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         inference_params=inference_params,
@@ -369,6 +371,7 @@ class LLM:
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
@@ -383,6 +386,7 @@ class LLM:
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
@@ -397,6 +401,7 @@ class LLM:
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: ToolManager,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
@@ -411,6 +416,7 @@ class LLM:
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
         tool_manager: None = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
         tool_choice: ToolChoice = ...,
@@ -424,6 +430,7 @@ class LLM:
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
         tool_manager: ToolManager | None = None,
+        provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
         tool_choice: ToolChoice = "auto",
@@ -455,6 +462,7 @@ class LLM:
         binding = _build_binding(
             system_prompt=system_prompt,
             tool_manager=tool_manager,
+            provider_executed_tools=provider_executed_tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             inference_params=(
@@ -553,6 +561,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[NewModelT],
         tool_manager: ToolManager,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -567,6 +576,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[NewModelT],
         tool_manager: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -581,6 +591,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[NewModelT],
         tool_manager: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -595,6 +606,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: None,
         tool_manager: ToolManager,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -609,6 +621,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: None,
         tool_manager: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -623,6 +636,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: None,
         tool_manager: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -637,6 +651,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: Unchanged = ...,
         tool_manager: ToolManager,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -651,6 +666,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: Unchanged = ...,
         tool_manager: None,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -665,6 +681,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: Unchanged = ...,
         tool_manager: Unchanged = ...,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
@@ -679,6 +696,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
         tool_manager: ToolManager | None | Unchanged = UNCHANGED,
+        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
         inference_params: InferenceParams | Unchanged = UNCHANGED,
@@ -717,6 +735,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 else system_prompt
             ),
             tool_manager=new_tool_manager,
+            provider_executed_tools=(
+                self.binding.provider_executed_tools
+                if isinstance(provider_executed_tools, Unchanged)
+                else provider_executed_tools
+            ),
             tool_choice=(
                 self.binding.tool_choice if isinstance(tool_choice, Unchanged) else tool_choice
             ),

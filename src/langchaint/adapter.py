@@ -22,14 +22,15 @@ retry loop makes. The loop records the response, its `Billing`, and its `Respons
 moment they arrive, so a raise from `interpret` still leaves the attempt and what it billed on the
 call's record.
 
-Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix
-(system_prompt, tool_schemas, tool_choice, parallel_tool_calls, inference_params, automatic_prompt_caching)
-to precomputed SDK keyword arguments once;
-`BoundAdapter.build_request` adds the per-call `messages` to them, and `open_stream`
-takes the `RequestParams` it built, so every attempt of one call sends the same request and a
-`Sequence[Message]` the adapter will not put on the wire is found before the first attempt.
-The split into two bind methods is what fixes the output type at bind time:
-each method is monomorphic in its output type, so no sentinel value has to imply a type downstream.
+Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix once.
+The frozen prefix includes `system_prompt`, `tool_schemas`, and `provider_executed_tools`.
+It also includes tool selection, inference parameters, and caching.
+`BoundAdapter.build_request` adds per-call `messages`.
+`open_stream` sends its `RequestParams`.
+Every attempt sends the same request.
+Adapters reject unsendable messages before the first attempt.
+The two bind methods fix the output type.
+Each method has one output type.
 """
 
 import email.utils
@@ -301,6 +302,28 @@ OpenAI's allowed-tools subset form is deliberately unmapped: the binding already
 """
 
 
+def validated_provider_executed_tool_types(
+    provider_executed_tools: tuple[Mapping[str, object], ...],
+    *,
+    supported_types: frozenset[str],
+    adapter_name: str,
+) -> frozenset[str]:
+    """Validate each `type` discriminator and return its distinct values.
+
+    Raises:
+        ValueError: a mapping lacks a supported string `type` value.
+    """
+    tool_types: set[str] = set()
+    for provider_executed_tool in provider_executed_tools:
+        tool_type = provider_executed_tool.get("type")
+        if not isinstance(tool_type, str) or tool_type not in supported_types:
+            raise ValueError(
+                f"{adapter_name} provider_executed_tools require a supported string type"
+            )
+        tool_types.add(tool_type)
+    return frozenset(tool_types)
+
+
 @dataclass(frozen=True, kw_only=True)
 class Binding:
     """The frozen prefix of one BoundLLM, in langchaint terms only.
@@ -321,6 +344,9 @@ class Binding:
     """
 
     tool_schemas: tuple[ToolSchema, ...]
+    provider_executed_tools: tuple[Mapping[str, object], ...]
+    """Provider-shaped tool definitions executed by the provider."""
+
     tool_choice: ToolChoice
     parallel_tool_calls: bool
     inference_params: InferenceParams

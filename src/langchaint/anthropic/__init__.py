@@ -12,14 +12,17 @@ Responses from uncataloged service tiers cost NaN.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 `AnthropicBedrockAccount` accepts `http_client` directly.
 
-Prices use USD per one million tokens.
+Token prices use USD per one million tokens.
+Web-search prices use USD per invocation.
 Source: https://platform.claude.com/docs/en/about-claude/pricing.
 Recheck that page before relying on a table.
 Cache reads cost 0.1 times base input.
 Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
 `ANTHROPIC_PRICING` covers the standard service tier.
-Callers state priority, batch, or negotiated rates through `pricing`.
+Its web-search rates are public list-price estimates.
+`AnthropicAccount.model(pricing=...)` replaces cataloged estimates.
+`AnthropicBedrockAccount.model(pricing=...)` accepts caller rates.
 """
 
 from collections.abc import Mapping
@@ -67,6 +70,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=1.00,
         cache_write_5m_usd_per_million_tokens=12.50,
         cache_write_1h_usd_per_million_tokens=20.00,
+        web_search_usd_per_invocation=0.01,
     ),
     "claude-sonnet-4-6": AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=3.00,
@@ -74,6 +78,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.30,
         cache_write_5m_usd_per_million_tokens=3.75,
         cache_write_1h_usd_per_million_tokens=6.00,
+        web_search_usd_per_invocation=0.01,
     ),
     # introductory pricing, through 2026-08-31; standard 3.00/15.00 from 2026-09-01
     "claude-sonnet-5": AnthropicPricingTable(
@@ -82,6 +87,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.20,
         cache_write_5m_usd_per_million_tokens=2.50,
         cache_write_1h_usd_per_million_tokens=4.00,
+        web_search_usd_per_invocation=0.01,
     ),
     "claude-opus-4-6": AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
@@ -89,6 +95,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.50,
         cache_write_5m_usd_per_million_tokens=6.25,
         cache_write_1h_usd_per_million_tokens=10.00,
+        web_search_usd_per_invocation=0.01,
     ),
     "claude-opus-4-7": AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
@@ -96,6 +103,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.50,
         cache_write_5m_usd_per_million_tokens=6.25,
         cache_write_1h_usd_per_million_tokens=10.00,
+        web_search_usd_per_invocation=0.01,
     ),
     "claude-opus-4-8": AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
@@ -103,6 +111,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.50,
         cache_write_5m_usd_per_million_tokens=6.25,
         cache_write_1h_usd_per_million_tokens=10.00,
+        web_search_usd_per_invocation=0.01,
     ),
     "claude-haiku-4-5-20251001": AnthropicPricingTable(
         input_cache_none_usd_per_million_tokens=1.00,
@@ -110,6 +119,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
         cache_read_usd_per_million_tokens=0.10,
         cache_write_5m_usd_per_million_tokens=1.25,
         cache_write_1h_usd_per_million_tokens=2.00,
+        web_search_usd_per_invocation=0.01,
     ),
 }
 """Public prices per anthropic model; the default pricing lookup, shared by both constructors."""

@@ -8,6 +8,7 @@ the zero-usage fallback when a response omits usage, and the request fields the 
 
 import asyncio
 import base64
+import inspect
 import json
 import math
 import re
@@ -120,6 +121,7 @@ from langchaint.shared_backoff import (
     RetryThisOne,
     Verdict,
 )
+from langchaint.tools import ToolSchema
 from tests.helpers import (
     openai_sdk_errors_and_classifications,
     openai_sdk_errors_and_verdicts,
@@ -131,6 +133,8 @@ _DEFAULT_RATES = OpenAIPricingTable(
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
 )
 
 _PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {"default": _DEFAULT_RATES}
@@ -141,6 +145,8 @@ _PRIORITY_RATES = OpenAIPricingTable(
     output_usd_per_million_tokens=20.0,
     cache_read_usd_per_million_tokens=2.5,
     cache_write_usd_per_million_tokens=6.25,
+    web_search_usd_per_invocation=0.02,
+    file_search_usd_per_invocation=0.005,
 )
 """Twice the default rates, so a tier-selection test reads as a doubling."""
 
@@ -174,6 +180,13 @@ _WEB_SEARCH_OUTPUT_ITEM: dict[str, object] = {
     "action": {"type": "search", "query": "langchaint"},
 }
 """One built-in tool call without another TurnPart variant."""
+
+_FILE_SEARCH_OUTPUT_ITEM: dict[str, object] = {
+    "type": "file_search_call",
+    "id": "fs_1",
+    "status": "completed",
+    "queries": ["first", "second"],
+}
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
@@ -247,6 +260,75 @@ def test_billing_carries_the_sdk_usage_object_itself() -> None:
     raw = _response(usage=_usage_with_cache())
     assert _billing_from_response(raw, _PRICING).usage_raw is raw.usage
     assert _billing_from_response(_response(usage=None), _PRICING).usage_raw is None
+
+
+def test_web_search_output_adds_the_cataloged_provider_executed_tool_cost() -> None:
+    """One search action adds one cataloged invocation."""
+    response = _response(
+        usage=_usage_with_cache(),
+        output=[dict(_WEB_SEARCH_OUTPUT_ITEM), dict(_TEXT_OUTPUT_ITEM)],
+    )
+    usage = _billing_from_response(response, _PRICING).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.01)
+
+
+def test_open_page_action_adds_no_provider_executed_tool_cost() -> None:
+    """OpenAI's web-search guide prices `search` actions only."""
+    open_page = dict(_WEB_SEARCH_OUTPUT_ITEM)
+    open_page["action"] = {"type": "open_page", "url": "https://example.com"}
+    response = _response(usage=_usage_with_cache(), output=[open_page])
+    usage = _billing_from_response(response, _PRICING).usage
+    assert usage.provider_executed_tool_cost_in_usd == 0.0
+
+
+def test_find_in_page_action_adds_no_provider_executed_tool_cost() -> None:
+    """OpenAI prices no separate fee for `find_in_page`."""
+    find_in_page = dict(_WEB_SEARCH_OUTPUT_ITEM)
+    find_in_page["action"] = {
+        "type": "find_in_page",
+        "url": "https://example.com",
+        "pattern": "price",
+    }
+    usage = _billing_from_response(
+        _response(usage=_usage_with_cache(), output=[find_in_page]), _PRICING
+    ).usage
+    assert usage.provider_executed_tool_cost_in_usd == 0.0
+
+
+def test_file_search_calls_and_web_search_have_separate_rates() -> None:
+    """Each file-search output item costs once, regardless of its query count."""
+    second_file_search = {**_FILE_SEARCH_OUTPUT_ITEM, "id": "fs_2", "queries": ["third"]}
+    response = _response(
+        usage=_usage_with_cache(),
+        output=[_WEB_SEARCH_OUTPUT_ITEM, _FILE_SEARCH_OUTPUT_ITEM, second_file_search],
+    )
+    usage = _billing_from_response(response, _PRICING).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.015)
+
+
+def test_unpriceable_charged_output_produces_nan() -> None:
+    """Image generation lacks response evidence for exact pricing."""
+    image_generation = {
+        "type": "image_generation_call",
+        "id": "image-1",
+        "status": "completed",
+        "result": "image-data",
+    }
+    usage = _billing_from_response(
+        _response(usage=_usage_with_cache(), output=[image_generation]), _PRICING
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+def test_charged_output_at_an_unpriced_tier_produces_nan() -> None:
+    """A charged call uses `_UNPRICED` when its served tier lacks pricing."""
+    response = _response(
+        usage=None,
+        output=[dict(_WEB_SEARCH_OUTPUT_ITEM)],
+        service_tier="flex",
+    )
+    usage = _billing_from_response(response, _PRICING).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
 
 
 def test_billing_pins_the_priced_tier_and_the_rates_that_applied() -> None:
@@ -704,13 +786,16 @@ def _binding(
     *,
     automatic_prompt_caching: bool,
     system_prompt: str | tuple[TextPart, ...] | None = None,
+    tool_schemas: tuple[ToolSchema, ...] = (),
     reasoning_effort: ReasoningEffort | None = None,
+    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
-    """Assemble a toolless binding with the fields these request tests vary."""
+    """Assemble a binding with the fields these request tests vary."""
     return Binding(
         system_prompt=system_prompt,
-        tool_schemas=(),
+        tool_schemas=tool_schemas,
+        provider_executed_tools=provider_executed_tools,
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort=reasoning_effort),
@@ -830,6 +915,7 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     binding = Binding(
         system_prompt=None,
         tool_schemas=(),
+        provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(temperature=0.2),
@@ -844,6 +930,145 @@ def test_request_omits_tool_fields_without_tools() -> None:
     assert isinstance(precomputed_fields.tools, openai.Omit)
     assert isinstance(precomputed_fields.tool_choice, openai.Omit)
     assert isinstance(precomputed_fields.parallel_tool_calls, openai.Omit)
+
+
+def test_provider_executed_tools_reach_responses_tools_unchanged() -> None:
+    """Responses receives provider-executed tool mappings through its tools parameter."""
+    provider_tool: dict[str, object] = {"type": "web_search", "search_context_size": "low"}
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            automatic_prompt_caching=True,
+            provider_executed_tools=(provider_tool,),
+        )
+    )
+    assert precomputed.tools == [provider_tool]
+    assert precomputed.tool_choice == "auto"
+    assert precomputed.parallel_tool_calls is True
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        "file_search",
+        "web_search",
+        "web_search_2025_08_26",
+        "web_search_preview",
+        "web_search_preview_2025_03_11",
+    ],
+)
+def test_every_supported_provider_executed_type_reaches_responses(tool_type: str) -> None:
+    """Each reviewed OpenAI provider-executed `type` reaches Responses unchanged."""
+    provider_tool: dict[str, object] = {"type": tool_type}
+    precomputed = _adapter()._precompute_fields(
+        _binding(automatic_prompt_caching=True, provider_executed_tools=(provider_tool,))
+    )
+    assert precomputed.tools == [provider_tool]
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        "apply_patch",
+        "code_interpreter",
+        "computer",
+        "computer_use_preview",
+        "custom",
+        "function",
+        "image_generation",
+        "local_shell",
+        "mcp",
+        "namespace",
+        "programmatic_tool_calling",
+        "shell",
+        "tool_search",
+    ],
+)
+def test_every_unlisted_provider_executed_type_is_rejected(tool_type: str) -> None:
+    """Responses rejects every installed `ToolParam` type outside the reviewed set."""
+    with pytest.raises(ValueError, match="supported string type"):
+        _ = _adapter()._precompute_fields(
+            _binding(
+                automatic_prompt_caching=True,
+                provider_executed_tools=({"type": tool_type},),
+            )
+        )
+
+
+def test_provider_executed_tools_require_direct_openai_billing() -> None:
+    """A non-OpenAI provider lacks verified OpenAI tool billing."""
+    adapter = OpenAIResponsesAdapter(
+        client=AsyncOpenAI(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="azure.ai.openai",
+        supports_prompt_cache_options=True,
+    )
+    with pytest.raises(ValueError, match="provider_name='openai'"):
+        _ = adapter._precompute_fields(
+            _binding(
+                automatic_prompt_caching=True,
+                provider_executed_tools=({"type": "web_search"},),
+            )
+        )
+
+
+@pytest.mark.parametrize("tool_type", ["web_search", "file_search"])
+@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
+    tool_type: str, rate: float | None
+) -> None:
+    """A configured charged tool rejects an unusable caller rate before requests."""
+    pricing: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
+        "default": OpenAIPricingTable(
+            input_cache_none_usd_per_million_tokens=2.5,
+            output_usd_per_million_tokens=10.0,
+            cache_read_usd_per_million_tokens=1.25,
+            cache_write_usd_per_million_tokens=3.125,
+            web_search_usd_per_invocation=rate if tool_type == "web_search" else 0.01,
+            file_search_usd_per_invocation=rate if tool_type == "file_search" else 0.0025,
+        )
+    }
+    adapter = OpenAIResponsesAdapter(
+        client=AsyncOpenAI(api_key="test"),
+        model="m",
+        pricing=pricing,
+        provider_name="openai",
+        supports_prompt_cache_options=True,
+    )
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        _ = adapter._precompute_fields(
+            _binding(
+                automatic_prompt_caching=True,
+                provider_executed_tools=({"type": tool_type},),
+            )
+        )
+
+
+def test_openai_provider_rates_default_to_unavailable() -> None:
+    """Ordinary custom pricing requires no unused provider-tool rates."""
+    parameters = inspect.signature(OpenAIPricingTable).parameters
+    assert parameters["web_search_usd_per_invocation"].default is None
+    assert parameters["file_search_usd_per_invocation"].default is None
+
+
+def test_provider_executed_tools_follow_function_tools_in_responses() -> None:
+    """Responses preserves each collection's order and places functions first."""
+    schema = ToolSchema(
+        name="echo",
+        description="Echo the input.",
+        args_schema={"type": "object"},
+    )
+    provider_tool: dict[str, object] = {"type": "web_search"}
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            automatic_prompt_caching=True,
+            tool_schemas=(schema,),
+            provider_executed_tools=(provider_tool,),
+        )
+    )
+    assert not isinstance(precomputed.tools, openai.Omit)
+    assert precomputed.tools[0]["type"] == "function"
+    assert precomputed.tools[1] is provider_tool
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
@@ -906,10 +1131,25 @@ class _FakeSDKStream(AsyncResponseStream[None]):
 
 
 def _stream(
-    replay_events: Sequence[ResponseStreamEvent], headers: dict[str, str] | None = None
+    replay_events: Sequence[ResponseStreamEvent],
+    headers: dict[str, str] | None = None,
+    *,
+    charged_provider_tools: bool = False,
 ) -> _OpenAIStream:
     """Build an adapter stream over replayed events, reading headers off a constructed response."""
-    return _OpenAIStream(sdk_stream=_FakeSDKStream(replay_events, headers))
+    return _OpenAIStream(
+        sdk_stream=_FakeSDKStream(replay_events, headers),
+        pricing=_PRICING,
+        charged_provider_tools=charged_provider_tools,
+    )
+
+
+def test_cutoff_openai_provider_tool_billing_is_nan() -> None:
+    """A charged binding cannot report zero before terminal usage arrives."""
+    billing = _stream([], charged_provider_tools=True).billing_reported()
+    assert billing is not None
+    assert math.isnan(billing.usage.provider_executed_tool_cost_in_usd)
+    assert _stream([]).billing_reported() is None
 
 
 def _kwarg_sent[OutputT](
@@ -2060,7 +2300,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
     @override
     def response_without_usage(self) -> BaseModel:
         """Return a turn whose usage field is absent, which openai answers a run with."""
-        return _response(usage=None, output=_conformance_output())
+        return _response(usage=None, output=[dict(_TEXT_OUTPUT_ITEM)])
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:

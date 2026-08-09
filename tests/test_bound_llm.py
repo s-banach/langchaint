@@ -101,6 +101,7 @@ _USAGE = Usage(
     input_tokens_cache_write_cost_in_usd=0.0,
     input_tokens_cache_none_cost_in_usd=0.0,
     output_tokens_cost_in_usd=0.0,
+    provider_executed_tool_cost_in_usd=0.0,
 )
 _USAGE_BILLED = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.25})
 """The billing a 200 that produced no output (a refusal or truncation) carries."""
@@ -1861,6 +1862,16 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
         response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
     )
     assert_type(structured_with_tools, BoundLLM[_Answer, ToolManager])
+    provider_tool = ({"type": "web_search"},)
+    text_with_provider_tool = llm.bind(
+        provider_executed_tools=provider_tool,
+        automatic_prompt_caching=True,
+    )
+    assert_type(text_with_provider_tool, BoundLLM[str, None])
+    assert_type(
+        structured.rebind(provider_executed_tools=provider_tool),
+        BoundLLM[_Answer, None],
+    )
 
     # BoundLLM[X] is BoundLLM[X, None]: the PEP 696 default keeps the common annotation short.
     assert_type(structured, BoundLLM[_Answer])
@@ -2066,6 +2077,23 @@ def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
     replacement = {"safety_identifier": "user-8"}
     assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
     assert bound_llm.rebind(extra_body=None).binding.extra_body is None
+
+
+def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
+    """Rebind preserves omitted tools and removes them with an empty tuple."""
+    first_tool = {"type": "web_search"}
+    second_tool = {"type": "file_search", "vector_store_ids": ["vs_1"]}
+    bound = LLM(_FakeAdapter()).bind(
+        provider_executed_tools=(first_tool,),
+        max_attempts=5,
+        automatic_prompt_caching=True,
+    )
+    assert bound.binding.provider_executed_tools == (first_tool,)
+    assert bound.rebind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
+    replaced = bound.rebind(provider_executed_tools=(second_tool,))
+    assert replaced.binding.provider_executed_tools == (second_tool,)
+    assert replaced.max_attempts == 5
+    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
 def test_generate_many_aligns_results_with_inputs() -> None:

@@ -25,6 +25,7 @@ def _usage(
     cache_write_cost: float = 0.0,
     cache_none_cost: float = 0.0,
     output_cost: float = 0.0,
+    provider_executed_tool_cost: float = 0.0,
 ) -> Usage:
     """Build a Usage from the fields a test cares about, defaulting the rest to zero."""
     return Usage(
@@ -37,6 +38,7 @@ def _usage(
         input_tokens_cache_write_cost_in_usd=cache_write_cost,
         input_tokens_cache_none_cost_in_usd=cache_none_cost,
         output_tokens_cost_in_usd=output_cost,
+        provider_executed_tool_cost_in_usd=provider_executed_tool_cost,
     )
 
 
@@ -46,12 +48,16 @@ def test_input_tokens_total_sums_the_partition() -> None:
     assert usage.input_tokens_total == 1000
 
 
-def test_cost_in_usd_sums_the_four_categories() -> None:
+def test_cost_in_usd_sums_the_five_categories() -> None:
     """cost_in_usd is derived, so it cannot disagree with the parts it adds."""
     usage = _usage(
-        cache_read_cost=0.01, cache_write_cost=0.02, cache_none_cost=0.03, output_cost=0.04
+        cache_read_cost=0.01,
+        cache_write_cost=0.02,
+        cache_none_cost=0.03,
+        output_cost=0.04,
+        provider_executed_tool_cost=0.05,
     )
-    assert usage.cost_in_usd == pytest.approx(0.10)
+    assert usage.cost_in_usd == pytest.approx(0.15)
 
 
 def test_negative_counter_is_rejected() -> None:
@@ -93,6 +99,7 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
         cache_write_cost=0.02,
         cache_none_cost=0.03,
         output_cost=0.04,
+        provider_executed_tool_cost=0.05,
     )
     second = _usage(
         cache_read=10,
@@ -104,6 +111,7 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
         cache_write_cost=0.20,
         cache_none_cost=0.30,
         output_cost=0.40,
+        provider_executed_tool_cost=0.50,
     )
     third = _usage(
         cache_read=100,
@@ -115,6 +123,7 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
         cache_write_cost=2.00,
         cache_none_cost=3.00,
         output_cost=4.00,
+        provider_executed_tool_cost=5.00,
     )
     total = Usage.sum_of([first, second, third])
     assert total.input_tokens_cache_read == 111
@@ -126,7 +135,8 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
     assert total.input_tokens_cache_write_cost_in_usd == pytest.approx(2.22)
     assert total.input_tokens_cache_none_cost_in_usd == pytest.approx(3.33)
     assert total.output_tokens_cost_in_usd == pytest.approx(4.44)
-    assert total.cost_in_usd == pytest.approx(11.10)
+    assert total.provider_executed_tool_cost_in_usd == pytest.approx(5.55)
+    assert total.cost_in_usd == pytest.approx(16.65)
 
 
 def test_sum_of_with_zero_usage_changes_nothing() -> None:

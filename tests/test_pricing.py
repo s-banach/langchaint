@@ -9,6 +9,7 @@ import math
 import pytest
 
 from langchaint import ZERO_USAGE, Usage, category_cost
+from langchaint.pricing import invocation_cost_in_usd
 from tests.helpers import stated_billing
 
 
@@ -32,6 +33,7 @@ def _usage(
         input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
         input_tokens_cache_none_cost_in_usd=input_tokens_cache_none_cost_in_usd,
         output_tokens_cost_in_usd=0.75,
+        provider_executed_tool_cost_in_usd=0.0,
     )
 
 
@@ -43,6 +45,24 @@ def test_category_cost_is_the_counter_times_the_rate_over_one_million() -> None:
 def test_a_zero_counter_costs_zero_at_an_unknown_rate() -> None:
     """0 * NaN is NaN, so the zero case is special-cased and a total over it stays a number."""
     assert category_cost(0, math.nan) == 0.0
+
+
+def test_category_cost_preserves_public_keyword_names() -> None:
+    """Public keyword calls retain their documented parameter names."""
+    assert category_cost(tokens=200, usd_per_million_tokens=3.0) == 0.0006
+
+
+def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:
+    """An unavailable rate affects only positive provider invocation counts."""
+    assert invocation_cost_in_usd(0, None) == 0.0
+    assert math.isnan(invocation_cost_in_usd(1, None))
+
+
+@pytest.mark.parametrize("invocations", [-1, True])
+def test_invocation_cost_rejects_invalid_counts(invocations: int) -> None:
+    """Negative and boolean counts cannot produce costs."""
+    with pytest.raises(ValueError, match="nonnegative int"):
+        _ = invocation_cost_in_usd(invocations, 0.01)
 
 
 def test_cache_savings_is_what_the_uncached_counterfactual_would_have_added() -> None:

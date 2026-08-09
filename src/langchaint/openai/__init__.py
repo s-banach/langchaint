@@ -11,11 +11,15 @@ Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
 `OpenAIBedrockAccount.model` always requires both parameters.
 Responses from uncataloged service tiers cost NaN.
 
-Prices use USD per one million tokens.
+Token prices use USD per one million tokens.
+Web-search prices use USD per invocation.
+File-search prices use USD per invocation.
 Source: https://developers.openai.com/api/docs/pricing.
 Recheck that page before relying on a table.
 `OPENAI_PRICING` covers the default service tier.
-Callers state flex, scale, priority, or negotiated rates through `pricing`.
+Its web-search rates are public list-price estimates.
+`OpenAIAccount.model(pricing=...)` replaces cataloged estimates.
+`OpenAIBedrockAccount.model(pricing=...)` accepts caller rates.
 Earlier models cache automatically and have free cache writes.
 The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
@@ -66,48 +70,64 @@ OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
         output_usd_per_million_tokens=10.00,
         cache_read_usd_per_million_tokens=0.125,
         cache_write_usd_per_million_tokens=0.00,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.2": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.75,
         output_usd_per_million_tokens=14.00,
         cache_read_usd_per_million_tokens=0.175,
         cache_write_usd_per_million_tokens=0.00,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.4": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=2.50,
         output_usd_per_million_tokens=15.00,
         cache_read_usd_per_million_tokens=0.25,
         cache_write_usd_per_million_tokens=0.00,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.4-mini": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=0.75,
         output_usd_per_million_tokens=4.50,
         cache_read_usd_per_million_tokens=0.075,
         cache_write_usd_per_million_tokens=0.00,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.5": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
         output_usd_per_million_tokens=30.00,
         cache_read_usd_per_million_tokens=0.50,
         cache_write_usd_per_million_tokens=0.00,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.6-luna": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=1.00,
         output_usd_per_million_tokens=6.00,
         cache_read_usd_per_million_tokens=0.10,
         cache_write_usd_per_million_tokens=1.25,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.6-terra": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=2.50,
         output_usd_per_million_tokens=15.00,
         cache_read_usd_per_million_tokens=0.25,
         cache_write_usd_per_million_tokens=3.125,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
     "gpt-5.6-sol": OpenAIPricingTable(
         input_cache_none_usd_per_million_tokens=5.00,
         output_usd_per_million_tokens=30.00,
         cache_read_usd_per_million_tokens=0.50,
         cache_write_usd_per_million_tokens=6.25,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
     ),
 }
 """Public prices per openai model; the default pricing lookup."""

@@ -80,7 +80,7 @@ _ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
             input_cache_none_usd_per_million_tokens=1.0,
             cache_read_usd_per_million_tokens=1.0,
             output_usd_per_million_tokens=1.0,
-        )
+        ),
     )
 }
 """The gemini counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
@@ -94,6 +94,9 @@ def test_anthropic_account_model_wires_model_and_pricing(model: AnthropicModelNa
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing["standard"] is ANTHROPIC_PRICING[model]
+    web_search_rate = adapter.pricing["standard"].web_search_usd_per_invocation
+    assert web_search_rate is not None
+    assert web_search_rate > 0
 
 
 @pytest.mark.parametrize("model", list(GEMINI_PRICING))
@@ -104,6 +107,12 @@ def test_gemini_account_model_wires_model_and_pricing(model: GeminiModelName) ->
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.model == model
     assert adapter.pricing["ON_DEMAND"] is GEMINI_PRICING[model]
+    google_search_rate = adapter.pricing["ON_DEMAND"].google_search_usd_per_query
+    google_maps_rate = adapter.pricing["ON_DEMAND"].google_maps_usd_per_query
+    assert google_search_rate is not None
+    assert google_search_rate > 0
+    assert google_maps_rate is not None
+    assert google_maps_rate > 0
 
 
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
@@ -114,6 +123,9 @@ def test_openai_account_model_wires_model_and_pricing(model: OpenAIModelName) ->
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
     assert adapter.pricing["default"] is OPENAI_PRICING[model]
+    web_search_rate = adapter.pricing["default"].web_search_usd_per_invocation
+    assert web_search_rate is not None
+    assert web_search_rate > 0
 
 
 _PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
@@ -132,6 +144,11 @@ _PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
 def test_the_prompt_cache_options_expectations_cover_the_catalog() -> None:
     """Require one cache-support expectation for every cataloged model."""
     assert set(_PROMPT_CACHE_OPTIONS_SUPPORT) == set(OPENAI_PRICING)
+
+
+def test_gemini_catalog_contains_only_gemini_3_models() -> None:
+    """Gemini provider-tool support begins with Gemini 3 models."""
+    assert all(model.startswith("gemini-3") for model in GEMINI_PRICING)
 
 
 @pytest.mark.parametrize(("model", "supported"), list(_PROMPT_CACHE_OPTIONS_SUPPORT.items()))
@@ -202,12 +219,14 @@ def test_gemini_pricing_override_replaces_the_on_demand_rates() -> None:
             input_cache_none_usd_per_million_tokens=2.0,
             cache_read_usd_per_million_tokens=0.2,
             output_usd_per_million_tokens=20.0,
-        )
+        ),
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
     )
     adapter = (
         GeminiAccount(client=genai.Client(api_key="offline", vertexai=False))
         .model(
-            "gemini-2.5-flash",
+            "gemini-3.5-flash",
             pricing={"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom},
         )
         .adapter
@@ -222,7 +241,7 @@ def test_gemini_adapter_requires_on_demand_pricing() -> None:
     with pytest.raises(ValueError, match="ON_DEMAND"):
         _ = GeminiGenerateContentAdapter(
             client=genai.Client(api_key="offline", vertexai=False),
-            model="gemini-2.5-flash",
+            model="gemini-3.5-flash",
             pricing={},
             provider_name="gcp.gemini",
         )
@@ -232,7 +251,7 @@ def test_gemini_account_model_raises_on_a_vertex_client() -> None:
     """Reject a Vertex AI client from `GeminiAccount.model`."""
     with pytest.raises(ValueError, match="contradicts the client"):
         _ = GeminiAccount(client=genai.Client(api_key="offline", vertexai=True)).model(
-            "gemini-2.5-flash"
+            "gemini-3.5-flash"
         )
 
 
@@ -240,7 +259,7 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
     """A vertexai client under provider_name "gcp.vertex_ai" is the stated Vertex construction."""
     adapter = GeminiGenerateContentAdapter(
         client=genai.Client(api_key="offline", vertexai=True),
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         pricing=_ARBITRARY_GEMINI_PRICING,
         provider_name="gcp.vertex_ai",
     )
@@ -255,7 +274,7 @@ def test_gemini_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None
         max_request_starts_per_second=25.0,
     )
     llm = account.model(
-        "gemini-2.5-flash",
+        "gemini-3.5-flash",
         service_tier="flex",
     )
     adapter = llm.adapter
@@ -263,9 +282,9 @@ def test_gemini_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None
     assert adapter.service_tier == "flex"
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert account.model("gemini-2.5-pro").shared_backoff is llm.shared_backoff
+    assert account.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
     assert llm.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
-    defaulted = account.model("gemini-2.5-flash")
+    defaulted = account.model("gemini-3.5-flash")
     defaulted_adapter = defaulted.adapter
     assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
     assert defaulted_adapter.service_tier is None
@@ -475,6 +494,7 @@ def test_pricing_override_replaces_the_standard_rates() -> None:
         cache_read_usd_per_million_tokens=0.20,
         cache_write_5m_usd_per_million_tokens=2.50,
         cache_write_1h_usd_per_million_tokens=4.00,
+        web_search_usd_per_invocation=0.01,
     )
     adapter = (
         AnthropicAccount(
@@ -573,7 +593,7 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
         ),
         (
             lambda: GeminiAccount(client=genai.Client(api_key="k", vertexai=False)).model(
-                "gemini-2.5-flash"
+                "gemini-3.5-flash"
             ),
             "gcp.gemini",
         ),

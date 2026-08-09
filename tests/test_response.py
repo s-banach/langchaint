@@ -75,6 +75,7 @@ _USAGE = Usage(
     input_tokens_cache_write_cost_in_usd=0.1,
     input_tokens_cache_none_cost_in_usd=0.1,
     output_tokens_cost_in_usd=0.2,
+    provider_executed_tool_cost_in_usd=0.0,
 )
 """One attempt's billing: four category costs summing to 0.5."""
 
@@ -336,6 +337,7 @@ def test_to_tables_carries_an_unpriced_cost_as_nan() -> None:
         input_tokens_cache_write_cost_in_usd=float("nan"),
         input_tokens_cache_none_cost_in_usd=float("nan"),
         output_tokens_cost_in_usd=float("nan"),
+        provider_executed_tool_cost_in_usd=float("nan"),
     )
     calls, attempts = to_tables(
         _response(output="hello", attempt_records=(attempt_record(error=None, usage=unpriced),))

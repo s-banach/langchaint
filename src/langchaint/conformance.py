@@ -63,6 +63,7 @@ from langchaint.usage import ZERO_USAGE
 _PLAIN_TEXT_BINDING = Binding(
     system_prompt=None,
     tool_schemas=(),
+    provider_executed_tools=(),
     tool_choice="auto",
     parallel_tool_calls=True,
     inference_params=InferenceParams(),

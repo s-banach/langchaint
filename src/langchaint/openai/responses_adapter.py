@@ -57,6 +57,9 @@ ContentPart mappings verified against openai 2.53.0:
 - `ImageUrlPart.url` becomes `image_url` unchanged.
 - `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
 
+Provider-executed tool mappings were verified against openai 2.53.0.
+Web search and file search return distinct output item types.
+
 Mapping decisions:
 - A str system_prompt travels as the `instructions` parameter, not as an input item;
   a parts system_prompt travels as a developer-role input message first in every request's input,
@@ -92,6 +95,7 @@ Mapping decisions:
 from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import nan
 from typing import Any, ClassVar, Literal, cast, override
 
 import openai
@@ -100,7 +104,6 @@ from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import AsyncResponseStream
 from openai.types.responses import (
     EasyInputMessageParam,
-    FunctionToolParam,
     ResponseErrorEvent,
     ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCallParam,
@@ -113,6 +116,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
     ResponseTextConfigParam,
     ToolChoiceFunctionParam,
+    ToolParam,
 )
 from openai.types.responses import (
     Response as OpenAIResponse,
@@ -154,6 +158,7 @@ from langchaint.adapter import (
     reject_extra_body_keys_the_adapter_populates,
     request_id_from_raw,
     request_json,
+    validated_provider_executed_tool_types,
 )
 from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError
@@ -188,7 +193,12 @@ from langchaint.openai.shared import (
     request_id_from_openai_error,
     require_prompt_cache_options_support,
 )
-from langchaint.pricing import Billing, require_pricing_key
+from langchaint.pricing import (
+    Billing,
+    invocation_cost_in_usd,
+    require_finite_nonnegative_rate,
+    require_pricing_key,
+)
 from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
@@ -197,6 +207,21 @@ type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionP
 
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
 """How much readable text to ask the API for, the values reasoning.summary takes."""
+
+_SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES = frozenset({
+    "file_search",
+    "web_search",
+    "web_search_2025_08_26",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+})
+_WEB_SEARCH_TOOL_TYPES = _SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES - {"file_search"}
+_UNPRICEABLE_OUTPUT_TYPES = frozenset({
+    "code_interpreter_call",
+    "computer_call",
+    "image_generation_call",
+    "shell_call",
+})
 
 
 def _wire_reasoning(
@@ -240,7 +265,7 @@ class _OpenAIPrecomputedFields:
     max_output_tokens: int | Omit
     temperature: float | Omit
     reasoning: Reasoning | Omit
-    tools: list[FunctionToolParam] | Omit
+    tools: list[ToolParam] | Omit
     tool_choice: _WireToolChoice | Omit
     parallel_tool_calls: bool | Omit
     prompt_cache_options: PromptCacheOptions | Omit
@@ -250,6 +275,7 @@ class _OpenAIPrecomputedFields:
     """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
 
     extra_body: Mapping[str, object] | None
+    charged_provider_tools: bool
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
@@ -486,13 +512,16 @@ def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
     return tool_choice
 
 
-def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]:
-    """Convert tool schemas to function tools.
+def _wire_tools(
+    tool_schemas: tuple[ToolSchema, ...],
+    provider_executed_tools: tuple[Mapping[str, object], ...],
+) -> list[ToolParam]:
+    """Convert every bound tool to one ordered wire list.
 
     strict is a required key of FunctionToolParam; None leaves the provider's non-strict default in place,
     matching the schemas the ToolManager generates, which are not written to strict mode's restrictions.
     """
-    return [
+    tools: list[ToolParam] = [
         {
             "type": "function",
             "name": tool_schema.name,
@@ -502,6 +531,10 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[FunctionToolParam]
         }
         for tool_schema in tool_schemas
     ]
+    # cast: the neutral Mapping type exceeds the SDK TypedDict union.
+    # The adapter validated each mapping's type discriminator.
+    tools.extend(cast("ToolParam", tool) for tool in provider_executed_tools)
+    return tools
 
 
 def _provider_failure(
@@ -693,6 +726,12 @@ def _billing_from_response(
     https://developers.openai.com/api/docs/guides/prompt-caching
     output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
 
+    OpenAI's web-search guide says only `search` actions incur tool-call costs.
+    This was read 2026-08-09:
+    https://developers.openai.com/api/docs/guides/tools-web-search
+    Each `file_search_call` incurs one file-search call fee.
+    Source: https://developers.openai.com/api/docs/pricing
+
     A response with no usage at all bills zero counters, at the priced tier's rates.
 
     Raises:
@@ -701,6 +740,21 @@ def _billing_from_response(
     """
     service_tier = _priced_tier(response.service_tier)
     table = pricing.get(service_tier, _UNPRICED)
+    web_search_invocations = sum(
+        1
+        for item in response.output
+        if item.type == "web_search_call" and item.action.type == "search"
+    )
+    file_search_invocations = sum(1 for item in response.output if item.type == "file_search_call")
+    provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
+        web_search_invocations,
+        table.web_search_usd_per_invocation,
+    ) + invocation_cost_in_usd(
+        file_search_invocations,
+        table.file_search_usd_per_invocation,
+    )
+    if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
+        provider_executed_tool_cost_in_usd = nan
     usage = response.usage
     if usage is None:
         return table.price(
@@ -711,6 +765,7 @@ def _billing_from_response(
             input_tokens_cache_none=0,
             output_tokens=0,
             output_tokens_reasoning=0,
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
     details = usage.input_tokens_details
     return table.price(
@@ -723,6 +778,7 @@ def _billing_from_response(
         ),
         output_tokens=usage.output_tokens,
         output_tokens_reasoning=usage.output_tokens_details.reasoning_tokens,
+        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
     )
 
 
@@ -831,6 +887,9 @@ class OpenAIResponsesAdapter(Adapter):
             ValueError: the binding declines automatic caching on a model built with
                 supports_prompt_cache_options False, or its extra_body holds a key in
                 _ADAPTER_POPULATED_WIRE_KEYS.
+                Also raised for unsupported provider-executed tool `type` values.
+                Provider-executed tools require `provider_name="openai"`.
+                Configured charged rates must be finite and nonnegative.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
@@ -840,6 +899,26 @@ class OpenAIResponsesAdapter(Adapter):
             automatic_prompt_caching=binding.automatic_prompt_caching,
             supports_prompt_cache_options=self.supports_prompt_cache_options,
         )
+        provider_executed_tool_types = validated_provider_executed_tool_types(
+            binding.provider_executed_tools,
+            supported_types=_SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES,
+            adapter_name="OpenAI Responses",
+        )
+        if provider_executed_tool_types and self.provider_name != "openai":
+            raise ValueError(
+                "OpenAI Responses provider_executed_tools require provider_name='openai'"
+            )
+        for pricing_table in self.pricing.values():
+            if provider_executed_tool_types & _WEB_SEARCH_TOOL_TYPES:
+                require_finite_nonnegative_rate(
+                    rate_name="web_search_usd_per_invocation",
+                    rate=pricing_table.web_search_usd_per_invocation,
+                )
+            if "file_search" in provider_executed_tool_types:
+                require_finite_nonnegative_rate(
+                    rate_name="file_search_usd_per_invocation",
+                    rate=pricing_table.file_search_usd_per_invocation,
+                )
         instructions: str | None = None
         input_prefix: list[ResponseInputItemParam] = []
         if isinstance(binding.system_prompt, str):
@@ -852,11 +931,11 @@ class OpenAIResponsesAdapter(Adapter):
                     system_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 system_parts.append(system_text)
             input_prefix.append({"role": "developer", "content": system_parts})
-        tools: list[FunctionToolParam] | Omit = omit
+        tools: list[ToolParam] | Omit = omit
         tool_choice: _WireToolChoice | Omit = omit
         parallel_tool_calls: bool | Omit = omit
-        if binding.tool_schemas:
-            tools = _wire_tools(binding.tool_schemas)
+        if binding.tool_schemas or binding.provider_executed_tools:
+            tools = _wire_tools(binding.tool_schemas, binding.provider_executed_tools)
             tool_choice = _wire_tool_choice(binding.tool_choice)
             parallel_tool_calls = binding.parallel_tool_calls
         return _OpenAIPrecomputedFields(
@@ -886,6 +965,7 @@ class OpenAIResponsesAdapter(Adapter):
             include=["reasoning.encrypted_content"],
             text=omit,
             extra_body=binding.extra_body,
+            charged_provider_tools=bool(provider_executed_tool_types),
         )
 
     @override
@@ -932,8 +1012,16 @@ class OpenAIResponsesAdapter(Adapter):
 class _OpenAIStream(AdapterStream):
     """One open Responses stream, backed by the SDK's stream helper."""
 
-    def __init__(self, *, sdk_stream: AsyncResponseStream[Any]) -> None:
+    def __init__(
+        self,
+        *,
+        sdk_stream: AsyncResponseStream[Any],
+        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+        charged_provider_tools: bool,
+    ) -> None:
         self._sdk_stream = sdk_stream
+        self._pricing = pricing
+        self._charged_provider_tools = charged_provider_tools
         self._terminal_response: OpenAIResponse | None = None
 
     @override
@@ -1058,13 +1146,27 @@ class _OpenAIStream(AdapterStream):
         return self._terminal_response
 
     @override
-    def billing_reported(self) -> None:
-        """None: openai reports usage only on the terminal response, so an open stream has none.
+    def billing_reported(self) -> Billing | None:
+        """Return terminal billing or NaN for incomplete charged provider tools.
 
         The SDK's stream state accumulates the response's output items and no counters
         (openai 2.45.0), and ResponseUsage arrives on the response the completed event carries,
         which is exactly the event a stream that ends early never receives.
         """
+        if self._terminal_response is not None:
+            return _billing_from_response(self._terminal_response, self._pricing)
+        if not self._charged_provider_tools:
+            return None
+        return self._pricing[_DEFAULT_TIER].price(
+            service_tier=_DEFAULT_TIER,
+            usage_raw=None,
+            input_tokens_cache_read=0,
+            input_tokens_cache_write=0,
+            input_tokens_cache_none=0,
+            output_tokens=0,
+            output_tokens_reasoning=0,
+            provider_executed_tool_cost_in_usd=nan,
+        )
 
     @override
     def request_id(self) -> str | None:
@@ -1152,7 +1254,11 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             input=params.input,
             extra_body=precomputed.extra_body,
         )
-        return _OpenAIStream(sdk_stream=await manager.__aenter__())
+        return _OpenAIStream(
+            sdk_stream=await manager.__aenter__(),
+            pricing=self._adapter.pricing,
+            charged_provider_tools=precomputed.charged_provider_tools,
+        )
 
 
 class _BoundOpenAIText(_BoundOpenAI[str]):

@@ -6,7 +6,9 @@ FunctionResponse name recovery, the adapter-owned stream assembly, and the parse
 """
 
 import asyncio
+import inspect
 import json
+import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import override
 
@@ -62,6 +64,7 @@ from langchaint.gemini import (
     assembled_response,
 )
 from langchaint.gemini.generate_content_adapter import (
+    _billing_from_response,
     _billing_from_usage,
     _GeminiRequestParams,
     _GeminiStream,
@@ -75,11 +78,19 @@ _ON_DEMAND_RATES = GeminiRates(
     output_usd_per_million_tokens=10.0,
 )
 
-_PRICING: dict[str, GeminiPricingTable] = {"ON_DEMAND": GeminiPricingTable(rates=_ON_DEMAND_RATES)}
+_PRICING: dict[str, GeminiPricingTable] = {
+    "ON_DEMAND": GeminiPricingTable(
+        rates=_ON_DEMAND_RATES,
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
+    )
+}
 """The on-demand tier alone, so a response reporting another traffic_type prices NaN."""
 
 _LONG_PROMPT_TABLE = GeminiPricingTable(
     rates=_ON_DEMAND_RATES,
+    google_search_usd_per_query=0.014,
+    google_maps_usd_per_query=0.014,
     long_prompt_threshold_tokens=200,
     long_prompt_rates=GeminiRates(
         input_cache_none_usd_per_million_tokens=2.0,
@@ -94,7 +105,7 @@ def _adapter() -> GeminiGenerateContentAdapter:
     """Build the adapter under test on an offline client."""
     return GeminiGenerateContentAdapter(
         client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         pricing=_PRICING,
         provider_name="gcp.gemini",
     )
@@ -104,6 +115,7 @@ def _binding(
     *,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
+    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     tool_choice: ToolChoice = "auto",
     parallel_tool_calls: bool = True,
     inference_params: InferenceParams | None = None,
@@ -114,6 +126,7 @@ def _binding(
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
+        provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         inference_params=inference_params if inference_params is not None else InferenceParams(),
@@ -171,6 +184,7 @@ def _response(
     *,
     finish_reason: types.FinishReason | None = types.FinishReason.STOP,
     usage_metadata: types.GenerateContentResponseUsageMetadata | None = None,
+    grounding_metadata: types.GroundingMetadata | None = None,
     block_reason: types.BlockedReason | None = None,
 ) -> types.GenerateContentResponse:
     """Build a response; parts None with finish_reason None builds one without candidates."""
@@ -182,6 +196,7 @@ def _response(
                     types.Content(role="model", parts=list(parts)) if parts is not None else None
                 ),
                 finish_reason=finish_reason,
+                grounding_metadata=grounding_metadata,
             )
         ]
     return types.GenerateContentResponse(
@@ -192,9 +207,34 @@ def _response(
             else None
         ),
         usage_metadata=usage_metadata,
-        model_version="gemini-2.5-flash",
+        model_version="gemini-3.5-flash",
         response_id="resp-1",
     )
+
+
+def _provider_call_parts(
+    *,
+    tool_call_id: str,
+    tool_type: types.ToolType,
+    queries: object,
+) -> list[types.Part]:
+    """Build one matched server-side tool call and response pair."""
+    return [
+        types.Part(
+            tool_call=types.ToolCall(
+                id=tool_call_id,
+                tool_type=tool_type,
+                args={"queries": queries},
+            )
+        ),
+        types.Part(
+            tool_response=types.ToolResponse(
+                id=tool_call_id,
+                tool_type=tool_type,
+                response={},
+            )
+        ),
+    ]
 
 
 def _gemini_stream(chunks: Sequence[types.GenerateContentResponse]) -> _GeminiStream:
@@ -356,6 +396,165 @@ def test_no_tools_binds_no_tool_config() -> None:
     assert config.tool_config is None
 
 
+def test_provider_executed_tools_reach_gemini_tools() -> None:
+    """Gemini validates provider-executed mappings through GenerateContentConfig."""
+    config = _bound_config(_binding(provider_executed_tools=({"google_search": {}},)))
+    assert config.tools is not None
+    assert isinstance(config.tools[0], types.Tool)
+    assert config.tools[0].google_search is not None
+    assert config.tool_config == types.ToolConfig(include_server_side_tool_invocations=True)
+
+
+def test_provider_executed_tools_follow_function_tools_in_gemini() -> None:
+    """Gemini places function declarations before provider-executed tools."""
+    config = _bound_config(
+        _binding(
+            tool_schemas=(_echo_schema(),),
+            provider_executed_tools=({"google_search": {}},),
+        )
+    )
+    assert config.tools is not None
+    assert isinstance(config.tools[0], types.Tool)
+    assert config.tools[0].function_declarations is not None
+    assert isinstance(config.tools[1], types.Tool)
+    assert config.tools[1].google_search is not None
+    assert config.tool_config == types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode=types.FunctionCallingConfigMode.VALIDATED
+        ),
+        include_server_side_tool_invocations=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_tool", "field_name"),
+    [
+        ({"code_execution": {}}, "code_execution"),
+        ({"file_search": {"file_search_store_names": ["fileSearchStores/one"]}}, "file_search"),
+        ({"google_maps": {}}, "google_maps"),
+        ({"google_search": {}}, "google_search"),
+        ({"url_context": {}}, "url_context"),
+    ],
+)
+def test_every_supported_gemini_provider_field_binds(
+    provider_tool: Mapping[str, object], field_name: str
+) -> None:
+    """Each reviewed Gemini provider field survives `types.Tool` normalization."""
+    config = _bound_config(_binding(provider_executed_tools=(provider_tool,)))
+    assert config.tools is not None
+    assert getattr(config.tools[0], field_name) is not None
+
+
+def test_one_gemini_mapping_can_populate_search_and_maps() -> None:
+    """Validation inspects every populated `types.Tool` field."""
+    config = _bound_config(
+        _binding(provider_executed_tools=({"google_search": {}, "google_maps": {}},))
+    )
+    assert config.tools is not None
+    assert isinstance(config.tools[0], types.Tool)
+    assert config.tools[0].google_search is not None
+    assert config.tools[0].google_maps is not None
+
+
+@pytest.mark.parametrize(
+    "provider_tool",
+    [
+        {},
+        {"computer_use": {}},
+        {"enterprise_web_search": {}},
+        {"exa_ai_search": {}},
+        {"function_declarations": []},
+        {"google_search_retrieval": {}},
+        {"mcp_servers": []},
+        {"parallel_ai_search": {}},
+        {"retrieval": {}},
+    ],
+)
+def test_every_unsupported_gemini_provider_field_is_rejected(
+    provider_tool: Mapping[str, object],
+) -> None:
+    """Every installed `types.Tool` field outside the reviewed set is rejected."""
+    with pytest.raises(ValueError, match=r"unsupported|validation"):
+        _ = _bound_config(_binding(provider_executed_tools=(provider_tool,)))
+
+
+def test_gemini_image_search_is_rejected() -> None:
+    """Google Search image results have separate unimplemented billing."""
+    with pytest.raises(ValueError, match="image search"):
+        _ = _bound_config(
+            _binding(
+                provider_executed_tools=(
+                    {"google_search": {"search_types": {"image_search": {}}}},
+                )
+            )
+        )
+
+
+def test_gemini_provider_tools_reject_non_gemini_3_models() -> None:
+    """Deprecated Gemini 2.5 models have no provider-executed tool path."""
+    adapter = GeminiGenerateContentAdapter(
+        client=genai.Client(api_key="offline", vertexai=False),
+        model="gemini-2.5-flash",
+        pricing=_PRICING,
+        provider_name="gcp.gemini",
+    )
+    with pytest.raises(ValueError, match="Gemini 3"):
+        _ = adapter.bind_text(_binding(provider_executed_tools=({"google_search": {}},)))
+
+
+def test_gemini_vertex_rejects_provider_tools() -> None:
+    """Vertex bindings reject provider-executed tools before requests."""
+    adapter = GeminiGenerateContentAdapter(
+        client=genai.Client(api_key="offline", vertexai=True),
+        model="gemini-3.5-flash",
+        pricing=_PRICING,
+        provider_name="gcp.vertex_ai",
+    )
+    with pytest.raises(ValueError, match="Gemini Developer API"):
+        _ = adapter.bind_text(_binding(provider_executed_tools=({"google_search": {}},)))
+
+
+@pytest.mark.parametrize("provider_field", ["google_search", "google_maps"])
+@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+def test_configured_gemini_charged_tool_requires_usable_pricing(
+    provider_field: str, rate: float | None
+) -> None:
+    """Every supplied pricing table must price each configured charged tool."""
+    pricing = {
+        "ON_DEMAND": GeminiPricingTable(
+            rates=_ON_DEMAND_RATES,
+            google_search_usd_per_query=(rate if provider_field == "google_search" else 0.014),
+            google_maps_usd_per_query=(rate if provider_field == "google_maps" else 0.014),
+        )
+    }
+    adapter = GeminiGenerateContentAdapter(
+        client=genai.Client(api_key="offline", vertexai=False),
+        model="gemini-3.5-flash",
+        pricing=pricing,
+        provider_name="gcp.gemini",
+    )
+    with pytest.raises(ValueError, match=r"unavailable|finite and nonnegative"):
+        _ = adapter.bind_text(_binding(provider_executed_tools=({provider_field: {}},)))
+
+
+def test_gemini_provider_rates_default_to_unavailable() -> None:
+    """Ordinary custom pricing requires no unused provider-tool rates."""
+    parameters = inspect.signature(GeminiPricingTable).parameters
+    assert parameters["google_search_usd_per_query"].default is None
+    assert parameters["google_maps_usd_per_query"].default is None
+
+
+def test_provider_executed_tools_reject_non_auto_tool_choice() -> None:
+    """Gemini ToolConfig cannot select provider-executed tools."""
+    with pytest.raises(ValueError, match="tool_choice='auto'"):
+        _ = _bound_config(
+            _binding(
+                provider_executed_tools=({"google_search": {}},),
+                tool_choice="required",
+            )
+        )
+
+
 def test_inference_params_map_to_generation_fields() -> None:
     """The InferenceParams fields land as temperature and max_output_tokens; None omits either."""
     config = _bound_config(
@@ -410,7 +609,7 @@ def test_service_tier_lands_on_the_config() -> None:
     """The adapter's service_tier is sent on every request; None sends nothing."""
     adapter = GeminiGenerateContentAdapter(
         client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         pricing=_PRICING,
         provider_name="gcp.gemini",
         service_tier="flex",
@@ -759,7 +958,7 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
         ),
     )
     body = json.loads(request.as_json())
-    assert body["model"] == "gemini-2.5-flash"
+    assert body["model"] == "gemini-3.5-flash"
     assert body["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
     assert body["config"]["temperature"] == 0.5
     assert "http_options" not in body["config"]
@@ -865,7 +1064,7 @@ def test_identity_reads_the_response_fields() -> None:
     bound = _adapter().bind_text(_binding())
     identity = bound.identity_from_raw(_response([types.Part(text="hi")]))
     assert (identity.model_served, identity.response_id, identity.request_id) == (
-        "gemini-2.5-flash",
+        "gemini-3.5-flash",
         "resp-1",
         None,
     )
@@ -878,7 +1077,9 @@ def test_identity_reads_the_response_fields() -> None:
 
 def test_the_usage_partition() -> None:
     """cache_read is the cached counter, cache_none the remainder plus tool-use, output includes thoughts."""
-    billing = _billing_from_usage(_usage_metadata(), _PRICING)
+    billing = _billing_from_usage(
+        _usage_metadata(), _PRICING, provider_executed_tool_cost_in_usd=0.0
+    )
     usage = billing.usage
     assert usage.input_tokens_cache_read == 40
     assert usage.input_tokens_cache_none == 80
@@ -892,6 +1093,221 @@ def test_the_usage_partition() -> None:
     assert billing.service_tier == "ON_DEMAND"
 
 
+def test_search_tool_call_adds_the_cataloged_provider_executed_tool_cost() -> None:
+    """Gemini prices each unique nonempty Search query."""
+    pricing = {
+        "ON_DEMAND": GeminiPricingTable(
+            rates=_ON_DEMAND_RATES,
+            google_search_usd_per_query=0.014,
+            google_maps_usd_per_query=0.014,
+        )
+    }
+    response = _response(
+        [
+            types.Part(
+                tool_call=types.ToolCall(
+                    id="search-1",
+                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                    args={"queries": ["first", "second"]},
+                )
+            ),
+            types.Part(
+                tool_response=types.ToolResponse(
+                    id="search-1",
+                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                    response={},
+                )
+            ),
+        ],
+        usage_metadata=_usage_metadata(),
+    )
+    usage = _billing_from_response(
+        response, pricing, configured_fields=frozenset({"google_search"})
+    ).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
+
+
+def test_search_queries_deduplicate_across_candidates_and_ignore_empty_strings() -> None:
+    """Gemini bills unique nonempty Search queries across the complete response."""
+    first_candidate = types.Candidate(
+        content=types.Content(
+            role="model",
+            parts=_provider_call_parts(
+                tool_call_id="search-1",
+                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                queries=["first", "", "second"],
+            ),
+        ),
+        finish_reason=types.FinishReason.STOP,
+    )
+    second_candidate = types.Candidate(
+        content=types.Content(
+            role="model",
+            parts=_provider_call_parts(
+                tool_call_id="search-2",
+                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                queries=["second", "third"],
+            ),
+        ),
+        finish_reason=types.FinishReason.STOP,
+    )
+    response = types.GenerateContentResponse(
+        candidates=[first_candidate, second_candidate],
+        usage_metadata=_usage_metadata(),
+        model_version="gemini-3.5-flash",
+        response_id="response-1",
+    )
+    usage = _billing_from_response(
+        response, _PRICING, configured_fields=frozenset({"google_search"})
+    ).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(3 * 0.014)
+
+
+def test_mixed_search_and_maps_calls_use_separate_counting_rules() -> None:
+    """Search deduplicates queries while Maps counts every returned query entry."""
+    pricing = {
+        "ON_DEMAND": GeminiPricingTable(
+            rates=_ON_DEMAND_RATES,
+            google_search_usd_per_query=0.01,
+            google_maps_usd_per_query=0.02,
+        )
+    }
+    parts = [
+        *_provider_call_parts(
+            tool_call_id="search-1",
+            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+            queries=["same", "same", "different"],
+        ),
+        *_provider_call_parts(
+            tool_call_id="maps-1",
+            tool_type=types.ToolType.GOOGLE_MAPS,
+            queries=["same", "same", "different"],
+        ),
+    ]
+    usage = _billing_from_response(
+        _response(parts, usage_metadata=_usage_metadata()),
+        pricing,
+        configured_fields=frozenset({"google_search", "google_maps"}),
+    ).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(2 * 0.01 + 3 * 0.02)
+
+
+def test_free_gemini_provider_tools_add_no_separate_fee() -> None:
+    """Code execution, URL context, and file search add no separate fee."""
+    parts = [
+        types.Part(
+            executable_code=types.ExecutableCode(
+                code="print(1)",
+                language=types.Language.PYTHON,
+            )
+        ),
+        *_provider_call_parts(
+            tool_call_id="url-1",
+            tool_type=types.ToolType.URL_CONTEXT,
+            queries=[],
+        ),
+        *_provider_call_parts(
+            tool_call_id="file-1",
+            tool_type=types.ToolType.FILE_SEARCH,
+            queries=[],
+        ),
+    ]
+    usage = _billing_from_response(
+        _response(parts, usage_metadata=_usage_metadata()),
+        _PRICING,
+        configured_fields=frozenset({"code_execution", "url_context", "file_search"}),
+    ).usage
+    assert usage.provider_executed_tool_cost_in_usd == 0.0
+
+
+def test_gemini_charged_tool_at_an_unpriced_tier_produces_nan() -> None:
+    """A charged query uses `_UNPRICED` for an unknown served tier."""
+    response = _response(
+        _provider_call_parts(
+            tool_call_id="search-1",
+            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+            queries=["query"],
+        ),
+        usage_metadata=_usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT),
+    )
+    usage = _billing_from_response(
+        response,
+        _PRICING,
+        configured_fields=frozenset({"google_search"}),
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+@pytest.mark.parametrize(
+    ("tool_type", "queries"),
+    [
+        (types.ToolType.GOOGLE_SEARCH_WEB, ["valid", 1]),
+        (types.ToolType.GOOGLE_SEARCH_WEB, "valid"),
+        (types.ToolType.GOOGLE_MAPS, [""]),
+        (types.ToolType.GOOGLE_MAPS, ["valid", 1]),
+    ],
+)
+def test_malformed_gemini_query_evidence_produces_nan(
+    tool_type: types.ToolType, queries: object
+) -> None:
+    """Unexpected query shapes cannot produce an exact provider-executed cost."""
+    field = "google_search" if tool_type == types.ToolType.GOOGLE_SEARCH_WEB else "google_maps"
+    usage = _billing_from_response(
+        _response(
+            _provider_call_parts(tool_call_id="call-1", tool_type=tool_type, queries=queries),
+            usage_metadata=_usage_metadata(),
+        ),
+        _PRICING,
+        configured_fields=frozenset({field}),
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+def test_incomplete_gemini_tool_pair_produces_nan() -> None:
+    """A server call without its matching response is incomplete billing evidence."""
+    part = types.Part(
+        tool_call=types.ToolCall(
+            id="search-1",
+            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+            args={"queries": ["query"]},
+        )
+    )
+    usage = _billing_from_response(
+        _response([part], usage_metadata=_usage_metadata()),
+        _PRICING,
+        configured_fields=frozenset({"google_search"}),
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+def test_mismatched_gemini_tool_pair_produces_nan() -> None:
+    """Server call and response identifiers and tool types must both match."""
+    parts = _provider_call_parts(
+        tool_call_id="search-1",
+        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+        queries=["query"],
+    )
+    assert parts[1].tool_response is not None
+    parts[1].tool_response.id = "search-2"
+    usage = _billing_from_response(
+        _response(parts, usage_metadata=_usage_metadata()),
+        _PRICING,
+        configured_fields=frozenset({"google_search"}),
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+def test_truncated_gemini_search_billing_produces_nan() -> None:
+    """A partial response cannot prove the final Search query count."""
+    usage = _billing_from_response(
+        _response([], usage_metadata=_usage_metadata()),
+        _PRICING,
+        configured_fields=frozenset({"google_search"}),
+        billing_complete=False,
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
 def test_the_long_prompt_threshold_reprices_every_category() -> None:
     """Above the threshold the long rates price; at or below it the base rates do."""
     short = _LONG_PROMPT_TABLE.price(
@@ -902,6 +1318,7 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         input_tokens_cache_none=100,
         output_tokens=10,
         output_tokens_reasoning=0,
+        provider_executed_tool_cost_in_usd=0.0,
     )
     assert short.input_cache_none_usd_per_million_tokens == 1.0
     long = _LONG_PROMPT_TABLE.price(
@@ -912,6 +1329,7 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         input_tokens_cache_none=101,
         output_tokens=10,
         output_tokens_reasoning=0,
+        provider_executed_tool_cost_in_usd=0.0,
     )
     assert long.input_cache_none_usd_per_million_tokens == 2.0
     assert long.cache_read_usd_per_million_tokens == 0.2
@@ -923,6 +1341,7 @@ def test_tool_execution_input_does_not_cross_the_long_prompt_threshold() -> None
     billing = _billing_from_usage(
         _usage_metadata(prompt_token_count=200, tool_use_prompt_token_count=50),
         {"ON_DEMAND": _LONG_PROMPT_TABLE},
+        provider_executed_tool_cost_in_usd=0.0,
     )
     assert billing.usage.input_tokens_cache_none == 210
     assert billing.input_cache_none_usd_per_million_tokens == 1.0
@@ -931,9 +1350,19 @@ def test_tool_execution_input_does_not_cross_the_long_prompt_threshold() -> None
 def test_the_long_prompt_fields_are_required_together() -> None:
     """A threshold without rates prices nothing, and rates without a threshold never apply."""
     with pytest.raises(ValueError, match="together"):
-        _ = GeminiPricingTable(rates=_ON_DEMAND_RATES, long_prompt_threshold_tokens=200)
+        _ = GeminiPricingTable(
+            rates=_ON_DEMAND_RATES,
+            google_search_usd_per_query=0.014,
+            google_maps_usd_per_query=0.014,
+            long_prompt_threshold_tokens=200,
+        )
     with pytest.raises(ValueError, match="together"):
-        _ = GeminiPricingTable(rates=_ON_DEMAND_RATES, long_prompt_rates=_ON_DEMAND_RATES)
+        _ = GeminiPricingTable(
+            rates=_ON_DEMAND_RATES,
+            google_search_usd_per_query=0.014,
+            google_maps_usd_per_query=0.014,
+            long_prompt_rates=_ON_DEMAND_RATES,
+        )
 
 
 def test_traffic_type_selects_the_table() -> None:
@@ -943,14 +1372,25 @@ def test_traffic_type_selects_the_table() -> None:
         cache_read_usd_per_million_tokens=0.05,
         output_usd_per_million_tokens=5.0,
     )
-    pricing = {**_PRICING, "ON_DEMAND_FLEX": GeminiPricingTable(rates=flex_rates)}
+    pricing = {
+        **_PRICING,
+        "ON_DEMAND_FLEX": GeminiPricingTable(
+            rates=flex_rates,
+            google_search_usd_per_query=0.014,
+            google_maps_usd_per_query=0.014,
+        ),
+    }
     flexed = _billing_from_usage(
-        _usage_metadata(traffic_type=types.TrafficType.ON_DEMAND_FLEX), pricing
+        _usage_metadata(traffic_type=types.TrafficType.ON_DEMAND_FLEX),
+        pricing,
+        provider_executed_tool_cost_in_usd=0.0,
     )
     assert flexed.service_tier == "ON_DEMAND_FLEX"
     assert flexed.input_cache_none_usd_per_million_tokens == 0.5
     unspecified = _billing_from_usage(
-        _usage_metadata(traffic_type=types.TrafficType.TRAFFIC_TYPE_UNSPECIFIED), pricing
+        _usage_metadata(traffic_type=types.TrafficType.TRAFFIC_TYPE_UNSPECIFIED),
+        pricing,
+        provider_executed_tool_cost_in_usd=0.0,
     )
     assert unspecified.service_tier == "ON_DEMAND"
     assert unspecified.input_cache_none_usd_per_million_tokens == 1.0
@@ -1017,6 +1457,7 @@ def test_assembly_merges_text_slices_and_signatures_end_parts() -> None:
             [types.Part(text="wer")],
             finish_reason=types.FinishReason.STOP,
             usage_metadata=_usage_metadata(),
+            grounding_metadata=types.GroundingMetadata(web_search_queries=["weather"]),
         ),
     ]
     assembled = assembled_response(chunks)
@@ -1026,6 +1467,7 @@ def test_assembly_merges_text_slices_and_signatures_end_parts() -> None:
             types.Part(text="answer"),
         ],
         usage_metadata=_usage_metadata(),
+        grounding_metadata=types.GroundingMetadata(web_search_queries=["weather"]),
     )
 
 
@@ -1075,11 +1517,96 @@ def test_billing_reported_follows_usage_arrival() -> None:
 
     before, after = asyncio.run(scenario())
     assert before is None
-    expected = _billing_from_usage(_usage_metadata(), _PRICING)
+    expected = _billing_from_usage(
+        _usage_metadata(), _PRICING, provider_executed_tool_cost_in_usd=0.0
+    )
     # Whole-Billing equality would fail on the NaN cache-write rate both sides carry.
     assert after is not None
     assert after.usage == expected.usage
     assert after.service_tier == expected.service_tier
+
+
+def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
+    """A charged query cannot report zero before terminal usage arrives."""
+
+    async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
+        responses: tuple[types.GenerateContentResponse, ...] = ()
+        for response in responses:
+            yield response
+
+    async def scenario() -> Billing | None:
+        stream = _GeminiStream(
+            chunks=chunks(),
+            pricing=_PRICING,
+            provider_tool_fields=frozenset({"google_search"}),
+            first_chunk=_response(
+                [
+                    *_provider_call_parts(
+                        tool_call_id="search-1",
+                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                        queries=["query"],
+                    ),
+                    types.Part(text="partial"),
+                ],
+                finish_reason=None,
+            ),
+        )
+        items = stream.items()
+        assert await anext(items) == "partial"
+        billing = stream.billing_reported()
+        await stream.close()
+        return billing
+
+    billing = asyncio.run(scenario())
+    assert billing is not None
+    assert math.isnan(billing.usage.provider_executed_tool_cost_in_usd)
+
+
+def test_stream_billing_collects_every_candidate_provider_query() -> None:
+    """Stream billing collects Search queries from every candidate."""
+    response = types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                content=types.Content(
+                    role="model",
+                    parts=_provider_call_parts(
+                        tool_call_id="search-1",
+                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                        queries=["first"],
+                    ),
+                ),
+                finish_reason=types.FinishReason.STOP,
+            ),
+            types.Candidate(
+                content=types.Content(
+                    role="model",
+                    parts=_provider_call_parts(
+                        tool_call_id="search-2",
+                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                        queries=["second"],
+                    ),
+                ),
+                finish_reason=types.FinishReason.STOP,
+            ),
+        ],
+        usage_metadata=_usage_metadata(),
+    )
+
+    async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
+        yield response
+
+    async def scenario() -> Billing | None:
+        stream = _GeminiStream(
+            chunks=chunks(),
+            pricing=_PRICING,
+            provider_tool_fields=frozenset({"google_search"}),
+        )
+        _ = [item async for item in stream.items()]
+        return stream.billing_reported()
+
+    billing = asyncio.run(scenario())
+    assert billing is not None
+    assert billing.usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
 
 
 def test_close_closes_the_sdk_iterator() -> None:
@@ -1245,10 +1772,13 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
                 [_executable_code_part()],
                 finish_reason=types.FinishReason.STOP,
                 usage_metadata=_usage_metadata(),
+                grounding_metadata=types.GroundingMetadata(web_search_queries=["weather"]),
             ),
         ]
         whole = _response(
-            [types.Part(text="Hello"), _executable_code_part()], usage_metadata=_usage_metadata()
+            [types.Part(text="Hello"), _executable_code_part()],
+            usage_metadata=_usage_metadata(),
+            grounding_metadata=types.GroundingMetadata(web_search_queries=["weather"]),
         )
         return assembled_response(chunks), whole
 

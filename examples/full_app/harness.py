@@ -73,6 +73,7 @@ _TURN_USAGE = Usage(
     input_tokens_cache_write_cost_in_usd=0.0,
     input_tokens_cache_none_cost_in_usd=0.006,
     output_tokens_cost_in_usd=0.004,
+    provider_executed_tool_cost_in_usd=0.0,
 )
 """What one scripted turn bills, so a lost fold is visible as a round number of cents.
 

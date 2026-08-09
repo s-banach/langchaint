@@ -137,6 +137,7 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
             input_tokens_cache_write_cost_in_usd=0.0,
             input_tokens_cache_none_cost_in_usd=0.0,
             output_tokens_cost_in_usd=0.0,
+            provider_executed_tool_cost_in_usd=0.0,
             inpit_tokens_cache_read=1,  # pyrefly: ignore[unexpected-keyword]
         )
 

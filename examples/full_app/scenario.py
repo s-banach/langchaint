@@ -26,6 +26,7 @@ SEARCH_USAGE = Usage(
     input_tokens_cache_write_cost_in_usd=0.0,
     input_tokens_cache_none_cost_in_usd=0.0012,
     output_tokens_cost_in_usd=0.0008,
+    provider_executed_tool_cost_in_usd=0.0,
 )
 """What one search call bills, summing to 0.002, distinct from a turn's 0.01 so a fold can be attributed."""
 

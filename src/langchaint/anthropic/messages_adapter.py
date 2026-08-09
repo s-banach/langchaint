@@ -53,6 +53,9 @@ ContentPart mappings verified against anthropic 0.121.0:
 - `ImageUrlPart` becomes `URLImageSourceParam`.
 - `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
 
+Server-tool counters were verified against anthropic 0.121.0.
+Web-search invocation counts appear in `Usage.server_tool_use`.
+
 Mapping decisions:
 - ToolMessage becomes a `tool_result` block inside a user message;
   consecutive tool results group into one user message because the API requires alternating roles.
@@ -74,6 +77,7 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import nan
 from typing import Any, ClassVar, Literal, cast, override
 
 import anthropic
@@ -97,8 +101,8 @@ from anthropic.types import (
     ThinkingBlockParam,
     ThinkingConfigParam,
     ToolChoiceParam,
-    ToolParam,
     ToolResultBlockParam,
+    ToolUnionParam,
     ToolUseBlockParam,
     URLImageSourceParam,
 )
@@ -136,6 +140,7 @@ from langchaint.adapter import (
     request_json,
     retry_after_seconds_from_headers,
     terminal_classification_from_response,
+    validated_provider_executed_tool_types,
     verdict_from_transient_error,
     verdict_under_retry_directive,
 )
@@ -154,7 +159,12 @@ from langchaint.messages import (
     TurnPart,
     UserMessage,
 )
-from langchaint.pricing import Billing, category_cost
+from langchaint.pricing import (
+    Billing,
+    category_cost,
+    invocation_cost_in_usd,
+    require_finite_nonnegative_rate,
+)
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 from langchaint.usage import Usage
@@ -252,8 +262,8 @@ class AnthropicPricingTable:
     Two cache-write rates, because Anthropic bills 5-minute and 1-hour writes differently and one
     response can report tokens written at both TTLs. Both are required: a table that priced only the
     TTL its adapter marks would price the other half of such a response at the wrong rate.
-    price() spends both and reports their sum as one cache-write cost, so what reaches Usage is
-    the neutral four categories.
+    price() reports both writes through one cache-write cost.
+    Usage also receives the provider-executed tool cost.
     """
 
     input_cache_none_usd_per_million_tokens: float
@@ -261,6 +271,8 @@ class AnthropicPricingTable:
     cache_read_usd_per_million_tokens: float
     cache_write_5m_usd_per_million_tokens: float
     cache_write_1h_usd_per_million_tokens: float
+    web_search_usd_per_invocation: float | None = None
+    """Web-search invocation price, or `None` until configured."""
 
     def price(  # noqa: PLR0913 (anthropic splits the cache-write counter that other providers report as one)
         self,
@@ -273,6 +285,7 @@ class AnthropicPricingTable:
         input_tokens_cache_none: int,
         output_tokens: int,
         output_tokens_reasoning: int,
+        provider_executed_tool_cost_in_usd: float,
     ) -> Billing:
         """Price one response's counters, the two cache-write TTLs each at their own rate.
 
@@ -312,6 +325,7 @@ class AnthropicPricingTable:
                 output_tokens_cost_in_usd=category_cost(
                     output_tokens, self.output_usd_per_million_tokens
                 ),
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),
             service_tier=service_tier,
             usage_raw=usage_raw,
@@ -332,6 +346,7 @@ _UNPRICED = AnthropicPricingTable(
     cache_read_usd_per_million_tokens=float("nan"),
     cache_write_5m_usd_per_million_tokens=float("nan"),
     cache_write_1h_usd_per_million_tokens=float("nan"),
+    web_search_usd_per_invocation=float("nan"),
 )
 """What prices a response reporting a service tier the adapter holds no table for.
 
@@ -351,6 +366,81 @@ def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
     return {"type": "ephemeral", "ttl": "1h"}
 
 
+_WEB_SEARCH_TOOL_TYPES = frozenset({
+    "web_search_20250305",
+    "web_search_20260209",
+    "web_search_20260318",
+})
+_WEB_FETCH_TOOL_TYPES = frozenset({
+    "web_fetch_20250910",
+    "web_fetch_20260209",
+    "web_fetch_20260309",
+    "web_fetch_20260318",
+})
+_TOOL_SEARCH_TOOL_TYPES = frozenset({
+    "tool_search_tool_bm25",
+    "tool_search_tool_bm25_20251119",
+    "tool_search_tool_regex",
+    "tool_search_tool_regex_20251119",
+})
+_CODE_EXECUTION_TOOL_TYPES = frozenset({
+    "code_execution_20260120",
+    "code_execution_20260521",
+})
+_CODE_EXECUTION_EXEMPTING_WEB_TOOL_TYPES = frozenset({
+    "web_search_20260209",
+    "web_search_20260318",
+    "web_fetch_20260209",
+    "web_fetch_20260309",
+    "web_fetch_20260318",
+})
+_SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES = (
+    _WEB_SEARCH_TOOL_TYPES
+    | _WEB_FETCH_TOOL_TYPES
+    | _TOOL_SEARCH_TOOL_TYPES
+    | _CODE_EXECUTION_TOOL_TYPES
+)
+
+
+@dataclass(frozen=True)
+class _AnthropicProviderTools:
+    """Validated provider-executed tool categories needed for billing."""
+
+    web_search: bool = False
+    web_fetch: bool = False
+    tool_search: bool = False
+    code_execution_exempt: bool = False
+
+
+_NO_ANTHROPIC_PROVIDER_TOOLS = _AnthropicProviderTools()
+
+
+def _provider_tools(
+    provider_executed_tools: tuple[Mapping[str, object], ...],
+) -> _AnthropicProviderTools:
+    """Validate supported `type` values while preserving each mapping by reference.
+
+    Raises:
+        ValueError: a mapping lacks a supported string `type` value.
+            Also raised when code execution lacks a qualifying web tool.
+    """
+    tool_types = validated_provider_executed_tool_types(
+        provider_executed_tools,
+        supported_types=_SUPPORTED_PROVIDER_EXECUTED_TOOL_TYPES,
+        adapter_name="Anthropic",
+    )
+    code_execution = bool(tool_types & _CODE_EXECUTION_TOOL_TYPES)
+    code_execution_exempt = bool(tool_types & _CODE_EXECUTION_EXEMPTING_WEB_TOOL_TYPES)
+    if code_execution and not code_execution_exempt:
+        raise ValueError("Anthropic code execution requires a qualifying web tool")
+    return _AnthropicProviderTools(
+        web_search=bool(tool_types & _WEB_SEARCH_TOOL_TYPES),
+        web_fetch=bool(tool_types & _WEB_FETCH_TOOL_TYPES),
+        tool_search=bool(tool_types & _TOOL_SEARCH_TOOL_TYPES),
+        code_execution_exempt=code_execution and code_execution_exempt,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class _AnthropicPrecomputedFields:
     """The typed request fields one binding precomputes.
@@ -363,7 +453,7 @@ class _AnthropicPrecomputedFields:
     max_tokens: int
     temperature: float | Omit
     system: list[TextBlockParam] | Omit
-    tools: list[ToolParam] | Omit
+    tools: list[ToolUnionParam] | Omit
     tool_choice: ToolChoiceParam | Omit
     output_config: OutputConfigParam | Omit
     thinking: ThinkingConfigParam | Omit
@@ -375,6 +465,7 @@ class _AnthropicPrecomputedFields:
     of the API's 4-marker request limit for per-request marked parts."""
 
     extra_body: Mapping[str, object] | None
+    provider_tools: _AnthropicProviderTools
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
@@ -696,16 +787,17 @@ def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> 
 
 def _wire_tools(
     tool_schemas: tuple[ToolSchema, ...],
+    provider_executed_tools: tuple[Mapping[str, object], ...],
     *,
     cache_breakpoint_on_last_tool: bool,
     cache_ttl: CacheTTL,
-) -> list[ToolParam]:
-    """Convert tool schemas to wire tools.
+) -> list[ToolUnionParam]:
+    """Convert every bound tool to one ordered wire list.
 
     cache_breakpoint_on_last_tool puts the frozen-prefix cache breakpoint on the last tool,
     used when no system prompt follows the tools to carry it.
     """
-    tools: list[ToolParam] = [
+    tools: list[ToolUnionParam] = [
         {
             "name": tool_schema.name,
             "description": tool_schema.description,
@@ -713,8 +805,15 @@ def _wire_tools(
         }
         for tool_schema in tool_schemas
     ]
-    if cache_breakpoint_on_last_tool and tools:
-        tools[-1]["cache_control"] = _cache_control_param(cache_ttl)
+    # cast: the neutral Mapping type exceeds the SDK TypedDict union.
+    # The adapter validated each mapping's type discriminator.
+    tools.extend(cast("ToolUnionParam", tool) for tool in provider_executed_tools)
+    if cache_breakpoint_on_last_tool and tools and "cache_control" not in tools[-1]:
+        # Copying preserves caller state; mutating it would alter the binding's mapping.
+        last_tool = dict(tools[-1])
+        last_tool["cache_control"] = _cache_control_param(cache_ttl)
+        # cast: the copied mapping remains wider than the SDK TypedDict union.
+        tools[-1] = cast("ToolUnionParam", last_tool)
     return tools
 
 
@@ -842,6 +941,9 @@ def _priced_tier(service_tier: AnthropicPricedServiceTier | None) -> AnthropicPr
 def _billing_from_sdk_usage(
     usage: anthropic.types.Usage,
     pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    *,
+    provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
+    billing_complete: bool = True,
 ) -> Billing:
     """Price the raw counters at the table the served tier selects.
 
@@ -857,6 +959,7 @@ def _billing_from_sdk_usage(
 
     Raises:
         pydantic.ValidationError: a reported counter is negative, so the priced Usage rejects it.
+        ValueError: a provider-executed request counter is boolean or negative.
     """
     output_tokens_details = usage.output_tokens_details
     input_tokens_cache_write_5m = usage.cache_creation_input_tokens or 0
@@ -865,7 +968,29 @@ def _billing_from_sdk_usage(
         input_tokens_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens
         input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
     service_tier = _priced_tier(usage.service_tier)
-    return pricing.get(service_tier, _UNPRICED).price(
+    table = pricing.get(service_tier, _UNPRICED)
+    server_tool_use = usage.server_tool_use
+    web_search_requests = 0 if server_tool_use is None else server_tool_use.web_search_requests
+    provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
+        web_search_requests,
+        table.web_search_usd_per_invocation,
+    )
+    if provider_tools.web_search and not billing_complete:
+        provider_executed_tool_cost_in_usd = nan
+    if server_tool_use is not None:
+        known_zero_fee_counters: set[str] = set()
+        if provider_tools.web_fetch:
+            known_zero_fee_counters.add("web_fetch_requests")
+        if provider_tools.tool_search:
+            known_zero_fee_counters.add("tool_search_requests")
+        if provider_tools.code_execution_exempt:
+            known_zero_fee_counters.add("code_execution_requests")
+        for counter_name, counter in server_tool_use.model_dump().items():
+            if counter_name == "web_search_requests" or counter_name in known_zero_fee_counters:
+                continue
+            if counter_name.endswith("_requests") and counter:
+                provider_executed_tool_cost_in_usd = nan
+    return table.price(
         service_tier=service_tier,
         usage_raw=usage,
         input_tokens_cache_read=usage.cache_read_input_tokens or 0,
@@ -876,6 +1001,7 @@ def _billing_from_sdk_usage(
         output_tokens_reasoning=(
             output_tokens_details.thinking_tokens if output_tokens_details is not None else 0
         ),
+        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
     )
 
 
@@ -1059,10 +1185,23 @@ class AnthropicMessagesAdapter(Adapter):
                 Also raised on an extra_body key in _ADAPTER_POPULATED_WIRE_KEYS,
                 and on an empty tuple system_prompt,
                 which bind rejects and only a directly constructed Binding can carry.
+                Also raised for unsupported provider-executed tool `type` values.
+                Code execution requires a qualifying web tool.
+                Provider-executed tools require `provider_name="anthropic"`.
+                Configured web-search rates must be finite and nonnegative.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
+        provider_tools = _provider_tools(binding.provider_executed_tools)
+        if binding.provider_executed_tools and self.provider_name != "anthropic":
+            raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
+        if provider_tools.web_search:
+            for pricing_table in self.pricing.values():
+                require_finite_nonnegative_rate(
+                    rate_name="web_search_usd_per_invocation",
+                    rate=pricing_table.web_search_usd_per_invocation,
+                )
         max_tokens = binding.inference_params.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
         bind_marker_count = 0
@@ -1085,19 +1224,19 @@ class AnthropicMessagesAdapter(Adapter):
                 system_blocks[-1]["cache_control"] = _cache_control_param(self.cache_ttl)
             bind_marker_count = sum(1 for block in system_blocks if "cache_control" in block)
             system = system_blocks
-        tools: list[ToolParam] | Omit = omit
+        tools: list[ToolUnionParam] | Omit = omit
         tool_choice: ToolChoiceParam | Omit = omit
-        if binding.tool_schemas:
+        if binding.tool_schemas or binding.provider_executed_tools:
             cache_breakpoint_on_last_tool = (
                 binding.automatic_prompt_caching and binding.system_prompt is None
             )
             tools = _wire_tools(
                 binding.tool_schemas,
+                binding.provider_executed_tools,
                 cache_breakpoint_on_last_tool=cache_breakpoint_on_last_tool,
                 cache_ttl=self.cache_ttl,
             )
-            if cache_breakpoint_on_last_tool:
-                bind_marker_count += 1
+            bind_marker_count += sum(1 for tool in tools if "cache_control" in tool)
             tool_choice = _wire_tool_choice(
                 binding.tool_choice, parallel_tool_calls=binding.parallel_tool_calls
             )
@@ -1140,6 +1279,7 @@ class AnthropicMessagesAdapter(Adapter):
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
             extra_body=binding.extra_body,
+            provider_tools=provider_tools,
         )
 
     @override
@@ -1223,10 +1363,13 @@ class _AnthropicStream(AdapterStream):
         *,
         sdk_stream: AsyncMessageStream[Any],
         pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+        provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
     ) -> None:
         self._sdk_stream = sdk_stream
         self._pricing = pricing
+        self._provider_tools = provider_tools
         self._snapshot_started = False
+        self._billing_complete = False
         """Whether an event has been accumulated, which is what makes current_message_snapshot readable."""
 
     @override
@@ -1287,6 +1430,7 @@ class _AnthropicStream(AdapterStream):
                     separator_pending = reasoning_delta_yielded
         if self._sdk_stream.current_message_snapshot.stop_reason is None:
             raise StreamProtocolError("stream ended without a stop reason")
+        self._billing_complete = True
 
     @override
     async def final(self) -> anthropic.types.Message:
@@ -1307,7 +1451,10 @@ class _AnthropicStream(AdapterStream):
         if not self._snapshot_started:
             return None
         return _billing_from_sdk_usage(
-            self._sdk_stream.current_message_snapshot.usage, self._pricing
+            self._sdk_stream.current_message_snapshot.usage,
+            self._pricing,
+            provider_tools=self._provider_tools,
+            billing_complete=self._billing_complete,
         )
 
     @override
@@ -1342,7 +1489,11 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             TypeError: raw is not an anthropic Message.
             pydantic.ValidationError: the message reports a negative counter.
         """
-        return _billing_from_sdk_usage(_as_message(raw).usage, pricing=self._adapter.pricing)
+        return _billing_from_sdk_usage(
+            _as_message(raw).usage,
+            pricing=self._adapter.pricing,
+            provider_tools=self._precomputed_fields.provider_tools,
+        )
 
     @override
     def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
@@ -1387,7 +1538,9 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             extra_body=precomputed.extra_body,
         )
         return _AnthropicStream(
-            sdk_stream=await manager.__aenter__(), pricing=self._adapter.pricing
+            sdk_stream=await manager.__aenter__(),
+            pricing=self._adapter.pricing,
+            provider_tools=precomputed.provider_tools,
         )
 
 

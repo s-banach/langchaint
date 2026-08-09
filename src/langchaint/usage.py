@@ -18,13 +18,13 @@ from langchaint.checked_copy import CheckedCopyModel
 class Usage(CheckedCopyModel):
     """Token counts for one request, normalized across providers, plus what each cost.
 
-    The counters are provider-reported facts. The four costs are langchaint's estimate, priced by
-    the adapter from the provider's own counters at the rates it holds for the service tier the
-    response reported. They are stored rather than derived because a provider can bill one
-    normalized counter at several rates: Anthropic's 5-minute and 1-hour cache writes bill
-    differently and input_tokens_cache_write collapses both into one count, so no rate the table
-    holds recovers that cost. The provider's own usage object, carried beside this one, holds the
-    uncollapsed counters.
+    The counters are provider-reported facts.
+    The five costs are langchaint estimates.
+    Adapters use provider counters and configured service-tier rates.
+    Costs are stored because one counter can use several rates.
+    Anthropic cache writes demonstrate this.
+    input_tokens_cache_write combines five-minute and one-hour writes.
+    The raw usage retains both counts.
     No validator cross-checks a cost against its counter; that would require the table here.
 
     output_tokens_reasoning is the reasoning share of output_tokens
@@ -36,15 +36,16 @@ class Usage(CheckedCopyModel):
     served at a service tier the adapter holds no table for. Every sum containing it is NaN, and the
     test for it is math.isnan, because nan > limit and nan < limit are both False.
 
-    Server-side tool use has no per-invocation counter and no cost here, so a provider bill charging
-    such a fee exceeds cost_in_usd. anthropic reports its own count on the raw SDK usage beside this
-    object (Usage.server_tool_use, anthropic 0.120.0); openai's ResponseUsage carries none.
+    provider_executed_tool_cost_in_usd aggregates provider-executed tool charges.
+    Provider-specific evidence remains on raw provider responses.
+    NaN signals missing pricing coverage for provider output that proves a charge.
 
     Every counter is non-negative by validation, so a defect that computes a negative count
     cannot pass silently.
-    The cost fields carry no such constraint: it rejects NaN, and an unpriceable response would fail
-    validation and take its output down with it. Nothing checks the rates in a caller's own
-    rate table either, so a negative rate arrives here as a negative cost.
+    Cost fields have no non-negative constraint.
+    Such a constraint rejects NaN and would destroy unpriceable output.
+    Caller-supplied token rates remain unvalidated.
+    Negative token rates yield negative token costs.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -58,6 +59,7 @@ class Usage(CheckedCopyModel):
     input_tokens_cache_write_cost_in_usd: float
     input_tokens_cache_none_cost_in_usd: float
     output_tokens_cost_in_usd: float
+    provider_executed_tool_cost_in_usd: float
 
     @property
     def input_tokens_total(self) -> int:
@@ -70,12 +72,13 @@ class Usage(CheckedCopyModel):
 
     @property
     def cost_in_usd(self) -> float:
-        """What the request cost in total, the sum of the four categories."""
+        """What the request cost in total, the sum of the five categories."""
         return (
             self.input_tokens_cache_read_cost_in_usd
             + self.input_tokens_cache_write_cost_in_usd
             + self.input_tokens_cache_none_cost_in_usd
             + self.output_tokens_cost_in_usd
+            + self.provider_executed_tool_cost_in_usd
         )
 
     @staticmethod
@@ -102,6 +105,7 @@ class Usage(CheckedCopyModel):
         input_tokens_cache_write_cost_in_usd = 0.0
         input_tokens_cache_none_cost_in_usd = 0.0
         output_tokens_cost_in_usd = 0.0
+        provider_executed_tool_cost_in_usd = 0.0
         for usage in usages:
             input_tokens_cache_read += usage.input_tokens_cache_read
             input_tokens_cache_write += usage.input_tokens_cache_write
@@ -112,6 +116,7 @@ class Usage(CheckedCopyModel):
             input_tokens_cache_write_cost_in_usd += usage.input_tokens_cache_write_cost_in_usd
             input_tokens_cache_none_cost_in_usd += usage.input_tokens_cache_none_cost_in_usd
             output_tokens_cost_in_usd += usage.output_tokens_cost_in_usd
+            provider_executed_tool_cost_in_usd += usage.provider_executed_tool_cost_in_usd
         return Usage(
             input_tokens_cache_read=input_tokens_cache_read,
             input_tokens_cache_write=input_tokens_cache_write,
@@ -122,6 +127,7 @@ class Usage(CheckedCopyModel):
             input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
             input_tokens_cache_none_cost_in_usd=input_tokens_cache_none_cost_in_usd,
             output_tokens_cost_in_usd=output_tokens_cost_in_usd,
+            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
         )
 
 
@@ -135,6 +141,7 @@ ZERO_USAGE = Usage(
     input_tokens_cache_write_cost_in_usd=0.0,
     input_tokens_cache_none_cost_in_usd=0.0,
     output_tokens_cost_in_usd=0.0,
+    provider_executed_tool_cost_in_usd=0.0,
 )
 """What sum_of returns for an empty iterable, and what a non-billing attempt or a
 200 reporting no usage normalizes to."""

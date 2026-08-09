@@ -106,7 +106,8 @@ Any metric a consumer could possibly want is a post-run fold over the registered
 Nothing has to be carried, so nothing can be dropped, and nothing is stored twice, so there is no second copy to drift.
 
 To stop a run that has spent its cost ceiling, read the same fold while the run is going.
-`AgentRun.usage` is the prefix fold, and `Usage.cost_in_usd` adds up its four categories.
+`AgentRun.usage` is the prefix fold.
+`Usage.cost_in_usd` adds its five cost categories.
 Check that against the cost ceiling at the top of each turn, in the loop `max_turns` already bounds.
 Check `own_usage` instead for a cost ceiling that should not cover a run's sub-agents.
 

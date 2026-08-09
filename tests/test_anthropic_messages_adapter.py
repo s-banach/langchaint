@@ -7,7 +7,9 @@ and the request fields the binding precomputes.
 
 import asyncio
 import base64
+import inspect
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import get_args, override
@@ -116,6 +118,7 @@ _STANDARD_RATES = AnthropicPricingTable(
     cache_read_usd_per_million_tokens=0.3,
     cache_write_5m_usd_per_million_tokens=3.75,
     cache_write_1h_usd_per_million_tokens=6.0,
+    web_search_usd_per_invocation=0.01,
 )
 
 _PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {"standard": _STANDARD_RATES}
@@ -127,6 +130,7 @@ _PRIORITY_RATES = AnthropicPricingTable(
     cache_read_usd_per_million_tokens=0.6,
     cache_write_5m_usd_per_million_tokens=7.5,
     cache_write_1h_usd_per_million_tokens=12.0,
+    web_search_usd_per_invocation=0.02,
 )
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
 
@@ -253,6 +257,146 @@ def test_billing_treats_none_cache_counts_as_zero() -> None:
     assert usage.input_tokens_cache_none == 7
 
 
+def test_web_search_requests_add_the_cataloged_provider_executed_tool_cost() -> None:
+    """Anthropic's raw invocation count prices web search exactly."""
+    raw = at.Usage(
+        input_tokens=7,
+        output_tokens=3,
+        server_tool_use=at.ServerToolUsage(web_search_requests=2, web_fetch_requests=0),
+    )
+    usage = _billing_from_sdk_usage(raw, _PRICING).usage
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.02)
+    assert usage.cost_in_usd > usage.provider_executed_tool_cost_in_usd
+
+
+def test_anthropic_zero_fee_server_tools_preserve_zero_cost() -> None:
+    """Web fetch, tool search, and exempt code execution add no separate fee."""
+    provider_tools = (
+        _adapter()
+        ._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=(
+                    {"type": "web_fetch_20260209"},
+                    {"type": "tool_search_tool_bm25"},
+                    {"type": "code_execution_20260120"},
+                ),
+                automatic_prompt_caching=False,
+            )
+        )
+        .provider_tools
+    )
+    server_tool_use = at.ServerToolUsage.model_validate({
+        "web_search_requests": 0,
+        "web_fetch_requests": 2,
+        "tool_search_requests": 3,
+        "code_execution_requests": 4,
+    })
+    usage_raw = at.Usage(
+        input_tokens=1,
+        output_tokens=1,
+        server_tool_use=server_tool_use,
+    )
+    usage = _billing_from_sdk_usage(usage_raw, _PRICING, provider_tools=provider_tools).usage
+    assert usage.provider_executed_tool_cost_in_usd == 0.0
+
+
+@pytest.mark.parametrize(
+    "counter_name",
+    ["web_fetch_requests", "tool_search_requests", "code_execution_requests"],
+)
+def test_unconfigured_anthropic_server_counter_produces_nan(counter_name: str) -> None:
+    """A nonzero unconfigured server-tool counter is unexpected billing evidence."""
+    server_tool_counters = {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0,
+    }
+    server_tool_counters[counter_name] = 1
+    server_tool_use = at.ServerToolUsage.model_validate(server_tool_counters)
+    usage_raw = at.Usage(
+        input_tokens=1,
+        output_tokens=1,
+        server_tool_use=server_tool_use,
+    )
+    cost = _billing_from_sdk_usage(usage_raw, _PRICING).usage.provider_executed_tool_cost_in_usd
+    assert math.isnan(cost)
+
+
+@pytest.mark.parametrize("unexpected_count", [0, 2])
+def test_unexpected_anthropic_server_counter_controls_nan(unexpected_count: int) -> None:
+    """Only a nonzero unexpected request counter proves an unpriced charge."""
+    server_tool_use = at.ServerToolUsage.model_validate({
+        "web_search_requests": 0,
+        "web_fetch_requests": 0,
+        "future_requests": unexpected_count,
+    })
+    usage_raw = at.Usage(
+        input_tokens=1,
+        output_tokens=1,
+        server_tool_use=server_tool_use,
+    )
+    cost = _billing_from_sdk_usage(usage_raw, _PRICING).usage.provider_executed_tool_cost_in_usd
+    if unexpected_count:
+        assert math.isnan(cost)
+    else:
+        assert cost == 0.0
+
+
+def test_truncated_anthropic_web_search_billing_produces_nan() -> None:
+    """A partial usage snapshot cannot prove the final web-search count."""
+    provider_tools = (
+        _adapter()
+        ._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=({"type": "web_search_20260318"},),
+                automatic_prompt_caching=False,
+            )
+        )
+        .provider_tools
+    )
+    usage_raw = at.Usage(input_tokens=1, output_tokens=1)
+    usage = _billing_from_sdk_usage(
+        usage_raw,
+        _PRICING,
+        provider_tools=provider_tools,
+        billing_complete=False,
+    ).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+
+
+@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None) -> None:
+    """A configured search rejects an unusable caller rate before requests."""
+    pricing: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
+        "standard": AnthropicPricingTable(
+            input_cache_none_usd_per_million_tokens=3.0,
+            output_usd_per_million_tokens=15.0,
+            cache_read_usd_per_million_tokens=0.3,
+            cache_write_5m_usd_per_million_tokens=3.75,
+            cache_write_1h_usd_per_million_tokens=6.0,
+            web_search_usd_per_invocation=rate,
+        )
+    }
+    adapter = AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test"),
+        model="m",
+        pricing=pricing,
+        provider_name="anthropic",
+    )
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        _ = adapter._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=({"type": "web_search_20250305"},),
+                automatic_prompt_caching=False,
+            )
+        )
+
+
 def test_billing_reads_reasoning_tokens_and_defaults_to_zero() -> None:
     """output_tokens_reasoning reads thinking_tokens, and is zero when output_tokens_details is absent."""
     with_details = _billing_from_sdk_usage(
@@ -305,6 +449,7 @@ def test_equal_write_rates_store_that_rate_as_the_write_price() -> None:
         cache_read_usd_per_million_tokens=0.3,
         cache_write_5m_usd_per_million_tokens=3.75,
         cache_write_1h_usd_per_million_tokens=3.75,
+        web_search_usd_per_invocation=0.01,
     )
     billing = _billing_from_sdk_usage(_usage_with_cache_split(), {"standard": equal_write_rates})
     assert billing.cache_write_usd_per_million_tokens == pytest.approx(3.75)
@@ -789,12 +934,14 @@ def _binding(
     system_prompt: str | tuple[TextPart, ...] | None,
     tool_schemas: tuple[ToolSchema, ...],
     automatic_prompt_caching: bool,
+    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
+        provider_executed_tools=provider_executed_tools,
         tool_choice="required",
         parallel_tool_calls=False,
         inference_params=InferenceParams(reasoning_effort="high"),
@@ -815,11 +962,220 @@ def test_request_omits_tool_sentinels_without_tools() -> None:
     assert precomputed_fields.thinking == {"type": "adaptive"}
 
 
+def test_provider_executed_tools_follow_function_tools_and_receive_automatic_caching() -> None:
+    """Provider-executed tools keep order and can carry the automatic cache marker."""
+    provider_tool: dict[str, object] = {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 3,
+    }
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt=None,
+            tool_schemas=_tool_schemas(),
+            provider_executed_tools=(provider_tool,),
+            automatic_prompt_caching=True,
+        )
+    )
+    tools = _block_list(precomputed.tools)
+    assert tools[0]["name"] == "get_weather"
+    assert tools[1]["type"] == "web_search_20250305"
+    assert tools[1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in provider_tool
+
+
+def test_provider_executed_tool_binds_without_function_tools() -> None:
+    """A provider-executed tool does not require an application function."""
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt="system",
+            tool_schemas=(),
+            provider_executed_tools=({"type": "web_search_20250305", "name": "web_search"},),
+            automatic_prompt_caching=False,
+        )
+    )
+    tools = _block_list(precomputed.tools)
+    assert tools == [{"type": "web_search_20250305", "name": "web_search"}]
+    assert precomputed.tool_choice == {"type": "any", "disable_parallel_tool_use": True}
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        "tool_search_tool_bm25",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_regex",
+        "tool_search_tool_regex_20251119",
+        "web_fetch_20250910",
+        "web_fetch_20260209",
+        "web_fetch_20260309",
+        "web_fetch_20260318",
+        "web_search_20250305",
+        "web_search_20260209",
+        "web_search_20260318",
+    ],
+)
+def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
+    """Each reviewed Anthropic provider-executed `type` reaches Messages unchanged."""
+    provider_tool: dict[str, object] = {"type": tool_type}
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt="system",
+            tool_schemas=(),
+            provider_executed_tools=(provider_tool,),
+            automatic_prompt_caching=False,
+        )
+    )
+    assert _block_list(precomputed.tools) == [provider_tool]
+
+
+@pytest.mark.parametrize(
+    "code_execution_type", ["code_execution_20260120", "code_execution_20260521"]
+)
+@pytest.mark.parametrize(
+    "web_tool_type",
+    [
+        "web_fetch_20260209",
+        "web_fetch_20260309",
+        "web_fetch_20260318",
+        "web_search_20260209",
+        "web_search_20260318",
+    ],
+)
+def test_supported_code_execution_requires_a_qualifying_web_tool(
+    code_execution_type: str, web_tool_type: str
+) -> None:
+    """Every reviewed code-execution type is free beside each qualifying web family."""
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt="system",
+            tool_schemas=(),
+            provider_executed_tools=(
+                {"type": web_tool_type},
+                {"type": code_execution_type},
+            ),
+            automatic_prompt_caching=False,
+        )
+    )
+    assert precomputed.provider_tools.code_execution_exempt
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [
+        "advisor_20260301",
+        "bash_20250124",
+        "code_execution_20250522",
+        "code_execution_20250825",
+        "computer_20250124",
+        "custom",
+        "mcp_toolset",
+        "memory_20250818",
+        "text_editor_20250124",
+        "text_editor_20250429",
+        "text_editor_20250728",
+        "unknown",
+    ],
+)
+def test_every_unlisted_anthropic_provider_type_is_rejected(tool_type: str) -> None:
+    """Messages rejects every reviewed client-executed or unaudited `type`."""
+    with pytest.raises(ValueError, match="supported string type"):
+        _ = _adapter()._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=({"type": tool_type},),
+                automatic_prompt_caching=False,
+            )
+        )
+
+
+@pytest.mark.parametrize("provider_tool", [{}, {"type": 1}])
+def test_anthropic_provider_type_must_be_a_supported_string(
+    provider_tool: Mapping[str, object],
+) -> None:
+    """Missing and non-string `type` values fail before requests."""
+    with pytest.raises(ValueError, match="supported string type"):
+        _ = _adapter()._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=(provider_tool,),
+                automatic_prompt_caching=False,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "code_execution_type", ["code_execution_20260120", "code_execution_20260521"]
+)
+def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: str) -> None:
+    """Standalone code execution lacks exact response billing evidence."""
+    with pytest.raises(ValueError, match="qualifying web tool"):
+        _ = _adapter()._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=({"type": code_execution_type},),
+                automatic_prompt_caching=False,
+            )
+        )
+
+
+def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
+    """Anthropic pricing does not establish Bedrock provider-tool billing."""
+    adapter = AnthropicMessagesAdapter(
+        client=AsyncAnthropicBedrock(aws_region="us-east-1"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="aws.bedrock",
+    )
+    with pytest.raises(ValueError, match="provider_name='anthropic'"):
+        _ = adapter._precompute_fields(
+            _binding(
+                system_prompt="system",
+                tool_schemas=(),
+                provider_executed_tools=({"type": "web_search_20250305"},),
+                automatic_prompt_caching=False,
+            )
+        )
+
+
+def test_anthropic_provider_rate_defaults_to_unavailable() -> None:
+    """Ordinary custom pricing requires no unused web-search rate."""
+    parameter = inspect.signature(AnthropicPricingTable).parameters[
+        "web_search_usd_per_invocation"
+    ]
+    assert parameter.default is None
+
+
+def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
+    """Provider-executed cache markers count toward Anthropic's request limit."""
+    provider_tools = tuple(
+        {
+            "type": "web_search_20250305",
+            "name": f"web_search_{index}",
+            "cache_control": {"type": "ephemeral"},
+        }
+        for index in range(2)
+    )
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            system_prompt=None,
+            tool_schemas=(),
+            provider_executed_tools=provider_tools,
+            automatic_prompt_caching=False,
+        )
+    )
+    assert precomputed.message_mark_budget == 2
+
+
 def test_request_passes_widened_reasoning_effort_through() -> None:
     """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
     binding = Binding(
         system_prompt=None,
         tool_schemas=(),
+        provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort="minimal"),
@@ -835,6 +1191,7 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
     binding = Binding(
         system_prompt=None,
         tool_schemas=(),
+        provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(),
@@ -854,6 +1211,7 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     binding = Binding(
         system_prompt=None,
         tool_schemas=(),
+        provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(temperature=0.2),

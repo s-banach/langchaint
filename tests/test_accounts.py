@@ -212,6 +212,23 @@ def test_context_entry_rejects_reentry_and_closes_on_exit() -> None:
     asyncio.run(scenario())
 
 
+def test_account_model_binds_provider_executed_tools_inside_its_lifecycle() -> None:
+    """Account-created models bind provider-executed tools during account use."""
+    client = AsyncOpenAI(api_key="offline")
+    account = OpenAIAccount(client=client)
+
+    async def scenario() -> None:
+        async with account:
+            bound = account.model("gpt-5.4-mini").bind(
+                provider_executed_tools=({"type": "web_search"},),
+                automatic_prompt_caching=True,
+            )
+            assert bound.binding.provider_executed_tools == ({"type": "web_search"},)
+        await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_closed_account_rejects_models_and_created_bindings() -> None:
     """Closing rejects model construction and request starts."""
     client = AsyncOpenAI(api_key="offline")

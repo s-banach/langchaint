@@ -152,8 +152,12 @@ class OpenAIPricingTable:
     output_usd_per_million_tokens: float
     cache_read_usd_per_million_tokens: float
     cache_write_usd_per_million_tokens: float
+    web_search_usd_per_invocation: float | None = None
+    """Price for one `search` action, or `None` until configured."""
+    file_search_usd_per_invocation: float | None = None
+    """Price for one `file_search_call`, or `None` until configured."""
 
-    def price(
+    def price(  # noqa: PLR0913 (each normalized category arrives separately)
         self,
         *,
         service_tier: str,
@@ -163,6 +167,7 @@ class OpenAIPricingTable:
         input_tokens_cache_none: int,
         output_tokens: int,
         output_tokens_reasoning: int,
+        provider_executed_tool_cost_in_usd: float,
     ) -> Billing:
         """Price one response's counters at these rates.
 
@@ -171,9 +176,8 @@ class OpenAIPricingTable:
         output_tokens_reasoning is the reasoning share of output_tokens, billed at the output rate;
         it is a parameter because the returned Usage carries it.
 
-        The total is the sum of the four category costs, so the parts are individually meaningful
-        and sum to cost_in_usd exactly; that association differs from a fused single-division chain
-        only at sub-ULP scale, immaterial once billing rounds to cents.
+        Token cost is the sum of four token category costs.
+        provider_executed_tool_cost_in_usd adds the provider-executed tool charge.
 
         Raises:
             pydantic.ValidationError: a counter is negative.
@@ -197,6 +201,7 @@ class OpenAIPricingTable:
                 output_tokens_cost_in_usd=category_cost(
                     output_tokens, self.output_usd_per_million_tokens
                 ),
+                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),
             service_tier=service_tier,
             usage_raw=usage_raw,
@@ -212,6 +217,8 @@ _UNPRICED = OpenAIPricingTable(
     output_usd_per_million_tokens=float("nan"),
     cache_read_usd_per_million_tokens=float("nan"),
     cache_write_usd_per_million_tokens=float("nan"),
+    web_search_usd_per_invocation=float("nan"),
+    file_search_usd_per_invocation=float("nan"),
 )
 """The table an adapter prices at when the response reports a service tier it holds no table for.
 

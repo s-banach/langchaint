@@ -1,20 +1,20 @@
 """The arithmetic that spends a rate, and the Billing one attempt carries.
 
-category_cost is the one multiplication: a rate per million tokens against a counter.
-Billing is what an adapter reports per response, carrying the priced Usage, the tier that priced it,
-the provider's own usage object, and the four prices behind the four costs.
-Counter times price reproduces the stored cost, so a record reproduces its own arithmetic without
-the rate table that made it.
+category_cost prices token counters.
+Billing carries priced Usage, its service tier, raw usage, and applied token prices.
+Counter times price reproduces the stored token cost.
+Records retain token arithmetic without the originating rate table.
 
-A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it, since
-only that adapter knows what its provider bills for. This module names no table type.
+Each backend subpackage defines the rate table its adapter spends.
+This module names no rate-table type.
 
-This module imports no SDK and no error class: a category the caller supplied no rate for costs NaN,
-so an unpriced category needs no error.
+This module imports no SDK or error class.
+Missing category rates produce NaN instead of exceptions.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite, nan
 
 from pydantic import BaseModel
 
@@ -39,7 +39,7 @@ def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, mode
 
 
 def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
-    """One category's cost, zero for a zero counter whatever the rate.
+    """Price one token category, preserving zero when the rate is unknown.
 
     The zero case is explicit because 0 * NaN is NaN, and an attempt that billed nothing in a
     category must not make a total unknown when that category has no rate.
@@ -49,12 +49,38 @@ def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
     return tokens * usd_per_million_tokens / 1_000_000
 
 
+def invocation_cost_in_usd(invocations: int, usd_per_invocation: float | None) -> float:
+    """Price provider invocations, preserving zero when the rate is unavailable.
+
+    Raises:
+        ValueError: `invocations` is boolean or negative.
+    """
+    if isinstance(invocations, bool) or invocations < 0:
+        raise ValueError("invocations must be a nonnegative int")
+    if not invocations:
+        return 0.0
+    if usd_per_invocation is None:
+        return nan
+    return invocations * usd_per_invocation
+
+
+def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> None:
+    """Reject a configured charged rate that cannot produce a finite nonnegative cost.
+
+    Raises:
+        ValueError: `rate` is unavailable, boolean, negative, infinite, or NaN.
+    """
+    if rate is None or isinstance(rate, bool) or not isfinite(rate) or rate < 0:
+        raise ValueError(f"{rate_name} must be finite and nonnegative")
+
+
 @dataclass(frozen=True, kw_only=True)
 class Billing:
     """What one attempt billed: the priced counters, what priced them, and the prices that applied.
 
-    The four prices are what this attempt's tokens priced at, so a stored row reproduces its own
-    costs by multiplication and a later rate change cannot silently reprice held history.
+    The four token prices are what this attempt's tokens priced at.
+    A stored row reproduces its token arithmetic without the originating rate table.
+    Later rate changes cannot reprice held history.
     A provider that bills cache writes at more than one rate in one response reports the blend of
     what those writes cost, since the counters behind the split do not survive into Usage.
     A price is NaN where no rate stood behind that category, which leaves the response's own

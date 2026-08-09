@@ -12,6 +12,7 @@ and the request fields the binding precomputes.
 import asyncio
 import base64
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import override
@@ -95,6 +96,8 @@ _DEFAULT_RATES = OpenAIPricingTable(
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
 )
 
 _PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {"default": _DEFAULT_RATES}
@@ -105,6 +108,8 @@ _PRIORITY_RATES = OpenAIPricingTable(
     output_usd_per_million_tokens=20.0,
     cache_read_usd_per_million_tokens=2.5,
     cache_write_usd_per_million_tokens=6.25,
+    web_search_usd_per_invocation=0.02,
+    file_search_usd_per_invocation=0.005,
 )
 """Twice the default rates, so a tier-selection test reads as a doubling."""
 
@@ -235,6 +240,26 @@ def test_billing_carries_the_sdk_usage_object_itself() -> None:
     raw = _completion(usage=_usage_with_cache())
     assert _billing(raw).usage_raw is raw.usage
     assert _billing(_completion(usage=None)).usage_raw is None
+
+
+def test_search_annotations_produce_unknown_provider_executed_tool_cost() -> None:
+    """Search annotations lack the invocation count required for exact billing."""
+    message: dict[str, object] = {
+        "content": "source",
+        "annotations": [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "start_index": 0,
+                    "end_index": 6,
+                    "title": "Source",
+                    "url": "https://example.com",
+                },
+            }
+        ],
+    }
+    usage = _billing(_completion(usage=_usage_with_cache(), message=message)).usage
+    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
 
 
 def test_billing_reads_reasoning_tokens() -> None:
@@ -677,6 +702,7 @@ def _binding(
     automatic_prompt_caching: bool = True,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
+    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     inference_params: InferenceParams | None = None,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
@@ -684,12 +710,25 @@ def _binding(
     return Binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
+        provider_executed_tools=provider_executed_tools,
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=inference_params if inference_params is not None else InferenceParams(),
         automatic_prompt_caching=automatic_prompt_caching,
         extra_body=extra_body,
     )
+
+
+def test_provider_executed_tools_raise_with_the_responses_interface() -> None:
+    """Chat Completions directs provider-executed tools to Responses."""
+    with pytest.raises(ValueError, match="OpenAIResponsesAdapter"):
+        _ = _adapter().bind_text(_binding(provider_executed_tools=({"type": "web_search"},)))
+
+
+def test_web_search_options_raise_with_the_responses_interface() -> None:
+    """Chat Completions rejects web search because its billing evidence is incomplete."""
+    with pytest.raises(ValueError, match="OpenAIResponsesAdapter"):
+        _ = _adapter().bind_text(_binding(extra_body={"web_search_options": {}}))
 
 
 def test_request_str_system_becomes_one_system_message_first() -> None:

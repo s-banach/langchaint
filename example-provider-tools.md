@@ -1,99 +1,176 @@
-# Provider tools: what enabling one would look like
+# Provider-executed tools
 
-A sketch, not a decision. It exists to make TODO.md's first item concrete.
+Provider-executed tools run during generation on the provider's service.
+`ToolManager` tools run inside the application.
+This execution ownership produces separate binding arguments.
 
-## What a provider tool is
+The user query remains in `GenerationInput`.
+Each `provider_executed_tools` entry carries provider request configuration.
+No provider-executed result enters `ToolManager.dispatch()`.
 
-A provider tool runs on the provider's own servers, inside the turn.
-You enable it with an entry in the request's `tools` array.
-The entry names a type and carries no function schema, and the application never dispatches it.
-The provider runs the tool and answers in the assistant turn, in a content block where the provider models one and beside the turn where it does not.
+Verified against anthropic 0.121.0, openai 2.53.0, and google-genai 2.17.0.
 
-Verified against the installed SDKs (anthropic 0.120.2, openai 2.51.0, google-genai 2.16.0):
-
-| provider | request entry | what comes back in the turn |
+| Provider API | Request entry | Result evidence |
 | --- | --- | --- |
-| anthropic | `{"type": "web_search_20250305", "name": "web_search"}` | `server_tool_use` block, then `web_search_tool_result` block |
-| openai Responses | `{"type": "web_search"}` | output item of type `web_search_call` |
-| gemini | `Tool(code_execution=ToolCodeExecution())` | `executable_code` and `code_execution_result` parts |
+| Anthropic Messages | `{"type": "web_search_20260318", "name": "web_search"}` | `server_tool_use` and result blocks |
+| OpenAI Responses | `{"type": "web_search"}` | `web_search_call` output items |
+| Gemini GenerateContent | `{"google_search": {}}` | paired `Part.tool_call` and `Part.tool_response` |
 
-`ServerToolUseBlock.name` enumerates anthropic's set: `web_search`, `web_fetch`, `code_execution`, `bash_code_execution`, `text_editor_code_execution`, `tool_search_tool_regex`, `tool_search_tool_bm25`.
-`google.genai.types.Tool` enumerates gemini's: `google_search`, `code_execution`, `url_context`, `file_search`, `computer_use`, and others.
+OpenAI Chat Completions uses `web_search_options` directly.
+langchaint rejects that field because responses omit exact invocation counts.
 
-Not every gemini provider tool answers in a content part.
-`Tool(google_search=...)` grounds the response and puts its sources on `Candidate.grounding_metadata`, which no assistant turn holds.
-That result remains in `Response.raw`.
+## Direct SDK forms
 
-## The binding side
+Anthropic accepts provider-executed entries beside application tool schemas.
 
 ```python
-from langchaint import ProviderTool
-from langchaint.anthropic import anthropic_model
+await anthropic_client.messages.create(
+    model=model,
+    max_tokens=1024,
+    messages=[{"role": "user", "content": question}],
+    tools=[
+        {
+            "type": "web_search_20260318",
+            "name": "web_search",
+            "max_uses": 5,
+        }
+    ],
+)
+```
 
-llm = anthropic_model(model="claude-opus-4-6", automatic_prompt_caching=False)
+OpenAI Responses uses the same request arrangement.
 
-bound = llm.bind(
-    system_prompt="Answer with citations.",
-    provider_tools=(
-        ProviderTool(entry={"type": "web_search_20250305", "name": "web_search", "max_uses": 5}),
+```python
+await openai_client.responses.create(
+    model=model,
+    input=question,
+    tools=[
+        {
+            "type": "web_search",
+            "search_context_size": "medium",
+        }
+    ],
+)
+```
+
+Gemini places `types.Tool` values inside `GenerateContentConfig.tools`.
+
+```python
+await gemini_client.aio.models.generate_content(
+    model=model,
+    contents=question,
+    config=types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        tool_config=types.ToolConfig(
+            include_server_side_tool_invocations=True,
+        ),
     ),
 )
 ```
 
-`ProviderTool.entry` is an opaque wire mapping, like `ReasoningPart.raw`.
-langchaint models nothing inside it, so a new provider tool needs no langchaint release.
-The adapter appends the entry to the same wire `tools` array it builds from `Binding.tool_schemas`.
-A binding parameter rather than an `extra_body` key, because every adapter refuses `tools` in `extra_body` as a wire key it populates.
+Gemini mappings are normalized through `types.Tool`.
+The invocation flag returns billing evidence and replayable provider blocks.
 
-`provider_tools` is separate from `tool_manager` because the two have nothing in common.
-A `Tool` carries a name, a schema, and a Python function langchaint calls.
-A `ProviderTool` carries a wire entry and nothing langchaint calls.
-
-## The response side
-
-Adapters store provider tool blocks as `RawPart` values.
-`RawPart.raw` preserves each SDK block for replay.
-
-Anthropic's existing fallback branch handles every remaining content block:
+Chat Completions accepts its separate request field directly.
 
 ```python
-# anthropic/messages_adapter.py
-else:
-    turn.append(RawPart(raw=block.model_dump(mode="python", exclude_none=True)))
+await openai_client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": question}],
+    web_search_options={"search_context_size": "medium"},
+)
 ```
 
-Anthropic's stream path needs no separate change.
-`get_final_message()` returns the SDK's accumulated `Message`, and `_assistant_message_from` runs on it.
-The per-item stream yields nothing for these blocks; the assembled turn carries them.
+## Binding API
 
-## What the round trip then looks like
+`provider_executed_tools` accepts provider-shaped mappings directly.
 
 ```python
-messages: list[Message] = [UserMessage(content="What shipped in Python 3.14?")]
-response = await bound.generate_one(messages)
+from anthropic.types import WebSearchTool20260318Param
 
-messages.append(response.assistant_message)  # carries the search blocks verbatim
-messages.append(UserMessage(content="Which of those are C API changes?"))
-second = await bound.generate_one(messages)
+from langchaint.anthropic import AnthropicAccount
+
+web_search: WebSearchTool20260318Param = {
+    "type": "web_search_20260318",
+    "name": "web_search",
+    "max_uses": 5,
+}
+
+async with AnthropicAccount() as anthropic:
+    bound = anthropic.model("claude-opus-4-8").bind(
+        system_prompt="Answer with citations.",
+        provider_executed_tools=(web_search,),
+        automatic_prompt_caching=False,
+    )
+    response = await bound.generate_one("What changed in Python 3.14?")
 ```
 
-The first `assistant_message` holds each search block as a `RawPart`.
+A strict type checker checks provider fields through the SDK annotation.
+langchaint imports no SDK type into its neutral core.
 
-Cross-provider replay returns `InvalidRequest` or lets the provider reject the `RawPart`.
+Omitting `provider_executed_tools` during `rebind` preserves its value.
+Passing `provider_executed_tools=()` removes every entry.
+Changing it preserves `max_attempts` and `BoundLLM` output types.
 
-## What the sketch does not settle
+## Supported configurations
 
-**Cost.** `usage.server_tool_use.web_search_requests` is a priced counter anthropic reports per response.
-langchaint's `Usage` has no field for it, so `cost_in_usd` under-reports a turn that searched.
-The counter is reachable on the raw SDK usage. Whether a per-tool fee is one of the priced categories that partition a request's cost is the design question to answer.
+Anthropic supports the reviewed web-search, web-fetch, and tool-search `type` values.
+Qualifying web-search and web-fetch `type` values can accompany reviewed code execution.
+Standalone code execution lacks exact response billing evidence.
+Bedrock clients reject every nonempty `provider_executed_tools` value.
 
-**openai and gemini blocks.** openai's `web_search_call` and gemini's `executable_code` become `RawPart` values.
-Gemini's case overlaps the existing `thought_signature` branch, so the part-level ordering there needs care.
+OpenAI Responses supports reviewed web-search aliases and `file_search`.
+Other `ToolParam` types require unavailable billing evidence or application execution.
+Non-OpenAI providers reject every nonempty `provider_executed_tools` value.
 
-## Conformance
+Gemini supports `google_search`, `google_maps`, `code_execution`, `url_context`, and `file_search`.
+Gemini image search and other `types.Tool` fields are rejected.
+Provider-executed tools require a Gemini 3 model identifier.
+Gemini 2.5 has no catalog entries.
 
-One invariant covers anthropic, openai Responses, and gemini:
-a constructed response holding a provider tool block round-trips through `_assistant_message_from` and back to the wire unchanged.
-Use `test_raw_part_round_trips_verbatim_in_position` from `conformance.py`.
+## Adapter behavior
 
-`ChatCompletionAssistantMessageParam` has no `annotations` field, so openai's citations are output-only and there is nothing to round-trip them into.
+Generated application schemas precede `provider_executed_tools` entries.
+Anthropic and OpenAI preserve accepted mappings by reference.
+Gemini normalizes each mapping and inspects every populated field.
+
+Mixed Gemini requests use `VALIDATED` function calling.
+Provider-only Gemini requests omit function-calling configuration.
+Every Gemini provider request enables server invocation blocks.
+
+Anthropic applies automatic cache control after combining both collections.
+The adapter copies any mapping receiving automatic `cache_control`.
+Caller mappings remain unchanged.
+
+## Response behavior
+
+Provider-executed response blocks become `RawPart` values.
+`RawPart.raw` carries provider data for same-provider replay.
+Metadata-only evidence remains reachable through `Response.raw`.
+Nothing dispatches through `ToolManager`.
+
+## Billing
+
+`Usage.provider_executed_tool_cost_in_usd` carries one summed cost category.
+`Usage.cost_in_usd` includes that category.
+Provider-specific evidence remains on raw provider responses.
+
+Provider-tool prices default to `None`.
+Charged bindings require configured provider-tool prices.
+Configured charged rates must be finite and nonnegative.
+Catalog rates estimate post-quota list prices.
+
+Anthropic prices `web_search_requests` at `web_search_usd_per_invocation`.
+Reviewed web fetch, tool search, and exempt code execution add zero.
+
+OpenAI prices only `web_search_call` items with `action.type == "search"`.
+Each `file_search_call` costs `file_search_usd_per_invocation` once.
+Vector-store storage costs remain application-owned.
+
+Gemini Search bills unique nonempty queries.
+Gemini Maps bills every returned nonempty query entry.
+Paired server blocks distinguish Search from Maps.
+
+Supported complete responses produce finite provider-executed costs.
+NaN remains a fallback for unexpected or incomplete billing evidence.
+Uncataloged served tiers also produce NaN for charged outcomes.

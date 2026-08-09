@@ -62,6 +62,6 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
             print(f"item {index} failed with {type(result).__name__}: {result.error_text}")
             print(f"item {index} billed {result.usage.cost_in_usd} USD before failing")
 
-            # generate_one raises on error.
+            # `generate_one` raises if the fallback also fails.
             results[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
         return results

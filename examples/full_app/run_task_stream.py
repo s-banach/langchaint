@@ -65,6 +65,7 @@ def build_app(scenario: Scenario) -> App:
         configs=configs,
         tracer=trace.get_tracer("examples.full_app"),
         on_event=print_event,
+        capture_message_content=False,
     )
 
 

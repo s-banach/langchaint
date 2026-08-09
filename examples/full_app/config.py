@@ -3,11 +3,13 @@
 Every limit an agent is subject to lives here, so a reader answers "what is this agent allowed to do"
 from one frozen object rather than from arguments scattered across the launch site.
 
-timeout_seconds bounds one provider request, and the run goes on to its next turn with the same
-messages, since a dropped request appended nothing. A run whose every call hangs is bounded by
-max_turns rather than looping forever.
+generate_one_timeout_seconds bounds one `generate_one` call.
+A dropped call appends no messages.
+The run proceeds with the same messages.
+max_turns bounds a run whose calls keep timing out.
 """
 
+import math
 from dataclasses import dataclass
 
 
@@ -18,10 +20,13 @@ class AgentConfig:
     name is the last segment of the run's agent_path, minus the spawn index a tool-spawned run
     carries. The scripted adapter selects a script by the "[tag]" prefix of system_prompt;
     __post_init__ rejects a prefix that differs from name, so the tag cannot drift.
+    automatic_prompt_caching is passed to every binding for this agent.
     max_tool_calls is a budget across the whole run, not per turn: calls beyond it are declined with an
     is_error tool message the model reads and adapts to, rather than dropped or raised on,
     so the model gets a chance to finish with what it already has.
     `max_attempts` bounds one `generate_one` call's requests, including the first.
+    generate_one_timeout_seconds bounds one `generate_one` call.
+    max_cost_in_usd stops new turns after settled spend reaches its value.
     self_correction_enabled sends every final answer back for critique until some critique has returned an
     approval, so a run whose critiques keep saying "revise" keeps bouncing and max_turns is what bounds it;
     an agent with it off answers on its first text turn.
@@ -29,10 +34,12 @@ class AgentConfig:
 
     name: str
     system_prompt: str
+    automatic_prompt_caching: bool
     max_turns: int = 8
     max_tool_calls: int = 12
     max_attempts: int = 2
-    timeout_seconds: float = 10.0
+    generate_one_timeout_seconds: float = 10.0
+    max_cost_in_usd: float | None = None
     self_correction_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -43,6 +50,7 @@ class AgentConfig:
 
         Raises:
             ValueError: system_prompt does not start with "[name] ".
+                Also raised when max_cost_in_usd is not positive and finite.
         """
         tag = f"[{self.name}] "
         if not self.system_prompt.startswith(tag):
@@ -50,6 +58,10 @@ class AgentConfig:
                 f"system_prompt must start with {tag!r} so the scripted adapter selects "
                 f"{self.name}'s script; got {self.system_prompt!r}"
             )
+        if self.max_cost_in_usd is not None and (
+            not math.isfinite(self.max_cost_in_usd) or self.max_cost_in_usd <= 0
+        ):
+            raise ValueError("max_cost_in_usd must be positive and finite")
 
 
 def build_configs() -> dict[str, AgentConfig]:
@@ -63,29 +75,33 @@ def build_configs() -> dict[str, AgentConfig]:
         AgentConfig(
             name="research_climate",
             system_prompt="[research_climate] Research the climate outlook.",
+            automatic_prompt_caching=False,
             max_turns=6,
-            timeout_seconds=1.5,
+            generate_one_timeout_seconds=1.5,
         ),
         AgentConfig(
             name="research_energy",
             system_prompt="[research_energy] Research the energy outlook.",
+            automatic_prompt_caching=False,
             max_turns=6,
             max_tool_calls=6,
-            timeout_seconds=1.5,
+            generate_one_timeout_seconds=1.5,
         ),
         AgentConfig(
             name="specialist",
             system_prompt="[specialist] Answer the question with one search.",
+            automatic_prompt_caching=False,
             max_turns=3,
             max_tool_calls=2,
-            timeout_seconds=1.0,
+            generate_one_timeout_seconds=1.0,
         ),
         AgentConfig(
             name="synthesize",
             system_prompt="[synthesize] Reconcile the findings.",
+            automatic_prompt_caching=False,
             max_turns=6,
             max_tool_calls=4,
-            timeout_seconds=1.0,
+            generate_one_timeout_seconds=1.0,
             self_correction_enabled=True,
         ),
     )

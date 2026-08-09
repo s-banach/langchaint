@@ -122,7 +122,7 @@ def build_scripts(scenario: str) -> dict[str, list[Turn]]:
 
     Scenarios:
         happy: every agent completes.
-        call_timeout: one research_climate turn hangs past config.timeout_seconds, so that call is
+        call_timeout: one turn hangs past config.generate_one_timeout_seconds, so that call is
             counted abandoned; the run keeps what it had already spent and answers on its next turn.
         app_timeout: both researchers stall on their second turn, so the whole-app deadline fires
             after each has already billed a turn, which is what makes the surviving fold worth reading.

@@ -7,11 +7,12 @@ A tool-spawned run carries a spawn index after "#", because an agent's name is n
 parent and agent_path is the one identity an event carries: without it, two spawns of one name would
 interleave indistinguishably in a UI.
 
-Every event a run emits after its first generate carries usage_so_far, that run's running total,
-so a UI redraws one agent's token counts from the event alone with no lookup into the orchestrator.
-usage_so_far includes spend reported by tools the run called, sub-agent runs included,
-so a parent's total is always the whole subtree beneath it. ToolProgress is the exception: a tool
-function does not know its run's total, so the event carries none and a UI leaves the counter alone.
+Progress events carry usage_so_far when the run knows its total.
+Terminal events carry usage.
+usage_so_far includes the run's sub-agent spend.
+Terminal usage includes the run's sub-agent spend.
+LlmResponse.usage covers its `generate_one` call only.
+ToolProgress carries neither field.
 
 GuiEmitter and current_gui_emitter live here, in the lowest shared module, so a tool function reaches
 its run's on_event without importing the run machinery, which itself imports the tools.
@@ -134,7 +135,7 @@ class ToolProgress:
 
 @dataclass(frozen=True)
 class LlmCallAbandoned:
-    """One generate call outran config.timeout_seconds and was dropped; the run continues.
+    """One call outran config.generate_one_timeout_seconds; the run continues.
 
     The request may have completed and billed server-side beyond what the provider had reported
     when the deadline hit, and that remainder is unobservable client-side. The TimedOutError
@@ -159,13 +160,18 @@ class AgentFinished:
 
 @dataclass(frozen=True)
 class AgentFailed:
-    """A run ended in an error; usage is what it had spent when the error landed.
-
-    A timeout lands here too, which is the case that makes usage-on-failure worth carrying at all.
-    """
+    """A run failed; usage is its settled spend."""
 
     agent_path: str
     error: str
+    usage: Usage
+
+
+@dataclass(frozen=True)
+class AgentCancelled:
+    """An outer scope cancelled a run; usage is its settled spend."""
+
+    agent_path: str
     usage: Usage
 
 
@@ -179,6 +185,7 @@ type Event = (
     | LlmCallAbandoned
     | AgentFinished
     | AgentFailed
+    | AgentCancelled
 )
 
 

@@ -14,26 +14,40 @@ suite uses, so no pytest-asyncio plugin is needed.
 """
 
 import asyncio
+import math
 from collections.abc import Callable
+from dataclasses import replace
 from typing import override
 
 import pytest
+import task_stream
 from config import AgentConfig, build_configs
 from events import (
+    AgentCancelled,
     AgentFailed,
     AgentFinished,
     Event,
     ToolProgress,
     current_gui_emitter,
 )
-from harness import Turn, build_llm
+from harness import Turn, build_llm, call
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel
 from scenario import build_scripts
-from task_stream import AgentRun, App, LlmFailure, build_delegate_tool
+from task_stream import (
+    AgentRun,
+    App,
+    LlmFailure,
+    ReActAgent,
+    ToolTurn,
+    _check_cost_limit,
+    _validate_tool_call_ids,
+    build_delegate_tool,
+)
 
-from langchaint import TimedOutError
+from langchaint import ZERO_USAGE, DispatchExceptionGroup, TimedOutError, ToolCall, tool
 from langchaint.tracing import TracedLLM
 
 
@@ -64,16 +78,23 @@ def _build_app(
     *,
     on_event: Callable[[Event], None] = _discard,
     exporter: InMemorySpanExporter | None = None,
+    climate_max_tool_calls: int | None = None,
 ) -> App:
     """Build an app for one scenario under a local TracerProvider."""
     tracer_provider = TracerProvider()
     if exporter is not None:
         tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configs = build_configs()
+    if climate_max_tool_calls is not None:
+        configs["research_climate"] = replace(
+            configs["research_climate"], max_tool_calls=climate_max_tool_calls
+        )
     return App(
         llm=build_llm(build_scripts(scenario)),
-        configs=build_configs(),
+        configs=configs,
         tracer=tracer_provider.get_tracer("full_app.test"),
         on_event=on_event,
+        capture_message_content=False,
     )
 
 
@@ -190,7 +211,7 @@ def test_the_agent_span_parents_its_own_generate_spans() -> None:
 
 
 def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
-    """config.timeout_seconds ends one call, and the run keeps both the account and its next turn."""
+    """generate_one_timeout_seconds ends one call; the run keeps its next turn."""
     app = _build_app("call_timeout")
     asyncio.run(app.run())
     climate = app.runs["root/research_climate"]
@@ -205,7 +226,7 @@ def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> 
     The TaskGroup in App.run awaits every child's unwind before the cancellation propagates, and a
     turn appends its record when it happens, so nothing stands between the except and the settled
     totals. The two in-flight calls add nothing: a cancellation destroys the frame holding the
-    account, which is the difference from config.timeout_seconds.
+    account, which differs from config.generate_one_timeout_seconds.
     """
     app = _build_app("app_timeout")
     at_except: list[tuple[int, float]] = []
@@ -222,13 +243,132 @@ def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> 
     assert at_except == [(0, pytest.approx(0.026))]
 
 
-def test_a_run_cancelled_from_outside_emits_no_terminal_event() -> None:
-    """An outside cancellation ends a run with no AgentFinished or AgentFailed.
+def test_a_cost_limit_rejects_unknown_cost() -> None:
+    """A NaN cost cannot pass a configured max_cost_in_usd."""
+    unknown_cost = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": math.nan})
+    with pytest.raises(RuntimeError, match="cost_in_usd is NaN"):
+        _check_cost_limit(unknown_cost, 1.0)
 
-    final() lets the CancelledError propagate rather than reporting it, so the run has no outcome to
-    report. A UI that treats a terminal event as guaranteed would show these runs in flight forever,
-    which is why final() says so.
-    """
+
+def test_agent_config_rejects_a_nan_cost_limit() -> None:
+    """max_cost_in_usd must be finite."""
+    with pytest.raises(ValueError, match="positive and finite"):
+        _ = AgentConfig(
+            name="limited",
+            system_prompt="[limited] answer",
+            automatic_prompt_caching=False,
+            max_cost_in_usd=math.nan,
+        )
+
+
+def test_tool_call_budget_uses_call_positions() -> None:
+    """max_tool_calls dispatches the first position and declines the second."""
+    app = _build_app("happy", climate_max_tool_calls=1)
+    asyncio.run(app.run())
+    climate = app.runs["root/research_climate"]
+    assert isinstance(climate, ReActAgent)
+    first_turn_tools = [
+        record
+        for record in climate.turn_log
+        if isinstance(record, ToolTurn) and record.turn_number == 1
+    ]
+    assert [record.tool_message.is_error for record in first_turn_tools] == [False, True]
+    assert climate.tool_calls_made == 1
+
+
+def test_duplicate_tool_call_ids_are_rejected() -> None:
+    """Repeated ToolCall.id values cannot enter positional budget handling."""
+    tool_calls = (
+        ToolCall(id="duplicate", name="search", args_json='{"query":"one"}'),
+        ToolCall(id="duplicate", name="search", args_json='{"query":"two"}'),
+    )
+    with pytest.raises(RuntimeError, match="appears twice"):
+        _validate_tool_call_ids(tool_calls)
+
+
+def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delegate propagates DispatchExceptionGroup from a sub-agent tool."""
+
+    class BrokenSearchArgs(BaseModel):
+        """Arguments for the failing replacement search tool."""
+
+        query: str
+
+    @tool(description="Raise a scripted defect.", name="search")
+    async def broken_search(args: BrokenSearchArgs) -> str:
+        """Raise a scripted defect.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError(f"search defect for {args.query}")
+
+    monkeypatch.setattr(task_stream, "search_tool", broken_search)
+    tracer = TracerProvider().get_tracer("full_app.test")
+    registry: dict[str, AgentRun] = {}
+    llm = TracedLLM(
+        build_llm({"specialist": [Turn(tool_calls=(call("search", '{"query": "q"}'),))]}),
+        capture_message_content=False,
+        tracer=tracer,
+    )
+    delegate_tool = build_delegate_tool(
+        llm=llm,
+        parent_path="root/parent",
+        sub_config=AgentConfig(
+            name="specialist",
+            system_prompt="[specialist] answer",
+            automatic_prompt_caching=False,
+        ),
+        tracer=tracer,
+        capture_message_content=False,
+        registry=registry,
+        on_event=_discard,
+    )
+
+    async def invoke() -> None:
+        with pytest.raises(DispatchExceptionGroup):
+            await delegate_tool.validate_and_run('{"question": "q"}')
+
+    asyncio.run(invoke())
+
+
+def test_settle_node_propagates_a_tool_function_defect() -> None:
+    """_settle_node propagates DispatchExceptionGroup."""
+
+    class DefectRun(AgentRun):
+        """A run whose tool layer reports a defect."""
+
+        @override
+        async def run(self) -> str:
+            """Raise one DispatchExceptionGroup.
+
+            Raises:
+                DispatchExceptionGroup: always.
+            """
+            raise DispatchExceptionGroup(
+                "tool function failed",
+                [RuntimeError("defect")],
+                completed_outcomes=(),
+            )
+
+    app = _build_app("happy")
+    run = DefectRun(
+        agent_path="root/defect",
+        config=AgentConfig(
+            name="defect",
+            system_prompt="[defect] fail",
+            automatic_prompt_caching=False,
+        ),
+        tracer=TracerProvider().get_tracer("full_app.test"),
+        registry={},
+        on_event=_discard,
+    )
+    with pytest.raises(DispatchExceptionGroup):
+        asyncio.run(app._settle_node(run))  # noqa: SLF001 (test the propagation boundary)
+
+
+def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
+    """An outside cancellation emits AgentCancelled before propagating."""
     events_by_path: dict[str, list[Event]] = {}
 
     def collect(event: Event) -> None:
@@ -246,9 +386,25 @@ def test_a_run_cancelled_from_outside_emits_no_terminal_event() -> None:
     asyncio.run(drive())
     climate = events_by_path["root/research_climate"]
     assert climate, "the cancelled run emitted events before the deadline"
-    assert not isinstance(climate[-1], AgentFinished | AgentFailed)
-    # The accounting survives the missing terminal event, which is the property that matters.
+    assert isinstance(climate[-1], AgentCancelled)
     assert app.runs["root/research_climate"].usage.cost_in_usd > 0
+
+
+def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
+    """A callback defect cannot replace the outer TimeoutError."""
+
+    def raise_on_cancelled(event: Event) -> None:
+        if isinstance(event, AgentCancelled):
+            raise TypeError("AgentCancelled callback failed")
+
+    app = _build_app("app_timeout", on_event=raise_on_cancelled)
+
+    async def drive() -> None:
+        async with asyncio.timeout(0.5):
+            await app.run()
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(drive())
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
@@ -290,7 +446,11 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
-        sub_config=AgentConfig(name="specialist", system_prompt="[specialist] answer"),
+        sub_config=AgentConfig(
+            name="specialist",
+            system_prompt="[specialist] answer",
+            automatic_prompt_caching=False,
+        ),
         tracer=tracer,
         capture_message_content=False,
         registry=registry,
@@ -322,7 +482,7 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
             return "unused"
 
     registry: dict[str, AgentRun] = {}
-    config = AgentConfig(name="twin", system_prompt="[twin] p")
+    config = AgentConfig(name="twin", system_prompt="[twin] p", automatic_prompt_caching=False)
     tracer = TracerProvider().get_tracer("full_app.test")
     _ = NoOpRun(
         agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard

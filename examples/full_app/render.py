@@ -6,6 +6,7 @@ the orchestrator to redraw a token counter.
 """
 
 from events import (
+    AgentCancelled,
     AgentFailed,
     AgentFinished,
     AgentStarted,
@@ -33,6 +34,8 @@ def _render_body(event: Event) -> str:
             return f"* {path} done, spent ${usage.cost_in_usd:.4f}"
         case AgentFailed(agent_path=path, error=error, usage=usage):
             return f"! {path} FAILED ({error[:40]}), spent ${usage.cost_in_usd:.4f}"
+        case AgentCancelled(agent_path=path, usage=usage):
+            return f"! {path} CANCELLED, settled spend ${usage.cost_in_usd:.4f}"
         case ToolProgress(tool_name=name, message=message):
             return f"  .. {name}: {message}"
         case TurnStarted(turn_number=turn, usage_so_far=usage):

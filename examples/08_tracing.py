@@ -1,45 +1,60 @@
-"""Tracing: wrap an LLM in TracedLLM and every generate call opens an OTel span."""
+"""Export traced generation and tool-dispatch spans to standard output."""
 
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 from pydantic import BaseModel
 
-from langchaint import Message, UserMessage, tool
+from langchaint import Message, ToolManager, UserMessage, tool
 from langchaint.openai import OpenAIAccount
 from langchaint.tracing import TracedLLM, TracedToolManager
 
 
 class WeatherArgs(BaseModel):
-    """Which city to report the weather for."""
+    """Select the city for a weather report."""
 
     city: str
 
 
 @tool(description="Return the current weather for a city.")
 async def get_weather(args: WeatherArgs) -> str:
-    """Return a canned weather report."""
+    """Return a fixed weather report."""
     return f"It is 18C and clear in {args.city}."
 
 
-async def traced_tool_turn() -> str:
-    """Run one tool turn, with every generate call and every dispatch traced.
+async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
+    """Trace each generation and dispatch until the model returns text.
 
     Raises:
-        openai.OpenAIError: OpenAI credentials are unavailable during account construction.
-        Exception: An owned resource close operation fails.
-        GenerationError: a terminal error in bound.generate_one.
-        DispatchExceptionGroup: a tool function raised.
+        openai.OpenAIError: OpenAI credentials are unavailable.
+        GenerationError: A `generate_one` call failed.
+        DispatchExceptionGroup: A tool function raised.
+        RuntimeError: The model exceeded `max_turns`.
     """
-    async with OpenAIAccount() as openai:
-        # capture_message_content has no default: False keeps message content off the spans.
-        traced = TracedLLM(openai.model("gpt-5.6-terra"), capture_message_content=False)
-        bound = traced.bind(
-            system_prompt="Use tools to answer the user's question.",
-            tool_manager=TracedToolManager([get_weather], capture_message_content=False),
-            automatic_prompt_caching=False,
-        )
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+    tracer = tracer_provider.get_tracer("langchaint.example")
 
-        messages: list[Message] = [UserMessage(content="What is the weather in Oslo?")]
+    account = OpenAIAccount()
+    tool_manager: ToolManager = TracedToolManager(
+        [get_weather], capture_message_content=False, tracer=tracer
+    )
+    traced = TracedLLM(
+        account.model("gpt-5.6-terra"),
+        capture_message_content=False,
+        tracer=tracer,
+    )
+    bound = traced.bind(
+        system_prompt="Use tools when needed.",
+        tool_manager=tool_manager,
+        automatic_prompt_caching=False,
+    )
+
+    messages: list[Message] = [UserMessage(content=prompt)]
+    for _ in range(max_turns):
         response = await bound.generate_one(messages)
         messages.append(response.assistant_message)
+        if not response.tool_calls:
+            return response.output
         outcomes = await bound.tool_manager.dispatch_many(response.tool_calls)
         messages.extend(outcome.tool_message for outcome in outcomes)
-        return (await bound.generate_one(messages)).output
+    raise RuntimeError(f"model did not finish within {max_turns} turns")

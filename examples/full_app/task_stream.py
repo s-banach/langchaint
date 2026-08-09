@@ -1,4 +1,4 @@
-"""The recommended shape for a streaming multi-agent app on langchaint.
+"""A multi-agent app that reports progress through callbacks.
 
 The app hands every run one on_event callback, and a run reports by calling it; nothing here is an
 async iterator.
@@ -12,9 +12,9 @@ on_event runs inside the run's frame, so a consumer that blocks in it slows the 
 wanting its own pace passes on_event=queue.put_nowait and drains the queue itself; the decoupling is
 the consumer's choice, never the shape's.
 
-Each turn passes config.timeout_seconds to generate_one as its timeout_seconds. langchaint owns that
-scope, so a call that runs out comes back as a TimedOutError the loop records and continues from,
-rather than as a cancellation that would take the run with it.
+Each turn passes config.generate_one_timeout_seconds to generate_one.
+langchaint owns that deadline.
+A TimedOutError lets the loop record the call and continue.
 
 Two capabilities ride on contextvars, the same mechanism that nests OTel spans across tasks:
 
@@ -44,6 +44,7 @@ dropped.
 
 import asyncio
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from typing import override
 
 from config import AgentConfig
 from events import (
+    AgentCancelled,
     AgentFailed,
     AgentFinished,
     AgentStarted,
@@ -153,6 +155,21 @@ def _spend_of(record: TurnRecord) -> Usage:
             return record.reported_usage
 
 
+def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
+    """Raise when usage reaches max_cost_in_usd or has an unknown cost.
+
+    Raises:
+        RuntimeError: max_cost_in_usd is set and usage cannot support another turn.
+    """
+    if max_cost_in_usd is None:
+        return
+    cost_in_usd = usage.cost_in_usd
+    if math.isnan(cost_in_usd):
+        raise RuntimeError("Cannot enforce max_cost_in_usd because cost_in_usd is NaN")
+    if cost_in_usd >= max_cost_in_usd:
+        raise RuntimeError(f"Run reached max_cost_in_usd={max_cost_in_usd}")
+
+
 class AgentRun(ABC):
     """The reporting half of an agent: the emitter install, the span, and the terminal events.
 
@@ -250,8 +267,7 @@ class AgentRun(ABC):
 
         Raises:
             Exception: whatever run() failed with; AgentFailed is emitted before the re-raise.
-            asyncio.CancelledError: an outer deadline cancelled the run. No terminal event is emitted,
-                because the run has no outcome to report; the turn logs already hold the records.
+            asyncio.CancelledError: An outer scope cancelled the run.
         """
         token = gui_emitter_var.set(GuiEmitter(self.agent_path, self.on_event))
         try:
@@ -265,6 +281,12 @@ class AgentRun(ABC):
                     extra_attributes=self.span_attributes,
                 ):
                     answer = await self.run()
+            except asyncio.CancelledError as error:
+                try:
+                    self.on_event(AgentCancelled(agent_path=self.agent_path, usage=self.usage))
+                except Exception as callback_error:
+                    error.add_note(f"AgentCancelled callback raised {callback_error!r}")
+                raise
             except Exception as error:
                 self.on_event(
                     AgentFailed(
@@ -283,8 +305,9 @@ class AgentRun(ABC):
 class ReActAgent(AgentRun):
     """The example's loop, written as the application's half of the contract: one coroutine.
 
-    Everything here is ordinary async code. The per-call deadline is langchaint's own
-    `timeout_seconds`, the events go out through on_event, and the span is the base class's business.
+    The per-call deadline uses generate_one's `timeout_seconds`.
+    Events go through on_event.
+    AgentRun owns the span.
     """
 
     def __init__(
@@ -326,7 +349,7 @@ class ReActAgent(AgentRun):
         has returned an approval; until then the answer is appended and sent back with an instruction
         to critique, and config.max_turns is what bounds that.
 
-        Each turn is one generate_one call carrying config.timeout_seconds. Every outcome reaches
+        Each turn carries config.generate_one_timeout_seconds. Every outcome reaches
         turn_log through the same append below, because a call that ran out of time comes back as a
         TimedOutError rather than as a cancellation: the loop is still running when it arrives, so
         it has somewhere to put the record.
@@ -334,24 +357,27 @@ class ReActAgent(AgentRun):
         Raises:
             GenerationError: a generate call failed after its retries, TimedOutError excepted; an
                 LlmFailure holding it is appended to turn_log before the raise. A call outrunning
-                config.timeout_seconds is recorded and retried on the next turn, not raised.
-            RuntimeError: the model kept calling tools for config.max_turns turns.
+                config.generate_one_timeout_seconds is recorded, then retried next turn.
+            RuntimeError: `max_turns` elapsed, or configured cost cannot permit another turn.
             DispatchExceptionGroup: a tool function raised; the settled siblings are folded first.
             asyncio.CancelledError: an outer deadline cancelled the run.
         """
         self.messages.append(UserMessage(content=self.prompt))
         for _ in range(self.config.max_turns):
+            usage_so_far = self.usage
+            _check_cost_limit(usage_so_far, self.config.max_cost_in_usd)
             self.turn_number += 1
             self.on_event(
                 TurnStarted(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    usage_so_far=self.usage,
+                    usage_so_far=usage_so_far,
                 )
             )
             try:
                 response = await self.bound.generate_one(
-                    self.messages, timeout_seconds=self.config.timeout_seconds
+                    self.messages,
+                    timeout_seconds=self.config.generate_one_timeout_seconds,
                 )
             except GenerationError as error:
                 self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
@@ -405,6 +431,7 @@ class ReActAgent(AgentRun):
             DispatchExceptionGroup: one or more tool functions raised. Its completed_outcomes are
                 folded and emitted before the re-raise, so a sibling that settled and reported spend
                 is accounted for even though the turn does not finish.
+            RuntimeError: ToolCall.id repeats.
             asyncio.CancelledError: an outer deadline cancelled the run mid-dispatch.
         """
         usage_so_far = self.usage
@@ -419,6 +446,7 @@ class ReActAgent(AgentRun):
                     usage_so_far=usage_so_far,
                 )
             )
+        _validate_tool_call_ids(tool_calls)
         remaining = max(0, self.config.max_tool_calls - self.tool_calls_made)
         affordable_ids = {tool_call.id for tool_call in tool_calls[:remaining]}
         # Charged where the calls are dispatched rather than where they settle, so a turn that raises
@@ -462,10 +490,23 @@ class ReActAgent(AgentRun):
         and delegate reports None, because a sub-run wrote its own turn_log
         and folding a reported total would count the whole subtree twice.
         An approving CritiqueVerdict is what releases a self-correcting run to answer.
+
+        Raises:
+            RuntimeError: An outcome repeats or names an unknown tool_call_id.
         """
         call_of_id = {tool_call.id: tool_call for tool_call in tool_calls}
+        settled_ids: set[str] = set()
         for outcome in outcomes:
-            tool_call = call_of_id[outcome.tool_message.tool_call_id]
+            tool_call_id = outcome.tool_message.tool_call_id
+            if tool_call_id in settled_ids:
+                raise RuntimeError(f"dispatch_many returned tool_call_id {tool_call_id!r} twice")
+            settled_ids.add(tool_call_id)
+            try:
+                tool_call = call_of_id[tool_call_id]
+            except KeyError:
+                raise RuntimeError(
+                    f"dispatch_many returned unknown tool_call_id {tool_call_id!r}"
+                ) from None
             match outcome:
                 case DispatchHandled(app_data=Usage() as reported_usage):
                     pass
@@ -561,6 +602,9 @@ def build_delegate_tool(
 
         The tool manager is assembled per spawn, through the same _tool_manager_for every run uses,
         so a self-correcting sub_config hands each spawn its own critique script.
+
+        Raises:
+            DispatchExceptionGroup: A specialist tool function raised.
         """
         tool_manager = _tool_manager_for(
             sub_config,
@@ -578,16 +622,17 @@ def build_delegate_tool(
                 system_prompt=sub_config.system_prompt,
                 tool_manager=tool_manager,
                 max_attempts=sub_config.max_attempts,
-                automatic_prompt_caching=True,
+                automatic_prompt_caching=sub_config.automatic_prompt_caching,
             ),
             prompt=args.question,
         )
         try:
             answer = await sub_run.final()
+        except DispatchExceptionGroup:
+            raise
         except Exception as error:
-            # Every failure, not just the langchaint taxonomy: a defect in a sub-agent's own tool must
-            # reach the parent model as a message it can answer around, not as an exception. The spend
-            # does not depend on this catch, because the records were written as the sub-run spent.
+            # A sub-agent failure becomes data the parent model can use.
+            # DispatchExceptionGroup is a tool-function defect and propagates.
             return ToolOutputExplicit(
                 content=f"The specialist failed: {describe_error(error)}. Answer without it.",
                 app_data=None,
@@ -596,6 +641,19 @@ def build_delegate_tool(
         return ToolOutputExplicit(content=answer, app_data=None)
 
     return delegate
+
+
+def _validate_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
+    """Reject duplicate IDs because partial outcomes correlate through tool_call_id.
+
+    Raises:
+        RuntimeError: tool_calls contains a duplicate ToolCall.id.
+    """
+    seen_ids: set[str] = set()
+    for tool_call in tool_calls:
+        if tool_call.id in seen_ids:
+            raise RuntimeError(f"ToolCall.id {tool_call.id!r} appears twice in one turn")
+        seen_ids.add(tool_call.id)
 
 
 class App:
@@ -612,7 +670,7 @@ class App:
         configs: Mapping[str, AgentConfig],
         tracer: Tracer,
         on_event: Callable[[Event], None],
-        capture_message_content: bool = False,
+        capture_message_content: bool,
     ) -> None:
         """Store the launch-time config of every agent, and wrap the LLM for tracing here.
 
@@ -622,9 +680,8 @@ class App:
         are non-recording: the agent and tool spans arrive with holes in them and nothing reports an
         error.
 
-        capture_message_content is passed to every wrapper the app builds and defaults to False here
-        only because this example's prompts are fabricated; langchaint itself requires it with no
-        default, and an application should pass it explicitly for the same reason.
+        capture_message_content is passed to every tracing wrapper.
+        The required value makes message capture explicit.
         """
         self._llm = TracedLLM(llm, capture_message_content=capture_message_content, tracer=tracer)
         self._configs = configs
@@ -666,20 +723,25 @@ class App:
                 system_prompt=config.system_prompt,
                 tool_manager=tool_manager,
                 max_attempts=config.max_attempts,
-                automatic_prompt_caching=True,
+                automatic_prompt_caching=config.automatic_prompt_caching,
             ),
             prompt=prompt,
         )
 
-    async def _settle_node(self, run: ReActAgent) -> None:
+    async def _settle_node(self, run: AgentRun) -> None:
         """Await one node's outcome and record it, so the next phase can read it.
 
-        A failure is recorded rather than propagated, because a dead node must not cancel its
-        concurrent sibling and the next phase synthesizes around the hole. A CancelledError still
-        propagates: it is a BaseException, and an outer deadline that raised it is ending the graph.
+        Generation and agent-limit failures become entries in failures.
+        DispatchExceptionGroup and cancellation propagate.
+
+        Raises:
+            DispatchExceptionGroup: A tool function raised.
+            asyncio.CancelledError: An outer scope cancelled the graph.
         """
         try:
             self.answers[run.agent_path] = await run.final()
+        except DispatchExceptionGroup:
+            raise
         except Exception as error:
             self.failures[run.agent_path] = describe_error(error)
 
@@ -700,6 +762,8 @@ class App:
 
         Raises:
             asyncio.CancelledError: an outer deadline cancelled the graph mid-run.
+            DispatchExceptionGroup: A synthesize tool function raised.
+            ExceptionGroup: A concurrent researcher tool function raised.
         """
         # delegate is built before the run that owns it, so both take the path from one function
         # rather than the tool repeating it as a literal; climate_name feeds both calls so the

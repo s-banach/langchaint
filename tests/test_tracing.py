@@ -1012,6 +1012,22 @@ def test_traced_bind_and_rebind_carry_extra_body_by_reference() -> None:
     assert bound.rebind(extra_body=None).binding.extra_body is None
 
 
+def test_traced_bind_and_rebind_forward_provider_executed_tools() -> None:
+    """Traced bindings keep, replace, or clear provider_executed_tools."""
+    provider_tool = {"type": "web_search"}
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    bound = traced.bind(provider_executed_tools=[provider_tool], automatic_prompt_caching=True)
+    assert bound.binding.provider_executed_tools == (provider_tool,)
+    assert bound.binding.provider_executed_tools[0] is provider_tool
+    assert bound.rebind(system_prompt="s").binding.provider_executed_tools[0] is provider_tool
+
+    replacement = {"type": "file_search"}
+    replaced = bound.rebind(provider_executed_tools=[replacement])
+    assert replaced.binding.provider_executed_tools == (replacement,)
+    assert replaced.binding.provider_executed_tools[0] is replacement
+    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
+
+
 def test_traced_bind_and_rebind_forward_max_attempts() -> None:
     """TracedLLM.bind and TracedBoundLLM.rebind forward max_attempts."""
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)

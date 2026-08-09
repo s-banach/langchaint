@@ -1,58 +1,29 @@
-"""Prompt caching: mark where the reusable prefix ends, in a binding and in a tool result."""
+"""Warm a reusable prompt prefix before running its batch siblings."""
 
-from langchaint import (
-    AssistantMessage,
-    Message,
-    Response,
-    TextPart,
-    ToolCall,
-    ToolMessage,
-    UserMessage,
-)
+from langchaint import GenerationError, Response, TextPart
 from langchaint.anthropic import AnthropicAccount
 
 
-async def cache_a_long_prefix() -> Response[str]:
-    """Bind a marked prefix, send a marked tool result, and print what the cache read and wrote.
+async def generate_with_a_warm_cache() -> list[Response[str] | GenerationError]:
+    """Warm one prefix and print each result's cache usage."""
+    account = AnthropicAccount()
+    stable_policy = (
+        "Support policy: route refunds to a human. "
+        "Never request a password or payment-card number. "
+    ) * 300
+    bound = account.model("claude-sonnet-5", cache_ttl="1h").bind(
+        system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
+        automatic_prompt_caching=False,
+    )
 
-    Raises:
-        Exception: An owned resource close operation fails.
-        GenerationError: any terminal outcome of the generate call.
-    """
-    async with AnthropicAccount() as anthropic:
-        # cache_ttl "1h" holds a cache entry across longer gaps than the default "5m".
-        # Its writes cost more, so "1h" pays off when reuses arrive over five minutes apart.
-        llm = anthropic.model("claude-sonnet-5", cache_ttl="1h")
-
-        # Cache the stable instructions, and not the promoted-product line after them.
-        # Pad a prefix you expect to cache: a provider caches only above a minimum token count.
-        bound = llm.bind(
-            system_prompt=[
-                TextPart(
-                    text="You are a support assistant. Route anything about refunds to a human. ",
-                    cache_breakpoint=True,
-                ),
-                TextPart(text="Today's promoted product is the X-200."),
-            ],
-            automatic_prompt_caching=False,
-        )
-
-        messages: list[Message] = [
-            UserMessage(content="Do you handle refunds?"),
-            AssistantMessage(turn=[ToolCall(id="call_1", name="lookup_policy", args_json="{}")]),
-            # cache_breakpoint on a tool result is honored only on the message's last part.
-            ToolMessage(
-                tool_call_id="call_1",
-                content=[
-                    TextPart(text="Retrieved at 09:00."),
-                    TextPart(text="Refund policy document.", cache_breakpoint=True),
-                ],
-            ),
-        ]
-        response = await bound.generate_one(messages)
-        usage = response.usage
-        read_cost = usage.input_tokens_cache_read_cost_in_usd
-        write_cost = usage.input_tokens_cache_write_cost_in_usd
-        print(f"cache read {usage.input_tokens_cache_read} tokens for {read_cost} USD")
-        print(f"cache wrote {usage.input_tokens_cache_write} tokens for {write_cost} USD")
-        return response
+    prompts = [
+        "Can I return an opened item?",
+        "How do I request a refund?",
+        "Which details may a support request include?",
+    ]
+    results = await bound.generate_many(prompts, warm_cache=True)
+    for index, result in enumerate(results):
+        usage = result.usage
+        print(f"item {index} wrote {usage.input_tokens_cache_write} cache tokens")
+        print(f"item {index} read {usage.input_tokens_cache_read} cache tokens")
+    return results

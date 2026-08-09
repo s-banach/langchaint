@@ -19,7 +19,8 @@ so `_billing_from_sdk_usage` carries the page that does.
 
 Reasoning replay, verified by docs and live runs because it is request-time behavior SDK introspection cannot show:
 the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
-It filters prior turns' thinking blocks itself, so re-emitting every ReasoningTrace unconditionally is safe.
+It filters prior thinking blocks itself.
+Therefore, re-emitting every ReasoningPart value is safe.
 It rejects consecutive thinking blocks re-sent out of their emission order, which turn order preserves.
 
 Cache breakpoints: with automatic_prompt_caching bound True,
@@ -136,15 +137,15 @@ from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.messages import (
     AssistantMessage,
+    ContentPart,
     Message,
-    OpaqueElement,
-    Part,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
 )
 from langchaint.pricing import Billing, category_cost
@@ -405,8 +406,8 @@ class _NotSendableError(Exception):
         self.reason = reason
 
 
-def _part_block(part: Part) -> TextBlockParam | ImageBlockParam:
-    """Convert one content Part to its wire block.
+def _part_block(part: ContentPart) -> TextBlockParam | ImageBlockParam:
+    """Convert one ContentPart to its wire block.
 
     Raises:
         _NotSendableError: an ImagePart's media_type is outside the API's accepted set,
@@ -449,7 +450,7 @@ def _user_content_blocks(
 
 
 def _tool_result_content(
-    content: str | tuple[Part, ...],
+    content: str | tuple[ContentPart, ...],
 ) -> str | list[TextBlockParam | ImageBlockParam]:
     """Convert one ToolMessage's content to the tool_result content field.
 
@@ -480,7 +481,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     """
     if "type" not in raw:
         raise _NotSendableError(
-            "an assistant turn element's stored payload names no type key, "
+            "ReasoningPart.raw or RawPart.raw names no type key, "
             "so anthropic has no content block to send it as"
         )
     # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
@@ -490,7 +491,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
     """Convert one AssistantMessage to wire blocks in turn order.
 
-    A ReasoningTrace's and an OpaqueElement's raw dict go to the wire unchanged, routed by their own
+    ReasoningPart.raw and RawPart.raw go to the wire unchanged, routed by their own
     type key: langchaint models nothing inside either dump, and the API rejects a tool-use
     continuation whose latest thinking block was modified.
     A dump another provider produced goes to the wire the same way and the API rejects its
@@ -503,21 +504,21 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
         _NotSendableError: a stored payload names no type key (from _replayed_block).
     """
     blocks: list[_ContentBlockParam] = []
-    for element in assistant_message.turn:
-        if isinstance(element, TextPart):
-            if element.text:
-                blocks.append(TextBlockParam(type="text", text=element.text))
-        elif isinstance(element, ToolCall):
+    for part in assistant_message.turn:
+        if isinstance(part, TextPart):
+            if part.text:
+                blocks.append(TextBlockParam(type="text", text=part.text))
+        elif isinstance(part, ToolCall):
             blocks.append(
                 ToolUseBlockParam(
                     type="tool_use",
-                    id=element.id,
-                    name=element.name,
-                    input=json.loads(element.args_json),
+                    id=part.id,
+                    name=part.name,
+                    input=json.loads(part.args_json),
                 )
             )
         else:
-            blocks.append(_replayed_block(element.raw))
+            blocks.append(_replayed_block(part.raw))
     return blocks
 
 
@@ -762,15 +763,15 @@ def _first_text_block_text(message: anthropic.types.Message) -> str | None:
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
     """Build the langchaint assistant turn from the SDK message, block order preserved.
 
-    A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
+    A thinking or redacted_thinking block becomes a ReasoningPart carrying the block's own
     model_dump for verbatim replay.
     The two reasoning block types get a branch each because only thinking carries readable text:
     a redacted_thinking block holds an opaque string under data and nothing a reader can display,
-    so its trace has no text.
-    Every other block, a server tool call and its result among them, becomes an OpaqueElement
+    so ReasoningPart.text is None.
+    Every other block, a server tool call and its result among them, becomes a RawPart
     holding its own model_dump, so the turn carries what the response was billed for.
     """
-    turn: list[TurnElement] = []
+    turn: list[TurnPart] = []
     for block in message.content:
         if block.type == "text":
             turn.append(TextPart(text=block.text))
@@ -778,15 +779,15 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
             turn.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
         elif block.type == "thinking":
             turn.append(
-                ReasoningTrace(
+                ReasoningPart(
                     raw=block.model_dump(mode="python", exclude_none=True),
                     text=block.thinking or None,
                 )
             )
         elif block.type == "redacted_thinking":
-            turn.append(ReasoningTrace(raw=block.model_dump(mode="python", exclude_none=True)))
+            turn.append(ReasoningPart(raw=block.model_dump(mode="python", exclude_none=True)))
         else:
-            turn.append(OpaqueElement(raw=block.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=block.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -1204,7 +1205,7 @@ class _AnthropicStream(AdapterStream):
         block, whose id and name are read off the SDK's message snapshot; the SDK appended the
         block there at content_block_start, before any of its deltas. A server_tool_use block
         grows by the same delta type and streams nothing; it reaches the caller in the turn final()
-        assembles, as an OpaqueElement.
+        assembles, as a RawPart.
 
         A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
         is a block boundary, never text. That boundary reaches the caller as a

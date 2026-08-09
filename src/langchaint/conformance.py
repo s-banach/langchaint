@@ -41,8 +41,8 @@ from langchaint.exceptions import AbandonedCallError, StreamProtocolError, Trans
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import (
     Message,
-    OpaqueElement,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     UserMessage,
     messages_from_json,
     messages_to_json,
@@ -136,32 +136,30 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_with_reasoning(self) -> BaseModel:
-        """Return an SDK response whose turn holds one reasoning element and one text part.
+        """Return an SDK response whose turn holds one ReasoningPart and one TextPart.
 
-        The reasoning must carry a key the installed SDK does not name, which is what an adapter
-        that rebuilt the payload from its own model would drop.
-        The turn's elements must map one to one onto the wire elements a request built from that
-        turn carries, so no two adjacent parts of a kind the adapter joins into one.
+        The reasoning must carry a key absent from the installed SDK.
+        Rebuilding the payload would drop that key.
+        Each TurnPart must map to one wire part.
+        Avoid adjacent parts the adapter joins.
         """
         ...
 
     @abstractmethod
-    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
-        """Return an SDK response whose turn holds one block this adapter has no variant for.
+    def response_with_raw_part(self) -> BaseModel | None:
+        """Return an SDK response whose turn holds one RawPart.
 
-        Beside it, at least one block the adapter does model.
-        The turn's elements must map one to one onto the wire elements a request built from that
-        turn carries, so no two adjacent blocks of a kind the adapter joins into one.
-        Return None where the wire holds a whole turn as one message's fields rather than as a list
-        of elements, which leaves no position an OpaqueElement could stand at; the invariant then
-        asserts nothing, so returning None on a wire that does carry such a block hides the drop the
-        invariant exists to catch.
+        Beside it, include at least one other TurnPart.
+        Each TurnPart must map to one wire part.
+        Return None when one message holds the whole turn.
+        Such a wire has no RawPart position.
+        Returning None on a part-based wire hides a dropped RawPart.
         """
         ...
 
     @abstractmethod
-    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
-        """Read the assistant turn's elements out of a request this adapter built, in wire order.
+    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+        """Read the assistant turn's parts from a request, in wire order.
 
         The one fixture that is not an input: what an adapter puts on the wire has no neutral shape,
         so the author supplies the reader and langchaint supplies the comparison.
@@ -202,16 +200,16 @@ class AdapterConformance(ABC):
         """Bind a fresh adapter for plain text under the one binding these invariants use."""
         return self.make_adapter().bind_text(_PLAIN_TEXT_BINDING)
 
-    def _assistant_wire_elements_of(
+    def _assistant_wire_parts_of(
         self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
     ) -> Sequence[object]:
-        """Build a request from messages and read its assistant turn's wire elements.
+        """Build a request and read its assistant turn's wire parts.
 
-        Asserts the request is valid, so callers compare elements without repeating the guard.
+        The assertion lets callers compare parts without repeating the guard.
         """
         request = bound_adapter.build_request(messages)
         assert not isinstance(request, InvalidRequest)
-        return self.assistant_wire_elements(request)
+        return self.assistant_wire_parts(request)
 
     def _billings(self) -> list[Billing]:
         """Return the billing of each fixture response the cost invariants price."""
@@ -303,57 +301,54 @@ class AdapterConformance(ABC):
         outcome = bound_adapter.interpret(self.response_with_reasoning())
         assert isinstance(outcome, AdapterResult)
         turn = outcome.assistant_message.turn
-        ((index, trace),) = [
-            (index, element)
-            for index, element in enumerate(turn)
-            if isinstance(element, ReasoningTrace)
+        ((index, reasoning_part),) = [
+            (index, part) for index, part in enumerate(turn) if isinstance(part, ReasoningPart)
         ]
-        elements = self._assistant_wire_elements_of(
+        parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(elements) == len(turn)
-        assert elements[index] == trace.raw
+        assert len(parts) == len(turn)
+        assert parts[index] == reasoning_part.raw
 
-    def test_a_block_the_adapter_does_not_model_round_trips_verbatim_in_position(self) -> None:
-        """A block langchaint has no variant for goes back on the wire unchanged, where it sat.
+    def test_raw_part_round_trips_verbatim_in_position(self) -> None:
+        """RawPart.raw returns unchanged in its original position.
 
-        The response was paid for, so a block dropped on the way in is output the caller bought and
-        cannot get back, and a tool loop continuing from that turn would send the provider a turn it
-        did not produce.
-        The turn must hold an OpaqueElement: an adapter that drops the block shortens the turn and
-        the wire elements together, so the one-to-one count alone passes on the drop.
+        Dropping the part loses paid output.
+        A continued tool loop would replay a different turn.
+        The turn must hold a RawPart.
+        Dropping a RawPart value shortens both compared sequences.
         """
-        response = self.response_with_a_block_the_adapter_does_not_model()
+        response = self.response_with_raw_part()
         if response is None:
             return
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(response)
         assert isinstance(outcome, AdapterResult)
         turn = outcome.assistant_message.turn
-        assert any(isinstance(element, OpaqueElement) for element in turn)
-        elements = self._assistant_wire_elements_of(
+        assert any(isinstance(part, RawPart) for part in turn)
+        parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(elements) == len(turn)
-        for index, element in enumerate(turn):
-            if isinstance(element, OpaqueElement):
-                assert elements[index] == element.raw
+        assert len(parts) == len(turn)
+        for index, part in enumerate(turn):
+            if isinstance(part, RawPart):
+                assert parts[index] == part.raw
 
     def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
-        """A turn restored by messages_from_json puts the same elements on the wire as the original.
+        """A restored turn puts the original parts on the wire.
 
         This is what makes the round trip a persistence format: serialization must not lose or
         reshape a raw payload the provider verifies, and every value this adapter puts in
-        ReasoningTrace.raw must serialize, which is where a non-JSON-representable value fails.
+        ReasoningPart.raw must serialize, which is where a non-JSON-representable value fails.
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
         assert isinstance(outcome, AdapterResult)
         original: list[Message] = [UserMessage(content="hi"), outcome.assistant_message]
         restored = messages_from_json(messages_to_json(original))
-        assert self._assistant_wire_elements_of(
+        assert self._assistant_wire_parts_of(
             bound_adapter, restored
-        ) == self._assistant_wire_elements_of(bound_adapter, original)
+        ) == self._assistant_wire_parts_of(bound_adapter, original)
 
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.

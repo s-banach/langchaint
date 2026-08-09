@@ -17,7 +17,7 @@ Verified against google-genai 2.16.0:
   https://ai.google.dev/gemini-api/docs/caching (read 2026-08-03).
 - `Part.thought` marks reasoning and `Part.thought_signature` is bytes; the SDK models serialize
   bytes as base64 in JSON mode and validate them back, so a `mode="json"` dump is the
-  round-trippable form ReasoningTrace.raw carries.
+  round-trippable form ReasoningPart.raw carries.
 - The SDK models forbid unknown keys, so a stored dump another provider produced has no wire route
   and build_request reports it as InvalidRequest.
 - The SDK enums construct unknown values as synthetic members with a UserWarning, so an effort or
@@ -27,11 +27,11 @@ Verified against google-genai 2.16.0:
 
 Reasoning replay, from https://ai.google.dev/gemini-api/docs/thinking (read 2026-08-03): thought
 signatures must be resent exactly as received, and they appear on thought steps and built-in tool
-steps. The adapter therefore emits a ReasoningTrace for every part carrying `thought` or a
+steps. The adapter therefore emits a ReasoningPart for every part carrying `thought` or a
 `thought_signature` and restores it verbatim with `Part.model_validate_json`. A signature-carrying
 part that also holds answer text or a function call additionally yields its TextPart or ToolCall,
-so consumers see the turn's content; on replay the trace's restored part already carries that
-payload, and the element following its trace is skipped when it matches, keeping the wire form
+so consumers see the turn's content; on replay ReasoningPart.raw already carries that
+payload, and the following TurnPart is skipped when it matches, keeping the wire form
 byte-identical to what arrived.
 
 Caching: generateContent has no request field enabling, disabling, or marking implicit caching, so
@@ -108,15 +108,15 @@ from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.messages import (
     AssistantMessage,
+    ContentPart,
     Message,
-    OpaqueElement,
-    Part,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
 )
 from langchaint.pricing import Billing, category_cost, require_pricing_key
@@ -392,27 +392,27 @@ def _tool_call_from(function_call: types.FunctionCall) -> ToolCall:
 def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
     """Build the langchaint assistant turn from a candidate's content, part order preserved.
 
-    A part carrying `thought` or a `thought_signature` becomes a ReasoningTrace holding the part's
+    A part carrying `thought` or a `thought_signature` becomes a ReasoningPart holding the part's
     JSON-mode dump, the round-trippable form for the signature bytes; the module docstring names
     the resend-exactly source. A signature-carrying part that also holds a function call or
     non-thought text additionally yields its ToolCall or TextPart, so the turn's consumers see the
-    content; _assistant_wire_parts skips that element on replay, keeping the wire form what arrived.
-    Thought text goes on the trace's text and nowhere else.
+    content; _assistant_wire_parts skips that TurnPart during replay.
+    Thought text goes on ReasoningPart.text and nowhere else.
     A part that yields none of those three, executable_code and code_execution_result among them,
-    becomes an OpaqueElement holding the same dump, so the turn carries what the response was billed
+    becomes a RawPart holding the same dump, so the turn carries what the response was billed
     for. Empty text is no text, so a part whose text is the empty string yields no TextPart; where
-    it carries no function call and no reasoning it becomes an OpaqueElement, and one carrying
+    it carries no function call and no reasoning it becomes a RawPart, and one carrying
     nothing at all replays as the empty-text part that arrived.
     Absent content or parts is an empty turn (a SAFETY candidate can carry a finish_reason and no
     content).
     """
     parts = content.parts if content is not None and content.parts is not None else []
-    turn: list[TurnElement] = []
+    turn: list[TurnPart] = []
     for part in parts:
         carries_reasoning = part.thought or part.thought_signature is not None
         if carries_reasoning:
             turn.append(
-                ReasoningTrace(
+                ReasoningPart(
                     raw=part.model_dump(mode="json", exclude_none=True),
                     text=(part.text or None) if part.thought else None,
                 )
@@ -423,7 +423,7 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
             if not part.thought:
                 turn.append(TextPart(text=part.text))
         elif not carries_reasoning:
-            turn.append(OpaqueElement(raw=part.model_dump(mode="json", exclude_none=True)))
+            turn.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -448,12 +448,12 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
     )
 
 
-def _part_from_dump(raw: Mapping[str, object], *, element_description: str) -> types.Part:
+def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> types.Part:
     """Restore one stored raw dump to the Part that produced it, byte-identical.
 
     model_validate_json is the inverse of the JSON-mode dump _assistant_message_from stored,
     restoring the signature bytes from base64.
-    element_description names the turn element raw came from, for the failure message.
+    part_description names the ReasoningPart or RawPart.
 
     Raises:
         _NotSendableError: raw does not restore to a Part. The SDK models forbid unknown keys, so a
@@ -464,35 +464,35 @@ def _part_from_dump(raw: Mapping[str, object], *, element_description: str) -> t
         return types.Part.model_validate_json(json.dumps(raw))
     except (TypeError, ValueError) as not_a_part:
         raise _NotSendableError(
-            f"{element_description} does not restore to a Gemini Part, so it cannot be sent: "
+            f"{part_description} does not restore to a Gemini Part, so it cannot be sent: "
             f"{not_a_part}"
         ) from not_a_part
 
 
-def _is_shadow_of(element: TurnElement, replayed_part: types.Part) -> bool:
-    """Whether element repeats the payload replayed_part already carries onto the wire.
+def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) -> bool:
+    """Whether TurnPart repeats payload already carried by replayed_part.
 
     _assistant_message_from pairs a signature-carrying part with the ToolCall or TextPart holding
     its consumer-facing payload; this is the replay-side match that keeps the pair one wire part.
-    An element that does not match is a genuine element and goes on the wire itself.
+    A part without a match goes on the wire itself.
     """
     function_call = replayed_part.function_call
-    if isinstance(element, ToolCall) and function_call is not None:
+    if isinstance(part, ToolCall) and function_call is not None:
         name = function_call.name or ""
         try:
-            args = json.loads(element.args_json)
+            args = json.loads(part.args_json)
         except json.JSONDecodeError:
             return False
         return (
-            element.name == name
-            and element.id == (function_call.id or name)
+            part.name == name
+            and part.id == (function_call.id or name)
             and args == (function_call.args or {})
         )
-    if isinstance(element, TextPart) and function_call is None:
+    if isinstance(part, TextPart) and function_call is None:
         return (
             bool(replayed_part.text)
             and not replayed_part.thought
-            and element.text == replayed_part.text
+            and part.text == replayed_part.text
         )
     return False
 
@@ -500,41 +500,43 @@ def _is_shadow_of(element: TurnElement, replayed_part: types.Part) -> bool:
 def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Part]:
     """Convert one AssistantMessage to wire parts in turn order.
 
-    A ReasoningTrace restores to the Part that produced it; when that part carries a function call
-    or non-thought text, the element _assistant_message_from paired with it follows in the turn and
+    A ReasoningPart restores to the Part that produced it; when that part carries a function call
+    or non-thought text, the paired TurnPart follows it and
     is skipped, so the pair goes back as the one part that arrived. An empty TextPart yields nothing.
-    An OpaqueElement restores the same way and carries no such pair.
+    A RawPart restores the same way and carries no such pair.
 
     Raises:
-        _NotSendableError: a trace or an opaque element does not restore to a Part (from
+        _NotSendableError: ReasoningPart.raw or RawPart.raw does not restore to a Gemini Part (from
             _part_from_dump), or a tool call's args_json is not a JSON object (from
             _function_call_from).
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     parts: list[types.Part] = []
-    trace_shadow: types.Part | None = None
-    for element in assistant_message.turn:
-        if trace_shadow is not None:
-            replayed_part = trace_shadow
-            trace_shadow = None
-            if _is_shadow_of(element, replayed_part):
+    replayed_part_with_paired_payload: types.Part | None = None
+    for part in assistant_message.turn:
+        if replayed_part_with_paired_payload is not None:
+            replayed_part = replayed_part_with_paired_payload
+            replayed_part_with_paired_payload = None
+            if _matches_replayed_part_payload(part, replayed_part):
                 continue
-        if isinstance(element, TextPart):
-            if element.text:
-                parts.append(types.Part(text=element.text))
-        elif isinstance(element, ToolCall):
-            parts.append(types.Part(function_call=_function_call_from(element)))
-        elif isinstance(element, ReasoningTrace):
-            part = _part_from_dump(element.raw, element_description="a reasoning trace")
-            parts.append(part)
-            if part.function_call is not None or (part.text and not part.thought):
-                trace_shadow = part
+        if isinstance(part, TextPart):
+            if part.text:
+                parts.append(types.Part(text=part.text))
+        elif isinstance(part, ToolCall):
+            parts.append(types.Part(function_call=_function_call_from(part)))
+        elif isinstance(part, ReasoningPart):
+            replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
+            parts.append(replayed_part)
+            if replayed_part.function_call is not None or (
+                replayed_part.text and not replayed_part.thought
+            ):
+                replayed_part_with_paired_payload = replayed_part
         else:
-            parts.append(_part_from_dump(element.raw, element_description="an opaque element"))
+            parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
     return parts
 
 
-def _user_parts(content: str | tuple[Part, ...]) -> list[types.Part]:
+def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
     """Convert one UserMessage's content to wire parts.
 
     An ImagePart's media_type passes through verbatim: no accepted set is introspectable, so a type

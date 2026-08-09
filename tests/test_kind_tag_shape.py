@@ -98,7 +98,7 @@ def test_discovery_finds_the_known_unions_with_their_variants_intact() -> None:
     one it found but flattened to a single variant, so a walk that stops early has to fail here.
     A union of one variant is not a union, which is what makes the lower bound safe to assert.
     """
-    assert {"Message", "Part", "TurnElement", "ResponseOutcome", "GenerateResult"} <= set(
+    assert {"Message", "ContentPart", "TurnPart", "ResponseOutcome", "GenerateResult"} <= set(
         _TAGGED_UNIONS
     )
     undersized = {

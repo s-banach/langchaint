@@ -30,9 +30,9 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
-    OpaqueElement,
+    RawPart,
     ReasoningDelta,
-    ReasoningTrace,
+    ReasoningPart,
     SpecificToolChoice,
     StopReason,
     StreamItem,
@@ -407,14 +407,14 @@ def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> N
         "reasoning_content": "thought it over",
     })
     assert _assistant_message_from(message).turn == (
-        ReasoningTrace(raw={"reasoning_content": "thought it over"}, text="thought it over"),
+        ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
         TextPart(text="hey"),
         TextPart(text="but no more"),
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
     )
 
 
-def test_a_custom_tool_call_becomes_an_opaque_element_and_replays_in_order() -> None:
+def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
     """The custom.input and ToolCall.args_json fields name different provider concepts."""
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
@@ -423,7 +423,7 @@ def test_a_custom_tool_call_becomes_an_opaque_element_and_replays_in_order() -> 
     })
     assistant_message = _assistant_message_from(message)
     assert assistant_message.turn == (
-        OpaqueElement(raw=_CUSTOM_TOOL_CALL_WIRE),
+        RawPart(raw=_CUSTOM_TOOL_CALL_WIRE),
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
     )
     assert _assistant_message_param(assistant_message) == {
@@ -432,14 +432,14 @@ def test_a_custom_tool_call_becomes_an_opaque_element_and_replays_in_order() -> 
     }
 
 
-def test_a_function_call_becomes_an_opaque_element_and_replays_unchanged() -> None:
+def test_a_function_call_becomes_a_raw_part_and_replays_unchanged() -> None:
     """The function_call field lacks the id ToolCall requires."""
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
         "function_call": _FUNCTION_CALL_WIRE,
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (OpaqueElement(raw={"function_call": _FUNCTION_CALL_WIRE}),)
+    assert assistant_message.turn == (RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "function_call": _FUNCTION_CALL_WIRE,
@@ -455,7 +455,7 @@ def test_a_function_call_keeps_its_field_when_an_extra_type_is_present(extra_typ
         "function_call": function_call,
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (OpaqueElement(raw={"function_call": function_call}),)
+    assert assistant_message.turn == (RawPart(raw={"function_call": function_call}),)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "function_call": function_call,
@@ -468,8 +468,8 @@ def test_build_request_rejects_two_deprecated_function_calls() -> None:
     request = bound.build_request([
         AssistantMessage(
             turn=(
-                OpaqueElement(raw={"function_call": _FUNCTION_CALL_WIRE}),
-                OpaqueElement(raw={"function_call": {"name": "second_lookup", "arguments": "{}"}}),
+                RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
+                RawPart(raw={"function_call": {"name": "second_lookup", "arguments": "{}"}}),
             )
         )
     ])
@@ -480,7 +480,7 @@ def test_build_request_rejects_two_deprecated_function_calls() -> None:
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """The refusal becomes a TextPart, so the refused turn replays as the model wrote it.
 
-    Dropped instead, the turn holds no elements and sends nothing back, which reopens the
+    Dropped instead, the turn holds no TurnPart values and sends nothing back, which reopens the
     Sequence[Message] at the point the model declined.
     """
     assistant_message = _assistant_message_from(
@@ -494,10 +494,10 @@ def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
 
 
 def test_the_turn_replays_as_one_assistant_param_with_reasoning_merged_beside_content() -> None:
-    """Texts join into content, calls become tool_calls entries, and the trace's raw merges in."""
+    """Texts join into content. ToolCall values and ReasoningPart.raw keep their fields."""
     assistant_message = AssistantMessage(
         turn=(
-            ReasoningTrace(raw={"reasoning_content": "thought it over"}, text="thought it over"),
+            ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
             TextPart(text="he"),
             TextPart(text="y"),
             ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
@@ -512,9 +512,9 @@ def test_the_turn_replays_as_one_assistant_param_with_reasoning_merged_beside_co
 
 
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
-    """An anthropic-produced trace's keys land on the param as-is; the API, not this adapter, refuses them."""
+    """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(turn=(ReasoningTrace(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "content": "hi",
@@ -688,14 +688,14 @@ def test_build_request_reports_an_image_inside_a_tool_message_as_invalid_request
     assert "text-only" in request.reason
 
 
-def test_build_request_reports_an_opaque_element_in_a_turn_as_invalid_request() -> None:
-    """A turn another provider produced fails before the wire can drop its OpaqueElement."""
+def test_build_request_reports_a_raw_part_in_a_turn_as_invalid_request() -> None:
+    """Unsupported RawPart.raw produces InvalidRequest before sending."""
     bound = _adapter().bind_text(_binding())
     request = bound.build_request([
         UserMessage(content="q"),
         AssistantMessage(
             turn=(
-                OpaqueElement(raw={"type": "server_tool_use", "name": "web_search"}),
+                RawPart(raw={"type": "server_tool_use", "name": "web_search"}),
                 TextPart(text="searching"),
             )
         ),
@@ -939,7 +939,7 @@ def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -
     )
     outcome = _structured_parse(completion)
     assert isinstance(outcome, EmptyTurn)
-    assert outcome.assistant_message.turn == (OpaqueElement(raw=_CUSTOM_TOOL_CALL_WIRE),)
+    assert outcome.assistant_message.turn == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE),)
 
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
@@ -1118,7 +1118,7 @@ def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concate
         "hey",
     ]
     result = _assert_result(_text_bound().interpret(final))
-    assert result.assistant_message.turn[0] == ReasoningTrace(
+    assert result.assistant_message.turn[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
 
@@ -1398,7 +1398,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
 
     @override
-    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel:
+    def response_with_raw_part(self) -> BaseModel:
         """Return message.content beside one custom message.tool_calls entry.
 
         openai 2.51.0 defines both fields on ChatCompletionMessage.
@@ -1409,24 +1409,24 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         )
 
     @override
-    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
-        """Decompose the one assistant param past the user message into wire-order elements.
+    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+        """Decompose one assistant param into wire-order parts.
 
-        This wire holds a turn as one message param, so the reader splits it back into the trace
-        dict, the content, and each tool call, matching the turn's element order.
+        This wire stores the turn in one message param.
+        Split ReasoningPart.raw, content, and ToolCall values in TurnPart order.
         """
         assert isinstance(request, _ChatCompletionsRequestParams)
         (assistant_param,) = request.messages[1:]
         payload = dict(assistant_param)
-        elements: list[object] = []
+        parts: list[object] = []
         if "reasoning_content" in payload:
-            elements.append({"reasoning_content": payload["reasoning_content"]})
+            parts.append({"reasoning_content": payload["reasoning_content"]})
         if "content" in payload:
-            elements.append(payload["content"])
+            parts.append(payload["content"])
         tool_calls = payload.get("tool_calls")
         if isinstance(tool_calls, list):
-            elements.extend(tool_calls)
-        return elements
+            parts.extend(tool_calls)
+        return parts
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:

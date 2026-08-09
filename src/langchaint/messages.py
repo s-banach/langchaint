@@ -52,8 +52,8 @@ class ImagePart(CheckedCopyModel):
     kind: Literal["image"] = "image"
 
 
-type Part = Annotated[TextPart | ImagePart, Field(discriminator="kind")]
-"""One element of a message body.
+type ContentPart = Annotated[TextPart | ImagePart, Field(discriminator="kind")]
+"""One model-facing value inside message content.
 
 Convert a document before sending it, into one form picked by its content.
 Extract the text layer to TextPart where words carry the meaning; rasterize the pages to ImagePart where layout does.
@@ -61,13 +61,13 @@ The application owns that conversion,
 so it picks the resolution, which pages to send, and the text extractor, and can measure what each choice costs.
 """
 
-type MessageContent = str | Sequence[Part]
+type MessageContent = str | Sequence[ContentPart]
 """A model-facing message body (text and images the model reads).
 This is the constructor-facing form a caller or tool provides;
-the pydantic message models store it as str | tuple[Part, ...], coercing the sequence to a frozen tuple,
+the pydantic message models store it as str | tuple[ContentPart, ...], coercing the sequence to a frozen tuple,
 so their fields spell that tuple form out rather than aliasing it.
 It is not the possibly-structured generation Response.output,
-which can be a parsed BaseModel that is not a Part and never round-trips back into a message body.
+which can be a parsed BaseModel that is not a ContentPart and never round-trips back into a message body.
 """
 
 
@@ -99,32 +99,33 @@ class UserMessage(CheckedCopyModel):
     BoundLLM.generate_one as a bare string, which wraps it in a UserMessage.
 
     Raises:
-        pydantic.ValidationError: content is neither a str nor a sequence of Parts,
+        pydantic.ValidationError: content is neither str nor a sequence of ContentPart values,
             or a key that is not a field was passed.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    content: str | tuple[Part, ...]
+    content: str | tuple[ContentPart, ...]
     kind: Literal["user"] = "user"
 
 
-class ReasoningTrace(CheckedCopyModel):
-    """One reasoning element the model produced, round-tripped verbatim.
+class ReasoningPart(CheckedCopyModel):
+    """One ReasoningPart the model produced, round-tripped verbatim.
 
     The core never inspects raw: raw is the producing SDK item's model_dump(exclude_none=True),
     and the consuming adapter re-feeds it
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
     thinking block; OpenAI re-reads encrypted_content; Gemini requires thought signatures resent
     exactly as received).
-    No provider reads another provider's trace.
-    Switching providers therefore means first rebuilding assistant turns without their traces;
+    No provider reads another provider's ReasoningPart.raw.
+    Switching providers requires rebuilding turns without foreign ReasoningPart values.
     each adapter's docstring states what its wire does with a foreign one.
     Full reasoning history is the default; editing the Sequence[Message] is the only way to change it.
     Trimming is the application's job.
-    Trimming for length removes whole turns; a kept turn keeps its traces.
+    Trimming for length removes whole turns.
+    A kept turn keeps its ReasoningPart values.
     The anthropic API 400s a tool-use continuation missing the latest assistant turn's thinking.
-    Beyond replay correctness, keeping traces matters for quality
+    Beyond replay correctness, keeping ReasoningPart values matters for quality
     (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
     and for prompt caching:
     reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
@@ -142,13 +143,13 @@ class ReasoningTrace(CheckedCopyModel):
 
     raw: Mapping[str, object]
     text: str | None = None
-    kind: Literal["reasoning_trace"] = "reasoning_trace"
+    kind: Literal["reasoning_part"] = "reasoning_part"
 
 
-class OpaqueElement(CheckedCopyModel):
-    """One assistant-turn value langchaint models nothing inside.
+class RawPart(CheckedCopyModel):
+    """One replayable provider fragment without another TurnPart variant.
 
-    An adapter emits OpaqueElement for replayable response values lacking another TurnElement variant.
+    An adapter emits RawPart for replayable response values lacking another TurnPart variant.
     The turn preserves their response order.
     raw is the producing SDK model_dump fragment required for replay.
     The consuming adapter sends raw unchanged in its original wire position.
@@ -159,15 +160,15 @@ class OpaqueElement(CheckedCopyModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     raw: Mapping[str, object]
-    kind: Literal["opaque_element"] = "opaque_element"
+    kind: Literal["raw_part"] = "raw_part"
 
 
-type TurnElement = Annotated[
-    ReasoningTrace | TextPart | ToolCall | OpaqueElement, Field(discriminator="kind")
+type TurnPart = Annotated[
+    ReasoningPart | TextPart | ToolCall | RawPart, Field(discriminator="kind")
 ]
-"""One element of an assistant turn, ordered as the provider emitted them.
-Discriminated on kind, so re-validating a persisted turn selects each element's variant from its tag.
-The text element is TextPart, not Part: an image a provider returns arrives as an OpaqueElement.
+"""One ordered value inside AssistantMessage.turn.
+
+An image a provider returns arrives as RawPart.
 """
 
 
@@ -183,7 +184,7 @@ def _text_only_turn(turn: object) -> object:
 
 
 class AssistantMessage(CheckedCopyModel):
-    """One assistant turn, stored as the ordered element sequence the provider emitted.
+    """One assistant turn, stored as the ordered part sequence the provider emitted.
 
     Both providers emit and require the order (Anthropic cannot rearrange thinking blocks;
     OpenAI replays output items in their original order under store=False),
@@ -194,7 +195,7 @@ class AssistantMessage(CheckedCopyModel):
 
     Raises:
         pydantic.ValidationError: a key that is not a field was passed,
-            or turn is neither a str nor a sequence of TurnElements,
+            or turn is neither str nor a sequence of TurnPart values,
             or a TextPart in the turn sets cache_breakpoint
             (openai has no breakpoint on assistant replay text,
             so a marked assistant part would be a provider-divergent runtime failure;
@@ -203,7 +204,7 @@ class AssistantMessage(CheckedCopyModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    turn: Annotated[tuple[TurnElement, ...], BeforeValidator(_text_only_turn)]
+    turn: Annotated[tuple[TurnPart, ...], BeforeValidator(_text_only_turn)]
     kind: Literal["assistant"] = "assistant"
 
     @model_validator(mode="after")
@@ -213,9 +214,7 @@ class AssistantMessage(CheckedCopyModel):
         Raises:
             ValueError: a TextPart in the turn sets cache_breakpoint; pydantic surfaces it as a ValidationError.
         """
-        if any(
-            isinstance(element, TextPart) and element.cache_breakpoint for element in self.turn
-        ):
+        if any(isinstance(part, TextPart) and part.cache_breakpoint for part in self.turn):
             raise ValueError(
                 "cache_breakpoint is not supported on assistant turn text: "
                 "openai has no breakpoint on assistant replay text; "
@@ -226,12 +225,12 @@ class AssistantMessage(CheckedCopyModel):
     @property
     def text(self) -> str:
         """The concatenated TextPart texts of the turn; empty when the turn held no text."""
-        return "".join(element.text for element in self.turn if isinstance(element, TextPart))
+        return "".join(part.text for part in self.turn if isinstance(part, TextPart))
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """The ToolCall elements of the turn, in emission order."""
-        return tuple(element for element in self.turn if isinstance(element, ToolCall))
+        """The ToolCall parts of the turn, in emission order."""
+        return tuple(part for part in self.turn if isinstance(part, ToolCall))
 
 
 class ToolMessage(CheckedCopyModel):
@@ -244,12 +243,12 @@ class ToolMessage(CheckedCopyModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     tool_call_id: str
-    content: str | tuple[Part, ...]
+    content: str | tuple[ContentPart, ...]
     is_error: bool = False
     kind: Literal["tool"] = "tool"
 
     @classmethod
-    def error(cls, tool_call: ToolCall, content: str | tuple[Part, ...]) -> "ToolMessage":
+    def error(cls, tool_call: ToolCall, content: str | tuple[ContentPart, ...]) -> "ToolMessage":
         """Build an is_error ToolMessage answering tool_call.
 
         tool_call_id is bound from tool_call.id, so the message answers that call by construction.
@@ -270,16 +269,15 @@ _MESSAGES_JSON: TypeAdapter[list[Message]] = TypeAdapter(list[Message])
 def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) -> str:
     """Serialize messages as JSON text that messages_from_json restores.
 
-    messages_from_json loads this output under every later langchaint version.
     A release that breaks loading says so in its release notes.
 
     The output is compact; pass indent (pydantic's dump_json indent) for text a human reads or diffs.
-    Each ReasoningTrace.raw and each OpaqueElement.raw is embedded as the mapping the adapter replays,
+    Each ReasoningPart.raw and each RawPart.raw is embedded as the mapping the adapter replays,
     so a restored conversation builds the same wire request as the original;
     the conformance suite asserts that per adapter.
 
     Raises:
-        pydantic_core.PydanticSerializationError: a ReasoningTrace.raw or OpaqueElement.raw value is
+        pydantic_core.PydanticSerializationError: a ReasoningPart.raw or RawPart.raw value is
             an object JSON cannot represent.
     """
     return _MESSAGES_JSON.dump_json(list(messages), indent=indent).decode()

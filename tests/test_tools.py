@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from langchaint import (
     CaptureTool,
+    ContentPart,
     DispatchCaptured,
     DispatchExceptionGroup,
     DispatchHandled,
@@ -28,7 +29,6 @@ from langchaint import (
     InvalidToolArgsDetail,
     InvalidToolArgsError,
     JSONSchemaTool,
-    Part,
     PydanticTool,
     TextPart,
     ToolCall,
@@ -281,21 +281,21 @@ def test_dispatch_wraps_success_in_a_tool_message() -> None:
     assert result.app_data is None
 
 
-def test_dispatch_carries_a_parts_result_into_tool_message_content() -> None:
-    """A function returning a sequence of parts reaches ToolMessage.content as a tuple of those parts.
+def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
+    """Sequence[ContentPart] reaches ToolMessage.content as a tuple.
 
     A success path that dropped or stringified the result would fail this equality.
     """
 
-    async def _parts_function(args: _EchoArgs) -> Sequence[Part]:
-        """Return content parts built from the validated text instead of a string."""
+    async def _content_parts_function(args: _EchoArgs) -> Sequence[ContentPart]:
+        """Return ContentPart values built from validated text."""
         return [TextPart(text=args.text), ImagePart(data=b"png", media_type="image/png")]
 
     tool = PydanticTool(
         name="render",
-        description="Return parts.",
+        description="Return model content.",
         args_model=_EchoArgs,
-        function=_parts_function,
+        function=_content_parts_function,
     )
     call = ToolCall(id="call1", name="render", args_json='{"text": "tide"}')
     result = asyncio.run(ToolManager([tool]).dispatch(call))

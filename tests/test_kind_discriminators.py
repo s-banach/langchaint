@@ -18,6 +18,7 @@ from typing import assert_type
 
 from langchaint import (
     AssistantMessage,
+    ContentPart,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchManyOutcome,
@@ -29,12 +30,11 @@ from langchaint import (
     ImagePart,
     InvalidToolArgsDetail,
     Message,
-    OpaqueElement,
-    Part,
     PauseAll,
     PauseAllDoNotRetry,
+    RawPart,
     ReasoningDelta,
-    ReasoningTrace,
+    ReasoningPart,
     Response,
     RetryThisOne,
     StreamItem,
@@ -43,7 +43,7 @@ from langchaint import (
     ToolCallDelta,
     ToolCallTurn,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
     Verdict,
 )
@@ -85,7 +85,7 @@ def _by_message_kind_missing_a_variant(message: Message) -> object:
             return message.content
 
 
-def _by_part_kind(part: Part) -> object:
+def _by_content_part_kind(part: ContentPart) -> object:
     match part.kind:
         case "text":
             return part.text
@@ -93,28 +93,28 @@ def _by_part_kind(part: Part) -> object:
             return part.media_type
 
 
-def _by_part_kind_missing_a_variant(part: Part) -> object:
+def _by_content_part_kind_missing_a_variant(part: ContentPart) -> object:
     match part.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "text":
             return part.text
 
 
-def _by_turn_element_kind(element: TurnElement) -> object:
-    match element.kind:
-        case "reasoning_trace":
-            return element.text
+def _by_turn_part_kind(part: TurnPart) -> object:
+    match part.kind:
+        case "reasoning_part":
+            return part.text
         case "text":
-            return element.cache_breakpoint
+            return part.cache_breakpoint
         case "tool_call":
-            return element.args_json
-        case "opaque_element":
-            return element.raw
+            return part.args_json
+        case "raw_part":
+            return part.raw
 
 
-def _by_turn_element_kind_missing_a_variant(element: TurnElement) -> object:
-    match element.kind:  # pyrefly: ignore[non-exhaustive-match]
-        case "reasoning_trace":
-            return element.raw
+def _by_turn_part_kind_missing_a_variant(part: TurnPart) -> object:
+    match part.kind:  # pyrefly: ignore[non-exhaustive-match]
+        case "reasoning_part":
+            return part.raw
 
 
 def _by_dispatch_outcome_kind(outcome: DispatchOutcome) -> object:
@@ -253,21 +253,24 @@ def test_a_message_kind_selects_the_variant_that_carries_the_field_read() -> Non
     assert _by_message_kind_missing_a_variant(_TOOL_MESSAGE) is None
 
 
-def test_a_part_kind_selects_the_variant_that_carries_the_field_read() -> None:
-    """Each Part variant's tag reaches a field the other variant does not carry."""
-    assert _by_part_kind(TextPart(text="hi")) == "hi"
-    assert _by_part_kind(ImagePart(data=b"png", media_type="image/png")) == "image/png"
-    assert _by_part_kind_missing_a_variant(ImagePart(data=b"png", media_type="image/png")) is None
+def test_a_content_part_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each ContentPart tag reaches a variant-specific field."""
+    assert _by_content_part_kind(TextPart(text="hi")) == "hi"
+    assert _by_content_part_kind(ImagePart(data=b"png", media_type="image/png")) == "image/png"
+    assert (
+        _by_content_part_kind_missing_a_variant(ImagePart(data=b"png", media_type="image/png"))
+        is None
+    )
 
 
-def test_a_turn_element_kind_selects_the_variant_that_carries_the_field_read() -> None:
-    """Each TurnElement variant's tag reaches a field some other variant does not carry."""
-    assert _by_turn_element_kind(ReasoningTrace(raw={"id": "rs_1"}, text="hm")) == "hm"
-    assert _by_turn_element_kind(TextPart(text="hi")) is False
-    assert _by_turn_element_kind(ToolCall(id="c1", name="probe", args_json="{}")) == "{}"
-    assert _by_turn_element_kind(OpaqueElement(raw={"id": "ws_1"})) == {"id": "ws_1"}
+def test_a_turn_part_kind_selects_the_variant_that_carries_the_field_read() -> None:
+    """Each TurnPart tag reaches a variant-specific field."""
+    assert _by_turn_part_kind(ReasoningPart(raw={"id": "rs_1"}, text="hm")) == "hm"
+    assert _by_turn_part_kind(TextPart(text="hi")) is False
+    assert _by_turn_part_kind(ToolCall(id="c1", name="probe", args_json="{}")) == "{}"
+    assert _by_turn_part_kind(RawPart(raw={"id": "ws_1"})) == {"id": "ws_1"}
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
-    assert _by_turn_element_kind_missing_a_variant(tool_call) is None
+    assert _by_turn_part_kind_missing_a_variant(tool_call) is None
 
 
 def test_a_dispatch_outcome_kind_selects_the_variant_that_carries_the_field_read() -> None:

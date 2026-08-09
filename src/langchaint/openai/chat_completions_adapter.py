@@ -56,12 +56,12 @@ Mapping decisions:
   which carry prompt_cache_breakpoint marks.
 - An AssistantMessage replays as one assistant message param, because this wire holds a turn as
   one object rather than as items: the turn's texts join into its `content`, each ToolCall
-  becomes one entry of its `tool_calls`, and a ReasoningTrace's raw dict merges into the param,
+  becomes one entry of its `tool_calls`, and ReasoningPart.raw merges into the param,
   putting `reasoning_content` beside `content` in the one message DeepSeek requires it on.
-  Replaying the trace verbatim is correct on both DeepSeek paths: outside a tool loop the API
-  ignores a replayed `reasoning_content`, and inside one omitting it is a 400
+  Outside a tool loop, the API ignores replayed `reasoning_content`.
+  Inside a tool loop, omission produces a 400
   (https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03).
-  openai's own Chat Completions returns no reasoning field, so the trace path never fires there.
+  openai's Chat Completions returns no reasoning field, so it produces no ReasoningPart.
 - `message.refusal` becomes a TextPart in the turn, so the sentences the model wrote to refuse
   are the turn's text and replay as assistant content; the stop reason is "refusal", tested
   ahead of the finish_reason rows, so a refusal arriving with finish_reason "stop" reports it.
@@ -141,13 +141,13 @@ from langchaint.messages import (
     AssistantMessage,
     ImagePart,
     Message,
-    OpaqueElement,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
 )
 from langchaint.openai.shared import (
@@ -330,50 +330,50 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     """TextPart values concatenate into content.
 
     ToolCall values become function tool_calls entries.
-    OpaqueElement.raw with type "custom" becomes a custom tool_calls entry unchanged.
-    OpaqueElement.raw holding only function_call merges into the message unchanged.
+    RawPart.raw with type "custom" becomes a custom tool_calls entry unchanged.
+    RawPart.raw holding only function_call merges into the message unchanged.
     These tool_calls entries retain their emission order.
-    Each ReasoningTrace.raw merges into the message fields.
+    Each ReasoningPart.raw merges into the message fields.
     This matches openai 2.51.0's ChatCompletionAssistantMessageParam variants.
 
     Raises:
-        _NotSendableError: OpaqueElement.raw matches no supported shape, or repeats function_call.
+        _NotSendableError: RawPart.raw matches no supported shape, or repeats function_call.
     """
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []
-    for element in assistant_message.turn:
-        if isinstance(element, ReasoningTrace):
-            param.update(element.raw)
-        elif isinstance(element, TextPart):
-            if element.text:
-                texts.append(element.text)
-        elif isinstance(element, ToolCall):
+    for part in assistant_message.turn:
+        if isinstance(part, ReasoningPart):
+            param.update(part.raw)
+        elif isinstance(part, TextPart):
+            if part.text:
+                texts.append(part.text)
+        elif isinstance(part, ToolCall):
             tool_calls.append({
-                "id": element.id,
+                "id": part.id,
                 "type": "function",
-                "function": {"name": element.name, "arguments": element.args_json},
+                "function": {"name": part.name, "arguments": part.args_json},
             })
-        elif element.raw.get("type") == "custom":
+        elif part.raw.get("type") == "custom":
             # cast: a deliberately-opaque value re-enters the typed API that serialized it.
-            tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", element.raw))
-        elif len(element.raw) == 1 and "function_call" in element.raw:
+            tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", part.raw))
+        elif len(part.raw) == 1 and "function_call" in part.raw:
             if "function_call" in param:
                 raise _NotSendableError(
                     "an assistant turn contains more than one function_call, but Chat Completions "
                     "has one function_call field"
                 )
-            param.update(element.raw)
+            param.update(part.raw)
         else:
             raise _NotSendableError(
-                "OpaqueElement.raw has no Chat Completions wire form: only custom tool_calls and "
+                "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
                 "function_call can hold it; rebuild the turn without it"
             )
     if texts:
         param["content"] = "".join(texts)
     if tool_calls:
         param["tool_calls"] = tool_calls
-    # The trace's raw keys are deliberately wider than the assistant param TypedDict, under
+    # ReasoningPart.raw keys are deliberately wider than the assistant param TypedDict, under
     # "Honor user inputs faithfully"; the cast is that boundary.
     return cast("ChatCompletionMessageParam", param)
 
@@ -382,7 +382,7 @@ def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessagePar
     """Keep the bound system prompt outside messages.
 
     Raises:
-        _NotSendableError: ToolMessage contains ImagePart, or OpaqueElement.raw has no wire form.
+        _NotSendableError: ToolMessage contains ImagePart, or RawPart.raw has no wire form.
     """
     wire: list[ChatCompletionMessageParam] = []
     for message in messages:
@@ -439,22 +439,22 @@ def _as_chat_completion(raw: BaseModel) -> ChatCompletion:
 def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     """Preserve replayable provider values inside AssistantMessage.turn.
 
-    A non-empty reasoning_content becomes ReasoningTrace first.
+    A non-empty reasoning_content becomes ReasoningPart first.
     message.content then becomes TextPart when non-empty.
     message.refusal then becomes TextPart when non-empty.
-    message.function_call then becomes OpaqueElement when present.
+    message.function_call then becomes RawPart when present.
     Each function message.tool_calls entry becomes ToolCall.
-    Each custom message.tool_calls entry becomes OpaqueElement.
+    Each custom message.tool_calls entry becomes RawPart.
     The message.tool_calls entry order is preserved.
     openai 2.51.0 defines both variants.
-    message.annotations and message.audio reach no TurnElement.
+    message.annotations and message.audio reach no TurnPart.
     Read those fields from Response.raw.
     """
-    turn: list[TurnElement] = []
+    turn: list[TurnPart] = []
     reasoning_content = _reasoning_content_extra(message)
     if reasoning_content is not None:
         turn.append(
-            ReasoningTrace(raw={"reasoning_content": reasoning_content}, text=reasoning_content)
+            ReasoningPart(raw={"reasoning_content": reasoning_content}, text=reasoning_content)
         )
     if message.content:
         turn.append(TextPart(text=message.content))
@@ -462,7 +462,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
         turn.append(TextPart(text=message.refusal))
     if message.function_call is not None:
         turn.append(
-            OpaqueElement(
+            RawPart(
                 raw=message.model_dump(mode="python", include={"function_call"}, exclude_none=True)
             )
         )
@@ -476,7 +476,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
                 )
             )
         else:
-            turn.append(OpaqueElement(raw=tool_call.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=tool_call.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 

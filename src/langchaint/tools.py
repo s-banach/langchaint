@@ -8,7 +8,7 @@ JSONSchemaTool is the raw-JSON-schema form for a tool whose schema is a plain JS
 args_schema rides through to the provider unchanged, and dispatch validates the arguments against args_schema
 with jsonschema (first that they are a JSON object, then the schema's field-level rules), so a schema violation
 renders through the same formatter as a PydanticTool failure and the function only ever sees valid arguments.
-Both function-bearing forms return str or a Sequence[Part] (text and images the model then sees).
+Both function-bearing forms return str or a Sequence[ContentPart].
 They may instead return a ToolOutputExplicit carrying that content plus is_error and app_data.
 CaptureTool is the function-free form: a tool whose whole job is carrying a validated instance to the application.
 The archetype is the final-response tool that ends a tool loop.
@@ -45,7 +45,7 @@ class ToolOutputExplicit[AppDataT = None]:
     """The explicit variant of ToolOutput: the model-visible outcome plus app_data.
 
     content is what the model reads, the same shape as a bare function return and as ToolMessage.content:
-    MessageContent, a str or a Sequence[Part] (text and images the model sees) and nothing else, because
+    MessageContent, a str or a Sequence[ContentPart], and nothing else, because
     content is model-facing and must already be in a form the model reads;
     a function with a typed result serializes it to that form itself.
     is_error marks a model-visible failure the model should read and adapt to;

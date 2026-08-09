@@ -38,10 +38,10 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
-    OpaqueElement,
     PydanticTool,
+    RawPart,
     ReasoningDelta,
-    ReasoningTrace,
+    ReasoningPart,
     SpecificToolChoice,
     StreamItem,
     TextPart,
@@ -455,7 +455,7 @@ def _message_with_content(
 def test_reasoning_round_trips_verbatim_in_position() -> None:
     """A thinking block round-trips verbatim and in its original position.
 
-    Produce yields one ReasoningTrace where the thinking block sat.
+    Produce yields one ReasoningPart where the thinking block sat.
     Consume re-emits the stored dict unchanged, in the same position, with one wire block per modeled block.
     """
     message = _message_with_content([
@@ -464,26 +464,26 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         at.ToolUseBlock(type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}),
     ])
     assistant_message = _assistant_message_from(message)
-    assert [type(element) for element in assistant_message.turn] == [
-        ReasoningTrace,
+    assert [type(part) for part in assistant_message.turn] == [
+        ReasoningPart,
         TextPart,
         ToolCall,
     ]
-    reasoning_trace = assistant_message.turn[0]
-    assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.raw == {
+    reasoning_part = assistant_message.turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.raw == {
         "type": "thinking",
         "thinking": "check first",
         "signature": "sig-1",
     }
-    assert reasoning_trace.text == "check first"
+    assert reasoning_part.text == "check first"
     assert assistant_message.text == "hello"
     assert assistant_message.tool_calls == (
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
     )
     blocks = _assistant_content_blocks(assistant_message)
     assert len(blocks) == len(message.content)
-    assert blocks[0] == reasoning_trace.raw
+    assert blocks[0] == reasoning_part.raw
     assert blocks[1] == {"type": "text", "text": "hello"}
     assert blocks[2] == {
         "type": "tool_use",
@@ -496,37 +496,37 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
 def test_empty_thinking_text_normalizes_to_none() -> None:
     """A thinking block whose text is "" yields text None, the single text-free condition.
 
-    The openai adapter cannot produce "", so storing it here would make a text-free trace
+    The openai adapter cannot produce "", so storing it here would give ReasoningPart.text
     two values to test for, one of them provider-specific.
     """
     message = _message_with_content([
         at.ThinkingBlock(type="thinking", thinking="", signature="sig")
     ])
-    reasoning_trace = _assistant_message_from(message).turn[0]
-    assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.text is None
-    assert reasoning_trace.raw["thinking"] == ""
+    reasoning_part = _assistant_message_from(message).turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.text is None
+    assert reasoning_part.raw["thinking"] == ""
 
 
 def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire.
 
-    Its trace carries no text: the block holds an opaque string under data and nothing readable.
+    ReasoningPart.text is None because the block has no readable text.
     """
     message = _message_with_content([
         at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes")
     ])
     assistant_message = _assistant_message_from(message)
-    reasoning_trace = assistant_message.turn[0]
-    assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.text is None
+    reasoning_part = assistant_message.turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.text is None
     assert _assistant_content_blocks(assistant_message) == [
         {"type": "redacted_thinking", "data": "opaque-bytes"}
     ]
 
 
-def test_a_server_tool_block_becomes_an_opaque_element_and_replays_as_itself() -> None:
-    """A block this adapter has no variant for reaches the turn and goes back unchanged.
+def test_a_server_tool_block_becomes_a_raw_part_and_replays_as_itself() -> None:
+    """A server tool block becomes RawPart and returns unchanged.
 
     The response was billed for that block, so dropping it would destroy output the caller paid for
     and leave a tool loop continuing from a turn the model did not produce.
@@ -541,8 +541,8 @@ def test_a_server_tool_block_becomes_an_opaque_element_and_replays_as_itself() -
             )
         ])
     )
-    (opaque_element,) = assistant_message.turn
-    assert isinstance(opaque_element, OpaqueElement)
+    (raw_part,) = assistant_message.turn
+    assert isinstance(raw_part, RawPart)
     assert _assistant_content_blocks(assistant_message) == [
         {
             "type": "server_tool_use",
@@ -553,12 +553,12 @@ def test_a_server_tool_block_becomes_an_opaque_element_and_replays_as_itself() -
     ]
 
 
-def test_produced_traces_survive_the_message_json_round_trip() -> None:
-    """A produced turn holding thinking and redacted_thinking traces re-validates equal from JSON.
+def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
+    """Produced ReasoningPart values re-validate equal from JSON.
 
-    Persist/resume serializes a Sequence[Message] with a TypeAdapter,
-    and a raw that came back changed is a request the API rejects,
-    so the round trip must restore each trace's dump exactly.
+    Persistence serializes Sequence[Message] through TypeAdapter.
+    A changed raw payload causes API rejection.
+    The round trip must restore each ReasoningPart.raw exactly.
     """
     message = _message_with_content([
         at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
@@ -572,9 +572,9 @@ def test_produced_traces_survive_the_message_json_round_trip() -> None:
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
-    """An openai-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
+    """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw = {"type": "reasoning", "id": "rs_1"}
-    assistant_message = AssistantMessage(turn=(ReasoningTrace(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
         raw,
         {"type": "text", "text": "hi"},
@@ -627,7 +627,7 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
         AssistantMessage(
             turn=(
                 TextPart(text="t"),
-                ReasoningTrace(raw={"type": "thinking", "thinking": "x", "signature": "s"}),
+                ReasoningPart(raw={"type": "thinking", "thinking": "x", "signature": "s"}),
             )
         )
     ]
@@ -1169,9 +1169,9 @@ def test_stream_final_turn_carries_reasoning() -> None:
         async for _item in adapter_stream.items():
             pass
         assistant_message = _assistant_message_from(await adapter_stream.final())
-        reasoning_trace = assistant_message.turn[0]
-        assert isinstance(reasoning_trace, ReasoningTrace)
-        assert reasoning_trace.raw == {
+        reasoning_part = assistant_message.turn[0]
+        assert isinstance(reasoning_part, ReasoningPart)
+        assert reasoning_part.raw == {
             "type": "thinking",
             "thinking": "check",
             "signature": "sig-1",
@@ -1730,7 +1730,7 @@ def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> 
 def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_request() -> None:
     """A stored payload with no type key is no content block, so nothing is sent.
 
-    A turn replayed from a provider whose elements carry no type key is what gets here.
+    RawPart.raw without a type key reaches this path.
     Automatic caching is bound on, the case where the wire path reads that key to place the
     breakpoint: passing the payload through raises KeyError out of build_request, which names a
     langchaint defect for a request no defect produced.
@@ -1742,7 +1742,7 @@ def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_reques
     bound_adapter = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
     messages = [
         UserMessage(content="q"),
-        AssistantMessage(turn=(OpaqueElement(raw={"parts": [{"text": "from elsewhere"}]}),)),
+        AssistantMessage(turn=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
     ]
     outcome = bound_adapter.build_request(messages)
     assert isinstance(outcome, InvalidRequest)
@@ -1985,7 +1985,7 @@ def _turn_content() -> list[at.ContentBlock]:
     The thinking block carries a key the installed SDK does not name; model_construct rather than
     the constructor, because the extra key is the point and the constructor of a pinned SDK model
     has no field for a key that SDK does not name.
-    The server tool call is the block this adapter has no turn-element variant for.
+    The server tool call has no other TurnPart variant.
     The text block stays last, so the request's automatic cache marker lands on it rather than on a
     block whose stored dump an invariant compares against the wire.
     """
@@ -2050,12 +2050,12 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         return _turn_message(_usage_with_cache_split())
 
     @override
-    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel | None:
         """Return the turn whose middle block is a server tool call."""
         return _turn_message(_usage_with_cache_split())
 
     @override
-    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
         """Read the content blocks of the assistant message this request ends with."""
         assert isinstance(request, _AnthropicRequestParams)
         return _content_blocks(request.messages[-1])

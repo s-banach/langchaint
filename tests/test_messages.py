@@ -1,4 +1,4 @@
-"""The kind discriminator on the Message, Part, and TurnElement unions.
+"""The kind discriminator on Message, ContentPart, and TurnPart.
 
 Persist/resume serializes a Sequence[Message] with a TypeAdapter and re-validates it,
 so a payload that re-validates to the wrong variant silently corrupts replay.
@@ -15,8 +15,8 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     Message,
-    OpaqueElement,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     TextPart,
     ToolCall,
     ToolMessage,
@@ -28,40 +28,40 @@ from langchaint import (
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
-def test_turn_elements_validate_to_the_variant_their_tag_names() -> None:
-    """A persisted turn re-validates to the variant each element's kind names, raw byte-identical.
+def test_turn_parts_validate_to_the_variant_their_tag_names() -> None:
+    """A persisted turn validates each part from its kind.
 
-    A turn whose dicts re-validate to the wrong variant would silently corrupt replay, and a trace
+    Selecting the wrong variant would corrupt replay, and a ReasoningPart
     whose raw came back changed is a request the producing provider rejects.
     """
     raw = {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc-1"}
     message = AssistantMessage.model_validate({
         "kind": "assistant",
         "turn": [
-            {"kind": "reasoning_trace", "raw": raw, "text": "thought it over"},
-            {"kind": "reasoning_trace", "raw": {"type": "reasoning", "id": "rs_2"}},
+            {"kind": "reasoning_part", "raw": raw, "text": "thought it over"},
+            {"kind": "reasoning_part", "raw": {"type": "reasoning", "id": "rs_2"}},
             {"kind": "text", "text": "hi"},
             {"kind": "tool_call", "id": "c1", "name": "probe", "args_json": "{}"},
         ],
     })
-    assert [type(element) for element in message.turn] == [
-        ReasoningTrace,
-        ReasoningTrace,
+    assert [type(part) for part in message.turn] == [
+        ReasoningPart,
+        ReasoningPart,
         TextPart,
         ToolCall,
     ]
     with_text, without_text = message.turn[0], message.turn[1]
-    assert isinstance(with_text, ReasoningTrace)
-    assert isinstance(without_text, ReasoningTrace)
+    assert isinstance(with_text, ReasoningPart)
+    assert isinstance(without_text, ReasoningPart)
     assert with_text.raw == raw
     assert with_text.text == "thought it over"
     assert without_text.text is None
 
 
-def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
-    """An element carrying a variant's fields but no kind fails, located at the element index.
+def test_an_untagged_turn_part_is_rejected_at_its_index() -> None:
+    """A TurnPart without kind fails at its index.
 
-    The tag selects the variant before any field is read, so no element is matched by its shape.
+    The tag selects the variant before reading fields.
     """
     with pytest.raises(ValidationError) as caught:
         _ = AssistantMessage.model_validate({"kind": "assistant", "turn": [{"text": "hi"}]})
@@ -70,8 +70,8 @@ def test_an_untagged_turn_element_is_rejected_at_its_index() -> None:
     ]
 
 
-def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> None:
-    """A tagged element is validated against that variant alone, so one bad field is one error."""
+def test_a_malformed_tagged_turn_part_reports_one_error_at_its_field() -> None:
+    """A tagged TurnPart validates against one variant."""
     with pytest.raises(ValidationError) as caught:
         _ = AssistantMessage.model_validate({
             "kind": "assistant",
@@ -79,6 +79,19 @@ def test_a_malformed_tagged_turn_element_reports_one_error_at_its_field() -> Non
         })
     assert [(error["loc"], error["type"]) for error in caught.value.errors()] == [
         (("turn", 0, "text", "text"), "string_type")
+    ]
+
+
+@pytest.mark.parametrize("kind", ["reasoning_trace", "opaque_element"])
+def test_reasoning_trace_and_opaque_element_tags_are_rejected(kind: str) -> None:
+    """The reasoning_trace and opaque_element tags fail discriminator validation."""
+    with pytest.raises(ValidationError) as caught:
+        _ = AssistantMessage.model_validate({
+            "kind": "assistant",
+            "turn": [{"kind": kind, "raw": {}}],
+        })
+    assert [(error["loc"], error["type"]) for error in caught.value.errors()] == [
+        (("turn", 0), "union_tag_invalid")
     ]
 
 
@@ -205,9 +218,7 @@ _PINNED_MESSAGES: tuple[Message, ...] = (
     UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
     AssistantMessage(
         turn=(
-            ReasoningTrace(
-                raw={"type": "thinking", "thinking": "hm", "signature": "s"}, text="hm"
-            ),
+            ReasoningPart(raw={"type": "thinking", "thinking": "hm", "signature": "s"}, text="hm"),
             TextPart(text="checking"),
             ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
             ToolCall(id="c2", name="fetch", args_json="{}"),
@@ -223,19 +234,19 @@ _PINNED_MESSAGES: tuple[Message, ...] = (
     ToolMessage(tool_call_id="c2", content="fetch failed", is_error=True),
     UserMessage(content="and then?"),
 )
-"""The conversation _PINNED_MESSAGES_JSON encodes. Changing an element invalidates that literal."""
+"""The conversation _PINNED_MESSAGES_JSON encodes. Changing a part invalidates that literal."""
 
 
 def _one_of_each_message() -> list[Message]:
-    """One conversation holding every message type, every turn element type, and both content forms.
+    """One conversation holding every Message and TurnPart variant.
 
-    Grow it by appending an element here, so _PINNED_MESSAGES stays pinned.
+    Append a part here, so _PINNED_MESSAGES stays pinned.
     """
     return [
         *_PINNED_MESSAGES,
         AssistantMessage(
             turn=(
-                OpaqueElement(raw={"type": "web_search_call", "id": "ws_1"}),
+                RawPart(raw={"type": "web_search_call", "id": "ws_1"}),
                 TextPart(text="ok"),
             )
         ),
@@ -248,7 +259,7 @@ def test_messages_json_round_trip_restores_the_list() -> None:
     assert messages_from_json(messages_to_json(messages)) == messages
 
 
-_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"turn":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_trace"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
+_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"turn":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_part"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
 """One messages_to_json output, pasted rather than computed.
 
 This is the persisted-text format applications hold on disk.
@@ -283,12 +294,12 @@ def test_messages_from_json_rejects_text_that_is_not_a_message_list() -> None:
 
 
 def test_messages_to_json_raises_on_a_raw_value_json_cannot_represent() -> None:
-    """A ReasoningTrace.raw holding a non-JSON-representable object raises, never silently reshapes.
+    """A ReasoningPart.raw holding a non-JSON-representable object raises, never silently reshapes.
 
-    This pins the failure mode for a hand-built trace: a raise, not a lossy fallback the replay
+    This pins the failure mode for a hand-built ReasoningPart: a raise, not a lossy fallback the replay
     would send.
     """
-    message = AssistantMessage(turn=(ReasoningTrace(raw={"payload": object()}),))
+    message = AssistantMessage(turn=(ReasoningPart(raw={"payload": object()}),))
     with pytest.raises(PydanticSerializationError):
         _ = messages_to_json([message])
 

@@ -50,4 +50,4 @@ Stop when a constructed anthropic usage reporting `web_search_requests` prices a
 State the answer for each where a reader reaches for it, so a reader stops looking.
 
 - Embeddings. The pydantic-ai RAG example needs them, and langchaint generates text only.
-- Media beyond images. `ImagePart` carries bytes and a media type. There is no audio part and no image named by URL; `plan-richer-content-blocks.md` holds the support matrix and the shapes for both. Documents stay out, and `Part`'s docstring already states the conversion the application performs instead.
+- Media beyond images. `ImagePart` carries bytes and a media type. `plan-richer-content-blocks.md` specifies `AudioPart` and `ImageUrlPart`. Documents stay outside `ContentPart`. Its docstring specifies the application conversion.

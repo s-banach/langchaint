@@ -24,9 +24,9 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
-    OpaqueElement,
+    RawPart,
     ReasoningDelta,
-    ReasoningTrace,
+    ReasoningPart,
     SpecificToolChoice,
     StreamItem,
     TextPart,
@@ -572,18 +572,18 @@ def test_marked_message_parts_are_invalid() -> None:
     assert "cache_breakpoint" in marked_tool.reason
 
 
-def test_a_cross_provider_trace_is_invalid() -> None:
-    """A trace another provider produced does not restore to a Part, so the item fails on its own."""
+def test_a_cross_provider_reasoning_part_is_invalid() -> None:
+    """A foreign ReasoningPart fails when ReasoningPart.raw cannot restore a Gemini Part."""
     invalid = _invalid_request([
         AssistantMessage(
             turn=(
-                ReasoningTrace(
+                ReasoningPart(
                     raw={"type": "thinking", "thinking": "x", "signature": "s"}, text="x"
                 ),
             )
         )
     ])
-    assert "reasoning trace" in invalid.reason
+    assert "ReasoningPart" in invalid.reason
 
 
 def test_empty_assistant_text_is_skipped_on_replay() -> None:
@@ -602,29 +602,29 @@ def _interpreted_turn(response: types.GenerateContentResponse) -> AssistantMessa
     return outcome.assistant_message
 
 
-def test_a_signed_function_call_yields_a_trace_and_the_call_and_replays_as_one_part() -> None:
-    """The trace preserves the signature, the ToolCall reaches dispatch, and replay reunites them."""
+def test_a_signed_function_call_yields_a_reasoning_part_and_call() -> None:
+    """ReasoningPart.raw preserves the signature. ToolCall remains dispatchable."""
     original = types.Part(
         thought_signature=b"\x00\x01sig",
         function_call=types.FunctionCall(name="f", args={"x": 1}),
     )
     turn = _interpreted_turn(_response([original]))
-    trace, tool_call = turn.turn
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.raw == original.model_dump(mode="json", exclude_none=True)
+    reasoning_part, tool_call = turn.turn
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.raw == original.model_dump(mode="json", exclude_none=True)
     assert tool_call == ToolCall(id="f", name="f", args_json='{"x": 1}')
     request = _built_request([UserMessage(content="go"), turn])
     model_parts = request.contents[1].parts
     assert model_parts == [original]
 
 
-def test_signed_answer_text_yields_a_trace_and_the_text_and_replays_as_one_part() -> None:
+def test_signed_answer_text_yields_a_reasoning_part_and_text_part() -> None:
     """Non-thought text carrying a signature stays readable as answer text and replays signed."""
     original = types.Part(text="final answer", thought_signature=b"sig")
     turn = _interpreted_turn(_response([original]))
-    trace, text_part = turn.turn
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text is None
+    reasoning_part, text_part = turn.turn
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.text is None
     assert text_part == TextPart(text="final answer")
     assert turn.text == "final answer"
     request = _built_request([UserMessage(content="go"), turn])
@@ -632,7 +632,7 @@ def test_signed_answer_text_yields_a_trace_and_the_text_and_replays_as_one_part(
 
 
 def test_a_thought_part_replays_byte_identical() -> None:
-    """The signature bytes survive the JSON round trip through ReasoningTrace.raw."""
+    """The signature bytes survive the JSON round trip through ReasoningPart.raw."""
     original = types.Part(thought=True, text="reasoning", thought_signature=b"\x00\xffsig")
     turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
     request = _built_request([UserMessage(content="go"), turn])
@@ -642,8 +642,8 @@ def test_a_thought_part_replays_byte_identical() -> None:
     assert model_parts[0].thought_signature == b"\x00\xffsig"
 
 
-def test_an_executable_code_part_becomes_an_opaque_element_and_replays_as_itself() -> None:
-    """A part this adapter has no variant for reaches the turn and goes back unchanged.
+def test_an_executable_code_part_becomes_a_raw_part_and_replays_as_itself() -> None:
+    """An executable_code Part becomes RawPart and returns unchanged.
 
     The response was billed for that part, so dropping it would destroy output the caller paid for
     and leave a tool loop continuing from a turn the model did not produce.
@@ -652,16 +652,16 @@ def test_an_executable_code_part_becomes_an_opaque_element_and_replays_as_itself
         executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
     )
     turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
-    opaque_element, text_part = turn.turn
-    assert isinstance(opaque_element, OpaqueElement)
-    assert opaque_element.raw == original.model_dump(mode="json", exclude_none=True)
+    raw_part, text_part = turn.turn
+    assert isinstance(raw_part, RawPart)
+    assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
     assert text_part == TextPart(text="answer")
     request = _built_request([UserMessage(content="go"), turn])
     assert request.contents[1].parts == [original, types.Part(text="answer")]
 
 
-def test_an_empty_text_beside_a_payload_still_becomes_an_opaque_element() -> None:
-    """A part whose text is the empty string carries no text, so its payload reaches the turn.
+def test_an_empty_text_beside_a_payload_still_becomes_a_raw_part() -> None:
+    """A Part with empty text and executable_code becomes RawPart.
 
     Reading that field as present rather than as non-empty drops the whole part.
     """
@@ -670,24 +670,24 @@ def test_an_empty_text_beside_a_payload_still_becomes_an_opaque_element() -> Non
         executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON),
     )
     turn = _interpreted_turn(_response([original]))
-    (opaque_element,) = turn.turn
-    assert isinstance(opaque_element, OpaqueElement)
-    assert opaque_element.raw == original.model_dump(mode="json", exclude_none=True)
+    (raw_part,) = turn.turn
+    assert isinstance(raw_part, RawPart)
+    assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
     request = _built_request([UserMessage(content="go"), turn])
     assert request.contents[1].parts == [original]
 
 
-def test_thought_text_is_trace_text_and_not_output() -> None:
-    """Thought text reaches trace.text and never the answer."""
+def test_thought_text_is_reasoning_part_text_and_not_output() -> None:
+    """Thought text reaches ReasoningPart.text and stays outside output."""
     turn = _interpreted_turn(
         _response([
             types.Part(thought=True, text="thinking..."),
             types.Part(text="answer"),
         ])
     )
-    trace = turn.turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == "thinking..."
+    reasoning_part = turn.turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.text == "thinking..."
     assert turn.text == "answer"
 
 
@@ -1101,7 +1101,7 @@ def test_open_stream_performs_the_connection_io(monkeypatch: pytest.MonkeyPatch)
 
 
 def _executable_code_part() -> types.Part:
-    """One code-execution part, the part this adapter has no turn-element variant for."""
+    """One code-execution part without another TurnPart variant."""
     return types.Part(
         executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
     )
@@ -1164,12 +1164,12 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
         return _reasoning_turn_response(_usage_metadata())
 
     @override
-    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel | None:
         """Return the turn whose middle part carries executable_code."""
         return _reasoning_turn_response(_usage_metadata())
 
     @override
-    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
         """Read the parts of the model Content this request ends with, as their JSON dumps."""
         assert isinstance(request, _GeminiRequestParams)
         parts = request.contents[-1].parts

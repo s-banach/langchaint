@@ -46,7 +46,7 @@ from langchaint import (
     JSONSchemaTool,
     MaxCompletionTokensExceededError,
     PydanticTool,
-    ReasoningTrace,
+    ReasoningPart,
     RefusalError,
     Response,
     RetriesExhaustedError,
@@ -1972,12 +1972,10 @@ class _ReasoningOnlyBoundAdapter(_FakeBoundAdapter):
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose assistant turn holds one ReasoningTrace and no text."""
+        """Return a result whose assistant turn holds one ReasoningPart and no text."""
         return AdapterResult(
             output="",
-            assistant_message=AssistantMessage(
-                turn=(ReasoningTrace(raw={"signature": "opaque"}),)
-            ),
+            assistant_message=AssistantMessage(turn=(ReasoningPart(raw={"signature": "opaque"}),)),
             stop_reason="end_turn",
         )
 
@@ -1991,16 +1989,16 @@ class _ReasoningOnlyAdapter(_FakeAdapter):
 
 
 class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
-    """A bound adapter whose success carries an empty-text trace beside an empty TextPart."""
+    """A bound adapter returning empty ReasoningPart.text and TextPart.text."""
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose turn holds one empty-text ReasoningTrace and one empty TextPart."""
+        """Return a result whose turn holds one empty-text ReasoningPart and one empty TextPart."""
         return AdapterResult(
             output="",
             assistant_message=AssistantMessage(
                 turn=(
-                    ReasoningTrace(raw={"signature": "opaque"}, text=""),
+                    ReasoningPart(raw={"signature": "opaque"}, text=""),
                     TextPart(text=""),
                 )
             ),
@@ -2009,7 +2007,7 @@ class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
 
 
 class _EmptyTextTurnAdapter(_FakeAdapter):
-    """An adapter handing out bound adapters whose turn elements all carry empty text."""
+    """An adapter returning TurnPart values with empty text."""
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
@@ -2021,12 +2019,12 @@ class _ReasoningWithTextBoundAdapter(_FakeBoundAdapter):
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose turn holds one texted ReasoningTrace and one TextPart."""
+        """Return a result whose turn holds one texted ReasoningPart and one TextPart."""
         return AdapterResult(
             output="answer",
             assistant_message=AssistantMessage(
                 turn=(
-                    ReasoningTrace(raw={"signature": "opaque"}, text="thought it over"),
+                    ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
                     TextPart(text="answer"),
                 )
             ),
@@ -2195,17 +2193,17 @@ def test_image_parts_are_captured_without_their_bytes() -> None:
 @pytest.mark.parametrize(
     "adapter",
     [_ReasoningOnlyAdapter(), _EmptyTextTurnAdapter()],
-    ids=["text_free_reasoning_alone", "empty_text_on_every_element"],
+    ids=["text_free_reasoning_alone", "empty_text_on_every_part"],
 )
 def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_array(
     adapter: _FakeAdapter,
 ) -> None:
-    """A turn whose elements carry no text still emits its message, with parts emptied.
+    """A turn without readable text emits a message with empty parts.
 
     The empty array is the deliberate exception to the omit-an-absent-source rule: there was an
     assistant turn, and it held nothing the convention's parts can carry. Both convention parts
-    require a content string, so a trace with no text and a trace with "" are alike excluded, and
-    the opaque reasoning payload beside them reaches no span either way.
+    require a content string, so both empty ReasoningPart.text values are excluded.
+    ReasoningPart.raw reaches no span.
     """
 
     async def scenario() -> None:
@@ -2224,14 +2222,14 @@ def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_
 
 
 def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
-    """A trace carrying text emits the convention's reasoning part holding exactly that text.
+    """ReasoningPart.text emits as the convention's reasoning part.
 
-    The opaque reasoning payload stays off the span whether or not the trace has text,
+    ReasoningPart.raw stays off the span whether ReasoningPart.text is present,
     so the part carries the readable copy and never the signature beside it.
     """
 
     async def scenario() -> None:
-        """Generate a turn holding a texted trace and a TextPart, and read the messages back."""
+        """Generate a texted ReasoningPart and TextPart, then read both messages."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_ReasoningWithTextAdapter()), tracer=tracer, capture_message_content=True

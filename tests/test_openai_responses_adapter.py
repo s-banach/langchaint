@@ -57,10 +57,10 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
-    OpaqueElement,
+    RawPart,
     ReasoningDelta,
     ReasoningEffort,
-    ReasoningTrace,
+    ReasoningPart,
     SpecificToolChoice,
     StopReason,
     StreamItem,
@@ -170,7 +170,7 @@ _WEB_SEARCH_OUTPUT_ITEM: dict[str, object] = {
     "status": "completed",
     "action": {"type": "search", "query": "langchaint"},
 }
-"""One built-in tool call, the output item this adapter has no turn-element variant for."""
+"""One built-in tool call without another TurnPart variant."""
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
@@ -406,7 +406,7 @@ def test_stop_reason_mapping(
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """A refusal content part becomes a TextPart, so the refused turn replays as the model wrote it.
 
-    Dropped instead, the turn holds no elements and sends nothing back, which reopens the
+    Dropped instead, the turn holds no TurnPart values and sends nothing back, which reopens the
     Sequence[Message] at the point the model declined.
     """
     assistant_message = _assistant_message_from(
@@ -421,7 +421,7 @@ def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
 def test_reasoning_round_trips_verbatim_in_position() -> None:
     """A reasoning item round-trips verbatim and in its original position.
 
-    Produce yields one ReasoningTrace where the reasoning item sat.
+    Produce yields one ReasoningPart where the reasoning item sat.
     Consume re-emits the stored dict unchanged, in the same position, with one input item per modeled output item.
     """
     response = _response(
@@ -429,21 +429,21 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         output=[_REASONING_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM],
     )
     assistant_message = _assistant_message_from(response)
-    assert [type(element) for element in assistant_message.turn] == [
-        ReasoningTrace,
+    assert [type(part) for part in assistant_message.turn] == [
+        ReasoningPart,
         TextPart,
         ToolCall,
     ]
-    reasoning_trace = assistant_message.turn[0]
-    assert isinstance(reasoning_trace, ReasoningTrace)
-    assert reasoning_trace.raw == _REASONING_OUTPUT_ITEM
+    reasoning_part = assistant_message.turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.raw == _REASONING_OUTPUT_ITEM
     assert assistant_message.text == "hey"
     assert assistant_message.tool_calls == (
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
     )
     items = _assistant_items(assistant_message)
     assert len(items) == len(response.output)
-    assert items[0] == reasoning_trace.raw
+    assert items[0] == reasoning_part.raw
     assert items[1] == {"role": "assistant", "content": "hey"}
     assert items[2] == {
         "type": "function_call",
@@ -453,15 +453,15 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
     }
 
 
-def test_a_built_in_tool_call_becomes_an_opaque_element_and_replays_as_itself() -> None:
-    """An output item this adapter has no variant for reaches the turn and goes back unchanged.
+def test_a_built_in_tool_call_becomes_a_raw_part_and_replays_as_itself() -> None:
+    """A built-in tool call becomes RawPart and returns unchanged.
 
     The response was billed for that item, so dropping it would destroy output the caller paid for
     and leave a tool loop continuing from a turn the model did not produce.
     """
     response = _response(usage=None, output=[_WEB_SEARCH_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM])
     assistant_message = _assistant_message_from(response)
-    assert [type(element) for element in assistant_message.turn] == [OpaqueElement, TextPart]
+    assert [type(part) for part in assistant_message.turn] == [RawPart, TextPart]
     items = _assistant_items(assistant_message)
     assert items == [_WEB_SEARCH_OUTPUT_ITEM, {"role": "assistant", "content": "hey"}]
 
@@ -509,10 +509,10 @@ def _reasoning_item(
         "an_empty_part_beside_a_real_one",
     ],
 )
-def test_reasoning_trace_text_takes_the_content_over_the_summary_and_is_none_without_text(
+def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_without_text(
     summary: tuple[str, ...], content: tuple[str, ...] | None, expected_text: str | None
 ) -> None:
-    r"""Parts join on a blank line, and a join that holds no text leaves trace.text None.
+    r"""Parts join on a blank line. Empty joined text leaves ReasoningPart.text as None.
 
     Content is the reasoning the summary is a rendering of, so it wins wherever it has text.
     Branching on whether the content list is present, rather than on the text it joins to, drops a
@@ -523,9 +523,9 @@ def test_reasoning_trace_text_takes_the_content_over_the_summary_and_is_none_wit
     "\n\n", which is truthy, so it would reach a span as a reasoning part carrying nothing.
     """
     response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
-    trace = _assistant_message_from(response).turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert trace.text == expected_text
+    reasoning_part = _assistant_message_from(response).turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.text == expected_text
 
 
 def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
@@ -548,12 +548,12 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
     assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
 
 
-def test_produced_traces_survive_the_message_json_round_trip() -> None:
-    """A produced turn holding a reasoning item's trace re-validates equal from JSON.
+def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
+    """A produced ReasoningPart re-validates equal from JSON.
 
-    Persist/resume serializes a Sequence[Message] with a TypeAdapter,
-    and replay under store=False re-reads encrypted_content from raw,
-    so the round trip must restore the trace's dump exactly.
+    Persistence serializes Sequence[Message] through TypeAdapter.
+    Replay under store=False re-reads encrypted_content from ReasoningPart.raw.
+    The round trip must restore ReasoningPart.raw exactly.
     """
     reasoning_item = _reasoning_item(summary=("thought it over",))
     reasoning_item["encrypted_content"] = "enc-1"
@@ -565,9 +565,9 @@ def test_produced_traces_survive_the_message_json_round_trip() -> None:
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
-    """An anthropic-produced trace emits its dict as-is; the API rejects the unknown type key, not this adapter."""
+    """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(turn=(ReasoningTrace(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_items(assistant_message) == [
         raw,
         {"role": "assistant", "content": "hi"},
@@ -1020,15 +1020,13 @@ def test_stream_yields_both_reasoning_channels_as_reasoning_deltas() -> None:
     assert translated == [ReasoningDelta(text="weighing"), ReasoningDelta(text="deciding"), "hey"]
 
 
-def test_a_summary_part_boundary_streams_the_separator_the_assembled_trace_uses() -> None:
+def test_a_summary_part_boundary_streams_the_assembled_reasoning_part_separator() -> None:
     """A part's done event puts a blank line before the next part's first delta.
 
     The API breaks between two parts structurally and never sends it as text, so deltas concatenated
     without it run the parts together.
 
-    One scenario drives both surfaces: the deltas spell out the two parts, and the terminal response
-    carries the reasoning item holding those same parts, as a stream's completed event does. What an
-    application prints while the stream runs then has to match the trace it holds once it ends.
+    The streamed text must match the completed ReasoningPart.text.
     """
     parts = ("First, water evaporates.", "Then it condenses.")
     adapter_stream = _stream([
@@ -1048,9 +1046,9 @@ def test_a_summary_part_boundary_streams_the_separator_the_assembled_trace_uses(
         return streamed, _assistant_message_from(await adapter_stream.final())
 
     streamed, assistant_message = asyncio.run(scenario())
-    trace = assistant_message.turn[0]
-    assert isinstance(trace, ReasoningTrace)
-    assert streamed == trace.text == "First, water evaporates.\n\nThen it condenses."
+    reasoning_part = assistant_message.turn[0]
+    assert isinstance(reasoning_part, ReasoningPart)
+    assert streamed == reasoning_part.text == "First, water evaporates.\n\nThen it condenses."
 
 
 def test_the_reasoning_text_channel_separates_its_parts_the_same_way() -> None:
@@ -1100,7 +1098,7 @@ def test_a_summary_part_that_streamed_no_text_leaves_the_next_part_unseparated(
 ) -> None:
     """A part that streamed no text arms nothing, so the reasoning never opens on a blank line.
 
-    A summary part holding no text is dropped from the assembled trace, and the stream owes the
+    A summary part holding no text is dropped from ReasoningPart.text, and the stream owes the
     same: a separator falls between two reasoning deltas or not at all. An empty delta is not text
     either, so counting it as one would open the reasoning on a blank line, its part having
     contributed nothing for a separator to follow.
@@ -1254,7 +1252,7 @@ def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> 
 
 
 def test_stream_final_turn_carries_reasoning() -> None:
-    """final()'s assistant turn includes the ReasoningTrace from the terminal response's output."""
+    """final()'s assistant turn includes the ReasoningPart from the terminal response's output."""
 
     async def scenario() -> None:
         adapter_stream = _stream([
@@ -1265,9 +1263,9 @@ def test_stream_final_turn_carries_reasoning() -> None:
         async for _item in adapter_stream.items():
             pass
         result = _assert_result(await _text_final(adapter_stream))
-        reasoning_trace = result.assistant_message.turn[0]
-        assert isinstance(reasoning_trace, ReasoningTrace)
-        assert reasoning_trace.raw == _REASONING_OUTPUT_ITEM
+        reasoning_part = result.assistant_message.turn[0]
+        assert isinstance(reasoning_part, ReasoningPart)
+        assert reasoning_part.raw == _REASONING_OUTPUT_ITEM
 
     asyncio.run(scenario())
 
@@ -1989,7 +1987,7 @@ def _conformance_output() -> list[object]:
     The reasoning item carries a key the installed SDK does not name. An adapter that rebuilt the
     item from its own pinned model would drop that key, which the API rejects on replay because
     encrypted_content must arrive byte-identical.
-    The web search call is the item this adapter has no turn-element variant for.
+    The web search call has no other TurnPart variant.
     """
     return [
         _REASONING_OUTPUT_ITEM | {"field_newer_than_sdk": "x"},
@@ -2047,12 +2045,12 @@ class TestOpenAIResponsesConformance(AdapterConformance):
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
-    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+    def response_with_raw_part(self) -> BaseModel | None:
         """Return the turn whose middle item is the built-in web search call."""
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
-    def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
         """Read the input items past the one the user message became."""
         assert isinstance(request, _OpenAIRequestParams)
         return request.input[1:]

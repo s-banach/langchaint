@@ -109,14 +109,14 @@ from langchaint.llm import (
 )
 from langchaint.messages import (
     AssistantMessage,
+    ContentPart,
     Message,
-    Part,
-    ReasoningTrace,
+    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
 )
 from langchaint.response import CallResult, GenerateResult, Response, ToolCallTurn
@@ -484,7 +484,7 @@ def _apply_agent_exit_attributes(
         })
 
 
-def _content_parts(content: str | tuple[Part, ...]) -> list[dict[str, object]]:
+def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, object]]:
     """Render a MessageContent as the convention's parts array.
 
     A str becomes a one-element text array rather than staying a bare string,
@@ -567,35 +567,35 @@ def _tool_call_arguments(args_json: str) -> object:
     return parsed
 
 
-def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
+def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
     """Render an assistant turn as the convention's parts array, in emission order.
 
-    A ReasoningTrace renders as the convention's ReasoningPart and a TextPart as the convention's
-    TextPart, each carrying its text. An element whose text is absent or empty renders as nothing,
+    A ReasoningPart renders as the convention's ReasoningPart and a TextPart as the convention's
+    TextPart, each carrying its text. A part without text renders as nothing,
     since both parts require a content string and an empty one carries nothing;
     the two adapters drop empty text on the wire side likewise.
     The reasoning payload itself is never emitted: it is the
     producing SDK item's model_dump, opaque by construction (an anthropic signature that may be
-    redacted, an openai encrypted_content), so shipping it buys a reader nothing, and ReasoningPart
+    redacted, an openai encrypted_content), so it provides no readable content, and ReasoningPart
     takes a content string rather than an opaque object.
-    An OpaqueElement renders as nothing for the same reason, carrying a payload and no text.
-    A turn holding only text-free elements therefore renders as an empty parts array,
+    A RawPart renders as nothing because it has no text.
+    A turn holding only text-free parts therefore renders as an empty parts array,
     not as a missing message.
     """
     parts: list[dict[str, object]] = []
-    for element in turn:
-        if isinstance(element, ReasoningTrace):
-            if element.text:
-                parts.append({"type": "reasoning", "content": element.text})
-        elif isinstance(element, TextPart):
-            if element.text:
-                parts.append({"type": "text", "content": element.text})
-        elif isinstance(element, ToolCall):
+    for part in turn:
+        if isinstance(part, ReasoningPart):
+            if part.text:
+                parts.append({"type": "reasoning", "content": part.text})
+        elif isinstance(part, TextPart):
+            if part.text:
+                parts.append({"type": "text", "content": part.text})
+        elif isinstance(part, ToolCall):
             parts.append({
                 "type": "tool_call",
-                "id": element.id,
-                "name": element.name,
-                "arguments": _tool_call_arguments(element.args_json),
+                "id": part.id,
+                "name": part.name,
+                "arguments": _tool_call_arguments(part.args_json),
             })
     return parts
 
@@ -1713,7 +1713,7 @@ class TracedToolManager(ToolManager):
     the key's JSON schema requires an object and no property of one, so the choice among objects is
     this module's.
     Its response field is the parts array every other content key uses, so a str content and a
-    Sequence[Part] content reach a backend in one shape.
+    Sequence[ContentPart] content reaches a backend in one shape.
     gen_ai.tool.call.arguments is the model's own argument JSON, deserialized on a best effort:
     the convention expects an object and asks an instrumentation holding a serialized string to try to
     deserialize it.

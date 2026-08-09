@@ -57,10 +57,10 @@ Mapping decisions:
   a parts system_prompt travels as a developer-role input message first in every request's input,
   the message the SDK documents `instructions` as inserting, because only input message parts
   carry prompt_cache_breakpoint.
-- An AssistantMessage re-feeds its turn elements in emission order,
+- An AssistantMessage re-feeds its TurnPart values in emission order,
   which the API requires for replay under store=False:
-  a ReasoningTrace is its reasoning item re-sent unchanged,
-  an OpaqueElement the item it holds re-sent unchanged,
+  a ReasoningPart is its reasoning item re-sent unchanged,
+  a RawPart re-sends its stored item unchanged,
   a ToolCall one `function_call` item,
   and a maximal run of adjacent TextParts one assistant message item;
   ToolMessage becomes a `function_call_output` item keyed by call_id.
@@ -155,15 +155,15 @@ from langchaint.exceptions import StreamProtocolError
 from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
+    ContentPart,
     Message,
-    OpaqueElement,
-    Part,
-    ReasoningTrace,
+    RawPart,
+    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnElement,
+    TurnPart,
     UserMessage,
 )
 from langchaint.openai.shared import (
@@ -310,7 +310,7 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
 
 
 def _function_call_output(
-    content: str | tuple[Part, ...],
+    content: str | tuple[ContentPart, ...],
 ) -> str | ResponseFunctionCallOutputItemListParam:
     """Convert one ToolMessage's content to the function_call_output output field.
 
@@ -366,7 +366,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
     each ToolCall becomes a function_call item keyed by call_id,
     which the paired ToolMessage's function_call_output references.
-    A ReasoningTrace's and an OpaqueElement's raw dict go to the wire unchanged, routed by their own
+    ReasoningPart.raw and RawPart.raw go to the wire unchanged, routed by their own
     type key, so encrypted_content replays byte-identical.
     A dump another provider produced goes to the wire the same way and the API rejects its
     unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
@@ -379,22 +379,22 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             items.append({"role": "assistant", "content": "".join(pending_texts)})
             pending_texts.clear()
 
-    for element in assistant_message.turn:
-        if isinstance(element, TextPart):
-            if element.text:
-                pending_texts.append(element.text)
-        elif isinstance(element, ToolCall):
+    for part in assistant_message.turn:
+        if isinstance(part, TextPart):
+            if part.text:
+                pending_texts.append(part.text)
+        elif isinstance(part, ToolCall):
             flush_text_run()
             function_call_item: ResponseFunctionToolCallParam = {
                 "type": "function_call",
-                "call_id": element.id,
-                "name": element.name,
-                "arguments": element.args_json,
+                "call_id": part.id,
+                "name": part.name,
+                "arguments": part.args_json,
             }
             items.append(function_call_item)
         else:
             flush_text_run()
-            items.append(_replayed_item(element.raw))
+            items.append(_replayed_item(part.raw))
     flush_text_run()
     return items
 
@@ -584,19 +584,19 @@ def _reasoning_text(item: ResponseReasoningItem) -> str | None:
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     """Build the langchaint assistant turn from the output items, item order preserved.
 
-    A reasoning item becomes a ReasoningTrace carrying the item's own model_dump for verbatim replay,
+    A reasoning item becomes a ReasoningPart carrying the item's own model_dump for verbatim replay,
     beside the readable text _reasoning_text extracts from it;
     a message item becomes one TextPart per content part it holds, in their order, from an
     output_text part and from a refusal part alike, because the sentences the model wrote to refuse
     are the turn's text and a turn built without them replays as nothing;
-    every other item, a built-in tool call among them, becomes an OpaqueElement holding the item's
+    every other item, a built-in tool call among them, becomes a RawPart holding the item's
     own model_dump, so the turn carries what the response was billed for.
     """
-    turn: list[TurnElement] = []
+    turn: list[TurnPart] = []
     for item in response.output:
         if item.type == "reasoning":
             turn.append(
-                ReasoningTrace(
+                ReasoningPart(
                     raw=item.model_dump(mode="python", exclude_none=True),
                     text=_reasoning_text(item),
                 )
@@ -610,7 +610,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
                 elif content_part.type == "refusal":
                     turn.append(TextPart(text=content_part.refusal))
         else:
-            turn.append(OpaqueElement(raw=item.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=item.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -706,7 +706,7 @@ class OpenAIResponsesAdapter(Adapter):
         counts every request as an attempt, and feeds each failure to SharedBackoff through parse,
         so the SDK must never retry beneath it.
 
-        reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text where the
+        reasoning_summary asks the API for readable text, which reaches ReasoningPart.text where the
         reasoning item carries no reasoning text of its own;
         None sends no summary field and leaves the provider default in place.
         A model may return no summary even when one is requested.

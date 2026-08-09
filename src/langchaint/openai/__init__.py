@@ -198,7 +198,7 @@ def openai_model(  # noqa: PLR0913 (the ready-LLM constructor states every choic
     shared_backoff and max_attempts have the LLM.__init__ meanings;
     pass one SharedBackoff across models on the same account so a rate limit pauses them together,
     and note one instance serves one event loop.
-    reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
+    reasoning_summary asks the API for readable text, which reaches ReasoningPart.text
     where the reasoning item carries no reasoning text of its own;
     None leaves the provider default in place.
     service_tier is what the request asks for, None sending nothing; it is not what prices the
@@ -281,7 +281,7 @@ def openai_bedrock_model(  # noqa: PLR0913 (the ready-LLM constructor states eve
     shared_backoff and max_attempts have the LLM.__init__ meanings;
     pass one SharedBackoff across models on the same account so a rate limit pauses them together,
     and note one instance serves one event loop.
-    reasoning_summary asks the API for readable text, which reaches ReasoningTrace.text
+    reasoning_summary asks the API for readable text, which reaches ReasoningPart.text
     where the reasoning item carries no reasoning text of its own;
     None leaves the provider default in place.
 

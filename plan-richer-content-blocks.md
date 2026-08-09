@@ -1,51 +1,68 @@
-# Richer content parts: image by URL, and audio
+# Richer content parts: image by URL and audio
 
-A plan for TODO.md's last item. Documents are out of scope, and the reason is already written in `Part`'s docstring: the application extracts the text layer or rasterizes the pages, and owns the resolution, the page selection, and the extractor.
+This plan covers TODO.md's final media item.
+Documents remain outside `ContentPart`.
+The existing `ContentPart` docstring specifies text extraction and page rasterization.
+Applications choose the resolution, pages, and extraction tools.
 
-langchaint never fetches a URL. A URL part is a URL on the wire, and the provider fetches it or refuses.
+langchaint never fetches a URL.
+It sends `url` unchanged through an SDK field.
+The provider may accept or refuse that value.
 
-## What each adapter can represent
+Chat Completions response audio remains available through the result's `raw` field.
+`AssistantMessage.turn` does not carry response audio.
+To resend its bytes, construct `AudioPart` explicitly.
+`AudioPart` remains model input only.
 
-Verified by introspection against anthropic 0.120.2, openai 2.51.0, google-genai 2.16.0.
+## Decision
 
-| adapter | image by URL | audio |
-| --- | --- | --- |
-| anthropic Messages | `URLImageSourceParam(type="url", url=...)` | nothing: `anthropic.types` holds no audio name |
-| openai Responses | `ResponseInputImageParam.image_url` | nothing: `ResponseInputContentParam` is text, image, file |
-| openai Chat Completions | `ChatCompletionContentPartImageParam` | `ChatCompletionContentPartInputAudioParam`, `format` is `Literal["wav", "mp3"]` |
-| gemini | `FileData(file_uri, mime_type)` | `Blob(data, mime_type)` |
+Add `ImageUrlPart` and `AudioPart` to the public `ContentPart` union.
+Every adapter must serialize each supported context or return `InvalidRequest`.
+`InvalidRequest` becomes `InvalidRequestError` before any request starts.
+Batch processing returns that failure beside the other inputs' outcomes.
+Partial adapter support does not justify omitting a provider-neutral input.
 
-`ResponseInputAudioParam` exists in the openai package but is absent from the Responses input-content union, so the Responses adapter has nothing to send it as.
+Here, sendable means the installed SDK exposes a matching input field.
+A sendable value may still receive a provider rejection.
+langchaint does not test provider acceptance before sending.
 
-Image by URL is representable everywhere. Audio is representable in two adapters of four.
+## Verified installed SDK facts
 
-## Where the raise happens
+Verified through introspection against anthropic 0.121.0, openai 2.53.0, and google-genai 2.17.0.
 
-Letting the provider refuse the part works wherever a wire field exists to send it in.
-Where no field exists, langchaint cannot serialize the part, so nothing reaches the provider to be refused.
-That is not a guess about a provider rule; it is the absence of a field in the SDK's own union.
+| adapter | `ImageUrlPart` in `UserMessage` | `ImageUrlPart` in `ToolMessage` | `AudioPart` in `UserMessage` | `AudioPart` in `ToolMessage` |
+| --- | --- | --- | --- | --- |
+| anthropic Messages | `ImageBlockParam` with `URLImageSourceParam` | `ToolResultBlockParam.content` includes `ImageBlockParam` | no audio input content type | no audio tool-result content type |
+| openai Responses | `ResponseInputImageParam.image_url` | `ResponseInputImageContentParam.image_url` | `ResponseInputContentParam` excludes audio | `ResponseFunctionCallOutputItemListParam` excludes audio |
+| openai Chat Completions | `ChatCompletionContentPartImageParam` | `ChatCompletionToolMessageParam.content` is text-only | `ChatCompletionContentPartInputAudioParam` | `ChatCompletionToolMessageParam.content` is text-only |
+| gemini | `Part.file_data` with `FileData` | `FunctionResponsePart.file_data` | `Part.inline_data` with `Blob` | `FunctionResponsePart.inline_data` with `FunctionResponseBlob` |
 
-The existing path already covers it.
-`_NotSendableError` names an unsendable `Sequence[Message]` inside an adapter, and `build_request` returns `InvalidRequest(reason=...)`.
-That becomes an `InvalidRequestError`, which is one item's failure row, so a batch's other items still run.
+`ResponseInputAudioParam` exists outside `ResponseInputContentParam`.
+`ResponseFunctionCallOutputItemListParam` also excludes audio.
+Therefore, the Responses adapter has no audio input-content variant.
 
-So:
+`ChatCompletionContentPartInputAudioParam.input_audio.data` is base64 text.
+Its `format` field accepts only `"wav"` and `"mp3"`.
 
-- An `ImageUrlPart` goes on the wire in all four adapters. Gemini decides whether it fetches an arbitrary `https://` URL; langchaint makes no claim about that.
-- An `AudioPart` goes on the wire in the Chat Completions and gemini adapters. In the anthropic and openai Responses adapters it is `InvalidRequest`, with the reason naming the adapter and the part.
-- An `AudioPart` whose `media_type` is outside `audio/wav` and `audio/mpeg` is `InvalidRequest` in the Chat Completions adapter, because `format` admits only `wav` and `mp3`. Gemini takes the media type through.
+`FileData.file_uri` describes a Google Cloud Storage URI.
+`FunctionResponsePart.file_data` describes a field unsupported by the Gemini API.
+Both SDK models serialize a supplied URI.
+langchaint sends the value unchanged and leaves rejection to gemini.
+
+`FileData.mime_type` is documented as required, although its model permits `None`.
+`ImageUrlPart.media_type=None` therefore remains sendable and may receive a provider rejection.
 
 ## The parts
 
 ```python
 class ImageUrlPart(CheckedCopyModel):
-    """url is fetched by the provider, never by langchaint.
+    """langchaint sends url unchanged and never fetches it.
 
-    media_type is an IANA media type such as "image/png".
-    Only gemini carries it on the wire, in FileData.mime_type;
-    anthropic's url source and openai's image_url are the URL alone.
+    media_type is an optional IANA media type.
+    Gemini receives it when present.
+    Other adapters receive url without media_type.
 
-    cache_breakpoint has the same meaning as on TextPart.
+    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -57,13 +74,17 @@ class ImageUrlPart(CheckedCopyModel):
 
 
 class AudioPart(CheckedCopyModel):
-    """media_type is an IANA media type such as "audio/wav".
+    """media_type is an IANA media type, such as "audio/wav".
 
-    In JSON, data is URL-safe base64 text, as on ImagePart.
+    JSON stores data as URL-safe base64 text.
+    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
     """
 
     model_config = ConfigDict(
-        frozen=True, extra="forbid", ser_json_bytes="base64", val_json_bytes="base64"
+        frozen=True,
+        extra="forbid",
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
     )
 
     data: bytes
@@ -72,30 +93,100 @@ class AudioPart(CheckedCopyModel):
     kind: Literal["audio"] = "audio"
 
 
-type Part = Annotated[TextPart | ImagePart | ImageUrlPart | AudioPart, Field(discriminator="kind")]
+type ContentPart = Annotated[
+    TextPart | ImagePart | ImageUrlPart | AudioPart,
+    Field(discriminator="kind"),
+]
 ```
 
-A separate class rather than a nullable `url` on `ImagePart`:
-every adapter branches on which of the two it holds, and the discriminated union is what makes the branch exhaustive.
+`ImagePart` carries inline image bytes.
+`ImageUrlPart` carries a URL sent for provider retrieval.
+Every adapter selects different SDK fields for those values.
+Separate variants make each selection explicit and exhaustively typed.
+`ImagePart` keeps its existing name.
 
-`ImagePart` keeps its name. It carries inline bytes, which is the common case, and renaming it breaks callers for no gain.
+## Adapter behavior
 
-## Round trip
+Each `ContentPart` converter uses `match part.kind` with one case per literal.
+Do not use `case _` or an `else` branch.
+A supported case constructs its SDK value.
+An unsupported case raises `_NotSendableError` with a standard reason.
+`build_request` converts that exception into `InvalidRequest`.
+Adding a `ContentPart` variant makes every unchanged match non-exhaustive under pyrefly.
+That failure requires an explicit case before CI passes.
 
-`Part`'s JSON form gains two `kind` values.
-A reader on an older langchaint rejects them, because the union has `extra="forbid"` and no matching tag.
-That is the pinned `messages_to_json` format changing, so it belongs in the release note.
+For Chat Completions, map `audio/wav` to `"wav"`.
+Map `audio/mpeg` to `"mp3"`.
+Other `AudioPart.media_type` values return `InvalidRequest` for `UserMessage`.
+The adapter returns `InvalidRequest` for any image or audio variant in `ChatCompletionToolMessageParam.content`.
 
-## Conformance
+Gemini passes `AudioPart.media_type` through unchanged.
+Anthropic and Responses return `InvalidRequest` for every `AudioPart`.
+Each reason names the adapter, message type, and `ContentPart` variant.
 
-Two invariants, one per part, in `conformance.py`:
+Anthropic, Chat Completions, and gemini already convert `_NotSendableError` into `InvalidRequest`.
+Responses currently states that every `Sequence[Message]` is sendable.
+Add equivalent `_NotSendableError` conversion to Responses.
 
-- A message holding an `ImageUrlPart` builds a request in every adapter.
-- A message holding an `AudioPart` either builds a request or returns `InvalidRequest` naming the part, and never raises out of `build_request`.
+## `cache_breakpoint`
 
-The second is what keeps the two-of-four support honest without making audio look universal.
+`cache_breakpoint` keeps the `TextPart.cache_breakpoint` meaning on both new variants.
+Anthropic carries supported marks through its existing block placement rules.
+The openai adapters carry supported marks on their content-part fields.
+Gemini returns `InvalidRequest` for any marked message part.
+Unsupported parts return `InvalidRequest` without dropping the mark.
 
-## What this leaves unanswered
+## Public integration
 
-Whether `AudioPart` earns its place at two adapters of four.
-The alternative is to write the answer in `Part`'s docstring, next to the document sentence: send audio through the Chat Completions or gemini backend, and there is no anthropic route.
+Export `ImageUrlPart` and `AudioPart` from top-level `langchaint`.
+Update `MessageContent` and tool-output documentation to include both variants.
+Update each adapter module docstring with its exact mappings.
+
+Tracing records `ImageUrlPart` with `type`, `url`, and optional `mime_type`.
+Use `"image_url"` as that trace part's `type`.
+Tracing records `AudioPart` as blob metadata and omits `data`.
+Both records remain controlled by `capture_message_content`.
+
+Update every exhaustive `ContentPart.kind` match with `"image_url"` and `"audio"`.
+
+## JSON round trip
+
+`ContentPart` JSON gains `"image_url"` and `"audio"` `kind` values.
+The updated union continues loading the pinned existing JSON.
+Older releases reject new values with Pydantic's `union_tag_invalid` error.
+Announce the new `kind` values in the release notes.
+
+Keep the existing pinned JSON literal unchanged.
+Add separate exact JSON tests for both new variants.
+Pin `AudioPart.data` as URL-safe base64 text.
+Test malformed base64 rejection and complete message round trips.
+
+## Conformance and tests
+
+A `UserMessage` containing `ImageUrlPart` builds in every adapter.
+A `ToolMessage` containing `ImageUrlPart` builds except in Chat Completions.
+Chat Completions returns `InvalidRequest` for that tool message.
+
+A `UserMessage` containing `AudioPart` builds in Chat Completions and gemini.
+A `ToolMessage` containing `AudioPart` builds in gemini.
+Other adapter and message combinations return `InvalidRequest` naming `AudioPart`.
+No `build_request` call raises for an unsupported part.
+
+Add representative values for every `ContentPart` variant to `AdapterConformance`.
+Test each value inside `UserMessage` and `ToolMessage`.
+The tool sequence includes an earlier matching `ToolCall`.
+Compare the case classes against the variants inside `ContentPart.__value__`.
+This assertion fails when `ContentPart` grows without a conformance case.
+
+Each standard case requires `build_request` to return `RequestParams` or `InvalidRequest`.
+An `InvalidRequest.reason` names the concrete `ContentPart` class and message class.
+No standard case may raise.
+`AdapterConformance` also requires `UserMessage` with `ImageUrlPart` to build.
+
+Adapter-specific tests enforce the support table.
+Supported cases inspect exact SDK input values, proving the part reached the request.
+Unsupported cases assert the expected `InvalidRequest.reason`.
+Add tracing tests for metadata and byte omission.
+Update the `ContentPart.kind` exhaustiveness tests.
+
+Run `scripts/CI.sh` before committing the implementation.

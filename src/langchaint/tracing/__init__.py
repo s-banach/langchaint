@@ -578,6 +578,7 @@ def _turn_parts(turn: tuple[TurnElement, ...]) -> list[dict[str, object]]:
     producing SDK item's model_dump, opaque by construction (an anthropic signature that may be
     redacted, an openai encrypted_content), so shipping it buys a reader nothing, and ReasoningPart
     takes a content string rather than an opaque object.
+    An OpaqueElement renders as nothing for the same reason, carrying a payload and no text.
     A turn holding only text-free elements therefore renders as an empty parts array,
     not as a missing message.
     """

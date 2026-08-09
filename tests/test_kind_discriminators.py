@@ -29,6 +29,7 @@ from langchaint import (
     ImagePart,
     InvalidToolArgsDetail,
     Message,
+    OpaqueElement,
     Part,
     PauseAll,
     PauseAllDoNotRetry,
@@ -101,11 +102,13 @@ def _by_part_kind_missing_a_variant(part: Part) -> object:
 def _by_turn_element_kind(element: TurnElement) -> object:
     match element.kind:
         case "reasoning_trace":
-            return element.raw
+            return element.text
         case "text":
             return element.cache_breakpoint
         case "tool_call":
             return element.args_json
+        case "opaque_element":
+            return element.raw
 
 
 def _by_turn_element_kind_missing_a_variant(element: TurnElement) -> object:
@@ -258,10 +261,11 @@ def test_a_part_kind_selects_the_variant_that_carries_the_field_read() -> None:
 
 
 def test_a_turn_element_kind_selects_the_variant_that_carries_the_field_read() -> None:
-    """Each TurnElement variant's tag reaches a field the other variants do not carry."""
-    assert _by_turn_element_kind(ReasoningTrace(raw={"id": "rs_1"})) == {"id": "rs_1"}
+    """Each TurnElement variant's tag reaches a field some other variant does not carry."""
+    assert _by_turn_element_kind(ReasoningTrace(raw={"id": "rs_1"}, text="hm")) == "hm"
     assert _by_turn_element_kind(TextPart(text="hi")) is False
     assert _by_turn_element_kind(ToolCall(id="c1", name="probe", args_json="{}")) == "{}"
+    assert _by_turn_element_kind(OpaqueElement(raw={"id": "ws_1"})) == {"id": "ws_1"}
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
     assert _by_turn_element_kind_missing_a_variant(tool_call) is None
 

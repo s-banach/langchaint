@@ -24,6 +24,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
+    OpaqueElement,
     ReasoningDelta,
     ReasoningTrace,
     SpecificToolChoice,
@@ -641,6 +642,41 @@ def test_a_thought_part_replays_byte_identical() -> None:
     assert model_parts[0].thought_signature == b"\x00\xffsig"
 
 
+def test_an_executable_code_part_becomes_an_opaque_element_and_replays_as_itself() -> None:
+    """A part this adapter has no variant for reaches the turn and goes back unchanged.
+
+    The response was billed for that part, so dropping it would destroy output the caller paid for
+    and leave a tool loop continuing from a turn the model did not produce.
+    """
+    original = types.Part(
+        executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
+    )
+    turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
+    opaque_element, text_part = turn.turn
+    assert isinstance(opaque_element, OpaqueElement)
+    assert opaque_element.raw == original.model_dump(mode="json", exclude_none=True)
+    assert text_part == TextPart(text="answer")
+    request = _built_request([UserMessage(content="go"), turn])
+    assert request.contents[1].parts == [original, types.Part(text="answer")]
+
+
+def test_an_empty_text_beside_a_payload_still_becomes_an_opaque_element() -> None:
+    """A part whose text is the empty string carries no text, so its payload reaches the turn.
+
+    Reading that field as present rather than as non-empty drops the whole part.
+    """
+    original = types.Part(
+        text="",
+        executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON),
+    )
+    turn = _interpreted_turn(_response([original]))
+    (opaque_element,) = turn.turn
+    assert isinstance(opaque_element, OpaqueElement)
+    assert opaque_element.raw == original.model_dump(mode="json", exclude_none=True)
+    request = _built_request([UserMessage(content="go"), turn])
+    assert request.contents[1].parts == [original]
+
+
 def test_thought_text_is_trace_text_and_not_output() -> None:
     """Thought text reaches trace.text and never the answer."""
     turn = _interpreted_turn(
@@ -1064,10 +1100,17 @@ def test_open_stream_performs_the_connection_io(monkeypatch: pytest.MonkeyPatch)
 # --- conformance ---
 
 
+def _executable_code_part() -> types.Part:
+    """One code-execution part, the part this adapter has no turn-element variant for."""
+    return types.Part(
+        executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
+    )
+
+
 def _reasoning_turn_response(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
 ) -> types.GenerateContentResponse:
-    """One thought part carrying signature bytes, then one text part.
+    """One thought part carrying signature bytes, one executable_code part, then one text part.
 
     The SDK models forbid unknown keys, so no fixture can carry a key the installed SDK does not
     name; the signature bytes are the payload an adapter that rebuilt parts from its own model
@@ -1076,6 +1119,7 @@ def _reasoning_turn_response(
     return _response(
         [
             types.Part(thought=True, text="check first", thought_signature=b"\x00\x01sig"),
+            _executable_code_part(),
             types.Part(text="hello"),
         ],
         usage_metadata=usage_metadata,
@@ -1120,6 +1164,11 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
         return _reasoning_turn_response(_usage_metadata())
 
     @override
+    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+        """Return the turn whose middle part carries executable_code."""
+        return _reasoning_turn_response(_usage_metadata())
+
+    @override
     def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:
         """Read the parts of the model Content this request ends with, as their JSON dumps."""
         assert isinstance(request, _GeminiRequestParams)
@@ -1129,16 +1178,23 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return one turn as assembled_response builds it and as a whole response."""
+        """Return one turn as assembled_response builds it and as a whole response.
+
+        The turn ends with the executable_code part, so the assembly is read on a part the adapter
+        models nothing inside as well as on the text it merges.
+        """
         chunks = [
             _response([types.Part(text="Hel")], finish_reason=None),
+            _response([types.Part(text="lo")], finish_reason=None),
             _response(
-                [types.Part(text="lo")],
+                [_executable_code_part()],
                 finish_reason=types.FinishReason.STOP,
                 usage_metadata=_usage_metadata(),
             ),
         ]
-        whole = _response([types.Part(text="Hello")], usage_metadata=_usage_metadata())
+        whole = _response(
+            [types.Part(text="Hello"), _executable_code_part()], usage_metadata=_usage_metadata()
+        )
         return assembled_response(chunks), whole
 
     @override

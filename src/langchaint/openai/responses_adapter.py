@@ -59,7 +59,9 @@ Mapping decisions:
   carry prompt_cache_breakpoint.
 - An AssistantMessage re-feeds its turn elements in emission order,
   which the API requires for replay under store=False:
-  a ReasoningTrace is its reasoning item re-sent unchanged, a ToolCall one `function_call` item,
+  a ReasoningTrace is its reasoning item re-sent unchanged,
+  an OpaqueElement the item it holds re-sent unchanged,
+  a ToolCall one `function_call` item,
   and a maximal run of adjacent TextParts one assistant message item;
   ToolMessage becomes a `function_call_output` item keyed by call_id.
   The API has no is_error flag, so the error text in output is the only error signal.
@@ -86,7 +88,7 @@ Mapping decisions:
 from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, override
+from typing import Any, ClassVar, Literal, cast, override
 
 import openai
 from openai import AsyncOpenAI, Omit, omit
@@ -118,9 +120,6 @@ from openai.types.responses.response_input_param import (
 )
 from openai.types.shared_params.reasoning import Reasoning
 from pydantic import BaseModel, ValidationError
-
-if TYPE_CHECKING:
-    from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
 
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
@@ -157,6 +156,7 @@ from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
     Message,
+    OpaqueElement,
     Part,
     ReasoningTrace,
     StopReason,
@@ -343,6 +343,21 @@ def _function_call_output(
     return output_content
 
 
+def _replayed_item(raw: Mapping[str, object]) -> ResponseInputItemParam:
+    """Copy one stored SDK dump into the input item it came from, unread and unchanged.
+
+    The dict is the producing SDK item's model_dump; when this adapter produced it, its shape is the
+    wire param's by construction, so the cast holds. A dump another provider produced is not this
+    shape; it is passed through unchanged, never dropped or neutralized here (trimming is the app's
+    job), and left to the API. Reconstructing it field by field would risk changing the payload the
+    API re-reads.
+    The shallow copy keeps the wire path from ever aliasing the frozen message's stored payload into
+    a mutable request structure.
+    """
+    # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
+    return cast("ResponseInputItemParam", dict(raw))
+
+
 def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
     """Convert one AssistantMessage to its input items in turn order.
 
@@ -351,9 +366,9 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
     each ToolCall becomes a function_call item keyed by call_id,
     which the paired ToolMessage's function_call_output references.
-    A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
-    so encrypted_content replays byte-identical.
-    A trace another provider produced goes to the wire the same way and the API rejects its
+    A ReasoningTrace's and an OpaqueElement's raw dict go to the wire unchanged, routed by their own
+    type key, so encrypted_content replays byte-identical.
+    A dump another provider produced goes to the wire the same way and the API rejects its
     unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
     """
     items: list[ResponseInputItemParam] = []
@@ -377,16 +392,9 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
                 "arguments": element.args_json,
             }
             items.append(function_call_item)
-        elif isinstance(element, ReasoningTrace):
+        else:
             flush_text_run()
-            # The dict is the producing SDK item's model_dump; when this adapter produced it,
-            # its shape is the wire param's by construction, so the cast holds. A trace another
-            # provider produced is not this shape; it is passed through unchanged, never dropped
-            # or neutralized here (trimming is the app's job), and left to the API.
-            # Reconstructing it field by field would risk changing the
-            # payload the API re-reads. The shallow copy keeps the wire path from ever aliasing
-            # the frozen message's stored payload into a mutable request structure.
-            items.append(cast("ResponseReasoningItemParam", dict(element.raw)))
+            items.append(_replayed_item(element.raw))
     flush_text_run()
     return items
 
@@ -581,7 +589,8 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     a message item becomes one TextPart per content part it holds, in their order, from an
     output_text part and from a refusal part alike, because the sentences the model wrote to refuse
     are the turn's text and a turn built without them replays as nothing;
-    built-in tool call items are dropped (built-in tools are out of scope).
+    every other item, a built-in tool call among them, becomes an OpaqueElement holding the item's
+    own model_dump, so the turn carries what the response was billed for.
     """
     turn: list[TurnElement] = []
     for item in response.output:
@@ -600,6 +609,8 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
                     turn.append(TextPart(text=content_part.text))
                 elif content_part.type == "refusal":
                     turn.append(TextPart(text=content_part.refusal))
+        else:
+            turn.append(OpaqueElement(raw=item.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -891,7 +902,8 @@ class _OpenAIStream(AdapterStream):
         comes next consumes it.
 
         Yields:
-            Stream items; SDK events langchaint does not model (built-in tool activity) are dropped.
+            Stream items; SDK events langchaint does not model (built-in tool activity) stream
+            nothing and reach the caller in the turn final()'s response carries.
 
         Raises:
             openai.APIStatusError: the stream ended without a terminal response after an error

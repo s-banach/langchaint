@@ -57,6 +57,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
+    OpaqueElement,
     ReasoningDelta,
     ReasoningEffort,
     ReasoningTrace,
@@ -162,6 +163,14 @@ _REASONING_OUTPUT_ITEM: dict[str, object] = {
     "summary": [],
     "encrypted_content": "enc-1",
 }
+
+_WEB_SEARCH_OUTPUT_ITEM: dict[str, object] = {
+    "type": "web_search_call",
+    "id": "ws_1",
+    "status": "completed",
+    "action": {"type": "search", "query": "langchaint"},
+}
+"""One built-in tool call, the output item this adapter has no turn-element variant for."""
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
@@ -442,6 +451,19 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         "name": "lookup",
         "arguments": '{"q": 1}',
     }
+
+
+def test_a_built_in_tool_call_becomes_an_opaque_element_and_replays_as_itself() -> None:
+    """An output item this adapter has no variant for reaches the turn and goes back unchanged.
+
+    The response was billed for that item, so dropping it would destroy output the caller paid for
+    and leave a tool loop continuing from a turn the model did not produce.
+    """
+    response = _response(usage=None, output=[_WEB_SEARCH_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM])
+    assistant_message = _assistant_message_from(response)
+    assert [type(element) for element in assistant_message.turn] == [OpaqueElement, TextPart]
+    items = _assistant_items(assistant_message)
+    assert items == [_WEB_SEARCH_OUTPUT_ITEM, {"role": "assistant", "content": "hey"}]
 
 
 def _reasoning_item(
@@ -1961,13 +1983,19 @@ def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> No
 
 
 def _conformance_output() -> list[object]:
-    """Build one reasoning item then one message item, mapping one to one onto their wire items.
+    """Build a reasoning item, a built-in web search call, then a message item.
 
+    The three map one to one onto their wire items.
     The reasoning item carries a key the installed SDK does not name. An adapter that rebuilt the
     item from its own pinned model would drop that key, which the API rejects on replay because
     encrypted_content must arrive byte-identical.
+    The web search call is the item this adapter has no turn-element variant for.
     """
-    return [_REASONING_OUTPUT_ITEM | {"field_newer_than_sdk": "x"}, dict(_TEXT_OUTPUT_ITEM)]
+    return [
+        _REASONING_OUTPUT_ITEM | {"field_newer_than_sdk": "x"},
+        dict(_WEB_SEARCH_OUTPUT_ITEM),
+        dict(_TEXT_OUTPUT_ITEM),
+    ]
 
 
 class TestOpenAIResponsesConformance(AdapterConformance):
@@ -2016,6 +2044,11 @@ class TestOpenAIResponsesConformance(AdapterConformance):
     @override
     def response_with_reasoning(self) -> BaseModel:
         """Return a turn whose reasoning item carries the unnamed key."""
+        return _response(usage=_usage_with_cache(), output=_conformance_output())
+
+    @override
+    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+        """Return the turn whose middle item is the built-in web search call."""
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override

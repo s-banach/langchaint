@@ -38,6 +38,7 @@ from langchaint import (
     ImagePart,
     InferenceParams,
     Message,
+    OpaqueElement,
     PydanticTool,
     ReasoningDelta,
     ReasoningTrace,
@@ -521,6 +522,34 @@ def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     assert reasoning_trace.text is None
     assert _assistant_content_blocks(assistant_message) == [
         {"type": "redacted_thinking", "data": "opaque-bytes"}
+    ]
+
+
+def test_a_server_tool_block_becomes_an_opaque_element_and_replays_as_itself() -> None:
+    """A block this adapter has no variant for reaches the turn and goes back unchanged.
+
+    The response was billed for that block, so dropping it would destroy output the caller paid for
+    and leave a tool loop continuing from a turn the model did not produce.
+    """
+    assistant_message = _assistant_message_from(
+        _message_with_content([
+            at.ServerToolUseBlock(
+                type="server_tool_use",
+                id="srvtoolu_1",
+                name="web_search",
+                input={"query": "langchaint"},
+            )
+        ])
+    )
+    (opaque_element,) = assistant_message.turn
+    assert isinstance(opaque_element, OpaqueElement)
+    assert _assistant_content_blocks(assistant_message) == [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "langchaint"},
+        }
     ]
 
 
@@ -1698,6 +1727,28 @@ def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> 
     assert "args_json" in outcome.reason
 
 
+def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_request() -> None:
+    """A stored payload with no type key is no content block, so nothing is sent.
+
+    A turn replayed from a provider whose elements carry no type key is what gets here.
+    Automatic caching is bound on, the case where the wire path reads that key to place the
+    breakpoint: passing the payload through raises KeyError out of build_request, which names a
+    langchaint defect for a request no defect produced.
+    """
+    adapter = _adapter()
+    precomputed_fields = adapter._precompute_fields(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+    )
+    bound_adapter = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
+    messages = [
+        UserMessage(content="q"),
+        AssistantMessage(turn=(OpaqueElement(raw={"parts": [{"text": "from elsewhere"}]}),)),
+    ]
+    outcome = bound_adapter.build_request(messages)
+    assert isinstance(outcome, InvalidRequest)
+    assert "type key" in outcome.reason
+
+
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
     """as_json holds the binding's precomputed fields and this call's converted messages.
 
@@ -1929,21 +1980,31 @@ def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot
 
 
 def _turn_content() -> list[at.ContentBlock]:
-    """Build one thinking block carrying a key the installed SDK does not name, then one text block.
+    """Build a thinking block, a server tool call, then a text block.
 
-    model_construct rather than the constructor: the extra key is the point, and the constructor of
-    a pinned SDK model has no field for a key that SDK does not name.
+    The thinking block carries a key the installed SDK does not name; model_construct rather than
+    the constructor, because the extra key is the point and the constructor of a pinned SDK model
+    has no field for a key that SDK does not name.
+    The server tool call is the block this adapter has no turn-element variant for.
+    The text block stays last, so the request's automatic cache marker lands on it rather than on a
+    block whose stored dump an invariant compares against the wire.
     """
     return [
         at.ThinkingBlock.model_construct(
             type="thinking", thinking="check first", signature="sig-1", field_newer_than_sdk="x"
+        ),
+        at.ServerToolUseBlock(
+            type="server_tool_use",
+            id="srvtoolu_1",
+            name="web_search",
+            input={"query": "langchaint"},
         ),
         at.TextBlock(type="text", text="hello"),
     ]
 
 
 def _turn_message(usage: at.Usage) -> at.Message:
-    """Build a finished turn of one thinking block then one text block, billing the given usage."""
+    """Build a finished turn of _turn_content's blocks, billing the given usage."""
     return _message_with_content(_turn_content(), stop_reason="end_turn", usage=usage)
 
 
@@ -1986,6 +2047,11 @@ class TestAnthropicMessagesConformance(AdapterConformance):
     @override
     def response_with_reasoning(self) -> BaseModel:
         """Return a turn whose thinking block carries the unnamed key."""
+        return _turn_message(_usage_with_cache_split())
+
+    @override
+    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+        """Return the turn whose middle block is a server tool call."""
         return _turn_message(_usage_with_cache_split())
 
     @override

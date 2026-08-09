@@ -103,8 +103,7 @@ class Response[OutputT](_SuccessCarrier):
     attempts counts its records.
     Every attempt record but the last failed and the last succeeded.
     assistant_message is the adapter-built turn exactly as the provider produced it,
-    the whole ordered turn (reasoning, text, and tool calls in emission order),
-    held by reference for appending to a Sequence[Message].
+    the whole ordered turn, held by reference for appending to a Sequence[Message].
     Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
     and is the rewrap this field exists to prevent.
     The last attempt record holds the same object, because the record is where every attempt's turn

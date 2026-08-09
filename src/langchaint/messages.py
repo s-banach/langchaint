@@ -117,8 +117,9 @@ class ReasoningTrace(CheckedCopyModel):
     to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
     thinking block; OpenAI re-reads encrypted_content; Gemini requires thought signatures resent
     exactly as received).
-    Replaying a trace through another provider is a malformed request that provider rejects.
-    Switching providers therefore means first rebuilding assistant turns without their traces.
+    No provider reads another provider's trace.
+    Switching providers therefore means first rebuilding assistant turns without their traces;
+    each adapter's docstring states what its wire does with a foreign one.
     Full reasoning history is the default; editing the Sequence[Message] is the only way to change it.
     Trimming is the application's job.
     Trimming for length removes whole turns; a kept turn keeps its traces.
@@ -127,7 +128,7 @@ class ReasoningTrace(CheckedCopyModel):
     (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
     and for prompt caching:
     reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
-    The dict field makes this model unhashable, unlike its frozen siblings; messages are never hashed.
+    The dict field makes this model unhashable; messages are never hashed.
 
     text is the provider's readable text, assembled from text already inside raw
     and adding nothing raw does not hold;
@@ -144,10 +145,29 @@ class ReasoningTrace(CheckedCopyModel):
     kind: Literal["reasoning_trace"] = "reasoning_trace"
 
 
-type TurnElement = Annotated[ReasoningTrace | TextPart | ToolCall, Field(discriminator="kind")]
+class OpaqueElement(CheckedCopyModel):
+    """One assistant-turn value langchaint models nothing inside.
+
+    An adapter emits OpaqueElement for replayable response values lacking another TurnElement variant.
+    The turn preserves their response order.
+    raw is the producing SDK model_dump fragment required for replay.
+    The consuming adapter sends raw unchanged in its original wire position.
+    Another adapter returns InvalidRequest or leaves validation to its provider.
+    Applications inspect Response.raw for the complete SDK response.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    raw: Mapping[str, object]
+    kind: Literal["opaque_element"] = "opaque_element"
+
+
+type TurnElement = Annotated[
+    ReasoningTrace | TextPart | ToolCall | OpaqueElement, Field(discriminator="kind")
+]
 """One element of an assistant turn, ordered as the provider emitted them.
 Discriminated on kind, so re-validating a persisted turn selects each element's variant from its tag.
-TextPart, not Part: assistant turns still return no images.
+The text element is TextPart, not Part: an image a provider returns arrives as an OpaqueElement.
 """
 
 
@@ -254,13 +274,13 @@ def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) 
     A release that breaks loading says so in its release notes.
 
     The output is compact; pass indent (pydantic's dump_json indent) for text a human reads or diffs.
-    Each ReasoningTrace.raw is embedded as the mapping the adapter replays,
+    Each ReasoningTrace.raw and each OpaqueElement.raw is embedded as the mapping the adapter replays,
     so a restored conversation builds the same wire request as the original;
     the conformance suite asserts that per adapter.
 
     Raises:
-        pydantic_core.PydanticSerializationError: a ReasoningTrace.raw value is an object JSON
-            cannot represent.
+        pydantic_core.PydanticSerializationError: a ReasoningTrace.raw or OpaqueElement.raw value is
+            an object JSON cannot represent.
     """
     return _MESSAGES_JSON.dump_json(list(messages), indent=indent).decode()
 

@@ -497,7 +497,7 @@ class ProviderFailedTerminally(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class EmptyTurn(NoOutput):
-    """A completed turn that produced no instance and no tool call.
+    """A completed turn that produced no instance and no ToolCall.
 
     The retry loop records the attempt and fails the item with an EmptyTurnError, without retrying:
     the model finished on its own terms and emitted nothing a structured binding can return, so a

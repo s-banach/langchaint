@@ -18,8 +18,8 @@ Verified against google-genai 2.16.0:
 - `Part.thought` marks reasoning and `Part.thought_signature` is bytes; the SDK models serialize
   bytes as base64 in JSON mode and validate them back, so a `mode="json"` dump is the
   round-trippable form ReasoningTrace.raw carries.
-- The SDK models forbid unknown keys, so a trace another provider produced has no wire route and
-  build_request reports it as InvalidRequest.
+- The SDK models forbid unknown keys, so a stored dump another provider produced has no wire route
+  and build_request reports it as InvalidRequest.
 - The SDK enums construct unknown values as synthetic members with a UserWarning, so an effort or
   tier word the SDK does not know still reaches the wire as given.
 - `FunctionResponse.response` documents the "output" and "error" keys as function output and error
@@ -109,6 +109,7 @@ from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.messages import (
     AssistantMessage,
     Message,
+    OpaqueElement,
     Part,
     ReasoningTrace,
     StopReason,
@@ -396,14 +397,20 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
     the resend-exactly source. A signature-carrying part that also holds a function call or
     non-thought text additionally yields its ToolCall or TextPart, so the turn's consumers see the
     content; _assistant_wire_parts skips that element on replay, keeping the wire form what arrived.
-    Thought text goes on the trace's text and nowhere else; empty non-thought text yields nothing.
+    Thought text goes on the trace's text and nowhere else.
+    A part that yields none of those three, executable_code and code_execution_result among them,
+    becomes an OpaqueElement holding the same dump, so the turn carries what the response was billed
+    for. Empty text is no text, so a part whose text is the empty string yields no TextPart; where
+    it carries no function call and no reasoning it becomes an OpaqueElement, and one carrying
+    nothing at all replays as the empty-text part that arrived.
     Absent content or parts is an empty turn (a SAFETY candidate can carry a finish_reason and no
     content).
     """
     parts = content.parts if content is not None and content.parts is not None else []
     turn: list[TurnElement] = []
     for part in parts:
-        if part.thought or part.thought_signature is not None:
+        carries_reasoning = part.thought or part.thought_signature is not None
+        if carries_reasoning:
             turn.append(
                 ReasoningTrace(
                     raw=part.model_dump(mode="json", exclude_none=True),
@@ -412,8 +419,11 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
             )
         if part.function_call is not None:
             turn.append(_tool_call_from(part.function_call))
-        elif part.text and not part.thought:
-            turn.append(TextPart(text=part.text))
+        elif part.text:
+            if not part.thought:
+                turn.append(TextPart(text=part.text))
+        elif not carries_reasoning:
+            turn.append(OpaqueElement(raw=part.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -438,22 +448,23 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
     )
 
 
-def _part_from_trace(trace: ReasoningTrace) -> types.Part:
-    """Restore a ReasoningTrace's raw dump to the Part that produced it, byte-identical.
+def _part_from_dump(raw: Mapping[str, object], *, element_description: str) -> types.Part:
+    """Restore one stored raw dump to the Part that produced it, byte-identical.
 
     model_validate_json is the inverse of the JSON-mode dump _assistant_message_from stored,
     restoring the signature bytes from base64.
+    element_description names the turn element raw came from, for the failure message.
 
     Raises:
         _NotSendableError: raw does not restore to a Part. The SDK models forbid unknown keys, so a
-            trace another provider produced has no Gemini wire route; a raw holding a value JSON
+            dump another provider produced has no Gemini wire route; a raw holding a value JSON
             cannot represent fails the same way.
     """
     try:
-        return types.Part.model_validate_json(json.dumps(trace.raw))
+        return types.Part.model_validate_json(json.dumps(raw))
     except (TypeError, ValueError) as not_a_part:
         raise _NotSendableError(
-            f"a reasoning trace does not restore to a Gemini Part, so it cannot be sent: "
+            f"{element_description} does not restore to a Gemini Part, so it cannot be sent: "
             f"{not_a_part}"
         ) from not_a_part
 
@@ -492,10 +503,12 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
     A ReasoningTrace restores to the Part that produced it; when that part carries a function call
     or non-thought text, the element _assistant_message_from paired with it follows in the turn and
     is skipped, so the pair goes back as the one part that arrived. An empty TextPart yields nothing.
+    An OpaqueElement restores the same way and carries no such pair.
 
     Raises:
-        _NotSendableError: a trace does not restore to a Part (from _part_from_trace), or a tool
-            call's args_json is not a JSON object (from _function_call_from).
+        _NotSendableError: a trace or an opaque element does not restore to a Part (from
+            _part_from_dump), or a tool call's args_json is not a JSON object (from
+            _function_call_from).
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     parts: list[types.Part] = []
@@ -511,11 +524,13 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
                 parts.append(types.Part(text=element.text))
         elif isinstance(element, ToolCall):
             parts.append(types.Part(function_call=_function_call_from(element)))
-        else:
-            part = _part_from_trace(element)
+        elif isinstance(element, ReasoningTrace):
+            part = _part_from_dump(element.raw, element_description="a reasoning trace")
             parts.append(part)
             if part.function_call is not None or (part.text and not part.thought):
                 trace_shadow = part
+        else:
+            parts.append(_part_from_dump(element.raw, element_description="an opaque element"))
     return parts
 
 
@@ -1215,7 +1230,8 @@ class _GeminiStream(AdapterStream):
         delta before the next part's first delta.
 
         Yields:
-            Stream items; parts langchaint does not model are dropped.
+            Stream items; a part langchaint does not model streams nothing and reaches the caller
+            in the turn final()'s assembled response carries.
 
         Raises:
             StreamProtocolError: the stream ended having seen neither a finish_reason nor a

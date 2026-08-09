@@ -15,6 +15,7 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     Message,
+    OpaqueElement,
     ReasoningTrace,
     TextPart,
     ToolCall,
@@ -230,7 +231,15 @@ def _one_of_each_message() -> list[Message]:
 
     Grow it by appending an element here, so _PINNED_MESSAGES stays pinned.
     """
-    return list(_PINNED_MESSAGES)
+    return [
+        *_PINNED_MESSAGES,
+        AssistantMessage(
+            turn=(
+                OpaqueElement(raw={"type": "web_search_call", "id": "ws_1"}),
+                TextPart(text="ok"),
+            )
+        ),
+    ]
 
 
 def test_messages_json_round_trip_restores_the_list() -> None:

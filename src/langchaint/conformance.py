@@ -14,8 +14,8 @@ Every invariant here is public API: changing one changes what every third-party 
 
 An adapter lacking a capability supplies a degenerate fixture rather than skipping. A provider with
 no prompt caching returns zero cache-write tokens from response_with_cache_writes, and the cache
-invariants run and pass, because zero counters cost zero at any rate. There is no skip hook, which
-is what would let a divergence report green while covering less.
+invariants run and pass, because zero counters cost zero at any rate. Skipping is what would let a
+divergence report green while covering less.
 """
 
 import asyncio
@@ -41,6 +41,7 @@ from langchaint.exceptions import AbandonedCallError, StreamProtocolError, Trans
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import (
     Message,
+    OpaqueElement,
     ReasoningTrace,
     UserMessage,
     messages_from_json,
@@ -141,6 +142,20 @@ class AdapterConformance(ABC):
         that rebuilt the payload from its own model would drop.
         The turn's elements must map one to one onto the wire elements a request built from that
         turn carries, so no two adjacent parts of a kind the adapter joins into one.
+        """
+        ...
+
+    @abstractmethod
+    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel | None:
+        """Return an SDK response whose turn holds one block this adapter has no variant for.
+
+        Beside it, at least one block the adapter does model.
+        The turn's elements must map one to one onto the wire elements a request built from that
+        turn carries, so no two adjacent blocks of a kind the adapter joins into one.
+        Return None where the wire holds a whole turn as one message's fields rather than as a list
+        of elements, which leaves no position an OpaqueElement could stand at; the invariant then
+        asserts nothing, so returning None on a wire that does carry such a block hides the drop the
+        invariant exists to catch.
         """
         ...
 
@@ -298,6 +313,31 @@ class AdapterConformance(ABC):
         )
         assert len(elements) == len(turn)
         assert elements[index] == trace.raw
+
+    def test_a_block_the_adapter_does_not_model_round_trips_verbatim_in_position(self) -> None:
+        """A block langchaint has no variant for goes back on the wire unchanged, where it sat.
+
+        The response was paid for, so a block dropped on the way in is output the caller bought and
+        cannot get back, and a tool loop continuing from that turn would send the provider a turn it
+        did not produce.
+        The turn must hold an OpaqueElement: an adapter that drops the block shortens the turn and
+        the wire elements together, so the one-to-one count alone passes on the drop.
+        """
+        response = self.response_with_a_block_the_adapter_does_not_model()
+        if response is None:
+            return
+        bound_adapter = self._bound_adapter()
+        outcome = bound_adapter.interpret(response)
+        assert isinstance(outcome, AdapterResult)
+        turn = outcome.assistant_message.turn
+        assert any(isinstance(element, OpaqueElement) for element in turn)
+        elements = self._assistant_wire_elements_of(
+            bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
+        )
+        assert len(elements) == len(turn)
+        for index, element in enumerate(turn):
+            if isinstance(element, OpaqueElement):
+                assert elements[index] == element.raw
 
     def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
         """A turn restored by messages_from_json puts the same elements on the wire as the original.

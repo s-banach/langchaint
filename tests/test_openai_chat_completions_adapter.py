@@ -30,6 +30,7 @@ from langchaint import (
     AssistantMessage,
     ImagePart,
     InferenceParams,
+    OpaqueElement,
     ReasoningDelta,
     ReasoningTrace,
     SpecificToolChoice,
@@ -116,7 +117,13 @@ _CUSTOM_TOOL_CALL_WIRE: dict[str, object] = {
     "type": "custom",
     "custom": {"name": "n", "input": "i"},
 }
-"""One custom tool call as the API returns it, which the turn drops."""
+"""One custom tool call as the API returns it."""
+
+_FUNCTION_CALL_WIRE: dict[str, object] = {
+    "name": "legacy_lookup",
+    "arguments": "{}",
+}
+"""One deprecated function_call as the API returns it."""
 
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
@@ -407,16 +414,67 @@ def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> N
     )
 
 
-def test_a_custom_tool_call_is_dropped_and_the_function_call_beside_it_survives() -> None:
-    """Only function tools are ever sent, so a custom call back is a provider defect."""
+def test_a_custom_tool_call_becomes_an_opaque_element_and_replays_in_order() -> None:
+    """The custom.input and ToolCall.args_json fields name different provider concepts."""
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
         "content": None,
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
     })
-    assert _assistant_message_from(message).turn == (
+    assistant_message = _assistant_message_from(message)
+    assert assistant_message.turn == (
+        OpaqueElement(raw=_CUSTOM_TOOL_CALL_WIRE),
         ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
     )
+    assert _assistant_message_param(assistant_message) == {
+        "role": "assistant",
+        "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
+    }
+
+
+def test_a_function_call_becomes_an_opaque_element_and_replays_unchanged() -> None:
+    """The function_call field lacks the id ToolCall requires."""
+    message = ChatCompletionMessage.model_validate({
+        "role": "assistant",
+        "function_call": _FUNCTION_CALL_WIRE,
+    })
+    assistant_message = _assistant_message_from(message)
+    assert assistant_message.turn == (OpaqueElement(raw={"function_call": _FUNCTION_CALL_WIRE}),)
+    assert _assistant_message_param(assistant_message) == {
+        "role": "assistant",
+        "function_call": _FUNCTION_CALL_WIRE,
+    }
+
+
+@pytest.mark.parametrize("extra_type", ["custom", "future"])
+def test_a_function_call_keeps_its_field_when_an_extra_type_is_present(extra_type: str) -> None:
+    """The function_call field identifies the replay position independently from its value."""
+    function_call = {**_FUNCTION_CALL_WIRE, "type": extra_type}
+    message = ChatCompletionMessage.model_validate({
+        "role": "assistant",
+        "function_call": function_call,
+    })
+    assistant_message = _assistant_message_from(message)
+    assert assistant_message.turn == (OpaqueElement(raw={"function_call": function_call}),)
+    assert _assistant_message_param(assistant_message) == {
+        "role": "assistant",
+        "function_call": function_call,
+    }
+
+
+def test_build_request_rejects_two_deprecated_function_calls() -> None:
+    """One assistant message has one function_call field, so a second value cannot fit."""
+    bound = _adapter().bind_text(_binding())
+    request = bound.build_request([
+        AssistantMessage(
+            turn=(
+                OpaqueElement(raw={"function_call": _FUNCTION_CALL_WIRE}),
+                OpaqueElement(raw={"function_call": {"name": "second_lookup", "arguments": "{}"}}),
+            )
+        )
+    ])
+    assert isinstance(request, InvalidRequest)
+    assert "more than one function_call" in request.reason
 
 
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
@@ -628,6 +686,22 @@ def test_build_request_reports_an_image_inside_a_tool_message_as_invalid_request
     ])
     assert isinstance(request, InvalidRequest)
     assert "text-only" in request.reason
+
+
+def test_build_request_reports_an_opaque_element_in_a_turn_as_invalid_request() -> None:
+    """A turn another provider produced fails before the wire can drop its OpaqueElement."""
+    bound = _adapter().bind_text(_binding())
+    request = bound.build_request([
+        UserMessage(content="q"),
+        AssistantMessage(
+            turn=(
+                OpaqueElement(raw={"type": "server_tool_use", "name": "web_search"}),
+                TextPart(text="searching"),
+            )
+        ),
+    ])
+    assert isinstance(request, InvalidRequest)
+    assert "no Chat Completions wire form" in request.reason
 
 
 def test_request_maps_the_inference_params_and_omits_the_unset() -> None:
@@ -856,17 +930,16 @@ def test_structured_bind_reports_refusal_on_a_refusal_beside_a_tool_call() -> No
     assert isinstance(outcome, Refusal)
 
 
-def test_structured_bind_reports_empty_turn_when_a_tool_calls_finish_kept_no_call() -> None:
-    """A tool_calls finish whose only call the turn dropped leaves nothing to dispatch.
-
-    None here would build a Response whose output is None, which Response.output rules out.
-    """
+def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -> None:
+    """EmptyTurn.assistant_message preserves a custom tool call langchaint cannot dispatch."""
     completion = _completion(
         usage=None,
         message={"tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
         finish_reason="tool_calls",
     )
-    assert isinstance(_structured_parse(completion), EmptyTurn)
+    outcome = _structured_parse(completion)
+    assert isinstance(outcome, EmptyTurn)
+    assert outcome.assistant_message.turn == (OpaqueElement(raw=_CUSTOM_TOOL_CALL_WIRE),)
 
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
@@ -1323,6 +1396,17 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
     def response_with_reasoning(self) -> BaseModel:
         """Return a turn carrying reasoning_content beside its one text part."""
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
+
+    @override
+    def response_with_a_block_the_adapter_does_not_model(self) -> BaseModel:
+        """Return message.content beside one custom message.tool_calls entry.
+
+        openai 2.51.0 defines both fields on ChatCompletionMessage.
+        """
+        return _completion(
+            usage=_usage_with_cache(),
+            message={"content": "hello", "tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
+        )
 
     @override
     def assistant_wire_elements(self, request: RequestParams) -> Sequence[object]:

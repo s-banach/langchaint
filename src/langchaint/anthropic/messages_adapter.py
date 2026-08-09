@@ -137,6 +137,7 @@ from langchaint.exceptions import StreamProtocolError, TransientError
 from langchaint.messages import (
     AssistantMessage,
     Message,
+    OpaqueElement,
     Part,
     ReasoningTrace,
     StopReason,
@@ -460,17 +461,46 @@ def _tool_result_content(
     return [_part_block(part) for part in content]
 
 
+def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
+    """Copy one stored SDK dump into the wire block it came from, unread and unchanged.
+
+    The dict is the producing SDK block's model_dump; when this adapter produced it, its shape is
+    the wire param's by construction, so the cast holds. A dump another provider produced is not
+    this shape; where it names a type key it is passed through unchanged, never dropped or
+    neutralized here (trimming is the app's job), and left to the API. Reconstructing it field by
+    field would risk the exact byte-level change replay cannot tolerate.
+    The shallow copy keeps the wire path (which mutates blocks to place cache breakpoints) from
+    ever writing into the frozen message's stored payload.
+
+    Raises:
+        _NotSendableError: raw names no type key. Every content block param is discriminated by that
+            key (anthropic 0.120.2), so a dump without one is no block, and the wire path reads it
+            to decide where the automatic cache breakpoint goes. build_request reports the whole
+            request unsendable and the item fails on its own.
+    """
+    if "type" not in raw:
+        raise _NotSendableError(
+            "an assistant turn element's stored payload names no type key, "
+            "so anthropic has no content block to send it as"
+        )
+    # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
+    return cast("_ContentBlockParam", dict(raw))
+
+
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
     """Convert one AssistantMessage to wire blocks in turn order.
 
-    A ReasoningTrace's raw dict goes to the wire unchanged, routed by its own type key,
-    because the API rejects a tool-use continuation whose latest thinking block was modified.
-    A trace another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
+    A ReasoningTrace's and an OpaqueElement's raw dict go to the wire unchanged, routed by their own
+    type key: langchaint models nothing inside either dump, and the API rejects a tool-use
+    continuation whose latest thinking block was modified.
+    A dump another provider produced goes to the wire the same way and the API rejects its
+    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
+    one naming no type key at all does not reach the wire (from _replayed_block).
     An empty TextPart is skipped because the API rejects empty text blocks.
 
     Raises:
         json.JSONDecodeError: a tool_call.args_json is not valid JSON.
+        _NotSendableError: a stored payload names no type key (from _replayed_block).
     """
     blocks: list[_ContentBlockParam] = []
     for element in assistant_message.turn:
@@ -486,18 +516,8 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
                     input=json.loads(element.args_json),
                 )
             )
-        elif isinstance(element, ReasoningTrace):
-            # The dict is the producing SDK block's model_dump; when this adapter produced it,
-            # its shape is the wire param's by construction, so the cast holds. A trace another
-            # provider produced is not this shape; it is passed through unchanged, never dropped
-            # or neutralized here (trimming is the app's job), and left to the API.
-            # Reconstructing it field by field would risk the exact
-            # byte-level change replay cannot tolerate. The shallow copy keeps the wire path
-            # (which mutates blocks to place cache breakpoints) from ever writing into the
-            # frozen message's stored payload.
-            blocks.append(
-                cast("ThinkingBlockParam | RedactedThinkingBlockParam", dict(element.raw))
-            )
+        else:
+            blocks.append(_replayed_block(element.raw))
     return blocks
 
 
@@ -541,6 +561,8 @@ def _wire_messages(
     so the cached span grows with messages.
     A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
     so that request writes none.
+    Every other block param names cache_control (anthropic 0.120.2), the ones langchaint models
+    nothing inside among them.
     A part with cache_breakpoint marks its own block in a user message
     and the enclosing tool_result block in a tool message;
     the latest marks up to message_mark_budget are written and older ones left unwritten.
@@ -549,7 +571,8 @@ def _wire_messages(
 
     Raises:
         _NotSendableError: an image part's media_type is outside the API's set (from _part_block),
-            or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking).
+            or a ToolMessage part other than the last sets cache_breakpoint (from the tool_result marking),
+            or a stored payload names no type key (from _assistant_content_blocks).
         json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
     """
     wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []
@@ -740,10 +763,12 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     """Build the langchaint assistant turn from the SDK message, block order preserved.
 
     A thinking or redacted_thinking block becomes a ReasoningTrace carrying the block's own
-    model_dump for verbatim replay; server tool blocks are dropped (built-in tools are out of scope).
+    model_dump for verbatim replay.
     The two reasoning block types get a branch each because only thinking carries readable text:
     a redacted_thinking block holds an opaque string under data and nothing a reader can display,
     so its trace has no text.
+    Every other block, a server tool call and its result among them, becomes an OpaqueElement
+    holding its own model_dump, so the turn carries what the response was billed for.
     """
     turn: list[TurnElement] = []
     for block in message.content:
@@ -760,6 +785,8 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
             )
         elif block.type == "redacted_thinking":
             turn.append(ReasoningTrace(raw=block.model_dump(mode="python", exclude_none=True)))
+        else:
+            turn.append(OpaqueElement(raw=block.model_dump(mode="python", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -1176,7 +1203,8 @@ class _AnthropicStream(AdapterStream):
         An input_json_delta yields a ToolCallDelta only when the block it grows is a tool_use
         block, whose id and name are read off the SDK's message snapshot; the SDK appended the
         block there at content_block_start, before any of its deltas. A server_tool_use block
-        grows by the same delta type and is dropped with the block.
+        grows by the same delta type and streams nothing; it reaches the caller in the turn final()
+        assembles, as an OpaqueElement.
 
         A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
         is a block boundary, never text. That boundary reaches the caller as a

@@ -5,7 +5,8 @@ Alpha: the API is unstable and may change without notice.
 
 ## Purpose
 
-langchaint provides `BoundLLM` and `EmbeddingModel` as provider-neutral async interfaces.
+langchaint provides `BoundLLM` and `EmbeddingModel` as provider-neutral async interfaces.  
+langchaint provides no agent class or agent loop.
 
 ## Install and authenticate
 
@@ -15,15 +16,15 @@ langchaint declares no dependency extras.
 Top-level `import langchaint` requires no provider SDK.
 Backend imports report missing dependencies through `ModuleNotFoundError`.
 
-| Provider | Class | Creates | Install | Default credentials |
+| Provider | Class | Creates | Depends | Default credentials |
 | --- | --- | --- | --- | --- |
-| Anthropic | `Anthropic` | `LLM` | `pip install langchaint anthropic` | `ANTHROPIC_API_KEY` |
-| Amazon Bedrock | `AnthropicBedrock` | `LLM` | `pip install langchaint "anthropic[bedrock]"` | AWS credential provider chain |
-| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `pip install langchaint boto3` | AWS credential provider chain |
-| DeepSeek | `DeepSeek` | `LLM` | `pip install langchaint openai` | `DEEPSEEK_API_KEY` |
-| Gemini | `Gemini` | `LLM` | `pip install langchaint google-genai` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `pip install langchaint openai` (and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
-| Amazon Bedrock | `OpenAIBedrock` | `LLM` | `pip install langchaint "openai[bedrock]"` | AWS credential provider chain |
+| Anthropic | `Anthropic` | `LLM` | `anthropic` | `ANTHROPIC_API_KEY` |
+| Amazon Bedrock | `AnthropicBedrock` | `LLM` | `anthropic[bedrock]` | AWS credential provider chain |
+| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `boto3` | AWS credential provider chain |
+| DeepSeek | `DeepSeek` | `LLM` | `openai` | `DEEPSEEK_API_KEY` |
+| Gemini | `Gemini` | `LLM` | `google-genai` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `openai` (and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
+| Amazon Bedrock | `OpenAIBedrock` | `LLM` | `openai[bedrock]` | AWS credential provider chain |
 
 Every listed class accepts `client=` for SDK client configuration.
 The Amazon Bedrock classes use the AWS credential provider chain.
@@ -132,16 +133,6 @@ An embedding batch contains inputs sent together during each attempt.
 `automatic_prompt_caching` is required because it changes billing.
 `cache_breakpoint=True` ends the reusable prefix at that `ContentPart`.
 `GenerateResult` and `GenerationError` include paid `Usage` across attempts.
-
-## Scope
-
-- langchaint provides no agent class or agent loop.
-- langchaint provides no vector storage or retrieval index.
-- langchaint adds no checks for undocumented provider rules.
-- langchaint provides no document or PDF `ContentPart`.
-
-Convert documents before generation requests.
-Use `ImagePart` for rasterized pages or `TextPart` for extracted text.
 
 ## More examples
 

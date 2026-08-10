@@ -13,17 +13,17 @@ langchaint provides no agent class or agent loop.
 langchaint requires Python 3.13 or newer.
 Applications install and pin each provider SDK directly.
 langchaint declares no dependency extras.
-Top-level `import langchaint` requires no provider SDK.
+Top-level `import langchaint` requires no provider SDK or `numpy`.
 Backend imports report missing dependencies through `ModuleNotFoundError`.
 
 | Provider | Class | Creates | Depends | Default credentials |
 | --- | --- | --- | --- | --- |
 | Anthropic | `Anthropic` | `LLM` | `anthropic` | `ANTHROPIC_API_KEY` |
 | Amazon Bedrock | `AnthropicBedrock` | `LLM` | `anthropic[bedrock]` | AWS credential provider chain |
-| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `boto3` | AWS credential provider chain |
+| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `boto3` and `numpy` | AWS credential provider chain |
 | DeepSeek | `DeepSeek` | `LLM` | `openai` | `DEEPSEEK_API_KEY` |
 | Gemini | `Gemini` | `LLM` | `google-genai` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `openai` (and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
+| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `openai` (`numpy` and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
 | Amazon Bedrock | `OpenAIBedrock` | `LLM` | `openai[bedrock]` | AWS credential provider chain |
 
 Every listed class accepts `client=` for SDK client configuration.
@@ -85,7 +85,7 @@ asyncio.run(main())
 
 `EmbeddingModel.embed()` requires `task` for every adapter.
 The OpenAI adapter sends no corresponding request field.
-`EmbeddingModel.embed()` returns `Float2D`, a normalized two-dimensional NumPy `float32` array.
+`EmbeddingModel.embed()` returns normalized `Float2D` values with `numpy.float32` elements.
 Each input produces one row.
 
 Use `CohereBedrock` for Cohere embeddings through Amazon Bedrock.

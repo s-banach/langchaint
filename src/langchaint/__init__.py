@@ -8,6 +8,8 @@ The `tool` decorator builds `PydanticTool` from an async function annotation.
 `run_many` exposes bounded concurrent batching for application work.
 """
 
+from typing import TYPE_CHECKING
+
 from langchaint.adapter import (
     ReasoningDelta,
     SpecificToolChoice,
@@ -16,7 +18,6 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.call import AttemptRecord, CallRecord
-from langchaint.embedding import EmbeddingModel, EmbeddingTask, Float2D
 from langchaint.exceptions import (
     AbandonedCallError,
     ContextWindowExceededError,
@@ -105,6 +106,32 @@ from langchaint.tools import (
     tool,
 )
 from langchaint.usage import ZERO_USAGE, Usage
+
+if TYPE_CHECKING:
+    from langchaint.embedding import EmbeddingModel, EmbeddingTask, Float2D
+
+
+def __getattr__(name: str) -> object:
+    """Resolve public embedding attributes through `langchaint.embedding`.
+
+    Raises:
+        ModuleNotFoundError: The requested attribute requires unavailable `numpy`.
+        AttributeError: `name` is not a deferred public attribute.
+    """
+    if name == "EmbeddingModel":
+        from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
+
+        return EmbeddingModel
+    if name == "EmbeddingTask":
+        from langchaint.embedding import EmbeddingTask  # noqa: PLC0415 (defer numpy)
+
+        return EmbeddingTask
+    if name == "Float2D":
+        from langchaint.embedding import Float2D  # noqa: PLC0415 (defer numpy)
+
+        return Float2D
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "LLM",

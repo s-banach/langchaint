@@ -12,7 +12,14 @@ import asyncio
 from collections.abc import Sequence
 from typing import ClassVar, Literal, Protocol
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError as exc:
+    if exc.name != "numpy":
+        raise
+    raise ModuleNotFoundError(
+        "langchaint embeddings require the numpy package; install numpy."
+    ) from exc
 
 from langchaint.adapter import ErrorClassification
 from langchaint.exceptions import EmbeddingOutputError
@@ -35,7 +42,7 @@ type EmbeddingTask = Literal[
 """The purpose a provider may use while creating embeddings."""
 
 type Float2D = np.ndarray[tuple[int, int], np.dtype[np.float32]]
-"""A two-axis NumPy array containing `float32` values."""
+"""A two-axis `np.ndarray` containing `np.float32` values."""
 
 type _FloatMatrixValues = Sequence[Sequence[float]] | Float2D
 

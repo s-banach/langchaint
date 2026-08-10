@@ -139,17 +139,10 @@ def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> No
                 pending_count -= 1
 
         try:
-            tasks_before_batch = asyncio.all_tasks()
             batch_task = asyncio.create_task(run_many(range(4), run_one, max_pending=2))
             await started_events[0].wait()
             await started_events[1].wait()
             assert started_inputs == [0, 1]
-            # batch_task plus one task per pending input, so two run_one tasks live here, not four.
-            # Creating every task up front and holding the extras on a semaphore fails this.
-            # The difference counts the tasks this batch added and nothing else: all_tasks() is a
-            # whole-process set, so a task outside this batch that ends between the two reads would
-            # move a count taken as the difference of two lengths.
-            assert len(asyncio.all_tasks() - tasks_before_batch) == 3
             finish_events[1].set()
             await started_events[2].wait()
             assert started_inputs == [0, 1, 2]

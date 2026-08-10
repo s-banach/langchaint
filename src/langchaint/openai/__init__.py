@@ -29,7 +29,9 @@ The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
 """
 
-from collections.abc import Mapping
+from __future__ import annotations
+
+from collections.abc import Mapping  # noqa: TC003 (required for runtime type introspection)
 from typing import Literal, overload
 
 try:
@@ -41,7 +43,7 @@ except ModuleNotFoundError as exc:
         "langchaint's openai backend requires the openai package; install openai."
     ) from exc
 
-from langchaint.embedding import EmbeddingModel
+import langchaint  # noqa: TC001 (required for runtime type introspection)
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
@@ -291,7 +293,7 @@ class OpenAI:
         *,
         dimension: int = 1536,
         max_attempts: int = 3,
-    ) -> EmbeddingModel: ...
+    ) -> langchaint.EmbeddingModel: ...
 
     @overload
     def embedding_model(
@@ -300,7 +302,7 @@ class OpenAI:
         *,
         dimension: int = 3072,
         max_attempts: int = 3,
-    ) -> EmbeddingModel: ...
+    ) -> langchaint.EmbeddingModel: ...
 
     @overload
     def embedding_model(
@@ -308,7 +310,7 @@ class OpenAI:
         model: Literal["text-embedding-ada-002"],
         *,
         max_attempts: int = 3,
-    ) -> EmbeddingModel: ...
+    ) -> langchaint.EmbeddingModel: ...
 
     def embedding_model(
         self,
@@ -316,7 +318,7 @@ class OpenAI:
         *,
         dimension: int | None = None,
         max_attempts: int = 3,
-    ) -> EmbeddingModel:
+    ) -> langchaint.EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged OpenAI model.
 
         Third-generation models accept their documented dimension range.
@@ -325,7 +327,7 @@ class OpenAI:
 
         Raises:
             ValueError: `model`, `dimension`, or `max_attempts` is invalid.
-            ModuleNotFoundError: tiktoken is unavailable.
+            ModuleNotFoundError: Either `numpy` or `tiktoken` is unavailable.
         """
         if model not in OPENAI_EMBEDDING_MODELS:
             raise ValueError(f"model {model!r} is not in OPENAI_EMBEDDING_MODELS")
@@ -343,6 +345,8 @@ class OpenAI:
                     f"dimension for {model!r} must be an int from 1 through "
                     f"{maximum_dimension}, got {validated_dimension!r}"
                 )
+        from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
+
         try:
             from langchaint.openai.embedding_adapter import (  # noqa: PLC0415 (keep tiktoken outside ordinary imports)
                 _OpenAIEmbeddingAdapter,

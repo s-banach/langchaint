@@ -2,12 +2,14 @@
 
 Importing this subpackage requires `anthropic`.
 `Anthropic.model` sends the stated model identifier verbatim.
-`AnthropicBedrock.model` sends a cataloged Bedrock identifier verbatim.
-`ANTHROPIC_BEDROCK` selects its SDK client class and default pricing.
+`AnthropicBedrock.model` sends the stated Bedrock identifier verbatim.
+`ANTHROPIC_BEDROCK` lists preferred identifiers and their `BedrockRouting` values.
 Anthropic 0.120.0 constructs both Bedrock client classes without network requests.
 
-Cataloged models receive standard-tier `ANTHROPIC_PRICING` rates.
+Cataloged Anthropic models receive standard-tier `ANTHROPIC_PRICING` rates.
+Known Bedrock model substrings receive the corresponding rates.
 Uncataloged Anthropic models require `pricing`.
+Uncataloged Bedrock models also require a passed `client`.
 Responses from uncataloged service tiers cost NaN.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 `AnthropicBedrock` accepts `http_client` directly.
@@ -128,19 +130,22 @@ _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items(
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""
 
 
-type AnthropicBedrockModelName = Literal[
-    "anthropic.claude-fable-5",
-    "anthropic.claude-opus-4-8",
-    "anthropic.claude-opus-4-7",
-    "anthropic.claude-sonnet-5",
-    "anthropic.claude-haiku-4-5",
-    "us.anthropic.claude-opus-4-6-v1",
-    "us.anthropic.claude-sonnet-4-6",
-]
+type AnthropicBedrockModelName = (
+    Literal[
+        "anthropic.claude-fable-5",
+        "anthropic.claude-opus-4-8",
+        "anthropic.claude-opus-4-7",
+        "anthropic.claude-sonnet-5",
+        "anthropic.claude-haiku-4-5",
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-sonnet-4-6",
+    ]
+    | str
+)
 """Bedrock identifiers accepted by `AnthropicBedrock.model`.
 
-The `us.` prefix identifies a cross-region inference profile.
 Each identifier is sent verbatim.
+The literal values offer preferred endpoint-specific identifiers.
 """
 
 
@@ -169,10 +174,22 @@ ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
         api="legacy", pricing_key="claude-sonnet-4-6"
     ),
 }
-"""Routing for each `AnthropicBedrockModelName` value."""
+"""`BedrockRouting` for each preferred `AnthropicBedrockModelName` value."""
 
-_BEDROCK_BY_MODEL_ID = dict[str, BedrockRouting](ANTHROPIC_BEDROCK.items())
-"""`ANTHROPIC_BEDROCK` with `str` keys for runtime model lookup."""
+_BEDROCK_PRICING_KEY_BY_MODEL_SUBSTRING: dict[str, AnthropicModelName] = {
+    (
+        "claude-haiku-4-5"
+        if routing.pricing_key == "claude-haiku-4-5-20251001"
+        else routing.pricing_key
+    ): routing.pricing_key
+    for routing in ANTHROPIC_BEDROCK.values()
+}
+"""Pricing keys selected by Bedrock model substrings."""
+
+_MANTLE_MODEL_IDS = frozenset(
+    model for model, routing in ANTHROPIC_BEDROCK.items() if routing.api == "mantle"
+)
+"""Exact identifiers whose imported `api` is `"mantle"`."""
 
 _BEDROCK_CLIENT_CLASS: dict[
     Literal["mantle", "legacy"], type[AsyncAnthropicBedrockMantle | AsyncAnthropicBedrock]
@@ -180,6 +197,30 @@ _BEDROCK_CLIENT_CLASS: dict[
     "mantle": AsyncAnthropicBedrockMantle,
     "legacy": AsyncAnthropicBedrock,
 }
+
+
+def _longest_model_substring[ValueT](
+    model: str, values_by_model_substring: Mapping[str, ValueT]
+) -> ValueT | None:
+    """Return the value for the longest contained model substring."""
+    longest_model_substring: str | None = None
+    for model_substring in values_by_model_substring:
+        if model_substring not in model:
+            continue
+        if longest_model_substring is None or len(model_substring) > len(longest_model_substring):
+            longest_model_substring = model_substring
+    if longest_model_substring is None:
+        return None
+    return values_by_model_substring[longest_model_substring]
+
+
+def _bedrock_routing(model: str) -> BedrockRouting | None:
+    """Select `pricing_key` by substring and `api` by exact preferred identifier."""
+    pricing_key = _longest_model_substring(model, _BEDROCK_PRICING_KEY_BY_MODEL_SUBSTRING)
+    if pricing_key is None:
+        return None
+    api: Literal["mantle", "legacy"] = "mantle" if model in _MANTLE_MODEL_IDS else "legacy"
+    return BedrockRouting(api=api, pricing_key=pricing_key)
 
 
 def _anthropic_adapter(
@@ -219,21 +260,29 @@ def _anthropic_adapter(
 def _anthropic_bedrock_adapter(
     model: str,
     *,
-    routing: BedrockRouting,
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
+    catalog_table: AnthropicPricingTable | None,
     pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
 ) -> AnthropicMessagesAdapter:
-    """Build the adapter for one cataloged Bedrock model.
+    """Build the adapter for one Bedrock model.
 
     Raises:
-        ValueError: `pricing` lacks its required `"standard"` key.
+        ValueError: An uncataloged model lacks `pricing`.
+            Also raised when `pricing` lacks its required `"standard"` key.
     """
+    if catalog_table is None:
+        if pricing is None:
+            raise ValueError(
+                f"model {model!r} has no matching Anthropic pricing; pass pricing= stating its rates"
+            )
+    else:
+        pricing = {"standard": catalog_table, **(pricing or {})}
     return AnthropicMessagesAdapter(
         client=client,
         model=model,
-        pricing={"standard": ANTHROPIC_PRICING[routing.pricing_key], **(pricing or {})},
+        pricing=pricing,
         provider_name="aws.bedrock",
         default_max_completion_tokens=default_max_completion_tokens,
         cache_ttl=cache_ttl,
@@ -399,25 +448,30 @@ class AnthropicBedrock:
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
     ) -> LLM:
-        """Build an `LLM` for one cataloged Bedrock model.
+        """Build an `LLM` for one Bedrock model.
 
         `model` is sent verbatim.
-        `ANTHROPIC_BEDROCK` selects its SDK client class and pricing estimate.
+        A known model substring selects pricing.
+        An exact preferred Mantle identifier selects `AsyncAnthropicBedrockMantle`.
+        Other known identifiers select `AsyncAnthropicBedrock`.
         Stated `pricing` extends or replaces the `"standard"` estimate.
+        Uncataloged models require `pricing` and a passed `client`.
         `default_max_completion_tokens` fills an unstated bound completion limit.
         `cache_ttl` applies to every cache marker.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
         Raises:
             anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
-            ValueError: `model` is absent from `ANTHROPIC_BEDROCK`.
+            ValueError: An uncataloged model lacks `pricing` or a passed `client`.
                 Also raised when a passed SDK client cannot serve `model`.
         """
-        routing = _BEDROCK_BY_MODEL_ID.get(model)
-        if routing is None:
-            raise ValueError(f"model {model!r} is not in ANTHROPIC_BEDROCK")
+        routing = _bedrock_routing(model)
         client = self._passed_client
         if client is None:
+            if routing is None:
+                raise ValueError(
+                    f"model {model!r} has no matching BedrockRouting; pass client= with its SDK client class"
+                )
             client = self._clients_by_api.get(routing.api)
             if client is None:
                 client = _BEDROCK_CLIENT_CLASS[routing.api](
@@ -426,7 +480,7 @@ class AnthropicBedrock:
                     max_retries=0,
                 )
                 self._clients_by_api[routing.api] = client
-        else:
+        elif routing is not None:
             required_class = _BEDROCK_CLIENT_CLASS[routing.api]
             if not isinstance(client, required_class):
                 raise ValueError(
@@ -435,8 +489,8 @@ class AnthropicBedrock:
                 )
         adapter = _anthropic_bedrock_adapter(
             model,
-            routing=routing,
             client=client,
+            catalog_table=(None if routing is None else ANTHROPIC_PRICING[routing.pricing_key]),
             pricing=pricing,
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,

@@ -79,6 +79,7 @@ from langchaint.anthropic import (
     AnthropicBedrock,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
+    AnthropicModelName,
     AnthropicPricedServiceTier,
     AnthropicPricingTable,
 )
@@ -2045,9 +2046,86 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
 
 
-def test_bedrock_table_is_total_over_the_bedrock_ids() -> None:
-    """Every AnthropicBedrockModelName has a routing entry, so a new Bedrock wire model id must add one."""
-    assert set(ANTHROPIC_BEDROCK) == set(get_args(AnthropicBedrockModelName.__value__))
+@pytest.mark.parametrize(
+    ("model", "aws_region", "pricing_key"),
+    [
+        ("anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
+        ("us.anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
+        ("eu.anthropic.claude-sonnet-4-6", "eu-west-1", "claude-sonnet-4-6"),
+        ("global.anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-sonnet-4-6",
+            "us-east-1",
+            "claude-sonnet-4-6",
+        ),
+        (
+            "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "eu-west-1",
+            "claude-haiku-4-5-20251001",
+        ),
+        ("us.anthropic.claude-sonnet-5", "us-east-1", "claude-sonnet-5"),
+    ],
+)
+def test_bedrock_model_matches_legacy_model_variants(
+    model: str,
+    aws_region: str,
+    pricing_key: AnthropicModelName,
+) -> None:
+    """Legacy model variants select `AsyncAnthropicBedrock` and matching pricing."""
+    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region=aws_region).model(model))
+    assert isinstance(adapter.client, AsyncAnthropicBedrock)
+    assert adapter.pricing["standard"] is ANTHROPIC_PRICING[pricing_key]
+
+
+def test_equal_length_model_substrings_use_catalog_order() -> None:
+    """Equal-length substrings select the first `ANTHROPIC_BEDROCK` `pricing_key`."""
+    model = "claude-opus-4-8.claude-sonnet-5"
+    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
+    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-8"]
+
+
+def test_preferred_api_uses_imported_catalog_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact preferred identifier uses its imported `api`."""
+    model = "anthropic.claude-sonnet-5"
+    monkeypatch.delitem(ANTHROPIC_BEDROCK, model)
+    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
+    assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
+
+
+def test_bedrock_model_accepts_custom_pricing_and_a_passed_client() -> None:
+    """A passed client serves an uncataloged model with stated pricing."""
+    model = "us.anthropic.claude-next"
+    adapter = _anthropic_adapter_of(
+        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1")).model(
+            model,
+            pricing=_PRICING,
+        )
+    )
+    assert adapter.model == model
+    assert adapter.pricing is _PRICING
+
+
+def test_uncataloged_bedrock_model_requires_a_passed_client() -> None:
+    """An uncataloged model cannot select `api`."""
+    with pytest.raises(ValueError, match="pass client="):
+        _ = AnthropicBedrock(aws_region="us-east-1").model(
+            "us.anthropic.claude-next",
+            pricing=_PRICING,
+        )
+
+
+def test_uncataloged_bedrock_model_requires_pricing() -> None:
+    """An uncataloged model has no default pricing."""
+    bedrock = AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"))
+    with pytest.raises(ValueError, match="pass pricing="):
+        _ = bedrock.model("us.anthropic.claude-next")
+
+
+def test_bedrock_preferred_model_names_equal_anthropic_bedrock_keys() -> None:
+    """`AnthropicBedrockModelName` literals equal `ANTHROPIC_BEDROCK` keys."""
+    preferred_model_names, accepted_string_type = get_args(AnthropicBedrockModelName.__value__)
+    assert accepted_string_type is str
+    assert set(ANTHROPIC_BEDROCK) == set(get_args(preferred_model_names))
 
 
 def test_wire_messages_marks_a_marked_user_part() -> None:

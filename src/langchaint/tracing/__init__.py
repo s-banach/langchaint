@@ -926,7 +926,7 @@ class TracedLLM:
 
     @property
     def shared_backoff(self) -> SharedBackoff:
-        """The wrapped LLM's SharedBackoff, so an app sharing a domain never reaches for a private field."""
+        """The wrapped `LLM.shared_backoff` for applications sharing a rate-limit quota."""
         return self._llm.shared_backoff
 
     @overload
@@ -1301,7 +1301,6 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         a GenerationError's last recorded one included.
 
         Raises:
-            RuntimeError: The wrapped account is closed before a request starts.
             GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
                 a refusal, a truncation, a rejected request, a provider error langchaint does not
                 retry, or an Exception that escaped langchaint's own machinery); the span is
@@ -1325,7 +1324,6 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         so a traced call gets the deadline an untraced one gets, of whichever kind its caller built.
 
         Raises:
-            RuntimeError: The wrapped account is closed before a request starts.
             GenerationError: the call failed; the span is attributed and closed first, and a batch
                 turns the error into that item's result. TimedOutError is one of them, so a call that
                 ran out of time closes its span like any other failure.
@@ -1423,7 +1421,6 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated
                 method).
-            RuntimeError: The wrapped account is closed before a request starts.
             asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
                 ended.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
@@ -1619,7 +1616,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         A second entry raises before the span is touched, so it cannot mark the first stream's span failed.
 
         Raises:
-            RuntimeError: The wrapped account is closed or this handle was already entered.
+            RuntimeError: This handle was already entered.
             Exception: the inner handle failed to open; the span is attributed by what the exception
                 is, takes error status, and ends.
         """

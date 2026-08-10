@@ -189,7 +189,7 @@ _ANTHROPIC_IMAGE_MEDIA_TYPES: tuple[_AnthropicImageMediaType, ...] = (
 
 
 _PAUSE_STATUSES = frozenset({429, 529})
-"""429 rate_limit_error and 529 overloaded_error: the whole account is throttled, so all pause."""
+"""429 rate_limit_error and 529 overloaded_error pause every request sharing the rate-limit quota."""
 
 _PAUSE_ERROR_TYPES = frozenset({"rate_limit_error", "overloaded_error"})
 """The two _PAUSE_STATUSES error types, which pause at any status carrying them."""
@@ -200,7 +200,8 @@ _RETRY_THIS_ONE_STATUSES = frozenset({408, 409, 500, 503, 504})
 500 api_error and 504 timeout_error come from the errors page.
 408 and 409 are the request and lock timeouts anthropic's own SDK retries (anthropic 0.120.2 _should_retry).
 503 is the status AsyncAnthropicBedrock raises ServiceUnavailableError for (anthropic 0.120.2).
-No errors page states that a Bedrock 503 throttles the account, so it retries rather than pauses.
+No errors page states that a Bedrock 503 throttles the rate-limit quota.
+It therefore retries without pausing every request.
 """
 
 _RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})

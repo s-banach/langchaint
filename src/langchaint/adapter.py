@@ -144,17 +144,7 @@ def request_id_from_raw(raw: BaseModel) -> str | None:
 def terminal_classification_from_response(
     *, status_code: int, headers: Mapping[str, str]
 ) -> Literal["invalid_request", "declared_final", "unknown_exception"]:
-    """Name the terminal error for one error response, by its status and its retry directive.
-
-    Whether the failure is retried is Adapter.parse's verdict, so this only names what a
-    DoNotRetry failure becomes: a 200 is a mid-stream error event raised on the live response, a
-    failure the provider named itself; a 4xx is this request's rejection, whoever issued it; a
-    status the non-standard x-should-retry header declared final is declared_final; and anything
-    left is a status langchaint has no account of.
-    The 4xx test comes before the header test, so a rejected request the directive marked
-    final keeps the rejection name. declared_final states a disposition and never what failed,
-    which the carried exception's own text names.
-    """
+    """Name one terminal error using its status and retry directive."""
     if status_code == 200:
         return "declared_final"
     if 400 <= status_code < 500:
@@ -181,18 +171,13 @@ def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
 def verdict_under_retry_directive(
     verdict: Verdict, *, headers: Mapping[str, str], retry_after: float | None
 ) -> Verdict:
-    """Let the provider's own x-should-retry directive override the verdict the status tables gave.
+    """Apply the provider's `x-should-retry` directive to `verdict`.
 
-    Both SDK clients read x-should-retry ahead of every status rule, so on an error response the
-    provider itself would judge, the directive decides whether this request is retried and no status
-    overrides it (anthropic 0.120.2, openai 2.51.0 BaseClient._should_retry).
-    It decides nothing about the account: _should_retry returns a bool, and the status is what says
-    the whole domain is throttled. So "false" over a pausing verdict gives PauseAllDoNotRetry, which
-    stops this request and still pauses the domain, and "true" promotes DoNotRetry to RetryThisOne,
-    the other verdicts already retrying.
-    retry_after is the wait the same response's headers named, which a promoted RetryThisOne carries.
-    Callers exclude a status-200 failure before calling: that is a mid-stream error event raised on
-    a response the provider accepted, whose headers the SDK never consults _should_retry about.
+    Both SDK clients read `x-should-retry` before status rules.
+    Anthropic 0.120.2 and OpenAI 2.51.0 verify this behavior.
+    The directive decides whether this request retries.
+    The status decides whether `SharedBackoff` pauses the rate-limit quota.
+    Callers exclude status-200 mid-stream error events.
     """
     directive = should_retry_from_headers(headers)
     if directive is False:
@@ -205,13 +190,10 @@ def verdict_under_retry_directive(
 
 
 def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
-    """Map a TransientError raised inside an admitted() block to its verdict.
+    """Map one `TransientError` to its `Verdict`.
 
-    The shared rule both provider parse functions apply to the one failure_types entry langchaint
-    itself raises: a billable 200 whose body reports a transient provider-side failure, which the
-    retry loop re-raises as a TransientError so the block's exit records it.
-    is_rate_limit says the provider named a rate limit, so the whole domain pauses; anything else is
-    the one request's to retry. Either verdict carries the error's own retry_after_seconds.
+    Retry loops create `TransientError` for transient failures in billable responses.
+    They raise it inside `SharedBackoff.admitted()`.
     """
     if error.is_rate_limit:
         return PauseAll(retry_after=error.retry_after_seconds)
@@ -487,19 +469,14 @@ class SchemaViolation(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class ProviderFailedTransiently(NoOutput):
-    """A billable 200 whose body reports a provider-side failure a resend may get past.
+    """A billable response reporting a transient provider failure.
 
-    The retry loop records the attempt and sends another, carrying reason as that attempt's
-    TransientError text. A stream handle records the same attempt and fails the item with
-    RetryUnavailableError: this outcome is read from the assembled response, so that stream is over
-    and the handle opens no other.
-    reason is the provider's own description of the failure.
-    is_rate_limit says the provider named a rate limit. The retry loop's TransientError carries it
-    through the admitted() block's exit, whose PauseAll verdict pauses the whole SharedBackoff
-    domain, exactly as a 429 status does.
-    A stream handle sets no such pause, so a sibling task learns of the limit from its own next
-    request: this outcome arrives with the stream already over, concluded inside the handle rather
-    than raised through the block.
+    Generation records the attempt and retries.
+    `reason` becomes the attempt's `TransientError` text.
+    `is_rate_limit=True` produces `PauseAll` during generation.
+    `PauseAll` pauses the rate-limit quota.
+    Streaming records the attempt and raises `RetryUnavailableError`.
+    Streaming cannot retry because the response stream already ended.
     """
 
     reason: str

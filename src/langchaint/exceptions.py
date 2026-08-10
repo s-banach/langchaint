@@ -58,15 +58,10 @@ if TYPE_CHECKING:
 class TransientError(Exception):
     """One failed attempt that a retry may fix.
 
-    __cause__ holds the original provider exception when one exists.
-    It plays two parts around the SharedBackoff admitted() block.
-    As a failure_types entry, one raised inside the block is parsed by
-    verdict_from_transient_error: is_rate_limit True becomes PauseAll and pauses the domain,
-    False becomes RetryThisOne, and retry_after_seconds is the wait the verdict carries.
-    As the attempt record's error, each retry loop wraps a parsed provider failure in one holding
-    the verdict's capped retry_after, so the record states the wait the loop honored.
-    No billing fields: the attempt that reached a billable 200 is recorded carrying this error, so
-    what it cost and the response it was read from are on that AttemptRecord.
+    `__cause__` holds the original provider exception when one exists.
+    Retry loops raise `TransientError` inside `SharedBackoff.admitted()`.
+    Attempt records store the capped wait on their `TransientError`.
+    Billing remains on the same `AttemptRecord`.
     """
 
     def __init__(

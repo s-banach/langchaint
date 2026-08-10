@@ -1,17 +1,17 @@
 """Warm a reusable prompt prefix before running its batch siblings."""
 
 from langchaint import GenerationError, Response, TextPart
-from langchaint.anthropic import AnthropicAccount
+from langchaint.anthropic import Anthropic
 
 
 async def generate_with_a_warm_cache() -> list[Response[str] | GenerationError]:
     """Warm one prefix and print each result's cache usage."""
-    account = AnthropicAccount()
+    anthropic = Anthropic()
     stable_policy = (
         "Support policy: route refunds to a human. "
         "Never request a password or payment-card number. "
     ) * 300
-    bound = account.model("claude-sonnet-5", cache_ttl="1h").bind(
+    bound = anthropic.model("claude-sonnet-5", cache_ttl="1h").bind(
         system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
         automatic_prompt_caching=False,
     )

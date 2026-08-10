@@ -1,184 +1,159 @@
 # langchaint
 
-Provider-neutral async LLM and embedding clients over official SDKs.
+Provider-neutral generation and embeddings over official SDKs.
 Alpha: the API is unstable and may change without notice.
 
-## The point
+## Purpose
 
-langchaint sits between application workflows and provider SDKs.
-Generation uses one message tree, error taxonomy, priced `Usage`, and `SharedBackoff`.
-Embeddings return normalized NumPy matrices directly.
-Applications keep agent loops, caching choices, and vector persistence.
+langchaint provides `BoundLLM` and `EmbeddingModel` as provider-neutral async interfaces.
 
-## Install
+## Install and authenticate
 
 langchaint requires Python 3.13 or newer.
-Its core dependencies are `pydantic`, `jsonschema`, and NumPy.
-Applications pin every provider SDK directly.
+Applications install and pin each provider SDK directly.
 langchaint declares no dependency extras.
-
-Install OpenAI generation support:
-
-    pip install langchaint openai
-
-Install OpenAI embedding support:
-
-    pip install langchaint openai tiktoken
-
-Install Cohere embedding support through Amazon Bedrock:
-
-    pip install langchaint boto3
-
 Top-level `import langchaint` requires no provider SDK.
-Backend imports report missing SDK dependencies through `ModuleNotFoundError`.
+Backend imports report missing dependencies through `ModuleNotFoundError`.
 
-## Generation example
+| Provider | Class | Creates | Install | Default credentials |
+| --- | --- | --- | --- | --- |
+| Anthropic | `Anthropic` | `LLM` | `pip install langchaint anthropic` | `ANTHROPIC_API_KEY` |
+| Amazon Bedrock | `AnthropicBedrock` | `LLM` | `pip install langchaint "anthropic[bedrock]"` | AWS credential provider chain |
+| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `pip install langchaint boto3` | AWS credential provider chain |
+| DeepSeek | `DeepSeek` | `LLM` | `pip install langchaint openai` | `DEEPSEEK_API_KEY` |
+| Gemini | `Gemini` | `LLM` | `pip install langchaint google-genai` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `pip install langchaint openai` (and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
+| Amazon Bedrock | `OpenAIBedrock` | `LLM` | `pip install langchaint "openai[bedrock]"` | AWS credential provider chain |
+
+Every listed class accepts `client=` for SDK client configuration.
+The Amazon Bedrock classes use the AWS credential provider chain.
+This includes environment credentials, profiles, SSO, containers, and instance roles.
+Pass `aws_region=` to select a Bedrock region explicitly.
+
+## Generation quickstart
 
 ```python
 import asyncio
 
-from pydantic import BaseModel
-
-from langchaint.openai import OpenAIAccount
-
-
-class Sentiment(BaseModel):
-    label: str
-    confidence: float
+from langchaint.openai import OpenAI
 
 
 async def main() -> None:
-    async with OpenAIAccount() as account:
-        classifier = account.model("gpt-5.6-terra").bind(
-            system_prompt="Classify the sentiment of the user's message.",
-            response_format=Sentiment,
-            automatic_prompt_caching=False,
-        )
-        response = await classifier.generate_one("This is the best day in months.")
-        print(response.output.label, response.usage.cost_in_usd)
+    openai = OpenAI()
+    bound_llm = openai.model("gpt-5.6-terra").bind(
+        system_prompt="Answer clearly and concisely.",
+        automatic_prompt_caching=False,
+    )
+    response = await bound_llm.generate_one("Why is the sky blue?")
+    print(response.output, response.usage.cost_in_usd)
 
 
 asyncio.run(main())
 ```
 
-`bind(response_format=Sentiment)` returns `BoundLLM[Sentiment]`.
-Its `response.output` is a validated `Sentiment` instance.
-Without `response_format`, `response.output` is assistant text.
-A bare generation `str` becomes one `UserMessage`.
+`response.output` is assistant text.
+Pass a Pydantic model to `LLM.bind(response_format=...)` for validated structured output.
 
-## Embedding example
+## Embedding quickstart
 
 ```python
 import asyncio
 
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 async def main() -> None:
-    async with OpenAIAccount() as account:
-        embedding_model = account.embedding_model(
-            "text-embedding-3-small",
-            dimension=1024,
-        )
-        documents = await embedding_model.embed(
-            ["The Moon orbits Earth.", "Mars has two small moons."],
-            task="retrieval_document",
-        )
-        query = await embedding_model.embed(
-            ["Which object circles Earth?"],
-            task="retrieval_query",
-        )
-        print(documents.shape, query.shape)
+    openai = OpenAI()
+    embedding_model = openai.embedding_model(
+        "text-embedding-3-small",
+        dimension=1024,
+    )
+    documents = await embedding_model.embed(
+        ["The Moon orbits Earth.", "Mars has two small moons."],
+        task="retrieval_document",
+    )
+    query = await embedding_model.embed(
+        ["Which object circles Earth?"],
+        task="retrieval_query",
+    )
+    print(documents.shape, query.shape)
 
 
 asyncio.run(main())
 ```
 
-OpenAI accepts `task` for interface consistency.
-It sends no corresponding OpenAI request field.
+`EmbeddingModel.embed()` requires `task` for every adapter.
+The OpenAI adapter sends no corresponding request field.
+`EmbeddingModel.embed()` returns `Float2D`, a normalized two-dimensional NumPy `float32` array.
+Each input produces one row.
 
-Use this construction for Cohere through Amazon Bedrock:
+Use `CohereBedrock` for Cohere embeddings through Amazon Bedrock.
+
+## Share one rate-limit quota
+
+Create one `OpenAI` per rate-limit quota.
 
 ```python
-from langchaint.cohere import CohereBedrockAccount
-
-async with CohereBedrockAccount(aws_region="us-east-1") as account:
-    embedding_model = account.embedding_model("cohere.embed-v4:0", dimension=1024)
+openai = OpenAI(
+    max_concurrent_requests=8,
+    max_request_starts_per_second=50.0,
+)
+terra = openai.model("gpt-5.6-terra")
+sol = openai.model("gpt-5.6-sol")
 ```
 
-Each result has shape `(len(inputs), dimension)` and dtype `np.float32`.
-Every row has L2 norm one.
-Each result owns writable, C-contiguous storage.
-langchaint performs no vector persistence.
+Both `terra` and `sol` use `openai.client` and one `SharedBackoff`.
+`max_concurrent_requests` applies across both `LLM` values.
+`max_request_starts_per_second` applies across both `LLM` values.
+An `EmbeddingModel` from `openai.embedding_model()` uses the same client and `SharedBackoff`.
 
-## What it has
+Pass an SDK client to close it directly.
 
-**Generation only through binding.**
-`LLM.bind()` returns `BoundLLM[OutputT]` with frozen inference configuration.
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+openai = OpenAI(client=client)
+terra = openai.model("gpt-5.6-terra")
+
+# Use terra.
+
+await client.close()
+```
+
+## Binding and results
+
+Call `LLM.bind()` before generating.
 `BoundLLM` provides `generate_one`, `generate_many`, and `stream_one`.
-Changing generation parameters uses `rebind()`.
+`BoundLLM.rebind()` replaces selected binding fields.
+`LLM.bind(max_attempts=...)` limits requests for one `GenerationInput`, including the first.
+An embedding batch contains inputs sent together during each attempt.
+`embedding_model(max_attempts=...)` limits requests for one embedding batch, including the first.
+`automatic_prompt_caching` is required because it changes billing.
+`cache_breakpoint=True` ends the reusable prefix at that `ContentPart`.
+`GenerateResult` and `GenerationError` include paid `Usage` across attempts.
 
-**Embeddings without binding.**
-`EmbeddingModel.embed()` takes texts and one required `task`.
-It returns `Float2D` directly.
-Provider adapters maximize ordered batches under documented request limits.
+## Scope
 
-**One `Account` per SDK client configuration.**
-Accounts share SDK clients and one `SharedBackoff` across request clients.
-Each account closes resources it created.
-
-**One accounting contract for generation.**
-Generation success and `GenerationError` both carry paid usage across attempts.
-
-**Priced generation usage.**
-`Usage` partitions input tokens by cache outcome.
-It carries one cost per priced category.
-
-**One `SharedBackoff` owning pacing.**
-Its `admitted()` block gates every request start.
-Rate limits pause the complete account request domain.
-
-**User-stated prompt caching.**
-`automatic_prompt_caching` is required because caching changes billing.
-`cache_breakpoint=True` places a prompt-cache boundary on that content part.
-
-**Streaming through a handle.**
-`stream_one` returns a `StreamHandle` async context manager.
-Its `final()` method returns the assembled result.
-
-**Tools under one protocol.**
-`PydanticTool`, `JSONSchemaTool`, and `CaptureTool` implement `Tool`.
-Applications may implement additional `Tool` forms.
-
-**Reasoning preserved across turns.**
-langchaint re-emits provider reasoning elements verbatim on later requests.
-
-**OTel tracing as a wrapper.**
-`langchaint.tracing` wraps generation clients and `ToolManager`.
-`capture_message_content` is required because prompt recording affects privacy.
-
-## What it does not have
-
-- No agent class or agent loop.
-- No vector storage or retrieval index.
-- No client-side guessing at undocumented provider rules.
-- No document or PDF content part.
+- langchaint provides no agent class or agent loop.
+- langchaint provides no vector storage or retrieval index.
+- langchaint adds no checks for undocumented provider rules.
+- langchaint provides no document or PDF `ContentPart`.
 
 Convert documents before generation requests.
 Use `ImagePart` for rasterized pages or `TextPart` for extracted text.
 
-## Layout
+## More examples
 
-    src/langchaint/           the provider-neutral core
-    src/langchaint/anthropic/ the Anthropic backend
-    src/langchaint/cohere/    the Cohere Bedrock embedding backend
-    src/langchaint/deepseek/  the DeepSeek backend using the OpenAI SDK
-    src/langchaint/gemini/    the Gemini backend
-    src/langchaint/openai/    the OpenAI backend
-    src/langchaint/tracing/   the OTel tracing subpackage
-    examples/                 focused examples and migration guidance
+[`examples/README.md`](examples/README.md) indexes focused examples and migration guidance.
+The examples cover structured output, batches, streaming, tools, tracing, pricing, and failures.
+They also cover prompt caching, reasoning, embeddings, and complete application structure.
 
-## Verification
+## Development
 
-Run `scripts/CI.sh`.
+Run `scripts/CI.sh` before committing.
 The tests are offline and require no API keys.
+
+## License
+
+langchaint uses the [MIT License](LICENSE).

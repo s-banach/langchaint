@@ -8,7 +8,6 @@ The `tool` decorator builds `PydanticTool` from an async function annotation.
 `run_many` exposes bounded concurrent batching for application work.
 """
 
-from langchaint.account import Account
 from langchaint.adapter import (
     ReasoningDelta,
     SpecificToolChoice,
@@ -111,7 +110,6 @@ __all__ = [
     "LLM",
     "ZERO_USAGE",
     "AbandonedCallError",
-    "Account",
     "Admission",
     "AssistantMessage",
     "AttemptRecord",

@@ -141,7 +141,7 @@ from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdic
 from langchaint.usage import Usage
 
 _PAUSE_STATUSES = frozenset({429, 503})
-"""429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE: account throttling and provider overload, so all pause."""
+"""429 RESOURCE_EXHAUSTED and 503 UNAVAILABLE pause every request sharing the rate-limit quota."""
 
 _RETRY_THIS_ONE_STATUSES = frozenset({408, 500, 502, 504})
 """One request's failure, retried without pausing siblings.

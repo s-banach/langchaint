@@ -38,7 +38,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 
 - Never choose a billing-relevant configuration for the user: `automatic_prompt_caching` is a required keyword with no default (an unstated `False` is a billing choice as real as opting in), and any convenience on top of user-stated caching is opt-in and default-off. Honor user-placed `cache_breakpoint` marks under either binding value.
 - Leave the tool loop to the application: ship no agent loop, and make a tool function return data, never a control-flow signal.
-- Keep one `SharedBackoff` owning pacing: one instance is one backpressure domain for the account it guards, and its `admitted()` block gates every request-start path.
+- Create one `SharedBackoff` per rate-limit quota. Its `admitted()` block gates every request-start path.
 - Wrap official SDK clients and delegate stream assembly to the SDK. Write no wire TypedDicts by hand. Validate a structured response against the caller's model where the response is in scope, because an SDK that validates inside the call returning the response raises where neither the response nor its billing is reachable.
 - Give the error taxonomy one axis, retry: retry a transient error and propagate the rest. Every non-transient error is one item's own failure, so a batch returns one outcome per `GenerationInput` and no item's failure cancels a sibling. A defect langchaint can detect in a binding raises before any request is sent. Never report a parse that returned no output as data.
 - Put the provider's own error text in the error langchaint raises, unabridged: a prefix naming what failed, then the provider string. Never summarize, truncate, or replace it, because the provider's wording is the only description of a condition langchaint does not model. Keep generated content out of `error_text` and `__str__`: the tracing layer writes both into spans unconditionally, so content placed there escapes whatever `capture_message_content` the caller chose. Content a caller recovers from a failure goes on its own field.
@@ -52,7 +52,7 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 - Honor user inputs faithfully, even invalid ones, and make no promise about how a provider will respond: never probe an endpoint to learn its errors, never add client-side guards guessing at provider-side rules, and do not restate this per case. Reserve client-side raises for documented provider facts and for defects that would otherwise produce a silently wrong result.
 - Use pydantic only where serde plus validation pay for themselves; everything else is a frozen dataclass or NamedTuple, and each qualifying model's docstring states what its validation buys. Derive every pydantic model from the checked-copy base, on which a key that is not a field is an error.
 - Keep the SDKs optional dependencies the application pins directly; declare no extras. The import path is the boundary: the neutral core imports no SDK; each backend subpackage imports its SDK at module top, guarded so a missing package raises a `ModuleNotFoundError` naming what to install.
-- Give each backend subpackage an `Account` class named for its provider. Each account owns its default SDK clients and one `SharedBackoff`. Send each model id verbatim. Require `pricing` where no carried table maps the model id. Document every parameter and cross-provider difference. Each subpackage docstring carries the pricing source URL.
+- Name each backend class for its provider. Compose Bedrock class names with the model provider. Send each model id verbatim. Require `pricing` where no carried table maps the model id. Document every parameter and cross-provider difference. Each subpackage docstring carries the pricing source URL.
 - Tier the public surface by audience: applications import from top-level `langchaint` and the backend subpackages; adapter authors import from `langchaint.adapter` and `langchaint.conformance`. Top-level `__all__` re-exports only the SDK-free application surface.
 - Check only what a type checker cannot. Applications are expected to run a strict one, so a runtime check that an argument has its annotated type duplicates it; check what a correctly-typed argument can still get wrong, such as a value out of range. `bool` is the case worth stating: it subclasses `int`, so a checker admits `True` wherever an `int` is annotated. A test that suppresses the type checker to reach a runtime check is a test of the type checker, so delete it rather than the suppression.
 - Ship OTel tracing in-tree as a thin, guarded-import subpackage off the top-level `__all__`. Premises: never fake an event boundary a span measures; the mapper gets attribute names and values, never the `GenerationInput`; catch and log telemetry failures, never propagate; wrap unconditionally, and leave enable/disable/routing to OTel SDK configuration. Record message content only through `capture_message_content`, a required keyword with no default. Use a convention key wherever one exists; reserve `langchaint.*` for what the convention lacks.
@@ -62,14 +62,11 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 One line per module saying what it is for; the module docstring is the spec of what it holds. No symbol lists: an inventory goes stale on every added name.
 
 - `llm.py`: the client `LLM` and the `BoundLLM` its `bind` returns.
-- `account.py`: the SDK-free `Account` protocol.
-- `account_base.py`: shared lifecycle and `SharedBackoff` construction for account-created request clients.
-- `account_state.py`: account state shared with account-created request clients.
 - `adapter.py`: the neutral base contract, dual-audience; imports no SDK.
 - `cancellation.py`: cancellation-safe execution of synchronous provider work.
 - `conformance.py`: the invariants every adapter holds to, as a test class an adapter author inherits; imports no SDK and no test runner.
 - `embedding.py`: provider-neutral embedding execution and output validation.
-- `shared_backoff.py`: the `SharedBackoff` backpressure domain, its `admitted()` block, the verdicts, and `PrivateBackoff`.
+- `shared_backoff.py`: paced request admission for one rate-limit quota.
 - `exceptions.py`: the error vocabulary.
 - `response.py`: the generate results and their flattening to a calls table and an attempts table.
 - `call.py`: the per-call history: one attempt's record, the frozen `CallRecord` every result carries, and the ledger the retry loops drive.

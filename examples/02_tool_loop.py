@@ -3,7 +3,7 @@
 from pydantic import BaseModel
 
 from langchaint import Message, Response, ToolCallTurn, ToolManager, UserMessage, tool
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 class WeatherArgs(BaseModel):
@@ -33,9 +33,9 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
         DispatchExceptionGroup: A tool function raised.
         RuntimeError: The model exceeded `max_turns`.
     """
-    account = OpenAIAccount()
+    openai = OpenAI()
     tool_manager = ToolManager([get_weather])
-    bound = account.model("gpt-5.6-terra").bind(
+    bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Use get_weather when needed. Return FinalAnswer when finished.",
         tool_manager=tool_manager,
         response_format=FinalAnswer,

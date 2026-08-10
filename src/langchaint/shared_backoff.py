@@ -1,27 +1,23 @@
-"""A shared pause and paced admission for one provider backpressure domain.
+"""Paced request admission for one rate-limit quota.
 
-SharedBackoff has one control action: holding a request from starting until a deadline its whole domain shares.
-A domain is the set of requests the caller routes through one instance, usually one model on one account.
-A request enters `admitted()`, the async-with block spanning one attempt.
-Entry acquires a permit when `max_concurrent_requests` is set, then admission; normally both are immediate.
-After the provider pushes back, every request in the domain waits at entry until the shared pause ends.
-When the pause ends, waiting requests remain ordered by arrival.
-`max_request_starts_per_second` spaces their request starts.
-Exit parses a provider failure into a verdict, records it, then returns the permit, in that order by position.
-SharedBackoff decides no retries and counts no tokens.
-It also bounds no pending work: it cannot tell an unadmitted request from one that has not entered yet.
-The bound on pending work belongs to whatever spawns the work.
+One `SharedBackoff` coordinates requests sharing one rate-limit quota.
+Its `admitted()` block spans one request attempt.
+Entry acquires a permit when `max_concurrent_requests` is set.
+Provider pushback pauses every request using the same `SharedBackoff`.
+Waiting requests remain ordered by arrival.
+`max_request_starts_per_second` spaces request starts.
+Exit records provider pushback before returning the permit.
+`SharedBackoff` retries no requests and counts no tokens.
+It does not bound pending work.
 
-The verdicts are PauseAll, PauseAllDoNotRetry, RetryThisOne, and DoNotRetry; only the two pausing
-ones change shared state.
-The verdict comes from the status, the error type, and the provider's own retry directive; a
-`retry-after` header never sets it.
-The header says how long to wait, not who has to wait.
+`PauseAll` and `PauseAllDoNotRetry` change shared state.
+`RetryThisOne` and `DoNotRetry` change no shared state.
+Status, error type, and provider retry directives determine each `Verdict`.
+`retry-after` states wait duration only.
 
-Every deadline here uses a forward-only clock (`time.monotonic`), never wall-clock time.
-The one exception is a `parse` converting a timestamp-formatted `retry-after`.
-A timestamp can only be compared against wall-clock time.
-This is for asyncio: safe for many tasks in one event loop, with no attempt to be safe across threads.
+Deadlines use `time.monotonic`.
+Timestamp-formatted `retry-after` values require wall-clock comparison.
+This module supports many asyncio tasks within one event loop.
 """
 
 import asyncio
@@ -94,10 +90,10 @@ class PauseAllDoNotRetry:
 
 
 type Verdict = PauseAll | PauseAllDoNotRetry | RetryThisOne | DoNotRetry
-"""What one parsed provider failure means for this request and for the domain.
+"""What one provider failure means for one request and its rate-limit quota.
 
-"Terminal verdict" names DoNotRetry and PauseAllDoNotRetry, on either of which the caller stops
-retrying this request.
+`DoNotRetry` and `PauseAllDoNotRetry` are terminal.
+Callers stop retrying this request for either verdict.
 """
 
 
@@ -188,7 +184,7 @@ class Admission:
         The order matters: recording after releasing would let a waiter take the permit and be
         admitted into the refusal already observed, so no await sits between recording and release.
         The release sits in a finally covering all exit processing, so a raise anywhere in it still
-        returns the permit and cannot starve the domain.
+        returns the permit and cannot starve waiting requests.
         Any exception outside failure_types is a fault in the attempt, not a provider failure: the
         permit returns and it propagates unparsed and unrecorded.
         On success nothing is recorded and verdict stays None.
@@ -208,31 +204,22 @@ class Admission:
 
 
 class SharedBackoff:
-    """The shared pause, the admission queue, and the permits of one domain.
+    """Coordinate request starts for one rate-limit quota.
 
-    Route every request in the domain through one instance, first attempts and retries alike.
+    Route every request sharing the rate-limit quota through one instance.
+    Each generated wait is positive and no greater than the wait ceiling.
+    A generated wait may fall below `minimum_wait_ceiling_seconds`.
+    `SharedBackoff` does not bound pending work.
 
-    The wait ceiling is a ceiling, not a wait: each pause of our own choosing lasts a fresh random
-    number greater than zero and no larger than it.
-    One wait can fall far below minimum_wait_ceiling_seconds.
-    There is no setting for how many requests may wait; the bound on pending work belongs to
-    whatever spawns the work.
-
-    Rules for the caller that no position in code enforces:
-
-    - Raise provider failures and stream error events as failure_types exceptions inside the block,
-      including failures you will not retry, and consume the whole stream inside the block.
-    - Do not catch a failure_types exception inside the block: a swallowed failure exits as a
-      success, unrecorded.
-    - Begin the attempt immediately after entry, and await no other admission mechanism inside the
-      block: blocking there after admission piles up admitted requests outside this object's reach.
-    - Keep a transport failure that produced nothing parseable out of failure_types; it propagates
-      unrecorded, and the caller treats it as RetryThisOne with no retry_after.
-    - Gate every retry on replay safety, whatever the verdict.
-    - On RetryThisOne, run a backoff private to the logical request between blocks, never inside one.
-    - On PauseAll, compute no wait of your own; the next entry already covers it.
-    - Turn off automatic retries in the SDK and the HTTP transport: left on, they run inside the
-      block, invisible to SharedBackoff.
+    Raise `failure_types` exceptions inside `admitted()`.
+    Consume provider streams inside `admitted()`.
+    Catching `failure_types` inside `admitted()` hides provider pushback.
+    Begin the request immediately after admission.
+    Keep unparseable transport failures outside `failure_types`.
+    Check replay safety before every retry.
+    Run `PrivateBackoff` between attempts for `RetryThisOne`.
+    Add no private wait for `PauseAll`.
+    Disable SDK and transport retries.
     """
 
     def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests, on_parse_error)
@@ -248,7 +235,7 @@ class SharedBackoff:
         max_request_starts_per_second: float = 50.0,
         on_parse_error: Literal["raise", "retry_this_one"] = "raise",
     ) -> None:
-        """Validate the configuration and initialize an unpaused domain.
+        """Validate the configuration and initialize an unpaused `SharedBackoff`.
 
         `parse` synchronously maps each provider failure to a `Verdict`.
         `failure_types` identifies the exceptions passed to `parse`.

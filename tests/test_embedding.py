@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 
 from langchaint import EmbeddingModel, EmbeddingOutputError, Float2D
-from langchaint.account_state import AccountState
 from langchaint.adapter import ErrorClassification
 from langchaint.embedding import EmbeddingTask, _validated_embeddings
 from langchaint.sequence_not_str import SequenceNotStr
@@ -148,14 +147,12 @@ def _model(
     adapter: _StubEmbeddingAdapter,
     *,
     max_attempts: int = 3,
-    account_state: AccountState | None = None,
     retry_provider_failures: bool = True,
 ) -> EmbeddingModel:
     return EmbeddingModel(
         adapter=adapter,
         shared_backoff=_shared_backoff(retry_provider_failures=retry_provider_failures),
         max_attempts=max_attempts,
-        account_state=account_state,
     )
 
 
@@ -278,20 +275,6 @@ def test_exhausted_transport_failure_propagates_unchanged() -> None:
     asyncio.run(scenario())
 
 
-def test_closed_account_rejects_embedding_work() -> None:
-    """Shared account state rejects work after closure."""
-    account_state = AccountState()
-    adapter = _StubEmbeddingAdapter([])
-    model = _model(adapter, account_state=account_state)
-    account_state.close()
-
-    async def scenario() -> None:
-        with pytest.raises(RuntimeError, match="closed"):
-            _ = await model.embed(["one"], task="classification")
-
-    asyncio.run(scenario())
-
-
 def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
     """Concurrent completion order cannot change returned row order."""
 
@@ -301,7 +284,6 @@ def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
             adapter=adapter,
             shared_backoff=_shared_backoff(),
             max_attempts=1,
-            account_state=None,
         )
         embed_task = asyncio.create_task(
             model.embed(["first", "second"], task="retrieval_document")
@@ -333,7 +315,6 @@ def test_retrying_one_request_batch_does_not_repeat_its_sibling(
             adapter=adapter,
             shared_backoff=_shared_backoff(),
             max_attempts=2,
-            account_state=None,
         )
 
         async def skip_sleep(_wait_seconds: float) -> None:

@@ -18,7 +18,7 @@ from langchaint.embedding import EmbeddingTask
 from langchaint.exceptions import EmbeddingOutputError
 from langchaint.openai import (
     OPENAI_EMBEDDING_MODELS,
-    OpenAIAccount,
+    OpenAI,
 )
 from langchaint.openai.embedding_adapter import (
     _OpenAIEmbeddingAdapter,
@@ -62,11 +62,11 @@ def _response(
     )
 
 
-def _pin_embedding_model_overloads(account: OpenAIAccount) -> None:
+def _pin_embedding_model_overloads(openai: OpenAI) -> None:
     """Pin each overload's result type without running this function."""
-    assert_type(account.embedding_model("text-embedding-3-small"), EmbeddingModel)
-    assert_type(account.embedding_model("text-embedding-3-large"), EmbeddingModel)
-    assert_type(account.embedding_model("text-embedding-ada-002"), EmbeddingModel)
+    assert_type(openai.embedding_model("text-embedding-3-small"), EmbeddingModel)
+    assert_type(openai.embedding_model("text-embedding-3-large"), EmbeddingModel)
+    assert_type(openai.embedding_model("text-embedding-ada-002"), EmbeddingModel)
 
 
 def test_embedding_catalog_has_the_documented_models() -> None:
@@ -93,8 +93,8 @@ def test_third_generation_models_accept_dimension_boundaries(
 ) -> None:
     """Accept each third-generation model's inclusive dimension boundaries."""
     client = _client(lambda _request: _response([[1.0]]))
-    account = OpenAIAccount(client=client)
-    embedding_model = account.embedding_model(model, dimension=dimension)
+    openai = OpenAI(client=client)
+    embedding_model = openai.embedding_model(model, dimension=dimension)
     assert embedding_model.dimension == dimension
     asyncio.run(client.close())
 
@@ -116,19 +116,19 @@ def test_third_generation_models_reject_invalid_dimensions(
 ) -> None:
     """Reject out-of-range dimensions and boolean dimensions."""
     client = _client(lambda _request: _response([[1.0]]))
-    account = OpenAIAccount(client=client)
+    openai = OpenAI(client=client)
     with pytest.raises(ValueError, match="dimension"):
-        _ = account.embedding_model(model, dimension=dimension)
+        _ = openai.embedding_model(model, dimension=dimension)
     asyncio.run(client.close())
 
 
 def test_embedding_model_defaults_and_ada_dimension() -> None:
     """Resolve each model's documented default dimension during construction."""
     client = _client(lambda _request: _response([[1.0]]))
-    account = OpenAIAccount(client=client)
-    assert account.embedding_model("text-embedding-3-small").dimension == 1536
-    assert account.embedding_model("text-embedding-3-large").dimension == 3072
-    assert account.embedding_model("text-embedding-ada-002").dimension == 1536
+    openai = OpenAI(client=client)
+    assert openai.embedding_model("text-embedding-3-small").dimension == 1536
+    assert openai.embedding_model("text-embedding-3-large").dimension == 3072
+    assert openai.embedding_model("text-embedding-ada-002").dimension == 1536
     asyncio.run(client.close())
 
 
@@ -137,13 +137,13 @@ def test_embedding_model_performs_no_tokenizer_loading(
 ) -> None:
     """Construct an embedding model without loading `cl100k_base`."""
     client = _client(lambda _request: _response([[1.0]]))
-    account = OpenAIAccount(client=client)
+    openai = OpenAI(client=client)
 
     def reject_loading(_name: str) -> tiktoken.Encoding:
         raise AssertionError("embedding_model loaded a tokenizer")
 
     monkeypatch.setattr(tiktoken, "get_encoding", reject_loading)
-    model = account.embedding_model("text-embedding-3-small")
+    model = openai.embedding_model("text-embedding-3-small")
     assert model.dimension == 1536
     asyncio.run(client.close())
 
@@ -151,11 +151,11 @@ def test_embedding_model_performs_no_tokenizer_loading(
 def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch) -> None:
     """Name tiktoken when the optional tokenizer dependency is unavailable."""
     client = _client(lambda _request: _response([[1.0]]))
-    account = OpenAIAccount(client=client)
+    openai = OpenAI(client=client)
     monkeypatch.delitem(sys.modules, "langchaint.openai.embedding_adapter")
     monkeypatch.setitem(sys.modules, "tiktoken", None)
     with pytest.raises(ModuleNotFoundError, match="require the tiktoken package"):
-        _ = account.embedding_model("text-embedding-3-small")
+        _ = openai.embedding_model("text-embedding-3-small")
     asyncio.run(client.close())
 
 
@@ -205,7 +205,7 @@ def test_ada_request_omits_dimensions() -> None:
     client = _client(handler)
 
     async def scenario() -> None:
-        model = OpenAIAccount(client=client).embedding_model("text-embedding-ada-002")
+        model = OpenAI(client=client).embedding_model("text-embedding-ada-002")
         _ = await model.embed(["text"], task="classification")
         await client.close()
 
@@ -375,7 +375,7 @@ def test_empty_input_string_fails_before_sdk_request() -> None:
     client = _client(handler)
 
     async def scenario() -> None:
-        model = OpenAIAccount(client=client).embedding_model(
+        model = OpenAI(client=client).embedding_model(
             "text-embedding-3-small",
             dimension=1,
         )
@@ -409,7 +409,7 @@ def test_transport_failure_retries_the_failed_batch(
     client = _client(handler)
 
     async def scenario() -> None:
-        model = OpenAIAccount(client=client).embedding_model(
+        model = OpenAI(client=client).embedding_model(
             "text-embedding-3-small",
             dimension=1,
             max_attempts=2,
@@ -454,7 +454,7 @@ def test_partition_cancellation_waits_for_token_counting(
     client = _client(lambda _request: _response([[1.0]]))
 
     async def scenario() -> None:
-        model = OpenAIAccount(client=client).embedding_model(
+        model = OpenAI(client=client).embedding_model(
             "text-embedding-3-small",
             dimension=1,
         )

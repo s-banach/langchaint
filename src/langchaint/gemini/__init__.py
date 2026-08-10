@@ -1,7 +1,7 @@
-"""The gemini backend provides an account, adapter, model catalog, and pricing.
+"""The gemini backend provides `Gemini`, its adapter, model catalog, and pricing.
 
 Importing this subpackage requires `google-genai`.
-`GeminiAccount.model` sends the stated model identifier verbatim.
+`Gemini.model` sends the stated model identifier verbatim.
 It reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
 Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
 Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
@@ -18,7 +18,7 @@ Maps source: https://ai.google.dev/gemini-api/docs/maps-grounding.
 Recheck that page before relying on a table.
 The catalog carries text, image, and video rates.
 Catalog tool rates estimate post-quota list prices.
-`GeminiAccount.model(pricing=...)` replaces cataloged estimates.
+`Gemini.model(pricing=...)` replaces cataloged estimates.
 langchaint sends no audio.
 Explicit cache-resource storage charges have no request `Usage` field.
 """
@@ -35,7 +35,6 @@ except ModuleNotFoundError as exc:
         "langchaint's gemini backend requires the google-genai package; install google-genai."
     ) from exc
 
-from langchaint.account_base import AccountBase
 from langchaint.gemini.generate_content_adapter import (
     GeminiGenerateContentAdapter,
     GeminiPricedServiceTier,
@@ -46,6 +45,7 @@ from langchaint.gemini.generate_content_adapter import (
     parse_gemini,
 )
 from langchaint.llm import LLM
+from langchaint.shared_backoff import SharedBackoff
 
 type GeminiModelName = Literal[
     "gemini-3.6-flash",
@@ -116,8 +116,8 @@ _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 """`GEMINI_PRICING` with `str` keys for runtime model lookup."""
 
 
-class GeminiAccount(AccountBase):
-    """Gemini SDK client and `SharedBackoff` shared by Gemini models."""
+class Gemini:
+    """Create `LLM` values for Gemini."""
 
     def __init__(
         self,
@@ -130,10 +130,9 @@ class GeminiAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build a Gemini account without sending a request.
+        """Build `Gemini` without sending a request.
 
         `client=None` constructs `genai.Client(vertexai=False)`.
-        A passed `client` remains caller-owned.
         A passed `client` must reach the Gemini Developer API.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
@@ -146,7 +145,7 @@ class GeminiAccount(AccountBase):
             ValueError: `client` is absent and no API key is available.
                 Also raised when a `SharedBackoff` setting is invalid.
         """
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_gemini,
             failure_types=GeminiGenerateContentAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -157,9 +156,6 @@ class GeminiAccount(AccountBase):
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
         self.client = client if client is not None else genai.Client(vertexai=False)
-        if client is None:
-            self._register_owned_sync_close(self.client.close)
-            self._register_owned_close(self.client.aio.aclose)
 
     @overload
     def model(
@@ -196,12 +192,10 @@ class GeminiAccount(AccountBase):
         The reported traffic type selects pricing.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when `pricing` lacks `"ON_DEMAND"`.
                 Also raised when `client` reaches Vertex AI.
         """
-        self._state.ensure_open()
         catalog_table = _PRICING_BY_MODEL_ID.get(model)
         if catalog_table is None:
             if pricing is None:
@@ -217,12 +211,12 @@ class GeminiAccount(AccountBase):
             provider_name="gcp.gemini",
             service_tier=service_tier,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
 
 __all__ = [
     "GEMINI_PRICING",
-    "GeminiAccount",
+    "Gemini",
     "GeminiGenerateContentAdapter",
     "GeminiModelName",
     "GeminiPricedServiceTier",

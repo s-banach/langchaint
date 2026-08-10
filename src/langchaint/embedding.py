@@ -1,7 +1,8 @@
 """Provider-neutral embedding execution and output validation.
 
 `EmbeddingModel` copies inputs before partitioning them into provider requests.
-Each request batch retries independently through one account's `SharedBackoff`.
+`EmbeddingModel` retries each embedding batch independently.
+All attempts use its `SharedBackoff`.
 The adapter owns provider batching and response decoding.
 The returned matrix preserves input order and owns writable `float32` storage.
 Every returned row has L2 norm one.
@@ -13,7 +14,6 @@ from typing import ClassVar, Literal, Protocol
 
 import numpy as np
 
-from langchaint.account_state import AccountClosedError, AccountState
 from langchaint.adapter import ErrorClassification
 from langchaint.exceptions import EmbeddingOutputError
 from langchaint.run_many import max_pending_for_requests, run_many
@@ -130,9 +130,8 @@ class EmbeddingModel:
         adapter: _EmbeddingAdapter,
         shared_backoff: SharedBackoff,
         max_attempts: int,
-        account_state: AccountState | None,
     ) -> None:
-        """Store one adapter and its shared request policy.
+        """Store one adapter, `SharedBackoff`, and `max_attempts`.
 
         Raises:
             ValueError: `max_attempts` is boolean or below one.
@@ -144,16 +143,6 @@ class EmbeddingModel:
         self.max_attempts = max_attempts
         self._adapter = adapter
         self._shared_backoff = shared_backoff
-        self._account_state = account_state
-
-    def _ensure_account_open(self) -> None:
-        """Reject work after account closure.
-
-        Raises:
-            RuntimeError: The creating account is closed.
-        """
-        if self._account_state is not None:
-            self._account_state.ensure_open()
 
     async def _embed_batch_with_retries(
         self,
@@ -164,7 +153,6 @@ class EmbeddingModel:
         """Run one request batch through its retry budget.
 
         Raises:
-            RuntimeError: The creating account is closed.
             asyncio.CancelledError: The caller cancelled this operation.
             Exception: A provider request failed terminally.
         """
@@ -175,10 +163,7 @@ class EmbeddingModel:
             admission = self._shared_backoff.admitted()
             try:
                 async with admission:
-                    self._ensure_account_open()
                     return await self._adapter.embed_batch(inputs, task=task)
-            except AccountClosedError:
-                raise
             except self._adapter.failure_types:
                 verdict = admission.verdict
                 if isinstance(verdict, DoNotRetry | PauseAllDoNotRetry):
@@ -206,13 +191,11 @@ class EmbeddingModel:
 
         Raises:
             TypeError: `inputs` is a bare `str`.
-            RuntimeError: The creating account is closed.
             ValueError: An input cannot form a provider request.
             EmbeddingOutputError: A successful response contains invalid vectors.
             asyncio.CancelledError: The caller cancelled this operation.
             Exception: A provider request failed terminally.
         """
-        self._ensure_account_open()
         if isinstance(inputs, str):
             raise TypeError("inputs is a bare str; wrap one input in a list")
         input_snapshot = tuple(inputs)

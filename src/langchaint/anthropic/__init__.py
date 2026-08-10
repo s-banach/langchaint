@@ -1,8 +1,8 @@
-"""The anthropic backend provides accounts, the Messages adapter, catalogs, and pricing.
+"""The anthropic backend provides LLM construction, the Messages adapter, catalogs, and pricing.
 
 Importing this subpackage requires `anthropic`.
-`AnthropicAccount.model` sends the stated model identifier verbatim.
-`AnthropicBedrockAccount.model` sends a cataloged Bedrock identifier verbatim.
+`Anthropic.model` sends the stated model identifier verbatim.
+`AnthropicBedrock.model` sends a cataloged Bedrock identifier verbatim.
 `ANTHROPIC_BEDROCK` selects its SDK client class and default pricing.
 Anthropic 0.120.0 constructs both Bedrock client classes without network requests.
 
@@ -10,7 +10,7 @@ Cataloged models receive standard-tier `ANTHROPIC_PRICING` rates.
 Uncataloged Anthropic models require `pricing`.
 Responses from uncataloged service tiers cost NaN.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
-`AnthropicBedrockAccount` accepts `http_client` directly.
+`AnthropicBedrock` accepts `http_client` directly.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
@@ -21,8 +21,8 @@ Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
 `ANTHROPIC_PRICING` covers the standard service tier.
 Its web-search rates are public list-price estimates.
-`AnthropicAccount.model(pricing=...)` replaces cataloged estimates.
-`AnthropicBedrockAccount.model(pricing=...)` accepts caller rates.
+`Anthropic.model(pricing=...)` replaces cataloged estimates.
+`AnthropicBedrock.model(pricing=...)` accepts caller rates.
 """
 
 from collections.abc import Mapping
@@ -40,7 +40,6 @@ except ModuleNotFoundError as exc:
         "langchaint's anthropic backend requires the anthropic package; install anthropic."
     ) from exc
 
-from langchaint.account_base import AccountBase
 from langchaint.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
     AnthropicPricedServiceTier,
@@ -51,6 +50,7 @@ from langchaint.anthropic.messages_adapter import (
     parse_anthropic,
 )
 from langchaint.llm import LLM
+from langchaint.shared_backoff import SharedBackoff
 
 type AnthropicModelName = Literal[
     "claude-fable-5",
@@ -137,7 +137,7 @@ type AnthropicBedrockModelName = Literal[
     "us.anthropic.claude-opus-4-6-v1",
     "us.anthropic.claude-sonnet-4-6",
 ]
-"""Bedrock identifiers accepted by `AnthropicBedrockAccount.model`.
+"""Bedrock identifiers accepted by `AnthropicBedrock.model`.
 
 The `us.` prefix identifies a cross-region inference profile.
 Each identifier is sent verbatim.
@@ -240,8 +240,8 @@ def _anthropic_bedrock_adapter(
     )
 
 
-class AnthropicAccount(AccountBase):
-    """Anthropic SDK client and `SharedBackoff` shared by Anthropic models."""
+class Anthropic:
+    """Create `LLM` values for Anthropic."""
 
     def __init__(
         self,
@@ -254,10 +254,9 @@ class AnthropicAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build an Anthropic account without sending a request.
+        """Build `Anthropic` without sending a request.
 
         `client=None` constructs `AsyncAnthropic()`.
-        A passed `client` remains caller-owned.
         A passed `client` must reach Anthropic.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
@@ -269,7 +268,7 @@ class AnthropicAccount(AccountBase):
         Raises:
             ValueError: A `SharedBackoff` setting is invalid.
         """
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_anthropic,
             failure_types=AnthropicMessagesAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -282,8 +281,6 @@ class AnthropicAccount(AccountBase):
         self.client = (
             client_without_retries(client) if client is not None else AsyncAnthropic(max_retries=0)
         )
-        if client is None:
-            self._register_owned_close(self.client.close)
 
     @overload
     def model(
@@ -328,11 +325,9 @@ class AnthropicAccount(AccountBase):
         The reported service tier selects pricing.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when `pricing` lacks its required `"standard"` key.
         """
-        self._state.ensure_open()
         adapter = _anthropic_adapter(
             model,
             client=self.client,
@@ -341,13 +336,13 @@ class AnthropicAccount(AccountBase):
             cache_ttl=cache_ttl,
             service_tier=service_tier,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
 
-class AnthropicBedrockAccount(AccountBase):
-    """Bedrock SDK clients and `SharedBackoff` shared by Anthropic models."""
+class AnthropicBedrock:
+    """Create `LLM` values for Anthropic models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (the account states every shared request policy)
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
         self,
         *,
         aws_region: str | None = None,
@@ -360,12 +355,10 @@ class AnthropicBedrockAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build a Bedrock account without sending a request.
+        """Build `AnthropicBedrock` without sending a request.
 
-        `aws_region` selects the region for account-created SDK clients.
-        A passed `client` remains caller-owned.
-        A passed `http_client` becomes account-owned.
-        `http_client` applies to account-created SDK clients.
+        `aws_region` selects the region for SDK clients created by `AnthropicBedrock`.
+        `http_client` applies to SDK clients created by `AnthropicBedrock`.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
         `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
@@ -381,7 +374,7 @@ class AnthropicBedrockAccount(AccountBase):
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None and http_client is not None:
             raise ValueError("Pass at most one of client= or http_client=")
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_anthropic,
             failure_types=AnthropicMessagesAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -397,8 +390,6 @@ class AnthropicBedrockAccount(AccountBase):
         self._clients_by_api: dict[
             Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
         ] = {}
-        if http_client is not None:
-            self._register_owned_close(http_client.aclose)
 
     def model(
         self,
@@ -419,11 +410,9 @@ class AnthropicBedrockAccount(AccountBase):
 
         Raises:
             anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
-            RuntimeError: This account is closed.
             ValueError: `model` is absent from `ANTHROPIC_BEDROCK`.
                 Also raised when a passed SDK client cannot serve `model`.
         """
-        self._state.ensure_open()
         routing = _BEDROCK_BY_MODEL_ID.get(model)
         if routing is None:
             raise ValueError(f"model {model!r} is not in ANTHROPIC_BEDROCK")
@@ -437,7 +426,6 @@ class AnthropicBedrockAccount(AccountBase):
                     max_retries=0,
                 )
                 self._clients_by_api[routing.api] = client
-                self._register_owned_close(client.close)
         else:
             required_class = _BEDROCK_CLIENT_CLASS[routing.api]
             if not isinstance(client, required_class):
@@ -453,14 +441,14 @@ class AnthropicBedrockAccount(AccountBase):
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
 
 __all__ = [
     "ANTHROPIC_BEDROCK",
     "ANTHROPIC_PRICING",
-    "AnthropicAccount",
-    "AnthropicBedrockAccount",
+    "Anthropic",
+    "AnthropicBedrock",
     "AnthropicBedrockModelName",
     "AnthropicMessagesAdapter",
     "AnthropicModelName",

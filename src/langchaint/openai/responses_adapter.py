@@ -832,8 +832,8 @@ class OpenAIResponsesAdapter(Adapter):
 
         provider_name says which provider the client reaches: "openai" for AsyncOpenAI,
         "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI.
-        `OpenAIAccount.model` passes "openai".
-        `OpenAIBedrockAccount.model` passes "aws.bedrock".
+        `OpenAI.model` passes "openai".
+        `OpenAIBedrock.model` passes "aws.bedrock".
         The two platform classes are in provider_name_by_client_class, so a value contradicting
         either makes Adapter.__init__ raise; an AsyncOpenAI takes the provider_name its caller
         states, since its base_url decides what it reaches.
@@ -846,10 +846,9 @@ class OpenAIResponsesAdapter(Adapter):
         It has no default because a wrong value fails either way: True on a model without the
         parameter risks a rejected request, and False on one with it refuses a binding the model
         would have accepted.
-        `OpenAIAccount.model` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
+        `OpenAI.model` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
         It requires the parameter for uncataloged identifiers.
-        `OpenAIBedrockAccount.model` always requires it.
-        having no catalog of Bedrock ids to read.
+        `OpenAIBedrock.model` always requires it because Bedrock ids have no catalog.
         It is a parameter here rather than a lookup on model because model is a str whose namespace
         this adapter cannot know: it serves the platforms provider_name_by_client_class maps and
         every OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.

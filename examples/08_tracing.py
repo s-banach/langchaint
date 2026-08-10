@@ -5,7 +5,7 @@ from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProces
 from pydantic import BaseModel
 
 from langchaint import Message, ToolManager, UserMessage, tool
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 from langchaint.tracing import TracedLLM, TracedToolManager
 
 
@@ -34,12 +34,12 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
     tracer = tracer_provider.get_tracer("langchaint.example")
 
-    account = OpenAIAccount()
+    openai = OpenAI()
     tool_manager: ToolManager = TracedToolManager(
         [get_weather], capture_message_content=False, tracer=tracer
     )
     traced = TracedLLM(
-        account.model("gpt-5.6-terra"),
+        openai.model("gpt-5.6-terra"),
         capture_message_content=False,
         tracer=tracer,
     )

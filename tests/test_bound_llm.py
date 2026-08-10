@@ -56,7 +56,6 @@ from langchaint import (
     Verdict,
 )
 from langchaint import shared_backoff as shared_backoff_module
-from langchaint.account_state import AccountState
 from langchaint.adapter import (
     Adapter,
     AdapterResult,
@@ -1357,10 +1356,10 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
 
 
 def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admission() -> None:
-    """A failure the provider named a rate limit pauses the whole domain.
+    """A failure the provider named a rate limit pauses every request sharing the rate-limit quota.
 
-    The flag is the only thing distinguishing this 200 from any other failed one, and it has to
-    reach the admitted() block's exit for a rate limit reported inside a 200 to pace the domain at all.
+    `is_rate_limit` is the only distinction from another failed response.
+    The exception must leave `admitted()` to pause the rate-limit quota.
     """
 
     async def scenario() -> None:
@@ -1523,7 +1522,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
     asyncio.run(scenario())
 
 
-def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_domain() -> None:
+def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_limit_quota() -> None:
     """The terminal half ends the retry loop, and the pausing half still holds every other request.
 
     Both halves matter: a verdict that only stopped would leave the siblings sending into the limit,
@@ -2559,8 +2558,7 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
 def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
     """A failed teardown does not cost the shared budget a permit, and does not reach the caller.
 
-    A permit the close skips is gone for the process's life, so the domain's concurrency shrinks
-    by one on every such stream.
+    Skipping a permit release permanently reduces `max_concurrent_requests`.
     """
 
     async def scenario() -> None:
@@ -2696,11 +2694,11 @@ _MID_STREAM_RETRY_AFTER_SECONDS = 30.0
 """The failing stream's wait, below the default `longest_wait_seconds`."""
 
 
-def test_a_mid_stream_rate_limit_pauses_the_domain() -> None:
+def test_a_mid_stream_rate_limit_pauses_the_rate_limit_quota() -> None:
     """An iterator rate limit pauses admission and reaches the caller."""
 
     async def scenario() -> None:
-        """Let the iteration fail after one item, then read the domain's pause and the error."""
+        """Read the pause after one stream item fails."""
         shared_backoff = SharedBackoff(
             parse=_parse_fake, failure_types=(TransientError,), max_concurrent_requests=8
         )
@@ -3444,7 +3442,7 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
     asyncio.run(scenario())
 
 
-def test_a_pause_all_do_not_retry_verdict_stops_a_stream_open_and_pauses_the_domain() -> None:
+def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
     """A stream open the provider gave up on raises the item's failure instead of reopening.
 
     The open loop retries every verdict _terminal_error_or_none does not name terminal, so treating
@@ -3859,8 +3857,8 @@ def test_stream_releases_its_permit_when_exhausted() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_rate_limited_stream_open_pauses_the_domain_and_the_retry_succeeds() -> None:
-    """A rate-limited open pauses the domain before its retry succeeds."""
+def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_succeeds() -> None:
+    """A rate-limited open pauses the rate-limit quota before its retry succeeds."""
 
     async def scenario() -> None:
         """Retry a stream open through a rate-limit failure, then finish the stream."""
@@ -4071,42 +4069,6 @@ def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
         assert _batch_outputs(results) == ["0", "1", "2", "3"]
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
-
-
-def test_account_closure_during_stream_admission_releases_the_permit() -> None:
-    """Stream admission rejects closure and releases its request permit."""
-
-    async def scenario() -> None:
-        """Close account state while the second request awaits pacing."""
-        account_state = AccountState()
-        adapter = _FakeAdapter(echo=True)
-        llm = LLM(
-            adapter,
-            shared_backoff=_fast_shared_backoff(
-                max_concurrent_requests=1,
-                max_request_starts_per_second=2.0,
-            ),
-        )
-        llm._account_state = account_state
-        bound_llm = llm.bind(automatic_prompt_caching=True)
-        first = await bound_llm.generate_one("first")
-        assert first.output == "first"
-
-        handle = bound_llm.stream_one("second")
-        second_task = asyncio.create_task(handle.__aenter__())
-        await asyncio.sleep(0.05)
-        account_state.close()
-        with pytest.raises(RuntimeError, match="closed"):
-            _ = await second_task
-        assert adapter.bound_adapters[0].open_count == 1
-
-        control = LLM(adapter, shared_backoff=llm.shared_backoff).bind(
-            automatic_prompt_caching=True
-        )
-        response = await control.generate_one("control")
-        assert response.output == "control"
-
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:

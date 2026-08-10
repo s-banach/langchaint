@@ -288,7 +288,7 @@ def call(name: str, args_json: str) -> ToolCall:
 
 
 def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
-    """Wrap a ScriptedAdapter in an LLM with a fast, generous backpressure domain."""
+    """Wrap a `ScriptedAdapter` in an `LLM` with fast request pacing."""
     adapter = ScriptedAdapter(scripts)
     return LLM(
         adapter,

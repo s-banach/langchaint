@@ -327,8 +327,8 @@ def _response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
 def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None:
     """APIStatusError.type is the body's error.type, and None where the body is not that shape.
 
-    parse_anthropic tests failure.type ahead of the status, so this read is what lets an
-    overloaded_error on an unlisted status still pause the domain.
+    `parse_anthropic()` checks `failure.type` before status.
+    This lets an unlisted `overloaded_error` pause the rate-limit quota.
     """
     client = anthropic.Anthropic(api_key="k")
     body = {"type": "error", "error": {"type": "overloaded_error", "message": "boom"}}
@@ -343,8 +343,8 @@ def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None
 def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
     """APIStatusError.code is the body's code, and None where the body is not a dict.
 
-    parse_openai tests failure.code inside its 429 branch, so this read is what keeps a spend-limit
-    429 terminal instead of pausing the domain.
+    `parse_openai()` checks `failure.code` within status 429.
+    This keeps spend-limit responses terminal without pausing the rate-limit quota.
     """
     client = openai.OpenAI(api_key="k")
     body = {"code": "insufficient_quota", "type": "insufficient_quota", "message": "boom"}

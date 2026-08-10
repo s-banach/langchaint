@@ -31,7 +31,7 @@ uv run python examples/full_app/run_task_stream.py
 
 ## Run live
 
-`run_live_task_stream.py` owns one `OpenAIAccount` for the application lifetime.
+`run_live_task_stream.py` uses one `OpenAI` throughout the application lifetime.
 It uses `gpt-5.6-terra` for every run.
 
 ```console

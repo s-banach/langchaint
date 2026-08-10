@@ -75,8 +75,8 @@ from langchaint.adapter import (
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_PRICING,
-    AnthropicAccount,
-    AnthropicBedrockAccount,
+    Anthropic,
+    AnthropicBedrock,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
     AnthropicPricedServiceTier,
@@ -503,9 +503,9 @@ def test_pricing_without_the_standard_key_raises_at_construction() -> None:
 
 
 def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None:
-    """AnthropicAccount.model merges stated pricing over catalog pricing."""
+    """Anthropic.model merges stated pricing over catalog pricing."""
     adapter = _anthropic_adapter_of(
-        AnthropicAccount(client=AsyncAnthropic(api_key="test")).model(
+        Anthropic(client=AsyncAnthropic(api_key="test")).model(
             "claude-sonnet-5",
             pricing={"priority": _PRIORITY_RATES},
         )
@@ -515,10 +515,10 @@ def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None
 
 
 def test_cache_ttl_is_stored_on_the_adapter() -> None:
-    """Both Account.model methods carry cache_ttl to their adapter."""
+    """`Anthropic.model()` and `AnthropicBedrock.model()` carry `cache_ttl`."""
     assert (
         _anthropic_adapter_of(
-            AnthropicAccount(client=AsyncAnthropic(api_key="test")).model(
+            Anthropic(client=AsyncAnthropic(api_key="test")).model(
                 "claude-sonnet-5",
                 cache_ttl="1h",
             )
@@ -527,7 +527,7 @@ def test_cache_ttl_is_stored_on_the_adapter() -> None:
     )
     assert (
         _anthropic_adapter_of(
-            AnthropicBedrockAccount(aws_region="us-east-1").model(
+            AnthropicBedrock(aws_region="us-east-1").model(
                 "anthropic.claude-sonnet-5",
                 cache_ttl="1h",
             )
@@ -1872,7 +1872,7 @@ def test_parse_anthropic_counts_a_fallthrough_and_a_listed_row_adds_nothing() ->
 
 
 def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_status() -> None:
-    """A rate-limit or overload error type pauses the domain whatever status carried it."""
+    """A rate-limit or overload error type pauses the rate-limit quota whatever status carried it."""
     overloaded = _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error")
     assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
 
@@ -1896,11 +1896,14 @@ def test_parse_anthropic_obeys_a_retry_directive_over_the_status_tables() -> Non
     assert parse_anthropic(retryable_429) == PauseAll(retry_after=None)
 
 
-def test_parse_anthropic_pauses_the_domain_on_a_directive_that_gives_this_request_up() -> None:
-    """A "false" directive over a pausing verdict stops this request and still pauses the domain.
+def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> None:
+    """A "false" directive stops this request.
 
-    The 429 says the account is throttled and the directive says this request will not come back,
-    which is the state PauseAllDoNotRetry carries and neither PauseAll nor DoNotRetry can.
+    The pausing verdict still pauses the rate-limit quota.
+
+    The 429 says the rate-limit quota is throttled.
+    The directive says this request will not come back.
+    `PauseAllDoNotRetry` carries both outcomes.
     The second row is at status 418, in no table: the pause comes from the error type there, so a
     guard written on the status instead of the verdict would drop it.
     """
@@ -2005,16 +2008,16 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
     expected_client_class: type[AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle],
 ) -> None:
     """Each Bedrock wire model id reaches its API's client class unchanged, retries pinned off."""
-    adapter = _anthropic_adapter_of(AnthropicBedrockAccount(aws_region="us-east-1").model(model))
+    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
     assert adapter.model == model
     assert isinstance(adapter.client, expected_client_class)
     assert adapter.client.max_retries == 0
 
 
 def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
-    """The Bedrock standard-tier table shares AnthropicAccount.model pricing."""
+    """The Bedrock standard-tier table shares Anthropic.model pricing."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrockAccount(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
+        AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
     )
     assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-6"]
 
@@ -2022,7 +2025,7 @@ def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     """Use a matching supplied client with SDK retries disabled."""
     adapter = _anthropic_adapter_of(
-        AnthropicBedrockAccount(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).model(
+        AnthropicBedrock(client=AsyncAnthropicBedrockMantle(aws_region="eu-west-1")).model(
             "anthropic.claude-opus-4-8"
         )
     )
@@ -2030,7 +2033,7 @@ def test_bedrock_model_uses_a_matching_supplied_client() -> None:
     assert adapter.model == "anthropic.claude-opus-4-8"
     assert adapter.client.max_retries == 0
     # The distinctive region proves the supplied client reaches the adapter.
-    # The account's aws_region is None.
+    # `AnthropicBedrock.aws_region` is None.
     assert adapter.client.aws_region == "eu-west-1"
 
 
@@ -2038,7 +2041,7 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
     """Reject a legacy client for a mantle model."""
     legacy_client = AsyncAnthropicBedrock(aws_region="us-east-1")
     with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
-        _ = AnthropicBedrockAccount(client=legacy_client).model("anthropic.claude-sonnet-5")
+        _ = AnthropicBedrock(client=legacy_client).model("anthropic.claude-sonnet-5")
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
 
 

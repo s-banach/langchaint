@@ -1,14 +1,14 @@
-"""The openai backend provides accounts, adapters, model catalogs, and pricing.
+"""The openai backend provides LLM and embedding construction, adapters, catalogs, and pricing.
 
 Importing this subpackage requires `openai`.
-`OpenAIAccount.model` uses the Responses API and reports `provider_name="openai"`.
-`OpenAIBedrockAccount.model` uses Responses and reports `provider_name="aws.bedrock"`.
+`OpenAI.model` uses the Responses API and reports `provider_name="openai"`.
+`OpenAIBedrock.model` uses Responses and reports `provider_name="aws.bedrock"`.
 Use `OpenAIChatCompletionsAdapter` directly for compatible endpoints.
 Use `OpenAIResponsesAdapter` directly for Azure.
 
 Cataloged models receive default-tier `OPENAI_PRICING` rates.
 Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
-`OpenAIBedrockAccount.model` always requires both parameters.
+`OpenAIBedrock.model` always requires both parameters.
 Responses from uncataloged service tiers cost NaN.
 
 Token prices use USD per one million tokens.
@@ -16,14 +16,14 @@ Web-search prices use USD per invocation.
 File-search prices use USD per invocation.
 Source: https://developers.openai.com/api/docs/pricing.
 Recheck that page before relying on a table.
-Embedding request limits and parameters come from the OpenAI embeddings guide.
+Embedding batching parameters come from the OpenAI embeddings guide.
 Source: https://developers.openai.com/api/docs/guides/embeddings.
 Cataloged embedding model dimensions come from the OpenAI model catalog.
 Source: https://developers.openai.com/api/docs/models/all.
 `OPENAI_PRICING` covers the default service tier.
 Its web-search rates are public list-price estimates.
-`OpenAIAccount.model(pricing=...)` replaces cataloged estimates.
-`OpenAIBedrockAccount.model(pricing=...)` accepts caller rates.
+`OpenAI.model(pricing=...)` replaces cataloged estimates.
+`OpenAIBedrock.model(pricing=...)` accepts caller rates.
 Earlier models cache automatically and have free cache writes.
 The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
@@ -41,7 +41,6 @@ except ModuleNotFoundError as exc:
         "langchaint's openai backend requires the openai package; install openai."
     ) from exc
 
-from langchaint.account_base import AccountBase
 from langchaint.embedding import EmbeddingModel
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
@@ -56,6 +55,7 @@ from langchaint.openai.shared import (
     client_without_retries,
     parse_openai,
 )
+from langchaint.shared_backoff import SharedBackoff
 
 type OpenAIModelName = Literal[
     "gpt-5.1",
@@ -163,13 +163,13 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
 
 OpenAI 2.45.0 documents this parameter for gpt-5.6-and-later.
 It carries `automatic_prompt_caching=False` to the request.
-`OpenAIAccount.model` derives `supports_prompt_cache_options` from this set.
+`OpenAI.model` derives `supports_prompt_cache_options` from this set.
 The set stays independent from pricing because parameter availability can change independently.
 """
 
 
-class OpenAIAccount(AccountBase):
-    """One OpenAI SDK client and `SharedBackoff` shared by OpenAI models."""
+class OpenAI:
+    """Create `LLM` and `EmbeddingModel` values for OpenAI."""
 
     def __init__(
         self,
@@ -182,10 +182,9 @@ class OpenAIAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build an OpenAI account without sending a request.
+        """Build `OpenAI` without sending a request.
 
         `client=None` constructs `AsyncOpenAI()`.
-        A passed `client` remains caller-owned.
         A passed `client` must reach OpenAI.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
@@ -198,7 +197,7 @@ class OpenAIAccount(AccountBase):
             openai.OpenAIError: `client` is absent and OpenAI credentials are unavailable.
             ValueError: A `SharedBackoff` setting is invalid.
         """
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIResponsesAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -211,8 +210,6 @@ class OpenAIAccount(AccountBase):
         self.client = (
             client_without_retries(client) if client is not None else AsyncOpenAI(max_retries=0)
         )
-        if client is None:
-            self._register_owned_close(self.client.close)
 
     @overload
     def model(
@@ -258,11 +255,9 @@ class OpenAIAccount(AccountBase):
         The reported service tier selects pricing.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: An uncataloged model lacks required pricing or caching data.
                 Also raised when the SDK client contradicts the OpenAI provider.
         """
-        self._state.ensure_open()
         catalog_table = _PRICING_BY_MODEL_ID.get(model)
         if catalog_table is None:
             if pricing is None:
@@ -287,7 +282,7 @@ class OpenAIAccount(AccountBase):
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
     @overload
     def embedding_model(
@@ -329,11 +324,9 @@ class OpenAIAccount(AccountBase):
         Every model counts batching tokens with tiktoken's `cl100k_base` encoding.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: `model`, `dimension`, or `max_attempts` is invalid.
             ModuleNotFoundError: tiktoken is unavailable.
         """
-        self._state.ensure_open()
         if model not in OPENAI_EMBEDDING_MODELS:
             raise ValueError(f"model {model!r} is not in OPENAI_EMBEDDING_MODELS")
         if model == "text-embedding-ada-002":
@@ -365,13 +358,17 @@ class OpenAIAccount(AccountBase):
             model=model,
             dimension=validated_dimension,
         )
-        return self._embedding_model(adapter, max_attempts=max_attempts)
+        return EmbeddingModel(
+            adapter=adapter,
+            shared_backoff=self._shared_backoff,
+            max_attempts=max_attempts,
+        )
 
 
-class OpenAIBedrockAccount(AccountBase):
-    """Bedrock SDK client and `SharedBackoff` shared by OpenAI models."""
+class OpenAIBedrock:
+    """Create `LLM` values for OpenAI models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (the account states every shared request policy)
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
         self,
         *,
         aws_region: str | None = None,
@@ -383,10 +380,9 @@ class OpenAIBedrockAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build a Bedrock account without sending a request.
+        """Build `OpenAIBedrock` without sending a request.
 
-        `aws_region` selects the region for an account-created SDK client.
-        A passed `client` remains caller-owned.
+        `aws_region` selects the region for an SDK client created by `OpenAIBedrock`.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
         `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
@@ -401,7 +397,7 @@ class OpenAIBedrockAccount(AccountBase):
         """
         if client is not None and aws_region is not None:
             raise ValueError("Pass at most one of client= or aws_region=")
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIResponsesAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -416,8 +412,6 @@ class OpenAIBedrockAccount(AccountBase):
             if client is not None
             else AsyncBedrockOpenAI(aws_region=aws_region, max_retries=0)
         )
-        if client is None:
-            self._register_owned_close(self.client.close)
 
     def model(
         self,
@@ -437,10 +431,8 @@ class OpenAIBedrockAccount(AccountBase):
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: `pricing` lacks its required `"default"` key.
         """
-        self._state.ensure_open()
         adapter = OpenAIResponsesAdapter(
             client=self.client,
             model=model,
@@ -449,15 +441,15 @@ class OpenAIBedrockAccount(AccountBase):
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
 
 __all__ = [
     "OPENAI_EMBEDDING_MODELS",
     "OPENAI_PRICING",
     "PROMPT_CACHE_OPTIONS_MODELS",
-    "OpenAIAccount",
-    "OpenAIBedrockAccount",
+    "OpenAI",
+    "OpenAIBedrock",
     "OpenAIChatCompletionsAdapter",
     "OpenAIEmbeddingModelName",
     "OpenAIModelName",

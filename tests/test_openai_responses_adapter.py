@@ -2064,8 +2064,8 @@ def test_parse_openai_obeys_a_retry_directive_over_the_status_tables() -> None:
     assert parse_openai(retryable_400) == RetryThisOne(retry_after=3.0)
 
 
-def test_parse_openai_pauses_the_domain_on_a_directive_that_gives_this_request_up() -> None:
-    """A "false" directive over a pausing verdict stops this request and still pauses the domain."""
+def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> None:
+    """A "false" directive stops this request and pauses the rate-limit quota."""
     throttled = status_error(
         openai.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
     )
@@ -2075,10 +2075,11 @@ def test_parse_openai_pauses_the_domain_on_a_directive_that_gives_this_request_u
 def test_parse_openai_applies_a_directive_to_a_spend_limit_429_by_its_verdict() -> None:
     """A spend-limit 429 is already DoNotRetry, so the directive moves it like any other one.
 
-    "false" leaves it DoNotRetry and starts no pause, since the guide's reason for the terminal
-    verdict is that the credits ran out rather than that the account is throttled.
-    "true" promotes it to RetryThisOne, which is what openai's own client does: _should_retry reads
-    the header ahead of everything and never reads error.code, so it retries this response.
+    "false" leaves `DoNotRetry` and starts no pause.
+    The credits ran out.
+    "true" promotes the verdict to `RetryThisOne`.
+    OpenAI's client also retries this response.
+    `_should_retry` reads the header before `error.code`.
     A guard written on the status instead of the verdict would pause here.
     """
     exhausted = status_error(

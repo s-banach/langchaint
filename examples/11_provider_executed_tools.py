@@ -1,7 +1,7 @@
 """Use OpenAI `provider_executed_tools` for web search."""
 
 from langchaint import RawPart, Response
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 async def search_the_web() -> Response[str]:
@@ -11,9 +11,9 @@ async def search_the_web() -> Response[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: The generation failed.
     """
-    account = OpenAIAccount()
+    openai = OpenAI()
     # Catalog pricing supplies the required web-search invocation rate.
-    bound = account.model("gpt-5.6-terra").bind(
+    bound = openai.model("gpt-5.6-terra").bind(
         provider_executed_tools=({"type": "web_search"},),
         automatic_prompt_caching=True,
     )

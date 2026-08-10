@@ -18,8 +18,7 @@ from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
-from langchaint.account_state import AccountClosedError
-from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrockAccount
+from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
 from langchaint.embedding import EmbeddingModel
 from langchaint.exceptions import EmbeddingOutputError
 
@@ -35,13 +34,13 @@ _JSON_CONTENT_TYPE = "application/json"
 
 
 def _pin_embedding_model_overloads(
-    account: CohereBedrockAccount,
+    cohere_bedrock: CohereBedrock,
     v4_model: CohereEmbedV4ModelName,
     v3_model: cohere_backend.CohereEmbedV3ModelName,
 ) -> None:
     """Pin each overload's result type without running this function."""
-    assert_type(account.embedding_model(v4_model), EmbeddingModel)
-    assert_type(account.embedding_model(v3_model), EmbeddingModel)
+    assert_type(cohere_bedrock.embedding_model(v4_model), EmbeddingModel)
+    assert_type(cohere_bedrock.embedding_model(v3_model), EmbeddingModel)
 
 
 def _run_async_test[**Parameters](
@@ -132,8 +131,8 @@ async def test_v4_routes_model_and_dimension_verbatim(
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client)
-        embeddings = await account.embedding_model(
+        cohere_bedrock = CohereBedrock(client=client)
+        embeddings = await cohere_bedrock.embedding_model(
             model,
             dimension=dimension,
             max_attempts=1,
@@ -144,7 +143,6 @@ async def test_v4_routes_model_and_dimension_verbatim(
         assert embeddings.flags.owndata
         assert embeddings.flags.writeable
         stubber.assert_no_pending_responses()
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -175,11 +173,10 @@ async def test_task_mapping(
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client)
-        model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+        cohere_bedrock = CohereBedrock(client=client)
+        model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         await model.embed(["text"], task=task)
         stubber.assert_no_pending_responses()
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -198,12 +195,11 @@ async def test_v3_omits_dimension() -> None:
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client)
-        model = account.embedding_model("cohere.embed-multilingual-v3")
+        cohere_bedrock = CohereBedrock(client=client)
+        model = cohere_bedrock.embedding_model("cohere.embed-multilingual-v3")
         embeddings = await model.embed(["query"], task="retrieval_query")
         assert embeddings.shape == (1, 1024)
         stubber.assert_no_pending_responses()
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -228,11 +224,10 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client)
-        embedding_model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+        cohere_bedrock = CohereBedrock(client=client)
+        embedding_model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         vectors = await embedding_model.embed(["text"], task="classification")
         assert vectors.shape == (1, 256)
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -242,11 +237,14 @@ def test_embedding_model_defaults_and_max_attempts() -> None:
     """Model construction applies defaults and validates `max_attempts`."""
     client = _bedrock_client()
     try:
-        account = CohereBedrockAccount(client=client)
-        assert account.embedding_model("cohere.embed-v4:0").dimension == 1536
-        assert account.embedding_model("cohere.embed-english-v3").dimension == 1024
+        cohere_bedrock = CohereBedrock(client=client)
+        assert cohere_bedrock.embedding_model("cohere.embed-v4:0").dimension == 1536
+        assert cohere_bedrock.embedding_model("cohere.embed-english-v3").dimension == 1024
+        assert (
+            cohere_bedrock.embedding_model("cohere.embed-v4:0", max_attempts=5).max_attempts == 5
+        )
         with pytest.raises(ValueError, match="max_attempts"):
-            _ = account.embedding_model("cohere.embed-v4:0", max_attempts=0)
+            _ = cohere_bedrock.embedding_model("cohere.embed-v4:0", max_attempts=0)
     finally:
         client.close()
 
@@ -300,15 +298,14 @@ async def test_v4_local_body_target_splits_before_the_next_input(
     monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 2000)
     client = _bedrock_client()
     try:
-        account = CohereBedrockAccount(client=client)
-        embedding_model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+        cohere_bedrock = CohereBedrock(client=client)
+        embedding_model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         texts = ("x" * 300, "y" * 300)
         batches = await embedding_model._adapter.partition_inputs(
             texts,
             task="retrieval_document",
         )
         assert batches == ((texts[0],), (texts[1],))
-        await account.aclose()
     finally:
         client.close()
 
@@ -321,15 +318,14 @@ async def test_v3_exact_body_limit_splits_before_the_next_input(
     monkeypatch.setattr(cohere_backend, "_INVOKE_MODEL_MAX_BODY_BYTES", 1000)
     client = _bedrock_client()
     try:
-        account = CohereBedrockAccount(client=client)
-        embedding_model = account.embedding_model("cohere.embed-english-v3")
+        cohere_bedrock = CohereBedrock(client=client)
+        embedding_model = cohere_bedrock.embedding_model("cohere.embed-english-v3")
         texts = ("x" * 500, "y" * 500)
         batches = await embedding_model._adapter.partition_inputs(
             texts,
             task="retrieval_document",
         )
         assert batches == ((texts[0],), (texts[1],))
-        await account.aclose()
     finally:
         client.close()
 
@@ -355,12 +351,11 @@ async def test_batching_uses_ninety_six_inputs() -> None:
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client, max_concurrent_requests=1)
-        model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+        cohere_bedrock = CohereBedrock(client=client, max_concurrent_requests=1)
+        model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         embeddings = await model.embed(inputs, task="clustering")
         assert embeddings.shape == (97, 256)
         stubber.assert_no_pending_responses()
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -388,12 +383,11 @@ async def test_oversized_singleton_fails_before_client_creation(
         return object()
 
     monkeypatch.setattr(cohere_backend.boto3, "client", create_client)
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     with pytest.raises(ValueError, match="body limit"):
         await model.embed(["x" * 100], task="retrieval_document")
     assert creation_calls == 0
-    await account.aclose()
 
 
 @_run_async_test
@@ -414,12 +408,11 @@ async def test_invalid_response_hides_vectors() -> None:
     )
     stubber.activate()
     try:
-        account = CohereBedrockAccount(client=client)
-        model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+        cohere_bedrock = CohereBedrock(client=client)
+        model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         with pytest.raises(EmbeddingOutputError) as raised:
             await model.embed(["text"], task="classification")
         assert "8675309" not in str(raised.value)
-        await account.aclose()
     finally:
         stubber.deactivate()
         client.close()
@@ -535,9 +528,9 @@ async def test_lazy_client_creation_precedes_admission(
     """Lazy creation completes before the first admission."""
     fake_client = _FakeClient()
     configs = _install_fake_client(monkeypatch, fake_client)
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    account._shared_backoff._pause_until = float("inf")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    cohere_bedrock._shared_backoff._pause_until = float("inf")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     embed_task = asyncio.create_task(model.embed(["text"], task="retrieval_query"))
     try:
         for _ in range(100):
@@ -551,8 +544,7 @@ async def test_lazy_client_creation_precedes_admission(
         _ = embed_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await embed_task
-        await account.aclose()
-    assert fake_client.closed
+    assert not fake_client.closed
 
 
 @_run_async_test
@@ -569,8 +561,8 @@ async def test_concurrent_preparation_creates_one_client(
         creation_started=creation_started,
         creation_release=creation_release,
     )
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     first = asyncio.create_task(model.embed(["first"], task="classification"))
     second = asyncio.create_task(model.embed(["second"], task="classification"))
     await _wait_for_event(creation_started)
@@ -582,8 +574,7 @@ async def test_concurrent_preparation_creates_one_client(
     assert second_vectors.shape == (1, 256)
     assert len(configs) == 1
     assert len(fake_client.requests) == 2
-    await account.aclose()
-    assert fake_client.closed
+    assert not fake_client.closed
 
 
 @_run_async_test
@@ -593,13 +584,12 @@ async def test_synchronous_attempt_runs_outside_event_loop(
     """The complete SDK attempt runs outside the event-loop thread."""
     fake_client = _FakeClient()
     _ = _install_fake_client(monkeypatch, fake_client)
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     event_loop_thread_id = threading.get_ident()
     await model.embed(["text"], task="classification")
     assert fake_client.invoke_thread_id != event_loop_thread_id
     assert fake_client.bodies[0].closed
-    await account.aclose()
 
 
 @_run_async_test
@@ -622,13 +612,13 @@ async def test_transient_client_error_retries_only_failed_request(
     )
     fake_client = _FakeClient(failures=[failure])
     _ = _install_fake_client(monkeypatch, fake_client)
-    account = CohereBedrockAccount(
+    cohere_bedrock = CohereBedrock(
         aws_region="us-east-1",
         minimum_wait_ceiling_seconds=0.000_001,
         longest_wait_seconds=0.000_002,
         quiet_seconds_per_decay_step=0.000_001,
     )
-    model = account.embedding_model(
+    model = cohere_bedrock.embedding_model(
         "cohere.embed-v4:0",
         dimension=256,
         max_attempts=2,
@@ -636,7 +626,6 @@ async def test_transient_client_error_retries_only_failed_request(
     embeddings = await model.embed(["text"], task="classification")
     assert embeddings.shape == (1, 256)
     assert len(fake_client.requests) == 2
-    await account.aclose()
 
 
 @_run_async_test
@@ -651,8 +640,8 @@ async def test_cancellation_waits_for_synchronous_attempt(
         invoke_release=invoke_release,
     )
     _ = _install_fake_client(monkeypatch, fake_client)
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     embed_task = asyncio.create_task(model.embed(["text"], task="classification"))
     await _wait_for_event(invoke_started)
     _ = embed_task.cancel()
@@ -662,7 +651,6 @@ async def test_cancellation_waits_for_synchronous_attempt(
     with pytest.raises(asyncio.CancelledError):
         await embed_task
     assert fake_client.bodies[0].closed
-    await account.aclose()
 
 
 @_run_async_test
@@ -679,8 +667,8 @@ async def test_cancelled_creation_retains_completed_client(
         creation_started=creation_started,
         creation_release=creation_release,
     )
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
+    cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+    model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     first_task = asyncio.create_task(model.embed(["first"], task="classification"))
     await _wait_for_event(creation_started)
     _ = first_task.cancel()
@@ -692,58 +680,43 @@ async def test_cancelled_creation_retains_completed_client(
     embeddings = await model.embed(["second"], task="classification")
     assert embeddings.shape == (1, 256)
     assert len(fake_client.requests) == 1
-    await account.aclose()
 
 
 @_run_async_test
-async def test_closure_during_creation_closes_new_client(
+async def test_cancelled_failed_creation_retries_client_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Account closure wins against active lazy creation."""
-    creation_started = threading.Event()
-    creation_release = threading.Event()
-    fake_client = _FakeClient()
-    _ = _install_fake_client(
-        monkeypatch,
-        fake_client,
-        creation_started=creation_started,
-        creation_release=creation_release,
-    )
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
-    embed_task = asyncio.create_task(model.embed(["text"], task="classification"))
-    await _wait_for_event(creation_started)
-    close_task = asyncio.create_task(account.aclose())
-    creation_release.set()
-    await close_task
-    with pytest.raises(AccountClosedError):
-        await embed_task
-    assert fake_client.closed
+    """A later prepare retries client creation hidden by caller cancellation."""
+    creation_calls = 0
+    installed_client = _bedrock_client()
+    prepare_task: asyncio.Task[None] | None = None
 
+    async def create(
+        client_cache: cohere_backend._CohereBedrockClientCache,
+    ) -> BedrockRuntimeClient:
+        nonlocal creation_calls
+        creation_calls += 1
+        if creation_calls == 1:
+            assert prepare_task is not None
+            _ = asyncio.get_running_loop().call_soon(prepare_task.cancel)
+            raise RuntimeError("client creation failed")
+        client_cache._client = installed_client
+        return installed_client
 
-@_run_async_test
-async def test_closure_waits_for_active_request_lease(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Account closure waits for an active SDK attempt."""
-    invoke_started = threading.Event()
-    invoke_release = threading.Event()
-    fake_client = _FakeClient(
-        invoke_started=invoke_started,
-        invoke_release=invoke_release,
+    monkeypatch.setattr(cohere_backend._CohereBedrockClientCache, "_create", create)
+    client_cache = cohere_backend._CohereBedrockClientCache(
+        aws_region="us-east-1",
+        client=None,
     )
-    _ = _install_fake_client(monkeypatch, fake_client)
-    account = CohereBedrockAccount(aws_region="us-east-1")
-    model = account.embedding_model("cohere.embed-v4:0", dimension=256)
-    embed_task = asyncio.create_task(model.embed(["text"], task="classification"))
-    await _wait_for_event(invoke_started)
-    close_task = asyncio.create_task(account.aclose())
-    await asyncio.sleep(0)
-    assert not close_task.done()
-    invoke_release.set()
-    await embed_task
-    await close_task
-    assert fake_client.closed
+    try:
+        prepare_task = asyncio.create_task(client_cache.prepare())
+        with pytest.raises(asyncio.CancelledError):
+            await prepare_task
+
+        await client_cache.prepare()
+        assert creation_calls == 2
+    finally:
+        installed_client.close()
 
 
 def test_passed_client_retry_configuration() -> None:
@@ -752,20 +725,19 @@ def test_passed_client_retry_configuration() -> None:
     one_attempt_client = _bedrock_client()
     try:
         with pytest.raises(ValueError, match="total_max_attempts"):
-            _ = CohereBedrockAccount(client=retrying_client)
-        _ = CohereBedrockAccount(client=one_attempt_client)
+            _ = CohereBedrock(client=retrying_client)
+        _ = CohereBedrock(client=one_attempt_client)
         with pytest.raises(ValueError, match="at most one"):
-            _ = CohereBedrockAccount(client=one_attempt_client, aws_region="us-east-1")
+            _ = CohereBedrock(client=one_attempt_client, aws_region="us-east-1")
     finally:
         retrying_client.close()
         one_attempt_client.close()
 
 
-@_run_async_test
-async def test_passed_client_remains_caller_owned(
+def test_caller_closes_passed_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Account closure leaves a passed client open."""
+    """The caller closes a passed client."""
     client = _bedrock_client()
     close_calls = 0
     original_close: Callable[[], None] = client.close
@@ -776,8 +748,7 @@ async def test_passed_client_remains_caller_owned(
         original_close()
 
     monkeypatch.setattr(client, "close", close)
-    account = CohereBedrockAccount(client=client)
-    await account.aclose()
+    _ = CohereBedrock(client=client)
     assert close_calls == 0
     client.close()
     assert close_calls == 1

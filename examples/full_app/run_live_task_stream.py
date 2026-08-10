@@ -1,4 +1,4 @@
-"""Run the progress-event app with one long-lived OpenAIAccount."""
+"""Run the progress-event app with one long-lived OpenAI."""
 
 import asyncio
 
@@ -8,7 +8,7 @@ from opentelemetry import trace
 from render import render
 from task_stream import App
 
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 MODEL = "gpt-5.6-terra"
 APP_TIMEOUT_SECONDS = 120.0
@@ -26,19 +26,18 @@ async def main() -> None:
         openai.OpenAIError: OpenAI credentials are unavailable.
         TimeoutError: APP_TIMEOUT_SECONDS expires.
         ExceptionGroup: a concurrent tool function raises.
-        asyncio.CancelledError: the caller cancels the app or account closure.
-        Exception: closing the owned OpenAI client fails.
+        asyncio.CancelledError: the caller cancels the app.
     """
-    async with OpenAIAccount() as account:
-        app = App(
-            llm=account.model(MODEL),
-            configs=build_configs(),
-            tracer=trace.get_tracer("examples.full_app.live"),
-            on_event=print_event,
-            capture_message_content=False,
-        )
-        async with asyncio.timeout(APP_TIMEOUT_SECONDS):
-            await app.run()
+    openai = OpenAI()
+    app = App(
+        llm=openai.model(MODEL),
+        configs=build_configs(),
+        tracer=trace.get_tracer("examples.full_app.live"),
+        on_event=print_event,
+        capture_message_content=False,
+    )
+    async with asyncio.timeout(APP_TIMEOUT_SECONDS):
+        await app.run()
     print(f"final answer: {app.final_answer!r}")
 
 

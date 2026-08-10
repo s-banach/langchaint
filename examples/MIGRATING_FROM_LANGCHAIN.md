@@ -5,36 +5,27 @@ It provides no chains, middleware stack, or agent loop.
 
 ## Basic construction
 
-Construct an account, select a model, bind configuration, then generate.
+Construct `OpenAI`, select a model, bind configuration, then generate.
 
 ```python
 from langchaint import UserMessage
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
-account = OpenAIAccount()
-llm = account.model("gpt-5.6-terra")
+openai = OpenAI()
+llm = openai.model("gpt-5.6-terra")
 bound = llm.bind(automatic_prompt_caching=False)
 response = await bound.generate_one([UserMessage(content="Hello")])
 print(response.output)
 ```
 
-`account` owns its default SDK client and one `SharedBackoff`.
-Every model from `account` shares that `SharedBackoff`.
-
-Use `async with` when structured cleanup fits the application.
-
-```python
-async with OpenAIAccount() as account:
-    bound = account.model("gpt-5.6-terra").bind(automatic_prompt_caching=False)
-    response = await bound.generate_one("Hello")
-```
+Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 
 ## API map
 
 | LangChain | langchaint |
 | --- | --- |
-| `ChatOpenAI(...)` | `account = OpenAIAccount()` |
-| `init_chat_model(...)` | `llm = account.model("gpt-5.6-terra")` |
+| `ChatOpenAI(...)` | `openai = OpenAI()` |
+| `init_chat_model(...)` | `llm = openai.model("gpt-5.6-terra")` |
 | `model.invoke(messages)` | `await bound.generate_one(messages)` |
 | `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
 | `model.batch(inputs)` | `await bound.generate_many(inputs)` |
@@ -43,7 +34,7 @@ async with OpenAIAccount() as account:
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model, automatic_prompt_caching=False)` |
 | `create_react_agent(...)` | application tool loop |
 | `RunnableRetry` | `max_attempts` on `bind` |
-| `InMemoryRateLimiter` | account request limits |
+| `InMemoryRateLimiter` | `max_concurrent_requests` and `max_request_starts_per_second` |
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
 | callbacks and LangSmith | `langchaint.tracing` with OTel |
@@ -57,46 +48,46 @@ async with OpenAIAccount() as account:
 Generation methods are asynchronous.
 There is no synchronous generation API.
 
-## Backend accounts
+## Backend classes
 
-Each backend subpackage exports its account class.
+Each backend subpackage exports a class named for its provider.
 These constructions use cataloged model identifiers.
 
 ```python
-from langchaint.anthropic import AnthropicAccount, AnthropicBedrockAccount
-from langchaint.cohere import CohereBedrockAccount
-from langchaint.deepseek import DeepSeekAccount
-from langchaint.gemini import GeminiAccount
-from langchaint.openai import OpenAIAccount, OpenAIBedrockAccount
+from langchaint.anthropic import Anthropic, AnthropicBedrock
+from langchaint.cohere import CohereBedrock
+from langchaint.deepseek import DeepSeek
+from langchaint.gemini import Gemini
+from langchaint.openai import OpenAI, OpenAIBedrock
 
-openai_account = OpenAIAccount()
-openai_llm = openai_account.model("gpt-5.6-terra")
+openai = OpenAI()
+openai_llm = openai.model("gpt-5.6-terra")
 
-anthropic_account = AnthropicAccount()
-anthropic_llm = anthropic_account.model("claude-sonnet-5")
+anthropic = Anthropic()
+anthropic_llm = anthropic.model("claude-sonnet-5")
 
-gemini_account = GeminiAccount()
-gemini_llm = gemini_account.model("gemini-3.6-flash")
+gemini = Gemini()
+gemini_llm = gemini.model("gemini-3.6-flash")
 
-deepseek_account = DeepSeekAccount()
-deepseek_llm = deepseek_account.model("deepseek-v4-flash")
+deepseek = DeepSeek()
+deepseek_llm = deepseek.model("deepseek-v4-flash")
 
-anthropic_bedrock_account = AnthropicBedrockAccount(aws_region="us-east-1")
-anthropic_bedrock_llm = anthropic_bedrock_account.model("anthropic.claude-sonnet-5")
+anthropic_bedrock = AnthropicBedrock(aws_region="us-east-1")
+anthropic_bedrock_llm = anthropic_bedrock.model("anthropic.claude-sonnet-5")
 
-openai_bedrock_account = OpenAIBedrockAccount(aws_region="us-east-1")
+openai_bedrock = OpenAIBedrock(aws_region="us-east-1")
 
-cohere_account = CohereBedrockAccount(aws_region="us-east-1")
-cohere_embeddings = cohere_account.embedding_model(
+cohere_bedrock = CohereBedrock(aws_region="us-east-1")
+cohere_embeddings = cohere_bedrock.embedding_model(
     "cohere.embed-v4:0",
     dimension=1024,
 )
 ```
 
-`DeepSeekAccount()` reads `DEEPSEEK_API_KEY` when `client` is absent.
+`DeepSeek()` reads `DEEPSEEK_API_KEY` when `client` is absent.
 Uncataloged models require explicit pricing.
-`OpenAIAccount.model` also requires `supports_prompt_cache_options` for uncataloged models.
-`OpenAIBedrockAccount.model` always requires both values.
+`OpenAI.model` also requires `supports_prompt_cache_options` for uncataloged models.
+`OpenAIBedrock.model` always requires both values.
 
 ## Bind and rebind
 
@@ -181,10 +172,10 @@ See [`11_provider_executed_tools.py`](11_provider_executed_tools.py) for a compl
 Row order matches input order.
 
 ```python
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
-account = OpenAIAccount()
-embedding_model = account.embedding_model(
+openai = OpenAI()
+embedding_model = openai.embedding_model(
     "text-embedding-3-small",
     dimension=512,
 )
@@ -199,8 +190,9 @@ query = await embedding_model.embed(
 print(documents.shape, query.shape)
 ```
 
-One account can create generation and embedding clients.
-They share the account's `SharedBackoff`.
+`OpenAI.model()` returns `LLM`.
+`OpenAI.embedding_model()` returns `EmbeddingModel`.
+Both use `openai.client` and one `SharedBackoff`.
 See [`09_embeddings.py`](09_embeddings.py) for both embedding tasks.
 
 ## Prompt caching
@@ -264,11 +256,11 @@ An adapter rejects `extra_body` keys that it already populates.
 Set `max_attempts=1` to disable retries.
 
 ```python
-account = OpenAIAccount(
+openai = OpenAI(
     max_concurrent_requests=16,
     max_request_starts_per_second=5,
 )
-bound = account.model("gpt-5.6-terra").bind(
+bound = openai.model("gpt-5.6-terra").bind(
     max_attempts=5,
     automatic_prompt_caching=False,
 )

@@ -1,9 +1,9 @@
-"""The Cohere backend provides Bedrock embedding accounts and model catalogs.
+"""The Cohere backend provides `CohereBedrock` and model catalogs.
 
 Importing this subpackage requires `boto3`.
 Every cataloged model identifier is sent verbatim.
-The account creates its default client before the first request admission.
-The account shares one client and `SharedBackoff` across its embedding models.
+`CohereBedrock` creates its default client before the first request admission.
+Its embedding models share that client and one `SharedBackoff`.
 AWS v4 documentation shows list and float-keyed response forms.
 
 Request source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed.html.
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, ClassVar, Literal, overload, override
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
@@ -34,8 +33,6 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, HTTPClientError
 from botocore.exceptions import ConnectionError as BotocoreConnectionError
 
-from langchaint.account_base import AccountBase
-from langchaint.account_state import AccountClosedError, AccountState
 from langchaint.adapter import (
     ErrorClassification,
     retry_after_seconds_from_headers,
@@ -49,11 +46,9 @@ from langchaint.embedding import (
     _validated_embeddings,
 )
 from langchaint.exceptions import EmbeddingOutputError
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
+from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, SharedBackoff, Verdict
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
-
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
     from langchaint.sequence_not_str import SequenceNotStr
@@ -97,7 +92,7 @@ _COHERE_EMBED_V3_MODELS: frozenset[CohereEmbedV3ModelName] = frozenset({
 COHERE_BEDROCK_EMBEDDING_MODELS: frozenset[_CohereBedrockEmbeddingModelName] = (
     _COHERE_EMBED_V4_MODELS | _COHERE_EMBED_V3_MODELS
 )
-"""Cohere embedding identifiers accepted by `CohereBedrockAccount`."""
+"""Cohere embedding identifiers accepted by `CohereBedrock`."""
 _COHERE_EMBED_V4_DIMENSIONS: frozenset[CohereEmbedV4Dimension] = frozenset({256, 512, 1024, 1536})
 _COHERE_INPUT_TYPE_BY_TASK: dict[EmbeddingTask, _CohereInputType] = {
     "retrieval_document": "search_document",
@@ -159,33 +154,25 @@ def _require_one_sdk_attempt(client: BedrockRuntimeClient) -> None:
         raise ValueError("client.meta.config.retries must set total_max_attempts to 1")
 
 
-class _CohereBedrockClientManager:
-    """Create, lease, and close one Bedrock Runtime client."""
+class _CohereBedrockClientCache:
+    """Share one Bedrock Runtime client across embedding models."""
 
     def __init__(
         self,
         *,
-        account_state: AccountState,
         aws_region: str | None,
         client: BedrockRuntimeClient | None,
     ) -> None:
         """Store client creation inputs without creating a client."""
-        self._account_state = account_state
         self._aws_region = aws_region
         self._client = client
-        self._owns_client = client is None
-        self._lock = asyncio.Lock()
-        self._creation_task: asyncio.Task[None] | None = None
-        self._active_leases = 0
-        self._leases_drained = asyncio.Event()
-        self._leases_drained.set()
+        self._creation_task: asyncio.Task[BedrockRuntimeClient] | None = None
 
-    async def _create_and_install(self) -> None:
-        """Create one client and install it while the account remains open.
+    async def _create(self) -> BedrockRuntimeClient:
+        """Create the default client.
 
         Raises:
-            AccountClosedError: Account closure started during creation.
-            Exception: `boto3.client` or client closure failed.
+            Exception: `boto3.client` failed.
         """
         client = await to_thread_cancellation_safe(
             lambda: boto3.client(
@@ -194,84 +181,38 @@ class _CohereBedrockClientManager:
                 config=Config(retries={"total_max_attempts": 1}),
             )
         )
-        close_client = False
-        async with self._lock:
-            try:
-                self._account_state.ensure_open()
-            except AccountClosedError:
-                close_client = True
-            if not close_client:
-                self._client = client
-            self._creation_task = None
-        if close_client:
-            await to_thread_cancellation_safe(client.close)
-            raise AccountClosedError("Account is closed")
+        self._client = client
+        return client
 
     async def prepare(self) -> None:
         """Create the default client once before request admission.
 
-        A cancelled caller waits for creation and leaves the client installed.
+        A cancelled caller waits for client creation to settle.
 
         Raises:
-            AccountClosedError: Account closure started.
             asyncio.CancelledError: This caller was cancelled after creation settled.
-            Exception: `boto3.client` or client closure failed.
+            Exception: `boto3.client` failed.
         """
-        self._account_state.ensure_open()
-        async with self._lock:
-            self._account_state.ensure_open()
-            if self._client is not None:
-                return
-            if self._creation_task is None:
-                self._creation_task = asyncio.create_task(self._create_and_install())
-            creation_task = self._creation_task
-        await await_task_cancellation_safe(creation_task)
-
-    @asynccontextmanager
-    async def request_lease(self) -> AsyncGenerator[BedrockRuntimeClient]:
-        """Lease the prepared client through one complete SDK attempt.
-
-        Yields:
-            The prepared client.
-
-        Raises:
-            AccountClosedError: Account closure started.
-            RuntimeError: `prepare()` has not installed the client.
-        """
-        async with self._lock:
-            self._account_state.ensure_open()
-            client = self._client
-            if client is None:
-                raise RuntimeError("prepare() must install the client before a request lease")
-            self._active_leases += 1
-            self._leases_drained.clear()
+        if self._client is not None:
+            return
+        if self._creation_task is None:
+            self._creation_task = asyncio.create_task(self._create())
+        creation_task = self._creation_task
         try:
-            yield client
+            await await_task_cancellation_safe(creation_task)
         finally:
-            async with self._lock:
-                self._active_leases -= 1
-                if self._active_leases == 0:
-                    self._leases_drained.set()
+            if self._creation_task is creation_task:
+                self._creation_task = None
 
-    async def aclose(self) -> None:
-        """Reject leases and close an internally created client.
+    def client(self) -> BedrockRuntimeClient:
+        """Return the prepared client.
 
         Raises:
-            Exception: Client creation or client closure failed.
+            RuntimeError: `prepare()` has not created the client.
         """
-        async with self._lock:
-            creation_task = self._creation_task
-        if creation_task is not None:
-            try:
-                await creation_task
-            except AccountClosedError:
-                pass
-        await self._leases_drained.wait()
-        async with self._lock:
-            client = self._client if self._owns_client else None
-            self._client = None
-        if client is not None:
-            await to_thread_cancellation_safe(client.close)
+        if self._client is None:
+            raise RuntimeError("prepare() must create the client before a request")
+        return self._client
 
 
 class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
@@ -282,13 +223,13 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
     def __init__(
         self,
         *,
-        client_manager: _CohereBedrockClientManager,
+        client_cache: _CohereBedrockClientCache,
         model: _CohereBedrockEmbeddingModelName,
         dimension: int,
         supports_dimension: bool,
     ) -> None:
         """Store one model's validated request configuration."""
-        self._client_manager = client_manager
+        self._client_cache = client_cache
         self.model = model
         self.dimension = dimension
         self._supports_dimension = supports_dimension
@@ -351,11 +292,10 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         """Create the default Bedrock client before request admission.
 
         Raises:
-            AccountClosedError: Account closure started.
             asyncio.CancelledError: This caller was cancelled after creation settled.
-            Exception: Client creation or client closure failed.
+            Exception: Client creation failed.
         """
-        await self._client_manager.prepare()
+        await self._client_cache.prepare()
 
     @override
     async def partition_inputs(
@@ -421,13 +361,12 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         """Invoke Bedrock and close its response body outside the event loop.
 
         Raises:
-            AccountClosedError: Account closure started.
             EmbeddingOutputError: Cohere returned invalid vectors.
             asyncio.CancelledError: Cancellation follows completed synchronous work.
             Exception: The SDK request, read, or body closure failed.
         """
-        async with self._client_manager.request_lease() as client:
-            return await to_thread_cancellation_safe(lambda: self._invoke(client, inputs, task))
+        client = self._client_cache.client()
+        return await to_thread_cancellation_safe(lambda: self._invoke(client, inputs, task))
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
@@ -435,10 +374,10 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         return _classify_cohere_bedrock(error)
 
 
-class CohereBedrockAccount(AccountBase):
-    """Share one Bedrock Runtime client and `SharedBackoff`."""
+class CohereBedrock:
+    """Create `EmbeddingModel` values for Cohere models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (every request policy reaches SharedBackoff)
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
         self,
         *,
         aws_region: str | None = None,
@@ -450,10 +389,9 @@ class CohereBedrockAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build a Cohere Bedrock account without creating a client.
+        """Build `CohereBedrock` without creating a client.
 
-        `aws_region` selects the region for an account-created client.
-        A passed `client` remains caller-owned.
+        `aws_region` selects the region for a client created by `CohereBedrock`.
         A passed `client` must disable SDK retries.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
@@ -471,7 +409,7 @@ class CohereBedrockAccount(AccountBase):
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None:
             _require_one_sdk_attempt(client)
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=_parse_cohere_bedrock,
             failure_types=_CohereBedrockEmbeddingAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -482,12 +420,10 @@ class CohereBedrockAccount(AccountBase):
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
         self.aws_region = aws_region
-        self._client_manager = _CohereBedrockClientManager(
-            account_state=self._state,
+        self._client_cache = _CohereBedrockClientCache(
             aws_region=aws_region,
             client=client,
         )
-        self._register_owned_close(self._client_manager.aclose)
 
     @overload
     def embedding_model(
@@ -519,10 +455,8 @@ class CohereBedrockAccount(AccountBase):
         V3 models always return 1024 dimensions.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: `model`, `dimension`, or `max_attempts` is invalid.
         """
-        self._state.ensure_open()
         if model in _COHERE_EMBED_V4_MODELS:
             selected_dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
             if (
@@ -541,17 +475,21 @@ class CohereBedrockAccount(AccountBase):
         else:
             raise ValueError(f"model {model!r} is not in COHERE_BEDROCK_EMBEDDING_MODELS")
         adapter = _CohereBedrockEmbeddingAdapter(
-            client_manager=self._client_manager,
+            client_cache=self._client_cache,
             model=model,
             dimension=selected_dimension,
             supports_dimension=supports_dimension,
         )
-        return self._embedding_model(adapter, max_attempts=max_attempts)
+        return EmbeddingModel(
+            adapter=adapter,
+            shared_backoff=self._shared_backoff,
+            max_attempts=max_attempts,
+        )
 
 
 __all__ = [
     "COHERE_BEDROCK_EMBEDDING_MODELS",
-    "CohereBedrockAccount",
+    "CohereBedrock",
     "CohereEmbedV3ModelName",
     "CohereEmbedV4Dimension",
     "CohereEmbedV4ModelName",

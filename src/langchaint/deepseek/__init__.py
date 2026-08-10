@@ -1,8 +1,8 @@
-"""The deepseek backend provides an account, model catalog, and pricing.
+"""The deepseek backend provides `DeepSeek`, its model catalog, and pricing.
 
 Importing this subpackage requires `openai`.
 DeepSeek serves Chat Completions at https://api.deepseek.com.
-`DeepSeekAccount` configures `AsyncOpenAI` for that endpoint.
+`DeepSeek` configures `AsyncOpenAI` for that endpoint.
 
 Prices use USD per one million tokens.
 Source: https://api-docs.deepseek.com/quick_start/pricing, read 2026-08-03.
@@ -28,10 +28,10 @@ except ModuleNotFoundError as exc:
 
 from openai.types.completion_usage import CompletionUsage
 
-from langchaint.account_base import AccountBase
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.shared import OpenAIPricingTable, client_without_retries, parse_openai
+from langchaint.shared_backoff import SharedBackoff
 
 type DeepSeekModelName = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
@@ -68,7 +68,7 @@ def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
     Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
     `CompletionUsage` models neither counter in openai 2.53.0.
     The SDK therefore stores both counters in `model_extra`.
-    `DeepSeekAccount.model` passes this as `cache_read_tokens_from_usage`.
+    `DeepSeek.model` passes this as `cache_read_tokens_from_usage`.
     Missing this reader prices cache hits as cache misses.
     """
     extra = usage.model_extra
@@ -80,8 +80,8 @@ def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
     return 0
 
 
-class DeepSeekAccount(AccountBase):
-    """DeepSeek SDK client and `SharedBackoff` shared by DeepSeek models."""
+class DeepSeek:
+    """Create `LLM` values for DeepSeek."""
 
     def __init__(
         self,
@@ -94,9 +94,8 @@ class DeepSeekAccount(AccountBase):
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
     ) -> None:
-        """Build a DeepSeek account without sending a request.
+        """Build `DeepSeek` without sending a request.
 
-        A passed `client` remains caller-owned.
         A passed `client` must reach DeepSeek.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
@@ -109,7 +108,7 @@ class DeepSeekAccount(AccountBase):
             ValueError: `client` is absent and `DEEPSEEK_API_KEY` is unset.
                 Also raised when a `SharedBackoff` setting is invalid.
         """
-        super().__init__(
+        self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIChatCompletionsAdapter.failure_types,
             max_concurrent_requests=max_concurrent_requests,
@@ -131,7 +130,6 @@ class DeepSeekAccount(AccountBase):
                 api_key=api_key,
                 max_retries=0,
             )
-            self._register_owned_close(client.close)
         self.client = client_without_retries(client)
 
     @overload
@@ -164,11 +162,9 @@ class DeepSeekAccount(AccountBase):
         Uncataloged models require `pricing`.
 
         Raises:
-            RuntimeError: This account is closed.
             ValueError: An uncataloged model lacks `pricing`.
                 Also raised when the SDK client contradicts the DeepSeek provider.
         """
-        self._state.ensure_open()
         table = pricing if pricing is not None else _PRICING_BY_MODEL_ID.get(model)
         if table is None:
             raise ValueError(
@@ -182,12 +178,12 @@ class DeepSeekAccount(AccountBase):
             supports_prompt_cache_options=False,
             cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
         )
-        return self._llm(adapter)
+        return LLM(adapter, shared_backoff=self._shared_backoff)
 
 
 __all__ = [
     "DEEPSEEK_PRICING",
-    "DeepSeekAccount",
+    "DeepSeek",
     "DeepSeekModelName",
     "cache_read_tokens_from_usage_deepseek",
 ]

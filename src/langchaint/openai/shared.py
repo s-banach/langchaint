@@ -31,7 +31,10 @@ from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdic
 from langchaint.usage import Usage
 
 _PAUSE_STATUSES = frozenset({429, 503})
-"""429 rate limits and both documented 503 forms: the whole account is throttled, so all pause."""
+"""429 rate limits and documented 503 forms throttle the rate-limit quota.
+
+Every request sharing the rate-limit quota pauses.
+"""
 
 _SPEND_LIMIT_CODES = frozenset({
     "credit_balance_exhausted",
@@ -123,14 +126,7 @@ def _image_data_uri(image_part: ImagePart) -> str:
 
 
 def _priced_tier(service_tier: OpenAIServiceTier | None) -> OpenAIPricedServiceTier:
-    """Which rates a response asks for: what it reports, or the default tier when it names none.
-
-    "auto" is a request word that names no processing mode, and the API documents the response
-    field as the mode actually used, so a response carrying it says nothing about what served it.
-    It prices at the default key like a response reporting no tier at all, rather than as NaN:
-    the account was most likely on the default tier, and a number that may be wrong by a tier
-    multiplier beats destroying the cost of a call that was paid for.
-    """
+    """Return the pricing key for one response's `service_tier`."""
     if service_tier is None or service_tier == "auto":
         return _DEFAULT_TIER
     return service_tier

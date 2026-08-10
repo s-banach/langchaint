@@ -1,14 +1,14 @@
 """Price an uncataloged model and read its response cost."""
 
 from langchaint import Response
-from langchaint.openai import OpenAIAccount, OpenAIPricingTable
+from langchaint.openai import OpenAI, OpenAIPricingTable
 
 
 async def price_at_negotiated_rates() -> Response[str]:
     """Price a model id outside the catalog at contract rates, and read both billing scopes.
 
     Raises:
-        openai.OpenAIError: OpenAI credentials are unavailable during account construction.
+        OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.
         GenerationError: any terminal outcome of the generate call.
     """
     negotiated_default_rates = OpenAIPricingTable(
@@ -17,8 +17,8 @@ async def price_at_negotiated_rates() -> Response[str]:
         cache_read_usd_per_million_tokens=0.10,
         cache_write_usd_per_million_tokens=0.00,
     )
-    account = OpenAIAccount()
-    bound = account.model(
+    openai = OpenAI()
+    bound = openai.model(
         "gpt-5.6",
         pricing={"default": negotiated_default_rates},
         supports_prompt_cache_options=True,

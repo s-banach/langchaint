@@ -65,7 +65,6 @@ from langchaint import (
     UserMessage,
     to_tables,
 )
-from langchaint.account_state import AccountState
 from langchaint.adapter import (
     AdapterResult,
     Binding,
@@ -719,35 +718,6 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
         assert isinstance(time_to_first_chunk, float)
         assert time_to_first_chunk >= 0.0
         assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)
-
-    asyncio.run(scenario())
-
-
-def test_tracing_records_closed_account_failures() -> None:
-    """Closed-account generation and stream failures end error spans."""
-
-    async def scenario() -> None:
-        """Close the account state before both traced request starts."""
-        tracer, exporter = _in_memory_tracer()
-        account_state = AccountState()
-        llm = LLM(_FakeAdapter())
-        llm._account_state = account_state
-        traced = TracedLLM(llm, tracer=tracer, capture_message_content=False)
-        bound = traced.bind(automatic_prompt_caching=True)
-        account_state.close()
-
-        with pytest.raises(RuntimeError, match="closed"):
-            _ = await bound.generate_one("hi")
-        with pytest.raises(RuntimeError, match="closed"):
-            async with bound.stream_one("hi"):
-                pass
-
-        spans = exporter.get_finished_spans()
-        assert len(spans) == 2
-        assert all(span.status.status_code == StatusCode.ERROR for span in spans)
-        for span in spans:
-            assert span.attributes is not None
-            assert span.attributes["error.type"] == "AccountClosedError"
 
     asyncio.run(scenario())
 

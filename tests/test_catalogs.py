@@ -17,23 +17,24 @@ from langchaint import LLM
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
-    AnthropicAccount,
-    AnthropicBedrockAccount,
+    Anthropic,
+    AnthropicBedrock,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
     AnthropicModelName,
     AnthropicPricedServiceTier,
     AnthropicPricingTable,
 )
+from langchaint.cohere import CohereBedrock
 from langchaint.deepseek import (
     DEEPSEEK_PRICING,
-    DeepSeekAccount,
+    DeepSeek,
     DeepSeekModelName,
     cache_read_tokens_from_usage_deepseek,
 )
 from langchaint.gemini import (
     GEMINI_PRICING,
-    GeminiAccount,
+    Gemini,
     GeminiGenerateContentAdapter,
     GeminiModelName,
     GeminiPricingTable,
@@ -41,14 +42,15 @@ from langchaint.gemini import (
 )
 from langchaint.openai import (
     OPENAI_PRICING,
-    OpenAIAccount,
-    OpenAIBedrockAccount,
+    OpenAI,
+    OpenAIBedrock,
     OpenAIChatCompletionsAdapter,
     OpenAIModelName,
     OpenAIPricedServiceTier,
     OpenAIPricingTable,
     OpenAIResponsesAdapter,
 )
+from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 
 _ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
     "default": OpenAIPricingTable(
@@ -58,9 +60,9 @@ _ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
         cache_write_usd_per_million_tokens=1.0,
     )
 }
-"""Stands in where OpenAIBedrockAccount.model requires unrelated pricing.
+"""Stands in where OpenAIBedrock.model requires unrelated pricing.
 
-OpenAIBedrockAccount.model has no default pricing catalog.
+OpenAIBedrock.model has no default pricing catalog.
 """
 
 _ARBITRARY_ANTHROPIC_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
@@ -87,9 +89,9 @@ _ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
 
 
 @pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
-def test_anthropic_account_model_wires_model_and_pricing(model: AnthropicModelName) -> None:
-    """AnthropicAccount.model returns an adapter carrying catalog pricing."""
-    llm = AnthropicAccount(client=AsyncAnthropic(api_key="offline")).model(model)
+def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> None:
+    """Anthropic.model returns an adapter carrying catalog pricing."""
+    llm = Anthropic(client=AsyncAnthropic(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
@@ -100,9 +102,9 @@ def test_anthropic_account_model_wires_model_and_pricing(model: AnthropicModelNa
 
 
 @pytest.mark.parametrize("model", list(GEMINI_PRICING))
-def test_gemini_account_model_wires_model_and_pricing(model: GeminiModelName) -> None:
-    """GeminiAccount.model returns an adapter carrying catalog pricing."""
-    llm = GeminiAccount(client=genai.Client(api_key="offline", vertexai=False)).model(model)
+def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
+    """Gemini.model returns an adapter carrying catalog pricing."""
+    llm = Gemini(client=genai.Client(api_key="offline", vertexai=False)).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.model == model
@@ -116,9 +118,9 @@ def test_gemini_account_model_wires_model_and_pricing(model: GeminiModelName) ->
 
 
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
-def test_openai_account_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
-    """OpenAIAccount.model returns an adapter carrying catalog pricing."""
-    llm = OpenAIAccount(client=AsyncOpenAI(api_key="offline")).model(model)
+def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
+    """OpenAI.model returns an adapter carrying catalog pricing."""
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
@@ -152,20 +154,20 @@ def test_gemini_catalog_contains_only_gemini_3_models() -> None:
 
 
 @pytest.mark.parametrize(("model", "supported"), list(_PROMPT_CACHE_OPTIONS_SUPPORT.items()))
-def test_openai_account_model_wires_prompt_cache_options_support(
+def test_openai_model_wires_prompt_cache_options_support(
     model: OpenAIModelName, *, supported: bool
 ) -> None:
-    """Verify `OpenAIAccount.model` reads cataloged cache support."""
-    llm = OpenAIAccount(client=AsyncOpenAI(api_key="offline")).model(model)
+    """Verify `OpenAI.model` reads cataloged cache support."""
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.supports_prompt_cache_options is supported
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_openai_account_model_accepts_an_uncataloged_model(*, supported: bool) -> None:
+def test_openai_model_accepts_an_uncataloged_model(*, supported: bool) -> None:
     """Pass uncataloged pricing and cache support unchanged."""
-    llm = OpenAIAccount(client=AsyncOpenAI(api_key="offline")).model(
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
         "ft:gpt-5.6-terra:acme::abc123",
         pricing=_ARBITRARY_PRICING,
         supports_prompt_cache_options=supported,
@@ -177,9 +179,9 @@ def test_openai_account_model_accepts_an_uncataloged_model(*, supported: bool) -
     assert adapter.supports_prompt_cache_options is supported
 
 
-def test_openai_account_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
+def test_openai_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
     """Honor stated cache support for a cataloged model."""
-    llm = OpenAIAccount(client=AsyncOpenAI(api_key="offline")).model(
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
         "gpt-5.6-terra",
         supports_prompt_cache_options=False,
     )
@@ -188,9 +190,9 @@ def test_openai_account_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
     assert adapter.supports_prompt_cache_options is False
 
 
-def test_anthropic_account_model_accepts_an_uncataloged_model() -> None:
+def test_anthropic_model_accepts_an_uncataloged_model() -> None:
     """A non-catalog id builds with caller-stated pricing, passed through rather than merged."""
-    llm = AnthropicAccount(client=AsyncAnthropic(api_key="offline")).model(
+    llm = Anthropic(client=AsyncAnthropic(api_key="offline")).model(
         "claude-next-preview",
         pricing=_ARBITRARY_ANTHROPIC_PRICING,
     )
@@ -200,9 +202,9 @@ def test_anthropic_account_model_accepts_an_uncataloged_model() -> None:
     assert adapter.pricing is _ARBITRARY_ANTHROPIC_PRICING
 
 
-def test_gemini_account_model_accepts_an_uncataloged_model() -> None:
+def test_gemini_model_accepts_an_uncataloged_model() -> None:
     """A non-catalog id builds with caller-stated pricing, passed through rather than merged."""
-    llm = GeminiAccount(client=genai.Client(api_key="offline", vertexai=False)).model(
+    llm = Gemini(client=genai.Client(api_key="offline", vertexai=False)).model(
         "gemini-next-preview",
         pricing=_ARBITRARY_GEMINI_PRICING,
     )
@@ -224,7 +226,7 @@ def test_gemini_pricing_override_replaces_the_on_demand_rates() -> None:
         google_maps_usd_per_query=0.014,
     )
     adapter = (
-        GeminiAccount(client=genai.Client(api_key="offline", vertexai=False))
+        Gemini(client=genai.Client(api_key="offline", vertexai=False))
         .model(
             "gemini-3.5-flash",
             pricing={"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom},
@@ -247,12 +249,10 @@ def test_gemini_adapter_requires_on_demand_pricing() -> None:
         )
 
 
-def test_gemini_account_model_raises_on_a_vertex_client() -> None:
-    """Reject a Vertex AI client from `GeminiAccount.model`."""
+def test_gemini_model_raises_on_a_vertex_client() -> None:
+    """Reject a Vertex AI client from `Gemini.model`."""
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = GeminiAccount(client=genai.Client(api_key="offline", vertexai=True)).model(
-            "gemini-3.5-flash"
-        )
+        _ = Gemini(client=genai.Client(api_key="offline", vertexai=True)).model("gemini-3.5-flash")
 
 
 def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None:
@@ -266,14 +266,14 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
     assert adapter.provider_name == "gcp.vertex_ai"
 
 
-def test_gemini_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None:
-    """GeminiAccount shares request policy while bind owns max_attempts."""
-    account = GeminiAccount(
+def test_gemini_shares_backoff_and_bind_owns_max_attempts() -> None:
+    """`Gemini` shares `SharedBackoff`; `LLM.bind()` sets `max_attempts`."""
+    gemini = Gemini(
         client=genai.Client(api_key="offline", vertexai=False),
         max_concurrent_requests=16,
         max_request_starts_per_second=25.0,
     )
-    llm = account.model(
+    llm = gemini.model(
         "gemini-3.5-flash",
         service_tier="flex",
     )
@@ -282,9 +282,9 @@ def test_gemini_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None
     assert adapter.service_tier == "flex"
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert account.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
+    assert gemini.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
     assert llm.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
-    defaulted = account.model("gemini-3.5-flash")
+    defaulted = gemini.model("gemini-3.5-flash")
     defaulted_adapter = defaulted.adapter
     assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
     assert defaulted_adapter.service_tier is None
@@ -297,11 +297,11 @@ def _deepseek_client() -> AsyncOpenAI:
 
 
 @pytest.mark.parametrize("model", list(DEEPSEEK_PRICING))
-def test_deepseek_account_model_wires_model_pricing_and_the_cache_reader(
+def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
     model: DeepSeekModelName,
 ) -> None:
     """Wire DeepSeek pricing and its cache-read usage reader."""
-    llm = DeepSeekAccount(client=_deepseek_client()).model(model)
+    llm = DeepSeek(client=_deepseek_client()).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIChatCompletionsAdapter)
     assert adapter.model == model
@@ -311,10 +311,10 @@ def test_deepseek_account_model_wires_model_pricing_and_the_cache_reader(
     assert adapter.provider_name == "deepseek"
 
 
-def test_deepseek_account_model_accepts_an_uncataloged_model() -> None:
+def test_deepseek_model_accepts_an_uncataloged_model() -> None:
     """A non-catalog id builds with caller-stated pricing, wrapped under the "default" tier."""
     table = _ARBITRARY_PRICING["default"]
-    llm = DeepSeekAccount(client=_deepseek_client()).model(
+    llm = DeepSeek(client=_deepseek_client()).model(
         "deepseek-next-preview",
         pricing=table,
     )
@@ -324,7 +324,7 @@ def test_deepseek_account_model_accepts_an_uncataloged_model() -> None:
     assert adapter.pricing["default"] is table
 
 
-def test_deepseek_account_without_a_client_requires_the_deepseek_key(
+def test_deepseek_without_a_client_requires_the_deepseek_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Building without a client reads DEEPSEEK_API_KEY, raising when it is unset rather than falling back.
@@ -334,34 +334,32 @@ def test_deepseek_account_without_a_client_requires_the_deepseek_key(
     """
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
-        _ = DeepSeekAccount()
+        _ = DeepSeek()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "offline")
-    adapter = DeepSeekAccount().model("deepseek-v4-flash").adapter
+    adapter = DeepSeek().model("deepseek-v4-flash").adapter
     assert isinstance(adapter, OpenAIChatCompletionsAdapter)
     assert adapter.client.api_key == "offline"
     assert str(adapter.client.base_url).startswith("https://api.deepseek.com")
 
 
-def test_deepseek_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None:
-    """DeepSeekAccount shares request policy while bind owns max_attempts."""
-    account = DeepSeekAccount(
+def test_deepseek_shares_backoff_and_bind_owns_max_attempts() -> None:
+    """`DeepSeek` shares `SharedBackoff`; `LLM.bind()` sets `max_attempts`."""
+    deepseek = DeepSeek(
         client=_deepseek_client(),
         max_concurrent_requests=16,
         max_request_starts_per_second=25.0,
     )
-    llm = account.model("deepseek-v4-flash")
+    llm = deepseek.model("deepseek-v4-flash")
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert account.model("deepseek-v4-pro").shared_backoff is llm.shared_backoff
+    assert deepseek.model("deepseek-v4-pro").shared_backoff is llm.shared_backoff
     assert llm.bind(automatic_prompt_caching=True, max_attempts=5).max_attempts == 5
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_openai_bedrock_account_model_forwards_prompt_cache_options_support(
-    *, supported: bool
-) -> None:
+def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported: bool) -> None:
     """Forward stated Bedrock cache-options support unchanged."""
-    llm = OpenAIBedrockAccount(client=AsyncBedrockOpenAI(aws_region="us-east-1")).model(
+    llm = OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1")).model(
         "openai.gpt-oss-120b-1:0",
         pricing=_ARBITRARY_PRICING,
         supports_prompt_cache_options=supported,
@@ -407,12 +405,12 @@ def test_a_base_client_takes_the_stated_provider_name(
     assert build().provider_name == provider_name
 
 
-def test_openai_bedrock_account_model_wires_model_pricing_and_region() -> None:
-    """OpenAIBedrockAccount builds AsyncBedrockOpenAI for aws_region.
+def test_openai_bedrock_model_wires_model_pricing_and_region() -> None:
+    """OpenAIBedrock builds AsyncBedrockOpenAI for aws_region.
 
-    Other OpenAIBedrockAccount tests pass a client, so they cannot catch this.
+    Other OpenAIBedrock tests pass a client, so they cannot catch this.
     """
-    llm = OpenAIBedrockAccount(aws_region="eu-west-1").model(
+    llm = OpenAIBedrock(aws_region="eu-west-1").model(
         "openai.gpt-oss-120b-1:0",
         pricing=_ARBITRARY_PRICING,
         supports_prompt_cache_options=False,
@@ -428,7 +426,7 @@ def test_openai_bedrock_account_model_wires_model_pricing_and_region() -> None:
 def test_adapter_client_never_retries_beneath_langchaint() -> None:
     """The stored client is a max_retries=0 copy keeping the caller's credentials."""
     client = AsyncAnthropic(api_key="offline")
-    llm = AnthropicAccount(client=client).model("claude-sonnet-5")
+    llm = Anthropic(client=client).model("claude-sonnet-5")
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.client.max_retries == 0
@@ -452,7 +450,7 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
             aws_region="us-east-1",
             http_client=http_client,
         )
-    llm = AnthropicBedrockAccount(client=client).model(model)
+    llm = AnthropicBedrock(client=client).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert client.max_retries != 0
@@ -466,21 +464,21 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     """Passing both client and http_client raises: a passed client already owns its transport."""
     client = AsyncAnthropicBedrockMantle(aws_region="us-east-1")
     with pytest.raises(ValueError, match="http_client="):
-        _ = AnthropicBedrockAccount(
+        _ = AnthropicBedrock(
             client=client,
             http_client=httpx.AsyncClient(),
         )
 
 
-def test_both_bedrock_accounts_raise_on_a_region_beside_a_client() -> None:
-    """Both Bedrock account constructors reject aws_region beside client."""
+def test_both_bedrock_classes_raise_on_a_region_beside_a_client() -> None:
+    """Both Bedrock constructors reject `aws_region` beside `client`."""
     with pytest.raises(ValueError, match="aws_region="):
-        _ = AnthropicBedrockAccount(
+        _ = AnthropicBedrock(
             aws_region="eu-west-1",
             client=AsyncAnthropicBedrockMantle(aws_region="us-east-1"),
         )
     with pytest.raises(ValueError, match="aws_region="):
-        _ = OpenAIBedrockAccount(
+        _ = OpenAIBedrock(
             aws_region="eu-west-1",
             client=AsyncBedrockOpenAI(aws_region="us-east-1"),
         )
@@ -497,7 +495,7 @@ def test_pricing_override_replaces_the_standard_rates() -> None:
         web_search_usd_per_invocation=0.01,
     )
     adapter = (
-        AnthropicAccount(
+        Anthropic(
             client=AsyncAnthropic(api_key="offline"),
         )
         .model(
@@ -512,64 +510,105 @@ def test_pricing_override_replaces_the_standard_rates() -> None:
 
 
 def test_service_tier_reaches_each_first_party_adapter() -> None:
-    """Each Account.model forwards its provider's service_tier.
+    """Each first-party `model()` forwards its provider's `service_tier`.
 
-    Neither Bedrock Account.model accepts service_tier.
+    Neither Bedrock `model()` accepts `service_tier`.
     """
-    anthropic_account = AnthropicAccount(client=AsyncAnthropic(api_key="offline"))
-    anthropic_adapter = anthropic_account.model(
+    anthropic = Anthropic(client=AsyncAnthropic(api_key="offline"))
+    anthropic_adapter = anthropic.model(
         "claude-sonnet-5",
         service_tier="standard_only",
     ).adapter
     assert isinstance(anthropic_adapter, AnthropicMessagesAdapter)
     assert anthropic_adapter.service_tier == "standard_only"
-    anthropic_unstated = anthropic_account.model("claude-sonnet-5").adapter
+    anthropic_unstated = anthropic.model("claude-sonnet-5").adapter
     assert isinstance(anthropic_unstated, AnthropicMessagesAdapter)
     assert anthropic_unstated.service_tier is None
-    openai_account = OpenAIAccount(client=AsyncOpenAI(api_key="offline"))
-    openai_adapter = openai_account.model("gpt-5.6-terra", service_tier="flex").adapter
+    openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
+    openai_adapter = openai.model("gpt-5.6-terra", service_tier="flex").adapter
     assert isinstance(openai_adapter, OpenAIResponsesAdapter)
     assert openai_adapter.service_tier == "flex"
-    unstated = openai_account.model("gpt-5.6-terra").adapter
+    unstated = openai.model("gpt-5.6-terra").adapter
     assert isinstance(unstated, OpenAIResponsesAdapter)
     assert unstated.service_tier is None
 
 
-def test_openai_account_owns_shared_backoff_and_bind_owns_max_attempts() -> None:
-    """OpenAIAccount shares request policy while bind owns max_attempts."""
-    account = OpenAIAccount(
-        client=AsyncOpenAI(api_key="offline"),
+def test_openai_shares_client_and_shared_backoff() -> None:
+    """Models from one `OpenAI` share its client and `SharedBackoff`."""
+    client = AsyncOpenAI(api_key="offline")
+    openai = OpenAI(
+        client=client,
         max_concurrent_requests=16,
         max_request_starts_per_second=25.0,
+        minimum_wait_ceiling_seconds=0.25,
+        longest_wait_seconds=12.0,
+        wait_multiplier=3.0,
+        quiet_seconds_per_decay_step=9.0,
     )
-    llm = account.model("gpt-5.6-terra")
-    assert llm.shared_backoff.max_concurrent_requests == 16
-    assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert account.model("gpt-5.6-sol").shared_backoff is llm.shared_backoff
-    assert llm.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
-    assert llm.bind(automatic_prompt_caching=False).max_attempts == 3
+    terra = openai.model("gpt-5.6-terra")
+    sol = openai.model("gpt-5.6-sol")
+    embedding_model = openai.embedding_model("text-embedding-3-small")
+
+    assert isinstance(terra.adapter, OpenAIResponsesAdapter)
+    assert isinstance(sol.adapter, OpenAIResponsesAdapter)
+    assert isinstance(embedding_model._adapter, _OpenAIEmbeddingAdapter)
+    assert terra.adapter.client is openai.client
+    assert sol.adapter.client is openai.client
+    assert embedding_model._adapter.client is openai.client
+    assert terra.shared_backoff is sol.shared_backoff
+    assert terra.shared_backoff is embedding_model._shared_backoff
+    assert terra.shared_backoff.max_concurrent_requests == 16
+    assert terra.shared_backoff.max_request_starts_per_second == 25.0
+    assert terra.shared_backoff.minimum_wait_ceiling_seconds == 0.25
+    assert terra.shared_backoff.longest_wait_seconds == 12.0
+    assert terra.shared_backoff.wait_multiplier == 3.0
+    assert terra.shared_backoff.quiet_seconds_per_decay_step == 9.0
+    assert terra.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
+    assert terra.bind(automatic_prompt_caching=False).max_attempts == 3
+
+
+def test_separate_openai_values_create_separate_shared_backoffs() -> None:
+    """Separate `OpenAI` values create separate `SharedBackoff` values."""
+    first = OpenAI(client=AsyncOpenAI(api_key="offline"))
+    second = OpenAI(client=AsyncOpenAI(api_key="offline"))
+
+    assert (
+        first.model("gpt-5.6-terra").shared_backoff
+        is not second.model("gpt-5.6-terra").shared_backoff
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_class",
+    [Anthropic, AnthropicBedrock, CohereBedrock, DeepSeek, Gemini, OpenAI, OpenAIBedrock],
+)
+def test_backend_classes_expose_no_lifecycle_methods(backend_class: type[object]) -> None:
+    """Backend classes expose no lifecycle methods."""
+    assert not hasattr(backend_class, "aclose")
+    assert not hasattr(backend_class, "__aenter__")
+    assert not hasattr(backend_class, "__aexit__")
 
 
 def test_reasoning_summary_lands_on_the_adapter() -> None:
     """A caller-supplied reasoning_summary reaches the adapter; the default is None."""
-    account = OpenAIAccount(client=AsyncOpenAI(api_key="offline"))
-    llm = account.model("gpt-5.6-terra", reasoning_summary="detailed")
+    openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
+    llm = openai.model("gpt-5.6-terra", reasoning_summary="detailed")
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.reasoning_summary == "detailed"
-    defaulted = account.model("gpt-5.6-terra")
+    defaulted = openai.model("gpt-5.6-terra")
     assert isinstance(defaulted.adapter, OpenAIResponsesAdapter)
     assert defaulted.adapter.reasoning_summary is None
 
 
 def test_cache_ttl_lands_on_the_adapter() -> None:
     """A caller-supplied cache_ttl reaches the adapter; the default is "5m"."""
-    account = AnthropicAccount(client=AsyncAnthropic(api_key="offline"))
-    llm = account.model("claude-sonnet-5", cache_ttl="1h")
+    anthropic = Anthropic(client=AsyncAnthropic(api_key="offline"))
+    llm = anthropic.model("claude-sonnet-5", cache_ttl="1h")
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.cache_ttl == "1h"
-    defaulted = account.model("claude-sonnet-5")
+    defaulted = anthropic.model("claude-sonnet-5")
     assert isinstance(defaulted.adapter, AnthropicMessagesAdapter)
     assert defaulted.adapter.cache_ttl == "5m"
 
@@ -578,27 +617,27 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
     ("build_llm", "expected_provider_name"),
     [
         (
-            lambda: AnthropicAccount(client=AsyncAnthropic(api_key="k")).model("claude-sonnet-5"),
+            lambda: Anthropic(client=AsyncAnthropic(api_key="k")).model("claude-sonnet-5"),
             "anthropic",
         ),
         (
-            lambda: AnthropicBedrockAccount(
+            lambda: AnthropicBedrock(
                 client=AsyncAnthropicBedrock(aws_region="us-east-1"),
             ).model("us.anthropic.claude-sonnet-4-6"),
             "aws.bedrock",
         ),
         (
-            lambda: OpenAIAccount(client=AsyncOpenAI(api_key="k")).model("gpt-5.6-terra"),
+            lambda: OpenAI(client=AsyncOpenAI(api_key="k")).model("gpt-5.6-terra"),
             "openai",
         ),
         (
-            lambda: GeminiAccount(client=genai.Client(api_key="k", vertexai=False)).model(
+            lambda: Gemini(client=genai.Client(api_key="k", vertexai=False)).model(
                 "gemini-3.5-flash"
             ),
             "gcp.gemini",
         ),
         (
-            lambda: OpenAIBedrockAccount(client=AsyncBedrockOpenAI(aws_region="us-east-1")).model(
+            lambda: OpenAIBedrock(client=AsyncBedrockOpenAI(aws_region="us-east-1")).model(
                 "openai.gpt-oss-120b-1:0",
                 pricing=_ARBITRARY_PRICING,
                 supports_prompt_cache_options=False,
@@ -606,15 +645,15 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
             "aws.bedrock",
         ),
         (
-            lambda: DeepSeekAccount(client=_deepseek_client()).model("deepseek-v4-flash"),
+            lambda: DeepSeek(client=_deepseek_client()).model("deepseek-v4-flash"),
             "deepseek",
         ),
     ],
 )
-def test_each_account_model_states_a_convention_provider_name(
+def test_each_model_states_a_convention_provider_name(
     build_llm: Callable[[], LLM], expected_provider_name: str
 ) -> None:
-    """Require a convention value for each account's `provider_name`."""
+    """Require a convention value for each adapter's `provider_name`."""
     defined = {member.value for member in gen_ai_semconv.GenAiProviderNameValues}
     adapter = build_llm().adapter
     assert adapter.provider_name == expected_provider_name
@@ -630,22 +669,22 @@ def test_each_account_model_states_a_convention_provider_name(
         ),
     ],
 )
-def test_openai_account_rejects_a_client_reaching_another_provider(
+def test_openai_rejects_a_client_reaching_another_provider(
     client: AsyncOpenAI,
 ) -> None:
     """Reject another provider's client from both OpenAI request APIs."""
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = OpenAIAccount(client=client).model("gpt-5.6-terra")
+        _ = OpenAI(client=client).model("gpt-5.6-terra")
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = OpenAIAccount(client=client).embedding_model("text-embedding-3-small")
+        _ = OpenAI(client=client).embedding_model("text-embedding-3-small")
     asyncio.run(client.close())
 
 
-def test_deepseek_account_model_rejects_a_bedrock_client() -> None:
-    """Reject a Bedrock SDK client from `DeepSeekAccount.model`."""
+def test_deepseek_model_rejects_a_bedrock_client() -> None:
+    """Reject a Bedrock SDK client from `DeepSeek.model`."""
     client = AsyncBedrockOpenAI(aws_region="us-east-1")
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = DeepSeekAccount(client=client).model("deepseek-v4-flash")
+        _ = DeepSeek(client=client).model("deepseek-v4-flash")
 
 
 @pytest.mark.parametrize(
@@ -660,7 +699,7 @@ def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
 ) -> None:
     """Both Bedrock client classes contradict provider_name="anthropic".
 
-    The Account.model annotations already stop this path.
+    `Anthropic.model()` annotations already stop this path.
     This test covers direct adapter construction.
     """
     with pytest.raises(ValueError, match="contradicts the client"):
@@ -684,4 +723,4 @@ def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
         pass
 
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = OpenAIAccount(client=SigV4BedrockOpenAI(aws_region="us-east-1")).model("gpt-5.6-terra")
+        _ = OpenAI(client=SigV4BedrockOpenAI(aws_region="us-east-1")).model("gpt-5.6-terra")

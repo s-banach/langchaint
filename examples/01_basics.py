@@ -1,11 +1,11 @@
-"""Construct an account, bind models, and inspect generation results."""
+"""Construct `OpenAI`, bind models, and inspect generation results."""
 
 from typing import Literal
 
 from pydantic import BaseModel
 
 from langchaint import InferenceParams, Response, to_tables
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 class Sentiment(BaseModel):
@@ -22,8 +22,8 @@ async def basics() -> None:
         openai.OpenAIError: OpenAI credentials are unavailable.
         GenerationError: A `generate_one` call failed.
     """
-    account = OpenAIAccount()
-    llm = account.model("gpt-5.6-terra")
+    openai = OpenAI()
+    llm = openai.model("gpt-5.6-terra")
 
     assistant = llm.bind(system_prompt="Be terse.", automatic_prompt_caching=False)
     colors = await assistant.generate_one("Name three primary colors.")

@@ -1,9 +1,9 @@
-"""Create retrieval embeddings and reuse their account for generation."""
+"""Create retrieval embeddings and generation through one `OpenAI`."""
 
 import numpy as np
 
 from langchaint import Response
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 async def retrieve_and_summarize() -> Response[str]:
@@ -13,9 +13,9 @@ async def retrieve_and_summarize() -> Response[str]:
         openai.OpenAIError: OpenAI credentials are unavailable.
         Exception: Embedding or generation failed.
     """
-    account = OpenAIAccount()
-    embedding_model = account.embedding_model("text-embedding-3-small", dimension=256)
-    summarizer = account.model("gpt-5.6-terra").bind(automatic_prompt_caching=False)
+    openai = OpenAI()
+    embedding_model = openai.embedding_model("text-embedding-3-small", dimension=256)
+    summarizer = openai.model("gpt-5.6-terra").bind(automatic_prompt_caching=False)
 
     documents = [
         "Whales are mammals that breathe air.",

@@ -1,20 +1,17 @@
-"""The client; generation happens only through a binding.
+"""Provider-neutral `LLM` construction and binding.
 
-LLM composes an adapter and a SharedBackoff.
-LLM has no generate methods.
-bind() freezes everything that determines the cacheable prompt prefix,
-fixes the output type, and precomputes SDK keyword arguments once;
-the returned BoundLLM takes only the per-request GenerationInput.
-There are no per-call parameter overrides; changing parameters is rebind().
-The SharedBackoff admitted() block gates every request start on every path, retries included,
-and one block spans one attempt.
-The retry loop raises each provider failure inside the block, so the exit parses and records it,
-and acts on the verdict the block leaves on Admission.verdict:
-a PauseAll holds every request in the domain at entry until the shared pause ends,
-a RetryThisOne waits out a PrivateBackoff between blocks,
-and a DoNotRetry becomes the item's GenerationError, named by Adapter.classify.
-PauseAllDoNotRetry is both: the pause it recorded holds the domain, and this item stops as
-ProviderDeclaredFinalError.
+`LLM` combines one `Adapter` and one `SharedBackoff`.
+`LLM` has no generation methods.
+`LLM.bind()` freezes the cacheable prompt prefix.
+It also fixes the output type and precomputes SDK arguments.
+The returned `BoundLLM` accepts per-request `GenerationInput` values.
+`BoundLLM.rebind()` changes parameters.
+One `SharedBackoff.admitted()` block spans each request attempt.
+Provider failures leave a `Verdict` on `Admission.verdict`.
+`PauseAll` pauses every request sharing the `SharedBackoff`.
+`RetryThisOne` waits through `PrivateBackoff` between attempts.
+`DoNotRetry` becomes the item's `GenerationError`.
+`PauseAllDoNotRetry` pauses shared requests and stops this item.
 """
 
 import asyncio
@@ -23,7 +20,6 @@ from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
-from langchaint.account_state import AccountClosedError, AccountState
 from langchaint.adapter import (
     Adapter,
     Binding,
@@ -289,10 +285,9 @@ class LLM:
     ) -> None:
         """Store the shared pieces.
 
-        shared_backoff None builds a private domain from the adapter's parse and failure_types,
-        at the SharedBackoff defaults with max_concurrent_requests 8. One instance is one
-        backpressure domain, so pass the same instance to every LLM whose requests share a
-        provider quota.
+        `shared_backoff=None` creates a `SharedBackoff` from the adapter.
+        It uses `max_concurrent_requests=8` and other `SharedBackoff` defaults.
+        Pass one instance to every `LLM` sharing a rate-limit quota.
         """
         self.adapter = adapter
         self.shared_backoff = (
@@ -302,7 +297,6 @@ class LLM:
                 parse=adapter.parse, failure_types=adapter.failure_types, max_concurrent_requests=8
             )
         )
-        self._account_state: AccountState | None = None
 
     @overload
     def bind[ModelT: BaseModel](
@@ -418,7 +412,6 @@ class LLM:
             tool_manager=tool_manager,
             shared_backoff=self.shared_backoff,
             max_attempts=max_attempts,
-            account_state=self._account_state,
         )
 
 
@@ -442,7 +435,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     the provider only ever sees the converted schemas inside the binding.
     """
 
-    def __init__(  # noqa: PLR0913 (the binding carries every bound field and account state)
+    def __init__(
         self,
         *,
         adapter: Adapter,
@@ -452,7 +445,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         tool_manager: ToolManagerT,
         shared_backoff: SharedBackoff,
         max_attempts: int,
-        account_state: AccountState | None,
     ) -> None:
         """Store the frozen pieces; called by `LLM.bind` and `rebind` only.
 
@@ -466,7 +458,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self.response_format = response_format
         self.shared_backoff = shared_backoff
         self.max_attempts = max_attempts
-        self._account_state = account_state
         self._bound_adapter = bound_adapter
         self._tool_manager = tool_manager
 
@@ -484,15 +475,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def _splits_tool_call_turns(self) -> bool:
         """Whether this binding's tool-call turns are ToolCallTurn: it is structured and tool-bound."""
         return self.response_format is not None and self._tool_manager is not None
-
-    def _ensure_account_open(self) -> None:
-        """Raise when this binding's account is closed.
-
-        Raises:
-            RuntimeError: This binding's account is closed.
-        """
-        if self._account_state is not None:
-            self._account_state.ensure_open()
 
     @overload
     def rebind[NewModelT: BaseModel](
@@ -715,7 +697,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             tool_manager=new_tool_manager,
             shared_backoff=self.shared_backoff,
             max_attempts=new_max_attempts,
-            account_state=self._account_state,
         )
 
     def _terminal_error(
@@ -729,10 +710,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> GenerationError:
         """Name this item's terminal failure from the verdict, else from classify's reading of exc.
 
-        A PauseAllDoNotRetry is declared_final without consulting classify: only a provider
-        directive that this request will not succeed produces one, which is what
-        ProviderDeclaredFinalError names. Reading the status instead would call a throttled
-        account's 429 a rejection of the request.
+        `PauseAllDoNotRetry` becomes `declared_final` without `classify()`.
+        A provider directive states this request will not succeed.
+        `ProviderDeclaredFinalError` names that outcome.
+        `classify()` could otherwise return `invalid_request` for status 429.
         Every other failure takes classify. Reached on a terminal verdict and on an exception
         outside failure_types that classify did not call transient, so the "transient" value cannot
         arrive; if a classify defect produces one anyway, it lands on the unknown_exception default
@@ -802,9 +783,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         None where the attempt received no response.
 
         Raises:
-            GenerationError: the verdict is terminal; _terminal_error names which. A
-                PauseAllDoNotRetry raises like any other terminal verdict, its pause already
-                recorded by the block's exit, so the domain keeps waiting while this item stops.
+            GenerationError: A terminal verdict stops this request.
+                `PauseAllDoNotRetry` also leaves shared requests paused.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         verdict = admission.verdict
@@ -914,14 +894,13 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         so an exception from that read still leaves the attempt and its billing on the record.
         Each attempt spans one admitted() block, held for the request only;
         backoff sleeps sit outside the block so a waiting task does not hold a permit.
-        Each provider failure is raised inside the block, so the exit records its verdict before
-        anyone else is admitted and a rate-limit error pauses the whole domain.
+        Each provider failure exits its block before another request starts.
+        A rate-limit error pauses the rate-limit quota.
         Every attempt is timed onto an AttemptRecord whose bracket is the request only,
         excluding the admission wait and the backoff sleep,
         so a slow request is distinguishable from time spent rate limited.
 
         Raises:
-            RuntimeError: This binding's account closes before a request starts.
             InvalidRequestError: build_request returned InvalidRequest, or the adapter classified
                 an attempt's error as a rejection of the request; terminal for this item, without a retry.
             ProviderDeclaredFinalError: the adapter classified an attempt's error as one the provider
@@ -962,7 +941,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             # reported, noted before the loop's frame unwound; None where a record settled it.
             raise _abandoned_call_error(TimedOutError, ledger, ledger.billing_in_flight) from None
 
-    async def _attempt_until_budget_runs_out(  # noqa: PLR0912 (account closure bypasses provider error handling)
+    async def _attempt_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _CallLedger, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
         """Send the request until it succeeds, fails terminally, or the retry budget runs out.
@@ -982,7 +961,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             GenerationError: every failure _generate_with_retries names but TimedOutError, which its
                 scope raises.
             ParserContractError: the adapter's parse violated its contract on an attempt's failure.
-            RuntimeError: This binding's account closed before an admitted request started.
         """
         request = self._request_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
@@ -993,7 +971,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             observations = _StreamObservations(billing=None, request_id=None, opened=False)
             try:
                 async with admission:
-                    self._ensure_account_open()
                     # Entering the block is the admission, so the clock starts on the first
                     # statement inside it.
                     deadline.resume_on_admission()
@@ -1027,13 +1004,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     if outcome.kind == "provider_failed_transiently":
                         # Raised inside the block so the exit parses it: a billable 200 whose
                         # body reports a transient failure is still a provider failure, and a
-                        # rate-limit body pauses the domain exactly as a 429 status does.
+                        # rate-limit body pauses the rate-limit quota exactly as a 429 status does.
                         assistant_message = outcome.assistant_message
                         raise TransientError(  # noqa: TRY301 (the admitted() block's exit is the parser, so the raise must sit inside it)
                             outcome.reason, is_rate_limit=outcome.is_rate_limit
                         )
-            except AccountClosedError:
-                raise
             except ParserContractError:
                 # A parse contract violation is langchaint's defect, not the attempt's failure:
                 # it skips the verdict handling below and reaches the caller inside EscapedExceptionError.
@@ -1101,13 +1076,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def _request_for_messages(
         self, messages: Sequence[Message], *, ledger: _CallLedger
     ) -> RequestParams:
-        """Build one request after confirming its account remains open.
+        """Build one provider request.
 
         Raises:
-            RuntimeError: This binding's account is closed.
             InvalidRequestError: The adapter rejects `messages` before any request.
         """
-        self._ensure_account_open()
         built = self._bound_adapter.build_request(messages)
         if isinstance(built, InvalidRequest):
             raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
@@ -1156,10 +1129,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         raises TimedOutError, which carries what the cut-off call spent. None is no deadline.
         A cancellation from anywhere else (a caller's own asyncio.timeout, a TaskGroup sibling
         failing, shutdown) cuts the call off and propagates, so this call's settled attempts are lost
-        with the frame. Ask for the deadline here to keep that account.
+        with the frame. Use `timeout_seconds` to preserve settled attempts.
 
         Raises:
-            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled this call.
         """
         return await self._generate_one_any_binding(
@@ -1183,17 +1155,13 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             GenerationError: whatever _generate_with_retries failed the call with, or
                 EscapedExceptionError wrapping any other Exception that reached here.
-            RuntimeError: This binding's account is closed.
             BaseException: whatever cut the call off, propagating unobserved.
         """
-        self._ensure_account_open()
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
             return await self._generate_with_retries(
                 _as_messages(generation_input), ledger=ledger, deadline=deadline
             )
-        except AccountClosedError:
-            raise
         except GenerationError:
             raise
         except Exception as escaped:
@@ -1295,7 +1263,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
-            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
                 does not catch; the started items are cancelled and awaited, and it propagates.
@@ -1323,12 +1290,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
-            RuntimeError: This binding's account is closed.
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception; the started
                 items are cancelled and awaited, and it propagates.
         """
-        self._ensure_account_open()
         _reject_bare_str_batch(generation_inputs)
         # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
@@ -1358,12 +1323,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[CallResult[OutputT | None]]:
         """Run the items through run_many, which returns them in input order.
 
-        The pending bound follows the domain's max_concurrent_requests, which is read-only, so
-        run_many always receives a positive int here.
+        The pending bound follows `SharedBackoff.max_concurrent_requests`.
+        `run_many` therefore receives a positive integer.
 
         Raises:
             asyncio.CancelledError: an outer scope cancelled generate_many.
-            RuntimeError: This binding's account closes before a request starts.
             BaseException: an item raised a BaseException that is not an Exception; run_many cancels
                 and awaits the started items, and it propagates.
         """
@@ -1431,7 +1395,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             messages=_as_messages(generation_input),
             shared_backoff=self.shared_backoff,
             max_attempts=self.max_attempts,
-            account_state=self._account_state,
             timeout_seconds=timeout_seconds,
             splits_tool_call_turns=self._splits_tool_call_turns,
         )

@@ -299,10 +299,10 @@ def test_a_failure_is_parsed_recorded_and_propagated() -> None:
 
 
 def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
-    """The verdict that stops one request still holds the domain, which is why it is not DoNotRetry.
+    """`PauseAllDoNotRetry` stops one request and pauses the rate-limit quota.
 
-    _record returns early on every verdict but the two pausing ones, so demoting this failure to
-    DoNotRetry would drop the account-wide pause the failure is evidence for.
+    `_record()` returns early for every verdict except two pausing verdicts.
+    `DoNotRetry` would drop the shared pause evidenced by this failure.
     """
 
     async def scenario() -> None:

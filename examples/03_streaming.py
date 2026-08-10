@@ -12,7 +12,7 @@ from langchaint import (
     ToolManager,
     tool,
 )
-from langchaint.openai import OpenAIAccount
+from langchaint.openai import OpenAI
 
 
 class WeatherArgs(BaseModel):
@@ -48,9 +48,9 @@ async def stream_tool_call() -> Response[str]:
         GenerationError: The stream ended with a generation failure.
         StreamProtocolError: The stream ended without a terminal event.
     """
-    account = OpenAIAccount()
+    openai = OpenAI()
     tool_manager = ToolManager([get_weather])
-    bound = account.model("gpt-5.6-terra", reasoning_summary="auto").bind(
+    bound = openai.model("gpt-5.6-terra", reasoning_summary="auto").bind(
         tool_manager=tool_manager,
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
         automatic_prompt_caching=False,

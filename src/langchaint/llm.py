@@ -4,6 +4,7 @@
 `LLM` has no generation methods.
 `LLM.bind()` freezes the cacheable prompt prefix.
 It also fixes the output type and precomputes SDK arguments.
+`tools=` constructs `ToolManager` from a sequence or binds an existing `ToolManager` unchanged.
 The returned `BoundLLM` accepts per-request `GenerationInput` values.
 `BoundLLM.rebind()` changes parameters.
 One `SharedBackoff.admitted()` block spans each request attempt.
@@ -72,7 +73,7 @@ from langchaint.shared_backoff import (
     Verdict,
 )
 from langchaint.streaming import StreamHandle, _close_stream_quietly
-from langchaint.tools import ToolManager
+from langchaint.tools import Tool, ToolManager
 
 
 class _StreamObservations(NamedTuple):
@@ -253,6 +254,15 @@ def _bind_adapter(
     return adapter.bind_structured(binding, response_format)
 
 
+def _resolve_tool_manager(
+    tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None,
+) -> ToolManager | None:
+    """Raise `ValueError` when a `tools` sequence contains duplicate names."""
+    if isinstance(tools, ToolManager) or tools is None:
+        return tools
+    return ToolManager(tools)
+
+
 class GenerateItem[OutputT](Protocol):
     """Runs one item of a batch.
 
@@ -303,7 +313,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -318,7 +328,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: None = ...,
+        tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -333,7 +343,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -348,7 +358,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: None = ...,
+        tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -362,7 +372,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
-        tool_manager: ToolManager | None = None,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
@@ -376,22 +386,24 @@ class LLM:
 
         response_format=Model gives BoundLLM[Model] whose output is a validated Model.
         Absent, bind gives BoundLLM[str] whose output is the assistant text.
-        Passing a tool_manager gives the BoundLLM[Model, ToolManager] form, whose structured request
-        methods type output as optional because a tool-call turn parses no instance; see BoundLLM.
-        A caller holding a ToolManager | None gets the union of the two forms, whose request methods
-        return the optional type, which is what a caller who does not know can act on.
-        automatic_prompt_caching has no default: caching changes billing,
-        so langchaint never chooses a caching configuration for the caller.
+        `tools=ToolManager(...)` binds that `ToolManager` unchanged.
+        A `tools` sequence constructs `ToolManager`.
+        A tool-bound structured request may return a `ToolCallTurn`; see `BoundLLM`.
+        `automatic_prompt_caching` has no default because caching changes billing.
+        langchaint never chooses a caching configuration for the caller.
         max_attempts counts requests sent including the first, so 1 means no retrying.
         Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
         Binding.extra_body documents extra_body: the merge precedence and the colliding-key raise.
 
         Raises:
-            ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
-                prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
-                model cannot honor and an extra_body key the adapter itself populates. Also raised
-                when max_attempts is a bool or an int below 1.
+            ValueError: A `tools` sequence contains duplicate names.
+                Also raised when `system_prompt` is an empty sequence of parts.
+                Pass `None` to bind no system prompt.
+                The adapter also raises for an unsupported caching configuration.
+                The adapter also raises when `extra_body` contains an adapter-populated key.
+                Also raised when `max_attempts` is a bool or below one.
         """
+        tool_manager = _resolve_tool_manager(tools)
         binding = _build_binding(
             system_prompt=system_prompt,
             tool_manager=tool_manager,
@@ -481,7 +493,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -496,7 +508,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -511,7 +523,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -526,7 +538,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -541,7 +553,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -556,7 +568,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -571,7 +583,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -586,7 +598,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -601,7 +613,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -616,7 +628,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tool_manager: ToolManager | None | Unchanged = UNCHANGED,
+        tools: (
+            ToolManager
+            | Sequence[Tool[BaseModel | Mapping[str, object] | None]]
+            | None
+            | Unchanged
+        ) = UNCHANGED,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
@@ -627,35 +644,35 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> "BoundLLM[Any, Any]":
         """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
 
-        response_format and tool_manager are the two fields whose change alters the static output
-        type, so they drive the overload return type: the first sets OutputT, the second sets
-        ToolManagerT, and leaving either out keeps what this binding has. Every combination is exact, including
-        dropping a tool_manager, which is what returns a structured binding to a non-optional output.
-        Replace semantics: a passed inference_params replaces the bound one whole, never field-wise.
-        Every rebind converts the binding to SDK keyword arguments again, a pure conversion with no I/O.
-        Whether a rebind preserves the provider's prompt cache is provider-specific and partly undocumented
-        (Anthropic documents the prefix order tools -> system -> messages),
-        and it depends on which field a rebind changes and on which value that field moves between,
-        so measure it on the deployment you ship on.
-        langchaint owns no cache-safety matrix over this.
-        A matrix carried in the code goes stale the moment a provider changes a model.
+        `response_format` sets `OutputT` in the overload return type.
+        `tools` sets `ToolManagerT`.
+        Omitting `tools` preserves the bound `ToolManagerT`.
+        Passing `tools=None` removes the bound `ToolManager`.
+        Passing `tools=ToolManager(...)` preserves that object's identity.
+        `inference_params` replaces the complete bound value.
+        `rebind` converts the new binding to SDK arguments without I/O.
+        Provider cache preservation depends on changed fields, provider, and model.
+        Measure cache behavior on the deployed configuration.
 
         Raises:
-            ValueError: system_prompt is an empty sequence of parts; pass None to bind no system
-                prompt. Also raised by the adapter, which refuses an automatic_prompt_caching its
-                model cannot honor and an extra_body key the adapter itself populates. Also raised
-                when max_attempts is a bool or an int below 1.
+            ValueError: A `tools` sequence contains duplicate names.
+                Also raised when `system_prompt` is an empty sequence of parts.
+                Pass `None` to bind no system prompt.
+                The adapter also raises for an unsupported caching configuration.
+                The adapter also raises when `extra_body` contains an adapter-populated key.
+                Also raised when `max_attempts` is a bool or below one.
         """
-        new_tool_manager = (
-            self.tool_manager if isinstance(tool_manager, Unchanged) else tool_manager
-        )
+        if isinstance(tools, Unchanged):
+            tool_manager = self.tool_manager
+        else:
+            tool_manager = _resolve_tool_manager(tools)
         new_binding = _build_binding(
             system_prompt=(
                 self.binding.system_prompt
                 if isinstance(system_prompt, Unchanged)
                 else system_prompt
             ),
-            tool_manager=new_tool_manager,
+            tool_manager=tool_manager,
             provider_executed_tools=(
                 self.binding.provider_executed_tools
                 if isinstance(provider_executed_tools, Unchanged)
@@ -694,7 +711,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             bound_adapter=_bind_adapter(self.adapter, new_binding, new_response_format),
             response_format=new_response_format,
             binding=new_binding,
-            tool_manager=new_tool_manager,
+            tool_manager=tool_manager,
             shared_backoff=self.shared_backoff,
             max_attempts=new_max_attempts,
         )

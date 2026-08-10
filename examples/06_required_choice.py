@@ -7,7 +7,6 @@ from langchaint import (
     DispatchCaptured,
     Message,
     SpecificToolChoice,
-    ToolManager,
     UserMessage,
     tool,
 )
@@ -49,7 +48,7 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
     )
     bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Research the question, then submit final_response.",
-        tool_manager=ToolManager([search, final_response_tool]),
+        tools=[search, final_response_tool],
         tool_choice="required",
         automatic_prompt_caching=True,
     )

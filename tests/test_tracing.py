@@ -1187,6 +1187,25 @@ def _bind_overload_pin() -> None:
     assert_type(structured, TracedBoundLLM[_Answer])
     text = traced.bind(automatic_prompt_caching=True)
     assert_type(text, TracedBoundLLM[str])
+    text_with_tools = traced.bind(tools=[_echo_tool()], automatic_prompt_caching=True)
+    assert_type(text_with_tools, TracedBoundLLM[str, ToolManager])
+    structured_with_tools = traced.bind(
+        response_format=_Answer,
+        tools=[_echo_tool()],
+        automatic_prompt_caching=True,
+    )
+    assert_type(structured_with_tools, TracedBoundLLM[_Answer, ToolManager])
+    tool_manager = ToolManager([])
+    assert_type(
+        traced.bind(tools=tool_manager, automatic_prompt_caching=True),
+        TracedBoundLLM[str, ToolManager],
+    )
+    assert_type(
+        structured.rebind(tools=[_echo_tool()]),
+        TracedBoundLLM[_Answer, ToolManager],
+    )
+    assert_type(structured.rebind(tools=tool_manager), TracedBoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(tools=None), TracedBoundLLM[_Answer])
 
 
 def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:
@@ -1536,16 +1555,48 @@ def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
     asyncio.run(scenario())
 
 
-def test_traced_tool_manager_is_a_tool_manager_bindable_as_one() -> None:
-    """TracedToolManager subclasses ToolManager, so bind's tool_manager parameter accepts it unchanged."""
-    tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
-    assert isinstance(tool_manager, ToolManager)
-    bound = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False).bind(
-        tool_manager=tool_manager, automatic_prompt_caching=True
-    )
-    assert bound.tool_manager is tool_manager
-    (schema,) = tool_manager.schemas()
-    assert schema.name == "echo"
+def test_traced_bind_and_rebind_preserve_tool_manager() -> None:
+    """`TracedLLM.bind` and `TracedBoundLLM.rebind` preserve `tools=ToolManager(...)`."""
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    bound_tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
+    bound = traced.bind(tools=bound_tool_manager, automatic_prompt_caching=True)
+    assert bound.tool_manager is bound_tool_manager
+    rebound_tool_manager = ToolManager([_echo_tool()])
+    rebound = bound.rebind(tools=rebound_tool_manager)
+    assert rebound.tool_manager is rebound_tool_manager
+
+
+def test_traced_bind_and_rebind_sequences_construct_traced_tool_managers() -> None:
+    """`TracedLLM.bind` and `TracedBoundLLM.rebind` construct `TracedToolManager` from sequences."""
+
+    async def scenario() -> None:
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeAdapter()),
+            tracer=tracer,
+            extra_attributes={"gen_ai.agent.name": "agent_a"},
+            capture_message_content=True,
+        )
+        bound = traced.bind(tools=[_echo_tool()], automatic_prompt_caching=True)
+        rebound = bound.rebind(tools=[_echo_tool()])
+        assert isinstance(bound.tool_manager, TracedToolManager)
+        assert isinstance(rebound.tool_manager, TracedToolManager)
+        assert rebound.tool_manager is not bound.tool_manager
+        await bound.tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
+        )
+        await rebound.tool_manager.dispatch(
+            ToolCall(id="call2", name="echo", args_json='{"text": "b"}')
+        )
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        for span in spans:
+            assert span.attributes is not None
+            assert span.attributes["gen_ai.agent.name"] == "agent_a"
+            assert "gen_ai.tool.call.arguments" in span.attributes
+            assert "gen_ai.tool.call.result" in span.attributes
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -1967,7 +2018,7 @@ def test_every_payload_attribute_reaches_validation() -> None:
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt="be brief",
-            tool_manager=ToolManager([_echo_tool()]),
+            tools=ToolManager([_echo_tool()]),
             automatic_prompt_caching=True,
         )
         await bound.generate_one([UserMessage(content="look it up")])
@@ -2097,7 +2148,7 @@ def test_capture_off_leaves_every_content_key_off_the_span() -> None:
         )
         bound = traced.bind(
             system_prompt="be brief",
-            tool_manager=ToolManager([_echo_tool()]),
+            tools=ToolManager([_echo_tool()]),
             automatic_prompt_caching=True,
         )
         await bound.generate_one("hi")
@@ -2122,7 +2173,7 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt="be brief",
-            tool_manager=ToolManager([_echo_tool()]),
+            tools=ToolManager([_echo_tool()]),
             automatic_prompt_caching=True,
         )
         await bound.generate_one([
@@ -2427,7 +2478,7 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
-            tool_manager=ToolManager([_unserializable_schema_tool()]),
+            tools=ToolManager([_unserializable_schema_tool()]),
             automatic_prompt_caching=True,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
@@ -2464,7 +2515,7 @@ def test_unserializable_content_leaves_the_stream_and_its_span_intact(
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
-            tool_manager=ToolManager([_unserializable_schema_tool()]),
+            tools=ToolManager([_unserializable_schema_tool()]),
             automatic_prompt_caching=True,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):

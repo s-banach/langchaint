@@ -9,7 +9,6 @@ from langchaint import (
     StreamItem,
     ToolCall,
     ToolCallDelta,
-    ToolManager,
     tool,
 )
 from langchaint.openai import OpenAI
@@ -49,9 +48,8 @@ async def stream_tool_call() -> Response[str]:
         StreamProtocolError: The stream ended without a terminal event.
     """
     openai = OpenAI()
-    tool_manager = ToolManager([get_weather])
     bound = openai.model("gpt-5.6-terra", reasoning_summary="auto").bind(
-        tool_manager=tool_manager,
+        tools=[get_weather],
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
         automatic_prompt_caching=False,
     )

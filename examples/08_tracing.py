@@ -4,9 +4,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 from pydantic import BaseModel
 
-from langchaint import Message, ToolManager, UserMessage, tool
+from langchaint import Message, UserMessage, tool
 from langchaint.openai import OpenAI
-from langchaint.tracing import TracedLLM, TracedToolManager
+from langchaint.tracing import TracedLLM
 
 
 class WeatherArgs(BaseModel):
@@ -35,9 +35,6 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     tracer = tracer_provider.get_tracer("langchaint.example")
 
     openai = OpenAI()
-    tool_manager: ToolManager = TracedToolManager(
-        [get_weather], capture_message_content=False, tracer=tracer
-    )
     traced = TracedLLM(
         openai.model("gpt-5.6-terra"),
         capture_message_content=False,
@@ -45,7 +42,7 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     )
     bound = traced.bind(
         system_prompt="Use tools when needed.",
-        tool_manager=tool_manager,
+        tools=[get_weather],
         automatic_prompt_caching=False,
     )
 

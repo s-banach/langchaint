@@ -91,7 +91,7 @@ from langchaint import (
     UserMessage,
     tool,
 )
-from langchaint.tracing import TracedBoundLLM, TracedLLM, TracedToolManager, agent_span
+from langchaint.tracing import TracedBoundLLM, TracedLLM, agent_span
 
 
 @dataclass(frozen=True)
@@ -547,23 +547,15 @@ def top_level_path(name: str) -> str:
     return f"root/{name}"
 
 
-def _tool_manager_for(
+def _tools_for(
     config: AgentConfig,
     tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
-    *,
-    capture_message_content: bool,
-    tracer: Tracer,
-) -> TracedToolManager:
-    """Assemble a run's tool manager from its config, the one place a tool list is built.
+) -> Sequence[Tool[BaseModel | Mapping[str, object] | None]]:
+    """`self_correction_enabled` adds one fresh critique tool.
 
-    self_correction_enabled adds a fresh critique here,
-    so the flag cannot separate from the tool its bounce requires:
-    a run with it on always has critique in its schema, delegate-spawned runs included.
+    Every run uses this function, including delegated runs.
     """
-    tool_list = [*tools, build_critique_tool()] if config.self_correction_enabled else list(tools)
-    return TracedToolManager(
-        tool_list, capture_message_content=capture_message_content, tracer=tracer
-    )
+    return [*tools, build_critique_tool()] if config.self_correction_enabled else tools
 
 
 def build_delegate_tool(
@@ -572,7 +564,6 @@ def build_delegate_tool(
     parent_path: str,
     sub_config: AgentConfig,
     tracer: Tracer,
-    capture_message_content: bool,
     registry: dict[str, AgentRun],
     on_event: Callable[[Event], None],
 ) -> PydanticTool[DelegateArgs, None]:
@@ -600,18 +591,11 @@ def build_delegate_tool(
     async def delegate(args: DelegateArgs) -> ToolOutputExplicit[None]:
         """Run the specialist to its answer; its spend is already on its log.
 
-        The tool manager is assembled per spawn, through the same _tool_manager_for every run uses,
-        so a self-correcting sub_config hands each spawn its own critique script.
+        `_tools_for` adds a fresh critique tool for each configured spawn.
 
         Raises:
             DispatchExceptionGroup: A specialist tool function raised.
         """
-        tool_manager = _tool_manager_for(
-            sub_config,
-            [search_tool],
-            capture_message_content=capture_message_content,
-            tracer=tracer,
-        )
         sub_run = ReActAgent(
             agent_path=f"{parent_path}/{sub_config.name}#{next(spawn_counter)}",
             config=sub_config,
@@ -620,7 +604,7 @@ def build_delegate_tool(
             on_event=on_event,
             bound=llm.bind(
                 system_prompt=sub_config.system_prompt,
-                tool_manager=tool_manager,
+                tools=_tools_for(sub_config, [search_tool]),
                 max_attempts=sub_config.max_attempts,
                 automatic_prompt_caching=sub_config.automatic_prompt_caching,
             ),
@@ -680,13 +664,12 @@ class App:
         are non-recording: the agent and tool spans arrive with holes in them and nothing reports an
         error.
 
-        capture_message_content is passed to every tracing wrapper.
+        `capture_message_content` configures `self._llm` and each constructed `TracedToolManager`.
         The required value makes message capture explicit.
         """
         self._llm = TracedLLM(llm, capture_message_content=capture_message_content, tracer=tracer)
         self._configs = configs
         self._tracer = tracer
-        self._capture_message_content = capture_message_content
         self._on_event = on_event
         self._runs: dict[str, AgentRun] = {}
         self.answers: dict[str, str] = {}
@@ -707,12 +690,6 @@ class App:
     ) -> ReActAgent:
         """Construct one node's agent from its config and register it."""
         config = self._configs[name]
-        tool_manager = _tool_manager_for(
-            config,
-            tools,
-            capture_message_content=self._capture_message_content,
-            tracer=self._tracer,
-        )
         return ReActAgent(
             agent_path=top_level_path(name),
             config=config,
@@ -721,7 +698,7 @@ class App:
             on_event=self._on_event,
             bound=self._llm.bind(
                 system_prompt=config.system_prompt,
-                tool_manager=tool_manager,
+                tools=_tools_for(config, tools),
                 max_attempts=config.max_attempts,
                 automatic_prompt_caching=config.automatic_prompt_caching,
             ),
@@ -774,7 +751,6 @@ class App:
             parent_path=top_level_path(climate_name),
             sub_config=self._configs["specialist"],
             tracer=self._tracer,
-            capture_message_content=self._capture_message_content,
             registry=self._runs,
             on_event=self._on_event,
         )

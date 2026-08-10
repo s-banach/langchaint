@@ -30,7 +30,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
 | `model.batch(inputs)` | `await bound.generate_many(inputs)` |
 | `model.stream(messages)` | `async with bound.stream_one(messages) as stream:` |
-| `model.bind_tools(tools)` | `llm.bind(tool_manager=ToolManager(tools), automatic_prompt_caching=False)` |
+| `model.bind_tools(tools)` | `llm.bind(tools=tools, automatic_prompt_caching=False)` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model, automatic_prompt_caching=False)` |
 | `create_react_agent(...)` | application tool loop |
 | `RunnableRetry` | `max_attempts` on `bind` |
@@ -136,7 +136,7 @@ class Answer(BaseModel):
 
 result = await llm.bind(
     response_format=Answer,
-    tool_manager=tool_manager,
+    tools=tools,
     automatic_prompt_caching=False,
 ).generate_one("Answer the question")
 

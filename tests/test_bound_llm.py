@@ -22,6 +22,7 @@ from langchaint import (
     Billing,
     BoundLLM,
     CallResult,
+    CaptureTool,
     ContextWindowExceededError,
     DoNotRetry,
     EmptyTurnError,
@@ -1785,6 +1786,14 @@ class _Answer(BaseModel):
     value: int
 
 
+def _capture_tool(name: str = "capture") -> CaptureTool[_Answer]:
+    return CaptureTool(
+        name=name,
+        description="Capture one value.",
+        args_model=_Answer,
+    )
+
+
 def test_rebind_to_a_response_format_rebinds_even_when_the_binding_is_unchanged() -> None:
     """response_format is not part of Binding, so a rebind that only changes it must still re-bind."""
     adapter = _FakeAdapter()
@@ -1832,6 +1841,51 @@ def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_str
     assert rebound._bound_adapter is not structured._bound_adapter
 
 
+def test_tools_construct_the_bound_tool_manager() -> None:
+    """Pin `LLM.bind(tools=[...])` construction of `BoundLLM.tool_manager`."""
+    tool = _capture_tool()
+    bound = LLM(_FakeAdapter()).bind(tools=[tool], automatic_prompt_caching=True)
+    assert isinstance(bound.tool_manager, ToolManager)
+    assert bound.tool_manager.schemas() == (tool.schema(),)
+
+
+def test_empty_tools_construct_an_empty_tool_manager() -> None:
+    """An empty `tools` sequence still binds a `ToolManager`."""
+    bound = LLM(_FakeAdapter()).bind(tools=[], automatic_prompt_caching=True)
+    assert isinstance(bound.tool_manager, ToolManager)
+    assert bound.tool_manager.schemas() == ()
+
+
+def test_duplicate_tool_names_fail_before_adapter_binding() -> None:
+    """`LLM.bind(tools=[...])` rejects duplicate names before `Adapter.bind_text`."""
+    adapter = _FakeAdapter()
+    duplicate = _capture_tool()
+    with pytest.raises(ValueError, match="duplicate tool name"):
+        _ = LLM(adapter).bind(tools=[duplicate, duplicate], automatic_prompt_caching=True)
+    assert adapter.bound_adapters == []
+
+
+def test_duplicate_tool_names_fail_before_rebinding_the_adapter() -> None:
+    """`BoundLLM.rebind(tools=[...])` rejects duplicate names before `Adapter.bind_text`."""
+    adapter = _FakeAdapter()
+    bound = LLM(adapter).bind(automatic_prompt_caching=True)
+    duplicate = _capture_tool()
+    with pytest.raises(ValueError, match="duplicate tool name"):
+        _ = bound.rebind(tools=[duplicate, duplicate])
+    assert len(adapter.bound_adapters) == 1
+
+
+def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
+    """`BoundLLM.rebind(tools=[...])` replaces `ToolManager`; `tools=None` removes it."""
+    original = _capture_tool("original")
+    replacement = _capture_tool("replacement")
+    bound = LLM(_FakeAdapter()).bind(tools=[original], automatic_prompt_caching=True)
+    rebound = bound.rebind(tools=[replacement])
+    assert rebound.tool_manager is not bound.tool_manager
+    assert rebound.tool_manager.schemas() == (replacement.schema(),)
+    assert rebound.rebind(tools=None).tool_manager is None
+
+
 def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> None:
     """Pin every binding's static BoundLLM type, the pair the request-method overloads key on.
 
@@ -1845,14 +1899,23 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
 
     text = llm.bind(automatic_prompt_caching=True)
     assert_type(text, BoundLLM[str, None])
-    text_with_tools = llm.bind(tool_manager=tool_manager, automatic_prompt_caching=True)
+    text_with_constructed_tools = llm.bind(tools=[_capture_tool()], automatic_prompt_caching=True)
+    assert_type(text_with_constructed_tools, BoundLLM[str, ToolManager])
+    text_with_tools = llm.bind(tools=tool_manager, automatic_prompt_caching=True)
     assert_type(text_with_tools, BoundLLM[str, ToolManager])
+    assert text_with_tools.tool_manager is tool_manager
     structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(structured, BoundLLM[_Answer, None])
     structured_with_tools = llm.bind(
-        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+        response_format=_Answer, tools=tool_manager, automatic_prompt_caching=True
     )
     assert_type(structured_with_tools, BoundLLM[_Answer, ToolManager])
+    structured_with_constructed_tools = llm.bind(
+        response_format=_Answer,
+        tools=[_capture_tool()],
+        automatic_prompt_caching=True,
+    )
+    assert_type(structured_with_constructed_tools, BoundLLM[_Answer, ToolManager])
     provider_tool = ({"type": "web_search"},)
     text_with_provider_tool = llm.bind(
         provider_executed_tools=provider_tool,
@@ -1870,8 +1933,11 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
     assert_type(text_with_tools.tool_manager, ToolManager)
     assert_type(text.tool_manager, None)
 
-    assert_type(structured.rebind(tool_manager=tool_manager), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(tool_manager=None), BoundLLM[_Answer, None])
+    rebound_with_tool_manager = structured.rebind(tools=tool_manager)
+    assert_type(rebound_with_tool_manager, BoundLLM[_Answer, ToolManager])
+    assert rebound_with_tool_manager.tool_manager is tool_manager
+    assert_type(structured.rebind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.rebind(tools=None), BoundLLM[_Answer, None])
     assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
     assert_type(structured_with_tools.rebind(response_format=None), BoundLLM[str, ToolManager])
     assert_type(structured_with_tools.rebind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
@@ -1883,7 +1949,7 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     Never called: pyrefly checks this body, and the assertions are about types alone.
     """
     structured_with_tools = llm.bind(
-        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+        response_format=_Answer, tools=tool_manager, automatic_prompt_caching=True
     )
     assert_type(
         await structured_with_tools.generate_one("hi"),
@@ -1898,7 +1964,7 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     )
     structured = llm.bind(response_format=_Answer, automatic_prompt_caching=True)
     assert_type(await structured.generate_one("hi"), Response[_Answer])
-    text_with_tools = llm.bind(tool_manager=tool_manager, automatic_prompt_caching=True)
+    text_with_tools = llm.bind(tools=tool_manager, automatic_prompt_caching=True)
     assert_type(await text_with_tools.generate_one("hi"), Response[str])
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
 
@@ -1918,14 +1984,12 @@ def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> N
     llm = LLM(_FakeAdapter())
     tool_manager = ToolManager([])
     assert not llm.bind(automatic_prompt_caching=True)._splits_tool_call_turns
-    assert not llm.bind(
-        tool_manager=tool_manager, automatic_prompt_caching=True
-    )._splits_tool_call_turns
+    assert not llm.bind(tools=tool_manager, automatic_prompt_caching=True)._splits_tool_call_turns
     assert not llm.bind(
         response_format=_Answer, automatic_prompt_caching=True
     )._splits_tool_call_turns
     assert llm.bind(
-        response_format=_Answer, tool_manager=tool_manager, automatic_prompt_caching=True
+        response_format=_Answer, tools=tool_manager, automatic_prompt_caching=True
     )._splits_tool_call_turns
 
 
@@ -1988,7 +2052,7 @@ def _structured_tool_bound_llm(
     the real response_format and tool_manager and the retry loops run unchanged over the scripted outcome.
     """
     bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
-        response_format=_Answer, tool_manager=ToolManager([]), automatic_prompt_caching=True
+        response_format=_Answer, tools=ToolManager([]), automatic_prompt_caching=True
     )
     bound_llm._bound_adapter = _ScriptedStructuredBoundAdapter(outcome)
     return bound_llm

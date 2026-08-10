@@ -127,6 +127,7 @@ await client.close()
 Call `LLM.bind()` before generating.
 `BoundLLM` provides `generate_one`, `generate_many`, and `stream_one`.
 `BoundLLM.rebind()` replaces selected binding fields.
+Pass `tools=[tool]` to `LLM.bind()`, then dispatch through `BoundLLM.tool_manager`.
 `LLM.bind(max_attempts=...)` limits requests for one `GenerationInput`, including the first.
 An embedding batch contains inputs sent together during each attempt.
 `embedding_model(max_attempts=...)` limits requests for one embedding batch, including the first.

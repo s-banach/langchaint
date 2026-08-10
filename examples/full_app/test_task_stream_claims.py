@@ -320,7 +320,6 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
             automatic_prompt_caching=False,
         ),
         tracer=tracer,
-        capture_message_content=False,
         registry=registry,
         on_event=_discard,
     )
@@ -452,7 +451,6 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
             automatic_prompt_caching=False,
         ),
         tracer=tracer,
-        capture_message_content=False,
         registry=registry,
         on_event=_discard,
     )

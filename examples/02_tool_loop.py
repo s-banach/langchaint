@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from langchaint import Message, Response, ToolCallTurn, ToolManager, UserMessage, tool
+from langchaint import Message, Response, ToolCallTurn, UserMessage, tool
 from langchaint.openai import OpenAI
 
 
@@ -34,10 +34,9 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
         RuntimeError: The model exceeded `max_turns`.
     """
     openai = OpenAI()
-    tool_manager = ToolManager([get_weather])
     bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Use get_weather when needed. Return FinalAnswer when finished.",
-        tool_manager=tool_manager,
+        tools=[get_weather],
         response_format=FinalAnswer,
         automatic_prompt_caching=True,
     )
@@ -48,7 +47,7 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
         match result:
             case ToolCallTurn():
                 messages.append(result.assistant_message)
-                outcomes = await tool_manager.dispatch_many(result.tool_calls)
+                outcomes = await bound.tool_manager.dispatch_many(result.tool_calls)
                 messages.extend(outcome.tool_message for outcome in outcomes)
             case Response():
                 return result.output

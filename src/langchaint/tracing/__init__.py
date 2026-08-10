@@ -4,10 +4,11 @@ TracedLLM wraps an LLM and mirrors bind / rebind so every binding stays traced;
 TracedBoundLLM wraps a BoundLLM and opens one CLIENT span per outbound call, which is one span for
 generate_one and one per item of a generate_many batch;
 TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
-TracedToolManager is a ToolManager whose every dispatch opens one INTERNAL execute_tool span;
-it is a subclass, not a wrapper, so it passes to LLM.bind's tool_manager parameter as one object,
-and dispatch_many gains per-call spans by inheritance because it runs through self.dispatch;
-a call answered through dispatch_many's precomputed argument opens no span, because no tool executed.
+`TracedToolManager.dispatch` opens one INTERNAL `execute_tool` span.
+`TracedToolManager` passes through `LLM.bind(tools=TracedToolManager(...))` unchanged.
+`ToolManager.dispatch_many` gains per-call spans through `self.dispatch`.
+`precomputed` calls open no span because no tool executes.
+`TracedLLM.bind(tools=[...])` constructs it with `tracer`, `extra_attributes`, and `capture_message_content`.
 Every Traced class accepts extra_attributes, a constant mapping set on each span it opens at span start
 (an agent name for cross-trace aggregation, a deployment tag);
 an attribute set at completion (a mapper's, an outcome's) wins a key collision.
@@ -248,19 +249,26 @@ def _set_span_attributes(span: Span, attributes: SpanAttributes) -> None:
 
 @dataclass(frozen=True, kw_only=True)
 class _SpanConfig:
-    """The tracing configuration TracedLLM resolves once, carried by every span descended from it.
-
-    These four values are identical at every step of TracedLLM -> TracedBoundLLM -> TracedStreamHandle,
-    so they travel as one object rather than as four parallel parameters restated at each constructor.
-    TracedToolManager does not take one: it is constructed by the application, not by a TracedLLM,
-    and it takes no attribute_mapper, so it stores its tracer, extra_attributes,
-    and capture_message_content directly.
-    """
-
     tracer: Tracer
     attribute_mapper: AttributeMapper
     extra_attributes: SpanAttributes
     capture_message_content: bool
+
+
+def _resolve_traced_tool_manager(
+    tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None,
+    *,
+    span_config: _SpanConfig,
+) -> ToolManager | None:
+    """Raise `ValueError` when a `tools` sequence contains duplicate names."""
+    if isinstance(tools, ToolManager) or tools is None:
+        return tools
+    return TracedToolManager(
+        tools,
+        tracer=span_config.tracer,
+        extra_attributes=span_config.extra_attributes,
+        capture_message_content=span_config.capture_message_content,
+    )
 
 
 _CONVENTION_FINISH_REASONS: Mapping[StopReason, str] = {
@@ -934,7 +942,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -949,7 +957,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: None = ...,
+        tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -964,7 +972,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -979,7 +987,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tool_manager: None = ...,
+        tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -993,7 +1001,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
-        tool_manager: ToolManager | None = None,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
@@ -1005,17 +1013,19 @@ class TracedLLM:
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
-        The overloads re-declare LLM.bind's response_format and tool_manager splits, so each binding
-        gets the output type and the tool marker LLM.bind gives it.
+        A `tools` sequence constructs `TracedToolManager`.
+        `tools=ToolManager(...)` binds that `ToolManager` unchanged.
         max_attempts counts requests sent including the first, so 1 means no retrying.
 
         Raises:
-            ValueError: system_prompt is empty, max_attempts is invalid, or the adapter rejects the binding.
+            ValueError: A `tools` sequence contains duplicate names.
+                Also raised when the wrapped `LLM.bind` rejects the binding.
         """
+        tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
         return TracedBoundLLM(
             bound_llm=self._llm.bind(
                 system_prompt=system_prompt,
-                tool_manager=tool_manager,
+                tools=tools,
                 provider_executed_tools=provider_executed_tools,
                 response_format=response_format,
                 inference_params=inference_params,
@@ -1044,9 +1054,9 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def __init__(
         self, *, bound_llm: BoundLLM[OutputT, ToolManagerT], span_config: _SpanConfig
     ) -> None:
-        """Store the wrapped BoundLLM and the span configuration; compute the span name once.
+        """Store the wrapped `BoundLLM` and `_SpanConfig`; compute the span name once.
 
-        span_config is TracedLLM's, unchanged; TracedLLM documents what each of its values means.
+        `span_config` is the originating `TracedLLM._span_config` object.
         """
         self._bound_llm = bound_llm
         self._span_config = span_config
@@ -1098,7 +1108,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1113,7 +1123,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1128,7 +1138,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1143,7 +1153,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1158,7 +1168,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1173,7 +1183,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1188,7 +1198,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: ToolManager,
+        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1203,7 +1213,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: None,
+        tools: None,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1218,7 +1228,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tool_manager: Unchanged = ...,
+        tools: Unchanged = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1233,7 +1243,12 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tool_manager: ToolManager | None | Unchanged = UNCHANGED,
+        tools: (
+            ToolManager
+            | Sequence[Tool[BaseModel | Mapping[str, object] | None]]
+            | None
+            | Unchanged
+        ) = UNCHANGED,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
@@ -1242,20 +1257,25 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_attempts: int | Unchanged = UNCHANGED,
         automatic_prompt_caching: bool | Unchanged = UNCHANGED,
     ) -> "TracedBoundLLM[Any, Any]":
-        """Mirror BoundLLM.rebind and re-wrap the plain BoundLLM in a TracedBoundLLM.
+        """Return a traced wrapper around the rebound `BoundLLM`.
 
-        rebind is mirrored so a rebound object stays traced;
-        a traced object whose rebind returned an untraced one would silently drop tracing,
-        the worst failure mode available here.
-        The overloads re-declare BoundLLM.rebind's response_format and tool_manager splits.
+        This preserves `_SpanConfig`.
+        A `tools` sequence constructs a replacement `TracedToolManager`.
+        `tools=ToolManager(...)` binds that replacement unchanged.
+        Omitting `tools` preserves the bound `ToolManager`.
+        Passing `tools=None` removes the bound `ToolManager`.
+
         Raises:
-            ValueError: system_prompt is empty, max_attempts is invalid, or the adapter rejects the binding.
+            ValueError: A `tools` sequence contains duplicate names.
+                Also raised when the wrapped `BoundLLM.rebind` rejects the binding.
         """
+        if not isinstance(tools, Unchanged):
+            tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
         return TracedBoundLLM(
             bound_llm=self._bound_llm.rebind(
                 response_format=response_format,
                 system_prompt=system_prompt,
-                tool_manager=tool_manager,
+                tools=tools,
                 provider_executed_tools=provider_executed_tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
@@ -1717,11 +1737,9 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
 class TracedToolManager(ToolManager):
     """A ToolManager whose every dispatch opens one execute_tool span.
 
-    A subclass rather than a TracedLLM-style wrapper, for two reasons the wrapper shape cannot meet:
-    LLM.bind types tool_manager as ToolManager, so only a subclass reaches bind and the app's loop
-    as one object; and ToolManager.dispatch_many runs through self.dispatch,
-    so overriding dispatch alone gives every concurrent call of a batch its own span
-    without restating the settle-and-group semantics documented on dispatch_many.
+    `TracedToolManager` subclasses `ToolManager` for `LLM.bind(tools=TracedToolManager(...))`.
+    `ToolManager.dispatch_many` calls `self.dispatch`.
+    Overriding `dispatch` adds spans without duplicating `ToolManager.dispatch_many`.
     The span name is "execute_tool {call.name}", the GenAI convention's {operation} {target} pattern;
     kind is INTERNAL because dispatch runs an in-process function
     (a CLIENT span would register as an outbound call langchaint cannot see being made).
@@ -1797,19 +1815,15 @@ class TracedToolManager(ToolManager):
     ) -> None:
         """Index the tools (ToolManager.__init__) and resolve the span pieces once.
 
-        capture_message_content is required and has its own value here, inheriting nothing from TracedLLM:
-        this object is constructed by the application and passed to bind, so there is nothing to inherit from.
-        It has no default for the reason TracedLLM's does not.
-        tracer None resolves trace.get_tracer("langchaint.tracing", <package version>), as on TracedLLM.
-        extra_attributes is a constant mapping set at span start on every dispatch span;
-        None means no such attributes.
-        A key dispatch also sets (an identity or outcome attribute) resolves to the dispatch-set value.
+        `capture_message_content` has no default because content capture affects privacy.
+        `tracer=None` resolves the langchaint tracer.
+        `extra_attributes=None` sets no constant dispatch attributes.
+        Dispatch attributes override colliding `extra_attributes` keys.
 
         Raises:
             ValueError: two tools share a name.
         """
         super().__init__(tools)
-        self._capture_message_content = capture_message_content
         self._tracer = (
             tracer
             if tracer is not None
@@ -1818,6 +1832,7 @@ class TracedToolManager(ToolManager):
         self._extra_attributes: SpanAttributes = (
             extra_attributes if extra_attributes is not None else {}
         )
+        self._capture_message_content = capture_message_content
 
     @override
     async def dispatch(self, call: ToolCall) -> DispatchOutcome:
@@ -1831,7 +1846,9 @@ class TracedToolManager(ToolManager):
         This method records and sets status itself, from the table on the class.
         """
         span = _start_span(
-            self._tracer, f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
+            self._tracer,
+            f"{_EXECUTE_TOOL_OPERATION} {call.name}",
+            kind=SpanKind.INTERNAL,
         )
         with trace.use_span(
             span, end_on_exit=False, record_exception=False, set_status_on_exception=False

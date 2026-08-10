@@ -78,7 +78,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires its SDK.
 - `inference_params.py`: the inference parameters.
-- `run_many.py`: runs a sequence of inputs under a bound on how many are pending; imports nothing from langchaint and models nothing about LLMs.
+- `run_many.py`: runs zero-argument async callables under a pending bound. It imports nothing from langchaint and models nothing about LLMs.
 - `sequence_not_str.py`: the sequence protocol excluding bare `str` values.
 - `tracing/`: the OTel subpackage; importing it requires opentelemetry-api, and it is off the top-level `__all__`.
 

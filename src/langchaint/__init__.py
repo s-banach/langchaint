@@ -5,7 +5,7 @@ Embedding generation uses `EmbeddingModel.embed()`.
 `__all__` exports only the SDK-free application surface.
 `Tool` and `ToolSchema` support application-defined tool forms.
 The `tool` decorator builds `PydanticTool` from an async function annotation.
-`run_many` exposes bounded concurrent batching for application work.
+`run_many` exposes bounded concurrent execution for application work.
 """
 
 from typing import TYPE_CHECKING

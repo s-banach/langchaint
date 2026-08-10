@@ -1,8 +1,9 @@
-"""Cover run_many: validation, the pending bound, input order, and the two cancellation paths."""
+"""Cover run_many validation, argument binding, bounds, ordering, and cancellation."""
 
 import asyncio
 from contextvars import ContextVar
 from enum import IntEnum
+from functools import partial
 
 import pytest
 
@@ -32,7 +33,7 @@ def test_max_pending_for_requests_rejects_invalid_concurrency(invalid: int) -> N
         _ = max_pending_for_requests(invalid)
 
 
-def test_run_many_validates_max_pending_before_running_items() -> None:
+def test_run_many_validates_max_pending_before_running_run_ones() -> None:
     """Invalid max_pending starts no run_one task."""
 
     async def scenario() -> None:
@@ -47,7 +48,10 @@ def test_run_many_validates_max_pending_before_running_items() -> None:
 
         for invalid_max_pending in (True, False, 0, -1):
             with pytest.raises(ValueError, match="max_pending"):
-                _ = await run_many([1], run_one, max_pending=invalid_max_pending)
+                _ = await run_many(
+                    [partial(run_one, 1)],
+                    max_pending=invalid_max_pending,
+                )
         assert not called
 
     asyncio.run(scenario())
@@ -68,43 +72,35 @@ def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
             """Return the input."""
             return input_value
 
-        assert await run_many([1, 2], run_one, max_pending=Concurrency.LOW) == [1, 2]
+        run_ones = tuple(partial(run_one, input_value) for input_value in (1, 2))
+        assert await run_many(run_ones, max_pending=Concurrency.LOW) == [1, 2]
 
     asyncio.run(scenario())
 
 
-def test_run_many_empty_inputs_start_no_task() -> None:
-    """Empty inputs return an empty result after max_pending validation."""
+def test_run_many_empty_run_ones_start_no_task() -> None:
+    """Empty run_ones return an empty result after max_pending validation."""
 
     async def scenario() -> None:
-        """Run an empty input sequence."""
-        called = False
-
-        async def run_one(input_value: int) -> int:
-            """Record execution and return the input."""
-            nonlocal called
-            called = True
-            return input_value
-
-        assert await run_many([], run_one, max_pending=2) == []
-        assert not called
+        """Run an empty run_ones sequence."""
+        assert await run_many([], max_pending=2) == []
 
     asyncio.run(scenario())
 
 
-def test_run_many_snapshots_inputs_before_starting_tasks() -> None:
-    """Mutating the input sequence cannot change the inputs still to start."""
+def test_run_many_snapshots_run_ones_before_starting_tasks() -> None:
+    """Mutating run_ones cannot change the run_ones still to start."""
 
     async def scenario() -> None:
-        """Clear the input list from its first run_one call."""
-        inputs = [0, 1, 2]
+        """Clear run_ones from its first run_one call."""
 
         async def run_one(input_value: int) -> int:
-            """Clear inputs after run_many captured them."""
-            inputs.clear()
+            """Clear run_ones after run_many captured them."""
+            run_ones.clear()
             return input_value
 
-        assert await run_many(inputs, run_one, max_pending=1) == [0, 1, 2]
+        run_ones = [partial(run_one, input_value) for input_value in range(3)]
+        assert await run_many(run_ones, max_pending=1) == [0, 1, 2]
 
     asyncio.run(scenario())
 
@@ -139,7 +135,8 @@ def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> No
                 pending_count -= 1
 
         try:
-            batch_task = asyncio.create_task(run_many(range(4), run_one, max_pending=2))
+            run_ones = tuple(partial(run_one, input_index) for input_index in range(4))
+            batch_task = asyncio.create_task(run_many(run_ones, max_pending=2))
             await started_events[0].wait()
             await started_events[1].wait()
             assert started_inputs == [0, 1]
@@ -159,8 +156,8 @@ def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> No
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_inputs() -> None:
-    """Outer cancellation settles two started tasks and starts no further input."""
+def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_run_ones() -> None:
+    """Outer cancellation settles started tasks and starts no further run_one."""
 
     async def scenario() -> None:
         """Cancel a four-input run after two inputs start."""
@@ -183,7 +180,8 @@ def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_inputs(
             finally:
                 settled_inputs.append(input_index)
 
-        batch_task = asyncio.create_task(run_many(range(4), run_one, max_pending=2))
+        run_ones = tuple(partial(run_one, input_index) for input_index in range(4))
+        batch_task = asyncio.create_task(run_many(run_ones, max_pending=2))
         await asyncio.gather(started_events[0].wait(), started_events[1].wait())
         _ = batch_task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -194,8 +192,50 @@ def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_inputs(
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_run_many_base_exception_settles_sibling_and_skips_unstarted_input() -> None:
-    """A BaseException settles its started sibling and starts no further input."""
+def test_run_many_repeated_cancellation_still_settles_started_tasks() -> None:
+    """Later cancellation cannot interrupt pending task settlement."""
+
+    async def scenario() -> None:
+        """Cancel run_many while its run_one handles cancellation."""
+        started = asyncio.Event()
+        cancellation_handler_started = asyncio.Event()
+        release_cancellation_handler = asyncio.Event()
+        run_one_settled = asyncio.Event()
+        never_finishes = asyncio.Event()
+
+        async def run_one() -> None:
+            """Delay settlement after receiving cancellation.
+
+            Raises:
+                asyncio.CancelledError: run_many cancelled this task.
+            """
+            started.set()
+            try:
+                await never_finishes.wait()
+            except asyncio.CancelledError:
+                cancellation_handler_started.set()
+                await release_cancellation_handler.wait()
+                raise
+            finally:
+                run_one_settled.set()
+
+        batch_task = asyncio.create_task(run_many([run_one], max_pending=1))
+        await started.wait()
+        _ = batch_task.cancel()
+        await cancellation_handler_started.wait()
+        _ = batch_task.cancel()
+        await asyncio.sleep(0)
+        assert not batch_task.done()
+        release_cancellation_handler.set()
+        with pytest.raises(asyncio.CancelledError):
+            await batch_task
+        assert run_one_settled.is_set()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_run_many_base_exception_settles_sibling_and_skips_unstarted_run_one() -> None:
+    """A BaseException settles its started sibling and starts no further run_one."""
 
     async def scenario() -> None:
         """Raise after two inputs start."""
@@ -222,16 +262,17 @@ def test_run_many_base_exception_settles_sibling_and_skips_unstarted_input() -> 
             finally:
                 settled_inputs.append(input_index)
 
+        run_ones = tuple(partial(run_one, input_index) for input_index in range(3))
         with pytest.raises(_RunManyFailure, match="first input failed"):
-            _ = await run_many(range(3), run_one, max_pending=2)
+            _ = await run_many(run_ones, max_pending=2)
         assert started_inputs == [0, 1]
         assert sorted(settled_inputs) == [0, 1]
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_run_many_selects_the_lowest_input_failure_from_one_wait() -> None:
-    """Simultaneous failures propagate the lowest input index's failure."""
+def test_run_many_selects_the_lowest_run_one_failure_from_one_wait() -> None:
+    """Simultaneous failures propagate the lowest run_one index's failure."""
 
     async def scenario() -> None:
         """Fail every initial task before run_many resumes."""
@@ -244,7 +285,8 @@ def test_run_many_selects_the_lowest_input_failure_from_one_wait() -> None:
             """
             raise _RunManyFailure(str(input_index))
 
+        run_ones = tuple(partial(run_one, input_index) for input_index in range(3))
         with pytest.raises(_RunManyFailure, match=r"^0$"):
-            _ = await run_many(range(3), run_one, max_pending=3)
+            _ = await run_many(run_ones, max_pending=3)
 
     asyncio.run(scenario())

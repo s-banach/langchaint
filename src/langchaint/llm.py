@@ -17,6 +17,7 @@ Provider failures leave a `Verdict` on `Admission.verdict`.
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from functools import partial
 from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
@@ -1363,8 +1364,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 deadline=WorkingTimeDeadline(max_working_seconds_per_item),
             )
 
+        run_ones = tuple(
+            partial(run_one, generation_input) for generation_input in generation_inputs
+        )
         max_pending = max_pending_for_requests(self.shared_backoff.max_concurrent_requests)
-        return await run_many(generation_inputs, run_one, max_pending=max_pending)
+        return await run_many(run_ones, max_pending=max_pending)
 
     @overload
     def stream_one(

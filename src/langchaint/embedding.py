@@ -10,6 +10,7 @@ Every returned row has L2 norm one.
 
 import asyncio
 from collections.abc import Sequence
+from functools import partial
 from typing import ClassVar, Literal, Protocol
 
 try:
@@ -211,12 +212,11 @@ class EmbeddingModel:
         batches = await self._adapter.partition_inputs(input_snapshot, task=task)
         await self._adapter.prepare()
 
-        async def run_batch(batch: tuple[str, ...]) -> Float2D:
-            return await self._embed_batch_with_retries(batch, task=task)
-
+        run_batches = tuple(
+            partial(self._embed_batch_with_retries, batch, task=task) for batch in batches
+        )
         matrices = await run_many(
-            batches,
-            run_batch,
+            run_batches,
             max_pending=max_pending_for_requests(self._shared_backoff.max_concurrent_requests),
         )
         combined = np.concatenate(matrices, axis=0, dtype=np.float32)

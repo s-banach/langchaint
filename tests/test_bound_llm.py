@@ -622,6 +622,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         stream: _FakeStream | None = None,
         open_seconds: float = 0.0,
         hang_from_open: int | None = None,
+        open_barrier: asyncio.Barrier | None = None,
+        open_barrier_from_call: int = 1,
     ) -> None:
         """Store the attempt script, echo mode, and the stream open_stream returns.
 
@@ -633,6 +635,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         stream's behavior; left None, each unscripted open returns a fresh success stream.
         open_seconds > 0 makes each open suspend that long,
         so a batch overlaps and peak_in_flight records the concurrency it reached.
+        open_barrier blocks matching calls until its other participants arrive.
         hang_from_open is the 1-based open_stream call from which every open suspends forever,
         so a cancellation or a deadline lands while that attempt is in flight.
         final_raws collects the response objects the scripted streams assemble, in order, so a
@@ -644,6 +647,8 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         self._explicit_stream = stream
         self._open_seconds = open_seconds
         self._hang_from_open = hang_from_open
+        self._open_barrier = open_barrier
+        self._open_barrier_from_call = open_barrier_from_call
         self._scripted_by_raw_id: dict[str, _ScriptedResponse] = {}
         self.final_raws: list[_FakeRawResponse] = []
         self.build_count = 0
@@ -698,9 +703,12 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         """
         messages = _as_fake_request(request).messages
         self.open_count += 1
+        open_call = self.open_count
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         try:
+            if self._open_barrier is not None and open_call >= self._open_barrier_from_call:
+                await self._open_barrier.wait()
             if self._hang_from_open is not None and self.open_count >= self._hang_from_open:
                 await asyncio.Event().wait()
             if self._open_seconds:
@@ -792,6 +800,8 @@ class _FakeAdapter(Adapter):
         classify_result: ErrorClassification = "unknown_exception",
         open_seconds: float = 0.0,
         hang_from_open: int | None = None,
+        open_barrier: asyncio.Barrier | None = None,
+        open_barrier_from_call: int = 1,
     ) -> None:
         """Store how each freshly bound adapter behaves and the classify verdict."""
         # This adapter reaches no SDK, so it passes client=None, which matches no entry in the
@@ -804,6 +814,8 @@ class _FakeAdapter(Adapter):
         self._classify_result = classify_result
         self._open_seconds = open_seconds
         self._hang_from_open = hang_from_open
+        self._open_barrier = open_barrier
+        self._open_barrier_from_call = open_barrier_from_call
         self.bound_adapters: list[_FakeBoundAdapter] = []
         self.structured_bind_count = 0
 
@@ -816,6 +828,8 @@ class _FakeAdapter(Adapter):
             stream=self._stream,
             open_seconds=self._open_seconds,
             hang_from_open=self._hang_from_open,
+            open_barrier=self._open_barrier,
+            open_barrier_from_call=self._open_barrier_from_call,
         )
         self.bound_adapters.append(bound)
         return bound
@@ -2253,27 +2267,41 @@ def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_togeth
     """warm_cache completes generation_inputs[0] before any sibling starts; the rest run at normal concurrency."""
 
     async def scenario() -> None:
-        """Run an identical three-item batch on two fresh slow fakes and compare the recorded peaks.
+        """Run controlled three-item batches and compare peak_in_flight.
 
-        Warmed, the first open overlaps nothing and the remaining two overlap each other, so the peak is 2;
-        the unwarmed control reaches 3, proving warm_cache alone changed the ordering.
-        A fresh adapter per run keeps the two peaks independent readings.
+        The warmed first open completes before blocked siblings overlap.
+        The unwarmed opens remain blocked until all three overlap.
         """
         generation_inputs = [[UserMessage(content=str(index))] for index in range(3)]
-        warmed_adapter = _FakeAdapter(echo=True, open_seconds=0.01)
+        warmed_barrier = asyncio.Barrier(3)
+        warmed_adapter = _FakeAdapter(
+            echo=True,
+            open_barrier=warmed_barrier,
+            open_barrier_from_call=2,
+        )
         warmed_bound_llm = LLM(
             warmed_adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)
         ).bind(automatic_prompt_caching=True)
-        warmed = await warmed_bound_llm.generate_many(generation_inputs, warm_cache=True)
-        assert _batch_outputs(warmed) == ["0", "1", "2"]
+        warmed_task = asyncio.create_task(
+            warmed_bound_llm.generate_many(generation_inputs, warm_cache=True)
+        )
+        await asyncio.wait_for(warmed_barrier.wait(), timeout=1.0)
         assert warmed_adapter.bound_adapters[0].peak_in_flight == 2
-        control_adapter = _FakeAdapter(echo=True, open_seconds=0.01)
+        warmed = await warmed_task
+        assert _batch_outputs(warmed) == ["0", "1", "2"]
+        control_barrier = asyncio.Barrier(4)
+        control_adapter = _FakeAdapter(
+            echo=True,
+            open_barrier=control_barrier,
+        )
         control_bound_llm = LLM(
             control_adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)
         ).bind(automatic_prompt_caching=True)
-        control = await control_bound_llm.generate_many(generation_inputs)
-        assert _batch_outputs(control) == ["0", "1", "2"]
+        control_task = asyncio.create_task(control_bound_llm.generate_many(generation_inputs))
+        await asyncio.wait_for(control_barrier.wait(), timeout=1.0)
         assert control_adapter.bound_adapters[0].peak_in_flight == 3
+        control = await control_task
+        assert _batch_outputs(control) == ["0", "1", "2"]
 
     asyncio.run(scenario())
 

@@ -526,17 +526,19 @@ async def test_lazy_client_creation_precedes_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Lazy creation completes before the first admission."""
+    creation_started = threading.Event()
     fake_client = _FakeClient()
-    configs = _install_fake_client(monkeypatch, fake_client)
+    configs = _install_fake_client(
+        monkeypatch,
+        fake_client,
+        creation_started=creation_started,
+    )
     cohere_bedrock = CohereBedrock(aws_region="us-east-1")
     cohere_bedrock._shared_backoff._pause_until = float("inf")
     model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
     embed_task = asyncio.create_task(model.embed(["text"], task="retrieval_query"))
     try:
-        for _ in range(100):
-            if configs:
-                break
-            await asyncio.sleep(0)
+        await _wait_for_event(creation_started)
         assert configs
         assert not embed_task.done()
         assert vars(configs[0])["retries"] == {"total_max_attempts": 1}

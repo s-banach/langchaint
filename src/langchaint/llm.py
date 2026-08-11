@@ -180,22 +180,6 @@ class WorkingTimeDeadline:
         self.scope.reschedule(asyncio.get_running_loop().time() + self._seconds_left)
 
 
-def _reject_bare_str_batch(generation_inputs: SequenceNotStr[GenerationInput]) -> None:
-    """Reject a bare str passed as the whole batch.
-
-    The SequenceNotStr parameter type makes the type checker reject a bare str;
-    this runtime guard is the backstop for untyped callers.
-
-    Raises:
-        TypeError: generation_inputs is a bare str.
-    """
-    if isinstance(generation_inputs, str):
-        raise TypeError(
-            "generation_inputs is a bare str; wrap it in a list, or use generate_one"
-            " for a single generation_input"
-        )
-
-
 def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
     if isinstance(generation_input, str):
         return (UserMessage(content=generation_input),)
@@ -878,9 +862,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         ledger.stage_response(
             raw=raw,
             billing=self._bound_adapter.billing_from_raw(raw),
-            identity=self._bound_adapter.identity_from_raw(raw).with_request_id_fallback(
-                request_id
-            ),
+            identity=self._bound_adapter.identity_from_raw(raw, request_id=request_id),
         )
         return self._bound_adapter.interpret(raw)
 
@@ -1242,9 +1224,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Run an order-aligned batch: result i belongs to generation_inputs[i].
 
         Each success uses generate_one's result type for this binding.
-        A bare str batch is rejected: str satisfies the item Sequence type, so it would silently
-        become one request per character.
-
         A GenerationError is returned in place of that item's result and never cancels a sibling.
         It names retries exhausted, a rejected request, an error langchaint does not retry, a 200
         that produced no output, or a defect in langchaint itself.
@@ -1280,7 +1259,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         started.
 
         Raises:
-            TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint
                 does not catch; the started items are cancelled and awaited, and it propagates.
@@ -1307,12 +1285,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Every item gets a WorkingTimeDeadline of its own, built where that item starts.
 
         Raises:
-            TypeError: generation_inputs is a bare str (from _reject_bare_str_batch).
             asyncio.CancelledError: an outer scope cancelled the batch.
             BaseException: an item raised a BaseException that is not an Exception; the started
                 items are cancelled and awaited, and it propagates.
         """
-        _reject_bare_str_batch(generation_inputs)
         # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
             first_result = await self._generate_or_failure(

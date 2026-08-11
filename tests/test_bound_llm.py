@@ -662,13 +662,13 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         return stated_billing(self._scripted_by_raw_id[_as_fake_raw(raw).id].usage)
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Name the fake model, take the response id from the raw's own, and the request id as it came."""
         fake_raw = _as_fake_raw(raw)
         return ResponseIdentity(
             model_served="fake-model-served",
             response_id=fake_raw.id,
-            request_id=fake_raw.request_id,
+            request_id=request_id,
         )
 
     @override
@@ -748,7 +748,7 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
         raise NotImplementedError
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Unreachable: response_format rebind tests do not generate."""
         raise NotImplementedError
 
@@ -1641,13 +1641,8 @@ def test_a_settled_attempts_billing_is_counted_once_after_a_later_deadline_cut()
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_generate_request_id_on_the_assembled_response_outranks_the_streams_own() -> None:
-    """The generate loop fills the request id in where the response has none, never replacing one.
-
-    The shipped adapters never hit this: their SDKs leave the assembled response without the header.
-    An adapter whose stream cannot reach the response headers is what the rule protects, because
-    overwriting would trade the id it does have for a null.
-    """
+def test_generate_reads_the_adapter_stream_request_id() -> None:
+    """The generate loop records AdapterStream.request_id()."""
 
     async def scenario() -> None:
         """Generate over a stream whose assembled response names its own request."""
@@ -1658,7 +1653,7 @@ def test_a_generate_request_id_on_the_assembled_response_outranks_the_streams_ow
         )
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = response.attempt_records
-        assert record.request_id == "req-from-assembled"
+        assert record.request_id == "req-fake-stream"
 
     asyncio.run(scenario())
 
@@ -2025,12 +2020,12 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
         return stated_billing(_USAGE)
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Report a fixed identity; no split test reads it."""
         return ResponseIdentity(
             model_served="fake-model-served",
             response_id="structured-response",
-            request_id=None,
+            request_id=request_id,
         )
 
     @override
@@ -2493,27 +2488,6 @@ def test_bare_str_is_shorthand_for_one_user_message() -> None:
         assert response.output == "hi"
         results = await bound_llm.generate_many(["a", [UserMessage(content="b")]])
         assert _batch_outputs(results) == ["a", "b"]
-
-    asyncio.run(scenario())
-
-
-def test_generate_many_rejects_a_bare_str_batch() -> None:
-    """A bare str as the whole batch raises instead of running per-character requests."""
-
-    async def scenario() -> None:
-        """Pass a bare str where generate_many expects the batch.
-
-        The suppressed pyrefly error is SequenceNotStr statically rejecting the bare str, which
-        leaves generate_many's overloads with nothing to match; the suppression doubles as a canary,
-        since pyrefly reports it as unused if typeshed drift ever makes str satisfy SequenceNotStr
-        and the static rejection lapses.
-        """
-        adapter = _FakeAdapter(echo=True)
-        bound_llm = LLM(adapter).bind(automatic_prompt_caching=True)
-        with pytest.raises(TypeError, match="generation_inputs is a bare str"):
-            # pyrefly: ignore[no-matching-overload]
-            await bound_llm.generate_many("hi")
-        assert adapter.bound_adapters[0].open_count == 0
 
     asyncio.run(scenario())
 
@@ -3333,13 +3307,8 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
     asyncio.run(scenario())
 
 
-def test_a_request_id_on_the_assembled_response_outranks_the_streams_own() -> None:
-    """The stream fills the request id in where the response has none, and never replaces one.
-
-    The shipped adapters never hit this: their SDKs leave the assembled response without the header.
-    An adapter whose stream cannot reach the response headers is what the rule protects, because
-    overwriting would trade the id it does have for a null.
-    """
+def test_streaming_reads_the_adapter_stream_request_id() -> None:
+    """StreamHandle.final records AdapterStream.request_id()."""
 
     async def scenario() -> None:
         """Drain a stream whose assembled response names its own request."""
@@ -3351,7 +3320,7 @@ def test_a_request_id_on_the_assembled_response_outranks_the_streams_own() -> No
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             response = await handle.final()
         (record,) = response.attempt_records
-        assert record.request_id == "req-from-assembled"
+        assert record.request_id == "req-fake-stream"
 
     asyncio.run(scenario())
 
@@ -3361,8 +3330,7 @@ def test_stream_retry_populates_attempt_records() -> None:
 
     The stream path stages the assembled response's identity too, so the succeeding record carries
     what a sent one does, and the failed open carries the request id its error named.
-    The succeeding record's request id is the stream's own: the assembled response carries no
-    request-id header, which is what leaves identity_from_raw nothing to report.
+    The succeeding request id comes from AdapterStream.request_id().
     """
 
     async def scenario() -> None:

@@ -8,7 +8,6 @@ class SequenceNotStr[T_co](Protocol):
     """A `Sequence` whose structural type rejects bare `str` values.
 
     It matches `list` and `tuple` while retaining covariance.
-    Its runtime users still reject bare `str` values explicitly.
     """
 
     @overload

@@ -185,8 +185,8 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         return _TURN_BILLING
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Name the scripted model and derive both ids from the turn this response came from.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Read the scripted response id and use request_id.
 
         Raises:
             TypeError: raw is not a FakeRaw.
@@ -194,7 +194,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         return ResponseIdentity(
             model_served="scripted-model",
             response_id=f"turn-{_turn_index(raw)}",
-            request_id=f"req-{_turn_index(raw)}",
+            request_id=request_id,
         )
 
     @override
@@ -271,7 +271,7 @@ class _ScriptedTurnStream(AdapterStream):
 
     @override
     def request_id(self) -> str | None:
-        """None: identity_from_raw derives the request id from the response itself."""
+        """Return no request id for scripted streams."""
         return None
 
     @override

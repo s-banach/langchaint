@@ -266,7 +266,6 @@ class RefusalError(GenerationError):
     a refusal can flip under sampling,
     but retrying spends the full input tokens
     (cache-read rate when warm, never zero) on an expected-value bet langchaint does not take by default.
-    An app whose economics differ overrides the adapter's _parsed_output.
     """
 
     @property
@@ -719,7 +718,7 @@ class GaveUpWaiting(Exception):  # noqa: N818 (the interface names the outcome, 
 
 
 class ParserContractError(Exception):
-    """A SharedBackoff `parse` raised, or returned something that is not a verdict.
+    """A SharedBackoff parse raised.
 
     A defect in `parse`, not a provider classification: fix `parse` rather than retrying through it.
     __cause__ holds what `parse` raised, where it raised.

@@ -1,11 +1,9 @@
-name: Refresh GenAI schemas
+name: Refresh GenAI semantic-convention data
 
-# The vendored GenAI payload schemas under tests/semconv_genai are a copy of files that no package
-# registry publishes, so no dependency update surfaces a change to them. This job is that signal:
-# monthly it refetches them and, when they moved, runs the gate and opens a pull request carrying
-# the diff and the result.
-# The gate runs here rather than on the pull request because a pull request opened with GITHUB_TOKEN
-# does not trigger workflow runs, so this job's own status is the green-or-red answer.
+# This job refreshes payload schemas and provider names monthly.
+# It opens a pull request when either source changes.
+# GitHub-token pull requests do not start workflows.
+# Therefore, this job runs the gate before opening the pull request.
 
 on:
   schedule:
@@ -32,32 +30,26 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      # Zero arguments: the upstream repository, file list, and destination are constants in the script.
-      - name: Refresh the vendored schemas
+      # The script stores every run parameter as a constant.
+      - name: Refresh vendored data
         run: uv run python -m scripts.refresh_semconv_genai
 
-      # Drift is measured on the schemas alone. SOURCE.md carries the fetched sha, which changes on
-      # every upstream commit including the many that touch no schema, so including it here would
-      # open a pull request monthly regardless of whether anything langchaint depends on moved.
-      # When only the sha moved, the rewritten SOURCE.md is discarded and its recorded commit stays
-      # the one whose schema bytes are actually vendored.
-      - name: Detect whether the schemas moved
+      # JSON diffs detect payload-schema or provider-name changes.
+      - name: Detect vendored data changes
         id: drift
         run: |
-          if git diff --quiet -- 'tests/semconv_genai/*.json'; then
+          if [ -z "$(git status --porcelain --untracked-files=all -- 'tests/semconv_genai/*.json')" ]; then
             echo "moved=false" >> "$GITHUB_OUTPUT"
-            echo "The vendored schemas match upstream; nothing to do."
-            git checkout -- tests/semconv_genai/SOURCE.md
+            echo "The vendored data matches upstream; nothing to do."
           else
             echo "moved=true" >> "$GITHUB_OUTPUT"
             git diff --stat -- tests/semconv_genai
           fi
 
-      # The gate decides what the pull request means: failing names the payload that no longer
-      # conforms, passing says every payload still validates, which is weaker (see the verdict below).
-      # Its exit code is kept for the final step so the pull request is opened either way and the job
-      # still reports the failure.
-      - name: Run the gate against the refreshed schemas
+      # The gate validates payloads and built-in provider names.
+      # continue-on-error keeps the pull-request step reachable.
+      # The final step restores a failed gate status.
+      - name: Run the gate against refreshed data
         if: steps.drift.outputs.moved == 'true'
         id: gate
         continue-on-error: true
@@ -67,32 +59,28 @@ jobs:
         if: steps.drift.outputs.moved == 'true'
         run: |
           set -euo pipefail
-          # A passing gate is not full conformance, and the limit travels with the claim rather than
-          # sitting in the test file: each anyOf over element types ends in a catch-all variant, so a
-          # renamed type const on a variant langchaint emits still validates through that variant.
           if [ "${{ steps.gate.outcome }}" = "success" ]; then
-            verdict="The gate passes: every payload still validates. That does not cover a renamed element type, because the schemas' catch-all variants admit unrecognized ones, so read the diff for \`const\` and \`required\` changes on the variants langchaint emits (TextPart, ToolCallRequestPart, ToolCallResponsePart, FunctionToolDefinition)."
+            verdict="The gate passes. Every tested payload validates. Every built-in provider name remains registered. Catch-all schema variants still admit unrecognized element types."
           else
-            verdict="The gate FAILS. A payload the tracing module emits no longer conforms; the run log names the attribute and the schema."
+            verdict="The gate fails. The run log identifies the rejected assertion."
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$BRANCH"
           git add tests/semconv_genai
-          git commit -m "Refresh the vendored GenAI payload schemas"
+          git commit -m "Refresh vendored GenAI semantic-convention data"
           git push --force origin "$BRANCH"
           if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
             gh pr create --head "$BRANCH" --base main \
-              --title "Refresh the vendored GenAI payload schemas" \
-              --body "$verdict"$'\n\n'"Opened by .github/workflows/refresh_semconv_genai.yml. The diff is upstream's; \`tests/semconv_genai/SOURCE.md\` records the new commit."
+              --title "Refresh vendored GenAI semantic-convention data" \
+              --body "$verdict"$'\n\n'"Opened by the refresh workflow. \`tests/semconv_genai/SOURCE.md\` records the source paths."
           else
             gh pr comment "$BRANCH" --body "Refreshed again. $verdict"
           fi
 
-      # continue-on-error above keeps the pull request step reachable, so the gate's verdict is
-      # re-raised here to decide the job's own status.
+      # This step applies the gate result to the job.
       - name: Report the gate's verdict
         if: steps.drift.outputs.moved == 'true' && steps.gate.outcome != 'success'
         run: |
-          echo "The refreshed schemas fail the gate; see the pull request." >&2
+          echo "The refreshed data fails the gate. See the pull request." >&2
           exit 1

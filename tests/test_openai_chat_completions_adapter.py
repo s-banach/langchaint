@@ -55,7 +55,7 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutputOutcome,
+    NoOutput,
     Refusal,
     RequestParams,
     ResponseOutcome,
@@ -979,19 +979,40 @@ def _structured_completion(
     return _completion(usage=None, message=message, finish_reason=finish_reason)
 
 
-def _structured_parse(completion: ChatCompletion) -> _StructuredReport | None | NoOutputOutcome:
+def _structured_parse(completion: ChatCompletion) -> ResponseOutcome[_StructuredReport | None]:
     """Run the structured binding's parse over one completion's finished turn."""
-    return _structured_bound()._parsed_output(_finished(completion))
+    return _structured_bound()._parsed_outcome(_finished(completion))
 
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the message's content into the response_format."""
     outcome = _structured_parse(_structured_completion(_REPORT_JSON))
-    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
     interpreted = _assert_result(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON))
     )
     assert interpreted.output == _StructuredReport(city="Nairobi", celsius=25)
+
+
+def test_structured_output_may_inherit_no_output() -> None:
+    """AdapterResult distinguishes successful output from NoOutput."""
+
+    class ReportAlsoNoOutput(BaseModel, NoOutput):
+        assistant_message: AssistantMessage = AssistantMessage(turn=())
+        city: str
+        celsius: int
+
+    adapter = _adapter()
+    bound = _BoundChatCompletionsStructured(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+        ),
+        response_format=ReportAlsoNoOutput,
+    )
+    outcome = bound.interpret(_structured_completion(_REPORT_JSON))
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
@@ -1054,14 +1075,20 @@ def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
     """A tool-call turn parses no instance and nothing went wrong, its prose text included."""
-    assert _structured_parse(_structured_completion(None, tool_call=True)) is None
-    assert _structured_parse(_structured_completion("let me look that up", tool_call=True)) is None
+    assert (
+        _assert_result(_structured_parse(_structured_completion(None, tool_call=True))).output
+        is None
+    )
+    prose_outcome = _structured_parse(
+        _structured_completion("let me look that up", tool_call=True)
+    )
+    assert _assert_result(prose_outcome).output is None
 
 
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
     """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
     outcome = _structured_parse(_structured_completion(_REPORT_JSON, tool_call=True))
-    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_refusal_and_never_validates_the_refusal_text() -> None:
@@ -1114,12 +1141,14 @@ def test_a_choice_with_no_finish_reason_is_unfinished_turn_carrying_the_partial_
     assert outcome.assistant_message.text == "hey"
 
 
-def test_identity_reads_the_completions_own_id_and_served_model() -> None:
-    """model_served reports what served the request, and request_id is None on the model itself."""
-    identity = _text_bound().identity_from_raw(_completion(usage=None, model="m-2026-01-01"))
+def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
+    """ResponseIdentity combines response fields with AdapterStream.request_id()."""
+    identity = _text_bound().identity_from_raw(
+        _completion(usage=None, model="m-2026-01-01"), request_id="req-chat"
+    )
     assert identity.response_id == "r1"
     assert identity.model_served == "m-2026-01-01"
-    assert identity.request_id is None
+    assert identity.request_id == "req-chat"
 
 
 class _FakeSDKStream(AsyncStream[ChatCompletionChunk]):

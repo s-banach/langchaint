@@ -179,6 +179,18 @@ def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
         _ = decorator(_type_checking_only_annotation)
 
 
+def test_tool_decorator_rejects_a_callable_instance() -> None:
+    """@tool requires a Python function before reading its signature."""
+
+    class CallableTool:
+        async def __call__(self, args: _EchoArgs) -> str:
+            return args.text
+
+    decorator = tool(description="Invalid callable instance.")
+    with pytest.raises(TypeError, match="@tool requires a function"):
+        _ = decorator(CallableTool())
+
+
 def test_validate_and_run_returns_the_function_result() -> None:
     """Valid args_json reaches the function as the validated model."""
     result = asyncio.run(_echo_tool().validate_and_run('{"text": "tide"}'))

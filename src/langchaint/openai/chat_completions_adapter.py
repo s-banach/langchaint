@@ -127,7 +127,6 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutput,
-    NoOutputOutcome,
     ReasoningDelta,
     Refusal,
     RequestParams,
@@ -140,7 +139,6 @@ from langchaint.adapter import (
     UnfinishedTurn,
     narrowed_request,
     reject_extra_body_keys_the_adapter_populates,
-    request_id_from_raw,
     request_json,
 )
 from langchaint.call import ResponseIdentity
@@ -593,6 +591,16 @@ def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
             return "refusal"
         case _:
             return "other"
+
+
+def _adapter_result[OutputT](
+    finished_turn: _FinishedTurn, output: OutputT
+) -> AdapterResult[OutputT]:
+    return AdapterResult(
+        output=output,
+        assistant_message=finished_turn.assistant_message,
+        stop_reason=_normalized_stop_reason(finished_turn),
+    )
 
 
 def cache_read_tokens_from_usage_openai(usage: CompletionUsage) -> int:
@@ -1077,13 +1085,12 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Read the response's own id, the model it reports serving the request, and the request id.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Combine the response's id and model with request_id.
 
         id and model are both required str fields on the SDK's ChatCompletion (openai 2.51.0),
         so neither is absent and neither needs converting.
-        request_id_from_raw returns None on a snapshot the stream state assembled, which carries
-        no request-id of its own; the stream handle's request_id() is where the header is read.
+        request_id comes from AdapterStream.request_id().
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
@@ -1092,7 +1099,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         return ResponseIdentity(
             model_served=completion.model,
             response_id=completion.id,
-            request_id=request_id_from_raw(completion),
+            request_id=request_id,
         )
 
     @override
@@ -1166,11 +1173,7 @@ class _BoundChatCompletionsText(_BoundChatCompletions[str]):
         finished_turn = _finished_turn_or_unfinished(_as_chat_completion(raw))
         if isinstance(finished_turn, NoOutput):
             return finished_turn
-        return AdapterResult(
-            output=finished_turn.assistant_message.text,
-            assistant_message=finished_turn.assistant_message,
-            stop_reason=_normalized_stop_reason(finished_turn),
-        )
+        return _adapter_result(finished_turn, finished_turn.assistant_message.text)
 
 
 class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[ModelT | None]):
@@ -1194,7 +1197,7 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
             precomputed_fields, response_format=_wire_response_format(response_format)
         )
 
-    def _parsed_output(self, finished_turn: _FinishedTurn) -> ModelT | None | NoOutputOutcome:
+    def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:
         """Validate message.content after the response enters langchaint.
 
         Therefore, rejected content and billing remain available.
@@ -1210,12 +1213,13 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
         text = finished_turn.message.content
         if text:
             try:
-                return self._response_format.model_validate_json(text)
+                output = self._response_format.model_validate_json(text)
+                return _adapter_result(finished_turn, output)
             except ValidationError as rejection:
                 validation_error = rejection
         assistant_message = finished_turn.assistant_message
         if _normalized_stop_reason(finished_turn) == "tool_use" and assistant_message.tool_calls:
-            return None
+            return _adapter_result(finished_turn, None)
         if finished_turn.message.refusal or finished_turn.finish_reason == "content_filter":
             return Refusal(assistant_message=assistant_message)
         if finished_turn.finish_reason == "length":
@@ -1237,11 +1241,4 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
         finished_turn = _finished_turn_or_unfinished(_as_chat_completion(raw))
         if isinstance(finished_turn, NoOutput):
             return finished_turn
-        output = self._parsed_output(finished_turn)
-        if isinstance(output, NoOutput):
-            return output
-        return AdapterResult(
-            output=output,
-            assistant_message=finished_turn.assistant_message,
-            stop_reason=_normalized_stop_reason(finished_turn),
-        )
+        return self._parsed_outcome(finished_turn)

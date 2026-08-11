@@ -121,8 +121,6 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutput,
-    NoOutputOutcome,
     ReasoningDelta,
     Refusal,
     RequestParams,
@@ -136,7 +134,6 @@ from langchaint.adapter import (
     narrowed_request,
     record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
-    request_id_from_raw,
     request_json,
     retry_after_seconds_from_headers,
     terminal_classification_from_response,
@@ -869,23 +866,6 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
     return raw
 
 
-def _identity_from_message(raw: BaseModel) -> ResponseIdentity:
-    """Read the message's own id, the model it reports serving the request, and the request id.
-
-    id and model are both required on anthropic.types.Message and every value of each is a str
-    (anthropic 0.120.0), so neither is absent and neither needs converting.
-
-    Raises:
-        TypeError: raw is not an anthropic Message.
-    """
-    message = _as_message(raw)
-    return ResponseIdentity(
-        model_served=message.model,
-        response_id=message.id,
-        request_id=request_id_from_raw(message),
-    )
-
-
 def _first_text_block_text(message: anthropic.types.Message) -> str | None:
     """Return the text of the turn's first text block, None when the turn holds none.
 
@@ -1497,13 +1477,18 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Read the message's own id, the model it reports serving the request, and the request id.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Combine the message's id and model with request_id.
 
         Raises:
             TypeError: raw is not an anthropic Message.
         """
-        return _identity_from_message(raw)
+        message = _as_message(raw)
+        return ResponseIdentity(
+            model_served=message.model,
+            response_id=message.id,
+            request_id=request_id,
+        )
 
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
@@ -1600,9 +1585,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         )
         self._precomputed_fields = replace(precomputed_fields, output_config=output_config)
 
-    def _parsed_output(
+    def _parsed_outcome(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage
-    ) -> ModelT | None | NoOutputOutcome:
+    ) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the message and its text in scope when
@@ -1627,14 +1612,15 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         text = _first_text_block_text(message)
         if text is not None:
             try:
-                return self._output_type_adapter.validate_json(text)
+                output = self._output_type_adapter.validate_json(text)
+                return _adapter_result(message, output, assistant_message)
             except ValidationError as rejection:
                 validation_error = rejection
         unfinished_turn = _unfinished_turn_or_none(message, assistant_message=assistant_message)
         if unfinished_turn is not None:
             return unfinished_turn
         if message.stop_reason == "tool_use":
-            return None
+            return _adapter_result(message, None, assistant_message)
         if message.stop_reason == "refusal":
             return Refusal(assistant_message=assistant_message)
         if message.stop_reason == "max_tokens":
@@ -1657,7 +1643,4 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
-        output = self._parsed_output(message, assistant_message)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(message, output, assistant_message)
+        return self._parsed_outcome(message, assistant_message)

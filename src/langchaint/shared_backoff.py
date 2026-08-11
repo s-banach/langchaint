@@ -21,7 +21,6 @@ This module supports many asyncio tasks within one event loop.
 """
 
 import asyncio
-import inspect
 import logging
 import math
 import random
@@ -255,11 +254,8 @@ class SharedBackoff:
                 Also raised when `longest_wait_seconds` is below `minimum_wait_ceiling_seconds`.
                 Also raised when their ratio is non-finite.
                 Also raised when `max_concurrent_requests` is boolean or below one.
-                Also raised when `on_parse_error` is unsupported.
                 Also raised when `failure_types` is empty.
-                Also raised when a failure type is not an `Exception` subclass.
                 Also raised when a failure type equals `Exception`.
-                Also raised when `inspect.iscoroutinefunction(parse)` is true.
         """
         self.minimum_wait_ceiling_seconds = _validated_positive_float(
             "minimum_wait_ceiling_seconds", minimum_wait_ceiling_seconds
@@ -302,28 +298,14 @@ class SharedBackoff:
                 f"max_concurrent_requests must be None or a positive int, "
                 f"got {max_concurrent_requests!r}"
             )
-        if on_parse_error not in ("raise", "retry_this_one"):
-            raise ValueError(
-                f'on_parse_error must be "raise" or "retry_this_one", got {on_parse_error!r}'
-            )
         if not failure_types:
             raise ValueError(
                 "failure_types must not be empty: the exit would parse nothing and record nothing"
             )
-        for failure_type in failure_types:
-            if (
-                not isinstance(failure_type, type)
-                or not issubclass(failure_type, Exception)
-                or failure_type is Exception
-            ):
-                raise ValueError(
-                    f"every failure_types entry must be a strict subclass of Exception, "
-                    f"got {failure_type!r}"
-                )
-        if inspect.iscoroutinefunction(parse):
-            raise ValueError("parse must be synchronous, got a coroutine function")
+        if Exception in failure_types:
+            raise ValueError("failure_types must not contain Exception")
         self.parse = parse
-        self.failure_types = tuple(failure_types)
+        self.failure_types = failure_types
         self._max_concurrent_requests = max_concurrent_requests
         self.on_parse_error: Literal["raise", "retry_this_one"] = on_parse_error
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
@@ -364,7 +346,7 @@ class SharedBackoff:
         """How often each noteworthy entry or exit event occurred, by tag.
 
         The correction tags: "retry_after_invalid", "retry_after_over_cap", and under
-        on_parse_error="retry_this_one" also "parse_raised" and "parse_returned_non_verdict".
+        on_parse_error="retry_this_one" also "parse_raised".
         The failure tags: "gave_up_waiting" for a budget that expired before admission, and
         "parser_contract_error" for a parse contract violation under on_parse_error="raise".
         A metric, read by no decision.
@@ -487,55 +469,29 @@ class SharedBackoff:
         )
 
     def _checked_parse(self, failure: Exception) -> Verdict:
-        """Call parse under its contract checks; correct what is safely correctable, raise on the rest.
-
-        An awaitable return is treated as a contract violation, closed first when it is a
-        coroutine, so no unawaited-coroutine warning fires; the construction-time coroutine check
-        cannot catch a callable whose __call__ is asynchronous.
+        """Call parse, handle raised exceptions, and normalize the verdict.
 
         Raises:
-            ParserContractError: parse raised or returned a non-verdict, and on_parse_error is
-                "raise"; a defect must not impersonate a provider classification, since the
-                impersonation retries permanent failures and hides the bug behind ordinary-looking
-                traffic.
+            ParserContractError: parse raised and on_parse_error is "raise".
         """
         try:
             result = self.parse(failure)
         except Exception as defect:  # noqa: BLE001 (parse is caller code; any Exception it raises is the defect handled here)
-            return self._parse_defect_outcome(
-                "parse raised instead of returning a verdict", "parse_raised", defect
-            )
-        if inspect.iscoroutine(result):
-            result.close()
-            return self._parse_defect_outcome(
-                "parse returned a coroutine instead of a verdict",
-                "parse_returned_non_verdict",
-                None,
-            )
-        if not isinstance(result, PauseAll | PauseAllDoNotRetry | RetryThisOne | DoNotRetry):
-            return self._parse_defect_outcome(
-                f"parse returned {result!r} instead of a verdict",
-                "parse_returned_non_verdict",
-                None,
-            )
+            return self._parse_error_outcome(defect)
         return self._normalized(result)
 
-    def _parse_defect_outcome(
-        self, description: str, tag: str, defect: BaseException | None
-    ) -> RetryThisOne:
-        """Turn one parse contract violation into the configured outcome.
+    def _parse_error_outcome(self, defect: Exception) -> RetryThisOne:
+        """Apply on_parse_error to an exception raised by parse.
 
         Raises:
-            ParserContractError: on_parse_error is "raise"; defect is chained as __cause__ where
-                parse raised one.
+            ParserContractError: on_parse_error is "raise".
         """
+        description = "parse raised instead of returning a verdict"
         if self.on_parse_error == "raise":
             self.event_counts["parser_contract_error"] += 1
             _logger.error("parse violated its contract: %s", description)
-            if defect is None:
-                raise ParserContractError(description)
             raise ParserContractError(description) from defect
-        self.event_counts[tag] += 1
+        self.event_counts["parse_raised"] += 1
         _logger.warning("corrected a parse contract violation to RetryThisOne: %s", description)
         return RetryThisOne(retry_after=None)
 
@@ -554,7 +510,7 @@ class SharedBackoff:
             return verdict
         return replace(verdict, retry_after=self._normalized_retry_after(verdict.retry_after))
 
-    def _normalized_retry_after(self, stated: object) -> float | None:
+    def _normalized_retry_after(self, stated: float) -> float | None:
         """Return a valid retry_after capped at longest_wait_seconds, or None.
 
         The type must be exactly int or float, which excludes bool; anything else becomes None,

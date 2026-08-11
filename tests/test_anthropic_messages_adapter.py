@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import get_args, override
+from typing import TypeIs, get_args, override
 
 import anthropic
 import anthropic.types as at
@@ -29,7 +29,7 @@ from anthropic.lib.streaming import (
     ParsedContentBlockStopEvent,
     ParsedMessageStreamEvent,
 )
-from anthropic.types import MessageParam, ParsedMessage
+from anthropic.types import ContentBlockParam, MessageParam, ParsedMessage
 from anthropic.types.parsed_message import ParsedTextBlock
 from pydantic import BaseModel, TypeAdapter
 
@@ -59,6 +59,7 @@ from langchaint import (
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
     Adapter,
+    AdapterResult,
     AdapterStream,
     Binding,
     ContextWindowExceeded,
@@ -66,9 +67,11 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutput,
     NoOutputOutcome,
     Refusal,
     RequestParams,
+    ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
 )
@@ -136,26 +139,26 @@ _PRIORITY_RATES = AnthropicPricingTable(
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
 
 
-def _as_dict(value: object) -> dict[str, object]:
-    """View one wire TypedDict as a plain dict for structural assertions."""
-    assert isinstance(value, dict)
-    mapping: dict[object, object] = value
-    return {str(key): item for key, item in mapping.items()}
-
-
-def _content_blocks(message: MessageParam) -> list[dict[str, object]]:
-    """Return one wire message's content blocks as plain dicts."""
-    content = _as_dict(message)["content"]
+def _content_blocks(message: MessageParam) -> list[ContentBlockParam]:
+    """Return one wire message's content blocks."""
+    content = message["content"]
     assert isinstance(content, list)
-    blocks: list[object] = content
-    return [_as_dict(block) for block in blocks]
+    blocks: list[ContentBlockParam] = []
+    for block in content:
+        assert _is_content_block_param(block)
+        blocks.append(block)
+    return blocks
 
 
-def _block_list(value: object) -> list[dict[str, object]]:
-    """View a wire block list (never the omit sentinel here) as plain dicts."""
+def _is_content_block_param(value: object) -> TypeIs[ContentBlockParam]:
+    """Distinguish request TypedDicts from response models."""
+    return isinstance(value, dict)
+
+
+def _block_list[BlockT](value: list[BlockT] | anthropic.Omit) -> list[BlockT]:
+    """Return populated Anthropic blocks."""
     assert isinstance(value, list)
-    blocks: list[object] = value
-    return [_as_dict(block) for block in blocks]
+    return value
 
 
 class _EchoArgs(BaseModel):
@@ -465,14 +468,17 @@ def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> N
 
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response, standard rates a response reporting no tier."""
-    counters = {"input_tokens": 100, "output_tokens": 50}
     pricing: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
         "standard": _STANDARD_RATES,
         "priority": _PRIORITY_RATES,
     }
-    at_priority = _billing_from_sdk_usage(at.Usage(**counters, service_tier="priority"), pricing)
-    at_standard = _billing_from_sdk_usage(at.Usage(**counters, service_tier="standard"), pricing)
-    reporting_none = _billing_from_sdk_usage(at.Usage(**counters), pricing)
+    at_priority = _billing_from_sdk_usage(
+        at.Usage(input_tokens=100, output_tokens=50, service_tier="priority"), pricing
+    )
+    at_standard = _billing_from_sdk_usage(
+        at.Usage(input_tokens=100, output_tokens=50, service_tier="standard"), pricing
+    )
+    reporting_none = _billing_from_sdk_usage(at.Usage(input_tokens=100, output_tokens=50), pricing)
     assert at_priority.usage.cost_in_usd == pytest.approx(2 * at_standard.usage.cost_in_usd)
     assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
 
@@ -749,8 +755,10 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
     assert [message["role"] for message in wire] == ["user", "assistant", "user"]
     tool_results = _content_blocks(wire[2])
     assert len(tool_results) == 2
-    assert tool_results[0]["is_error"] is False
-    assert tool_results[1]["is_error"] is True
+    assert tool_results[0]["type"] == "tool_result"
+    assert tool_results[1]["type"] == "tool_result"
+    assert tool_results[0].get("is_error") is False
+    assert tool_results[1].get("is_error") is True
 
 
 def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
@@ -763,7 +771,8 @@ def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
         messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
     )
     tool_results = _content_blocks(wire[0])
-    assert tool_results[-1]["cache_control"] == {"type": "ephemeral"}
+    assert tool_results[-1]["type"] == "tool_result"
+    assert tool_results[-1].get("cache_control") == {"type": "ephemeral"}
     assert "cache_control" not in tool_results[0]
 
 
@@ -815,7 +824,8 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
         messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
-    assert tool_result["content"] == [
+    assert tool_result["type"] == "tool_result"
+    assert tool_result.get("content") == [
         {"type": "text", "text": "saw"},
         {
             "type": "image",
@@ -852,8 +862,9 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         {**expected_unmarked_block, "cache_control": {"type": "ephemeral"}}
     ]
     tool_result = _content_blocks(wire[1])[0]
-    assert tool_result["content"] == [expected_unmarked_block]
-    assert tool_result["cache_control"] == {"type": "ephemeral"}
+    assert tool_result["type"] == "tool_result"
+    assert tool_result.get("content") == [expected_unmarked_block]
+    assert tool_result.get("cache_control") == {"type": "ephemeral"}
 
 
 @pytest.mark.parametrize(
@@ -980,8 +991,8 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
     )
     tools = _block_list(precomputed.tools)
     assert tools[0]["name"] == "get_weather"
-    assert tools[1]["type"] == "web_search_20250305"
-    assert tools[1]["cache_control"] == {"type": "ephemeral"}
+    assert tools[1].get("type") == "web_search_20250305"
+    assert tools[1].get("cache_control") == {"type": "ephemeral"}
     assert "cache_control" not in provider_tool
 
 
@@ -1244,7 +1255,7 @@ def test_request_marks_the_system_block_only_when_caching() -> None:
     cached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
-    assert _block_list(cached.system)[0]["cache_control"] == {"type": "ephemeral"}
+    assert _block_list(cached.system)[0].get("cache_control") == {"type": "ephemeral"}
     uncached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
     )
@@ -1257,7 +1268,7 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
     without_system = _adapter()._precompute_fields(
         _binding(system_prompt=None, tool_schemas=schemas, automatic_prompt_caching=True)
     )
-    assert _block_list(without_system.tools)[-1]["cache_control"] == {"type": "ephemeral"}
+    assert _block_list(without_system.tools)[-1].get("cache_control") == {"type": "ephemeral"}
     with_system = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_prompt_caching=True)
     )
@@ -1606,9 +1617,9 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     )
 
 
-def _structured_parse(message: at.Message) -> _StructuredReport | None | NoOutputOutcome:
+def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport | None]:
     """Run the structured binding's parse over one message, with the turn that message carries."""
-    return _structured_bound()._parsed_output(message, _assistant_message_from(message))
+    return _structured_bound()._parsed_outcome(message, _assistant_message_from(message))
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1647,21 +1658,16 @@ def test_identity_reads_the_messages_own_id_and_served_model() -> None:
     A message the SDK did not parse from an HTTP response body carries no request id, which is the
     state every streamed message is in.
     """
-    identity = _structured_bound().identity_from_raw(_message_with_content([]))
+    identity = _structured_bound().identity_from_raw(_message_with_content([]), request_id=None)
     assert identity == ResponseIdentity(
         model_served="claude-sonnet-5", response_id="msg_1", request_id=None
     )
 
 
-def test_identity_reads_the_request_id_the_sdk_attached_to_the_message() -> None:
-    """A message parsed from a response body carries the request-id header, which identity reports.
-
-    The assignment is what the SDK's own add_request_id does to every model it parses from a body
-    (anthropic 0.120.0).
-    """
+def test_identity_reads_the_adapter_stream_request_id() -> None:
+    """The AdapterStream request id reaches ResponseIdentity unchanged."""
     message = _message_with_content([])
-    message._request_id = "req_anthropic"
-    identity = _structured_bound().identity_from_raw(message)
+    identity = _structured_bound().identity_from_raw(message, request_id="req_anthropic")
     assert identity.request_id == "req_anthropic"
 
 
@@ -1752,7 +1758,29 @@ def test_the_request_sends_extra_body_by_reference(
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's text block into the response_format."""
     outcome = _structured_parse(_structured_message(_REPORT_JSON))
-    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
+
+
+def test_structured_output_may_inherit_no_output() -> None:
+    """AdapterResult distinguishes successful output from NoOutput."""
+
+    class ReportAlsoNoOutput(BaseModel, NoOutput):
+        assistant_message: AssistantMessage = AssistantMessage(turn=())
+        city: str
+        celsius: int
+
+    adapter = _adapter()
+    bound = _BoundAnthropicStructured(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+        ),
+        response_format=ReportAlsoNoOutput,
+    )
+    outcome = bound.interpret(_structured_message(_REPORT_JSON))
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
 @pytest.mark.parametrize(
@@ -1808,13 +1836,16 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_
 
 def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
     """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
-    assert _structured_parse(_structured_message(None, stop_reason="tool_use")) is None
+    outcome = _structured_parse(_structured_message(None, stop_reason="tool_use"))
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output is None
 
 
 def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_as_none() -> None:
     """A tool_use turn whose text block is prose is the tool call, not a schema violation."""
     outcome = _structured_parse(_structured_message("let me look that up", stop_reason="tool_use"))
-    assert outcome is None
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output is None
 
 
 def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
@@ -2142,7 +2173,8 @@ def test_wire_messages_marks_a_marked_user_part() -> None:
         messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     blocks = _content_blocks(wire[0])
-    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[0]["type"] == "text"
+    assert blocks[0].get("cache_control") == {"type": "ephemeral"}
     assert "cache_control" not in blocks[1]
 
 
@@ -2156,7 +2188,9 @@ def test_wire_messages_marks_a_marked_image_part() -> None:
     wire = _wire_messages(
         messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
-    assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral"}
+    image_block = _content_blocks(wire[0])[0]
+    assert image_block["type"] == "image"
+    assert image_block.get("cache_control") == {"type": "ephemeral"}
 
 
 def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part() -> None:
@@ -2171,8 +2205,12 @@ def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part()
         messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
-    assert tool_result["cache_control"] == {"type": "ephemeral"}
-    assert tool_result["content"] == [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result.get("cache_control") == {"type": "ephemeral"}
+    assert tool_result.get("content") == [
+        {"type": "text", "text": "a"},
+        {"type": "text", "text": "b"},
+    ]
 
 
 def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
@@ -2263,7 +2301,8 @@ def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cachi
     )
     blocks = _content_blocks(wire[0])
     assert "cache_control" not in blocks[0]
-    assert all(block["cache_control"] == {"type": "ephemeral"} for block in blocks[1:])
+    assert all(block["type"] == "text" for block in blocks)
+    assert all(block.get("cache_control") == {"type": "ephemeral"} for block in blocks[1:])
 
 
 def test_wire_messages_reserves_two_of_the_four_markers_for_automatic_caching() -> None:
@@ -2279,8 +2318,11 @@ def test_wire_messages_reserves_two_of_the_four_markers_for_automatic_caching() 
     )
     marked_blocks = _content_blocks(wire[0])
     assert "cache_control" not in marked_blocks[0]
-    assert all(block["cache_control"] == {"type": "ephemeral"} for block in marked_blocks[1:])
-    assert _content_blocks(wire[1])[-1]["cache_control"] == {"type": "ephemeral"}
+    assert all(block["type"] == "text" for block in marked_blocks)
+    assert all(block.get("cache_control") == {"type": "ephemeral"} for block in marked_blocks[1:])
+    last_block = _content_blocks(wire[1])[-1]
+    assert last_block["type"] == "text"
+    assert last_block.get("cache_control") == {"type": "ephemeral"}
 
 
 def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
@@ -2358,8 +2400,12 @@ def test_wire_messages_budget_mixes_user_and_tool_result_marks_across_messages()
         messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=2
     )
     assert "cache_control" not in _content_blocks(wire[0])[0]
-    assert _content_blocks(wire[1])[0]["cache_control"] == {"type": "ephemeral"}
-    assert _content_blocks(wire[2])[0]["cache_control"] == {"type": "ephemeral"}
+    tool_result = _content_blocks(wire[1])[0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result.get("cache_control") == {"type": "ephemeral"}
+    latest_text = _content_blocks(wire[2])[0]
+    assert latest_text["type"] == "text"
+    assert latest_text.get("cache_control") == {"type": "ephemeral"}
 
 
 def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automatic_marker() -> (
@@ -2404,7 +2450,7 @@ def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
     precomputed_fields = _adapter_1h()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
     )
-    assert _block_list(precomputed_fields.system)[0]["cache_control"] == {
+    assert _block_list(precomputed_fields.system)[0].get("cache_control") == {
         "type": "ephemeral",
         "ttl": "1h",
     }
@@ -2416,7 +2462,7 @@ def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
     precomputed_fields = _adapter_1h()._precompute_fields(
         _binding(system_prompt=None, tool_schemas=_tool_schemas(), automatic_prompt_caching=True)
     )
-    assert _block_list(precomputed_fields.tools)[-1]["cache_control"] == {
+    assert _block_list(precomputed_fields.tools)[-1].get("cache_control") == {
         "type": "ephemeral",
         "ttl": "1h",
     }
@@ -2431,8 +2477,12 @@ def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() ->
     wire = _wire_messages(
         messages, automatic_prompt_caching=True, cache_ttl="1h", message_mark_budget=2
     )
-    assert _content_blocks(wire[0])[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-    assert _content_blocks(wire[1])[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    first_block = _content_blocks(wire[0])[0]
+    assert first_block["type"] == "text"
+    assert first_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+    last_block = _content_blocks(wire[1])[-1]
+    assert last_block["type"] == "text"
+    assert last_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:

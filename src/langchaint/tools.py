@@ -316,9 +316,12 @@ class _ToolDecorator:
         so a model defined in the decorating scope resolves.
 
         Raises:
+            TypeError: the decorated value is not a Python function.
             TypeError: the parameter annotation is not a BaseModel subclass, or did not resolve.
                 A name imported only under `if TYPE_CHECKING` does not exist at runtime.
         """
+        if not inspect.isfunction(function):
+            raise TypeError("@tool requires a function")
         parameter = next(iter(inspect.signature(function).parameters.values()))
         args_model: object = parameter.annotation
         if isinstance(args_model, str):

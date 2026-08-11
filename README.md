@@ -7,6 +7,10 @@ Alpha: the API is unstable and may change without notice.
 
 langchaint provides `BoundLLM` and `EmbeddingModel` as provider-neutral async interfaces.  
 langchaint provides no agent class or agent loop.
+langchaint uses pyrefly with the strict `all` preset.
+Applications should use langchaint with a strict type checker.
+langchaint relies on static checking for argument types.
+langchaint does not repeat every argument type check at runtime.
 
 ## Install and authenticate
 

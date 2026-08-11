@@ -140,7 +140,6 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutput,
     NoOutputOutcome,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
@@ -156,7 +155,6 @@ from langchaint.adapter import (
     UnfinishedTurn,
     narrowed_request,
     reject_extra_body_keys_the_adapter_populates,
-    request_id_from_raw,
     request_json,
     validated_provider_executed_tool_types,
 )
@@ -591,23 +589,6 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
     if not isinstance(raw, OpenAIResponse):
         raise TypeError(f"expected an openai Response, got {type(raw).__name__}")
     return raw
-
-
-def _identity_from_response(raw: BaseModel) -> ResponseIdentity:
-    """Read the response's own id, the model it reports serving the request, and the request id.
-
-    id and model are both required on openai.types.responses.Response and every value of each is a
-    str (openai 2.48.0), so neither is absent and neither needs converting.
-
-    Raises:
-        TypeError: raw is not an openai Response.
-    """
-    response = _as_response(raw)
-    return ResponseIdentity(
-        model_served=response.model,
-        response_id=response.id,
-        request_id=request_id_from_raw(response),
-    )
 
 
 def _first_output_text(response: OpenAIResponse) -> str | None:
@@ -1206,13 +1187,18 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         return _billing_from_response(_as_response(raw), pricing=self._adapter.pricing)
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Read the response's own id, the model it reports serving the request, and the request id.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Combine the response's id and model with request_id.
 
         Raises:
             TypeError: raw is not an openai Response.
         """
-        return _identity_from_response(raw)
+        response = _as_response(raw)
+        return ResponseIdentity(
+            model_served=response.model,
+            response_id=response.id,
+            request_id=request_id,
+        )
 
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
@@ -1367,9 +1353,9 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
             assistant_message=assistant_message,
         )
 
-    def _parsed_output(
+    def _parsed_outcome(
         self, response: OpenAIResponse, assistant_message: AssistantMessage
-    ) -> ModelT | None | NoOutputOutcome:
+    ) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the response and its text in scope when
@@ -1389,11 +1375,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         text = _first_output_text(response)
         if response.status != "failed" and text is not None:
             try:
-                return self._response_format.model_validate_json(text)
+                output = self._response_format.model_validate_json(text)
+                return _adapter_result(response, output, assistant_message)
             except ValidationError as rejection:
                 validation_error = rejection
         if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
-            return None
+            return _adapter_result(response, None, assistant_message)
         return self._no_instance(response, validation_error, assistant_message)
 
     @override
@@ -1405,7 +1392,4 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         """
         response = _as_response(raw)
         assistant_message = _assistant_message_from(response)
-        output = self._parsed_output(response, assistant_message)
-        if isinstance(output, NoOutput):
-            return output
-        return _adapter_result(response, output, assistant_message)
+        return self._parsed_outcome(response, assistant_message)

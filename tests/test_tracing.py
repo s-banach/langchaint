@@ -1963,13 +1963,101 @@ def test_vendored_schemas_and_the_payload_attributes_account_for_each_other() ->
     compare against. An upstream file that breaks that naming fails here too, which is the reason
     ATTRIBUTE_SCHEMA_FILES stays a written-out map rather than a comprehension over the keys.
     """
-    vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("*.json")}
+    vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
     assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
     assert vendored == set(_PAYLOAD_SCHEMA_FILES.values())
     assert set(_PAYLOAD_SCHEMA_FILES) <= _emitted_convention_keys()
     assert set(_PAYLOAD_SCHEMA_FILES) >= _UNVALIDATED_PAYLOAD_ATTRIBUTES
     for key, file in _PAYLOAD_SCHEMA_FILES.items():
         assert file == key.replace(".", "-").replace("_", "-") + ".json"
+
+
+def test_provider_name_values_from_registry_returns_sorted_values() -> None:
+    """The refresh extracts and sorts provider names."""
+    registry = b"""attributes:
+  - key: gen_ai.provider.name
+    type:
+      members:
+        - id: zeta
+          value: "zeta"
+        - id: alpha
+          value: "alpha"
+    stability: development
+  - key: gen_ai.request.model
+    type: string
+"""
+    assert refresh_semconv_genai.provider_name_values_from_registry(registry) == (
+        "alpha",
+        "zeta",
+    )
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [
+        b"attributes:\n  - key: gen_ai.request.model\n    type: string\n",
+        b"""attributes:
+  - key: gen_ai.provider.name
+    type:
+      members:
+        - id: first
+          value: "first"
+  - key: gen_ai.provider.name
+    type:
+      members:
+        - id: second
+          value: "second"
+""",
+        b"""attributes:
+  - key: gen_ai.provider.name
+    type:
+      members:
+        - id: empty
+          value: ""
+""",
+        b"""attributes:
+  - key: gen_ai.provider.name
+    type:
+      members: malformed
+""",
+        b"""attributes:
+  - key: gen_ai.provider.name
+    type:
+      members:
+        - id: duplicate
+          value: "duplicate"
+        - id: duplicate_again
+          value: "duplicate"
+""",
+    ],
+)
+def test_provider_name_values_from_registry_rejects_invalid_registry(
+    registry: bytes,
+) -> None:
+    """The refresh rejects missing, duplicated, empty, or malformed registry data."""
+    with pytest.raises(ValueError, match=r"registry|gen_ai.provider.name"):
+        _ = refresh_semconv_genai.provider_name_values_from_registry(registry)
+
+
+def test_refresh_validates_registry_before_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Malformed registry data leaves every destination unwritten."""
+
+    def fake_fetch(url: str) -> bytes:
+        """Return one malformed registry beside valid metadata and schemas."""
+        if "/commits/" in url:
+            return b'{"sha": "revision"}'
+        if url.endswith("/registry.yaml"):
+            return b"attributes:\n"
+        return b"{}"
+
+    monkeypatch.setattr(refresh_semconv_genai, "DESTINATION", tmp_path)
+    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_DOC", tmp_path / "SOURCE.md")
+    monkeypatch.setattr(refresh_semconv_genai, "fetch", fake_fetch)
+    with pytest.raises(ValueError, match="registry"):
+        refresh_semconv_genai.main()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:

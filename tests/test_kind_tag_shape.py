@@ -40,16 +40,6 @@ def _flatten_union(annotation: object) -> list[type]:
     return [annotation] if isinstance(annotation, type) else []
 
 
-def _own_annotations(variant: type) -> dict[str, object]:
-    """Read the annotations the class declares itself, ignoring any it inherits.
-
-    inspect.get_annotations reads them wherever the interpreter keeps them, and evaluates any it
-    finds deferred. A 3.13 class dict holds __annotations__; a 3.14 one holds __annotate_func__ and
-    caches under __annotations_cache__, so reading __annotations__ out of the dict finds nothing.
-    """
-    return inspect.get_annotations(variant)
-
-
 def _tagged_unions() -> dict[str, tuple[type, ...]]:
     """Map each langchaint type alias whose variants all declare kind to those variants."""
     found: dict[str, tuple[type, ...]] = {}
@@ -58,14 +48,17 @@ def _tagged_unions() -> dict[str, tuple[type, ...]]:
             if getattr(value, "__value__", None) is None:
                 continue
             variants = _flatten_union(value)
-            if variants and all("kind" in _own_annotations(variant) for variant in variants):
+            if variants and all(
+                "kind" in inspect.get_annotations(variant) for variant in variants
+            ):
                 found[attribute_name] = tuple(variants)
     return found
 
 
 def _tag_of(variant: type) -> str:
     """Read the one string a variant's kind Literal holds."""
-    literal_arguments = get_args(_own_annotations(variant)["kind"])
+    annotations = inspect.get_annotations(variant)
+    literal_arguments = get_args(annotations["kind"])
     assert len(literal_arguments) == 1, f"{variant.__name__}.kind holds no single Literal value"
     tag = literal_arguments[0]
     assert isinstance(tag, str), f"{variant.__name__}.kind is not a string Literal"

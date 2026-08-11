@@ -99,7 +99,6 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutput,
-    NoOutputOutcome,
     ReasoningDelta,
     Refusal,
     RequestParams,
@@ -224,9 +223,7 @@ def _populated_provider_tool_fields(tool: types.Tool) -> frozenset[str]:
             Also raised when Google Search enables image search.
     """
     populated_fields = frozenset(
-        field_name
-        for field_name in types.Tool.model_fields
-        if getattr(tool, field_name) is not None
+        field_name for field_name, field_value in tool if field_value is not None
     )
     if not populated_fields or not populated_fields <= _SUPPORTED_PROVIDER_TOOL_FIELDS:
         raise ValueError("Gemini provider_executed_tools contain an unsupported field")
@@ -721,7 +718,7 @@ def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) ->
     if isinstance(part, ToolCall) and function_call is not None:
         name = function_call.name or ""
         try:
-            args = json.loads(part.args_json)
+            args: object = json.loads(part.args_json)
         except json.JSONDecodeError:
             return False
         return (
@@ -1042,14 +1039,11 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
         ValueError: extra_body holds a refused key, or a key matching generationConfig holds
             something other than an object, which the merge would substitute wholesale for the
             generationConfig fields the adapter populates.
+            Also raised when generationConfig contains a non-string key.
     """
     if extra_body is None:
         return
-    reject_extra_body_keys_the_adapter_populates(
-        extra_body,
-        populated_keys=_ADAPTER_POPULATED_TOP_LEVEL_WIRE_KEYS,
-        normalized_key=_normalized_wire_key,
-    )
+    generation_configs: list[Mapping[str, object]] = []
     for key, nested in extra_body.items():
         if _normalized_wire_key(key) != "generationconfig":
             continue
@@ -1059,8 +1053,20 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
                 f"extra_body key {key!r} must map to an object: the SDK merge would substitute "
                 f"a non-object value for the generationConfig fields the adapter populates"
             )
+        for nested_key in nested:
+            if not isinstance(nested_key, str):
+                raise ValueError(  # noqa: TRY004
+                    f"extra_body key {key!r} must map to an object with only string keys"
+                )
+        generation_configs.append(nested)
+    reject_extra_body_keys_the_adapter_populates(
+        extra_body,
+        populated_keys=_ADAPTER_POPULATED_TOP_LEVEL_WIRE_KEYS,
+        normalized_key=_normalized_wire_key,
+    )
+    for generation_config in generation_configs:
         reject_extra_body_keys_the_adapter_populates(
-            nested,
+            generation_config,
             populated_keys=_ADAPTER_POPULATED_GENERATION_CONFIG_KEYS,
             normalized_key=_normalized_wire_key,
         )
@@ -1714,6 +1720,16 @@ def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
     return "other"
 
 
+def _adapter_result[OutputT](
+    finished_turn: _FinishedTurn, output: OutputT
+) -> AdapterResult[OutputT]:
+    return AdapterResult(
+        output=output,
+        assistant_message=finished_turn.assistant_message,
+        stop_reason=_normalized_stop_reason(finished_turn),
+    )
+
+
 class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
     """What both gemini bindings share: the request path, and what a response says about itself.
 
@@ -1739,13 +1755,11 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Read the model the response reports serving it and the response's own id.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Combine the response's id and model with request_id.
 
         Both fields are optional on the SDK response; an absent one reports as the empty string,
         which states the response named none without inventing a value.
-        request_id is None: the SDK models no request-id header (google-genai 2.16.0).
-
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
@@ -1753,7 +1767,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         return ResponseIdentity(
             model_served=response.model_version or "",
             response_id=response.response_id or "",
-            request_id=None,
+            request_id=request_id,
         )
 
     @override
@@ -1823,11 +1837,7 @@ class _BoundGeminiText(_BoundGemini[str]):
         finished_turn = _finished_turn_or_no_output(_as_response(raw))
         if isinstance(finished_turn, NoOutput):
             return finished_turn
-        return AdapterResult(
-            output=finished_turn.assistant_message.text,
-            assistant_message=finished_turn.assistant_message,
-            stop_reason=_normalized_stop_reason(finished_turn),
-        )
+        return _adapter_result(finished_turn, finished_turn.assistant_message.text)
 
 
 class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
@@ -1846,11 +1856,11 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         self._provider_tool_fields = provider_tool_fields
         self._output_type_adapter = output_type_adapter
 
-    def _parsed_output(self, finished_turn: _FinishedTurn) -> ModelT | None | NoOutputOutcome:
+    def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
         Validating here rather than in the SDK is what puts the response and its text in scope when
-        the text is rejected; the anthropic adapter's _parsed_output states the shared reasoning,
+        the text is rejected; the anthropic adapter's _parsed_outcome states the shared reasoning,
         and the ordering matches it: the finish reason is read before the rejection, so text the
         token cap cut mid-object is reported as the truncation and not as a violation of the schema
         it was closing.
@@ -1859,7 +1869,8 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         text = finished_turn.assistant_message.text
         if text:
             try:
-                return self._output_type_adapter.validate_json(text)
+                output = self._output_type_adapter.validate_json(text)
+                return _adapter_result(finished_turn, output)
             except ValidationError as rejection:
                 validation_error = rejection
         finish_reason = finished_turn.finish_reason
@@ -1871,7 +1882,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
                 assistant_message=assistant_message,
             )
         if assistant_message.tool_calls:
-            return None
+            return _adapter_result(finished_turn, None)
         if finish_reason in _REFUSAL_FINISH_REASONS:
             return Refusal(assistant_message=assistant_message)
         if finish_reason == types.FinishReason.MAX_TOKENS:
@@ -1893,11 +1904,4 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         finished_turn = _finished_turn_or_no_output(_as_response(raw))
         if isinstance(finished_turn, NoOutput):
             return finished_turn
-        output = self._parsed_output(finished_turn)
-        if isinstance(output, NoOutput):
-            return output
-        return AdapterResult(
-            output=output,
-            assistant_message=finished_turn.assistant_message,
-            stop_reason=_normalized_stop_reason(finished_turn),
-        )
+        return self._parsed_outcome(finished_turn)

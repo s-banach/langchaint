@@ -1,17 +1,14 @@
-# Vendored GenAI payload schemas
+# Vendored GenAI semantic-convention data
 
-Source: <https://github.com/open-telemetry/semantic-conventions-genai>, `model/gen-ai/`, at commit `c26a2c21d1ee70d5231bd440c7b48d3c94ee506a`.
+Source repository: <https://github.com/open-telemetry/semantic-conventions-genai>.
+Source branch: `main`.
 
-Licensed Apache-2.0 by the OpenTelemetry Authors, copied unmodified.
+Payload schemas come from `model/gen-ai/gen-ai-*.json`.
+Provider names come from `model/gen-ai/registry.yaml`.
 
-These are the JSON Schemas the GenAI semantic convention attaches to the span
-attributes whose semconv type is `any`, which is every attribute carrying a
-structured payload. Nothing publishes them to a package registry, so the copies
-here are the pin. `tests/test_tracing.py` validates against them every payload the
-tracing module emits, less the paths its `_UNVALIDATED_PAYLOAD_ATTRIBUTES` exempts
-and documents. What these schemas do and do not enforce is recorded there too:
-each `anyOf` over element types ends in a catch-all variant, so a green run means less
-than full conformance.
+OpenTelemetry Authors license these files under Apache-2.0.
+Payload schemas are copied unchanged.
+Provider names are extracted and sorted.
 
 Refresh with `uv run python -m scripts.refresh_semconv_genai`, then read `git diff`.
 

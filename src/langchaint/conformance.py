@@ -433,8 +433,7 @@ class AdapterConformance(ABC):
     ) -> None:
         """failure_types entries are strict Exception subclasses, and TransientError is one.
 
-        SharedBackoff rejects anything else at construction, so a violation here fails before any
-        request. TransientError is required because the retry loop raises it inside the admitted()
+        TransientError is required because the retry loop raises it inside the admitted()
         block for a billable response reporting a transient failure; an adapter without it would
         leave those failures unrecorded.
         """

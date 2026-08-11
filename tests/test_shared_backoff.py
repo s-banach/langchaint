@@ -6,11 +6,9 @@ _set_wait_ceiling under a fake clock, which no timer reads because no request qu
 """
 
 import asyncio
-import gc
 import time
-import warnings
 from collections.abc import Callable, Coroutine
-from typing import override
+from typing import Literal, override
 
 import pytest
 
@@ -47,7 +45,7 @@ def _shared_backoff(
     wait_multiplier: float = 2.0,
     quiet_seconds_per_decay_step: float = 60.0,
     max_request_starts_per_second: float = 200.0,
-    on_parse_error: str = "raise",
+    on_parse_error: Literal["raise", "retry_this_one"] = "raise",
 ) -> SharedBackoff:
     """Build a SharedBackoff with test-friendly defaults, overridable per test."""
     return SharedBackoff(
@@ -59,7 +57,6 @@ def _shared_backoff(
         wait_multiplier=wait_multiplier,
         quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         max_request_starts_per_second=max_request_starts_per_second,
-        # pyrefly: ignore[bad-argument-type]  # str, so tests can pass invalid values
         on_parse_error=on_parse_error,
     )
 
@@ -128,38 +125,12 @@ def test_constructor_rejects_invalid_max_concurrent_requests() -> None:
     _ = _shared_backoff(max_concurrent_requests=8)
 
 
-def test_constructor_rejects_unknown_on_parse_error() -> None:
-    """on_parse_error takes exactly "raise" and "retry_this_one"."""
-    with pytest.raises(ValueError, match="on_parse_error"):
-        _ = _shared_backoff(on_parse_error="quiet")
-    _ = _shared_backoff(on_parse_error="retry_this_one")
-
-
-def test_constructor_rejects_a_coroutine_parse() -> None:
-    """A coroutine parse can never be awaited by the synchronous exit."""
-
-    async def parse(_failure: Exception) -> Verdict:
-        return DoNotRetry()
-
-    with pytest.raises(ValueError, match="parse"):
-        # pyrefly: ignore[bad-argument-type]  # the rejection under test
-        _ = _shared_backoff(parse=parse)
-
-
-def test_constructor_rejects_failure_types_wider_than_exception() -> None:
-    """Exception itself and anything reaching only BaseException are rejected."""
-    for failure_type in (Exception, BaseException, KeyboardInterrupt, SystemExit):
-        with pytest.raises(ValueError, match="failure_types"):
-            _ = SharedBackoff(
-                parse=_retry_verdict,
-                # pyrefly: ignore[bad-argument-type]  # the rejection under test
-                failure_types=(failure_type,),
-                max_concurrent_requests=1,
-            )
+def test_constructor_rejects_exception_as_a_failure_type() -> None:
+    """Exception would include caller defects outside provider failures."""
     with pytest.raises(ValueError, match="failure_types"):
         _ = SharedBackoff(
             parse=_retry_verdict,
-            failure_types=(asyncio.CancelledError,),  # pyrefly: ignore[bad-argument-type]
+            failure_types=(Exception,),
             max_concurrent_requests=1,
         )
 
@@ -388,42 +359,6 @@ def test_a_raising_parse_raises_parser_contract_error_with_the_full_chain() -> N
     _run(scenario)
 
 
-def test_a_non_verdict_return_raises_parser_contract_error() -> None:
-    """A parse returning something that is not a verdict is a contract violation."""
-
-    async def scenario() -> None:
-        shared_backoff = _shared_backoff(
-            parse=lambda _failure: "nonsense"  # pyrefly: ignore[bad-argument-type]
-        )
-        with pytest.raises(ParserContractError) as caught:
-            await _raise_in_block(shared_backoff.admitted(), ProviderFailure("429"))
-        assert caught.value.__cause__ is None
-        assert isinstance(caught.value.__context__, ProviderFailure)
-
-    _run(scenario)
-
-
-def test_a_parse_returning_a_coroutine_is_a_contract_violation_with_no_warning() -> None:
-    """The wrapper closes the coroutine, so no unawaited-coroutine warning fires."""
-
-    async def verdict_coroutine() -> Verdict:
-        return DoNotRetry()
-
-    async def scenario() -> None:
-        shared_backoff = _shared_backoff(
-            # A callable whose __call__ is synchronous but returns an awaitable, which the
-            # construction-time coroutine-function check cannot catch.
-            parse=lambda _failure: verdict_coroutine()  # pyrefly: ignore[bad-argument-type]
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            with pytest.raises(ParserContractError):
-                await _raise_in_block(shared_backoff.admitted(), ProviderFailure("429"))
-            _ = gc.collect()
-
-    _run(scenario)
-
-
 def test_the_retry_this_one_fallback_corrects_a_parse_defect() -> None:
     """Under the fallback the defect becomes RetryThisOne, counted, and the failure propagates."""
 
@@ -447,14 +382,13 @@ def test_retry_after_normalization() -> None:
 
     The wrapper normalizes before either _record or Admission.verdict sees the verdict.
     """
-    cases: list[tuple[object, float | None]] = [
+    cases: list[tuple[float, float | None]] = [
         (-5, None),
         (0, None),
         (float("nan"), None),
         (float("-inf"), None),
         (float("inf"), None),
         (True, None),
-        ("60", None),
         (-(10**1000), None),
         (9999, 60.0),
         (10**1000, 60.0),
@@ -465,7 +399,6 @@ def test_retry_after_normalization() -> None:
     async def scenario() -> None:
         for stated, expected in cases:
             shared_backoff = _shared_backoff(
-                # pyrefly: ignore[bad-argument-type]  # invalid retry_after is the case under test
                 parse=lambda _failure, stated=stated: PauseAll(retry_after=stated)
             )
             admission = await _fail_one_attempt(shared_backoff)

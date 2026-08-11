@@ -82,7 +82,7 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutputOutcome,
+    NoOutput,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
@@ -1698,9 +1698,9 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
     )
 
 
-def _structured_parse(response: OpenAIResponse) -> _StructuredReport | None | NoOutputOutcome:
+def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport | None]:
     """Run the structured binding's parse over one response, with the turn that response carries."""
-    return _structured_bound()._parsed_output(response, _assistant_message_from(response))
+    return _structured_bound()._parsed_outcome(response, _assistant_message_from(response))
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1747,7 +1747,28 @@ def _structured_response(
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's output text into the response_format."""
     outcome = _structured_parse(_structured_response(_REPORT_JSON))
-    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
+
+
+def test_structured_output_may_inherit_no_output() -> None:
+    """AdapterResult distinguishes successful output from NoOutput."""
+
+    class ReportAlsoNoOutput(BaseModel, NoOutput):
+        assistant_message: AssistantMessage = AssistantMessage(turn=())
+        city: str
+        celsius: int
+
+    adapter = _adapter()
+    bound = _BoundOpenAIStructured(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(system_prompt="sys", automatic_prompt_caching=False)
+        ),
+        response_format=ReportAlsoNoOutput,
+    )
+    outcome = bound.interpret(_structured_response(_REPORT_JSON))
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
@@ -1787,19 +1808,20 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
     """A completed turn whose output is a function call parses no instance and nothing went wrong."""
-    assert _structured_parse(_structured_response(None, tool_call=True)) is None
+    outcome = _structured_parse(_structured_response(None, tool_call=True))
+    assert _assert_result(outcome).output is None
 
 
 def test_structured_bind_reports_a_tool_call_turn_whose_text_is_not_the_instance_as_none() -> None:
     """A tool-call turn whose text is prose is the tool call, not a schema violation."""
     outcome = _structured_parse(_structured_response("let me look that up", tool_call=True))
-    assert outcome is None
+    assert _assert_result(outcome).output is None
 
 
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
     """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
     outcome = _structured_parse(_structured_response(_REPORT_JSON, tool_call=True))
-    assert outcome == _StructuredReport(city="Nairobi", celsius=25)
+    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
 
 
 def _text_bound() -> _BoundOpenAIText:
@@ -1829,21 +1851,18 @@ def test_identity_reads_the_responses_own_id_and_served_model() -> None:
     A response the SDK did not parse from an HTTP response body carries no request id, which is the
     state every streamed response is in.
     """
-    identity = _text_bound().identity_from_raw(_response(usage=None, model="m-2026-01-01"))
+    identity = _text_bound().identity_from_raw(
+        _response(usage=None, model="m-2026-01-01"), request_id=None
+    )
     assert identity == ResponseIdentity(
         model_served="m-2026-01-01", response_id="r1", request_id=None
     )
 
 
-def test_identity_reads_the_request_id_the_sdk_attached_to_the_response() -> None:
-    """A response parsed from a response body carries the request-id header, which identity reports.
-
-    The assignment is what the SDK's own add_request_id does to every model it parses from a body
-    (openai 2.48.0).
-    """
+def test_identity_reads_the_adapter_stream_request_id() -> None:
+    """The AdapterStream request id reaches ResponseIdentity unchanged."""
     response = _response(usage=None)
-    response._request_id = "req_openai"
-    identity = _text_bound().identity_from_raw(response)
+    identity = _text_bound().identity_from_raw(response, request_id="req_openai")
     assert identity.request_id == "req_openai"
 
 

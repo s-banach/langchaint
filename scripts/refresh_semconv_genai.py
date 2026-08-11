@@ -1,43 +1,13 @@
-"""Refresh the vendored GenAI payload JSON schemas and record the commit they came from.
+"""Refresh vendored GenAI data from one OpenTelemetry commit.
 
-The schemas describe the structured payloads the tracing module writes into
-gen_ai.system_instructions, gen_ai.tool.definitions, gen_ai.input.messages,
-gen_ai.output.messages, gen_ai.tool.call.arguments, and gen_ai.tool.call.result.
-They are vendored because nothing publishes them: open-telemetry/semantic-conventions-genai
-releases only GitHub Releases with no package-registry artifact, and the per-language
-semantic-convention packages carry attribute name constants only, no payload schemas
-(opentelemetry-semantic-conventions 0.64b0 ships .py files and no data files at all).
-The convention references each schema from an annotation on the attribute it describes,
-where the attribute's own semconv type is `any`:
-
-    type: any
-    annotations:
-      type:
-        json_schema: model/gen-ai/gen-ai-tool-definitions.json
-
-Only the six schemas the tracing module can emit are vendored; gen-ai-memory-records.json
-and gen-ai-retrieval-documents.json describe attributes langchaint never writes.
-
-Run it with zero arguments: `uv run python -m scripts.refresh_semconv_genai`. The upstream
-repository, the file list, and the destination are the constants below, so the run is
-committed, not assembled at the invocation. DESTINATION is resolved from this file rather
-than the working directory, so a run from elsewhere refreshes the vendored copies instead
-of quietly creating a tests/semconv_genai beside wherever it was launched.
-It resolves the head of BRANCH first and fetches every file at that one commit,
-so the schemas and the sha in SOURCE_DOC cannot disagree.
-Rerunning is how drift is detected: refresh, then read `git diff` over the .json files. No diff
-there means the schemas have not moved, whatever SOURCE_DOC's sha now says, because that sha
-advances on every upstream commit including the many that touch no schema. A failing `scripts/CI.sh`
-over a diff in the .json files names the payload that no longer conforms; a passing one means every
-payload still validates, which is weaker than full conformance because each anyOf over element types
-ends in a catch-all variant that admits a renamed type (the limits are in _validate_payload_attributes).
-The monthly .github/workflows/refresh_semconv_genai.yml runs exactly this, applies that same
-schemas-only test, and opens a pull request when they moved, so the diff reaches review without
-anyone remembering to look.
+Payload schemas validate tracing values.
+`provider-name-values.json` validates built-in `provider_name` values.
+Run `uv run python -m scripts.refresh_semconv_genai` without arguments.
 """
 
 import json
 import pathlib
+import re
 import urllib.request
 
 REPO = "open-telemetry/semantic-conventions-genai"
@@ -45,6 +15,8 @@ BRANCH = "main"
 MODEL_DIR = "model/gen-ai"
 DESTINATION = pathlib.Path(__file__).parent.parent / "tests" / "semconv_genai"
 SOURCE_DOC = DESTINATION / "SOURCE.md"
+REGISTRY_FILE = "registry.yaml"
+PROVIDER_NAME_VALUES_FILE = "provider-name-values.json"
 
 ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.system_instructions": "gen-ai-system-instructions.json",
@@ -54,14 +26,11 @@ ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.tool.call.arguments": "gen-ai-tool-call-arguments.json",
     "gen_ai.tool.call.result": "gen-ai-tool-call-result.json",
 }
-"""Each payload attribute the tracing module emits, mapped to the schema describing it.
+"""Map each emitted payload attribute to its schema.
 
-This is the fetch list and the table written into SOURCE_DOC, so a schema can only be
-vendored by being named here beside the attribute that justifies it.
-tests/test_tracing.py imports this map rather than restating it, and checks it against
-three sources that do not come from here: the schema files on disk, the attribute keys the
-tracing module emits, and upstream's own naming, which names each schema after the attribute
-it describes. So an edit here that mislabels SOURCE_DOC's attribute column fails that test.
+The refresh fetches these schemas.
+SOURCE_DOC lists this mapping.
+tests/test_tracing.py compares it against vendored files, tracing keys, and upstream filenames.
 """
 
 
@@ -91,23 +60,85 @@ def resolve_head_sha() -> str:
     return sha
 
 
-def render_source_doc(sha: str) -> str:
-    """Render SOURCE_DOC recording where the schemas came from and how to refresh them."""
+def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
+    """Extract sorted `gen_ai.provider.name` values.
+
+    Raises:
+        ValueError: The registry attribute is missing, duplicated, empty, or malformed.
+    """
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{REGISTRY_FILE} must be UTF-8") from error
+    attribute_pattern = re.compile(r"^  - key: gen_ai\.provider\.name\s*$")
+    starts = [index for index, line in enumerate(lines) if attribute_pattern.fullmatch(line)]
+    if len(starts) != 1:
+        raise ValueError(f"{REGISTRY_FILE} must define gen_ai.provider.name exactly once")
+    start = starts[0]
+    end = next(
+        (index for index in range(start + 1, len(lines)) if lines[index].startswith("  - key:")),
+        len(lines),
+    )
+    attribute_lines = lines[start:end]
+    if attribute_lines.count("    type:") != 1:
+        raise ValueError("gen_ai.provider.name must define one type mapping")
+    if attribute_lines.count("      members:") != 1:
+        raise ValueError("gen_ai.provider.name type must define one members list")
+    members_start = attribute_lines.index("      members:") + 1
+    members_end = next(
+        (
+            index
+            for index in range(members_start, len(attribute_lines))
+            if attribute_lines[index].strip()
+            and len(attribute_lines[index]) - len(attribute_lines[index].lstrip()) <= 6
+        ),
+        len(attribute_lines),
+    )
+    member_starts = [
+        index
+        for index in range(members_start, members_end)
+        if attribute_lines[index].startswith("        - ")
+    ]
+    if not member_starts:
+        raise ValueError("gen_ai.provider.name members must not be empty")
+    values: list[str] = []
+    for position, member_start in enumerate(member_starts):
+        member_end = (
+            member_starts[position + 1] if position + 1 < len(member_starts) else members_end
+        )
+        value_lines = [
+            line.removeprefix("          value: ")
+            for line in attribute_lines[member_start:member_end]
+            if line.startswith("          value: ")
+        ]
+        if len(value_lines) != 1:
+            raise ValueError("each gen_ai.provider.name member must define one value")
+        try:
+            value: object = json.loads(value_lines[0])
+        except json.JSONDecodeError as error:
+            raise ValueError("gen_ai.provider.name values must be JSON strings") from error
+        if not isinstance(value, str) or not value:
+            raise ValueError("gen_ai.provider.name values must be non-empty strings")
+        values.append(value)
+    if len(values) != len(set(values)):
+        raise ValueError("gen_ai.provider.name values must be unique")
+    return tuple(sorted(values))
+
+
+def render_source_doc() -> str:
+    """Render SOURCE_DOC with source paths and refresh instructions."""
     lines = [
-        "# Vendored GenAI payload schemas",
+        "# Vendored GenAI semantic-convention data",
         "",
-        f"Source: <https://github.com/{REPO}>, `{MODEL_DIR}/`, at commit `{sha}`.",
+        f"Source repository: <https://github.com/{REPO}>.",
+        f"Source branch: `{BRANCH}`.",
         "",
-        "Licensed Apache-2.0 by the OpenTelemetry Authors, copied unmodified.",
+        f"Payload schemas come from `{MODEL_DIR}/gen-ai-*.json`.",
+        f"Provider names come from `{MODEL_DIR}/{REGISTRY_FILE}`.",
         "",
-        "These are the JSON Schemas the GenAI semantic convention attaches to the span",
-        "attributes whose semconv type is `any`, which is every attribute carrying a",
-        "structured payload. Nothing publishes them to a package registry, so the copies",
-        "here are the pin. `tests/test_tracing.py` validates against them every payload the",
-        "tracing module emits, less the paths its `_UNVALIDATED_PAYLOAD_ATTRIBUTES` exempts",
-        "and documents. What these schemas do and do not enforce is recorded there too:",
-        "each `anyOf` over element types ends in a catch-all variant, so a green run means less",
-        "than full conformance.",
+        "OpenTelemetry Authors license these files under Apache-2.0.",
+        "Payload schemas are copied unchanged.",
+        "Provider names are extracted and sorted.",
         "",
         "Refresh with `uv run python -m scripts.refresh_semconv_genai`, then read `git diff`.",
         "",
@@ -119,22 +150,31 @@ def render_source_doc(sha: str) -> str:
 
 
 def main() -> None:
-    """Fetch every schema at one upstream commit and rewrite SOURCE_DOC with that sha.
+    """Fetch every vendored file from one upstream commit.
 
     Raises:
         urllib.error.HTTPError: an upstream request answered with an error status.
         urllib.error.URLError: the host could not be reached.
         json.JSONDecodeError: the commits endpoint returned a body that was not JSON.
         KeyError: the commits endpoint returned no sha, meaning the API shape changed.
-        OSError: a schema or SOURCE_DOC could not be written.
+        ValueError: registry.yaml is missing or malformed.
+        OSError: a vendored file could not be written.
     """
     sha = resolve_head_sha()
+    schema_contents = {
+        file: fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{file}")
+        for file in sorted(ATTRIBUTE_SCHEMA_FILES.values())
+    }
+    registry = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{REGISTRY_FILE}")
+    provider_name_values = provider_name_values_from_registry(registry)
     DESTINATION.mkdir(parents=True, exist_ok=True)
-    for file in sorted(ATTRIBUTE_SCHEMA_FILES.values()):
-        content = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{file}")
+    for file, content in schema_contents.items():
         _ = (DESTINATION / file).write_bytes(content)
         print(f"wrote {DESTINATION / file} ({len(content)} bytes)")
-    _ = SOURCE_DOC.write_text(render_source_doc(sha))
+    provider_name_values_path = DESTINATION / PROVIDER_NAME_VALUES_FILE
+    _ = provider_name_values_path.write_text(json.dumps(provider_name_values, indent=2) + "\n")
+    print(f"wrote {provider_name_values_path}")
+    _ = SOURCE_DOC.write_text(render_source_doc())
     print(f"wrote {SOURCE_DOC} at {sha}")
 
 

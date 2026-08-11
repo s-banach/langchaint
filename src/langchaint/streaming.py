@@ -675,8 +675,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 self._ledger.stage_response(
                     raw=raw,
                     billing=self._bound_adapter.billing_from_raw(raw),
-                    identity=self._bound_adapter.identity_from_raw(raw).with_request_id_fallback(
-                        adapter_stream.request_id()
+                    identity=self._bound_adapter.identity_from_raw(
+                        raw, request_id=adapter_stream.request_id()
                     ),
                 )
                 self._conclusion = self._conclude(

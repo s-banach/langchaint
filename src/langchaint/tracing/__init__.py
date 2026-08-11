@@ -1439,8 +1439,6 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         for, configured on the SDK where every other tracing volume decision is made.
 
         Raises:
-            TypeError: generation_inputs is a bare str (the whole-batch guard, in the delegated
-                method).
             asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
                 ended.
             BaseException: an item raised a BaseException that is not an Exception, which langchaint

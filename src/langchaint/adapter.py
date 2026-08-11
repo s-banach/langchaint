@@ -132,15 +132,6 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
     return None
 
 
-def request_id_from_raw(raw: BaseModel) -> str | None:
-    """Read the request-id header both SDKs attach to a response they parsed from an HTTP body.
-
-    Absent rather than None on a response the streaming helper assembled from events, and None where
-    the response arrived without the header (anthropic 0.120.0, openai 2.48.0).
-    """
-    return getattr(raw, "_request_id", None)
-
-
 def terminal_classification_from_response(
     *, status_code: int, headers: Mapping[str, str]
 ) -> Literal["invalid_request", "declared_final", "unknown_exception"]:
@@ -408,11 +399,6 @@ class AdapterResult[OutputT]:
 class NoOutput:
     """The shared shape of a 200 that produced no output: the turn it produced instead.
 
-    Declares assistant_message once, and is the runtime test that narrows to NoOutputOutcome:
-    isinstance rejects a type alias, so an adapter helper whose result is an output value or a variant
-    tests against this base and annotates the variants as NoOutputOutcome.
-    Every subclass must be a variant of that alias; that is what makes the test sound.
-
     assistant_message is whatever turn the response carried, which every variant has one of and none
     of them can return as the output: the sentences a refusal wrote, the text a schema violation
     rejected, the fragment a run that failed had emitted. The retry loop puts it on the attempt's
@@ -591,15 +577,19 @@ def request_json(request: RequestParams, *, omitted_class: type) -> str:
 def _without_omitted(value: object, omitted_class: type) -> object:
     """Return value with every mapping key whose value is an omit sentinel dropped, recursively."""
     if isinstance(value, dict):
-        mapping: dict[object, object] = value
-        return {
-            key: _without_omitted(item, omitted_class)
-            for key, item in mapping.items()
-            if not isinstance(item, omitted_class)
-        }
+        without_omitted: dict[object, object] = {}
+        for key, item in value.items():
+            key_object: object = key
+            item_object: object = item
+            if not isinstance(item_object, omitted_class):
+                without_omitted[key_object] = _without_omitted(item_object, omitted_class)
+        return without_omitted
     if isinstance(value, list):
-        items: list[object] = value
-        return [_without_omitted(item, omitted_class) for item in items]
+        without_omitted_items: list[object] = []
+        for item in value:
+            item_object: object = item
+            without_omitted_items.append(_without_omitted(item_object, omitted_class))
+        return without_omitted_items
     return value
 
 
@@ -622,8 +612,7 @@ type NoOutputOutcome = (
 )
 """Every outcome of a billable 200 that produced no output.
 
-The type an adapter helper returns beside its output value, tested at runtime with
-isinstance(x, NoOutput). Spelled as the concrete variants rather than as NoOutput so that a match on
+Spelled as the concrete variants rather than as NoOutput so that a match on
 kind over it, or over ResponseOutcome, is provably exhaustive: a variant added here without a match
 case in each retry loop is a type error rather than a silent fall-through.
 The variants differ in what the retry loop does with them, which is why they are separate types rather
@@ -726,13 +715,13 @@ class BoundAdapter[OutputT](ABC):
         ...
 
     @abstractmethod
-    def identity_from_raw(self, raw: BaseModel) -> ResponseIdentity:
-        """Read what the response says about itself: its ids and the model that served it.
+    def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
+        """Build ResponseIdentity from raw and request_id.
 
         Called on every response the moment it arrives, beside billing_from_raw. No I/O.
         Return response_id as a str, converting it here where a provider's own is not one:
         the adapter is the only place that knows the format, and langchaint invents no id.
-        request_id is None where the response carries no request-id header.
+        request_id comes from the AdapterStream that produced raw.
 
         Raises:
             TypeError: raw is not the SDK response type this bound adapter produces, which is a
@@ -907,8 +896,7 @@ class Adapter(ABC):
     status and error type parse reads, plus TransientError, which the retry loop raises for a 200
     whose body reports a transient failure. Transport failures that produced nothing parseable (a
     connection drop, a timeout) stay out, propagating unparsed for classify to sort.
-    Every entry must be a strict subclass of Exception; SharedBackoff rejects anything else at
-    construction.
+    Every entry must be a strict subclass of Exception.
     """
 
     @abstractmethod

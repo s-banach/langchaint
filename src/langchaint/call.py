@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 class ResponseIdentity(NamedTuple):
-    """What one response says about itself: its ids and the model that served it.
+    """Identifiers recorded for one response.
 
     Returned by BoundAdapter.identity_from_raw, and the source of the AttemptRecord fields of the
     same names.
@@ -39,17 +39,6 @@ class ResponseIdentity(NamedTuple):
     model_served: str
     response_id: str
     request_id: str | None
-
-    def with_request_id_fallback(self, request_id: str | None) -> "ResponseIdentity":
-        """Fill request_id from the open stream when the response itself carries none.
-
-        A response the SDK assembled from stream events need not carry the request-id header its
-        HTTP response did; the stream is what still has it. A request_id the response does carry
-        wins, being the header of the request that came back.
-        """
-        if self.request_id is not None:
-            return self
-        return self._replace(request_id=request_id)
 
 
 @dataclass(frozen=True, kw_only=True)

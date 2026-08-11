@@ -117,7 +117,7 @@ def test_a_subclass_inheriting_forbid_from_its_base_passes_without_restating_it(
         other: int
 
     with pytest.raises(ValidationError, match="junk"):
-        _ = Child(value=1, other=2, junk=3)  # pyrefly: ignore[unexpected-keyword]
+        _ = Child.model_validate({"value": 1, "other": 2, "junk": 3})
 
 
 def test_construction_rejects_a_key_that_is_not_a_field() -> None:
@@ -127,19 +127,19 @@ def test_construction_rejects_a_key_that_is_not_a_field() -> None:
     class-definition hook above is what keeps the rest of them from regressing.
     """
     with pytest.raises(ValidationError, match="inpit_tokens_cache_read"):
-        _ = Usage(
-            input_tokens_cache_read=0,
-            input_tokens_cache_write=0,
-            input_tokens_cache_none=1,
-            output_tokens=1,
-            output_tokens_reasoning=0,
-            input_tokens_cache_read_cost_in_usd=0.0,
-            input_tokens_cache_write_cost_in_usd=0.0,
-            input_tokens_cache_none_cost_in_usd=0.0,
-            output_tokens_cost_in_usd=0.0,
-            provider_executed_tool_cost_in_usd=0.0,
-            inpit_tokens_cache_read=1,  # pyrefly: ignore[unexpected-keyword]
-        )
+        _ = Usage.model_validate({
+            "input_tokens_cache_read": 0,
+            "input_tokens_cache_write": 0,
+            "input_tokens_cache_none": 1,
+            "output_tokens": 1,
+            "output_tokens_reasoning": 0,
+            "input_tokens_cache_read_cost_in_usd": 0.0,
+            "input_tokens_cache_write_cost_in_usd": 0.0,
+            "input_tokens_cache_none_cost_in_usd": 0.0,
+            "output_tokens_cost_in_usd": 0.0,
+            "provider_executed_tool_cost_in_usd": 0.0,
+            "inpit_tokens_cache_read": 1,
+        })
 
 
 @pytest.mark.parametrize(

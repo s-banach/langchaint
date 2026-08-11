@@ -4,6 +4,8 @@ These tests cover identifiers, pricing objects, overrides, and client routing.
 """
 
 import asyncio
+import json
+import pathlib
 from collections.abc import Callable
 
 import httpx
@@ -11,7 +13,6 @@ import pytest
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
-from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 
 from langchaint import LLM
 from langchaint.adapter import Adapter
@@ -86,6 +87,19 @@ _ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
     )
 }
 """The gemini counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
+
+
+@pytest.fixture(scope="module", name="provider_name_values")
+def _provider_name_values_fixture() -> set[str]:
+    path = pathlib.Path(__file__).parent / "semconv_genai" / "provider-name-values.json"
+    payload: object = json.loads(path.read_text())
+    assert isinstance(payload, list)
+    values: set[str] = set()
+    for value in payload:
+        assert isinstance(value, str)
+        values.add(value)
+    assert len(values) == len(payload)
+    return values
 
 
 @pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
@@ -651,13 +665,12 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
     ],
 )
 def test_each_model_states_a_convention_provider_name(
-    build_llm: Callable[[], LLM], expected_provider_name: str
+    build_llm: Callable[[], LLM], expected_provider_name: str, provider_name_values: set[str]
 ) -> None:
     """Require a convention value for each adapter's `provider_name`."""
-    defined = {member.value for member in gen_ai_semconv.GenAiProviderNameValues}
     adapter = build_llm().adapter
     assert adapter.provider_name == expected_provider_name
-    assert adapter.provider_name in defined
+    assert adapter.provider_name in provider_name_values
 
 
 @pytest.mark.parametrize(

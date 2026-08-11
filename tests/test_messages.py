@@ -142,13 +142,6 @@ def test_tool_message_error_accepts_part_content() -> None:
     assert message.is_error is True
 
 
-def test_tool_message_is_frozen() -> None:
-    """ToolMessage is immutable; reassigning content raises."""
-    message = ToolMessage(tool_call_id="c1", content="ok")
-    with pytest.raises(ValidationError):
-        message.content = "changed"  # pyrefly: ignore[read-only]
-
-
 def test_binary_image_bytes_round_trip_through_json() -> None:
     """A UserMessage and a ToolMessage holding non-UTF-8 image bytes survive the JSON round trip.
 

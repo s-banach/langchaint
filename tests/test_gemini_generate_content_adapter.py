@@ -49,6 +49,7 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    NoOutput,
     Refusal,
     RequestParams,
     SchemaViolation,
@@ -655,6 +656,13 @@ def test_extra_body_generation_config_must_be_an_object(not_an_object: object) -
         _ = _adapter().bind_text(_binding(extra_body={"generationConfig": not_an_object}))
 
 
+def test_extra_body_generation_config_rejects_a_non_string_key() -> None:
+    """Invalid `generationConfig` keys fail before collision detection."""
+    generation_config: dict[object, object] = {1: "value", "temperature": 0.1}
+    with pytest.raises(ValueError, match="only string keys"):
+        _ = _adapter().bind_text(_binding(extra_body={"generationConfig": generation_config}))
+
+
 def test_extra_body_passes_unpopulated_keys_through() -> None:
     """Unmapped wire fields stay reachable, delivered as per-request HttpOptions.extra_body."""
     extra_body = {"cachedContent": "caches/abc", "generationConfig": {"topK": 5}}
@@ -1046,6 +1054,19 @@ def test_structured_binding_outcomes() -> None:
     assert "LANGUAGE" in unfinished.reason
 
 
+def test_structured_output_may_inherit_no_output() -> None:
+    """AdapterResult distinguishes successful output from NoOutput."""
+
+    class ReportAlsoNoOutput(BaseModel, NoOutput):
+        assistant_message: AssistantMessage = AssistantMessage(turn=())
+        value: int
+
+    bound = _adapter().bind_structured(_binding(), ReportAlsoNoOutput)
+    outcome = bound.interpret(_response([types.Part(text='{"value": 3}')]))
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.output == ReportAlsoNoOutput(value=3)
+
+
 def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
     """Only non-thought text is the candidate instance."""
     bound = _adapter().bind_structured(_binding(), _Answer)
@@ -1062,13 +1083,13 @@ def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
 def test_identity_reads_the_response_fields() -> None:
     """model_version and response_id report as-is, absent ones as the empty string."""
     bound = _adapter().bind_text(_binding())
-    identity = bound.identity_from_raw(_response([types.Part(text="hi")]))
+    identity = bound.identity_from_raw(_response([types.Part(text="hi")]), request_id="req-gemini")
     assert (identity.model_served, identity.response_id, identity.request_id) == (
         "gemini-3.5-flash",
         "resp-1",
-        None,
+        "req-gemini",
     )
-    bare = bound.identity_from_raw(types.GenerateContentResponse())
+    bare = bound.identity_from_raw(types.GenerateContentResponse(), request_id=None)
     assert (bare.model_served, bare.response_id) == ("", "")
 
 

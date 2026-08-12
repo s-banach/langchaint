@@ -51,7 +51,6 @@ async def stream_tool_call() -> Response[str]:
     bound = openai.model("gpt-5.6-terra", reasoning_summary="auto").bind(
         tools=[get_weather],
         tool_choice=SpecificToolChoice(tool_name=get_weather.name),
-        automatic_prompt_caching=False,
     )
 
     async with bound.stream_one("What is the weather in Oslo?") as handle:

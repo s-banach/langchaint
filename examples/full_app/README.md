@@ -57,7 +57,7 @@ For example, the first specialist uses `root/research_climate/specialist#0`.
 
 ## Required configuration
 
-`AgentConfig.automatic_prompt_caching` has no default.
+`AgentConfig.automatic_cache_breakpoints` has no default.
 Each binding receives that exact value.
 `App.capture_message_content` has no default.
 Each tracing wrapper receives that exact value.

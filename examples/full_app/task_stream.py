@@ -606,7 +606,7 @@ def build_delegate_tool(
                 system_prompt=sub_config.system_prompt,
                 tools=_tools_for(sub_config, [search_tool]),
                 max_attempts=sub_config.max_attempts,
-                automatic_prompt_caching=sub_config.automatic_prompt_caching,
+                automatic_cache_breakpoints=sub_config.automatic_cache_breakpoints,
             ),
             prompt=args.question,
         )
@@ -700,7 +700,7 @@ class App:
                 system_prompt=config.system_prompt,
                 tools=_tools_for(config, tools),
                 max_attempts=config.max_attempts,
-                automatic_prompt_caching=config.automatic_prompt_caching,
+                automatic_cache_breakpoints=config.automatic_cache_breakpoints,
             ),
             prompt=prompt,
         )

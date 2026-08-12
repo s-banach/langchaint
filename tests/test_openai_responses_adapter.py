@@ -725,7 +725,7 @@ def test_wire_input_sends_image_url_parts_unchanged() -> None:
 def test_build_request_reports_audio_as_invalid_request(message: Message) -> None:
     """OpenAIResponsesAdapter returns InvalidRequest for AudioPart."""
     request = (
-        _adapter().bind_text(_binding(automatic_prompt_caching=True)).build_request([message])
+        _adapter().bind_text(_binding(automatic_cache_breakpoints=True)).build_request([message])
     )
     assert isinstance(request, InvalidRequest)
     assert "AudioPart" in request.reason
@@ -765,7 +765,7 @@ def _adapter(
 
 def _binding(
     *,
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
     reasoning_effort: ReasoningEffort | None = None,
@@ -780,7 +780,7 @@ def _binding(
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort=reasoning_effort),
-        automatic_prompt_caching=automatic_prompt_caching,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
@@ -808,7 +808,7 @@ def test_request_assembles_the_reasoning_object_key_by_key(
     over one Reasoning(effort=..., summary=...) call.
     """
     precomputed_fields = _adapter(reasoning_summary=reasoning_summary)._precompute_fields(
-        _binding(automatic_prompt_caching=True, reasoning_effort=reasoning_effort)
+        _binding(automatic_cache_breakpoints=True, reasoning_effort=reasoning_effort)
     )
     if expected_reasoning is None:
         assert isinstance(precomputed_fields.reasoning, openai.Omit)
@@ -817,44 +817,43 @@ def test_request_assembles_the_reasoning_object_key_by_key(
 
 
 @pytest.mark.parametrize(
-    ("supports_prompt_cache_options", "automatic_prompt_caching", "expected_options"),
+    ("supports_prompt_cache_options", "automatic_cache_breakpoints", "expected_options"),
     [
         (True, False, {"mode": "explicit"}),
         (True, True, None),
         (False, True, None),
     ],
     ids=[
-        "supported_and_caching_disabled",
-        "supported_and_caching_automatic",
-        "unsupported_and_caching_automatic",
+        "supported_and_automatic_cache_breakpoints_disabled",
+        "supported_and_automatic_cache_breakpoints_enabled",
+        "unsupported_and_automatic_cache_breakpoints_enabled",
     ],
 )
-def test_request_sends_explicit_mode_exactly_when_the_binding_declines_caching(
+def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabled(
     expected_options: dict[str, str] | None,
     *,
     supports_prompt_cache_options: bool,
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
 ) -> None:
     """Explicit mode with no breakpoints is the one prompt_cache_options value langchaint sends.
 
-    Bound True leaves the omit sentinel whatever the model takes, so the provider's implicit caching
-    stays in place. The fourth combination, bound False on a model that takes no parameter, has no
-    row here because it raises instead of building fields.
+    `automatic_cache_breakpoints=True` leaves the omit sentinel.
+    `automatic_cache_breakpoints=False` without parameter support raises before building fields.
     """
     precomputed_fields = _adapter(
         supports_prompt_cache_options=supports_prompt_cache_options
-    )._precompute_fields(_binding(automatic_prompt_caching=automatic_prompt_caching))
+    )._precompute_fields(_binding(automatic_cache_breakpoints=automatic_cache_breakpoints))
     if expected_options is None:
         assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
     else:
         assert precomputed_fields.prompt_cache_options == expected_options
 
 
-def test_declining_caching_on_a_model_without_the_parameter_raises() -> None:
-    """A model taking no prompt_cache_options cannot be told to stop caching, so bind refuses."""
+def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises() -> None:
+    """`automatic_cache_breakpoints=False` requires `prompt_cache_options`."""
     with pytest.raises(ValueError, match="supports_prompt_cache_options"):
         _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
-            _binding(automatic_prompt_caching=False)
+            _binding(automatic_cache_breakpoints=False)
         )
 
 
@@ -867,7 +866,7 @@ def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
     """
     llm = LLM(_adapter(supports_prompt_cache_options=False))
     with pytest.raises(ValueError, match="model 'm'"):
-        _ = llm.bind(automatic_prompt_caching=False)
+        _ = llm.bind(automatic_cache_breakpoints=False)
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -876,7 +875,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
     different request from omitting the key.
     """
-    binding = _binding(automatic_prompt_caching=True)
+    binding = _binding(automatic_cache_breakpoints=True)
     assert isinstance(_adapter()._precompute_fields(binding).service_tier, openai.Omit)
     stated = OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
@@ -892,7 +891,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _adapter()._precompute_fields(_binding(automatic_prompt_caching=True))
+    unset = _adapter()._precompute_fields(_binding(automatic_cache_breakpoints=True))
     assert isinstance(unset.temperature, openai.Omit)
     binding = Binding(
         system_prompt=None,
@@ -901,14 +900,14 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(temperature=0.2),
-        automatic_prompt_caching=True,
+        automatic_cache_breakpoints=True,
     )
     assert _adapter()._precompute_fields(binding).temperature == 0.2
 
 
 def test_request_omits_tool_fields_without_tools() -> None:
     """No tools leaves tools, tool_choice, and parallel_tool_calls at the omit sentinel."""
-    precomputed_fields = _adapter()._precompute_fields(_binding(automatic_prompt_caching=True))
+    precomputed_fields = _adapter()._precompute_fields(_binding(automatic_cache_breakpoints=True))
     assert isinstance(precomputed_fields.tools, openai.Omit)
     assert isinstance(precomputed_fields.tool_choice, openai.Omit)
     assert isinstance(precomputed_fields.parallel_tool_calls, openai.Omit)
@@ -919,7 +918,7 @@ def test_provider_executed_tools_reach_responses_tools_unchanged() -> None:
     provider_tool: dict[str, object] = {"type": "web_search", "search_context_size": "low"}
     precomputed = _adapter()._precompute_fields(
         _binding(
-            automatic_prompt_caching=True,
+            automatic_cache_breakpoints=True,
             provider_executed_tools=(provider_tool,),
         )
     )
@@ -942,7 +941,7 @@ def test_every_supported_provider_executed_type_reaches_responses(tool_type: str
     """Each reviewed OpenAI provider-executed `type` reaches Responses unchanged."""
     provider_tool: dict[str, object] = {"type": tool_type}
     precomputed = _adapter()._precompute_fields(
-        _binding(automatic_prompt_caching=True, provider_executed_tools=(provider_tool,))
+        _binding(automatic_cache_breakpoints=True, provider_executed_tools=(provider_tool,))
     )
     assert precomputed.tools == [provider_tool]
 
@@ -970,7 +969,7 @@ def test_every_unlisted_provider_executed_type_is_rejected(tool_type: str) -> No
     with pytest.raises(ValueError, match="supported string type"):
         _ = _adapter()._precompute_fields(
             _binding(
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
                 provider_executed_tools=({"type": tool_type},),
             )
         )
@@ -989,7 +988,7 @@ def test_provider_executed_tools_require_direct_openai_billing() -> None:
     with pytest.raises(ValueError, match="provider_name='openai'"):
         _ = adapter._precompute_fields(
             _binding(
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
                 provider_executed_tools=({"type": "web_search"},),
             )
         )
@@ -1022,7 +1021,7 @@ def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
     with pytest.raises(ValueError, match="finite and nonnegative"):
         _ = adapter._precompute_fields(
             _binding(
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
                 provider_executed_tools=({"type": tool_type},),
             )
         )
@@ -1045,7 +1044,7 @@ def test_provider_executed_tools_follow_function_tools_in_responses() -> None:
     provider_tool: dict[str, object] = {"type": "web_search"}
     precomputed = _adapter()._precompute_fields(
         _binding(
-            automatic_prompt_caching=True,
+            automatic_cache_breakpoints=True,
             tool_schemas=(schema,),
             provider_executed_tools=(provider_tool,),
         )
@@ -1063,7 +1062,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
     """
     with pytest.raises(ValueError, match="temperature"):
         _ = _adapter()._precompute_fields(
-            _binding(automatic_prompt_caching=True, extra_body={"temperature": 0.5})
+            _binding(automatic_cache_breakpoints=True, extra_body={"temperature": 0.5})
         )
 
 
@@ -1080,7 +1079,7 @@ def test_the_request_sends_extra_body_by_reference(
     text_bound = _BoundOpenAIText(
         adapter=adapter,
         precomputed_fields=adapter._precompute_fields(
-            _binding(automatic_prompt_caching=True, extra_body=extra_body)
+            _binding(automatic_cache_breakpoints=True, extra_body=extra_body)
         ),
     )
     assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
@@ -1676,7 +1675,7 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
     """Build a structured-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
-        _binding(automatic_prompt_caching=False, system_prompt="sys")
+        _binding(automatic_cache_breakpoints=False, system_prompt="sys")
     )
     return _BoundOpenAIStructured(
         adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
@@ -1747,7 +1746,7 @@ def test_structured_output_may_inherit_no_output() -> None:
     bound = _BoundOpenAIStructured(
         adapter=adapter,
         precomputed_fields=adapter._precompute_fields(
-            _binding(system_prompt="sys", automatic_prompt_caching=False)
+            _binding(system_prompt="sys", automatic_cache_breakpoints=False)
         ),
         response_format=ReportAlsoNoOutput,
     )
@@ -1814,7 +1813,7 @@ def _text_bound() -> _BoundOpenAIText:
     adapter = _adapter()
     return _BoundOpenAIText(
         adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(automatic_prompt_caching=False)),
+        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=False)),
     )
 
 
@@ -1978,7 +1977,7 @@ def test_every_request_carries_the_reasoning_include(
     so without this parameter every replayed reasoning item could be silently empty.
     """
     adapter = _adapter()
-    precomputed_fields = adapter._precompute_fields(_binding(automatic_prompt_caching=True))
+    precomputed_fields = adapter._precompute_fields(_binding(automatic_cache_breakpoints=True))
     text_bound = _BoundOpenAIText(adapter=adapter, precomputed_fields=precomputed_fields)
     structured_bound = _BoundOpenAIStructured(
         adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
@@ -2002,7 +2001,7 @@ def test_the_structured_request_sends_the_text_parameter(
     adapter = _adapter()
     structured_bound = _BoundOpenAIStructured(
         adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(automatic_prompt_caching=True)),
+        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=True)),
         response_format=_StructuredReport,
     )
     assert _kwarg_sent(monkeypatch, structured_bound, "text") == {
@@ -2240,7 +2239,7 @@ def test_request_system_parts_become_a_developer_input_message() -> None:
     """A parts system_prompt travels as a developer-role input message; instructions stays unset."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
-            automatic_prompt_caching=True,
+            automatic_cache_breakpoints=True,
             system_prompt=(
                 TextPart(text="stable instructions", cache_breakpoint=True),
                 TextPart(text="semi-stable context"),
@@ -2266,7 +2265,7 @@ def test_request_system_parts_become_a_developer_input_message() -> None:
 def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> None:
     """A str system_prompt keeps the instructions mapping and sends no prefix item."""
     precomputed_fields = _adapter()._precompute_fields(
-        _binding(automatic_prompt_caching=True, system_prompt="sys")
+        _binding(automatic_cache_breakpoints=True, system_prompt="sys")
     )
     assert precomputed_fields.instructions == "sys"
     assert precomputed_fields.input_prefix == []

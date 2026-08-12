@@ -287,7 +287,7 @@ def test_anthropic_zero_fee_server_tools_preserve_zero_cost() -> None:
                     {"type": "tool_search_tool_bm25"},
                     {"type": "code_execution_20260120"},
                 ),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
         .provider_tools
@@ -357,7 +357,7 @@ def test_truncated_anthropic_web_search_billing_produces_nan() -> None:
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=({"type": "web_search_20260318"},),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
         .provider_tools
@@ -397,7 +397,7 @@ def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None)
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=({"type": "web_search_20250305"},),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
 
@@ -742,7 +742,7 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     assert [message["role"] for message in wire] == ["user", "assistant", "user"]
     tool_results = _content_blocks(wire[2])
@@ -760,7 +760,7 @@ def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
     )
     tool_results = _content_blocks(wire[0])
     assert tool_results[-1]["type"] == "tool_result"
@@ -782,19 +782,19 @@ def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
         )
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
     )
     assert all("cache_control" not in block for block in _content_blocks(wire[0]))
 
 
-def test_wire_messages_writes_no_breakpoint_when_caching_disabled() -> None:
-    """With caching off, no block anywhere carries a cache_control marker."""
+def test_wire_messages_writes_no_automatic_breakpoint_when_disabled() -> None:
+    """False writes no automatic `cache_control` marker."""
     messages = [
         UserMessage(content="hi"),
         ToolMessage(tool_call_id="tu_1", content="r1"),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     assert all(
         "cache_control" not in block for message in wire for block in _content_blocks(message)
@@ -813,7 +813,7 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
         )
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["type"] == "tool_result"
@@ -842,7 +842,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
             UserMessage(content=(image_url,)),
             ToolMessage(tool_call_id="tu_1", content=(image_url,)),
         ],
-        automatic_prompt_caching=False,
+        automatic_cache_breakpoints=False,
         cache_ttl="5m",
         message_mark_budget=4,
     )
@@ -884,7 +884,7 @@ def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -
     ]
     with pytest.raises(_NotSendableError, match="image/tiff"):
         _ = _wire_messages(
-            messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+            messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
         )
 
 
@@ -937,7 +937,7 @@ def _binding(
     *,
     system_prompt: str | tuple[TextPart, ...] | None,
     tool_schemas: tuple[ToolSchema, ...],
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
@@ -949,7 +949,7 @@ def _binding(
         tool_choice="required",
         parallel_tool_calls=False,
         inference_params=InferenceParams(reasoning_effort="high"),
-        automatic_prompt_caching=automatic_prompt_caching,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
@@ -957,7 +957,7 @@ def _binding(
 def test_request_omits_tool_sentinels_without_tools() -> None:
     """No tools leaves both tools and tool_choice at the omit sentinel."""
     precomputed_fields = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
     assert precomputed_fields.max_tokens == 4096
     assert isinstance(precomputed_fields.tools, anthropic.Omit)
@@ -978,7 +978,7 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
             system_prompt=None,
             tool_schemas=_tool_schemas(),
             provider_executed_tools=(provider_tool,),
-            automatic_prompt_caching=True,
+            automatic_cache_breakpoints=True,
         )
     )
     tools = _block_list(precomputed.tools)
@@ -995,7 +995,7 @@ def test_provider_executed_tool_binds_without_function_tools() -> None:
             system_prompt="system",
             tool_schemas=(),
             provider_executed_tools=({"type": "web_search_20250305", "name": "web_search"},),
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         )
     )
     tools = _block_list(precomputed.tools)
@@ -1027,7 +1027,7 @@ def test_every_supported_anthropic_provider_type_binds(tool_type: str) -> None:
             system_prompt="system",
             tool_schemas=(),
             provider_executed_tools=(provider_tool,),
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         )
     )
     assert _block_list(precomputed.tools) == [provider_tool]
@@ -1058,7 +1058,7 @@ def test_supported_code_execution_requires_a_qualifying_web_tool(
                 {"type": web_tool_type},
                 {"type": code_execution_type},
             ),
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         )
     )
     assert precomputed.provider_tools.code_execution_exempt
@@ -1089,7 +1089,7 @@ def test_every_unlisted_anthropic_provider_type_is_rejected(tool_type: str) -> N
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=({"type": tool_type},),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
 
@@ -1105,7 +1105,7 @@ def test_anthropic_provider_type_must_be_a_supported_string(
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=(provider_tool,),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
 
@@ -1121,7 +1121,7 @@ def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: st
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=({"type": code_execution_type},),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
 
@@ -1140,7 +1140,7 @@ def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
                 system_prompt="system",
                 tool_schemas=(),
                 provider_executed_tools=({"type": "web_search_20250305"},),
-                automatic_prompt_caching=False,
+                automatic_cache_breakpoints=False,
             )
         )
 
@@ -1168,7 +1168,7 @@ def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
             system_prompt=None,
             tool_schemas=(),
             provider_executed_tools=provider_tools,
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         )
     )
     assert precomputed.message_mark_budget == 2
@@ -1183,7 +1183,7 @@ def test_request_passes_widened_reasoning_effort_through() -> None:
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort="minimal"),
-        automatic_prompt_caching=False,
+        automatic_cache_breakpoints=False,
     )
     precomputed_fields = _adapter()._precompute_fields(binding)
     assert precomputed_fields.output_config == {"effort": "minimal"}
@@ -1199,7 +1199,7 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(),
-        automatic_prompt_caching=False,
+        automatic_cache_breakpoints=False,
     )
     precomputed_fields = _adapter()._precompute_fields(binding)
     assert isinstance(precomputed_fields.output_config, anthropic.Omit)
@@ -1209,7 +1209,7 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
     """A bound temperature lands on the request; None leaves the omit sentinel."""
     unset = _adapter()._precompute_fields(
-        _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
+        _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert isinstance(unset.temperature, anthropic.Omit)
     binding = Binding(
@@ -1219,7 +1219,7 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=InferenceParams(temperature=0.2),
-        automatic_prompt_caching=False,
+        automatic_cache_breakpoints=False,
     )
     assert _adapter()._precompute_fields(binding).temperature == 0.2
 
@@ -1230,7 +1230,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
     different request from omitting the key.
     """
-    binding = _binding(system_prompt=None, tool_schemas=(), automatic_prompt_caching=False)
+    binding = _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
     assert isinstance(_adapter()._precompute_fields(binding).service_tier, anthropic.Omit)
     stated = AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test"),
@@ -1242,14 +1242,14 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     assert stated._precompute_fields(binding).service_tier == "standard_only"
 
 
-def test_request_marks_the_system_block_only_when_caching() -> None:
-    """The system block carries a breakpoint under caching and none without it."""
+def test_request_marks_the_system_block_for_automatic_cache_breakpoints() -> None:
+    """The system block follows `automatic_cache_breakpoints`."""
     cached = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
     assert _block_list(cached.system)[0].get("cache_control") == {"type": "ephemeral"}
     uncached = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert "cache_control" not in _block_list(uncached.system)[0]
 
@@ -1258,11 +1258,11 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
     """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
     without_system = _adapter()._precompute_fields(
-        _binding(system_prompt=None, tool_schemas=schemas, automatic_prompt_caching=True)
+        _binding(system_prompt=None, tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
     assert _block_list(without_system.tools)[-1].get("cache_control") == {"type": "ephemeral"}
     with_system = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=schemas, automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
     assert "cache_control" not in _block_list(with_system.tools)[-1]
 
@@ -1602,7 +1602,7 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
     """Build a structured-bound adapter over a keyless client; no request is sent."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
     )
     return _BoundAnthropicStructured(
         adapter=adapter, precomputed_fields=precomputed_fields, response_format=_StructuredReport
@@ -1717,7 +1717,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             _binding(
                 system_prompt=None,
                 tool_schemas=(),
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
                 extra_body={"max_tokens": 10},
             )
         )
@@ -1739,7 +1739,7 @@ def test_the_request_sends_extra_body_by_reference(
             _binding(
                 system_prompt=None,
                 tool_schemas=(),
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
                 extra_body=extra_body,
             )
         ),
@@ -1766,7 +1766,7 @@ def test_structured_output_may_inherit_no_output() -> None:
     bound = _BoundAnthropicStructured(
         adapter=adapter,
         precomputed_fields=adapter._precompute_fields(
-            _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+            _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
         ),
         response_format=ReportAlsoNoOutput,
     )
@@ -2116,7 +2116,7 @@ def test_wire_messages_marks_a_marked_user_part() -> None:
         ),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     blocks = _content_blocks(wire[0])
     assert blocks[0]["type"] == "text"
@@ -2132,7 +2132,7 @@ def test_wire_messages_marks_a_marked_image_part() -> None:
         ),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     image_block = _content_blocks(wire[0])[0]
     assert image_block["type"] == "image"
@@ -2148,7 +2148,7 @@ def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part()
         )
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     tool_result = _content_blocks(wire[0])[0]
     assert tool_result["type"] == "tool_result"
@@ -2169,7 +2169,7 @@ def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
     ]
     with pytest.raises(_NotSendableError, match="last part"):
         _ = _wire_messages(
-            messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+            messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
         )
 
 
@@ -2203,13 +2203,13 @@ def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_reques
     """A stored payload with no type key is no content block, so nothing is sent.
 
     RawPart.raw without a type key reaches this path.
-    Automatic caching is bound on, the case where the wire path reads that key to place the
+    `automatic_cache_breakpoints=True` makes the wire path read that key to place the
     breakpoint: passing the payload through raises KeyError out of build_request, which names a
     langchaint defect for a request no defect produced.
     """
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
     bound_adapter = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
     messages = [
@@ -2235,7 +2235,9 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
     assert "temperature" not in rendered["precomputed"]
 
 
-def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_caching() -> None:
+def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cache_breakpoints() -> (
+    None
+):
     """Five marks spend the 4-marker request budget on the latest four; the oldest goes unwritten."""
     messages = [
         UserMessage(
@@ -2243,7 +2245,7 @@ def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cachi
         ),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=4
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
     blocks = _content_blocks(wire[0])
     assert "cache_control" not in blocks[0]
@@ -2251,8 +2253,8 @@ def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cachi
     assert all(block.get("cache_control") == {"type": "ephemeral"} for block in blocks[1:])
 
 
-def test_wire_messages_reserves_two_of_the_four_markers_for_automatic_caching() -> None:
-    """With automatic caching, only the latest two marks are written beside the last-block marker."""
+def test_wire_messages_reserves_markers_for_automatic_cache_breakpoints() -> None:
+    """`automatic_cache_breakpoints=True` leaves room for the latest explicit marks."""
     messages = [
         UserMessage(
             content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(3))
@@ -2260,7 +2262,7 @@ def test_wire_messages_reserves_two_of_the_four_markers_for_automatic_caching() 
         UserMessage(content="question"),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
     )
     marked_blocks = _content_blocks(wire[0])
     assert "cache_control" not in marked_blocks[0]
@@ -2280,7 +2282,7 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
                 TextPart(text="semi-stable context"),
             ),
             tool_schemas=(),
-            automatic_prompt_caching=True,
+            automatic_cache_breakpoints=True,
         )
     )
     assert precomputed_fields.system == [
@@ -2290,8 +2292,8 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
     assert precomputed_fields.message_mark_budget == 1
 
 
-def test_request_system_parts_without_automatic_caching_mark_only_marked_parts() -> None:
-    """Bound False, only the marked system part carries a marker; the budget spends only on it."""
+def test_request_system_parts_without_automatic_cache_breakpoints_mark_only_marked_parts() -> None:
+    """With `automatic_cache_breakpoints=False`, only `cache_breakpoint` writes a marker."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(
@@ -2299,7 +2301,7 @@ def test_request_system_parts_without_automatic_caching_mark_only_marked_parts()
                 TextPart(text="volatile"),
             ),
             tool_schemas=(),
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         )
     )
     assert precomputed_fields.system == [
@@ -2318,19 +2320,19 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
                     TextPart(text=f"s{index}", cache_breakpoint=True) for index in range(4)
                 ),
                 tool_schemas=(),
-                automatic_prompt_caching=True,
+                automatic_cache_breakpoints=True,
             )
         )
 
 
 def test_request_str_system_leaves_a_message_mark_budget_of_two() -> None:
-    """A str system prompt under automatic caching leaves a message_mark_budget of two."""
+    """A str system prompt with `automatic_cache_breakpoints=True` leaves two message marks."""
     precomputed_fields = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
     assert precomputed_fields.message_mark_budget == 2
     uncached = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert uncached.message_mark_budget == 4
 
@@ -2343,7 +2345,7 @@ def test_wire_messages_budget_mixes_user_and_tool_result_marks_across_messages()
         UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=2
     )
     assert "cache_control" not in _content_blocks(wire[0])[0]
     tool_result = _content_blocks(wire[1])[0]
@@ -2362,7 +2364,7 @@ def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automat
         UserMessage(content=(TextPart(text="q", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=True, cache_ttl="5m", message_mark_budget=2
+        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
     )
     assert _content_blocks(wire[0]) == [
         {"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}
@@ -2375,7 +2377,7 @@ def test_wire_messages_writes_no_marks_at_zero_budget() -> None:
         UserMessage(content=(TextPart(text="m", cache_breakpoint=True),)),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=False, cache_ttl="5m", message_mark_budget=0
+        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=0
     )
     assert "cache_control" not in _content_blocks(wire[0])[0]
 
@@ -2394,7 +2396,7 @@ def _adapter_1h() -> AnthropicMessagesAdapter:
 def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the automatic system marker and flows into the request."""
     precomputed_fields = _adapter_1h()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=True)
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
     assert _block_list(precomputed_fields.system)[0].get("cache_control") == {
         "type": "ephemeral",
@@ -2406,7 +2408,9 @@ def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
 def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
     """cache_ttl="1h" puts the explicit ttl key on the last-tool marker."""
     precomputed_fields = _adapter_1h()._precompute_fields(
-        _binding(system_prompt=None, tool_schemas=_tool_schemas(), automatic_prompt_caching=True)
+        _binding(
+            system_prompt=None, tool_schemas=_tool_schemas(), automatic_cache_breakpoints=True
+        )
     )
     assert _block_list(precomputed_fields.tools)[-1].get("cache_control") == {
         "type": "ephemeral",
@@ -2421,7 +2425,7 @@ def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() ->
         UserMessage(content="question"),
     ]
     wire = _wire_messages(
-        messages, automatic_prompt_caching=True, cache_ttl="1h", message_mark_budget=2
+        messages, automatic_cache_breakpoints=True, cache_ttl="1h", message_mark_budget=2
     )
     first_block = _content_blocks(wire[0])[0]
     assert first_block["type"] == "text"
@@ -2435,7 +2439,7 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
     """An empty parts tuple, reachable only via a directly constructed Binding, raises instead of IndexError."""
     with pytest.raises(ValueError, match="empty tuple"):
         _ = _adapter()._precompute_fields(
-            _binding(system_prompt=(), tool_schemas=(), automatic_prompt_caching=True)
+            _binding(system_prompt=(), tool_schemas=(), automatic_cache_breakpoints=True)
         )
 
 

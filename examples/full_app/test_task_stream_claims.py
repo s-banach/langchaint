@@ -256,7 +256,7 @@ def test_agent_config_rejects_a_nan_cost_limit() -> None:
         _ = AgentConfig(
             name="limited",
             system_prompt="[limited] answer",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
             max_cost_in_usd=math.nan,
         )
 
@@ -317,7 +317,7 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
         sub_config=AgentConfig(
             name="specialist",
             system_prompt="[specialist] answer",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         ),
         tracer=tracer,
         registry=registry,
@@ -356,7 +356,7 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
         config=AgentConfig(
             name="defect",
             system_prompt="[defect] fail",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         ),
         tracer=TracerProvider().get_tracer("full_app.test"),
         registry={},
@@ -448,7 +448,7 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
         sub_config=AgentConfig(
             name="specialist",
             system_prompt="[specialist] answer",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
         ),
         tracer=tracer,
         registry=registry,
@@ -480,7 +480,7 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
             return "unused"
 
     registry: dict[str, AgentRun] = {}
-    config = AgentConfig(name="twin", system_prompt="[twin] p", automatic_prompt_caching=False)
+    config = AgentConfig(name="twin", system_prompt="[twin] p", automatic_cache_breakpoints=False)
     tracer = TracerProvider().get_tracer("full_app.test")
     _ = NoOpRun(
         agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard

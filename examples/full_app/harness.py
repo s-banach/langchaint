@@ -122,7 +122,12 @@ class ScriptedAdapter(Adapter):
 
     def __init__(self, scripts: dict[str, list[Turn]]) -> None:
         """Store one Script per agent tag."""
-        super().__init__(client=None, model="fake-model", provider_name="fake")
+        super().__init__(
+            client=None,
+            model="fake-model",
+            provider_name="fake",
+            automatic_cache_breakpoints_default=False,
+        )
         self.scripts = {tag: Script(turns=list(turns)) for tag, turns in scripts.items()}
 
     @override

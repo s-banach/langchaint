@@ -274,7 +274,7 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
         traced = TracedLLM(
             LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
         )
-        bound = traced.bind(automatic_prompt_caching=True)
+        bound = traced.bind()
 
         assert (await bound.generate_one("hi")).output == "hi"
         (row,) = await bound.generate_many(["hi"])
@@ -344,7 +344,7 @@ def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -
             capture_message_content=True,
         )
         with pytest.raises(InvalidRequestError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind().generate_one("hi")
 
     asyncio.run(scenario())
 
@@ -375,7 +375,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
         traced = TracedLLM(
             LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
         )
-        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        response = await traced.bind().generate_one("hi")
         assert response.output == "hi"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
@@ -413,7 +413,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
             capture_message_content=False,
         )
         with pytest.raises(RefusalError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -439,7 +439,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
             capture_message_content=False,
         )
         with pytest.raises(MaxCompletionTokensExceededError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -462,7 +462,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
             capture_message_content=False,
         )
         with pytest.raises(RetriesExhaustedError):
-            await traced.bind(max_attempts=2, automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=2).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -494,7 +494,7 @@ def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None
             capture_message_content=False,
         )
         with pytest.raises(InvalidRequestError):
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == "misconfigured"
@@ -521,7 +521,7 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
         )
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):
-                await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+                await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
 
@@ -543,7 +543,7 @@ def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> 
             tracer=tracer,
             capture_message_content=False,
         )
-        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        handle = traced.bind().stream_one("hi")
 
         async def enter_and_leave() -> None:
             """Enter the handle whose open never returns; the wait_for below cancels this."""
@@ -593,7 +593,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
             tracer=tracer,
             capture_message_content=False,
         )
-        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi", timeout_seconds=0.05)
+        handle = traced.bind().stream_one("hi", timeout_seconds=0.05)
 
         with pytest.raises(TimedOutError):
             async with handle:
@@ -625,7 +625,7 @@ def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
         )
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):
-                await traced.bind(automatic_prompt_caching=True).generate_many(["a", "b"])
+                await traced.bind().generate_many(["a", "b"])
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
         assert all(span.status.status_code == StatusCode.UNSET for span in spans)
@@ -645,7 +645,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        response = await traced.bind().generate_one("hi")
         assert response.attempts == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
@@ -677,7 +677,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
             tracer=tracer,
             capture_message_content=False,
         )
-        results = await traced.bind(automatic_prompt_caching=True).generate_many([
+        results = await traced.bind().generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
             [UserMessage(content="c")],
@@ -706,7 +706,7 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
         """Iterate the stream fully, call final(), and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
         assert "".join(texts) == "ok"
@@ -729,7 +729,7 @@ def test_stream_final_is_idempotent_and_ends_the_span_once() -> None:
         """Call final() twice on one drained stream and count the spans."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             first = await stream.final()
             second = await stream.final()
         assert first is second
@@ -745,7 +745,7 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
         """Break out after one item and confirm one span ended without error status."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             async for _item in stream:
                 break
         (span,) = exporter.get_finished_spans()
@@ -764,7 +764,7 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
         """Enter and leave the context without driving the stream."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi"):
+        async with traced.bind().stream_one("hi"):
             pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
@@ -787,7 +787,7 @@ def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
         """Drain a stream, leave the block, then pull one more item."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        handle = traced.bind().stream_one("hi")
         async with handle:
             _ = [item async for item in handle]
             await handle.final()
@@ -810,7 +810,7 @@ def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
         """Drain a stream, leave the block, then enter the same handle again."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        handle = traced.bind().stream_one("hi")
         async with handle:
             _ = [item async for item in handle]
             await handle.final()
@@ -830,7 +830,7 @@ def test_stream_never_entered_emits_no_span() -> None:
         """Build a handle and drop it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        _handle = traced.bind(automatic_prompt_caching=True).stream_one("hi")
+        _handle = traced.bind().stream_one("hi")
         assert exporter.get_finished_spans() == ()
 
     asyncio.run(scenario())
@@ -846,7 +846,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 
     async def _drain(traced: TracedLLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             async for _item in stream:
                 pass
 
@@ -887,7 +887,7 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
             capture_message_content=False,
         )
         with pytest.raises(RetriesExhaustedError):
-            async with traced.bind(max_attempts=2, automatic_prompt_caching=True).stream_one("hi"):
+            async with traced.bind(max_attempts=2).stream_one("hi"):
                 pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -911,7 +911,7 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             with pytest.raises(RefusalError):
                 await stream.final()
         (span,) = exporter.get_finished_spans()
@@ -947,9 +947,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(
-            system_prompt="s2"
-        )
+        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
         assert_type(rebound, TracedBoundLLM[str])
         await rebound.generate_one("hi")
         async with rebound.stream_one("hi") as stream:
@@ -974,7 +972,7 @@ def test_traced_bind_and_rebind_carry_extra_body_by_reference() -> None:
     """TracedLLM.bind forwards extra_body to LLM.bind; TracedBoundLLM.rebind keeps, replaces, or clears it."""
     extra_body = {"safety_identifier": "user-7"}
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    bound = traced.bind(extra_body=extra_body, automatic_prompt_caching=True)
+    bound = traced.bind(extra_body=extra_body)
     assert bound.binding.extra_body is extra_body
     assert bound.rebind(system_prompt="s").binding.extra_body is extra_body
     replacement = {"safety_identifier": "user-8"}
@@ -986,7 +984,7 @@ def test_traced_bind_and_rebind_forward_provider_executed_tools() -> None:
     """Traced bindings keep, replace, or clear provider_executed_tools."""
     provider_tool = {"type": "web_search"}
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    bound = traced.bind(provider_executed_tools=[provider_tool], automatic_prompt_caching=True)
+    bound = traced.bind(provider_executed_tools=[provider_tool])
     assert bound.binding.provider_executed_tools == (provider_tool,)
     assert bound.binding.provider_executed_tools[0] is provider_tool
     assert bound.rebind(system_prompt="s").binding.provider_executed_tools[0] is provider_tool
@@ -998,11 +996,24 @@ def test_traced_bind_and_rebind_forward_provider_executed_tools() -> None:
     assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
+def test_traced_bind_and_rebind_forward_automatic_cache_breakpoints() -> None:
+    """`automatic_cache_breakpoints=True` makes omitted `TracedLLM.bind` forwarding fail.
+
+    `automatic_cache_breakpoints=None` makes omitted `TracedBoundLLM.rebind` forwarding fail.
+    """
+    adapter = _FakeAdapter(automatic_cache_breakpoints_default=False)
+    traced = TracedLLM(LLM(adapter), capture_message_content=False)
+    bound = traced.bind(automatic_cache_breakpoints=True)
+    assert bound.binding.automatic_cache_breakpoints is True
+    reset = bound.rebind(automatic_cache_breakpoints=None)
+    assert reset.binding.automatic_cache_breakpoints is False
+
+
 def test_traced_bind_and_rebind_forward_max_attempts() -> None:
     """TracedLLM.bind and TracedBoundLLM.rebind forward max_attempts."""
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    assert traced.bind(automatic_prompt_caching=True).max_attempts == 3
-    bound = traced.bind(max_attempts=2, automatic_prompt_caching=True)
+    assert traced.bind().max_attempts == 3
+    bound = traced.bind(max_attempts=2)
     assert bound.max_attempts == 2
     assert bound.rebind().max_attempts == 2
     assert bound.rebind(max_attempts=4).max_attempts == 4
@@ -1030,7 +1041,7 @@ def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes == {
             "gen_ai.operation.name": "chat",
@@ -1061,7 +1072,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        response = await traced.bind().generate_one("hi")
         assert response.output == "ok"
         assert calls == []
 
@@ -1092,7 +1103,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
             capture_message_content=False,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            response = await traced.bind().generate_one("hi")
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
@@ -1128,7 +1139,7 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        results = await traced.bind(automatic_prompt_caching=True).generate_many([
+        results = await traced.bind().generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
         ])
@@ -1165,7 +1176,7 @@ def test_raising_mapper_in_final_still_returns_the_response() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        async with traced.bind(automatic_prompt_caching=True).stream_one("hi") as stream:
+        async with traced.bind().stream_one("hi") as stream:
             async for _item in stream:
                 pass
             response = await stream.final()
@@ -1183,21 +1194,20 @@ def _bind_overload_pin() -> None:
     Not a test: assert_type is a runtime no-op, so pytest could only ever report it as passing.
     """
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    structured = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
+    structured = traced.bind(response_format=_Answer)
     assert_type(structured, TracedBoundLLM[_Answer])
-    text = traced.bind(automatic_prompt_caching=True)
+    text = traced.bind()
     assert_type(text, TracedBoundLLM[str])
-    text_with_tools = traced.bind(tools=[_echo_tool()], automatic_prompt_caching=True)
+    text_with_tools = traced.bind(tools=[_echo_tool()])
     assert_type(text_with_tools, TracedBoundLLM[str, ToolManager])
     structured_with_tools = traced.bind(
         response_format=_Answer,
         tools=[_echo_tool()],
-        automatic_prompt_caching=True,
     )
     assert_type(structured_with_tools, TracedBoundLLM[_Answer, ToolManager])
     tool_manager = ToolManager([])
     assert_type(
-        traced.bind(tools=tool_manager, automatic_prompt_caching=True),
+        traced.bind(tools=tool_manager),
         TracedBoundLLM[str, ToolManager],
     )
     assert_type(
@@ -1225,7 +1235,7 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
     traced = TracedLLM(LLM(adapter, shared_backoff=shared_backoff), capture_message_content=False)
     assert traced.adapter is adapter
     assert traced.shared_backoff is shared_backoff
-    bound = traced.bind(response_format=_Answer, automatic_prompt_caching=True)
+    bound = traced.bind(response_format=_Answer)
     assert bound.adapter is adapter
     assert bound.shared_backoff is shared_backoff
     assert bound.response_format is _Answer
@@ -1251,7 +1261,7 @@ def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() ->
             tracer=tracer,
             capture_message_content=False,
         )
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert span.attributes["gen_ai.agent.name"] == "agent_a"
@@ -1275,9 +1285,7 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
             tracer=tracer,
             capture_message_content=False,
         )
-        rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(
-            system_prompt="s2"
-        )
+        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
         async with rebound.stream_one("hi") as stream:
             await stream.final()
         await rebound.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
@@ -1317,7 +1325,7 @@ def test_gen_ai_attributes_is_public_and_composable() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        response = await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        response = await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert span.attributes["app.request_seconds"] == sum(
@@ -1559,7 +1567,7 @@ def test_traced_bind_and_rebind_preserve_tool_manager() -> None:
     """`TracedLLM.bind` and `TracedBoundLLM.rebind` preserve `tools=ToolManager(...)`."""
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
     bound_tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
-    bound = traced.bind(tools=bound_tool_manager, automatic_prompt_caching=True)
+    bound = traced.bind(tools=bound_tool_manager)
     assert bound.tool_manager is bound_tool_manager
     rebound_tool_manager = ToolManager([_echo_tool()])
     rebound = bound.rebind(tools=rebound_tool_manager)
@@ -1577,7 +1585,7 @@ def test_traced_bind_and_rebind_sequences_construct_traced_tool_managers() -> No
             extra_attributes={"gen_ai.agent.name": "agent_a"},
             capture_message_content=True,
         )
-        bound = traced.bind(tools=[_echo_tool()], automatic_prompt_caching=True)
+        bound = traced.bind(tools=[_echo_tool()])
         rebound = bound.rebind(tools=[_echo_tool()])
         assert isinstance(bound.tool_manager, TracedToolManager)
         assert isinstance(rebound.tool_manager, TracedToolManager)
@@ -1643,7 +1651,7 @@ def test_generate_many_passes_warm_cache_through() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        results = await traced.bind(automatic_prompt_caching=True).generate_many(
+        results = await traced.bind().generate_many(
             [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
         )
         assert all(isinstance(result, Response) for result in results)
@@ -1669,7 +1677,7 @@ def test_each_convention_defined_span_kind_carries_the_required_operation_name()
         """Open one span of each kind and read the operation name each carries, in end order."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        bound = traced.bind(automatic_prompt_caching=True)
+        bound = traced.bind()
         await bound.generate_one("hi")
         await bound.generate_many([[UserMessage(content="hi")]])
         async with bound.stream_one("hi") as stream:
@@ -1709,7 +1717,7 @@ def test_extra_attributes_cannot_displace_the_operation_name() -> None:
             capture_message_content=False,
             extra_attributes={"gen_ai.operation.name": "not-the-operation"},
         )
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert span.attributes["gen_ai.operation.name"] == "chat"
@@ -2107,7 +2115,6 @@ def test_every_payload_attribute_reaches_validation() -> None:
         bound = traced.bind(
             system_prompt="be brief",
             tools=ToolManager([_echo_tool()]),
-            automatic_prompt_caching=True,
         )
         await bound.generate_one([UserMessage(content="look it up")])
         tool_manager = TracedToolManager(
@@ -2237,7 +2244,6 @@ def test_capture_off_leaves_every_content_key_off_the_span() -> None:
         bound = traced.bind(
             system_prompt="be brief",
             tools=ToolManager([_echo_tool()]),
-            automatic_prompt_caching=True,
         )
         await bound.generate_one("hi")
         (span,) = exporter.get_finished_spans()
@@ -2262,7 +2268,6 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
         bound = traced.bind(
             system_prompt="be brief",
             tools=ToolManager([_echo_tool()]),
-            automatic_prompt_caching=True,
         )
         await bound.generate_one([
             UserMessage(content="look it up"),
@@ -2322,7 +2327,7 @@ def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
         """Generate from a str GenerationInput and read the input messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         assert _captured(exporter, "gen_ai.input.messages") == [
             {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
         ]
@@ -2337,7 +2342,7 @@ def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data(
         """Generate over Sequence[Message] containing ImagePart, ImageUrlPart, and AudioPart."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one([
+        await traced.bind().generate_one([
             UserMessage(
                 content=(
                     TextPart(text="what is this"),
@@ -2395,7 +2400,7 @@ def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_
         """Generate the turn and read the output messages back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(adapter), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
             {"role": "assistant", "parts": [], "finish_reason": "stop"}
         ]
@@ -2419,7 +2424,7 @@ def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
         traced = TracedLLM(
             LLM(_ReasoningWithTextAdapter()), tracer=tracer, capture_message_content=True
         )
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
             {
                 "role": "assistant",
@@ -2447,7 +2452,7 @@ def test_an_absent_system_prompt_omits_its_key_while_capture_stays_on() -> None:
         """Generate under a binding with no system prompt and no tools."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+        await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.system_instructions" not in span.attributes
@@ -2466,7 +2471,6 @@ def test_system_prompt_parts_become_one_instruction_element_each() -> None:
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             system_prompt=[TextPart(text="be brief"), TextPart(text="cite sources")],
-            automatic_prompt_caching=True,
         )
         await bound.generate_one("hi")
         assert _captured(exporter, "gen_ai.system_instructions") == [
@@ -2490,9 +2494,7 @@ def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> Non
             capture_message_content=True,
         )
         with pytest.raises(RefusalError):
-            await traced.bind(
-                system_prompt="be brief", automatic_prompt_caching=True
-            ).generate_one("hi")
+            await traced.bind(system_prompt="be brief").generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
@@ -2518,7 +2520,7 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
             capture_message_content=True,
         )
         with pytest.raises(RetriesExhaustedError):
-            await traced.bind(max_attempts=2, automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=2).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
@@ -2541,7 +2543,7 @@ def test_generate_many_captures_each_items_own_generation_input_under_capture() 
             tracer=tracer,
             capture_message_content=True,
         )
-        await traced.bind(automatic_prompt_caching=True).generate_many(["a", "b"])
+        await traced.bind().generate_many(["a", "b"])
         first, second = exporter.get_finished_spans()
         assert "a" in str(_attribute(first, "gen_ai.input.messages"))
         assert "b" not in str(_attribute(first, "gen_ai.input.messages"))
@@ -2567,7 +2569,6 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             tools=ToolManager([_unserializable_schema_tool()]),
-            automatic_prompt_caching=True,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             response = await bound.generate_one("hi")
@@ -2604,7 +2605,6 @@ def test_unserializable_content_leaves_the_stream_and_its_span_intact(
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
             tools=ToolManager([_unserializable_schema_tool()]),
-            automatic_prompt_caching=True,
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             async with bound.stream_one("hi") as stream:
@@ -2628,7 +2628,7 @@ def test_the_stream_span_captures_input_at_start_and_output_at_final() -> None:
         """Drive a stream to completion under capture and read both sides back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(system_prompt="be brief", automatic_prompt_caching=True)
+        bound = traced.bind(system_prompt="be brief")
         async with bound.stream_one("hi") as stream:
             _ = [item async for item in stream]
             await stream.final()
@@ -2652,9 +2652,7 @@ def test_capture_survives_rebind_and_reaches_the_rebound_binding() -> None:
         """Rebind a captured binding and confirm the new one still captures."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        rebound = traced.bind(system_prompt="s", automatic_prompt_caching=True).rebind(
-            system_prompt="s2"
-        )
+        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
         await rebound.generate_one("hi")
         assert _captured(exporter, "gen_ai.system_instructions") == [
             {"type": "text", "content": "s2"}
@@ -2754,7 +2752,7 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
         """Generate over a turn holding one parseable and one unparseable tool call."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(automatic_prompt_caching=True)
+        bound = traced.bind()
         await bound.generate_one([
             AssistantMessage(
                 turn=(
@@ -2800,7 +2798,7 @@ def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
         """Generate over a turn whose tool call carries a non-object argument value."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one([
+        await traced.bind().generate_one([
             AssistantMessage(turn=(ToolCall(id="call1", name="echo", args_json=args_json),))
         ])
         assert _captured(exporter, "gen_ai.input.messages") == [
@@ -2827,7 +2825,7 @@ def test_an_ordinary_float_argument_survives_the_parse() -> None:
         """Generate over a turn whose tool call carries a finite float and read the arguments back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind(automatic_prompt_caching=True).generate_one([
+        await traced.bind().generate_one([
             AssistantMessage(
                 turn=(ToolCall(id="call1", name="echo", args_json='{"n": 1.5, "big": 1e300}'),)
             )
@@ -2936,7 +2934,7 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
             capture_message_content=capture_message_content,
         )
         with pytest.raises(RefusalError) as raised:
-            await traced.bind(max_attempts=3, automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind(max_attempts=3).generate_one("hi")
 
         error = raised.value
         assert error.attempts == 2
@@ -2981,7 +2979,7 @@ def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reas
             capture_message_content=True,
         )
         with pytest.raises(UnfinishedTurnError) as raised:
-            await traced.bind(automatic_prompt_caching=True).generate_one("hi")
+            await traced.bind().generate_one("hi")
         assert raised.value.stop_reason is None
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None

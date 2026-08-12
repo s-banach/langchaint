@@ -15,7 +15,7 @@ async def search_the_web() -> Response[str]:
     # Catalog pricing supplies the required web-search invocation rate.
     bound = openai.model("gpt-5.6-terra").bind(
         provider_executed_tools=({"type": "web_search"},),
-        automatic_prompt_caching=True,
+        automatic_cache_breakpoints=True,
     )
     response = await bound.generate_one("Find today's OpenAI developer news.")
 

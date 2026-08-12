@@ -194,7 +194,7 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
     inference_params: InferenceParams,
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
     extra_body: Mapping[str, object] | None,
 ) -> Binding:
     """Convert bind arguments to the frozen Binding.
@@ -217,7 +217,7 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         inference_params=inference_params,
-        automatic_prompt_caching=automatic_prompt_caching,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
@@ -306,7 +306,7 @@ class LLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "BoundLLM[ModelT, ToolManager]": ...
     @overload
     def bind[ModelT: BaseModel](
@@ -321,7 +321,7 @@ class LLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "BoundLLM[ModelT, None]": ...
     @overload
     def bind(
@@ -336,7 +336,7 @@ class LLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
     def bind(
@@ -351,7 +351,7 @@ class LLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "BoundLLM[str, None]": ...
     def bind(  # noqa: PLR0913 (the binding states every choice: prompt, tools, format, params, caching, extra_body)
         self,
@@ -365,7 +365,7 @@ class LLM:
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
         max_attempts: int = 3,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = None,
     ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
 
@@ -374,17 +374,16 @@ class LLM:
         `tools=ToolManager(...)` binds that `ToolManager` unchanged.
         A `tools` sequence constructs `ToolManager`.
         A tool-bound structured request may return a `ToolCallTurn`; see `BoundLLM`.
-        `automatic_prompt_caching` has no default because caching changes billing.
-        langchaint never chooses a caching configuration for the caller.
+        `automatic_cache_breakpoints=None` uses `Adapter.automatic_cache_breakpoints_default`.
         max_attempts counts requests sent including the first, so 1 means no retrying.
-        Ad-hoc use is llm.bind(automatic_prompt_caching=False).generate_one(...).
+        Ad-hoc use is llm.bind(automatic_cache_breakpoints=False).generate_one(...).
         Binding.extra_body documents extra_body: the merge precedence and the colliding-key raise.
 
         Raises:
             ValueError: A `tools` sequence contains duplicate names.
                 Also raised when `system_prompt` is an empty sequence of parts.
                 Pass `None` to bind no system prompt.
-                The adapter also raises for an unsupported caching configuration.
+                The adapter also raises for unsupported `automatic_cache_breakpoints`.
                 The adapter also raises when `extra_body` contains an adapter-populated key.
                 Also raised when `max_attempts` is a bool or below one.
         """
@@ -398,7 +397,11 @@ class LLM:
             inference_params=(
                 inference_params if inference_params is not None else InferenceParams()
             ),
-            automatic_prompt_caching=automatic_prompt_caching,
+            automatic_cache_breakpoints=(
+                self.adapter.automatic_cache_breakpoints_default
+                if automatic_cache_breakpoints is None
+                else automatic_cache_breakpoints
+            ),
             extra_body=extra_body,
         )
         return BoundLLM(
@@ -486,7 +489,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManager]": ...
     @overload
     def rebind[NewModelT: BaseModel](
@@ -501,7 +504,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, None]": ...
     @overload
     def rebind[NewModelT: BaseModel](
@@ -516,7 +519,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
     @overload
     def rebind(
@@ -531,7 +534,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
     def rebind(
@@ -546,7 +549,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, None]": ...
     @overload
     def rebind(
@@ -561,7 +564,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManagerT]": ...
     @overload
     def rebind(
@@ -576,7 +579,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManager]": ...
     @overload
     def rebind(
@@ -591,7 +594,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, None]": ...
     @overload
     def rebind(
@@ -606,7 +609,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManagerT]": ...
     def rebind(  # noqa: PLR0913 (rebind takes every field bind takes, each replaceable alone)
         self,
@@ -625,7 +628,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_attempts: int | Unchanged = UNCHANGED,
-        automatic_prompt_caching: bool | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
     ) -> "BoundLLM[Any, Any]":
         """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
 
@@ -635,6 +638,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Passing `tools=None` removes the bound `ToolManager`.
         Passing `tools=ToolManager(...)` preserves that object's identity.
         `inference_params` replaces the complete bound value.
+        `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
+        `Binding.automatic_cache_breakpoints` stores the result.
         `rebind` converts the new binding to SDK arguments without I/O.
         Provider cache preservation depends on changed fields, provider, and model.
         Measure cache behavior on the deployed configuration.
@@ -643,7 +648,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ValueError: A `tools` sequence contains duplicate names.
                 Also raised when `system_prompt` is an empty sequence of parts.
                 Pass `None` to bind no system prompt.
-                The adapter also raises for an unsupported caching configuration.
+                The adapter also raises for unsupported `automatic_cache_breakpoints`.
                 The adapter also raises when `extra_body` contains an adapter-populated key.
                 Also raised when `max_attempts` is a bool or below one.
         """
@@ -676,10 +681,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 if isinstance(inference_params, Unchanged)
                 else inference_params
             ),
-            automatic_prompt_caching=(
-                self.binding.automatic_prompt_caching
-                if isinstance(automatic_prompt_caching, Unchanged)
-                else automatic_prompt_caching
+            automatic_cache_breakpoints=(
+                self.binding.automatic_cache_breakpoints
+                if isinstance(automatic_cache_breakpoints, Unchanged)
+                else (
+                    self.adapter.automatic_cache_breakpoints_default
+                    if automatic_cache_breakpoints is None
+                    else automatic_cache_breakpoints
+                )
             ),
             extra_body=(
                 self.binding.extra_body if isinstance(extra_body, Unchanged) else extra_body

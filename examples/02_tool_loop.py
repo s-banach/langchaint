@@ -38,7 +38,7 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
         system_prompt="Use get_weather when needed. Return FinalAnswer when finished.",
         tools=[get_weather],
         response_format=FinalAnswer,
-        automatic_prompt_caching=True,
+        automatic_cache_breakpoints=True,
     )
 
     messages: list[Message] = [UserMessage(content=prompt)]

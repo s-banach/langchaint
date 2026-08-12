@@ -23,7 +23,7 @@ async def price_at_negotiated_rates() -> Response[str]:
         "gpt-5.6",
         pricing=pricing,
         supports_prompt_cache_options=True,
-    ).bind(system_prompt="Be terse.", automatic_prompt_caching=False)
+    ).bind(system_prompt="Be terse.")
     response = await bound.generate_one("Name three primary colors.")
     print(f"bill this call at {response.usage.cost_in_usd} USD")
     print(f"kept answer cost: {response.usage_successful_attempt.cost_in_usd} USD")

@@ -67,7 +67,7 @@ _PLAIN_TEXT_BINDING = Binding(
     tool_choice="auto",
     parallel_tool_calls=True,
     inference_params=InferenceParams(),
-    automatic_prompt_caching=True,
+    automatic_cache_breakpoints=True,
 )
 """The binding every invariant here binds under: text output and nothing else stated."""
 

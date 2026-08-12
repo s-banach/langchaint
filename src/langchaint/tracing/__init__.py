@@ -902,8 +902,8 @@ class TracedLLM:
 
         capture_message_content True puts the bound system prompt, the bound tool definitions, the GenerationInput,
         and the assistant turn on every span this LLM's bindings open.
-        It is required and has no default: recording prompts is a privacy choice langchaint never makes for the user,
-        the way automatic_prompt_caching is a billing choice bind never makes.
+        It is required and has no default.
+        Recording prompts is a privacy choice langchaint never makes.
         The convention takes the same position, that instrumentations SHOULD NOT capture content by default
         but SHOULD provide an opt-in; requiring the keyword is stricter, in the safe direction.
         The value propagates to every binding and every stream handle, and rebind carries it unchanged,
@@ -950,7 +950,7 @@ class TracedLLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "TracedBoundLLM[ModelT, ToolManager]": ...
     @overload
     def bind[ModelT: BaseModel](
@@ -965,7 +965,7 @@ class TracedLLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "TracedBoundLLM[ModelT, None]": ...
     @overload
     def bind(
@@ -980,7 +980,7 @@ class TracedLLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
     def bind(
@@ -995,7 +995,7 @@ class TracedLLM:
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
         max_attempts: int = ...,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = ...,
     ) -> "TracedBoundLLM[str, None]": ...
     def bind(  # noqa: PLR0913 (mirrors LLM.bind, which states every binding choice)
         self,
@@ -1009,7 +1009,7 @@ class TracedLLM:
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
         max_attempts: int = 3,
-        automatic_prompt_caching: bool,
+        automatic_cache_breakpoints: bool | None = None,
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
@@ -1033,7 +1033,7 @@ class TracedLLM:
                 parallel_tool_calls=parallel_tool_calls,
                 extra_body=extra_body,
                 max_attempts=max_attempts,
-                automatic_prompt_caching=automatic_prompt_caching,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
             ),
             span_config=self._span_config,
         )
@@ -1116,7 +1116,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
     @overload
     def rebind[NewModelT: BaseModel](
@@ -1131,7 +1131,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, None]": ...
     @overload
     def rebind[NewModelT: BaseModel](
@@ -1146,7 +1146,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
     @overload
     def rebind(
@@ -1161,7 +1161,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
     def rebind(
@@ -1176,7 +1176,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, None]": ...
     @overload
     def rebind(
@@ -1191,7 +1191,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManagerT]": ...
     @overload
     def rebind(
@@ -1206,7 +1206,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
     @overload
     def rebind(
@@ -1221,7 +1221,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, None]": ...
     @overload
     def rebind(
@@ -1236,7 +1236,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
-        automatic_prompt_caching: bool | Unchanged = ...,
+        automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
     def rebind(  # noqa: PLR0913 (mirrors BoundLLM.rebind, which takes every field bind takes)
         self,
@@ -1255,7 +1255,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         inference_params: InferenceParams | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_attempts: int | Unchanged = UNCHANGED,
-        automatic_prompt_caching: bool | Unchanged = UNCHANGED,
+        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
     ) -> "TracedBoundLLM[Any, Any]":
         """Return a traced wrapper around the rebound `BoundLLM`.
 
@@ -1282,7 +1282,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 inference_params=inference_params,
                 extra_body=extra_body,
                 max_attempts=max_attempts,
-                automatic_prompt_caching=automatic_prompt_caching,
+                automatic_cache_breakpoints=automatic_cache_breakpoints,
             ),
             span_config=self._span_config,
         )

@@ -110,6 +110,7 @@ def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> N
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing is ANTHROPIC_PRICING[model]
+    assert adapter.automatic_cache_breakpoints_default is False
     web_search_rate = adapter.pricing.web_search_usd_per_invocation
     assert web_search_rate is not None
     assert web_search_rate > 0
@@ -123,6 +124,7 @@ def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.model == model
     assert adapter.pricing["ON_DEMAND"] is GEMINI_PRICING[model]
+    assert adapter.automatic_cache_breakpoints_default is False
     google_search_rate = adapter.pricing["ON_DEMAND"].google_search_usd_per_query
     google_maps_rate = adapter.pricing["ON_DEMAND"].google_maps_usd_per_query
     assert google_search_rate is not None
@@ -140,6 +142,7 @@ def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     assert adapter.model == model
     assert adapter.pricing is OPENAI_PRICING[model]
     assert adapter.regional_processing is False
+    assert adapter.automatic_cache_breakpoints_default is False
     web_search_rate = adapter.pricing.web_search_usd_per_invocation
     assert web_search_rate is not None
     assert web_search_rate > 0
@@ -176,6 +179,7 @@ def test_openai_model_wires_prompt_cache_options_support(
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.supports_prompt_cache_options is supported
+    assert adapter.automatic_cache_breakpoints_default is not supported
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -192,6 +196,7 @@ def test_openai_model_accepts_an_uncataloged_model(*, supported: bool) -> None:
     assert adapter.model == "ft:gpt-5.6-terra:acme::abc123"
     assert adapter.pricing is _ARBITRARY_PRICING
     assert adapter.supports_prompt_cache_options is supported
+    assert adapter.automatic_cache_breakpoints_default is not supported
 
 
 def test_openai_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
@@ -299,12 +304,12 @@ def test_gemini_shares_backoff_and_bind_owns_max_attempts() -> None:
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
     assert gemini.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
-    assert llm.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
+    assert llm.bind(automatic_cache_breakpoints=False, max_attempts=5).max_attempts == 5
     defaulted = gemini.model("gemini-3.5-flash")
     defaulted_adapter = defaulted.adapter
     assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
     assert defaulted_adapter.service_tier is None
-    assert defaulted.bind(automatic_prompt_caching=False).max_attempts == 3
+    assert defaulted.bind(automatic_cache_breakpoints=False).max_attempts == 3
 
 
 def _deepseek_client() -> AsyncOpenAI:
@@ -324,6 +329,7 @@ def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
     assert adapter.pricing.default is DEEPSEEK_PRICING[model]
     assert adapter.cache_read_tokens_from_usage is cache_read_tokens_from_usage_deepseek
     assert adapter.supports_prompt_cache_options is False
+    assert adapter.automatic_cache_breakpoints_default is True
     assert adapter.provider_name == "deepseek"
 
 
@@ -369,7 +375,7 @@ def test_deepseek_shares_backoff_and_bind_owns_max_attempts() -> None:
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
     assert deepseek.model("deepseek-v4-pro").shared_backoff is llm.shared_backoff
-    assert llm.bind(automatic_prompt_caching=True, max_attempts=5).max_attempts == 5
+    assert llm.bind(automatic_cache_breakpoints=True, max_attempts=5).max_attempts == 5
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -383,6 +389,7 @@ def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.supports_prompt_cache_options is supported
+    assert adapter.automatic_cache_breakpoints_default is not supported
 
 
 @pytest.mark.parametrize(
@@ -588,8 +595,8 @@ def test_openai_shares_client_and_shared_backoff() -> None:
     assert terra.shared_backoff.longest_wait_seconds == 12.0
     assert terra.shared_backoff.wait_multiplier == 3.0
     assert terra.shared_backoff.quiet_seconds_per_decay_step == 9.0
-    assert terra.bind(automatic_prompt_caching=False, max_attempts=5).max_attempts == 5
-    assert terra.bind(automatic_prompt_caching=False).max_attempts == 3
+    assert terra.bind(automatic_cache_breakpoints=False, max_attempts=5).max_attempts == 5
+    assert terra.bind(automatic_cache_breakpoints=False).max_attempts == 3
 
 
 def test_separate_openai_values_create_separate_shared_backoffs() -> None:

@@ -35,7 +35,7 @@ payload, and the following TurnPart is skipped when it matches, keeping the wire
 byte-identical to what arrived.
 
 Caching: generateContent has no request field enabling, disabling, or marking implicit caching, so
-`automatic_prompt_caching` True and False build identical requests, implicit cache reads bill at
+`automatic_cache_breakpoints` True and False build identical requests, implicit cache reads bill at
 the cache-read rate under either value, and no cache write is ever billed. A user-placed
 `cache_breakpoint` mark has no wire form either; silently dropping it would misstate the request,
 so a marked system part raises ValueError at bind and a marked message part returns InvalidRequest.
@@ -1205,7 +1205,12 @@ class GeminiGenerateContentAdapter(Adapter):
                 f"provider_name={provider_name!r} contradicts the client: "
                 f"client.vertexai is True, which reaches {_VERTEX_PROVIDER_NAME!r}"
             )
-        super().__init__(client=client, model=model, provider_name=provider_name)
+        super().__init__(
+            client=client,
+            model=model,
+            provider_name=provider_name,
+            automatic_cache_breakpoints_default=False,
+        )
         self.client = client
         self.pricing = pricing
         self.service_tier: GeminiServiceTier | None = service_tier

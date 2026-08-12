@@ -676,7 +676,7 @@ def _adapter(*, supports_prompt_cache_options: bool = True) -> OpenAIChatComplet
 
 def _binding(
     *,
-    automatic_prompt_caching: bool = True,
+    automatic_cache_breakpoints: bool = True,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
@@ -691,7 +691,7 @@ def _binding(
         tool_choice="auto",
         parallel_tool_calls=True,
         inference_params=inference_params if inference_params is not None else InferenceParams(),
-        automatic_prompt_caching=automatic_prompt_caching,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
@@ -841,44 +841,43 @@ def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them()
 
 
 @pytest.mark.parametrize(
-    ("supports_prompt_cache_options", "automatic_prompt_caching", "expected_options"),
+    ("supports_prompt_cache_options", "automatic_cache_breakpoints", "expected_options"),
     [
         (True, False, {"mode": "explicit"}),
         (True, True, None),
         (False, True, None),
     ],
     ids=[
-        "supported_and_caching_disabled",
-        "supported_and_caching_automatic",
-        "unsupported_and_caching_automatic",
+        "supported_and_automatic_cache_breakpoints_disabled",
+        "supported_and_automatic_cache_breakpoints_enabled",
+        "unsupported_and_automatic_cache_breakpoints_enabled",
     ],
 )
-def test_request_sends_explicit_mode_exactly_when_the_binding_declines_caching(
+def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabled(
     expected_options: dict[str, str] | None,
     *,
     supports_prompt_cache_options: bool,
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
 ) -> None:
     """Explicit mode with no breakpoints is the one prompt_cache_options value langchaint sends.
 
-    Bound True leaves the omit sentinel whatever the model takes, so the provider's implicit caching
-    stays in place. The fourth combination, bound False on a model that takes no parameter, has no
-    row here because it raises instead of building fields.
+    `automatic_cache_breakpoints=True` leaves the omit sentinel.
+    `automatic_cache_breakpoints=False` without parameter support raises before building fields.
     """
     precomputed_fields = _adapter(
         supports_prompt_cache_options=supports_prompt_cache_options
-    )._precompute_fields(_binding(automatic_prompt_caching=automatic_prompt_caching))
+    )._precompute_fields(_binding(automatic_cache_breakpoints=automatic_cache_breakpoints))
     if expected_options is None:
         assert isinstance(precomputed_fields.prompt_cache_options, openai.Omit)
     else:
         assert precomputed_fields.prompt_cache_options == expected_options
 
 
-def test_declining_caching_on_a_model_without_the_parameter_raises() -> None:
-    """A model taking no prompt_cache_options cannot be told to stop caching, so bind refuses."""
+def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises() -> None:
+    """`automatic_cache_breakpoints=False` requires `prompt_cache_options`."""
     with pytest.raises(ValueError, match="supports_prompt_cache_options"):
         _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
-            _binding(automatic_prompt_caching=False)
+            _binding(automatic_cache_breakpoints=False)
         )
 
 
@@ -983,7 +982,7 @@ def test_structured_output_may_inherit_no_output() -> None:
     bound = _BoundChatCompletionsStructured(
         adapter=adapter,
         precomputed_fields=adapter._precompute_fields(
-            _binding(system_prompt="sys", tool_schemas=(), automatic_prompt_caching=False)
+            _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
         ),
         response_format=ReportAlsoNoOutput,
     )

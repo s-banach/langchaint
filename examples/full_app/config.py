@@ -20,7 +20,7 @@ class AgentConfig:
     name is the last segment of the run's agent_path, minus the spawn index a tool-spawned run
     carries. The scripted adapter selects a script by the "[tag]" prefix of system_prompt;
     __post_init__ rejects a prefix that differs from name, so the tag cannot drift.
-    automatic_prompt_caching is passed to every binding for this agent.
+    automatic_cache_breakpoints is passed to every binding for this agent.
     max_tool_calls is a budget across the whole run, not per turn: calls beyond it are declined with an
     is_error tool message the model reads and adapts to, rather than dropped or raised on,
     so the model gets a chance to finish with what it already has.
@@ -34,7 +34,7 @@ class AgentConfig:
 
     name: str
     system_prompt: str
-    automatic_prompt_caching: bool
+    automatic_cache_breakpoints: bool
     max_turns: int = 8
     max_tool_calls: int = 12
     max_attempts: int = 2
@@ -75,14 +75,14 @@ def build_configs() -> dict[str, AgentConfig]:
         AgentConfig(
             name="research_climate",
             system_prompt="[research_climate] Research the climate outlook.",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
             max_turns=6,
             generate_one_timeout_seconds=1.5,
         ),
         AgentConfig(
             name="research_energy",
             system_prompt="[research_energy] Research the energy outlook.",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
             max_turns=6,
             max_tool_calls=6,
             generate_one_timeout_seconds=1.5,
@@ -90,7 +90,7 @@ def build_configs() -> dict[str, AgentConfig]:
         AgentConfig(
             name="specialist",
             system_prompt="[specialist] Answer the question with one search.",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
             max_turns=3,
             max_tool_calls=2,
             generate_one_timeout_seconds=1.0,
@@ -98,7 +98,7 @@ def build_configs() -> dict[str, AgentConfig]:
         AgentConfig(
             name="synthesize",
             system_prompt="[synthesize] Reconcile the findings.",
-            automatic_prompt_caching=False,
+            automatic_cache_breakpoints=False,
             max_turns=6,
             max_tool_calls=4,
             generate_one_timeout_seconds=1.0,

@@ -43,7 +43,6 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     bound = traced.bind(
         system_prompt="Use tools when needed.",
         tools=[get_weather],
-        automatic_prompt_caching=False,
     )
 
     messages: list[Message] = [UserMessage(content=prompt)]

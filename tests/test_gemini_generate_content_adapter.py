@@ -120,7 +120,7 @@ def _binding(
     tool_choice: ToolChoice = "auto",
     parallel_tool_calls: bool = True,
     inference_params: InferenceParams | None = None,
-    automatic_prompt_caching: bool = False,
+    automatic_cache_breakpoints: bool = False,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Build a Binding with every field stated, defaults naming the plainest choice."""
@@ -131,7 +131,7 @@ def _binding(
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         inference_params=inference_params if inference_params is not None else InferenceParams(),
-        automatic_prompt_caching=automatic_prompt_caching,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
@@ -331,14 +331,16 @@ def test_parallel_tool_calls_false_raises_at_bind() -> None:
         _ = _adapter().bind_text(_binding(parallel_tool_calls=False))
 
 
-def test_automatic_prompt_caching_values_build_identical_requests() -> None:
-    """Implicit caching has no wire form, so the flag changes nothing about the request."""
-    caching = _built_request([UserMessage(content="hi")], _binding(automatic_prompt_caching=True))
-    not_caching = _built_request(
-        [UserMessage(content="hi")], _binding(automatic_prompt_caching=False)
+def test_automatic_cache_breakpoints_values_build_identical_requests() -> None:
+    """Implicit caching has no wire form, so the parameter changes nothing."""
+    enabled = _built_request(
+        [UserMessage(content="hi")], _binding(automatic_cache_breakpoints=True)
     )
-    assert caching.config == not_caching.config
-    assert caching.contents == not_caching.contents
+    disabled = _built_request(
+        [UserMessage(content="hi")], _binding(automatic_cache_breakpoints=False)
+    )
+    assert enabled.config == disabled.config
+    assert enabled.contents == disabled.contents
 
 
 def _echo_schema() -> ToolSchema:

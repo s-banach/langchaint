@@ -45,10 +45,7 @@ from langchaint.openai import OpenAI
 
 async def main() -> None:
     openai = OpenAI()
-    bound_llm = openai.model("gpt-5.6-terra").bind(
-        system_prompt="Answer clearly and concisely.",
-        automatic_prompt_caching=False,
-    )
+    bound_llm = openai.model("gpt-5.6-terra").bind(system_prompt="Answer clearly and concisely.")
     response = await bound_llm.generate_one("Why is the sky blue?")
     print(response.output, response.usage.cost_in_usd)
 
@@ -137,8 +134,9 @@ Pass `tools=[tool]` to `LLM.bind()`, then dispatch through `BoundLLM.tool_manage
 `LLM.bind(max_attempts=...)` limits requests for one `GenerationInput`, including the first.
 An embedding batch contains inputs sent together during each attempt.
 `embedding_model(max_attempts=...)` limits requests for one embedding batch, including the first.
-`automatic_prompt_caching` is required because it changes billing.
-`cache_breakpoint=True` ends the reusable prefix at that `ContentPart`.
+`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default`.
+Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
+`cache_breakpoint=True` requests an explicit breakpoint at that `ContentPart`.
 `GenerateResult` and `GenerationError` include paid `Usage` across attempts.
 
 ## More examples

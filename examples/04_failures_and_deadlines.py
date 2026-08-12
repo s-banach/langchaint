@@ -28,11 +28,8 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     summarizer = anthropic.model("claude-sonnet-5").bind(
         system_prompt="Summarize in one sentence.",
         max_attempts=5,
-        automatic_prompt_caching=False,
     )
-    fallback = openai.model("gpt-5.6-terra").bind(
-        system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
-    )
+    fallback = openai.model("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
 
     # This media_type is invalid for anthropic.
     scanned_page: list[Message] = [

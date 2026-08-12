@@ -299,24 +299,22 @@ class OpenAIPricingTable:
 
 
 def require_prompt_cache_options_support(
-    *, model: str, automatic_prompt_caching: bool, supports_prompt_cache_options: bool
+    *, model: str, automatic_cache_breakpoints: bool, supports_prompt_cache_options: bool
 ) -> None:
-    """Require the prompt_cache_options parameter where a binding declines automatic caching.
+    """Require `prompt_cache_options` when `automatic_cache_breakpoints=False`.
 
-    Both adapters' _precompute_fields call this: that parameter is the only thing carrying
-    automatic_prompt_caching False to the wire, so a model built without it must refuse the
-    binding rather than cache anyway at whatever the model charges for it.
+    `prompt_cache_options` carries `automatic_cache_breakpoints=False` to the request.
+    Both OpenAI adapters call this before building fields.
 
     Raises:
-        ValueError: the binding declines automatic caching and the model was built with
-            supports_prompt_cache_options False.
+        ValueError: `automatic_cache_breakpoints=False` lacks `prompt_cache_options` support.
     """
-    if not automatic_prompt_caching and not supports_prompt_cache_options:
+    if not automatic_cache_breakpoints and not supports_prompt_cache_options:
         raise ValueError(
-            f"model {model!r} was built with supports_prompt_cache_options False, "
+            f"model {model!r} was built with supports_prompt_cache_options=False, "
             "so prompt_cache_options is never sent. "
-            "prompt_cache_options is what carries automatic_prompt_caching False to the wire. "
-            "Bind automatic_prompt_caching=True, or set supports_prompt_cache_options True "
+            "prompt_cache_options carries automatic_cache_breakpoints=False to the request. "
+            "Bind automatic_cache_breakpoints=True, or set supports_prompt_cache_options=True "
             "if the model accepts it."
         )
 

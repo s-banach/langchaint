@@ -50,7 +50,7 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
         system_prompt="Research the question, then submit final_response.",
         tools=[search, final_response_tool],
         tool_choice="required",
-        automatic_prompt_caching=True,
+        automatic_cache_breakpoints=True,
     )
 
     messages: list[Message] = [UserMessage(content=prompt)]

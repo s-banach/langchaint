@@ -46,8 +46,8 @@ Verified against openai 2.51.0:
   `completion_tokens_details` (`reasoning_tokens`) are Optional, each counter included.
 - `ChatCompletionToolMessageParam.content` is text-only.
 - `prompt_cache_options` and part-level `prompt_cache_breakpoint` take the same values as on the
-  Responses API, and the adapter maps `automatic_prompt_caching` and marked parts exactly as
-  Binding.automatic_prompt_caching's docstring states for the openai adapters.
+  Responses API, and the adapter maps `automatic_cache_breakpoints` and marked parts exactly as
+  Binding.automatic_cache_breakpoints's docstring states for the openai adapters.
 
 ContentPart mappings verified against openai 2.53.0:
 - `ImagePart` becomes `image_url.url` containing a data URL.
@@ -741,9 +741,7 @@ class OpenAIChatCompletionsAdapter(Adapter):
 
         supports_prompt_cache_options says whether the model accepts the prompt_cache_options
         request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
-        That parameter is the only thing that carries automatic_prompt_caching False to the wire,
-        so False here makes bind raise for a binding that declines caching, rather than cache
-        anyway at whatever that model charges for it.
+        `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
         It has no default because a wrong value fails either way: True on a model without the
         parameter risks a rejected request, and False on one with it refuses a binding the model
         would have accepted.
@@ -764,7 +762,12 @@ class OpenAIChatCompletionsAdapter(Adapter):
         Raises:
             ValueError: `provider_name` contradicts the client's class.
         """
-        super().__init__(client=client, model=model, provider_name=provider_name)
+        super().__init__(
+            client=client,
+            model=model,
+            provider_name=provider_name,
+            automatic_cache_breakpoints_default=not supports_prompt_cache_options,
+        )
         self.client = client_without_retries(client)
         self.pricing = pricing
         self.supports_prompt_cache_options = supports_prompt_cache_options
@@ -775,8 +778,8 @@ class OpenAIChatCompletionsAdapter(Adapter):
         """Precompute the typed request fields the binding determines.
 
         Raises:
-            ValueError: the binding declines automatic caching on a model built with
-                supports_prompt_cache_options False, or its extra_body holds a key in
+            ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
+                Also raised when extra_body holds a key in
                 _ADAPTER_POPULATED_WIRE_KEYS. Also raised when provider_executed_tools is nonempty.
                 Also raised when extra_body contains web_search_options.
         """
@@ -795,7 +798,7 @@ class OpenAIChatCompletionsAdapter(Adapter):
         )
         require_prompt_cache_options_support(
             model=self.model,
-            automatic_prompt_caching=binding.automatic_prompt_caching,
+            automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
             supports_prompt_cache_options=self.supports_prompt_cache_options,
         )
         messages_prefix: list[ChatCompletionMessageParam] = []
@@ -835,7 +838,9 @@ class OpenAIChatCompletionsAdapter(Adapter):
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             prompt_cache_options=(
-                omit if binding.automatic_prompt_caching else PromptCacheOptions(mode="explicit")
+                omit
+                if binding.automatic_cache_breakpoints
+                else PromptCacheOptions(mode="explicit")
             ),
             service_tier=self.service_tier if self.service_tier is not None else omit,
             response_format=omit,

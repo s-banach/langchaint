@@ -19,14 +19,14 @@ Verified against openai 2.45.0:
   implicit mode writes up to the latest three explicit breakpoints and explicit mode up to the
   latest four, older marks staying readable for matching; and `ttl` takes "30m" as its only value,
   so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
-  The adapter sends the parameter when the binding sets automatic_prompt_caching False; bound True,
+  The adapter sends the parameter for `automatic_cache_breakpoints=False`.
+  With `automatic_cache_breakpoints=True`,
   the provider's implicit caching is left in place and nothing is sent.
-  On a model whose supports_prompt_cache_options is False, a binding that declines caching raises at
-  bind time, the parameter that would carry it being one the model does not take.
+  `automatic_cache_breakpoints=False` requires a model accepting `prompt_cache_options`.
 - A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
   under either binding value, and the adapter sends every mark and caps nothing,
   the per-request write limits above being the API's to apply.
-  With automatic_prompt_caching False on a model taking `prompt_cache_options`,
+  With `automatic_cache_breakpoints=False` on a model accepting `prompt_cache_options`,
   marked parts are what re-enables caching at exactly those boundaries.
 - The API stores responses server-side for later retrieval by default;
   the adapter always sends `store=False`: the caller's `GenerationInput` is the whole state,
@@ -827,9 +827,7 @@ class OpenAIResponsesAdapter(Adapter):
 
         supports_prompt_cache_options says whether the model accepts the prompt_cache_options
         request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
-        That parameter is the only thing that carries automatic_prompt_caching False to the wire,
-        so False here makes bind raise for a binding that declines caching, rather than cache
-        anyway at whatever that model charges for it.
+        `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
         It has no default because a wrong value fails either way: True on a model without the
         parameter risks a rejected request, and False on one with it refuses a binding the model
         would have accepted.
@@ -849,7 +847,12 @@ class OpenAIResponsesAdapter(Adapter):
         Raises:
             ValueError: `provider_name` contradicts the client's class.
         """
-        super().__init__(client=client, model=model, provider_name=provider_name)
+        super().__init__(
+            client=client,
+            model=model,
+            provider_name=provider_name,
+            automatic_cache_breakpoints_default=not supports_prompt_cache_options,
+        )
         self.client = client_without_retries(client)
         self.pricing = pricing
         self.regional_processing = regional_processing
@@ -866,8 +869,8 @@ class OpenAIResponsesAdapter(Adapter):
         first in every request's input, because only input message parts carry prompt_cache_breakpoint.
 
         Raises:
-            ValueError: the binding declines automatic caching on a model built with
-                supports_prompt_cache_options False, or its extra_body holds a key in
+            ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
+                Also raised when extra_body holds a key in
                 _ADAPTER_POPULATED_WIRE_KEYS.
                 Also raised for unsupported provider-executed tool `type` values.
                 Provider-executed tools require `provider_name="openai"`.
@@ -878,7 +881,7 @@ class OpenAIResponsesAdapter(Adapter):
         )
         require_prompt_cache_options_support(
             model=self.model,
-            automatic_prompt_caching=binding.automatic_prompt_caching,
+            automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
             supports_prompt_cache_options=self.supports_prompt_cache_options,
         )
         provider_executed_tool_types = validated_provider_executed_tool_types(
@@ -940,7 +943,9 @@ class OpenAIResponsesAdapter(Adapter):
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             prompt_cache_options=(
-                omit if binding.automatic_prompt_caching else PromptCacheOptions(mode="explicit")
+                omit
+                if binding.automatic_cache_breakpoints
+                else PromptCacheOptions(mode="explicit")
             ),
             service_tier=self.service_tier if self.service_tier is not None else omit,
             include=["reasoning.encrypted_content"],

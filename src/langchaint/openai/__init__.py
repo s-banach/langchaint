@@ -85,7 +85,7 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
 """Cataloged models accepting `prompt_cache_options`.
 
 OpenAI 2.45.0 documents this parameter for gpt-5.6-and-later.
-It carries `automatic_prompt_caching=False` to the request.
+It carries `automatic_cache_breakpoints=False` to the request.
 `OpenAI.model` derives `supports_prompt_cache_options` from this set.
 The set stays independent from pricing because parameter availability can change independently.
 """

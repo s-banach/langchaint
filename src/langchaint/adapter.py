@@ -323,18 +323,14 @@ class Binding:
     tool_choice: ToolChoice
     parallel_tool_calls: bool
     inference_params: InferenceParams
-    automatic_prompt_caching: bool
-    """Whether the adapter manages prompt caching automatically.
+    automatic_cache_breakpoints: bool
+    """Whether `automatic_cache_breakpoints` is enabled.
 
-    True: the anthropic adapter marks the frozen prefix and each request's last message block as cache breakpoints;
-    the openai adapter leaves the provider's implicit caching in place.
-    False: the anthropic adapter writes no breakpoints of its own,
-    and the openai adapter requests explicit-mode caching with no breakpoints,
-    so a Sequence[Message] without marked parts caches nothing and pays no cache writes.
-    Under either value, a part with cache_breakpoint True adds a breakpoint at exactly that boundary,
-    so False plus marked parts is the fully user-specified caching configuration.
-    On openai, False requires an adapter built with supports_prompt_cache_options True,
-    which openai documents as gpt-5.6 and later; on any other model it raises at bind time.
+    `automatic_cache_breakpoints=True` lets the adapter or provider select cache boundaries.
+    `automatic_cache_breakpoints=False` forbids that selection where supported.
+    `cache_breakpoint=True` requests an explicit breakpoint under either value.
+    OpenAI models lacking `prompt_cache_options` require `automatic_cache_breakpoints=True`.
+    Gemini cannot control implicit caching, so both values build identical requests.
     """
 
     extra_body: Mapping[str, object] | None = None
@@ -832,11 +828,20 @@ class Adapter(ABC):
     since both subclass it.
     """
 
-    def __init__(self, *, client: object, model: str, provider_name: str) -> None:
-        """Check client against the stated provider_name, then store model and provider_name.
+    def __init__(
+        self,
+        *,
+        client: object,
+        model: str,
+        provider_name: str,
+        automatic_cache_breakpoints_default: bool,
+    ) -> None:
+        """Validate `provider_name` and store the adapter-wide values.
 
         client is checked here and not stored.
         Its object annotation is the price of checking every adapter in one place.
+        `automatic_cache_breakpoints_default` resolves an unstated `LLM.bind` value.
+        Adapter authors must select it.
 
         Rates are not stored here. Each provider's service tiers are its own words, so an adapter
         holds a mapping from the tier its responses report to the table that prices that tier,
@@ -858,6 +863,7 @@ class Adapter(ABC):
         )
         self.model = model
         self.provider_name = provider_name
+        self.automatic_cache_breakpoints_default = automatic_cache_breakpoints_default
 
     @abstractmethod
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:

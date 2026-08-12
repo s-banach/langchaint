@@ -13,7 +13,7 @@ from langchaint.openai import OpenAI
 
 openai = OpenAI()
 llm = openai.model("gpt-5.6-terra")
-bound = llm.bind(automatic_prompt_caching=False)
+bound = llm.bind()
 response = await bound.generate_one([UserMessage(content="Hello")])
 print(response.output)
 ```
@@ -30,8 +30,8 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
 | `model.batch(inputs)` | `await bound.generate_many(inputs)` |
 | `model.stream(messages)` | `async with bound.stream_one(messages) as stream:` |
-| `model.bind_tools(tools)` | `llm.bind(tools=tools, automatic_prompt_caching=False)` |
-| `model.with_structured_output(Model)` | `llm.bind(response_format=Model, automatic_prompt_caching=False)` |
+| `model.bind_tools(tools)` | `llm.bind(tools=tools)` |
+| `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
 | `RunnableRetry` | `max_attempts` on `bind` |
 | `InMemoryRateLimiter` | `max_concurrent_requests` and `max_request_starts_per_second` |
@@ -101,7 +101,6 @@ concise = llm.bind(
     system_prompt="Answer in one sentence.",
     inference_params=InferenceParams(temperature=0.2),
     max_attempts=3,
-    automatic_prompt_caching=False,
 )
 creative = concise.rebind(
     system_prompt="Write a vivid paragraph.",
@@ -137,7 +136,6 @@ class Answer(BaseModel):
 result = await llm.bind(
     response_format=Answer,
     tools=tools,
-    automatic_prompt_caching=False,
 ).generate_one("Answer the question")
 
 match result:
@@ -197,11 +195,10 @@ See [`09_embeddings.py`](09_embeddings.py) for both embedding tasks.
 
 ## Prompt caching
 
-`automatic_prompt_caching` is required on every `bind`.
-The value has billing consequences.
-langchaint never selects it for the caller.
+`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` when the argument is `None`.
+Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
 
-Explicit `cache_breakpoint=True` values remain active under either setting.
+Explicit `cache_breakpoint=True` values remain active under either `automatic_cache_breakpoints` value.
 
 ```python
 from langchaint import TextPart
@@ -214,7 +211,7 @@ bound = llm.bind(
         ),
         TextPart(text="Request-specific context."),
     ],
-    automatic_prompt_caching=False,
+    automatic_cache_breakpoints=False,
 )
 ```
 
@@ -243,7 +240,6 @@ Use `extra_body` for other provider wire fields.
 ```python
 bound = llm.bind(
     extra_body={"top_p": 0.9},
-    automatic_prompt_caching=False,
 )
 ```
 
@@ -262,7 +258,6 @@ openai = OpenAI(
 )
 bound = openai.model("gpt-5.6-terra").bind(
     max_attempts=5,
-    automatic_prompt_caching=False,
 )
 ```
 

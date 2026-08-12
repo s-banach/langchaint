@@ -23,11 +23,11 @@ It filters prior thinking blocks itself.
 Therefore, re-emitting every ReasoningPart value is safe.
 It rejects consecutive thinking blocks re-sent out of their emission order, which turn order preserves.
 
-Cache breakpoints: with automatic_prompt_caching bound True,
+`automatic_cache_breakpoints`: with `automatic_cache_breakpoints=True`,
 the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
 or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,
 so the cached span grows with the Sequence[Message].
-Bound False, the adapter writes no marker of its own.
+With `automatic_cache_breakpoints=False`, the adapter writes no marker of its own.
 The adapter never sends the API's top-level automatic cache_control request parameter:
 it is unavailable on Bedrock, which this adapter also serves.
 A part with cache_breakpoint True adds a marker under either binding: on the part's own text or image block
@@ -40,7 +40,7 @@ The API allows at most 4 cache_control markers per request.
 The SDK documents no such limit, so the source is the provider's prompt-caching page, read 2026-07-25:
 https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 message_mark_budget is what the limit leaves after the binding's own markers.
-Those are the system parts with cache_breakpoint set, plus whichever markers automatic_prompt_caching adds.
+Those are the system parts with cache_breakpoint set, plus whichever markers automatic_cache_breakpoints adds.
 A binding whose own markers exceed the limit fails at bind with ValueError.
 Where more message parts carry cache_breakpoint than that budget allows, the latest ones get markers.
 Older ones go unmarked, mirroring openai's documented latest-N rule.
@@ -502,7 +502,7 @@ class _AnthropicPrecomputedFields:
     thinking: ThinkingConfigParam | Omit
     service_tier: AnthropicServiceTier | Omit
     inference_geo: str | Omit
-    automatic_prompt_caching: bool
+    automatic_cache_breakpoints: bool
     cache_ttl: CacheTTL
     message_mark_budget: int
     """What the binding's own markers (system marks, the frozen-prefix and last-message markers) leave
@@ -651,7 +651,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
     Raises:
         _NotSendableError: raw names no type key. Every content block param is discriminated by that
             key (anthropic 0.120.2), so a dump without one is no block, and the wire path reads it
-            to decide where the automatic cache breakpoint goes. build_request reports the whole
+            to place `automatic_cache_breakpoints`. build_request reports the whole
             request unsendable and the item fails on its own.
     """
     if "type" not in raw:
@@ -727,13 +727,13 @@ def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
 def _wire_messages(
     messages: Sequence[Message],
     *,
-    automatic_prompt_caching: bool,
+    automatic_cache_breakpoints: bool,
     cache_ttl: CacheTTL,
     message_mark_budget: int,
 ) -> list[MessageParam]:
     """Convert messages to wire messages.
 
-    With automatic_prompt_caching, places the per-request cache breakpoint on the last content block,
+    With automatic_cache_breakpoints, places the per-request cache breakpoint on the last content block,
     so the cached span grows with messages.
     A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
     so that request writes none.
@@ -783,7 +783,7 @@ def _wire_messages(
     if message_mark_budget > 0:
         for block in marked_blocks[-message_mark_budget:]:
             block["cache_control"] = _cache_control_param(cache_ttl)
-    if automatic_prompt_caching and wire:
+    if automatic_cache_breakpoints and wire:
         last_blocks = wire[-1][1]
         if last_blocks:
             last_block = last_blocks[-1]
@@ -804,7 +804,7 @@ def _request_messages(
     try:
         return _wire_messages(
             messages,
-            automatic_prompt_caching=precomputed_fields.automatic_prompt_caching,
+            automatic_cache_breakpoints=precomputed_fields.automatic_cache_breakpoints,
             cache_ttl=precomputed_fields.cache_ttl,
             message_mark_budget=precomputed_fields.message_mark_budget,
         )
@@ -1187,7 +1187,12 @@ class AnthropicMessagesAdapter(Adapter):
         Raises:
             ValueError: `provider_name` contradicts the client's class.
         """
-        super().__init__(client=client, model=model, provider_name=provider_name)
+        super().__init__(
+            client=client,
+            model=model,
+            provider_name=provider_name,
+            automatic_cache_breakpoints_default=False,
+        )
         self.client = client_without_retries(client)
         self.pricing = pricing
         self.default_max_completion_tokens = default_max_completion_tokens
@@ -1200,7 +1205,7 @@ class AnthropicMessagesAdapter(Adapter):
 
         A str system_prompt is one system block; a parts system_prompt is one block per part,
         each marked part carrying cache_control.
-        automatic_prompt_caching marks the last system block (idempotent when it is already marked)
+        automatic_cache_breakpoints marks the last system block (idempotent when it is already marked)
         or, with no system prompt, the last tool.
         The binding's markers spend the API's 4-marker request limit first;
         message_mark_budget carries the remainder to _wire_messages.
@@ -1245,7 +1250,7 @@ class AnthropicMessagesAdapter(Adapter):
                     if part.cache_breakpoint:
                         system_block["cache_control"] = _cache_control_param(self.cache_ttl)
                     system_blocks.append(system_block)
-            if binding.automatic_prompt_caching:
+            if binding.automatic_cache_breakpoints:
                 system_blocks[-1]["cache_control"] = _cache_control_param(self.cache_ttl)
             bind_marker_count = sum(1 for block in system_blocks if "cache_control" in block)
             system = system_blocks
@@ -1253,7 +1258,7 @@ class AnthropicMessagesAdapter(Adapter):
         tool_choice: ToolChoiceParam | Omit = omit
         if binding.tool_schemas or binding.provider_executed_tools:
             cache_breakpoint_on_last_tool = (
-                binding.automatic_prompt_caching and binding.system_prompt is None
+                binding.automatic_cache_breakpoints and binding.system_prompt is None
             )
             tools = _wire_tools(
                 binding.tool_schemas,
@@ -1265,7 +1270,7 @@ class AnthropicMessagesAdapter(Adapter):
             tool_choice = _wire_tool_choice(
                 binding.tool_choice, parallel_tool_calls=binding.parallel_tool_calls
             )
-        last_message_marker_count = 1 if binding.automatic_prompt_caching else 0
+        last_message_marker_count = 1 if binding.automatic_cache_breakpoints else 0
         message_mark_budget = (
             _CACHE_MARKER_REQUEST_LIMIT - bind_marker_count - last_message_marker_count
         )
@@ -1301,7 +1306,7 @@ class AnthropicMessagesAdapter(Adapter):
             thinking=thinking,
             service_tier=self.service_tier if self.service_tier is not None else omit,
             inference_geo=self.inference_geo if self.inference_geo is not None else omit,
-            automatic_prompt_caching=binding.automatic_prompt_caching,
+            automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
             extra_body=binding.extra_body,

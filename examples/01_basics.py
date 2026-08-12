@@ -25,14 +25,14 @@ async def basics() -> None:
     openai = OpenAI()
     llm = openai.model("gpt-5.6-terra")
 
-    assistant = llm.bind(system_prompt="Be terse.", automatic_prompt_caching=False)
+    assistant = llm.bind(system_prompt="Be terse.")
     colors = await assistant.generate_one("Name three primary colors.")
     print(f"answer: {colors.output}")
     print(f"model: {colors.call.model}")
     print(f"provider: {colors.call.provider_name}")
     print(f"attempts: {len(colors.call.attempt_records)}")
 
-    classifier = llm.bind(response_format=Sentiment, automatic_prompt_caching=False)
+    classifier = llm.bind(response_format=Sentiment)
     classification = await classifier.generate_one("Best day I have had in months.")
     print(f"{classification.output.label}: {classification.output.confidence}")
 

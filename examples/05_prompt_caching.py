@@ -13,7 +13,7 @@ async def generate_with_a_warm_cache() -> list[Response[str] | GenerationError]:
     ) * 300
     bound = anthropic.model("claude-sonnet-5", cache_ttl="1h").bind(
         system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
-        automatic_prompt_caching=False,
+        automatic_cache_breakpoints=False,
     )
 
     prompts = [

@@ -30,7 +30,7 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
         max_attempts=5,
         automatic_prompt_caching=False,
     )
-    fallback = openai.model("gpt-5.6-terra", regional_processing=False).bind(
+    fallback = openai.model("gpt-5.6-terra").bind(
         system_prompt="Summarize in one sentence.", automatic_prompt_caching=False
     )
 

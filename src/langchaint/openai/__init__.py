@@ -139,7 +139,7 @@ class OpenAI:
         self,
         model: OpenAIModelName,
         *,
-        regional_processing: bool,
+        regional_processing: bool = ...,
         pricing: OpenAIPricingTable | None = ...,
         supports_prompt_cache_options: bool | None = ...,
         reasoning_summary: ReasoningSummary | None = ...,
@@ -151,7 +151,7 @@ class OpenAI:
         self,
         model: str,
         *,
-        regional_processing: bool,
+        regional_processing: bool = ...,
         pricing: OpenAIPricingTable,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = ...,
@@ -162,7 +162,7 @@ class OpenAI:
         self,
         model: str,
         *,
-        regional_processing: bool,
+        regional_processing: bool = False,
         pricing: OpenAIPricingTable | None = None,
         supports_prompt_cache_options: bool | None = None,
         reasoning_summary: ReasoningSummary | None = None,
@@ -174,7 +174,8 @@ class OpenAI:
         Cataloged models receive `OPENAI_PRICING`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
-        `regional_processing` controls regional token-rate multipliers.
+        `regional_processing=False` uses the standard `1.0` token-price multiplier.
+        Set it to `True` when the configured endpoint uses regional processing.
         `supports_prompt_cache_options` states whether the model accepts that request parameter.
         Cataloged models derive that value from `PROMPT_CACHE_OPTIONS_MODELS`.
         `reasoning_summary` requests readable reasoning summary text.

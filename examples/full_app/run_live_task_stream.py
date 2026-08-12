@@ -30,7 +30,7 @@ async def main() -> None:
     """
     openai = OpenAI()
     app = App(
-        llm=openai.model(MODEL, regional_processing=False),
+        llm=openai.model(MODEL),
         configs=build_configs(),
         tracer=trace.get_tracer("examples.full_app.live"),
         on_event=print_event,

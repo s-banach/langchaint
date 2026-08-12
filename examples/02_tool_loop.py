@@ -34,7 +34,7 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
         RuntimeError: The model exceeded `max_turns`.
     """
     openai = OpenAI()
-    bound = openai.model("gpt-5.6-terra", regional_processing=False).bind(
+    bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Use get_weather when needed. Return FinalAnswer when finished.",
         tools=[get_weather],
         response_format=FinalAnswer,

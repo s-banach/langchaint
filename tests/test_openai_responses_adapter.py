@@ -758,7 +758,6 @@ def _adapter(
         model="m",
         pricing=_PRICING,
         provider_name="openai",
-        regional_processing=False,
         supports_prompt_cache_options=supports_prompt_cache_options,
         reasoning_summary=reasoning_summary,
     )

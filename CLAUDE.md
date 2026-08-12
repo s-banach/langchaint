@@ -36,7 +36,6 @@ Put a verified fact in a docstring only where the caller acts on it, naming the 
 
 ## Design rules
 
-- Never choose a billing-relevant configuration for the user: `automatic_prompt_caching` is a required keyword with no default (an unstated `False` is a billing choice as real as opting in), and any convenience on top of user-stated caching is opt-in and default-off. Honor user-placed `cache_breakpoint` marks under either binding value.
 - Leave the tool loop to the application: ship no agent loop, and make a tool function return data, never a control-flow signal.
 - Create one `SharedBackoff` per rate-limit quota. Its `admitted()` block gates every request-start path.
 - Wrap official SDK clients and delegate stream assembly to the SDK. Write no wire TypedDicts by hand. Validate a structured response against the caller's model where the response is in scope, because an SDK that validates inside the call returning the response raises where neither the response nor its billing is reachable.

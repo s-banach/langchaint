@@ -36,7 +36,7 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
 
     openai = OpenAI()
     traced = TracedLLM(
-        openai.model("gpt-5.6-terra", regional_processing=False),
+        openai.model("gpt-5.6-terra"),
         capture_message_content=False,
         tracer=tracer,
     )

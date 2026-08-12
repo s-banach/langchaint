@@ -800,7 +800,7 @@ class OpenAIResponsesAdapter(Adapter):
         model: str,
         pricing: OpenAIPricingTable,
         provider_name: str,
-        regional_processing: bool,
+        regional_processing: bool = False,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIServiceTier | None = None,
@@ -841,7 +841,8 @@ class OpenAIResponsesAdapter(Adapter):
         every OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.
 
         `pricing` holds this model's rates and modifiers.
-        `regional_processing` applies its regional multiplier to token rates.
+        `regional_processing=False` uses the standard `1.0` token-price multiplier.
+        `regional_processing=True` applies the regional token-price multiplier.
         service_tier is what the request asks for, None sending nothing. It cannot decide the price:
         the API documents the reported mode as possibly different from the requested one.
 

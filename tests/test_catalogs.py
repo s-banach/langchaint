@@ -134,14 +134,12 @@ def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
 def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     """OpenAI.model returns an adapter carrying catalog pricing."""
-    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
-        model,
-        regional_processing=False,
-    )
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
     assert adapter.pricing is OPENAI_PRICING[model]
+    assert adapter.regional_processing is False
     web_search_rate = adapter.pricing.web_search_usd_per_invocation
     assert web_search_rate is not None
     assert web_search_rate > 0
@@ -555,7 +553,7 @@ def test_service_tier_reaches_each_first_party_adapter() -> None:
     assert isinstance(openai_adapter, OpenAIResponsesAdapter)
     assert openai_adapter.service_tier == "flex"
     assert openai_adapter.regional_processing is False
-    unstated = openai.model("gpt-5.6-terra", regional_processing=False).adapter
+    unstated = openai.model("gpt-5.6-terra").adapter
     assert isinstance(unstated, OpenAIResponsesAdapter)
     assert unstated.service_tier is None
 

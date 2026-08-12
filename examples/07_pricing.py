@@ -21,7 +21,6 @@ async def price_at_negotiated_rates() -> Response[str]:
     openai = OpenAI()
     bound = openai.model(
         "gpt-5.6",
-        regional_processing=False,
         pricing=pricing,
         supports_prompt_cache_options=True,
     ).bind(system_prompt="Be terse.", automatic_prompt_caching=False)

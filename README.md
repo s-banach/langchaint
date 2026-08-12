@@ -45,7 +45,7 @@ from langchaint.openai import OpenAI
 
 async def main() -> None:
     openai = OpenAI()
-    bound_llm = openai.model("gpt-5.6-terra", regional_processing=False).bind(
+    bound_llm = openai.model("gpt-5.6-terra").bind(
         system_prompt="Answer clearly and concisely.",
         automatic_prompt_caching=False,
     )
@@ -57,7 +57,8 @@ asyncio.run(main())
 ```
 
 `response.output` is assistant text.
-`regional_processing` states whether the configured endpoint uses regional processing.
+`regional_processing=False` uses the standard `1.0` token-price multiplier.
+Set it to `True` when the configured endpoint uses regional processing.
 Pass a Pydantic model to `LLM.bind(response_format=...)` for validated structured output.
 
 ## Embedding quickstart
@@ -104,8 +105,8 @@ openai = OpenAI(
     max_concurrent_requests=8,
     max_request_starts_per_second=50.0,
 )
-terra = openai.model("gpt-5.6-terra", regional_processing=False)
-sol = openai.model("gpt-5.6-sol", regional_processing=False)
+terra = openai.model("gpt-5.6-terra")
+sol = openai.model("gpt-5.6-sol")
 ```
 
 Both `terra` and `sol` use `openai.client` and one `SharedBackoff`.
@@ -120,7 +121,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI()
 openai = OpenAI(client=client)
-terra = openai.model("gpt-5.6-terra", regional_processing=False)
+terra = openai.model("gpt-5.6-terra")
 
 # Use terra.
 

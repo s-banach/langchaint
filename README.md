@@ -1,6 +1,6 @@
 # langchaint
 
-Provider-neutral generation and embeddings over official SDKs.
+langchaint provides typed generation and embeddings with raw provider responses and per-attempt billing.
 Alpha: the API is unstable and may change without notice.
 
 ## Purpose
@@ -45,7 +45,7 @@ from langchaint.openai import OpenAI
 
 async def main() -> None:
     openai = OpenAI()
-    bound_llm = openai.model("gpt-5.6-terra").bind(
+    bound_llm = openai.model("gpt-5.6-terra", regional_processing=False).bind(
         system_prompt="Answer clearly and concisely.",
         automatic_prompt_caching=False,
     )
@@ -57,6 +57,7 @@ asyncio.run(main())
 ```
 
 `response.output` is assistant text.
+`regional_processing` states whether the configured endpoint uses regional processing.
 Pass a Pydantic model to `LLM.bind(response_format=...)` for validated structured output.
 
 ## Embedding quickstart
@@ -103,8 +104,8 @@ openai = OpenAI(
     max_concurrent_requests=8,
     max_request_starts_per_second=50.0,
 )
-terra = openai.model("gpt-5.6-terra")
-sol = openai.model("gpt-5.6-sol")
+terra = openai.model("gpt-5.6-terra", regional_processing=False)
+sol = openai.model("gpt-5.6-sol", regional_processing=False)
 ```
 
 Both `terra` and `sol` use `openai.client` and one `SharedBackoff`.
@@ -119,7 +120,7 @@ from openai import AsyncOpenAI
 
 client = AsyncOpenAI()
 openai = OpenAI(client=client)
-terra = openai.model("gpt-5.6-terra")
+terra = openai.model("gpt-5.6-terra", regional_processing=False)
 
 # Use terra.
 

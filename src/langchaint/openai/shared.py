@@ -10,6 +10,7 @@ import base64
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal
 
 import openai
@@ -68,14 +69,10 @@ The API documents the response value as the processing mode actually used and sa
 from the value the request set, so the tier is read off each response rather than assumed.
 """
 
-type OpenAIPricedServiceTier = Literal["default", "flex", "scale", "priority", "fast"]
-"""The pricing mapping's key: the tiers a caller can hold rates for.
+type _OpenAINormalizedServiceTier = Literal["default", "flex", "scale", "priority", "fast"]
+"""Normalized OpenAI response service tiers."""
 
-"auto" is excluded. It is in the response literal only because request and response share one type,
-and it names no processing mode, so it is not a tier anyone has a rate for.
-"""
-
-_DEFAULT_TIER: OpenAIPricedServiceTier = "default"
+_DEFAULT_TIER: _OpenAINormalizedServiceTier = "default"
 
 type _FailureDisposition = Literal["transient", "terminal"]
 
@@ -125,33 +122,21 @@ def _image_data_uri(image_part: ImagePart) -> str:
     return f"data:{image_part.media_type};base64,{encoded_data}"
 
 
-def _priced_tier(service_tier: OpenAIServiceTier | None) -> OpenAIPricedServiceTier:
-    """Return the pricing key for one response's `service_tier`."""
+def _priced_tier(service_tier: OpenAIServiceTier | None) -> _OpenAINormalizedServiceTier:
+    """Normalize one response's `service_tier`."""
     if service_tier is None or service_tier == "auto":
         return _DEFAULT_TIER
     return service_tier
 
 
 @dataclass(frozen=True, kw_only=True)
-class OpenAIPricingTable:
-    """One model's rates at one OpenAI service tier, one rate per priced category.
-
-    cache_write_usd_per_million_tokens applies because OpenAI bills cache writes (reported as
-    input_tokens_details.cache_write_tokens) starting with gpt-5.6.
-
-    An adapter holds one table per service tier it can price and selects by the tier the response
-    reports, so a response served at a tier the caller supplied no table for costs NaN
-    rather than these rates.
-    """
+class OpenAIRates:
+    """OpenAI token rates for one service tier."""
 
     input_cache_none_usd_per_million_tokens: float
     output_usd_per_million_tokens: float
     cache_read_usd_per_million_tokens: float
     cache_write_usd_per_million_tokens: float
-    web_search_usd_per_invocation: float | None = None
-    """Price for one `search` action, or `None` until configured."""
-    file_search_usd_per_invocation: float | None = None
-    """Price for one `file_search_call`, or `None` until configured."""
 
     def price(  # noqa: PLR0913 (each normalized category arrives separately)
         self,
@@ -207,21 +192,110 @@ class OpenAIPricingTable:
             output_usd_per_million_tokens=self.output_usd_per_million_tokens,
         )
 
+    def multiplied(self, *, input_multiplier: float, output_multiplier: float) -> "OpenAIRates":
+        """Return rates multiplied by category."""
+        return OpenAIRates(
+            input_cache_none_usd_per_million_tokens=(
+                self.input_cache_none_usd_per_million_tokens * input_multiplier
+            ),
+            output_usd_per_million_tokens=(self.output_usd_per_million_tokens * output_multiplier),
+            cache_read_usd_per_million_tokens=(
+                self.cache_read_usd_per_million_tokens * input_multiplier
+            ),
+            cache_write_usd_per_million_tokens=(
+                self.cache_write_usd_per_million_tokens * input_multiplier
+            ),
+        )
 
-_UNPRICED = OpenAIPricingTable(
+
+_UNPRICED_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=float("nan"),
     output_usd_per_million_tokens=float("nan"),
     cache_read_usd_per_million_tokens=float("nan"),
     cache_write_usd_per_million_tokens=float("nan"),
-    web_search_usd_per_invocation=float("nan"),
-    file_search_usd_per_invocation=float("nan"),
 )
-"""The table an adapter prices at when the response reports a service tier it holds no table for.
 
-Every nonzero counter costs NaN and every zero counter costs zero, so the response's own numbers
-survive and the cost says it is unknown. Pricing at some other tier's rates instead would report a
-number wrong by that tier's multiplier, and raising would destroy a response that was paid for.
-"""
+
+@dataclass(frozen=True, kw_only=True)
+class OpenAILongContextPricing:
+    """OpenAI rate multipliers above one input-token threshold."""
+
+    input_tokens_above: int
+    input_multiplier: float
+    output_multiplier: float
+
+    def __post_init__(self) -> None:
+        """Reject invalid thresholds and multipliers.
+
+        Raises:
+            ValueError: A threshold or multiplier is invalid.
+        """
+        if isinstance(self.input_tokens_above, bool) or self.input_tokens_above <= 0:
+            raise ValueError("input_tokens_above must be a positive int")
+        for name, multiplier in (
+            ("input_multiplier", self.input_multiplier),
+            ("output_multiplier", self.output_multiplier),
+        ):
+            if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
+
+@dataclass(frozen=True, kw_only=True)
+class OpenAIPricingTable:
+    """OpenAI rates and modifiers for one model."""
+
+    default: OpenAIRates
+    flex: OpenAIRates | None = None
+    fast: OpenAIRates | None = None
+    scale: OpenAIRates | None = None
+    long_context: OpenAILongContextPricing | None = None
+    regional_processing_multiplier: float | None = None
+    web_search_usd_per_invocation: float | None = None
+    file_search_usd_per_invocation: float | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an invalid regional multiplier.
+
+        Raises:
+            ValueError: The regional multiplier is invalid.
+        """
+        multiplier = self.regional_processing_multiplier
+        if multiplier is None:
+            return
+        if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+            raise ValueError("regional_processing_multiplier must be finite and positive")
+
+    def rates_for(
+        self,
+        *,
+        service_tier: OpenAIServiceTier | None,
+        input_tokens_total: int,
+        regional_processing: bool,
+    ) -> OpenAIRates:
+        """Select token rates using reported response metadata."""
+        priced_tier = _priced_tier(service_tier)
+        if priced_tier == "default":
+            rates = self.default
+        elif priced_tier == "flex":
+            rates = self.flex
+        elif priced_tier in ("fast", "priority"):
+            rates = self.fast
+        else:
+            rates = self.scale
+        if rates is None:
+            return _UNPRICED_RATES
+        long_context = self.long_context
+        if long_context is not None and input_tokens_total > long_context.input_tokens_above:
+            rates = rates.multiplied(
+                input_multiplier=long_context.input_multiplier,
+                output_multiplier=long_context.output_multiplier,
+            )
+        if not regional_processing:
+            return rates
+        multiplier = self.regional_processing_multiplier
+        if multiplier is None:
+            return _UNPRICED_RATES
+        return rates.multiplied(input_multiplier=multiplier, output_multiplier=multiplier)
 
 
 def require_prompt_cache_options_support(

@@ -77,14 +77,14 @@ from langchaint.adapter import (
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
+    ANTHROPIC_BEDROCK_PRICING,
     ANTHROPIC_PRICING,
     Anthropic,
     AnthropicBedrock,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
-    AnthropicModelName,
-    AnthropicPricedServiceTier,
     AnthropicPricingTable,
+    AnthropicRates,
 )
 from langchaint.anthropic.messages_adapter import (
     PARSE_FALLTHROUGH_COUNTS,
@@ -116,25 +116,26 @@ from langchaint.shared_backoff import (
 )
 from langchaint.tools import ToolSchema
 
-_STANDARD_RATES = AnthropicPricingTable(
+_STANDARD_RATES = AnthropicRates(
     input_cache_none_usd_per_million_tokens=3.0,
     output_usd_per_million_tokens=15.0,
     cache_read_usd_per_million_tokens=0.3,
     cache_write_5m_usd_per_million_tokens=3.75,
     cache_write_1h_usd_per_million_tokens=6.0,
-    web_search_usd_per_invocation=0.01,
 )
 
-_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {"standard": _STANDARD_RATES}
+_PRICING = AnthropicPricingTable(
+    standard=_STANDARD_RATES,
+    web_search_usd_per_invocation=0.01,
+)
 """The standard tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = AnthropicPricingTable(
+_PRIORITY_RATES = AnthropicRates(
     input_cache_none_usd_per_million_tokens=6.0,
     output_usd_per_million_tokens=30.0,
     cache_read_usd_per_million_tokens=0.6,
     cache_write_5m_usd_per_million_tokens=7.5,
     cache_write_1h_usd_per_million_tokens=12.0,
-    web_search_usd_per_invocation=0.02,
 )
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
 
@@ -374,16 +375,16 @@ def test_truncated_anthropic_web_search_billing_produces_nan() -> None:
 @pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
 def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None) -> None:
     """A configured search rejects an unusable caller rate before requests."""
-    pricing: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
-        "standard": AnthropicPricingTable(
+    pricing = AnthropicPricingTable(
+        standard=AnthropicRates(
             input_cache_none_usd_per_million_tokens=3.0,
             output_usd_per_million_tokens=15.0,
             cache_read_usd_per_million_tokens=0.3,
             cache_write_5m_usd_per_million_tokens=3.75,
             cache_write_1h_usd_per_million_tokens=6.0,
-            web_search_usd_per_invocation=rate,
-        )
-    }
+        ),
+        web_search_usd_per_invocation=rate,
+    )
     adapter = AnthropicMessagesAdapter(
         client=AsyncAnthropic(api_key="test"),
         model="m",
@@ -448,14 +449,16 @@ def test_the_stored_write_price_is_the_blend_of_what_the_two_ttls_billed() -> No
 def test_equal_write_rates_store_that_rate_as_the_write_price() -> None:
     """With both TTLs priced alike the blend is that rate, so blending adds no artifact."""
     equal_write_rates = AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=3.0,
-        output_usd_per_million_tokens=15.0,
-        cache_read_usd_per_million_tokens=0.3,
-        cache_write_5m_usd_per_million_tokens=3.75,
-        cache_write_1h_usd_per_million_tokens=3.75,
+        standard=AnthropicRates(
+            input_cache_none_usd_per_million_tokens=3.0,
+            output_usd_per_million_tokens=15.0,
+            cache_read_usd_per_million_tokens=0.3,
+            cache_write_5m_usd_per_million_tokens=3.75,
+            cache_write_1h_usd_per_million_tokens=3.75,
+        ),
         web_search_usd_per_invocation=0.01,
     )
-    billing = _billing_from_sdk_usage(_usage_with_cache_split(), {"standard": equal_write_rates})
+    billing = _billing_from_sdk_usage(_usage_with_cache_split(), equal_write_rates)
     assert billing.cache_write_usd_per_million_tokens == pytest.approx(3.75)
 
 
@@ -468,10 +471,10 @@ def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> N
 
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response, standard rates a response reporting no tier."""
-    pricing: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
-        "standard": _STANDARD_RATES,
-        "priority": _PRIORITY_RATES,
-    }
+    pricing = AnthropicPricingTable(
+        standard=_STANDARD_RATES,
+        priority=_PRIORITY_RATES,
+    )
     at_priority = _billing_from_sdk_usage(
         at.Usage(input_tokens=100, output_tokens=50, service_tier="priority"), pricing
     )
@@ -495,30 +498,19 @@ def test_the_categories_are_priced_apart() -> None:
     )
 
 
-def test_pricing_without_the_standard_key_raises_at_construction() -> None:
-    """A pricing mapping missing "standard" fails before any request, naming the model."""
-    priority_only: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
-        "priority": _PRIORITY_RATES
-    }
-    with pytest.raises(ValueError, match=re.escape("'standard'")):
-        _ = AnthropicMessagesAdapter(
-            client=AsyncAnthropic(api_key="test"),
-            model="claude-sonnet-5",
-            pricing=priority_only,
-            provider_name="anthropic",
-        )
-
-
-def test_the_catalog_prices_the_standard_tier_and_a_caller_adds_others() -> None:
-    """Anthropic.model merges stated pricing over catalog pricing."""
+def test_anthropic_model_accepts_replacement_pricing() -> None:
+    """Anthropic.model accepts a replacement pricing table."""
+    replacement = AnthropicPricingTable(
+        standard=ANTHROPIC_PRICING["claude-sonnet-5"].standard,
+        priority=_PRIORITY_RATES,
+    )
     adapter = _anthropic_adapter_of(
         Anthropic(client=AsyncAnthropic(api_key="test")).model(
             "claude-sonnet-5",
-            pricing={"priority": _PRIORITY_RATES},
+            pricing=replacement,
         )
     )
-    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-sonnet-5"]
-    assert adapter.pricing["priority"] is _PRIORITY_RATES
+    assert adapter.pricing is replacement
 
 
 def test_cache_ttl_is_stored_on_the_adapter() -> None:
@@ -2046,12 +2038,12 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
     assert adapter.client.max_retries == 0
 
 
-def test_bedrock_model_shares_the_first_party_pricing_object() -> None:
-    """The Bedrock standard-tier table shares Anthropic.model pricing."""
+def test_bedrock_model_uses_its_bedrock_pricing_object() -> None:
+    """The Bedrock catalog remains independent from direct Anthropic pricing."""
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
     )
-    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-6"]
+    assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:
@@ -2075,52 +2067,6 @@ def test_bedrock_model_rejects_a_client_whose_class_does_not_serve_the_models_ap
     with pytest.raises(ValueError, match=re.escape("anthropic.claude-sonnet-5")) as excinfo:
         _ = AnthropicBedrock(client=legacy_client).model("anthropic.claude-sonnet-5")
     assert "AsyncAnthropicBedrockMantle" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    ("model", "aws_region", "pricing_key"),
-    [
-        ("anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
-        ("us.anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
-        ("eu.anthropic.claude-sonnet-4-6", "eu-west-1", "claude-sonnet-4-6"),
-        ("global.anthropic.claude-sonnet-4-6", "us-east-1", "claude-sonnet-4-6"),
-        (
-            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-sonnet-4-6",
-            "us-east-1",
-            "claude-sonnet-4-6",
-        ),
-        (
-            "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "eu-west-1",
-            "claude-haiku-4-5-20251001",
-        ),
-        ("us.anthropic.claude-sonnet-5", "us-east-1", "claude-sonnet-5"),
-    ],
-)
-def test_bedrock_model_matches_legacy_model_variants(
-    model: str,
-    aws_region: str,
-    pricing_key: AnthropicModelName,
-) -> None:
-    """Legacy model variants select `AsyncAnthropicBedrock` and matching pricing."""
-    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region=aws_region).model(model))
-    assert isinstance(adapter.client, AsyncAnthropicBedrock)
-    assert adapter.pricing["standard"] is ANTHROPIC_PRICING[pricing_key]
-
-
-def test_equal_length_model_substrings_use_catalog_order() -> None:
-    """Equal-length substrings select the first `ANTHROPIC_BEDROCK` `pricing_key`."""
-    model = "claude-opus-4-8.claude-sonnet-5"
-    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
-    assert adapter.pricing["standard"] is ANTHROPIC_PRICING["claude-opus-4-8"]
-
-
-def test_preferred_api_uses_imported_catalog_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An exact preferred identifier uses its imported `api`."""
-    model = "anthropic.claude-sonnet-5"
-    monkeypatch.delitem(ANTHROPIC_BEDROCK, model)
-    adapter = _anthropic_adapter_of(AnthropicBedrock(aws_region="us-east-1").model(model))
-    assert isinstance(adapter.client, AsyncAnthropicBedrockMantle)
 
 
 def test_bedrock_model_accepts_custom_pricing_and_a_passed_client() -> None:

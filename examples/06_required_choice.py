@@ -46,7 +46,7 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
         description="Submit your final structured answer once.",
         args_model=FinalResponse,
     )
-    bound = openai.model("gpt-5.6-terra").bind(
+    bound = openai.model("gpt-5.6-terra", regional_processing=False).bind(
         system_prompt="Research the question, then submit final_response.",
         tools=[search, final_response_tool],
         tool_choice="required",

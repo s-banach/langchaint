@@ -6,32 +6,30 @@ Importing this subpackage requires `openai`.
 Use `OpenAIChatCompletionsAdapter` directly for compatible endpoints.
 Use `OpenAIResponsesAdapter` directly for Azure.
 
-Cataloged models receive default-tier `OPENAI_PRICING` rates.
+Cataloged models receive `OPENAI_PRICING`.
 Uncataloged OpenAI models require `pricing` and `supports_prompt_cache_options`.
 `OpenAIBedrock.model` always requires both parameters.
-Responses from uncataloged service tiers cost NaN.
+Missing optional rates produce NaN token costs.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
 File-search prices use USD per invocation.
+`scripts/pricing/litellm-pricing-snapshot.json` supplies token prices.
+Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+`scripts/pricing/provider-pricing-metadata.json` supplies tool and regional prices.
 Source: https://developers.openai.com/api/docs/pricing.
-Recheck that page before relying on a table.
 Embedding batching parameters come from the OpenAI embeddings guide.
 Source: https://developers.openai.com/api/docs/guides/embeddings.
 Cataloged embedding model dimensions come from the OpenAI model catalog.
 Source: https://developers.openai.com/api/docs/models/all.
-`OPENAI_PRICING` covers the default service tier.
-Its web-search rates are public list-price estimates.
 `OpenAI.model(pricing=...)` replaces cataloged estimates.
 `OpenAIBedrock.model(pricing=...)` accepts caller rates.
-Earlier models cache automatically and have free cache writes.
 The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping  # noqa: TC003 (required for runtime type introspection)
 from typing import Literal, overload
 
 try:
@@ -45,31 +43,21 @@ except ModuleNotFoundError as exc:
 
 import langchaint  # noqa: TC001 (required for runtime type introspection)
 from langchaint.llm import LLM
+from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelName
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
     OpenAIResponsesAdapter,
     ReasoningSummary,
 )
 from langchaint.openai.shared import (
-    OpenAIPricedServiceTier,
+    OpenAILongContextPricing,
     OpenAIPricingTable,
+    OpenAIRates,
     OpenAIServiceTier,
     client_without_retries,
     parse_openai,
 )
 from langchaint.shared_backoff import SharedBackoff
-
-type OpenAIModelName = Literal[
-    "gpt-5.1",
-    "gpt-5.2",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-]
-"""Model identifiers with public prices in OPENAI_PRICING."""
 
 type OpenAIEmbeddingModelName = Literal[
     "text-embedding-3-small",
@@ -85,74 +73,6 @@ OPENAI_EMBEDDING_MODELS: frozenset[OpenAIEmbeddingModelName] = frozenset({
 })
 """Cataloged OpenAI embedding model identifiers."""
 
-OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
-    "gpt-5.1": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=1.25,
-        output_usd_per_million_tokens=10.00,
-        cache_read_usd_per_million_tokens=0.125,
-        cache_write_usd_per_million_tokens=0.00,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.2": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=1.75,
-        output_usd_per_million_tokens=14.00,
-        cache_read_usd_per_million_tokens=0.175,
-        cache_write_usd_per_million_tokens=0.00,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.4": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=2.50,
-        output_usd_per_million_tokens=15.00,
-        cache_read_usd_per_million_tokens=0.25,
-        cache_write_usd_per_million_tokens=0.00,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.4-mini": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=0.75,
-        output_usd_per_million_tokens=4.50,
-        cache_read_usd_per_million_tokens=0.075,
-        cache_write_usd_per_million_tokens=0.00,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.5": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=5.00,
-        output_usd_per_million_tokens=30.00,
-        cache_read_usd_per_million_tokens=0.50,
-        cache_write_usd_per_million_tokens=0.00,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.6-luna": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=1.00,
-        output_usd_per_million_tokens=6.00,
-        cache_read_usd_per_million_tokens=0.10,
-        cache_write_usd_per_million_tokens=1.25,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.6-terra": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=2.50,
-        output_usd_per_million_tokens=15.00,
-        cache_read_usd_per_million_tokens=0.25,
-        cache_write_usd_per_million_tokens=3.125,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-    "gpt-5.6-sol": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=5.00,
-        output_usd_per_million_tokens=30.00,
-        cache_read_usd_per_million_tokens=0.50,
-        cache_write_usd_per_million_tokens=6.25,
-        web_search_usd_per_invocation=0.01,
-        file_search_usd_per_invocation=0.0025,
-    ),
-}
-"""Public prices per openai model; the default pricing lookup."""
-
 _PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](OPENAI_PRICING.items())
 """`OPENAI_PRICING` with `str` keys for runtime model lookup."""
 
@@ -160,6 +80,7 @@ PROMPT_CACHE_OPTIONS_MODELS: frozenset[OpenAIModelName] = frozenset({
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-5.6",
 })
 """Cataloged models accepting `prompt_cache_options`.
 
@@ -218,7 +139,8 @@ class OpenAI:
         self,
         model: OpenAIModelName,
         *,
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = ...,
+        regional_processing: bool,
+        pricing: OpenAIPricingTable | None = ...,
         supports_prompt_cache_options: bool | None = ...,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIServiceTier | None = ...,
@@ -229,7 +151,8 @@ class OpenAI:
         self,
         model: str,
         *,
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+        regional_processing: bool,
+        pricing: OpenAIPricingTable,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = ...,
         service_tier: OpenAIServiceTier | None = ...,
@@ -239,7 +162,8 @@ class OpenAI:
         self,
         model: str,
         *,
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] | None = None,
+        regional_processing: bool,
+        pricing: OpenAIPricingTable | None = None,
         supports_prompt_cache_options: bool | None = None,
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIServiceTier | None = None,
@@ -247,9 +171,10 @@ class OpenAI:
         """Build an `LLM` for one Responses API model.
 
         `model` is sent verbatim.
-        Cataloged models receive public default pricing.
-        Stated `pricing` replaces or extends catalog pricing.
-        Uncataloged models require `pricing` with a `"default"` entry.
+        Cataloged models receive `OPENAI_PRICING`.
+        Stated `pricing` replaces catalog pricing.
+        Uncataloged models require `pricing`.
+        `regional_processing` controls regional token-rate multipliers.
         `supports_prompt_cache_options` states whether the model accepts that request parameter.
         Cataloged models derive that value from `PROMPT_CACHE_OPTIONS_MODELS`.
         `reasoning_summary` requests readable reasoning summary text.
@@ -272,7 +197,7 @@ class OpenAI:
                     "prompt_cache_options; pass supports_prompt_cache_options= stating that"
                 )
         else:
-            pricing = {"default": catalog_table, **(pricing or {})}
+            pricing = pricing or catalog_table
             if supports_prompt_cache_options is None:
                 supports_prompt_cache_options = model in PROMPT_CACHE_OPTIONS_MODELS
         adapter = OpenAIResponsesAdapter(
@@ -280,6 +205,7 @@ class OpenAI:
             model=model,
             pricing=pricing,
             provider_name="openai",
+            regional_processing=regional_processing,
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
@@ -421,7 +347,7 @@ class OpenAIBedrock:
         self,
         model: str,
         *,
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+        pricing: OpenAIPricingTable,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
     ) -> LLM:
@@ -429,19 +355,18 @@ class OpenAIBedrock:
 
         `model` is sent verbatim.
         Bedrock model identifiers have no carried pricing catalog.
-        `pricing` requires a `"default"` entry.
+        `pricing` states this Bedrock model's rates.
         `supports_prompt_cache_options` states whether the model accepts that request parameter.
         `reasoning_summary` requests readable reasoning summary text.
         Bedrock models accept no OpenAI `service_tier` parameter here.
 
-        Raises:
-            ValueError: `pricing` lacks its required `"default"` key.
         """
         adapter = OpenAIResponsesAdapter(
             client=self.client,
             model=model,
             pricing=pricing,
             provider_name="aws.bedrock",
+            regional_processing=False,
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
@@ -456,9 +381,10 @@ __all__ = [
     "OpenAIBedrock",
     "OpenAIChatCompletionsAdapter",
     "OpenAIEmbeddingModelName",
+    "OpenAILongContextPricing",
     "OpenAIModelName",
-    "OpenAIPricedServiceTier",
     "OpenAIPricingTable",
+    "OpenAIRates",
     "OpenAIResponsesAdapter",
     "OpenAIServiceTier",
     "ReasoningSummary",

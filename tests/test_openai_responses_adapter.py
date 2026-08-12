@@ -11,7 +11,6 @@ import base64
 import inspect
 import json
 import math
-import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Literal, override
 
@@ -95,8 +94,8 @@ from langchaint.call import ResponseIdentity
 from langchaint.conformance import AdapterConformance
 from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
-    OpenAIPricedServiceTier,
     OpenAIPricingTable,
+    OpenAIRates,
     OpenAIResponsesAdapter,
     ReasoningSummary,
 )
@@ -128,25 +127,25 @@ from tests.helpers import (
     status_error,
 )
 
-_DEFAULT_RATES = OpenAIPricingTable(
+_DEFAULT_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=2.5,
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
+)
+
+_PRICING = OpenAIPricingTable(
+    default=_DEFAULT_RATES,
     web_search_usd_per_invocation=0.01,
     file_search_usd_per_invocation=0.0025,
 )
-
-_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {"default": _DEFAULT_RATES}
 """The default tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = OpenAIPricingTable(
+_PRIORITY_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=5.0,
     output_usd_per_million_tokens=20.0,
     cache_read_usd_per_million_tokens=2.5,
     cache_write_usd_per_million_tokens=6.25,
-    web_search_usd_per_invocation=0.02,
-    file_search_usd_per_invocation=0.005,
 )
 """Twice the default rates, so a tier-selection test reads as a doubling."""
 
@@ -320,15 +319,15 @@ def test_unpriceable_charged_output_produces_nan() -> None:
     assert math.isnan(usage.provider_executed_tool_cost_in_usd)
 
 
-def test_charged_output_at_an_unpriced_tier_produces_nan() -> None:
-    """A charged call uses `_UNPRICED` when its served tier lacks pricing."""
+def test_charged_output_at_an_unpriced_tier_keeps_tool_cost() -> None:
+    """Missing token rates do not change provider-executed tool costs."""
     response = _response(
         usage=None,
         output=[dict(_WEB_SEARCH_OUTPUT_ITEM)],
         service_tier="flex",
     )
     usage = _billing_from_response(response, _PRICING).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+    assert usage.provider_executed_tool_cost_in_usd == 0.01
 
 
 def test_billing_pins_the_priced_tier_and_the_rates_that_applied() -> None:
@@ -388,10 +387,7 @@ def test_the_categories_are_priced_apart() -> None:
 
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response; "auto" and no tier both price at default."""
-    pricing: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-        "default": _DEFAULT_RATES,
-        "priority": _PRIORITY_RATES,
-    }
+    pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
     at_priority = _billing_from_response(
         _response(usage=_usage_with_cache(), service_tier="priority"), pricing
     ).usage
@@ -415,21 +411,6 @@ def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
     assert billing.service_tier == "flex"
     assert billing.usage.input_tokens_total == 1000
     assert billing.usage.output_tokens == 40
-
-
-def test_pricing_without_the_default_key_raises_at_construction() -> None:
-    """A pricing mapping missing "default" fails before any request, naming the model."""
-    priority_only: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-        "priority": _PRIORITY_RATES
-    }
-    with pytest.raises(ValueError, match=re.escape("'default'")):
-        _ = OpenAIResponsesAdapter(
-            client=AsyncOpenAI(api_key="test"),
-            model="gpt-5.6-terra",
-            pricing=priority_only,
-            provider_name="openai",
-            supports_prompt_cache_options=True,
-        )
 
 
 _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
@@ -777,6 +758,7 @@ def _adapter(
         model="m",
         pricing=_PRICING,
         provider_name="openai",
+        regional_processing=False,
         supports_prompt_cache_options=supports_prompt_cache_options,
         reasoning_summary=reasoning_summary,
     )
@@ -902,6 +884,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
         model="m",
         pricing=_PRICING,
         provider_name="openai",
+        regional_processing=False,
         supports_prompt_cache_options=True,
         service_tier="flex",
     )
@@ -1001,6 +984,7 @@ def test_provider_executed_tools_require_direct_openai_billing() -> None:
         model="m",
         pricing=_PRICING,
         provider_name="azure.ai.openai",
+        regional_processing=False,
         supports_prompt_cache_options=True,
     )
     with pytest.raises(ValueError, match="provider_name='openai'"):
@@ -1018,21 +1002,22 @@ def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
     tool_type: str, rate: float | None
 ) -> None:
     """A configured charged tool rejects an unusable caller rate before requests."""
-    pricing: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-        "default": OpenAIPricingTable(
+    pricing = OpenAIPricingTable(
+        default=OpenAIRates(
             input_cache_none_usd_per_million_tokens=2.5,
             output_usd_per_million_tokens=10.0,
             cache_read_usd_per_million_tokens=1.25,
             cache_write_usd_per_million_tokens=3.125,
-            web_search_usd_per_invocation=rate if tool_type == "web_search" else 0.01,
-            file_search_usd_per_invocation=rate if tool_type == "file_search" else 0.0025,
-        )
-    }
+        ),
+        web_search_usd_per_invocation=rate if tool_type == "web_search" else 0.01,
+        file_search_usd_per_invocation=rate if tool_type == "file_search" else 0.0025,
+    )
     adapter = OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
         model="m",
         pricing=pricing,
         provider_name="openai",
+        regional_processing=False,
         supports_prompt_cache_options=True,
     )
     with pytest.raises(ValueError, match="finite and nonnegative"):
@@ -1140,6 +1125,7 @@ def _stream(
     return _OpenAIStream(
         sdk_stream=_FakeSDKStream(replay_events, headers),
         pricing=_PRICING,
+        regional_processing=False,
         charged_provider_tools=charged_provider_tools,
     )
 

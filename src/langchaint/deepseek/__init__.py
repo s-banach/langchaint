@@ -30,20 +30,25 @@ from openai.types.completion_usage import CompletionUsage
 
 from langchaint.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
-from langchaint.openai.shared import OpenAIPricingTable, client_without_retries, parse_openai
+from langchaint.openai.shared import (
+    OpenAIPricingTable,
+    OpenAIRates,
+    client_without_retries,
+    parse_openai,
+)
 from langchaint.shared_backoff import SharedBackoff
 
 type DeepSeekModelName = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""
 
-DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIPricingTable] = {
-    "deepseek-v4-flash": OpenAIPricingTable(
+DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIRates] = {
+    "deepseek-v4-flash": OpenAIRates(
         input_cache_none_usd_per_million_tokens=0.14,
         output_usd_per_million_tokens=0.28,
         cache_read_usd_per_million_tokens=0.0028,
         cache_write_usd_per_million_tokens=0.0,
     ),
-    "deepseek-v4-pro": OpenAIPricingTable(
+    "deepseek-v4-pro": OpenAIRates(
         input_cache_none_usd_per_million_tokens=0.435,
         output_usd_per_million_tokens=0.87,
         cache_read_usd_per_million_tokens=0.003625,
@@ -52,7 +57,7 @@ DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIPricingTable] = {
 }
 """Public off-peak prices per deepseek model; the default pricing lookup."""
 
-_PRICING_BY_MODEL_ID = dict[str, OpenAIPricingTable](DEEPSEEK_PRICING.items())
+_PRICING_BY_MODEL_ID = dict[str, OpenAIRates](DEEPSEEK_PRICING.items())
 """`DEEPSEEK_PRICING` with `str` keys for runtime model lookup."""
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -137,7 +142,7 @@ class DeepSeek:
         self,
         model: DeepSeekModelName,
         *,
-        pricing: OpenAIPricingTable | None = ...,
+        pricing: OpenAIRates | None = ...,
     ) -> LLM: ...
 
     @overload
@@ -145,14 +150,14 @@ class DeepSeek:
         self,
         model: str,
         *,
-        pricing: OpenAIPricingTable,
+        pricing: OpenAIRates,
     ) -> LLM: ...
 
     def model(
         self,
         model: str,
         *,
-        pricing: OpenAIPricingTable | None = None,
+        pricing: OpenAIRates | None = None,
     ) -> LLM:
         """Build an `LLM` for one DeepSeek Chat Completions model.
 
@@ -173,7 +178,7 @@ class DeepSeek:
         adapter = OpenAIChatCompletionsAdapter(
             client=self.client,
             model=model,
-            pricing={"default": table},
+            pricing=OpenAIPricingTable(default=table),
             provider_name="deepseek",
             supports_prompt_cache_options=False,
             cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,

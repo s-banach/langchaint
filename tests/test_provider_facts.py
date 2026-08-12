@@ -303,15 +303,11 @@ def test_every_openai_error_code_has_a_disposition() -> None:
     assert codes <= set(openai_shared._DISPOSITION_BY_ERROR_CODE)
 
 
-def test_anthropic_service_tier_values_are_the_pricing_mapping_keys() -> None:
-    """The tier words a response can report are exactly AnthropicPricedServiceTier.
-
-    An adapter's pricing mapping is keyed by that alias, so a value the SDK adds and the alias
-    lacks would price NaN with no table a caller could supply for it.
-    """
+def test_anthropic_reported_service_tier_values_match_the_sdk() -> None:
+    """The SDK response tiers match `_AnthropicReportedServiceTier`."""
     annotation = _field_annotation(AnthropicUsage, "service_tier")
     reported = typing.get_args(typing.get_args(annotation)[0])
-    assert reported == typing.get_args(messages_adapter.AnthropicPricedServiceTier.__value__)
+    assert reported == typing.get_args(messages_adapter._AnthropicReportedServiceTier.__value__)
     assert reported == ("standard", "priority", "batch")
 
 

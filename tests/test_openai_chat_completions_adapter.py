@@ -13,7 +13,6 @@ import asyncio
 import base64
 import json
 import math
-import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import override
 
@@ -67,8 +66,8 @@ from langchaint.deepseek import cache_read_tokens_from_usage_deepseek
 from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
     OpenAIChatCompletionsAdapter,
-    OpenAIPricedServiceTier,
     OpenAIPricingTable,
+    OpenAIRates,
 )
 from langchaint.openai.chat_completions_adapter import (
     _assistant_message_from,
@@ -91,25 +90,21 @@ from langchaint.shared_backoff import RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 from tests.helpers import openai_sdk_errors_and_classifications, openai_sdk_errors_and_verdicts
 
-_DEFAULT_RATES = OpenAIPricingTable(
+_DEFAULT_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=2.5,
     output_usd_per_million_tokens=10.0,
     cache_read_usd_per_million_tokens=1.25,
     cache_write_usd_per_million_tokens=3.125,
-    web_search_usd_per_invocation=0.01,
-    file_search_usd_per_invocation=0.0025,
 )
 
-_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {"default": _DEFAULT_RATES}
+_PRICING = OpenAIPricingTable(default=_DEFAULT_RATES)
 """The default tier alone, so a response reporting another tier prices NaN."""
 
-_PRIORITY_RATES = OpenAIPricingTable(
+_PRIORITY_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=5.0,
     output_usd_per_million_tokens=20.0,
     cache_read_usd_per_million_tokens=2.5,
     cache_write_usd_per_million_tokens=6.25,
-    web_search_usd_per_invocation=0.02,
-    file_search_usd_per_invocation=0.005,
 )
 """Twice the default rates, so a tier-selection test reads as a doubling."""
 
@@ -213,7 +208,7 @@ def _lenient_completion(finish_reason: str | None) -> ChatCompletion:
 
 def _billing(
     completion: ChatCompletion,
-    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable] = _PRICING,
+    pricing: OpenAIPricingTable = _PRICING,
 ) -> Billing:
     """Price one completion with the openai cache-read reader, the adapter's default."""
     return _billing_from_chat_completion(
@@ -303,10 +298,7 @@ def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
 
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response; "auto" and no tier both price at default."""
-    pricing: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-        "default": _DEFAULT_RATES,
-        "priority": _PRIORITY_RATES,
-    }
+    pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
     at_priority = _billing(
         _completion(usage=_usage_with_cache(), service_tier="priority"), pricing
     ).usage
@@ -353,21 +345,6 @@ def test_the_deepseek_reader_prices_cache_hits_as_cache_reads() -> None:
 def test_the_deepseek_reader_returns_zero_without_the_extra_field() -> None:
     """The openai usage shape carries no prompt_cache_hit_tokens, so the reader reads zero."""
     assert cache_read_tokens_from_usage_deepseek(_usage_with_cache()) == 0
-
-
-def test_pricing_without_the_default_key_raises_at_construction() -> None:
-    """A pricing mapping missing "default" fails before any request, naming the model."""
-    priority_only: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-        "priority": _PRIORITY_RATES
-    }
-    with pytest.raises(ValueError, match=re.escape("'default'")):
-        _ = OpenAIChatCompletionsAdapter(
-            client=AsyncOpenAI(api_key="test"),
-            model="deepseek-v4-flash",
-            pricing=priority_only,
-            provider_name="deepseek",
-            supports_prompt_cache_options=False,
-        )
 
 
 def _finished(completion: ChatCompletion) -> _FinishedTurn:

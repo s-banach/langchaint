@@ -1,0 +1,59 @@
+name: Refresh pricing metadata
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 1 * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: refresh-pricing-metadata
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+      - name: Refresh pricing metadata
+        run: uv run python -m scripts.update_pricing_metadata
+      - name: Detect pricing changes
+        id: changes
+        run: |
+          if git diff --quiet -- scripts/pricing/litellm-pricing-snapshot.json src/langchaint/openai/_generated_pricing.py src/langchaint/anthropic/_generated_pricing.py; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run CI
+        id: ci
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: bash scripts/CI.sh
+      - name: Create refresh pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: pricing-metadata-refresh-${{ github.run_id }}
+          CI_OUTCOME: ${{ steps.ci.outcome }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add scripts/pricing/litellm-pricing-snapshot.json
+          git add src/langchaint/openai/_generated_pricing.py
+          git add src/langchaint/anthropic/_generated_pricing.py
+          git commit -m "Refresh pricing metadata"
+          git push --set-upstream origin "$BRANCH"
+          gh pr create --title "Refresh pricing metadata" --body-file .github/pricing-refresh-body.md
+          gh pr comment "$BRANCH" --body "scripts/CI.sh outcome: $CI_OUTCOME"
+      - name: Report CI failure
+        if: steps.changes.outputs.changed == 'true' && steps.ci.outcome == 'failure'
+        run: exit 1

@@ -23,8 +23,8 @@ from langchaint.anthropic import (
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
     AnthropicModelName,
-    AnthropicPricedServiceTier,
     AnthropicPricingTable,
+    AnthropicRates,
 )
 from langchaint.cohere import CohereBedrock
 from langchaint.deepseek import (
@@ -47,34 +47,34 @@ from langchaint.openai import (
     OpenAIBedrock,
     OpenAIChatCompletionsAdapter,
     OpenAIModelName,
-    OpenAIPricedServiceTier,
     OpenAIPricingTable,
+    OpenAIRates,
     OpenAIResponsesAdapter,
 )
 from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
 
-_ARBITRARY_PRICING: dict[OpenAIPricedServiceTier, OpenAIPricingTable] = {
-    "default": OpenAIPricingTable(
-        input_cache_none_usd_per_million_tokens=1.0,
-        output_usd_per_million_tokens=1.0,
-        cache_read_usd_per_million_tokens=1.0,
-        cache_write_usd_per_million_tokens=1.0,
-    )
-}
+_ARBITRARY_RATES = OpenAIRates(
+    input_cache_none_usd_per_million_tokens=1.0,
+    output_usd_per_million_tokens=1.0,
+    cache_read_usd_per_million_tokens=1.0,
+    cache_write_usd_per_million_tokens=1.0,
+)
+
+_ARBITRARY_PRICING = OpenAIPricingTable(default=_ARBITRARY_RATES)
 """Stands in where OpenAIBedrock.model requires unrelated pricing.
 
 OpenAIBedrock.model has no default pricing catalog.
 """
 
-_ARBITRARY_ANTHROPIC_PRICING: dict[AnthropicPricedServiceTier, AnthropicPricingTable] = {
-    "standard": AnthropicPricingTable(
+_ARBITRARY_ANTHROPIC_PRICING = AnthropicPricingTable(
+    standard=AnthropicRates(
         input_cache_none_usd_per_million_tokens=1.0,
         output_usd_per_million_tokens=1.0,
         cache_read_usd_per_million_tokens=1.0,
         cache_write_5m_usd_per_million_tokens=1.0,
         cache_write_1h_usd_per_million_tokens=1.0,
     )
-}
+)
 """The anthropic counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
 _ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
@@ -109,8 +109,8 @@ def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> N
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
-    assert adapter.pricing["standard"] is ANTHROPIC_PRICING[model]
-    web_search_rate = adapter.pricing["standard"].web_search_usd_per_invocation
+    assert adapter.pricing is ANTHROPIC_PRICING[model]
+    web_search_rate = adapter.pricing.web_search_usd_per_invocation
     assert web_search_rate is not None
     assert web_search_rate > 0
 
@@ -134,22 +134,21 @@ def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
 @pytest.mark.parametrize("model", list(OPENAI_PRICING))
 def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
     """OpenAI.model returns an adapter carrying catalog pricing."""
-    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
+        model,
+        regional_processing=False,
+    )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
-    assert adapter.pricing["default"] is OPENAI_PRICING[model]
-    web_search_rate = adapter.pricing["default"].web_search_usd_per_invocation
+    assert adapter.pricing is OPENAI_PRICING[model]
+    web_search_rate = adapter.pricing.web_search_usd_per_invocation
     assert web_search_rate is not None
     assert web_search_rate > 0
 
 
 _PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
-    "gpt-5.1": False,
-    "gpt-5.2": False,
-    "gpt-5.4": False,
-    "gpt-5.4-mini": False,
-    "gpt-5.5": False,
+    "gpt-5.6": True,
     "gpt-5.6-luna": True,
     "gpt-5.6-terra": True,
     "gpt-5.6-sol": True,
@@ -172,7 +171,10 @@ def test_openai_model_wires_prompt_cache_options_support(
     model: OpenAIModelName, *, supported: bool
 ) -> None:
     """Verify `OpenAI.model` reads cataloged cache support."""
-    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
+    llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
+        model,
+        regional_processing=False,
+    )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.supports_prompt_cache_options is supported
@@ -183,6 +185,7 @@ def test_openai_model_accepts_an_uncataloged_model(*, supported: bool) -> None:
     """Pass uncataloged pricing and cache support unchanged."""
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
         "ft:gpt-5.6-terra:acme::abc123",
+        regional_processing=False,
         pricing=_ARBITRARY_PRICING,
         supports_prompt_cache_options=supported,
     )
@@ -197,6 +200,7 @@ def test_openai_model_honors_a_stated_flag_on_a_cataloged_id() -> None:
     """Honor stated cache support for a cataloged model."""
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
         "gpt-5.6-terra",
+        regional_processing=False,
         supports_prompt_cache_options=False,
     )
     adapter = llm.adapter
@@ -319,7 +323,7 @@ def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIChatCompletionsAdapter)
     assert adapter.model == model
-    assert adapter.pricing["default"] is DEEPSEEK_PRICING[model]
+    assert adapter.pricing.default is DEEPSEEK_PRICING[model]
     assert adapter.cache_read_tokens_from_usage is cache_read_tokens_from_usage_deepseek
     assert adapter.supports_prompt_cache_options is False
     assert adapter.provider_name == "deepseek"
@@ -327,7 +331,7 @@ def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
 
 def test_deepseek_model_accepts_an_uncataloged_model() -> None:
     """A non-catalog id builds with caller-stated pricing, wrapped under the "default" tier."""
-    table = _ARBITRARY_PRICING["default"]
+    table = _ARBITRARY_PRICING.default
     llm = DeepSeek(client=_deepseek_client()).model(
         "deepseek-next-preview",
         pricing=table,
@@ -335,7 +339,7 @@ def test_deepseek_model_accepts_an_uncataloged_model() -> None:
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIChatCompletionsAdapter)
     assert adapter.model == "deepseek-next-preview"
-    assert adapter.pricing["default"] is table
+    assert adapter.pricing.default is table
 
 
 def test_deepseek_without_a_client_requires_the_deepseek_key(
@@ -401,6 +405,7 @@ def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported
                 model="gpt-5.6-terra",
                 pricing=_ARBITRARY_PRICING,
                 provider_name="groq",
+                regional_processing=False,
                 supports_prompt_cache_options=False,
             ),
             "groq",
@@ -498,14 +503,18 @@ def test_both_bedrock_classes_raise_on_a_region_beside_a_client() -> None:
         )
 
 
-def test_pricing_override_replaces_the_standard_rates() -> None:
-    """A caller-supplied "standard" table replaces the catalog's, and a caller's tier is added."""
-    custom_standard = AnthropicPricingTable(
+def test_anthropic_model_replaces_catalog_pricing() -> None:
+    """A caller-supplied pricing table replaces catalog pricing."""
+    custom_standard = AnthropicRates(
         input_cache_none_usd_per_million_tokens=2.00,
         output_usd_per_million_tokens=10.00,
         cache_read_usd_per_million_tokens=0.20,
         cache_write_5m_usd_per_million_tokens=2.50,
         cache_write_1h_usd_per_million_tokens=4.00,
+    )
+    replacement = AnthropicPricingTable(
+        standard=custom_standard,
+        batch=custom_standard,
         web_search_usd_per_invocation=0.01,
     )
     adapter = (
@@ -514,13 +523,12 @@ def test_pricing_override_replaces_the_standard_rates() -> None:
         )
         .model(
             "claude-sonnet-5",
-            pricing={"standard": custom_standard, "batch": custom_standard},
+            pricing=replacement,
         )
         .adapter
     )
     assert isinstance(adapter, AnthropicMessagesAdapter)
-    assert adapter.pricing["standard"] is custom_standard
-    assert adapter.pricing["batch"] is custom_standard
+    assert adapter.pricing is replacement
 
 
 def test_service_tier_reaches_each_first_party_adapter() -> None:
@@ -532,17 +540,22 @@ def test_service_tier_reaches_each_first_party_adapter() -> None:
     anthropic_adapter = anthropic.model(
         "claude-sonnet-5",
         service_tier="standard_only",
+        inference_geo="us",
     ).adapter
     assert isinstance(anthropic_adapter, AnthropicMessagesAdapter)
     assert anthropic_adapter.service_tier == "standard_only"
+    assert anthropic_adapter.inference_geo == "us"
     anthropic_unstated = anthropic.model("claude-sonnet-5").adapter
     assert isinstance(anthropic_unstated, AnthropicMessagesAdapter)
     assert anthropic_unstated.service_tier is None
     openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
-    openai_adapter = openai.model("gpt-5.6-terra", service_tier="flex").adapter
+    openai_adapter = openai.model(
+        "gpt-5.6-terra", regional_processing=False, service_tier="flex"
+    ).adapter
     assert isinstance(openai_adapter, OpenAIResponsesAdapter)
     assert openai_adapter.service_tier == "flex"
-    unstated = openai.model("gpt-5.6-terra").adapter
+    assert openai_adapter.regional_processing is False
+    unstated = openai.model("gpt-5.6-terra", regional_processing=False).adapter
     assert isinstance(unstated, OpenAIResponsesAdapter)
     assert unstated.service_tier is None
 
@@ -559,8 +572,8 @@ def test_openai_shares_client_and_shared_backoff() -> None:
         wait_multiplier=3.0,
         quiet_seconds_per_decay_step=9.0,
     )
-    terra = openai.model("gpt-5.6-terra")
-    sol = openai.model("gpt-5.6-sol")
+    terra = openai.model("gpt-5.6-terra", regional_processing=False)
+    sol = openai.model("gpt-5.6-sol", regional_processing=False)
     embedding_model = openai.embedding_model("text-embedding-3-small")
 
     assert isinstance(terra.adapter, OpenAIResponsesAdapter)
@@ -587,8 +600,8 @@ def test_separate_openai_values_create_separate_shared_backoffs() -> None:
     second = OpenAI(client=AsyncOpenAI(api_key="offline"))
 
     assert (
-        first.model("gpt-5.6-terra").shared_backoff
-        is not second.model("gpt-5.6-terra").shared_backoff
+        first.model("gpt-5.6-terra", regional_processing=False).shared_backoff
+        is not second.model("gpt-5.6-terra", regional_processing=False).shared_backoff
     )
 
 
@@ -606,11 +619,11 @@ def test_backend_classes_expose_no_lifecycle_methods(backend_class: type[object]
 def test_reasoning_summary_lands_on_the_adapter() -> None:
     """A caller-supplied reasoning_summary reaches the adapter; the default is None."""
     openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
-    llm = openai.model("gpt-5.6-terra", reasoning_summary="detailed")
+    llm = openai.model("gpt-5.6-terra", regional_processing=False, reasoning_summary="detailed")
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.reasoning_summary == "detailed"
-    defaulted = openai.model("gpt-5.6-terra")
+    defaulted = openai.model("gpt-5.6-terra", regional_processing=False)
     assert isinstance(defaulted.adapter, OpenAIResponsesAdapter)
     assert defaulted.adapter.reasoning_summary is None
 
@@ -641,7 +654,9 @@ def test_cache_ttl_lands_on_the_adapter() -> None:
             "aws.bedrock",
         ),
         (
-            lambda: OpenAI(client=AsyncOpenAI(api_key="k")).model("gpt-5.6-terra"),
+            lambda: OpenAI(client=AsyncOpenAI(api_key="k")).model(
+                "gpt-5.6-terra", regional_processing=False
+            ),
             "openai",
         ),
         (
@@ -687,7 +702,7 @@ def test_openai_rejects_a_client_reaching_another_provider(
 ) -> None:
     """Reject another provider's client from both OpenAI request APIs."""
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = OpenAI(client=client).model("gpt-5.6-terra")
+        _ = OpenAI(client=client).model("gpt-5.6-terra", regional_processing=False)
     with pytest.raises(ValueError, match="contradicts the client"):
         _ = OpenAI(client=client).embedding_model("text-embedding-3-small")
     asyncio.run(client.close())
@@ -736,4 +751,6 @@ def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
         pass
 
     with pytest.raises(ValueError, match="contradicts the client"):
-        _ = OpenAI(client=SigV4BedrockOpenAI(aws_region="us-east-1")).model("gpt-5.6-terra")
+        _ = OpenAI(client=SigV4BedrockOpenAI(aws_region="us-east-1")).model(
+            "gpt-5.6-terra", regional_processing=False
+        )

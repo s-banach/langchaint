@@ -12,7 +12,7 @@ from langchaint import UserMessage
 from langchaint.openai import OpenAI
 
 openai = OpenAI()
-llm = openai.model("gpt-5.6-terra")
+llm = openai.model("gpt-5.6-terra", regional_processing=False)
 bound = llm.bind(automatic_prompt_caching=False)
 response = await bound.generate_one([UserMessage(content="Hello")])
 print(response.output)
@@ -25,7 +25,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | LangChain | langchaint |
 | --- | --- |
 | `ChatOpenAI(...)` | `openai = OpenAI()` |
-| `init_chat_model(...)` | `llm = openai.model("gpt-5.6-terra")` |
+| `init_chat_model(...)` | `llm = openai.model("gpt-5.6-terra", regional_processing=False)` |
 | `model.invoke(messages)` | `await bound.generate_one(messages)` |
 | `model.ainvoke(messages)` | `await bound.generate_one(messages)` |
 | `model.batch(inputs)` | `await bound.generate_many(inputs)` |
@@ -61,7 +61,7 @@ from langchaint.gemini import Gemini
 from langchaint.openai import OpenAI, OpenAIBedrock
 
 openai = OpenAI()
-openai_llm = openai.model("gpt-5.6-terra")
+openai_llm = openai.model("gpt-5.6-terra", regional_processing=False)
 
 anthropic = Anthropic()
 anthropic_llm = anthropic.model("claude-sonnet-5")
@@ -260,7 +260,7 @@ openai = OpenAI(
     max_concurrent_requests=16,
     max_request_starts_per_second=5,
 )
-bound = openai.model("gpt-5.6-terra").bind(
+bound = openai.model("gpt-5.6-terra", regional_processing=False).bind(
     max_attempts=5,
     automatic_prompt_caching=False,
 )

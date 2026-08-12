@@ -77,7 +77,7 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import nan
+from math import isfinite, nan
 from typing import Any, ClassVar, Literal, cast, override
 
 import anthropic
@@ -233,14 +233,10 @@ capacity if available or standard capacity, so no request value names priority.
 "standard_only" is the one value that pins a tier.
 """
 
-type AnthropicPricedServiceTier = Literal["standard", "priority", "batch"]
-"""What a response reports having been served at (anthropic 0.120.0), and the pricing mapping's key.
+type _AnthropicReportedServiceTier = Literal["standard", "priority", "batch"]
+"""What an Anthropic response reports having served."""
 
-Disjoint from AnthropicServiceTier: the request and response vocabularies share no word, and the
-response field carries no precondition on the request, so the tier is read off each response.
-"""
-
-_STANDARD_TIER: AnthropicPricedServiceTier = "standard"
+_STANDARD_TIER: _AnthropicReportedServiceTier = "standard"
 
 type AnthropicClient = AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
 
@@ -254,23 +250,14 @@ def client_without_retries[ClientT: AnthropicClient](client: ClientT) -> ClientT
 
 
 @dataclass(frozen=True, kw_only=True)
-class AnthropicPricingTable:
-    """One model's rates at one Anthropic service tier.
-
-    Two cache-write rates, because Anthropic bills 5-minute and 1-hour writes differently and one
-    response can report tokens written at both TTLs. Both are required: a table that priced only the
-    TTL its adapter marks would price the other half of such a response at the wrong rate.
-    price() reports both writes through one cache-write cost.
-    Usage also receives the provider-executed tool cost.
-    """
+class AnthropicRates:
+    """Anthropic token rates for one service tier."""
 
     input_cache_none_usd_per_million_tokens: float
     output_usd_per_million_tokens: float
     cache_read_usd_per_million_tokens: float
     cache_write_5m_usd_per_million_tokens: float
     cache_write_1h_usd_per_million_tokens: float
-    web_search_usd_per_invocation: float | None = None
-    """Web-search invocation price, or `None` until configured."""
 
     def price(  # noqa: PLR0913 (anthropic splits the cache-write counter that other providers report as one)
         self,
@@ -337,20 +324,78 @@ class AnthropicPricingTable:
             output_usd_per_million_tokens=self.output_usd_per_million_tokens,
         )
 
+    def multiplied(self, multiplier: float) -> "AnthropicRates":
+        """Return token rates multiplied by one value."""
+        return AnthropicRates(
+            input_cache_none_usd_per_million_tokens=(
+                self.input_cache_none_usd_per_million_tokens * multiplier
+            ),
+            output_usd_per_million_tokens=self.output_usd_per_million_tokens * multiplier,
+            cache_read_usd_per_million_tokens=(
+                self.cache_read_usd_per_million_tokens * multiplier
+            ),
+            cache_write_5m_usd_per_million_tokens=(
+                self.cache_write_5m_usd_per_million_tokens * multiplier
+            ),
+            cache_write_1h_usd_per_million_tokens=(
+                self.cache_write_1h_usd_per_million_tokens * multiplier
+            ),
+        )
 
-_UNPRICED = AnthropicPricingTable(
+
+_UNPRICED_RATES = AnthropicRates(
     input_cache_none_usd_per_million_tokens=float("nan"),
     output_usd_per_million_tokens=float("nan"),
     cache_read_usd_per_million_tokens=float("nan"),
     cache_write_5m_usd_per_million_tokens=float("nan"),
     cache_write_1h_usd_per_million_tokens=float("nan"),
-    web_search_usd_per_invocation=float("nan"),
 )
-"""What prices a response reporting a service tier the adapter holds no table for.
 
-Every nonzero counter costs NaN and every zero counter costs zero, so the paid response survives
-carrying a cost that says it is unknown.
-"""
+
+@dataclass(frozen=True, kw_only=True)
+class AnthropicPricingTable:
+    """Anthropic rates and modifiers for one model."""
+
+    standard: AnthropicRates
+    priority: AnthropicRates | None = None
+    batch: AnthropicRates | None = None
+    inference_geo_us_multiplier: float | None = None
+    web_search_usd_per_invocation: float | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an invalid regional multiplier.
+
+        Raises:
+            ValueError: The regional multiplier is invalid.
+        """
+        multiplier = self.inference_geo_us_multiplier
+        if multiplier is None:
+            return
+        if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+            raise ValueError("inference_geo_us_multiplier must be finite and positive")
+
+    def rates_for(
+        self,
+        *,
+        service_tier: _AnthropicReportedServiceTier | None,
+        inference_geo: str | None,
+    ) -> AnthropicRates:
+        """Select token rates using reported response metadata."""
+        priced_tier = _priced_tier(service_tier)
+        if priced_tier == "standard":
+            rates = self.standard
+        elif priced_tier == "priority":
+            rates = self.priority
+        else:
+            rates = self.batch
+        if rates is None:
+            return _UNPRICED_RATES
+        if inference_geo != "us":
+            return rates
+        multiplier = self.inference_geo_us_multiplier
+        if multiplier is None:
+            return _UNPRICED_RATES
+        return rates.multiplied(multiplier)
 
 
 def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
@@ -456,6 +501,7 @@ class _AnthropicPrecomputedFields:
     output_config: OutputConfigParam | Omit
     thinking: ThinkingConfigParam | Omit
     service_tier: AnthropicServiceTier | Omit
+    inference_geo: str | Omit
     automatic_prompt_caching: bool
     cache_ttl: CacheTTL
     message_mark_budget: int
@@ -476,6 +522,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "output_config",
     "thinking",
     "service_tier",
+    "inference_geo",
     "messages",
     "stream",
 })
@@ -910,8 +957,10 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     return AssistantMessage(turn=tuple(turn))
 
 
-def _priced_tier(service_tier: AnthropicPricedServiceTier | None) -> AnthropicPricedServiceTier:
-    """Return the tier that selects the table: what the response reports, "standard" where it reports none.
+def _priced_tier(
+    service_tier: _AnthropicReportedServiceTier | None,
+) -> _AnthropicReportedServiceTier:
+    """Normalize a missing reported tier to `standard`.
 
     A response reporting no tier prices at the standard rates, which is what a Bedrock response
     needs: the field is unlikely to be populated there and Anthropic's service tiers do not apply.
@@ -921,12 +970,12 @@ def _priced_tier(service_tier: AnthropicPricedServiceTier | None) -> AnthropicPr
 
 def _billing_from_sdk_usage(
     usage: anthropic.types.Usage,
-    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+    pricing: AnthropicPricingTable,
     *,
     provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
     billing_complete: bool = True,
 ) -> Billing:
-    """Price the raw counters at the table the served tier selects.
+    """Price counters using reported response metadata.
 
     `usage.input_tokens` excludes cache reads and writes, so it is exactly the uncached-input counter.
     The SDK documents no relationship among the input counters, so the source is the provider's
@@ -949,12 +998,15 @@ def _billing_from_sdk_usage(
         input_tokens_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens
         input_tokens_cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens
     service_tier = _priced_tier(usage.service_tier)
-    table = pricing.get(service_tier, _UNPRICED)
+    rates = pricing.rates_for(
+        service_tier=usage.service_tier,
+        inference_geo=usage.inference_geo,
+    )
     server_tool_use = usage.server_tool_use
     web_search_requests = 0 if server_tool_use is None else server_tool_use.web_search_requests
     provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
         web_search_requests,
-        table.web_search_usd_per_invocation,
+        pricing.web_search_usd_per_invocation,
     )
     if provider_tools.web_search and not billing_complete:
         provider_executed_tool_cost_in_usd = nan
@@ -971,7 +1023,7 @@ def _billing_from_sdk_usage(
                 continue
             if counter_name.endswith("_requests") and counter:
                 provider_executed_tool_cost_in_usd = nan
-    return table.price(
+    return rates.price(
         service_tier=service_tier,
         usage_raw=usage,
         input_tokens_cache_read=usage.cache_read_input_tokens or 0,
@@ -1090,16 +1142,17 @@ class AnthropicMessagesAdapter(Adapter):
     and the caller's stated value stands for anything else.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (each request and billing parameter remains explicit)
         self,
         *,
         client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
         model: str,
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+        pricing: AnthropicPricingTable,
         provider_name: str,
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
         service_tier: AnthropicServiceTier | None = None,
+        inference_geo: str | None = None,
     ) -> None:
         """Store the SDK client, which owns credentials and endpoints.
 
@@ -1125,30 +1178,22 @@ class AnthropicMessagesAdapter(Adapter):
         The openai Responses adapter has no TTL to configure, so no neutral parameter fits.
         A different TTL is therefore a different adapter.
 
-        pricing holds one table per service tier this adapter can price, keyed by what a response
-        reports, and a response reporting a tier absent from it costs NaN. The "standard" key is
-        required because every response that reports no tier at all prices there.
+        `pricing` holds this model's rates and modifiers.
+        `inference_geo` requests one inference geography.
         service_tier is what the request asks for, None sending nothing. It cannot decide the price:
         the request and response vocabularies are disjoint, and the tier the response reports is
-        what selects the table.
+        what selects token rates.
 
         Raises:
-            ValueError: pricing has no "standard" key, which would price every response reporting
-                no tier, and every standard-tier response, as NaN, with nothing said until the cost
-                comes back unknown.
-                Also raised by Adapter.__init__ when provider_name contradicts the client's class.
+            ValueError: `provider_name` contradicts the client's class.
         """
-        if _STANDARD_TIER not in pricing:
-            raise ValueError(
-                f"pricing for model {model!r} has no {_STANDARD_TIER!r} key; "
-                f"it prices every response that reports no service tier, so it is required"
-            )
         super().__init__(client=client, model=model, provider_name=provider_name)
         self.client = client_without_retries(client)
         self.pricing = pricing
         self.default_max_completion_tokens = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl
         self.service_tier: AnthropicServiceTier | None = service_tier
+        self.inference_geo = inference_geo
 
     def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
         """Precompute the typed request fields the binding determines.
@@ -1178,11 +1223,10 @@ class AnthropicMessagesAdapter(Adapter):
         if binding.provider_executed_tools and self.provider_name != "anthropic":
             raise ValueError("Anthropic provider_executed_tools require provider_name='anthropic'")
         if provider_tools.web_search:
-            for pricing_table in self.pricing.values():
-                require_finite_nonnegative_rate(
-                    rate_name="web_search_usd_per_invocation",
-                    rate=pricing_table.web_search_usd_per_invocation,
-                )
+            require_finite_nonnegative_rate(
+                rate_name="web_search_usd_per_invocation",
+                rate=self.pricing.web_search_usd_per_invocation,
+            )
         max_tokens = binding.inference_params.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
         bind_marker_count = 0
@@ -1256,6 +1300,7 @@ class AnthropicMessagesAdapter(Adapter):
             output_config=output_config,
             thinking=thinking,
             service_tier=self.service_tier if self.service_tier is not None else omit,
+            inference_geo=self.inference_geo if self.inference_geo is not None else omit,
             automatic_prompt_caching=binding.automatic_prompt_caching,
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
@@ -1343,7 +1388,7 @@ class _AnthropicStream(AdapterStream):
         self,
         *,
         sdk_stream: AsyncMessageStream[Any],
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+        pricing: AnthropicPricingTable,
         provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
     ) -> None:
         self._sdk_stream = sdk_stream
@@ -1464,7 +1509,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> Billing:
-        """Price the message's counters at the table its reported tier selects.
+        """Price counters using reported response metadata.
 
         Raises:
             TypeError: raw is not an anthropic Message.
@@ -1520,6 +1565,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             output_config=precomputed.output_config,
             thinking=precomputed.thinking,
             service_tier=precomputed.service_tier,
+            inference_geo=precomputed.inference_geo,
             messages=params.messages,
             extra_body=precomputed.extra_body,
         )

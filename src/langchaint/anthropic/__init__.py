@@ -6,28 +6,28 @@ Importing this subpackage requires `anthropic`.
 `ANTHROPIC_BEDROCK` lists preferred identifiers and their `BedrockRouting` values.
 Anthropic 0.120.0 constructs both Bedrock client classes without network requests.
 
-Cataloged Anthropic models receive standard-tier `ANTHROPIC_PRICING` rates.
-Known Bedrock model substrings receive the corresponding rates.
+Cataloged Anthropic models receive `ANTHROPIC_PRICING`.
+Cataloged Bedrock models receive `ANTHROPIC_BEDROCK_PRICING`.
 Uncataloged Anthropic models require `pricing`.
 Uncataloged Bedrock models also require a passed `client`.
-Responses from uncataloged service tiers cost NaN.
+Missing optional rates produce NaN token costs.
 Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 `AnthropicBedrock` accepts `http_client` directly.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
+`scripts/pricing/litellm-pricing-snapshot.json` supplies token prices.
+Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+`scripts/pricing/provider-pricing-metadata.json` supplies tool and modifier prices.
 Source: https://platform.claude.com/docs/en/about-claude/pricing.
-Recheck that page before relying on a table.
 Cache reads cost 0.1 times base input.
 Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
-`ANTHROPIC_PRICING` covers the standard service tier.
-Its web-search rates are public list-price estimates.
+`ANTHROPIC_PRICING` web-search rates are public list-price estimates.
 `Anthropic.model(pricing=...)` replaces cataloged estimates.
 `AnthropicBedrock.model(pricing=...)` accepts caller rates.
 """
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -42,10 +42,15 @@ except ModuleNotFoundError as exc:
         "langchaint's anthropic backend requires the anthropic package; install anthropic."
     ) from exc
 
+from langchaint.anthropic._generated_pricing import (
+    ANTHROPIC_BEDROCK_PRICING,
+    ANTHROPIC_PRICING,
+    AnthropicModelName,
+)
 from langchaint.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
-    AnthropicPricedServiceTier,
     AnthropicPricingTable,
+    AnthropicRates,
     AnthropicServiceTier,
     CacheTTL,
     client_without_retries,
@@ -53,78 +58,6 @@ from langchaint.anthropic.messages_adapter import (
 )
 from langchaint.llm import LLM
 from langchaint.shared_backoff import SharedBackoff
-
-type AnthropicModelName = Literal[
-    "claude-fable-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-haiku-4-5-20251001",
-]
-"""Model identifiers with public prices in ANTHROPIC_PRICING."""
-
-ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
-    "claude-fable-5": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=10.00,
-        output_usd_per_million_tokens=50.00,
-        cache_read_usd_per_million_tokens=1.00,
-        cache_write_5m_usd_per_million_tokens=12.50,
-        cache_write_1h_usd_per_million_tokens=20.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    "claude-sonnet-4-6": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=3.00,
-        output_usd_per_million_tokens=15.00,
-        cache_read_usd_per_million_tokens=0.30,
-        cache_write_5m_usd_per_million_tokens=3.75,
-        cache_write_1h_usd_per_million_tokens=6.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    # introductory pricing, through 2026-08-31; standard 3.00/15.00 from 2026-09-01
-    "claude-sonnet-5": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=2.00,
-        output_usd_per_million_tokens=10.00,
-        cache_read_usd_per_million_tokens=0.20,
-        cache_write_5m_usd_per_million_tokens=2.50,
-        cache_write_1h_usd_per_million_tokens=4.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    "claude-opus-4-6": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=5.00,
-        output_usd_per_million_tokens=25.00,
-        cache_read_usd_per_million_tokens=0.50,
-        cache_write_5m_usd_per_million_tokens=6.25,
-        cache_write_1h_usd_per_million_tokens=10.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    "claude-opus-4-7": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=5.00,
-        output_usd_per_million_tokens=25.00,
-        cache_read_usd_per_million_tokens=0.50,
-        cache_write_5m_usd_per_million_tokens=6.25,
-        cache_write_1h_usd_per_million_tokens=10.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    "claude-opus-4-8": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=5.00,
-        output_usd_per_million_tokens=25.00,
-        cache_read_usd_per_million_tokens=0.50,
-        cache_write_5m_usd_per_million_tokens=6.25,
-        cache_write_1h_usd_per_million_tokens=10.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-    "claude-haiku-4-5-20251001": AnthropicPricingTable(
-        input_cache_none_usd_per_million_tokens=1.00,
-        output_usd_per_million_tokens=5.00,
-        cache_read_usd_per_million_tokens=0.10,
-        cache_write_5m_usd_per_million_tokens=1.25,
-        cache_write_1h_usd_per_million_tokens=2.00,
-        web_search_usd_per_invocation=0.01,
-    ),
-}
-"""Public prices per anthropic model; the default pricing lookup, shared by both constructors."""
 
 _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items())
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""
@@ -151,45 +84,21 @@ The literal values offer preferred endpoint-specific identifiers.
 
 @dataclass(frozen=True, kw_only=True)
 class BedrockRouting:
-    """The SDK client API and default pricing source for one Bedrock identifier.
-
-    `api` selects a class from `_BEDROCK_CLIENT_CLASS`.
-    `pricing_key` selects an `ANTHROPIC_PRICING` entry.
-    """
+    """The SDK client API for one Bedrock identifier."""
 
     api: Literal["mantle", "legacy"]
-    pricing_key: AnthropicModelName
 
 
 ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
-    "anthropic.claude-fable-5": BedrockRouting(api="mantle", pricing_key="claude-fable-5"),
-    "anthropic.claude-opus-4-8": BedrockRouting(api="mantle", pricing_key="claude-opus-4-8"),
-    "anthropic.claude-opus-4-7": BedrockRouting(api="mantle", pricing_key="claude-opus-4-7"),
-    "anthropic.claude-sonnet-5": BedrockRouting(api="mantle", pricing_key="claude-sonnet-5"),
-    "anthropic.claude-haiku-4-5": BedrockRouting(
-        api="mantle", pricing_key="claude-haiku-4-5-20251001"
-    ),
-    "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy", pricing_key="claude-opus-4-6"),
-    "us.anthropic.claude-sonnet-4-6": BedrockRouting(
-        api="legacy", pricing_key="claude-sonnet-4-6"
-    ),
+    "anthropic.claude-fable-5": BedrockRouting(api="mantle"),
+    "anthropic.claude-opus-4-8": BedrockRouting(api="mantle"),
+    "anthropic.claude-opus-4-7": BedrockRouting(api="mantle"),
+    "anthropic.claude-sonnet-5": BedrockRouting(api="mantle"),
+    "anthropic.claude-haiku-4-5": BedrockRouting(api="mantle"),
+    "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy"),
+    "us.anthropic.claude-sonnet-4-6": BedrockRouting(api="legacy"),
 }
 """`BedrockRouting` for each preferred `AnthropicBedrockModelName` value."""
-
-_BEDROCK_PRICING_KEY_BY_MODEL_SUBSTRING: dict[str, AnthropicModelName] = {
-    (
-        "claude-haiku-4-5"
-        if routing.pricing_key == "claude-haiku-4-5-20251001"
-        else routing.pricing_key
-    ): routing.pricing_key
-    for routing in ANTHROPIC_BEDROCK.values()
-}
-"""Pricing keys selected by Bedrock model substrings."""
-
-_MANTLE_MODEL_IDS = frozenset(
-    model for model, routing in ANTHROPIC_BEDROCK.items() if routing.api == "mantle"
-)
-"""Exact identifiers whose imported `api` is `"mantle"`."""
 
 _BEDROCK_CLIENT_CLASS: dict[
     Literal["mantle", "legacy"], type[AsyncAnthropicBedrockMantle | AsyncAnthropicBedrock]
@@ -199,44 +108,25 @@ _BEDROCK_CLIENT_CLASS: dict[
 }
 
 
-def _longest_model_substring[ValueT](
-    model: str, values_by_model_substring: Mapping[str, ValueT]
-) -> ValueT | None:
-    """Return the value for the longest contained model substring."""
-    longest_model_substring: str | None = None
-    for model_substring in values_by_model_substring:
-        if model_substring not in model:
-            continue
-        if longest_model_substring is None or len(model_substring) > len(longest_model_substring):
-            longest_model_substring = model_substring
-    if longest_model_substring is None:
-        return None
-    return values_by_model_substring[longest_model_substring]
-
-
 def _bedrock_routing(model: str) -> BedrockRouting | None:
-    """Select `pricing_key` by substring and `api` by exact preferred identifier."""
-    pricing_key = _longest_model_substring(model, _BEDROCK_PRICING_KEY_BY_MODEL_SUBSTRING)
-    if pricing_key is None:
-        return None
-    api: Literal["mantle", "legacy"] = "mantle" if model in _MANTLE_MODEL_IDS else "legacy"
-    return BedrockRouting(api=api, pricing_key=pricing_key)
+    """Return routing for one exact catalog identifier."""
+    return ANTHROPIC_BEDROCK.get(model)
 
 
 def _anthropic_adapter(
     model: str,
     *,
     client: AsyncAnthropic,
-    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
+    pricing: AnthropicPricingTable | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
     service_tier: AnthropicServiceTier | None = None,
+    inference_geo: str | None = None,
 ) -> AnthropicMessagesAdapter:
     """Build the adapter for one Messages API model.
 
     Raises:
         ValueError: An uncataloged model lacks `pricing`.
-            Also raised when `pricing` lacks its required `"standard"` key.
     """
     catalog_table = _PRICING_BY_MODEL_ID.get(model)
     if catalog_table is None:
@@ -245,7 +135,7 @@ def _anthropic_adapter(
                 f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
             )
     else:
-        pricing = {"standard": catalog_table, **(pricing or {})}
+        pricing = pricing or catalog_table
     return AnthropicMessagesAdapter(
         client=client,
         model=model,
@@ -254,6 +144,7 @@ def _anthropic_adapter(
         default_max_completion_tokens=default_max_completion_tokens,
         cache_ttl=cache_ttl,
         service_tier=service_tier,
+        inference_geo=inference_geo,
     )
 
 
@@ -262,7 +153,7 @@ def _anthropic_bedrock_adapter(
     *,
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
     catalog_table: AnthropicPricingTable | None,
-    pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
+    pricing: AnthropicPricingTable | None = None,
     default_max_completion_tokens: int = 4096,
     cache_ttl: CacheTTL = "5m",
 ) -> AnthropicMessagesAdapter:
@@ -270,15 +161,14 @@ def _anthropic_bedrock_adapter(
 
     Raises:
         ValueError: An uncataloged model lacks `pricing`.
-            Also raised when `pricing` lacks its required `"standard"` key.
     """
     if catalog_table is None:
         if pricing is None:
             raise ValueError(
-                f"model {model!r} has no matching Anthropic pricing; pass pricing= stating its rates"
+                f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
             )
     else:
-        pricing = {"standard": catalog_table, **(pricing or {})}
+        pricing = pricing or catalog_table
     return AnthropicMessagesAdapter(
         client=client,
         model=model,
@@ -336,10 +226,11 @@ class Anthropic:
         self,
         model: AnthropicModelName,
         *,
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = ...,
+        pricing: AnthropicPricingTable | None = ...,
         default_max_completion_tokens: int = ...,
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
     ) -> LLM: ...
 
     @overload
@@ -347,35 +238,37 @@ class Anthropic:
         self,
         model: str,
         *,
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable],
+        pricing: AnthropicPricingTable,
         default_max_completion_tokens: int = ...,
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
+        inference_geo: str | None = ...,
     ) -> LLM: ...
 
     def model(
         self,
         model: str,
         *,
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
+        pricing: AnthropicPricingTable | None = None,
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
         service_tier: AnthropicServiceTier | None = None,
+        inference_geo: str | None = None,
     ) -> LLM:
         """Build an `LLM` for one Messages API model.
 
         `model` is sent verbatim.
-        Cataloged models receive standard-tier `ANTHROPIC_PRICING`.
-        Stated `pricing` extends or replaces catalog pricing.
-        Uncataloged models require `pricing` with a `"standard"` entry.
+        Cataloged models receive `ANTHROPIC_PRICING`.
+        Stated `pricing` replaces catalog pricing.
+        Uncataloged models require `pricing`.
         `default_max_completion_tokens` fills an unstated bound completion limit.
         `cache_ttl` applies to every cache marker.
         `service_tier` sets the requested Anthropic service tier.
+        `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
 
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
-                Also raised when `pricing` lacks its required `"standard"` key.
         """
         adapter = _anthropic_adapter(
             model,
@@ -384,6 +277,7 @@ class Anthropic:
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
             service_tier=service_tier,
+            inference_geo=inference_geo,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff)
 
@@ -444,17 +338,17 @@ class AnthropicBedrock:
         self,
         model: AnthropicBedrockModelName,
         *,
-        pricing: Mapping[AnthropicPricedServiceTier, AnthropicPricingTable] | None = None,
+        pricing: AnthropicPricingTable | None = None,
         default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
     ) -> LLM:
         """Build an `LLM` for one Bedrock model.
 
         `model` is sent verbatim.
-        A known model substring selects pricing.
+        An exact catalog identifier selects pricing.
         An exact preferred Mantle identifier selects `AsyncAnthropicBedrockMantle`.
         Other known identifiers select `AsyncAnthropicBedrock`.
-        Stated `pricing` extends or replaces the `"standard"` estimate.
+        Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing` and a passed `client`.
         `default_max_completion_tokens` fills an unstated bound completion limit.
         `cache_ttl` applies to every cache marker.
@@ -490,7 +384,7 @@ class AnthropicBedrock:
         adapter = _anthropic_bedrock_adapter(
             model,
             client=client,
-            catalog_table=(None if routing is None else ANTHROPIC_PRICING[routing.pricing_key]),
+            catalog_table=ANTHROPIC_BEDROCK_PRICING.get(model),
             pricing=pricing,
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
@@ -500,14 +394,15 @@ class AnthropicBedrock:
 
 __all__ = [
     "ANTHROPIC_BEDROCK",
+    "ANTHROPIC_BEDROCK_PRICING",
     "ANTHROPIC_PRICING",
     "Anthropic",
     "AnthropicBedrock",
     "AnthropicBedrockModelName",
     "AnthropicMessagesAdapter",
     "AnthropicModelName",
-    "AnthropicPricedServiceTier",
     "AnthropicPricingTable",
+    "AnthropicRates",
     "AnthropicServiceTier",
     "BedrockRouting",
     "CacheTTL",

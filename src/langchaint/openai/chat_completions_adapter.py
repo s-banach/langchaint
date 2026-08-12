@@ -158,11 +158,8 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.openai.shared import (
-    _DEFAULT_TIER,
-    _UNPRICED,
     OPENAI_FAILURE_TYPES,
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
-    OpenAIPricedServiceTier,
     OpenAIPricingTable,
     OpenAIServiceTier,
     _image_data_uri,
@@ -173,7 +170,7 @@ from langchaint.openai.shared import (
     request_id_from_openai_error,
     require_prompt_cache_options_support,
 )
-from langchaint.pricing import Billing, require_pricing_key
+from langchaint.pricing import Billing
 from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
@@ -619,10 +616,10 @@ def cache_read_tokens_from_usage_openai(usage: CompletionUsage) -> int:
 def _billing_from_chat_completion(
     completion: ChatCompletion,
     *,
-    pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+    pricing: OpenAIPricingTable,
     cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
 ) -> Billing:
-    """Price one response's raw counters at the table its priced tier selects.
+    """Price counters using the reported `service_tier`.
 
     The whole response is the argument, not its usage: the tier that selects the rates is on the
     response and the counters are on the usage, and pricing one response's counters at another
@@ -640,20 +637,25 @@ def _billing_from_chat_completion(
     provider may report it through an extra usage field; the write counter is
     prompt_tokens_details.cache_write_tokens, 0 where the details object is absent.
 
-    A response with no usage at all bills zero counters, at the priced tier's rates.
+    A response without usage bills zero counters.
 
     Raises:
         pydantic.ValidationError: the counters leave input_tokens_cache_none negative, a response
             over-reporting its cache counters, so the priced Usage rejects it.
     """
     service_tier = _priced_tier(completion.service_tier)
-    table = pricing.get(service_tier, _UNPRICED)
+    usage = completion.usage
+    input_tokens_total = 0 if usage is None else usage.prompt_tokens
+    rates = pricing.rates_for(
+        service_tier=completion.service_tier,
+        input_tokens_total=input_tokens_total,
+        regional_processing=False,
+    )
     provider_executed_tool_cost_in_usd = (
         nan if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
-    usage = completion.usage
     if usage is None:
-        return table.price(
+        return rates.price(
             service_tier=service_tier,
             usage_raw=None,
             input_tokens_cache_read=0,
@@ -669,7 +671,7 @@ def _billing_from_chat_completion(
     cache_write_tokens = (
         prompt_details.cache_write_tokens or 0 if prompt_details is not None else 0
     )
-    return table.price(
+    return rates.price(
         service_tier=service_tier,
         usage_raw=usage,
         input_tokens_cache_read=cache_read_tokens,
@@ -717,7 +719,7 @@ class OpenAIChatCompletionsAdapter(Adapter):
         *,
         client: AsyncOpenAI,
         model: str,
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+        pricing: OpenAIPricingTable,
         provider_name: str,
         supports_prompt_cache_options: bool,
         cache_read_tokens_from_usage: Callable[
@@ -755,20 +757,13 @@ class OpenAIChatCompletionsAdapter(Adapter):
         over-report the cost of every cached request.
         langchaint.deepseek passes cache_read_tokens_from_usage_deepseek.
 
-        pricing holds one table per service tier this adapter can price, keyed by what a response
-        reports, and a response served at a tier absent from it costs NaN. The "default" key is
-        required because every response reporting no tier, and every response reporting "auto",
-        prices there.
+        `pricing` holds this model's rates and modifiers.
         service_tier is what the request asks for, None sending nothing. It cannot decide the price:
         the API documents the reported mode as possibly different from the requested one.
 
         Raises:
-            ValueError: pricing has no "default" key, which would price every response reporting no
-                tier, and every default-tier response, as NaN, with nothing said until the cost
-                comes back unknown.
-                Also raised by Adapter.__init__ when provider_name contradicts the client's class.
+            ValueError: `provider_name` contradicts the client's class.
         """
-        require_pricing_key(pricing, key=_DEFAULT_TIER, model=model)
         super().__init__(client=client, model=model, provider_name=provider_name)
         self.client = client_without_retries(client)
         self.pricing = pricing
@@ -908,7 +903,7 @@ class _ChatCompletionsStream(AdapterStream):
         self,
         *,
         sdk_stream: AsyncStream[ChatCompletionChunk],
-        pricing: Mapping[OpenAIPricedServiceTier, OpenAIPricingTable],
+        pricing: OpenAIPricingTable,
         cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
     ) -> None:
         self._sdk_stream = sdk_stream
@@ -1071,7 +1066,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> Billing:
-        """Price the response's counters at the table its priced tier selects.
+        """Price counters using the reported `service_tier`.
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.

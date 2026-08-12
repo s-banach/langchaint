@@ -9,7 +9,7 @@ import pkgutil
 from collections.abc import Iterator, Mapping
 from types import ModuleType
 
-import httpx
+import httpx2
 import openai
 from pydantic import BaseModel
 
@@ -150,16 +150,16 @@ def status_error[ErrorT: openai.APIStatusError](
     headers: dict[str, str] | None = None,
     error_code: str | None = None,
 ) -> ErrorT:
-    """Build one of the openai SDK's status exceptions around a constructed httpx response.
+    """Build an openai status exception around a constructed httpx2.Response.
 
     error_code fills the body's code the way the SDK reads it onto the exception; the SDK gets
     the body with the error envelope already unwrapped, so the dict here carries code directly.
     The body's type is always insufficient_quota, the ambiguous value parse must not decide by.
     None builds the exception a non-JSON body produces, whose code attribute is None.
     """
-    response = httpx.Response(
+    response = httpx2.Response(
         status_code,
-        request=httpx.Request("POST", "https://api.openai.com"),
+        request=httpx2.Request("POST", "https://api.openai.com"),
         headers=headers,
     )
     body = (
@@ -172,15 +172,15 @@ def status_error[ErrorT: openai.APIStatusError](
 
 def connection_error() -> openai.APIConnectionError:
     """Build the openai SDK's transport-failure exception, which carries a request and no response."""
-    return openai.APIConnectionError(request=httpx.Request("POST", "https://api.openai.com"))
+    return openai.APIConnectionError(request=httpx2.Request("POST", "https://api.openai.com"))
 
 
 def openai_sdk_errors_and_classifications() -> Mapping[Exception, ErrorClassification]:
     """Return the whole exception table classify_openai shares across both openai adapters.
 
-    Each status code is the one the SDK raises that class for, read from openai 2.51.0;
-    the bare APIStatusError rows are the statuses the SDK maps to no class of its own, 413 among
-    them, which is why the classification reads the status rather than the exception class.
+    openai 3.0.0 provides each class for its listed status code.
+    Bare `APIStatusError` rows cover statuses without dedicated classes.
+    The classification reads `status_code` because those rows share one exception class.
     APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
     isinstance.
     A status row states the name a DoNotRetry failure takes, never whether it is retried:
@@ -191,7 +191,7 @@ def openai_sdk_errors_and_classifications() -> Mapping[Exception, ErrorClassific
     """
     return {
         connection_error(): "transient",
-        openai.APITimeoutError(httpx.Request("POST", "https://api.openai.com")): "transient",
+        openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): "transient",
         status_error(openai.RateLimitError, 429): "invalid_request",
         status_error(openai.ConflictError, 409): "invalid_request",
         status_error(openai.BadRequestError, 400): "invalid_request",

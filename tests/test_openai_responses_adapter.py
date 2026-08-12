@@ -14,7 +14,7 @@ import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Literal, override
 
-import httpx
+import httpx2
 import openai
 import pytest
 from openai import AsyncOpenAI
@@ -1098,10 +1098,10 @@ class _FakeSDKStream(AsyncResponseStream[None]):
         self, replay_events: Sequence[ResponseStreamEvent], headers: dict[str, str] | None = None
     ) -> None:
         self._replay_events = list(replay_events)
-        self._response = httpx.Response(
+        self._response = httpx2.Response(
             200,
             headers=headers,
-            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
         )
 
     @override
@@ -2025,11 +2025,11 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
 
 
 def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
-    """Build the SDK's 429 exception around a constructed httpx response."""
-    response = httpx.Response(
+    """Build the SDK's 429 exception around a constructed httpx2.Response."""
+    response = httpx2.Response(
         429,
         headers=headers,
-        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
     )
     return openai.RateLimitError("rate limited", response=response, body=None)
 
@@ -2037,9 +2037,8 @@ def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
 def test_parse_openai_reads_retry_after_from_the_headers_without_letting_it_pick() -> None:
     """A retry-after header fills the verdict's retry_after and never changes which verdict.
 
-    The header parsing itself is tested in tests/test_adapter.py against the shared function;
-    what is provider-specific is where the headers are found. httpx.Headers is case-insensitive,
-    so the lookup keeps working whatever case the server sent.
+    `httpx2.Headers` provides case-insensitive lookup.
+    The assertion covers mixed-case `Retry-After-MS`.
     """
     assert parse_openai(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(retry_after=1.5)
     assert parse_openai(_rate_limit_error({})) == PauseAll(retry_after=None)

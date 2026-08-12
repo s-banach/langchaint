@@ -31,7 +31,7 @@ build-backend = "uv_build"
 dev = [
     "anthropic>=0.120.0",
     "numpy>=2.5.0",
-    "openai>=2.51.0",
+    "openai>=3.0.0",
     "opentelemetry-api>=1.30.0",
     # opentelemetry-sdk is needed only by the tracing tests' in-memory exporter
     # (InMemorySpanExporter, SimpleSpanProcessor, TracerProvider); the wrapper

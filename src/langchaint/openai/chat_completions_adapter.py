@@ -1043,8 +1043,8 @@ class _ChatCompletionsStream(AdapterStream):
     def request_id(self) -> str | None:
         """Read the request-id header off the response the SDK stream is reading.
 
-        AsyncStream sets its httpx response as the public response attribute in its constructor
-        (openai 2.51.0), so this is readable from the moment the stream opens.
+        openai 3.0.0 exposes `AsyncStream.response` as `httpx2.Response`.
+        The header is readable when the stream opens.
         """
         request_id: str | None = self._sdk_stream.response.headers.get("x-request-id")
         return request_id

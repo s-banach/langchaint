@@ -1,8 +1,8 @@
 """Pin SDK facts used by langchaint arithmetic and request mapping.
 
 These tests inspect declared fields, method signatures, and Bedrock service models.
-Current facts target anthropic 0.120.0 and openai 2.53.0.
-They also target google-genai 2.16.0 and botocore 1.43.67.
+Current facts target anthropic 0.121.0 and openai 3.0.0.
+They also target google-genai 2.17.0 and botocore 1.43.69.
 """
 
 import inspect
@@ -12,6 +12,7 @@ import anthropic
 import boto3
 import botocore.session
 import httpx
+import httpx2
 import openai
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from anthropic.types import (
@@ -311,12 +312,21 @@ def test_anthropic_reported_service_tier_values_match_the_sdk() -> None:
     assert reported == ("standard", "priority", "batch")
 
 
-def _response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
-    """Build the httpx.Response the SDK error constructors read."""
+def _anthropic_response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
+    """Build the httpx.Response read by anthropic error constructors."""
     return httpx.Response(
         status_code=status_code,
         headers=headers,
         request=httpx.Request("POST", "https://example.invalid/v1"),
+    )
+
+
+def _openai_response_with(status_code: int, headers: dict[str, str]) -> httpx2.Response:
+    """Build the httpx2.Response read by openai error constructors."""
+    return httpx2.Response(
+        status_code=status_code,
+        headers=headers,
+        request=httpx2.Request("POST", "https://example.invalid/v1"),
     )
 
 
@@ -328,10 +338,14 @@ def test_anthropic_status_error_reads_the_error_type_parse_branches_on() -> None
     """
     client = anthropic.Anthropic(api_key="k")
     body = {"type": "error", "error": {"type": "overloaded_error", "message": "boom"}}
-    error = client._make_status_error("boom", body=body, response=_response_with(529, {}))
+    error = client._make_status_error(
+        "boom", body=body, response=_anthropic_response_with(529, {})
+    )
     assert isinstance(error, anthropic.APIStatusError)
     assert error.type == "overloaded_error"
-    bodyless = client._make_status_error("boom", body=None, response=_response_with(529, {}))
+    bodyless = client._make_status_error(
+        "boom", body=None, response=_anthropic_response_with(529, {})
+    )
     assert isinstance(bodyless, anthropic.APIStatusError)
     assert bodyless.type is None
 
@@ -344,10 +358,12 @@ def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
     """
     client = openai.OpenAI(api_key="k")
     body = {"code": "insufficient_quota", "type": "insufficient_quota", "message": "boom"}
-    error = client._make_status_error("boom", body=body, response=_response_with(429, {}))
+    error = client._make_status_error("boom", body=body, response=_openai_response_with(429, {}))
     assert isinstance(error, openai.APIStatusError)
     assert error.code == "insufficient_quota"
-    bodyless = client._make_status_error("boom", body=None, response=_response_with(429, {}))
+    bodyless = client._make_status_error(
+        "boom", body=None, response=_openai_response_with(429, {})
+    )
     assert isinstance(bodyless, openai.APIStatusError)
     assert bodyless.code is None
 
@@ -385,10 +401,12 @@ def test_openai_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
     }
     for status_code, error_class in listed.items():
         error = client._make_status_error(
-            "boom", body=None, response=_response_with(status_code, {})
+            "boom", body=None, response=_openai_response_with(status_code, {})
         )
         assert type(error) is error_class, status_code
-    unlisted = client._make_status_error("boom", body=None, response=_response_with(413, {}))
+    unlisted = client._make_status_error(
+        "boom", body=None, response=_openai_response_with(413, {})
+    )
     assert type(unlisted) is openai.APIStatusError
 
 
@@ -415,10 +433,12 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
     }
     for status_code, error_class in listed.items():
         error = client._make_status_error(
-            "boom", body=None, response=_response_with(status_code, {})
+            "boom", body=None, response=_anthropic_response_with(status_code, {})
         )
         assert type(error) is error_class, status_code
-    unlisted = client._make_status_error("boom", body=None, response=_response_with(451, {}))
+    unlisted = client._make_status_error(
+        "boom", body=None, response=_anthropic_response_with(451, {})
+    )
     assert type(unlisted) is anthropic.APIStatusError
 
 
@@ -430,9 +450,16 @@ def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
     """
     named: set[int] = set()
     for status_code in range(400, 600):
-        error = client._make_status_error(
-            "boom", body=None, response=_response_with(status_code, {})
-        )
+        if isinstance(
+            client, (AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle)
+        ):
+            error = client._make_status_error(
+                "boom", body=None, response=_anthropic_response_with(status_code, {})
+            )
+        else:
+            error = client._make_status_error(
+                "boom", body=None, response=_openai_response_with(status_code, {})
+            )
         if getattr(type(error), "status_code", None) is not None:
             named.add(status_code)
     return named
@@ -446,7 +473,7 @@ def test_every_status_a_supported_client_names_is_in_one_of_the_verdict_tables()
     operator nothing.
     Which statuses get a dedicated class depends on the client class, not the package.
     anthropic's three clients each define their own _make_status_error; openai's three inherit
-    AsyncOpenAI's (anthropic 0.120.2, openai 2.51.0).
+    AsyncOpenAI's (anthropic 0.121.0, openai 3.0.0).
     Sweeping every client class the two SDKs' adapters accept covers a release that overrides one more.
     The check is one-directional, for the reason test_every_openai_error_code_has_a_disposition
     gives: a table legitimately holds a status no client class names, 500 and 504 among them.

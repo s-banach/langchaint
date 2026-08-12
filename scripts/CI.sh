@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 
 ci_exit_status=0
 
+echo "=== uv lock --upgrade ==="
+uv lock --upgrade || ci_exit_status=1
+
 echo "=== ruff check --fix ==="
 uv run ruff check --fix --exit-non-zero-on-fix || ci_exit_status=1
 

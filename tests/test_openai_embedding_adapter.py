@@ -7,7 +7,7 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Literal, assert_type
 
-import httpx
+import httpx2
 import numpy as np
 import pytest
 import tiktoken
@@ -27,12 +27,12 @@ from langchaint.openai.embedding_adapter import (
 from langchaint.shared_backoff import PrivateBackoff
 
 
-def _client(handler: Callable[[httpx.Request], httpx.Response]) -> AsyncOpenAI:
+def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
     """Build an offline client whose requests reach `handler`."""
     return AsyncOpenAI(
         api_key="offline",
         max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
 
 
@@ -40,11 +40,11 @@ def _response(
     vectors: Sequence[Sequence[float]],
     *,
     indexes: Sequence[int] | None = None,
-) -> httpx.Response:
+) -> httpx2.Response:
     """Build one successful SDK response from vectors and optional indexes."""
     if indexes is None:
         indexes = range(len(vectors))
-    return httpx.Response(
+    return httpx2.Response(
         200,
         json={
             "object": "list",
@@ -167,7 +167,7 @@ def test_request_maps_inputs_model_dimension_and_encoding(task: EmbeddingTask) -
     """Send OpenAI fields without sending provider-neutral `task`."""
     request_bodies: list[dict[str, object]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         request_bodies.append(json.loads(request.content))
         return _response([[3.0, 4.0], [0.0, 2.0]], indexes=[1, 0])
 
@@ -198,7 +198,7 @@ def test_ada_request_omits_dimensions() -> None:
     """Omit `dimensions` for `text-embedding-ada-002`."""
     request_bodies: list[dict[str, object]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         request_bodies.append(json.loads(request.content))
         return _response([[1.0] * 1536])
 
@@ -270,8 +270,8 @@ def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
 def test_response_rejects_invalid_data_shapes(data: object) -> None:
     """Malformed successful response data raises `EmbeddingOutputError`."""
 
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
             200,
             json={
                 "object": "list",
@@ -367,7 +367,7 @@ def test_empty_input_string_fails_before_sdk_request() -> None:
     """Reject an empty string before request admission and SDK execution."""
     request_count = 0
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
         nonlocal request_count
         request_count += 1
         return _response([[1.0]])
@@ -387,15 +387,15 @@ def test_empty_input_string_fails_before_sdk_request() -> None:
     assert request_count == 0
 
 
-@pytest.mark.parametrize("failure_type", [httpx.ConnectError, httpx.ReadTimeout])
+@pytest.mark.parametrize("failure_type", [httpx2.ConnectError, httpx2.ReadTimeout])
 def test_transport_failure_retries_the_failed_batch(
-    failure_type: type[httpx.ConnectError] | type[httpx.ReadTimeout],
+    failure_type: type[httpx2.ConnectError] | type[httpx2.ReadTimeout],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retry an OpenAI transport failure through the private batch backoff."""
     request_count = 0
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         nonlocal request_count
         request_count += 1
         if request_count == 1:

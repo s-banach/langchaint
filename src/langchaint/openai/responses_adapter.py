@@ -1164,9 +1164,8 @@ class _OpenAIStream(AdapterStream):
     def request_id(self) -> str | None:
         """Read the request-id header off the response the SDK stream is reading.
 
-        AsyncResponseStream exposes its httpx response only as _response, which it sets in its
-        constructor, so this is readable from the moment the stream opens and there is no public
-        route to the same headers (openai 2.48.0).
+        openai 3.0.0 exposes `AsyncResponseStream._response` as `httpx2.Response`.
+        No public attribute exposes the same headers.
         """
         http_response = self._sdk_stream._response  # noqa: SLF001
         request_id: str | None = http_response.headers.get("x-request-id")

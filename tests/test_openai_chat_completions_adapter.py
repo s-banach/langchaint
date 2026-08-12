@@ -16,7 +16,7 @@ import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import override
 
-import httpx
+import httpx2
 import openai
 import pytest
 from openai import AsyncOpenAI, AsyncStream
@@ -1142,10 +1142,10 @@ class _FakeSDKStream(AsyncStream[ChatCompletionChunk]):
         headers: dict[str, str] | None = None,
     ) -> None:
         self._replay = list(replay)
-        self.response = httpx.Response(
+        self.response = httpx2.Response(
             200,
             headers=headers,
-            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+            request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
         )
 
     @override
@@ -1356,7 +1356,7 @@ def _bare_api_error() -> openai.APIError:
     """Build the bare APIError the SDK raises for a mid-stream SSE error payload."""
     return openai.APIError(
         "provider mid-stream error",
-        httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
         body={"code": "server_error", "type": "insufficient_quota", "message": "boom"},
     )
 
@@ -1380,11 +1380,11 @@ def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_respo
     "error",
     [
         openai.APIConnectionError(
-            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
         ),
         openai.APIResponseValidationError(
-            response=httpx.Response(
-                200, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            response=httpx2.Response(
+                200, request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
             ),
             body=None,
         ),
@@ -1517,7 +1517,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
     def response_with_raw_part(self) -> BaseModel:
         """Return message.content beside one custom message.tool_calls entry.
 
-        openai 2.51.0 defines both fields on ChatCompletionMessage.
+        openai 3.0.0 defines both fields on ChatCompletionMessage.
         """
         return _completion(
             usage=_usage_with_cache(),

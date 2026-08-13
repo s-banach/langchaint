@@ -768,10 +768,12 @@ class OpenAIChatCompletionsAdapter(Adapter):
             provider_name=provider_name,
             automatic_cache_breakpoints_default=not supports_prompt_cache_options,
         )
-        self.client = client_without_retries(client)
-        self.pricing = pricing
-        self.supports_prompt_cache_options = supports_prompt_cache_options
-        self.cache_read_tokens_from_usage = cache_read_tokens_from_usage
+        self.client: AsyncOpenAI = client_without_retries(client)
+        self.pricing: OpenAIPricingTable = pricing
+        self.supports_prompt_cache_options: bool = supports_prompt_cache_options
+        self.cache_read_tokens_from_usage: Callable[[CompletionUsage], int] = (
+            cache_read_tokens_from_usage
+        )
         self.service_tier: OpenAIServiceTier | None = service_tier
 
     def _precompute_fields(self, binding: Binding) -> _ChatCompletionsPrecomputedFields:

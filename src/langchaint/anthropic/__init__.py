@@ -217,7 +217,7 @@ class Anthropic:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.client = (
+        self.client: AsyncAnthropic = (
             client_without_retries(client) if client is not None else AsyncAnthropic(max_retries=0)
         )
 
@@ -327,8 +327,8 @@ class AnthropicBedrock:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.aws_region = aws_region
-        self.http_client = http_client
+        self.aws_region: str | None = aws_region
+        self.http_client: httpx.AsyncClient | None = http_client
         self._passed_client = client_without_retries(client) if client is not None else None
         self._clients_by_api: dict[
             Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle

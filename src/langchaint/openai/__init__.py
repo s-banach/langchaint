@@ -130,7 +130,7 @@ class OpenAI:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.client = (
+        self.client: AsyncOpenAI = (
             client_without_retries(client) if client is not None else AsyncOpenAI(max_retries=0)
         )
 
@@ -338,7 +338,7 @@ class OpenAIBedrock:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.client = (
+        self.client: AsyncBedrockOpenAI = (
             client_without_retries(client)
             if client is not None
             else AsyncBedrockOpenAI(aws_region=aws_region, max_retries=0)

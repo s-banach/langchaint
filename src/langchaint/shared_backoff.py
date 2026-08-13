@@ -257,17 +257,17 @@ class SharedBackoff:
                 Also raised when `failure_types` is empty.
                 Also raised when a failure type equals `Exception`.
         """
-        self.minimum_wait_ceiling_seconds = _validated_positive_float(
+        self.minimum_wait_ceiling_seconds: float = _validated_positive_float(
             "minimum_wait_ceiling_seconds", minimum_wait_ceiling_seconds
         )
-        self.longest_wait_seconds = _validated_positive_float(
+        self.longest_wait_seconds: float = _validated_positive_float(
             "longest_wait_seconds", longest_wait_seconds
         )
-        self.wait_multiplier = _validated_positive_float("wait_multiplier", wait_multiplier)
-        self.quiet_seconds_per_decay_step = _validated_positive_float(
+        self.wait_multiplier: float = _validated_positive_float("wait_multiplier", wait_multiplier)
+        self.quiet_seconds_per_decay_step: float = _validated_positive_float(
             "quiet_seconds_per_decay_step", quiet_seconds_per_decay_step
         )
-        self.max_request_starts_per_second = _validated_positive_float(
+        self.max_request_starts_per_second: float = _validated_positive_float(
             "max_request_starts_per_second", max_request_starts_per_second
         )
         self._seconds_between_request_starts = 1.0 / self.max_request_starts_per_second
@@ -304,8 +304,8 @@ class SharedBackoff:
             )
         if Exception in failure_types:
             raise ValueError("failure_types must not contain Exception")
-        self.parse = parse
-        self.failure_types = failure_types
+        self.parse: Callable[[Exception], Verdict] = parse
+        self.failure_types: tuple[type[Exception], ...] = failure_types
         self._max_concurrent_requests = max_concurrent_requests
         self.on_parse_error: Literal["raise", "retry_this_one"] = on_parse_error
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))

@@ -33,7 +33,7 @@ ANTHROPIC_LITELLM_KEYS = {
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 }
 ANTHROPIC_ALIASES = {"claude-haiku-4-5": "claude-haiku-4-5-20251001"}
-ANTHROPIC_INFERENCE_GEO_MODELS = frozenset({
+ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
     "claude-fable-5",
     "claude-opus-5",
     "claude-sonnet-5",

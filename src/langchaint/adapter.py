@@ -861,9 +861,9 @@ class Adapter(ABC):
             provider_name=provider_name,
             provider_name_by_client_class=self.provider_name_by_client_class,
         )
-        self.model = model
+        self.model: str = model
         self.provider_name = provider_name
-        self.automatic_cache_breakpoints_default = automatic_cache_breakpoints_default
+        self.automatic_cache_breakpoints_default: bool = automatic_cache_breakpoints_default
 
     @abstractmethod
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:

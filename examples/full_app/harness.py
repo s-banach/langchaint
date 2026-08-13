@@ -128,7 +128,9 @@ class ScriptedAdapter(Adapter):
             provider_name="fake",
             automatic_cache_breakpoints_default=False,
         )
-        self.scripts = {tag: Script(turns=list(turns)) for tag, turns in scripts.items()}
+        self.scripts: dict[str, Script] = {
+            tag: Script(turns=list(turns)) for tag, turns in scripts.items()
+        }
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:

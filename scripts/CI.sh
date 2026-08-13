@@ -21,6 +21,9 @@ uv run ruff format --exit-non-zero-on-format || ci_exit_status=1
 echo "=== pyrefly check ==="
 uv run pyrefly check || ci_exit_status=1
 
+echo "=== pyrefly coverage check ==="
+uv run pyrefly coverage check || ci_exit_status=1
+
 echo "=== pytest ==="
 uv run pytest || ci_exit_status=1
 

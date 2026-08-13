@@ -73,8 +73,8 @@ class TransientError(Exception):
     ) -> None:
         """Store the server-stated wait and the rate-limit classification."""
         super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
-        self.is_rate_limit = is_rate_limit
+        self.retry_after_seconds: float | None = retry_after_seconds
+        self.is_rate_limit: bool = is_rate_limit
 
 
 class EmbeddingOutputError(RuntimeError):
@@ -629,7 +629,7 @@ class InvalidToolArgsError(Exception):
     def __init__(self, validation_error: ValidationError) -> None:
         """Hold the ValidationError by reference; __str__ derives the message from it."""
         super().__init__()
-        self.validation_error = validation_error
+        self.validation_error: ValidationError = validation_error
 
     @override
     def __str__(self) -> str:

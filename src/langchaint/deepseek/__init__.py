@@ -135,7 +135,7 @@ class DeepSeek:
                 api_key=api_key,
                 max_retries=0,
             )
-        self.client = client_without_retries(client)
+        self.client: AsyncOpenAI = client_without_retries(client)
 
     @overload
     def model(

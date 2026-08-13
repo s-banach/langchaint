@@ -106,7 +106,7 @@ class Unchanged:
         return "UNCHANGED"
 
 
-UNCHANGED = Unchanged()
+UNCHANGED: Unchanged = Unchanged()
 
 
 type GenerationInput = str | Sequence[Message]
@@ -144,7 +144,7 @@ class WallClockDeadline:
 
     def __init__(self, timeout_seconds: float | None) -> None:
         """Arm the scope now, or open one that never expires when timeout_seconds is None."""
-        self.scope = asyncio.timeout(timeout_seconds)
+        self.scope: asyncio.Timeout = asyncio.timeout(timeout_seconds)
 
     def suspend_until_admitted(self) -> None:
         """Keep the clock running."""
@@ -161,7 +161,7 @@ class WorkingTimeDeadline:
 
     def __init__(self, max_working_seconds: float | None) -> None:
         """Open the scope unarmed; the first resume_on_admission arms it with the budget."""
-        self.scope = asyncio.timeout(None)
+        self.scope: asyncio.Timeout = asyncio.timeout(None)
         self._seconds_left = max_working_seconds
 
     def suspend_until_admitted(self) -> None:
@@ -284,8 +284,8 @@ class LLM:
         It uses `max_concurrent_requests=8` and other `SharedBackoff` defaults.
         Pass one instance to every `LLM` sharing a rate-limit quota.
         """
-        self.adapter = adapter
-        self.shared_backoff = (
+        self.adapter: Adapter = adapter
+        self.shared_backoff: SharedBackoff = (
             shared_backoff
             if shared_backoff is not None
             else SharedBackoff(
@@ -453,11 +453,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """
         if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
-        self.adapter = adapter
-        self.binding = binding
-        self.response_format = response_format
-        self.shared_backoff = shared_backoff
-        self.max_attempts = max_attempts
+        self.adapter: Adapter = adapter
+        self.binding: Binding = binding
+        self.response_format: type[OutputT] | None = response_format
+        self.shared_backoff: SharedBackoff = shared_backoff
+        self.max_attempts: int = max_attempts
         self._bound_adapter = bound_adapter
         self._tool_manager = tool_manager
 

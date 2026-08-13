@@ -131,7 +131,7 @@ class Usage(CheckedCopyModel):
         )
 
 
-ZERO_USAGE = Usage(
+ZERO_USAGE: Usage = Usage(
     input_tokens_cache_read=0,
     input_tokens_cache_write=0,
     input_tokens_cache_none=0,

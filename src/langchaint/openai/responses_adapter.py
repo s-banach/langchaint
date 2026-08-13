@@ -853,11 +853,11 @@ class OpenAIResponsesAdapter(Adapter):
             provider_name=provider_name,
             automatic_cache_breakpoints_default=not supports_prompt_cache_options,
         )
-        self.client = client_without_retries(client)
-        self.pricing = pricing
-        self.regional_processing = regional_processing
-        self.supports_prompt_cache_options = supports_prompt_cache_options
-        self.reasoning_summary = reasoning_summary
+        self.client: AsyncOpenAI = client_without_retries(client)
+        self.pricing: OpenAIPricingTable = pricing
+        self.regional_processing: bool = regional_processing
+        self.supports_prompt_cache_options: bool = supports_prompt_cache_options
+        self.reasoning_summary: ReasoningSummary | None = reasoning_summary
         self.service_tier: OpenAIServiceTier | None = service_tier
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:

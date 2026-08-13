@@ -419,7 +419,7 @@ class CohereBedrock:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.aws_region = aws_region
+        self.aws_region: str | None = aws_region
         self._client_cache = _CohereBedrockClientCache(
             aws_region=aws_region,
             client=client,

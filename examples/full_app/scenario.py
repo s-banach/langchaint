@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from langchaint import PydanticTool, ToolOutputExplicit, Usage, tool
 
-SEARCH_USAGE = Usage(
+SEARCH_USAGE: Usage = Usage(
     input_tokens_cache_read=0,
     input_tokens_cache_write=0,
     input_tokens_cache_none=200,

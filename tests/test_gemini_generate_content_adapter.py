@@ -15,9 +15,7 @@ from typing import override
 import httpx
 import pytest
 from google import genai
-
-# The types suppression: the SDK publishes this exact import in its own docs.
-from google.genai import errors, types  # pyrefly: ignore[implicit-reexport]
+from google.genai import errors, types
 from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (

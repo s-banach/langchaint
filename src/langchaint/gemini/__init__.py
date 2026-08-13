@@ -155,7 +155,7 @@ class Gemini:
             wait_multiplier=wait_multiplier,
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
-        self.client = client if client is not None else genai.Client(vertexai=False)
+        self.client: genai.Client = client if client is not None else genai.Client(vertexai=False)
 
     @overload
     def model(

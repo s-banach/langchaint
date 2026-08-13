@@ -82,9 +82,7 @@ from typing import ClassVar, Literal, override
 
 import httpx
 from google import genai
-
-# The types suppression: the SDK publishes this exact import in its own docs.
-from google.genai import errors, types  # pyrefly: ignore[implicit-reexport]
+from google.genai import errors, types
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
@@ -1211,8 +1209,8 @@ class GeminiGenerateContentAdapter(Adapter):
             provider_name=provider_name,
             automatic_cache_breakpoints_default=False,
         )
-        self.client = client
-        self.pricing = pricing
+        self.client: genai.Client = client
+        self.pricing: Mapping[str, GeminiPricingTable] = pricing
         self.service_tier: GeminiServiceTier | None = service_tier
 
     def _bound_config(

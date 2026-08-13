@@ -213,11 +213,11 @@ class AgentRun(ABC):
                 "drop its turn_log records from every fold. Disambiguate the path, as delegate "
                 "does with its spawn index."
             )
-        self.agent_path = agent_path
-        self.config = config
-        self.tracer = tracer
-        self.registry = registry
-        self.on_event = on_event
+        self.agent_path: str = agent_path
+        self.config: AgentConfig = config
+        self.tracer: Tracer = tracer
+        self.registry: dict[str, AgentRun] = registry
+        self.on_event: Callable[[Event], None] = on_event
         self.turn_log: list[TurnRecord] = []
         registry[agent_path] = self
 
@@ -329,11 +329,11 @@ class ReActAgent(AgentRun):
             registry=registry,
             on_event=on_event,
         )
-        self.bound = bound
-        self.prompt = prompt
-        self.turn_number = 0
-        self.tool_calls_made = 0
-        self.critique_approved = False
+        self.bound: TracedBoundLLM[str, ToolManager] = bound
+        self.prompt: str = prompt
+        self.turn_number: int = 0
+        self.tool_calls_made: int = 0
+        self.critique_approved: bool = False
         self.messages: list[Message] = []
 
     @override

@@ -146,9 +146,9 @@ class EmbeddingModel:
         """
         if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
-        self.model = adapter.model
-        self.dimension = adapter.dimension
-        self.max_attempts = max_attempts
+        self.model: str = adapter.model
+        self.dimension: int = adapter.dimension
+        self.max_attempts: int = max_attempts
         self._adapter = adapter
         self._shared_backoff = shared_backoff
 

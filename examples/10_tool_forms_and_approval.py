@@ -61,7 +61,7 @@ async def search_docs(
     return ToolOutputExplicit(content=f"Found 3 passages for {query!r}.", app_data=raw_result)
 
 
-search_docs_tool = JSONSchemaTool(
+search_docs_tool: JSONSchemaTool[Mapping[str, object]] = JSONSchemaTool(
     name="search_docs",
     description="Search documentation exposed by an MCP server.",
     args_schema={

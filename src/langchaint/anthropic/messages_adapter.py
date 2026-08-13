@@ -1193,12 +1193,12 @@ class AnthropicMessagesAdapter(Adapter):
             provider_name=provider_name,
             automatic_cache_breakpoints_default=False,
         )
-        self.client = client_without_retries(client)
-        self.pricing = pricing
-        self.default_max_completion_tokens = default_max_completion_tokens
+        self.client: AnthropicClient = client_without_retries(client)
+        self.pricing: AnthropicPricingTable = pricing
+        self.default_max_completion_tokens: int = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl
         self.service_tier: AnthropicServiceTier | None = service_tier
-        self.inference_geo = inference_geo
+        self.inference_geo: str | None = inference_geo
 
     def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
         """Precompute the typed request fields the binding determines.

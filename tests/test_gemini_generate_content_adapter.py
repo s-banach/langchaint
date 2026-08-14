@@ -17,6 +17,7 @@ from google.genai import errors, types
 from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
+    AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
     Billing,
@@ -377,6 +378,20 @@ def test_tool_schemas_become_function_declarations() -> None:
                 mode=types.FunctionCallingConfigMode.ANY, allowed_function_names=["echo"]
             ),
         ),
+        (
+            AllowedToolsChoice(mode="auto", tool_names=("echo",)),
+            types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.VALIDATED,
+                allowed_function_names=["echo"],
+            ),
+        ),
+        (
+            AllowedToolsChoice(mode="required", tool_names=("echo",)),
+            types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.ANY,
+                allowed_function_names=["echo"],
+            ),
+        ),
     ],
 )
 def test_tool_choice_mapping(
@@ -385,6 +400,32 @@ def test_tool_choice_mapping(
     """Neutral "required" is mode ANY; a specific choice is ANY narrowed to the one name."""
     config = _bound_config(_binding(tool_schemas=(_echo_schema(),), tool_choice=tool_choice))
     assert config.tool_config == types.ToolConfig(function_calling_config=expected)
+
+
+def test_allowed_tools_choice_keeps_complete_gemini_function_declarations() -> None:
+    """AllowedToolsChoice changes ToolConfig without removing function_declarations."""
+    lookup_schema = ToolSchema(
+        name="lookup",
+        description="Look up the city.",
+        args_schema={"type": "object", "properties": {}},
+    )
+    config = _bound_config(
+        _binding(
+            tool_schemas=(_echo_schema(), lookup_schema),
+            tool_choice=AllowedToolsChoice(mode="auto", tool_names=("lookup",)),
+        )
+    )
+    assert config.tools is not None
+    assert isinstance(config.tools[0], types.Tool)
+    declarations = config.tools[0].function_declarations
+    assert declarations is not None
+    assert [declaration.name for declaration in declarations] == ["echo", "lookup"]
+    assert config.tool_config == types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode=types.FunctionCallingConfigMode.VALIDATED,
+            allowed_function_names=["lookup"],
+        )
+    )
 
 
 def test_no_tools_binds_no_tool_config() -> None:
@@ -549,6 +590,18 @@ def test_provider_executed_tools_reject_non_auto_tool_choice() -> None:
             _binding(
                 provider_executed_tools=({"google_search": {}},),
                 tool_choice="required",
+            )
+        )
+
+
+def test_provider_executed_tools_reject_allowed_tools_choice() -> None:
+    """allowed_function_names cannot restrict Gemini provider-executed tools."""
+    with pytest.raises(ValueError, match="tool_choice='auto'"):
+        _ = _bound_config(
+            _binding(
+                tool_schemas=(_echo_schema(),),
+                provider_executed_tools=({"google_search": {}},),
+                tool_choice=AllowedToolsChoice(mode="auto", tool_names=("echo",)),
             )
         )
 

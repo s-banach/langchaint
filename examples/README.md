@@ -11,7 +11,7 @@ Most examples construct backend classes directly to show request code.
 | [`03_streaming.py`](03_streaming.py) | Every `StreamItem` variant and `StreamHandle.final()` |
 | [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) | Request pacing, deadlines, batch failures, and provider fallback |
 | [`05_prompt_caching.py`](05_prompt_caching.py) | `cache_breakpoint` and `generate_many(warm_cache=True)` |
-| [`06_required_choice.py`](06_required_choice.py) | `CaptureTool`, `tool_choice="required"`, and `SpecificToolChoice` |
+| [`06_required_choice.py`](06_required_choice.py) | `CaptureTool`, `AllowedToolsChoice`, `tool_choice="required"`, and `SpecificToolChoice` |
 | [`07_pricing.py`](07_pricing.py) | Uncataloged model pricing and both usage scopes |
 | [`08_tracing.py`](08_tracing.py) | A console exporter and a complete traced tool loop |
 | [`09_embeddings.py`](09_embeddings.py) | Retrieval tasks, normalized matrices, and `OpenAI` generation |

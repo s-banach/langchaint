@@ -75,6 +75,7 @@ from openai.types.responses import (
     ResponseInputTextParam,
     ResponseReasoningItem,
     ResponseTextConfigParam,
+    ToolChoiceAllowedParam,
     ToolChoiceFunctionParam,
     ToolParam,
 )
@@ -94,6 +95,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AllowedToolsChoice,
     Binding,
     BoundAdapter,
     EmptyTurn,
@@ -157,7 +159,9 @@ from langchaint.pricing import (
 from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
-type _WireToolChoice = Literal["none", "auto", "required"] | ToolChoiceFunctionParam
+type _WireToolChoice = (
+    Literal["none", "auto", "required"] | ToolChoiceFunctionParam | ToolChoiceAllowedParam
+)
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
 
 type ReasoningSummary = Literal["auto", "concise", "detailed"]
@@ -446,6 +450,14 @@ def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
     """Convert the neutral tool choice."""
     if isinstance(tool_choice, SpecificToolChoice):
         return {"type": "function", "name": tool_choice.tool_name}
+    if isinstance(tool_choice, AllowedToolsChoice):
+        return {
+            "type": "allowed_tools",
+            "mode": tool_choice.mode,
+            "tools": [
+                {"type": "function", "name": tool_name} for tool_name in tool_choice.tool_names
+            ],
+        }
     return tool_choice
 
 

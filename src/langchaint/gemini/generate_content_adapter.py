@@ -81,6 +81,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AllowedToolsChoice,
     Binding,
     BoundAdapter,
     EmptyTurn,
@@ -940,6 +941,15 @@ def _wire_tool_config(tool_choice: ToolChoice) -> types.ToolConfig:
             mode=types.FunctionCallingConfigMode.ANY,
             allowed_function_names=[tool_choice.tool_name],
         )
+    elif isinstance(tool_choice, AllowedToolsChoice):
+        function_calling_config = types.FunctionCallingConfig(
+            mode=(
+                types.FunctionCallingConfigMode.VALIDATED
+                if tool_choice.mode == "auto"
+                else types.FunctionCallingConfigMode.ANY
+            ),
+            allowed_function_names=list(tool_choice.tool_names),
+        )
     elif tool_choice == "auto":
         function_calling_config = types.FunctionCallingConfig(
             mode=types.FunctionCallingConfigMode.AUTO
@@ -1161,7 +1171,7 @@ class GeminiGenerateContentAdapter(Adapter):
         Raises:
             pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
             ValueError: A marked system part, disabled parallel calls, empty `system_prompt`, or reserved key is used.
-            ValueError: Provider-executed tools use a non-auto choice, a pre-Gemini-3 model, or Vertex AI.
+            ValueError: Provider-executed tools use a choice other than "auto", a pre-Gemini-3 model, or Vertex AI.
             ValueError: A configured charged rate is not finite and nonnegative.
         """
         _reject_extra_body_keys(binding.extra_body)

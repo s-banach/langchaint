@@ -13,12 +13,15 @@ from pydantic import BaseModel
 from langchaint import (
     LLM,
     ZERO_USAGE,
+    AllowedToolsChoice,
     AssistantMessage,
     Billing,
     BoundLLM,
     CallResult,
     CaptureTool,
     ContextWindowExceededError,
+    DispatchHandled,
+    DispatchInvalidToolArgs,
     DoNotRetry,
     EmptyTurnError,
     EscapedExceptionError,
@@ -44,6 +47,7 @@ from langchaint import (
     ToolCall,
     ToolCallTurn,
     ToolManager,
+    ToolSchema,
     TransientError,
     UnfinishedTurnError,
     UnknownExceptionError,
@@ -1622,6 +1626,59 @@ def _capture_tool(name: str = "capture") -> CaptureTool[_Answer]:
         description="Capture one value.",
         args_model=_Answer,
     )
+
+
+class _SchemaOnceTool:
+    """Expose one schema call so a repeated conversion fails visibly."""
+
+    def __init__(self) -> None:
+        self._tool = _capture_tool("schema_once")
+        self.schema_calls = 0
+
+    @property
+    def name(self) -> str:
+        """Return the wrapped tool name."""
+        return self._tool.name
+
+    def schema(self) -> ToolSchema:
+        """Return the schema once and reject another conversion."""
+        self.schema_calls += 1
+        if self.schema_calls > 1:
+            raise AssertionError("Tool.schema() was called more than once")
+        return self._tool.schema()
+
+    async def dispatch(self, call: ToolCall) -> DispatchHandled[_Answer] | DispatchInvalidToolArgs:
+        """Dispatch through the wrapped tool."""
+        return await self._tool.dispatch(call)
+
+
+def test_allowed_tools_choice_requires_a_name() -> None:
+    """AllowedToolsChoice rejects empty tool_names."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        _ = AllowedToolsChoice(mode="auto", tool_names=())
+
+
+def test_allowed_tools_choice_rejects_an_unbound_name_before_adapter_binding() -> None:
+    """Binding validates AllowedToolsChoice against its application tool schemas."""
+    adapter = _FakeAdapter()
+    with pytest.raises(ValueError, match="missing"):
+        _ = LLM(adapter).bind(
+            tools=[_capture_tool("present")],
+            tool_choice=AllowedToolsChoice(mode="auto", tool_names=("missing",)),
+        )
+    assert adapter.bound_adapters == []
+
+
+def test_rebind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
+    """Changing only tool_choice preserves the converted tool definitions by identity."""
+    tool = _SchemaOnceTool()
+    bound = LLM(_FakeAdapter()).bind(tools=[tool])
+    rebound = bound.rebind(
+        tool_choice=AllowedToolsChoice(mode="required", tool_names=(tool.name,))
+    )
+    assert tool.schema_calls == 1
+    assert rebound.tool_manager is bound.tool_manager
+    assert rebound.binding.tool_schemas is bound.binding.tool_schemas
 
 
 def test_rebind_to_a_response_format_rebinds_even_when_the_binding_is_unchanged() -> None:

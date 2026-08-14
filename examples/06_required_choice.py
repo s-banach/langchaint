@@ -3,6 +3,7 @@
 from pydantic import BaseModel
 
 from langchaint import (
+    AllowedToolsChoice,
     CaptureTool,
     DispatchCaptured,
     Message,
@@ -51,7 +52,7 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
     bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Research the question, then submit final_response.",
         tools=[search, final_response_tool],
-        tool_choice="required",
+        tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,)),
         automatic_cache_breakpoints=True,
     )
 
@@ -63,6 +64,8 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
                 tool_choice=SpecificToolChoice(tool_name=final_response_tool.name)
             )
         response = await bound.generate_one(messages)
+        if turn == 0:
+            bound = bound.rebind(tool_choice="required")
         messages.append(response.assistant_message)
         for call in response.tool_calls:
             if call.name != final_response_tool.name:

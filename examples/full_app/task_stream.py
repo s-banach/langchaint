@@ -268,6 +268,11 @@ class ReActAgent(AgentRun):
         """
         self.messages.append(UserMessage(content=self.prompt))
         for _ in range(self.config.max_turns):
+            if (
+                self.tool_calls_made >= self.config.max_tool_calls
+                and self.bound.binding.tool_choice != "none"
+            ):
+                self.bound = self.bound.rebind(tool_choice="none")
             usage_so_far = self.usage
             _check_cost_limit(usage_so_far, self.config.max_cost_in_usd)
             self.turn_number += 1

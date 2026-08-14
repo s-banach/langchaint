@@ -93,6 +93,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AllowedToolsChoice,
     Binding,
     BoundAdapter,
     ContextWindowExceeded,
@@ -763,7 +764,11 @@ def _request_messages(
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
-    """Convert the neutral tool choice; neutral "required" is Anthropic "any"."""
+    """Convert the neutral tool choice; neutral "required" is Anthropic "any".
+
+    Raises:
+        TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
+    """
     disable_parallel_tool_use = not parallel_tool_calls
     if isinstance(tool_choice, SpecificToolChoice):
         return {
@@ -771,6 +776,8 @@ def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> 
             "name": tool_choice.tool_name,
             "disable_parallel_tool_use": disable_parallel_tool_use,
         }
+    if isinstance(tool_choice, AllowedToolsChoice):
+        raise TypeError("AnthropicMessagesAdapter does not support AllowedToolsChoice")
     if tool_choice == "auto":
         return {"type": "auto", "disable_parallel_tool_use": disable_parallel_tool_use}
     if tool_choice == "required":
@@ -1113,6 +1120,7 @@ class AnthropicMessagesAdapter(Adapter):
             ValueError: Binding marks exceed four, `extra_body` conflicts, or `system_prompt` is empty.
             ValueError: A provider-executed tool type is unsupported or code execution lacks a qualifying web tool.
             ValueError: Provider-executed tools use another provider or web-search rates are invalid.
+            TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
@@ -1209,7 +1217,7 @@ class AnthropicMessagesAdapter(Adapter):
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output; pure conversion, no I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Propagates _precompute_fields' ValueError and TypeError.
         """
         return _BoundAnthropicText(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
@@ -1221,7 +1229,7 @@ class AnthropicMessagesAdapter(Adapter):
     ) -> BoundAdapter[ModelT | None]:
         """Bind for structured output validated into response_format; pure conversion, no I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Propagates _precompute_fields' ValueError and TypeError.
         """
         return _BoundAnthropicStructured(
             adapter=self,

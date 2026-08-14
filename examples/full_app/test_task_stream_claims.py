@@ -237,6 +237,7 @@ def test_tool_call_budget_uses_call_positions() -> None:
     ]
     assert [record.tool_message.is_error for record in first_turn_tools] == [False, True]
     assert climate.tool_calls_made == 1
+    assert climate.bound.binding.tool_choice == "none"
 
 
 def test_duplicate_tool_call_ids_are_rejected() -> None:

@@ -50,6 +50,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     LLM,
+    AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
     ImagePart,
@@ -66,6 +67,7 @@ from langchaint import (
     TextPart,
     ToolCall,
     ToolCallDelta,
+    ToolChoice,
     ToolMessage,
     UserMessage,
 )
@@ -721,6 +723,21 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     }
 
 
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_wire_tool_choice_restricts_function_names_in_order(
+    mode: Literal["auto", "required"],
+) -> None:
+    """AllowedToolsChoice maps to the Responses allowed_tools form."""
+    assert _wire_tool_choice(AllowedToolsChoice(mode=mode, tool_names=("second", "first"))) == {
+        "type": "allowed_tools",
+        "mode": mode,
+        "tools": [
+            {"type": "function", "name": "second"},
+            {"type": "function", "name": "first"},
+        ],
+    }
+
+
 def _adapter(
     *,
     reasoning_summary: ReasoningSummary | None = None,
@@ -747,6 +764,7 @@ def _binding(
     tool_schemas: tuple[ToolSchema, ...] = (),
     reasoning_effort: ReasoningEffort | None = None,
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
+    tool_choice: ToolChoice = "auto",
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
@@ -754,7 +772,7 @@ def _binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
         provider_executed_tools=provider_executed_tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
         parallel_tool_calls=True,
         inference_params=InferenceParams(reasoning_effort=reasoning_effort),
         automatic_cache_breakpoints=automatic_cache_breakpoints,
@@ -1017,6 +1035,46 @@ def test_provider_executed_tools_follow_function_tools_in_responses() -> None:
     assert not isinstance(precomputed.tools, openai.Omit)
     assert precomputed.tools[0]["type"] == "function"
     assert precomputed.tools[1] is provider_tool
+
+
+def test_allowed_tools_choice_keeps_complete_responses_tool_definitions() -> None:
+    """AllowedToolsChoice changes tool_choice without removing tools."""
+    schemas = (
+        ToolSchema(name="first", description="First.", args_schema={"type": "object"}),
+        ToolSchema(name="second", description="Second.", args_schema={"type": "object"}),
+    )
+    provider_tool: dict[str, object] = {"type": "web_search"}
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            automatic_cache_breakpoints=True,
+            tool_schemas=schemas,
+            provider_executed_tools=(provider_tool,),
+            tool_choice=AllowedToolsChoice(mode="auto", tool_names=("second",)),
+        )
+    )
+    assert not isinstance(precomputed.tools, openai.Omit)
+    assert precomputed.tools == [
+        {
+            "type": "function",
+            "name": "first",
+            "description": "First.",
+            "parameters": {"type": "object"},
+            "strict": None,
+        },
+        {
+            "type": "function",
+            "name": "second",
+            "description": "Second.",
+            "parameters": {"type": "object"},
+            "strict": None,
+        },
+        provider_tool,
+    ]
+    assert precomputed.tool_choice == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "function", "name": "second"}],
+    }
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:

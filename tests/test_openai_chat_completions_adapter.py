@@ -8,7 +8,7 @@ import base64
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import override
+from typing import Literal, override
 
 import httpx2
 import openai
@@ -21,6 +21,7 @@ from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel
 
 from langchaint import (
+    AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
     ContentPart,
@@ -36,6 +37,7 @@ from langchaint import (
     TextPart,
     ToolCall,
     ToolCallDelta,
+    ToolChoice,
     ToolMessage,
     UserMessage,
 )
@@ -650,6 +652,23 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
     }
 
 
+@pytest.mark.parametrize("mode", ["auto", "required"])
+def test_wire_tool_choice_restricts_function_names_in_order(
+    mode: Literal["auto", "required"],
+) -> None:
+    """AllowedToolsChoice maps to the Chat Completions allowed_tools form."""
+    assert _wire_tool_choice(AllowedToolsChoice(mode=mode, tool_names=("second", "first"))) == {
+        "type": "allowed_tools",
+        "allowed_tools": {
+            "mode": mode,
+            "tools": [
+                {"type": "function", "function": {"name": "second"}},
+                {"type": "function", "function": {"name": "first"}},
+            ],
+        },
+    }
+
+
 def _adapter(*, supports_prompt_cache_options: bool = True) -> OpenAIChatCompletionsAdapter:
     """Build an adapter over a keyless client, valid because no request is sent.
 
@@ -670,6 +689,7 @@ def _binding(
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
+    tool_choice: ToolChoice = "auto",
     inference_params: InferenceParams | None = None,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
@@ -678,7 +698,7 @@ def _binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
         provider_executed_tools=provider_executed_tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
         parallel_tool_calls=True,
         inference_params=inference_params if inference_params is not None else InferenceParams(),
         automatic_cache_breakpoints=automatic_cache_breakpoints,
@@ -828,6 +848,29 @@ def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them()
     ]
     assert with_tool.tool_choice == "auto"
     assert with_tool.parallel_tool_calls is True
+
+
+def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions() -> None:
+    """AllowedToolsChoice changes tool_choice without removing tools."""
+    schemas = (
+        ToolSchema(name="first", description="First.", args_schema={"type": "object"}),
+        ToolSchema(name="second", description="Second.", args_schema={"type": "object"}),
+    )
+    precomputed = _adapter()._precompute_fields(
+        _binding(
+            tool_schemas=schemas,
+            tool_choice=AllowedToolsChoice(mode="required", tool_names=("second",)),
+        )
+    )
+    assert not isinstance(precomputed.tools, openai.Omit)
+    assert [tool["function"]["name"] for tool in precomputed.tools] == ["first", "second"]
+    assert precomputed.tool_choice == {
+        "type": "allowed_tools",
+        "allowed_tools": {
+            "mode": "required",
+            "tools": [{"type": "function", "function": {"name": "second"}}],
+        },
+    }
 
 
 @pytest.mark.parametrize(

@@ -74,6 +74,7 @@ from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.lib.streaming.chat import ChatCompletionStreamState
 from openai.types.chat import (
     ChatCompletion,
+    ChatCompletionAllowedToolChoiceParam,
     ChatCompletionChunk,
     ChatCompletionContentPartImageParam,
     ChatCompletionContentPartInputAudioParam,
@@ -99,6 +100,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterResult,
     AdapterStream,
+    AllowedToolsChoice,
     Binding,
     BoundAdapter,
     EmptyTurn,
@@ -153,7 +155,11 @@ from langchaint.pricing import Billing
 from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
-type _WireToolChoice = Literal["none", "auto", "required"] | ChatCompletionNamedToolChoiceParam
+type _WireToolChoice = (
+    Literal["none", "auto", "required"]
+    | ChatCompletionNamedToolChoiceParam
+    | ChatCompletionAllowedToolChoiceParam
+)
 """The subset of the API's tool_choice union the neutral vocabulary maps onto."""
 
 _AUDIO_FORMAT_BY_MEDIA_TYPE: Mapping[str, Literal["wav", "mp3"]] = {
@@ -431,6 +437,17 @@ def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
     """Convert the neutral tool choice."""
     if isinstance(tool_choice, SpecificToolChoice):
         return {"type": "function", "function": {"name": tool_choice.tool_name}}
+    if isinstance(tool_choice, AllowedToolsChoice):
+        return {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": tool_choice.mode,
+                "tools": [
+                    {"type": "function", "function": {"name": tool_name}}
+                    for tool_name in tool_choice.tool_names
+                ],
+            },
+        }
     return tool_choice
 
 

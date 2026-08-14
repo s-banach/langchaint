@@ -11,6 +11,7 @@ The `tool` decorator builds `PydanticTool` from an async function annotation.
 from typing import TYPE_CHECKING
 
 from langchaint.adapter import (
+    AllowedToolsChoice,
     ReasoningDelta,
     SpecificToolChoice,
     StreamItem,
@@ -138,6 +139,7 @@ __all__ = [
     "ZERO_USAGE",
     "AbandonedCallError",
     "Admission",
+    "AllowedToolsChoice",
     "AssistantMessage",
     "AttemptRecord",
     "AudioPart",

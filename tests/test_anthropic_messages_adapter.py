@@ -35,6 +35,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     LLM,
+    AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
     Billing,
@@ -923,6 +924,7 @@ def _binding(
     tool_schemas: tuple[ToolSchema, ...],
     automatic_cache_breakpoints: bool,
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
+    tool_choice: ToolChoice = "required",
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
@@ -930,7 +932,7 @@ def _binding(
         system_prompt=system_prompt,
         tool_schemas=tool_schemas,
         provider_executed_tools=provider_executed_tools,
-        tool_choice="required",
+        tool_choice=tool_choice,
         parallel_tool_calls=False,
         inference_params=InferenceParams(reasoning_effort="high"),
         automatic_cache_breakpoints=automatic_cache_breakpoints,
@@ -948,6 +950,19 @@ def test_request_omits_tool_sentinels_without_tools() -> None:
     assert isinstance(precomputed_fields.tool_choice, anthropic.Omit)
     assert precomputed_fields.output_config == {"effort": "high"}
     assert precomputed_fields.thinking == {"type": "adaptive"}
+
+
+def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
+    """AnthropicMessagesAdapter rejects AllowedToolsChoice during text binding."""
+    with pytest.raises(TypeError, match="does not support AllowedToolsChoice"):
+        _ = _adapter().bind_text(
+            _binding(
+                system_prompt="sys",
+                tool_schemas=_tool_schemas(),
+                automatic_cache_breakpoints=False,
+                tool_choice=AllowedToolsChoice(mode="auto", tool_names=("get_weather",)),
+            )
+        )
 
 
 def test_provider_executed_tools_follow_function_tools_and_receive_automatic_caching() -> None:

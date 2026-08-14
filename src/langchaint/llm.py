@@ -64,7 +64,7 @@ from langchaint.shared_backoff import (
     Verdict,
 )
 from langchaint.streaming import StreamHandle, _close_stream_quietly
-from langchaint.tools import Tool, ToolManager
+from langchaint.tools import Tool, ToolManager, ToolSchema
 
 
 class _StreamObservations(NamedTuple):
@@ -168,7 +168,7 @@ def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
 def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
     *,
     system_prompt: str | Sequence[TextPart] | None,
-    tool_manager: ToolManager | None,
+    tool_schemas: tuple[ToolSchema, ...],
     provider_executed_tools: Sequence[Mapping[str, object]],
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
@@ -178,10 +178,9 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
 ) -> Binding:
     """Convert bind arguments to the frozen Binding.
 
-    Tool schema conversion happens here, once per binding.
-
     Raises:
         ValueError: system_prompt is an empty sequence of parts; pass None to bind no system prompt.
+        ValueError: `tool_choice` contains a name absent from `tool_schemas`.
     """
     if system_prompt is not None and not isinstance(system_prompt, str):
         if not system_prompt:
@@ -191,7 +190,7 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
         system_prompt = tuple(system_prompt)
     return Binding(
         system_prompt=system_prompt,
-        tool_schemas=() if tool_manager is None else tool_manager.schemas(),
+        tool_schemas=tool_schemas,
         provider_executed_tools=tuple(provider_executed_tools),
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
@@ -348,15 +347,17 @@ class LLM:
 
         Raises:
             ValueError: `tools` contains duplicate names.
+            ValueError: `tool_choice` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence.
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_attempts` is boolean or below one.
+            TypeError: The adapter does not support `tool_choice`.
         """
         tool_manager = _resolve_tool_manager(tools)
         binding = _build_binding(
             system_prompt=system_prompt,
-            tool_manager=tool_manager,
+            tool_schemas=() if tool_manager is None else tool_manager.schemas(),
             provider_executed_tools=provider_executed_tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
@@ -594,22 +595,26 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             ValueError: `tools` contains duplicate names.
+            ValueError: `tool_choice` contains a name absent from the bound tool schemas.
             ValueError: `system_prompt` is an empty sequence.
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_attempts` is boolean or below one.
+            TypeError: The adapter does not support `tool_choice`.
         """
         if isinstance(tools, Unchanged):
             tool_manager = self.tool_manager
+            tool_schemas = self.binding.tool_schemas
         else:
             tool_manager = _resolve_tool_manager(tools)
+            tool_schemas = () if tool_manager is None else tool_manager.schemas()
         new_binding = _build_binding(
             system_prompt=(
                 self.binding.system_prompt
                 if isinstance(system_prompt, Unchanged)
                 else system_prompt
             ),
-            tool_manager=tool_manager,
+            tool_schemas=tool_schemas,
             provider_executed_tools=(
                 self.binding.provider_executed_tools
                 if isinstance(provider_executed_tools, Unchanged)

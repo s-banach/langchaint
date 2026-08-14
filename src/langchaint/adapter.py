@@ -220,14 +220,43 @@ class SpecificToolChoice:
     """Tool choice that forces the model to call the named tool."""
 
     tool_name: str
+    kind: Literal["specific"] = "specific"
 
 
-type ToolChoice = Literal["auto", "required", "none"] | SpecificToolChoice
+@dataclass(frozen=True, kw_only=True)
+class AllowedToolsChoice:
+    """Tool choice restricted to named application tools.
+
+    `tool_names` names entries in `Binding.tool_schemas` and permits no calls to
+    `Binding.provider_executed_tools`.
+    `mode="auto"` permits text or a named tool call.
+    `mode="required"` requires a named tool call.
+
+    Raises:
+        ValueError: `tool_names` is empty.
+    """
+
+    tool_names: tuple[str, ...]
+    mode: Literal["auto", "required"]
+    kind: Literal["allowed_tools"] = "allowed_tools"
+
+    def __post_init__(self) -> None:
+        """Reject empty `tool_names`.
+
+        Raises:
+            ValueError: `tool_names` is empty.
+        """
+        if not self.tool_names:
+            raise ValueError("AllowedToolsChoice.tool_names must not be empty")
+
+
+type ToolChoice = Literal["auto", "required", "none"] | SpecificToolChoice | AllowedToolsChoice
 """Provider-neutral tool choice.
 
 "auto" lets the model decide, "required" forces some tool call (Anthropic's "any"), and "none" forbids tool calls.
 SpecificToolChoice forces one named tool.
-OpenAI's allowed-tools subset form is deliberately unmapped: the binding already pins the tool list.
+AllowedToolsChoice restricts calls without changing the bound tool definitions, preserving their cacheable prefix.
+Adapters without `AllowedToolsChoice` support reject `AllowedToolsChoice` at bind time.
 """
 
 
@@ -297,6 +326,26 @@ class Binding:
     duplicate key, so each adapter raises at bind time for a
     key it populates itself instead of letting the merge silently override the binding.
     """
+
+    def __post_init__(self) -> None:
+        """Reject `AllowedToolsChoice` names absent from `tool_schemas`.
+
+        Raises:
+            ValueError: `AllowedToolsChoice.tool_names` contains an unknown name.
+        """
+        if not isinstance(self.tool_choice, AllowedToolsChoice):
+            return
+        bound_tool_names = {tool_schema.name for tool_schema in self.tool_schemas}
+        unknown_tool_names = tuple(
+            tool_name
+            for tool_name in self.tool_choice.tool_names
+            if tool_name not in bound_tool_names
+        )
+        if unknown_tool_names:
+            raise ValueError(
+                f"AllowedToolsChoice.tool_names contains names absent from "
+                f"Binding.tool_schemas: {unknown_tool_names!r}"
+            )
 
 
 def reject_extra_body_keys_the_adapter_populates(

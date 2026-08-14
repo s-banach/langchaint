@@ -911,6 +911,7 @@ class TracedLLM:
         Raises:
             ValueError: A `tools` sequence contains duplicate names.
                 Also raised when the wrapped `LLM.bind` rejects the binding.
+            TypeError: The wrapped `LLM.bind` rejects `tool_choice`.
         """
         tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
         return TracedBoundLLM(
@@ -1158,6 +1159,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             ValueError: A `tools` sequence contains duplicate names.
                 Also raised when the wrapped `BoundLLM.rebind` rejects the binding.
+            TypeError: The wrapped `BoundLLM.rebind` rejects `tool_choice`.
         """
         if not isinstance(tools, Unchanged):
             tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)

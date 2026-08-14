@@ -109,6 +109,24 @@ creative = concise.rebind(
 
 `rebind` replaces the complete `InferenceParams` value.
 
+Use `AllowedToolsChoice` to change `tool_choice` without changing `tools`:
+
+```python
+from langchaint import AllowedToolsChoice
+
+bound = llm.bind(tools=[search, final_response])
+search_only = bound.rebind(
+    tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,))
+)
+```
+
+`tool_names` must be nonempty and name entries supplied through `tools`.
+`mode="auto"` permits text or a named tool call, while `mode="required"` requires a named tool call.
+`OpenAIResponsesAdapter`, `OpenAIChatCompletionsAdapter`, and `GeminiGenerateContentAdapter` support `AllowedToolsChoice`.
+`AnthropicMessagesAdapter` raises `TypeError` during binding because it does not support `AllowedToolsChoice`.
+
+See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `tool_choice="required"`, and `SpecificToolChoice` with unchanged `tools`.
+
 ## Result types
 
 | Binding | `generate_one` success type |

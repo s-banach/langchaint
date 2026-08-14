@@ -109,6 +109,7 @@ The event carries accounting already stored in `turn_log`.
 `max_tool_calls` counts tool-call positions.
 The first affordable positions dispatch.
 Later positions receive `DispatchPrecomputed` outcomes.
+After the count is spent, the next generation uses `tool_choice="none"` while retaining the bound tool definitions.
 Repeated `ToolCall.id` values raise before dispatch.
 That validation keeps partial-outcome correlation unambiguous.
 

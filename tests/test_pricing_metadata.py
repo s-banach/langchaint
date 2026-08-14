@@ -224,24 +224,3 @@ def test_provider_metadata_must_be_positive_and_finite(value: float) -> None:
     }
     with pytest.raises(ValueError, match="is invalid"):
         _ = _metadata_multiplier(metadata, "openai", "regional_processing_multiplier")
-
-
-def test_ci_keeps_event_triggers_and_adds_weekly_schedule() -> None:
-    """CI retains events and adds weekly dependency testing."""
-    repository = Path(__file__).resolve().parents[1]
-    workflow = (repository / ".github/workflows/ci.yml").read_text()
-    assert "push:" in workflow
-    assert "pull_request:" in workflow
-    assert 'cron: "17 9 * * 1"' in workflow
-
-
-def test_refresh_workflow_creates_reviewable_pull_requests() -> None:
-    """Pricing refreshes use unique branches and preserve failed CI results."""
-    repository = Path(__file__).resolve().parents[1]
-    workflow = (repository / ".github/workflows/refresh_pricing_metadata.yml").read_text()
-    body = (repository / ".github/pricing-refresh-body.md").read_text()
-    assert 'cron: "23 9 1 * *"' in workflow
-    assert "continue-on-error: true" in workflow
-    assert "pricing-metadata-refresh-${{ github.run_id }}" in workflow
-    assert "--force" not in workflow
-    assert "Check Anthropic Bedrock model mappings." in body

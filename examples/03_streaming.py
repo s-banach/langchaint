@@ -27,7 +27,7 @@ async def get_weather(args: WeatherArgs) -> str:
 
 
 def print_stream_item(item: StreamItem) -> None:
-    """Print one `StreamItem` using its variant's fields."""
+    """Print one StreamItem."""
     match item:
         case str():
             print(item, end="", flush=True)
@@ -40,7 +40,7 @@ def print_stream_item(item: StreamItem) -> None:
 
 
 async def stream_tool_call() -> Response[str]:
-    """Print stream items and return the assembled `Response`.
+    """Print stream items and return the assembled Response.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

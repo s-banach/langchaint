@@ -45,8 +45,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `AIMessage` | `AssistantMessage` |
 | `ToolMessage` | `ToolMessage` |
 
-Generation methods are asynchronous.
-There is no synchronous generation API.
+langchaint provides only asynchronous generation methods.
 
 ## Backend classes
 

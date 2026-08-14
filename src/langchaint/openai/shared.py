@@ -1,9 +1,7 @@
-"""What both adapters over the openai SDK share.
+"""Share openai clients, errors, and pricing.
 
-The Responses adapter and the Chat Completions adapter wrap the same SDK client classes, raise the
-same exception family, and price the same service-tier vocabulary, so the failure tables, the
-pricing table, and the client-class map live here once. This module imports neither adapter module
-and nothing private to the SDK.
+The Responses and Chat Completions adapters use the same clients, exceptions, and service tiers.
+This module imports neither adapter nor private SDK modules.
 """
 
 import base64
@@ -322,12 +320,8 @@ def require_prompt_cache_options_support(
 def parse_openai(failure: Exception) -> Verdict:
     """Map one OPENAI_FAILURE_TYPES exception to its verdict.
 
-    A status 200 is a mid-stream error an adapter stream raised on a response the provider
-    accepted, so _verdict_from_openai_error_code reads its code and the response's headers say
-    nothing about this failure.
-    Every other status goes to _verdict_from_openai_status, and the provider's own x-should-retry
-    directive then overrides that verdict, through verdict_under_retry_directive, which states the
-    rule.
+    Status 200 identifies a mid-stream error, so its code selects the verdict.
+    Other statuses use `_verdict_from_openai_status` before `x-should-retry` overrides it.
     A retry-after header only fills a verdict's retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
     Never raises: an Exception outside OPENAI_FAILURE_TYPES is DoNotRetry, counted as a fallthrough.
@@ -359,15 +353,14 @@ def _verdict_from_openai_status(
 
     The listed rows come from openai's error-code guide,
     https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
-    _PAUSE_STATUSES are PauseAll, except one whose error.code is in _SPEND_LIMIT_CODES, which is
-    DoNotRetry because the guide states retrying those will not restore access;
-    _RETRY_THIS_ONE_STATUSES are RetryThisOne and _DO_NOT_RETRY_STATUSES are DoNotRetry.
+    `_PAUSE_STATUSES` return `PauseAll` unless `_SPEND_LIMIT_CODES` requires `DoNotRetry`.
+    Retrying spend-limit errors cannot restore access.
+    `_RETRY_THIS_ONE_STATUSES` return `RetryThisOne`.
+    `_DO_NOT_RETRY_STATUSES` return `DoNotRetry`.
     Some rows come from the SDK rather than the guide; each table's docstring names which and why.
-    error.code separates the spend-limit 429s; the guide notes the accompanying error.type can
-    still read insufficient_quota, so the type separates nothing.
+    `error.code` separates spend-limit 429 errors because `error.type` may still be `insufficient_quota`.
     Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    an unlisted 5xx is RetryThisOne, one attempt's server-side failure; any other unlisted
-    status is DoNotRetry.
+    unlisted 5xx statuses return `RetryThisOne`, and other unlisted statuses return `DoNotRetry`.
     """
     if failure.status_code in _PAUSE_STATUSES:
         if failure.code in _SPEND_LIMIT_CODES:
@@ -393,9 +386,10 @@ def _verdict_from_openai_error_code(
 ) -> Verdict:
     """Return the verdict a status-200 mid-stream error's code gives it.
 
-    The code picks the verdict through _DISPOSITION_BY_ERROR_CODE: rate_limit_exceeded is
-    PauseAll as a 429 is, any other transient code is RetryThisOne, and a terminal code is
-    DoNotRetry, as is a code outside the table, counted in PARSE_FALLTHROUGH_COUNTS and logged.
+    `rate_limit_exceeded` returns `PauseAll`.
+    Other transient codes return `RetryThisOne`.
+    Terminal and unknown codes return `DoNotRetry`.
+    Unknown codes increment `PARSE_FALLTHROUGH_COUNTS` and are logged.
     """
     disposition = None if failure.code is None else _DISPOSITION_BY_ERROR_CODE.get(failure.code)
     if disposition == "transient":
@@ -425,11 +419,10 @@ APIStatusError for every other one (openai 2.51.0), so a subclass list would sil
 def classify_openai(error: Exception) -> ErrorClassification:
     """Sort an exception parse_openai gave no verdict, or name the terminal error for a DoNotRetry.
 
-    APIConnectionError, which APITimeoutError subclasses, carries no response: a transport
-    failure that produced nothing parseable, transient.
-    An APIStatusError only arrives here after parse_openai verdicted DoNotRetry, since every one is
-    in OPENAI_FAILURE_TYPES; terminal_classification_from_response names what it becomes.
-    Anything else the SDK raises is unknown_exception, which fails this item without a retry.
+    `APIConnectionError` is a transient transport failure without a response.
+    `APITimeoutError` is an `APIConnectionError` subclass.
+    `APIStatusError` reaches this function only after `parse_openai` returns `DoNotRetry`.
+    Other exceptions return `unknown_exception`.
     """
     if isinstance(error, openai.APIConnectionError):
         return "transient"
@@ -444,8 +437,7 @@ def classify_openai(error: Exception) -> ErrorClassification:
 def request_id_from_openai_error(error: Exception) -> str | None:
     """Read the request-id header off the SDK exception.
 
-    APIStatusError is the only openai exception carrying request_id, which it reads off the
-    error response's headers, None where that response carried none (openai 2.48.0).
+    `APIStatusError` alone carries `request_id` from response headers in openai 2.48.0.
     """
     if isinstance(error, openai.APIStatusError):
         return error.request_id

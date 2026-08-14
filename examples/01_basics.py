@@ -1,4 +1,4 @@
-"""Construct `OpenAI`, bind models, and inspect generation results."""
+"""Demonstrate OpenAI generation results."""
 
 from typing import Literal
 
@@ -16,7 +16,7 @@ class Sentiment(BaseModel):
 
 
 async def basics() -> None:
-    """Generate text, parse structured output, rebind, and run a batch.
+    """Demonstrate text, structured, rebound, and batch generation.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

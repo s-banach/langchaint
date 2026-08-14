@@ -1,14 +1,8 @@
-"""The success variants' constructor invariants, the _success_variant split, the two usage scopes, and to_tables.
+"""Test response variants, Usage scopes, and to_tables.
 
-The retry loops in llm.py and streaming.py construct every success variant through _success_variant,
-so these invariants are what stops a refactor of either loop from building a success row whose records disagree,
-and the _success_variant tests pin which variant a turn becomes;
-the retry tests in test_bound_llm.py pin the record values themselves.
-usage is the paid total folded from attempt_records and usage_successful_attempt is the last record's own,
-so a retried billed 200 makes them diverge; both are exercised here.
-to_tables is the table boundary, exercised here over a success and over each GenerationError variant,
-because what each variant puts in the shared columns (output, error_summary, stop_reason, and the
-per-attempt billing columns) differs per variant and is what a mixed batch's tables show.
+Constructor tests verify CallRecord invariants.
+_success_variant tests verify variant selection.
+to_tables tests verify rows for successes and GenerationError variants.
 """
 
 import json
@@ -45,13 +39,13 @@ from tests.helpers import CALL_STARTED_AT, StubRaw, attempt_record, call_record,
 
 @dataclass(frozen=True, kw_only=True)
 class _Request(RequestParams):
-    """Stand-in for the request an adapter builds, held on a GenerationError."""
+    """Provide a request for GenerationError tests."""
 
     prompt: str
 
     @override
     def as_json(self) -> str:
-        """Render the one field as a JSON object, as a real adapter renders its own."""
+        """Serialize prompt as JSON."""
         return json.dumps({"prompt": self.prompt})
 
 
@@ -59,7 +53,7 @@ _REQUEST = _Request(prompt="the-prompt-text")
 
 
 class _ProviderUsage(BaseModel):
-    """Stand-in for the SDK's own usage object, holding detail the neutral Usage has no field for."""
+    """Provide provider-specific usage fields."""
 
     cache_creation_5m_input_tokens: int
     server_tool_use_requests: int
@@ -85,7 +79,7 @@ def _response[OutputT](
     output: OutputT,
     attempt_records: tuple[AttemptRecord, ...],
 ) -> Response[OutputT]:
-    """Build a Response with the fields under test; everything else is fixed filler."""
+    """Build a Response for constructor tests."""
     return Response(
         output=output,
         call=call_record(attempt_records, elapsed_seconds=1.5),
@@ -98,7 +92,7 @@ def _response[OutputT](
 _TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": "tide"}')
 
 _TOOL_CALL_TURN_MESSAGE = AssistantMessage(turn=(_TOOL_CALL,))
-"""The turn a ToolCallTurn under test carries: one tool call and nothing else."""
+"""Provide one ToolCall for ToolCallTurn tests."""
 
 
 def _tool_call_turn[OutputT](
@@ -107,7 +101,7 @@ def _tool_call_turn[OutputT](
     attempt_records: tuple[AttemptRecord, ...],
     assistant_message: AssistantMessage = _TOOL_CALL_TURN_MESSAGE,
 ) -> ToolCallTurn[OutputT]:
-    """Build a ToolCallTurn with the fields under test; everything else is fixed filler."""
+    """Build a ToolCallTurn for constructor tests."""
     return ToolCallTurn(
         output=output,
         call=call_record(attempt_records, elapsed_seconds=1.5),
@@ -246,8 +240,7 @@ def test_usage_is_the_paid_total_across_attempts(
 ) -> None:
     """Usage folds every attempt's billing; usage_successful_attempt stays the kept answer's own.
 
-    A retried billed 200 makes the two diverge, which is what says the fold is over the records
-    rather than a copy of the last one.
+    A retried billed response separates total Usage from successful-attempt Usage.
     """
     response = _response(
         output="ok",
@@ -264,8 +257,7 @@ def test_usage_is_the_paid_total_across_attempts(
 def test_to_tables_success_writes_one_call_row_and_one_attempt_row() -> None:
     """A success names its output and reason on the call row and its billing on the attempt row.
 
-    usage_raw_json is None on a billed attempt whose provider sent no usage object, which is what says
-    the column tracks the provider's report rather than whether the attempt billed.
+    usage_raw_json records the provider usage object independently of Billing.
     """
     turn = AssistantMessage(turn=(TextPart(text="hello"),))
     calls, attempts = to_tables(
@@ -303,12 +295,7 @@ def test_to_tables_success_writes_one_call_row_and_one_attempt_row() -> None:
 
 
 def test_to_tables_bills_each_attempt_in_its_own_row() -> None:
-    """A retried billed 200 gets a row each, so the call's spend is the caller's sum over them.
-
-    kept marks only the attempt whose turn became the answer, which is what makes the kept row's
-    tokens the single answer's own and the sum over both rows the paid total. A single cost column
-    on a call row could state one or the other and not both.
-    """
+    """Attempt rows separate paid Usage from kept output Usage."""
     _, attempts = to_tables(
         _response(
             output="ok",
@@ -393,8 +380,7 @@ def test_to_tables_pins_the_prices_that_applied_beside_the_counters() -> None:
 def test_to_tables_dumps_the_provider_usage_object_the_neutral_counters_cannot_hold() -> None:
     """usage_raw_json carries what Usage merges or drops, so the archive keeps it past the process.
 
-    A caller reaches the cache-write TTL split and the server-tool counters with their query
-    engine's JSON functions; no column of langchaint's own exists for either.
+    usage_raw_json preserves provider-specific usage fields for JSON queries.
     """
     _, attempts = to_tables(
         _response(
@@ -419,8 +405,7 @@ def test_to_tables_dumps_the_provider_usage_object_the_neutral_counters_cannot_h
 def test_to_tables_places_each_attempt_on_the_calls_timeline() -> None:
     """started_after_seconds is measured from the call's start, so the first wait is visible.
 
-    The gap between one row's start plus its elapsed_seconds and the next row's start is the
-    admission wait or backoff sleep between the two, which no attempt bracket covers.
+    started_after_seconds exposes waits between attempts.
     """
     _, attempts = to_tables(
         _failure(
@@ -464,8 +449,7 @@ def test_to_tables_measures_time_to_first_item_from_the_attempts_own_start() -> 
 def test_to_tables_writes_the_ids_and_served_model_each_attempt_carries() -> None:
     """Every column is the record's own value.
 
-    model_served and response_id are null on the attempt that received no response; request_id is
-    not, being the one the error channel fills.
+    A response-less attempt may still carry request_id from its error.
     """
     _, attempts = to_tables(
         _failure(
@@ -494,8 +478,7 @@ def test_to_tables_structured_output_becomes_json() -> None:
 def test_to_tables_writes_a_tool_call_turn_as_a_null_output_with_no_error_summary() -> None:
     """A ToolCallTurn that parsed no instance is a success whose output cell is None.
 
-    str(None) would write the string "None" into a column readers scan for real output, and the
-    error_summary and stop_reason cells are what tell this row from the failure row beside it.
+    A ToolCallTurn without parsed output stores None in the output column.
     """
     calls, _ = to_tables(
         _tool_call_turn(output=None, attempt_records=(attempt_record(error=None),))
@@ -508,8 +491,8 @@ def test_to_tables_writes_a_tool_call_turn_as_a_null_output_with_no_error_summar
 def test_to_tables_failure_summarizes_the_call_and_rows_each_attempts_own_error() -> None:
     """error_summary states how the call ended; each attempt's own error is its row's error_text.
 
-    The two differ on this class: error_text folds every attempt's error into one string, and
-    error_summary states the outcome without restating what the attempt rows already carry.
+    error_summary states the call outcome.
+    Attempt rows preserve each error_text.
     """
     calls, attempts = to_tables(
         _failure(
@@ -554,8 +537,7 @@ def test_to_tables_writes_no_request_where_the_call_built_none() -> None:
 def test_a_failures_text_carries_no_part_of_the_request() -> None:
     """error_text and __str__ stay free of the prompt, which the tracing layer writes unconditionally.
 
-    A caller who set capture_message_content False would otherwise find the GenerationInput in a span
-    anyway, through the error's own text.
+    Error text excludes GenerationInput content.
     """
     failure = _failure(attempt_records=(attempt_record(error=TransientError("e1")),))
     assert failure.request == _REQUEST
@@ -586,8 +568,7 @@ def test_to_tables_a_failed_200_reports_its_billing_and_reason(
 ) -> None:
     """A 200 that produced no output still carries its cost and usage, plus the call's reason.
 
-    Its attempt has no error of its own: the failure is the call's, so error_summary carries it and
-    the attempt's error_text is None.
+    Call failure uses error_summary while its attempt error_text remains None.
     """
     calls, attempts = to_tables(
         error_class(
@@ -642,12 +623,7 @@ def _abandoned(
 
 
 def test_to_tables_rows_the_request_that_was_in_flight_when_the_call_was_cut_off() -> None:
-    """The cut-off request gets an attempt row carrying what the provider had billed for it.
-
-    Its ending was never observed, so every column describing how it ended is null, which is what
-    distinguishes it from an attempt that failed. It sits after the settled records under the next
-    attempt_index, so one SUM over cost_in_usd reaches the total the error reports.
-    """
+    """Attempt rows include the abandoned request after settled records."""
     calls, attempts = to_tables(
         _abandoned(
             attempt_records=(
@@ -700,11 +676,7 @@ def test_to_tables_writes_no_extra_row_for_a_call_cut_off_between_attempts() -> 
 
 
 def test_a_cut_off_call_counts_a_staged_response_once() -> None:
-    """A response that arrived and was never read is one record, not also an attempt in flight.
-
-    freeze closes it into an ordinary record carrying its own billing, so reporting the same request
-    as in flight too would put it in the attempts table twice and add its billing to usage again.
-    """
+    """A settled response does not remain in flight."""
     ledger = _CallLedger(model="fake-model", provider_name="fake")
     ledger.start_call()
     ledger.start_attempt()

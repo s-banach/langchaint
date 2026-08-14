@@ -95,7 +95,7 @@ async def dispatch_with_approval(
     tool_calls: Sequence[ToolCall],
     approved_transfer_call_ids: frozenset[str],
 ) -> tuple[ToolMessage, ...]:
-    """Dispatch calls and record settled outcomes before propagating defects.
+    """Dispatch approved calls and record settled outcomes.
 
     Raises:
         DispatchExceptionGroup: At least one tool function raised.

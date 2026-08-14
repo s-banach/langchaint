@@ -1,8 +1,8 @@
-"""The gemini backend provides `Gemini`, its adapter, model catalog, and pricing.
+"""Construct Gemini `LLM` values with cataloged pricing.
 
 Importing this subpackage requires `google-genai`.
 `Gemini.model` sends the stated model identifier verbatim.
-It reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
+`Gemini.model` reaches the Gemini Developer API and reports `provider_name="gcp.gemini"`.
 Vertex AI callers construct `GeminiGenerateContentAdapter` directly.
 Use `provider_name="gcp.vertex_ai"` and Vertex pricing there.
 
@@ -15,8 +15,8 @@ Google Search prices use USD per query.
 Google Maps prices use USD per query.
 Source: https://ai.google.dev/gemini-api/docs/pricing, read 2026-08-03.
 Maps source: https://ai.google.dev/gemini-api/docs/maps-grounding.
-Recheck that page before relying on a table.
-The catalog carries text, image, and video rates.
+Recheck the sources before relying on a table.
+`GEMINI_PRICING` carries text, image, and video rates.
 Catalog tool rates estimate post-quota list prices.
 `Gemini.model(pricing=...)` replaces cataloged estimates.
 langchaint sends no audio.

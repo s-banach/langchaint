@@ -1,9 +1,4 @@
-"""BoundLLM and StreamHandle driven by fake adapters.
-
-A fake BoundAdapter scripts each attempt to fail or to produce a scripted response,
-and a fake AdapterStream emits a fixed item sequence.
-Together they pin the retry loop, rebind rebuild, batch ordering, and the stream contract without any network access.
-"""
+"""Test BoundLLM and StreamHandle with fake adapters."""
 
 import asyncio
 import json
@@ -102,11 +97,7 @@ _USAGE_STREAM = _USAGE.model_copy(update={"output_tokens_cost_in_usd": 0.001})
 
 
 def _parse_fake(failure: Exception) -> Verdict:
-    """Map a TransientError with the shared rule, as a provider parse maps its own SDK errors.
-
-    Every other exception the fakes raise stands for a transport failure outside failure_types,
-    so this parse never sees one; DoNotRetry is the fallthrough a real parse would end on.
-    """
+    """Map TransientError with verdict_from_transient_error."""
     if isinstance(failure, TransientError):
         return verdict_from_transient_error(failure)
     return DoNotRetry()
@@ -147,11 +138,7 @@ def _fast_shared_backoff(
 
 
 def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
-    """Assert every batch result is a success and return the outputs in order.
-
-    Narrowing each result to Response is what makes result.output well-typed,
-    and it doubles as the assertion that no item exhausted its retries in a batch the test expects to succeed whole.
-    """
+    """Assert success and return each batch output in order."""
     outputs: list[str] = []
     for result in results:
         assert isinstance(result, Response)
@@ -160,13 +147,7 @@ def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
 
 
 class _FakeRawResponse(BaseModel):
-    """Stands in for the SDK response model a real adapter holds in raw.
-
-    Its id is what the fake bound adapter looks the scripted response up under, standing in for the
-    fields a real adapter reads the turn and the counters off.
-    request_id stands in for the header both SDKs attach to a response they parsed from an HTTP
-    body, so a response a stream assembled leaves it None as a real one does.
-    """
+    """Identify one fake raw response and its optional request ID."""
 
     id: str
     request_id: str | None = None
@@ -213,12 +194,7 @@ _FAKE_TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": "tide"}')
 
 
 class _FakeStream(AdapterStream):
-    """A fixed item sequence and a fixed assembled response.
-
-    final() hands back the response object, exactly as a real adapter's stream does;
-    scripted_response() is what the fake bound adapter registers for it, standing in for interpret
-    and billing_from_raw reading that response.
-    """
+    """Provide fixed stream items and an assembled response."""
 
     def __init__(self) -> None:
         """Start unclosed; close records that it ran."""
@@ -267,8 +243,7 @@ class _FakeStream(AdapterStream):
 class _RefusingStream(_FakeStream):
     """A stream that yields items normally but whose assembled response holds a refusal.
 
-    Mirrors an adapter that reads the assembled message and finds a refusal, reporting the Refusal
-    variant carrying the turn the model wrote to refuse.
+    Report Refusal with the model's refusal turn.
     """
 
     @override
@@ -280,8 +255,7 @@ class _RefusingStream(_FakeStream):
 class _UnfinishedTurnStream(_FakeStream):
     """A stream that yields items normally but whose assembled message is not a finished turn.
 
-    Mirrors an adapter that reads a stop reason it cannot call finished, reporting UnfinishedTurn
-    with the reason naming the provider's own word.
+    Report UnfinishedTurn with the provider reason.
     """
 
     @override
@@ -305,8 +279,7 @@ _VALIDATION_ERROR_JSON = (
 class _SchemaViolationStream(_FakeStream):
     """A stream that yields items normally but whose assembled text the response_format rejects.
 
-    Mirrors an adapter that validates the assembled message and gets a rejection, reporting
-    SchemaViolation with what pydantic rejected.
+    Report SchemaViolation with pydantic's ValidationError.
     """
 
     @override
@@ -358,8 +331,7 @@ _PROVIDER_FAILED_TRANSIENTLY = ProviderFailedTransiently(
 class _ProviderFailedTransientlyStream(_FakeStream):
     """A stream whose assembled response reports a provider failure a resend may get past.
 
-    Mirrors an adapter reading the assembled response in AdapterStream.final() and finding a body
-    that reports the run failed, reporting ProviderFailedTransiently with the 200's billing.
+    Report ProviderFailedTransiently with the assembled response's Billing.
     """
 
     @override
@@ -382,11 +354,7 @@ class _ProviderFailedTerminallyStream(_FakeStream):
 
 
 class _FinalRaisesStream(_FakeStream):
-    """A stream that yields items normally but whose final() raises instead of returning a response.
-
-    Mirrors an adapter whose assembly step failed, so this call reached no response at all.
-    Each call raises a fresh error, so a replayed one is identifiable by identity.
-    """
+    """Yield items before final raises a fresh error."""
 
     def __init__(self) -> None:
         """Start with no final() call counted."""
@@ -521,7 +489,7 @@ class _HangingStream(_FakeStream):
 
 
 class _HangsAfterFirstItemStream(_FakeStream):
-    """A stream that delivers one item then suspends forever, to be cancelled mid-iteration."""
+    """Yield one item before suspending until cancellation."""
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -549,35 +517,25 @@ class _FailingCloseStream(_FakeStream):
 
 
 type _ScriptedAttempt = Exception | _ScriptedResponse
-"""One scripted attempt: an exception open_stream raises, or the response the attempt assembles.
-
-The two exist because the adapter contract splits that way: an attempt with no response to read is
-an exception for Adapter.classify, and a response is what the attempt's stream assembles and
-interpret then reads.
-A Sequence[Message] the fake will not put on the wire is its invalid_request, which build_request reports
-before any stream is opened.
-"""
+"""One open_stream exception or assembled response."""
 
 
 class _ScriptedAttemptStream(_FakeStream):
-    """One attempt's stream over a scripted response, standing in for a real per-request stream.
+    """Stream one scripted response.
 
-    raw is fresh per attempt and carries no request_id, as a response an SDK assembled from stream
-    events does; request_id() derives the header from the raw's id, so a record's request id on a
-    concluded attempt comes only from the fallback patch off this stream.
-    A success yields its content as one chunk and then the fixed tool call, so the drained text and
-    final()'s output agree; a scripted no-output response yields nothing.
+    Each attempt has a fresh raw response and request ID.
+    A success yields its content and _FAKE_TOOL_CALL.
     """
 
     def __init__(self, *, raw: _FakeRawResponse, content: str | None) -> None:
-        """Hold the fresh raw final() returns and the content items() yields, None yielding none."""
+        """Store final output and optional streamed content."""
         super().__init__()
         self.raw = raw
         self._content = content
 
     @override
     def request_id(self) -> str | None:
-        """Name this attempt's request, derived from the raw so each attempt's header is its own."""
+        """Derive the request ID from raw.id."""
         return f"req-{self.raw.id}"
 
     @override
@@ -589,13 +547,13 @@ class _ScriptedAttemptStream(_FakeStream):
 
 @dataclass(frozen=True, kw_only=True)
 class _FakeRequest(RequestParams):
-    """What the fake would put on the wire, which is the messages and nothing else."""
+    """Store messages for a fake request."""
 
     messages: tuple[Message, ...]
 
     @override
     def as_json(self) -> str:
-        """Render the messages as a JSON array of each message's dump."""
+        """Serialize messages as JSON."""
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
@@ -625,21 +583,13 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         open_barrier: asyncio.Barrier | None = None,
         open_barrier_from_call: int = 1,
     ) -> None:
-        """Store the attempt script, echo mode, and the stream open_stream returns.
+        """Configure fake request and stream behavior.
 
-        failures scripts each attempt in order: an Exception raises from open_stream, and a
-        _ScriptedResponse is what that attempt's stream assembles.
-        invalid_requests scripts build_request, one entry per call, and an entry is reported
-        instead of a request, so open_stream is not reached for that call.
-        stream, when given, is what every unscripted open returns, so a test controls that
-        stream's behavior; left None, each unscripted open returns a fresh success stream.
-        open_seconds > 0 makes each open suspend that long,
-        so a batch overlaps and peak_in_flight records the concurrency it reached.
-        open_barrier blocks matching calls until its other participants arrive.
-        hang_from_open is the 1-based open_stream call from which every open suspends forever,
-        so a cancellation or a deadline lands while that attempt is in flight.
-        final_raws collects the response objects the scripted streams assemble, in order, so a
-        test can assert the caller got one of them and not a copy.
+        failures and invalid_requests provide ordered outcomes.
+        stream overrides unscripted streams.
+        open_seconds and open_barrier control concurrency.
+        hang_from_open suspends matching calls.
+        final_raws records assembled response objects.
         """
         self._failures = list(failures)
         self._invalid_requests = list(invalid_requests)
@@ -906,11 +856,7 @@ def test_rebind_rejects_invalid_max_attempts() -> None:
 
 
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
-    """The attempt keeps the response it received and what that response billed, with no turn.
-
-    The 200 arrived and was paid for before interpret read it, so an exception from that read must
-    not take the attempt off the call: the record is the only account of what the item spent.
-    """
+    """An interpretation failure preserves raw response and Billing."""
 
     async def scenario() -> None:
         """Drive one generate_one whose interpret raises over the response its stream assembled."""
@@ -928,11 +874,7 @@ def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_recor
 
 
 def test_stream_final_records_the_response_before_interpreting_it() -> None:
-    """A raise from interpret leaves the assembled response and its billing on the attempt record.
-
-    The stream's one request is paid for by the time final() has a response, so an exception from
-    reading it must not erase what it billed.
-    """
+    """Interpret failure preserves the assembled response and Billing."""
 
     async def scenario() -> None:
         """Call final() on a stream whose interpret raises, then freeze the ledger it left."""
@@ -953,13 +895,7 @@ def test_stream_final_records_the_response_before_interpreting_it() -> None:
 
 
 def test_retry_recovers_after_a_transient_failure() -> None:
-    """One transient failure then success yields a two-attempt success Response.
-
-    The succeeding record carries the answer turn and what the response said about itself, and the
-    failed one carries neither: its request never came back.
-    The Response carries the object the succeeding attempt assembled (identity, not equality): an equal
-    copy would silently introduce the per-request deep copy the no-rewrap rule bans.
-    """
+    """A transient failure followed by success returns both attempt records."""
 
     async def scenario() -> None:
         """Drive one generate_one through a single transient failure."""
@@ -1026,12 +962,7 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
 
 
 def test_a_failed_attempt_records_the_request_id_off_its_error() -> None:
-    """An attempt that received no response still carries the request id its error named.
-
-    The three attempts name three different requests: the second failure names none, so an id on its
-    record would be the first attempt's outliving the attempt that read it, and the third attempt's own
-    id comes from the response rather than from either error.
-    """
+    """Each attempt records only its own request ID."""
 
     async def scenario() -> None:
         """Drive one generate_one through two transient failures, the first naming its request."""
@@ -1051,11 +982,7 @@ def test_a_failed_attempt_records_the_request_id_off_its_error() -> None:
 
 
 def test_an_adapter_raised_transient_error_still_names_its_request() -> None:
-    """A TransientError the adapter raised itself never reaches classify, and is read for its id anyway.
-
-    Both retry loops read it: the generate loop in its own except clause, and the stream loop ahead
-    of the check that sends a transient error straight back for a retry.
-    """
+    """Adapter-raised TransientError bypasses classify and preserves request ID."""
 
     async def scenario() -> None:
         """Fail one generate attempt and one stream open with a transient error naming its request."""
@@ -1131,13 +1058,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
 
 def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> None:
-    """An InvalidRequest from build_request fails the item before any request goes out.
-
-    classify returns "transient" here and is never reached: a returned outcome is not an exception,
-    so no classify verdict can turn this into an attempt.
-    The InvalidRequestError the loop builds carries the reason and the per-item failure fields, and no
-    request, there being none to carry.
-    """
+    """InvalidRequest fails before request admission and classification."""
 
     async def scenario() -> None:
         """Drive one generate_one whose build_request refuses under a transient classify verdict."""
@@ -1160,12 +1081,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
 
 
 def test_rejection_after_transient_attempts_carries_their_records() -> None:
-    """An InvalidRequestError the provider's rejection raised carries the earlier attempts' records.
-
-    The prior attempts' usage rides the error, so a billed 200 retried before the rejection stays
-    accounted for. The rejected attempt went out, so it gets a record of its own, billing nothing.
-    The error carries the request every one of those attempts sent.
-    """
+    """InvalidRequestError preserves earlier attempt records and Usage."""
 
     async def scenario() -> None:
         """Settle one billed transient attempt, then have classify call the next one a rejection."""
@@ -1239,11 +1155,7 @@ def test_a_no_output_outcome_raises_without_retry(
     expected_error: type[GenerationError],
     expected_stop_reason: StopReason,
 ) -> None:
-    """Each outcome carrying no output fails the item on the first attempt, with its own error and reason.
-
-    None of the three is retried: the token cap, the turn that finished saying nothing, and the
-    request too long to serve all repeat on a resend.
-    """
+    """Each terminal no-output outcome fails without retrying."""
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the outcome."""
@@ -1261,12 +1173,7 @@ def test_a_no_output_outcome_raises_without_retry(
 
 
 def test_schema_violation_outcome_raises_without_retry() -> None:
-    """A SchemaViolation outcome fails the item, and pydantic's rejection travels on the error.
-
-    error_text carries none of the rejection, whose msg embeds the value a caller's own validator
-    rejected; the tracing layer writes error_text into every span whatever capture_message_content
-    the caller chose.
-    """
+    """SchemaViolation preserves ValidationError outside error_text."""
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports SchemaViolation."""
@@ -1297,8 +1204,7 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
 def test_unfinished_turn_outcome_raises_carrying_the_adapter_s_reason() -> None:
     """An UnfinishedTurn outcome fails the item, and the adapter's reason reaches error_text.
 
-    The reason is the only description of a 200 langchaint does not model, so the error must carry
-    it rather than a constant of its own.
+    The error preserves the provider's reason.
     """
 
     async def scenario() -> None:
@@ -1379,11 +1285,7 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
 
 
 def test_provider_failed_terminally_raises_without_retry() -> None:
-    """A terminal provider failure fails the item once, with the provider's own text as the reason.
-
-    Never retried: what the body names is a property of the request, so the retry budget would buy
-    the same body at full price each time.
-    """
+    """ProviderFailedTerminally fails once with the provider reason."""
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the terminal failure."""
@@ -1428,8 +1330,7 @@ def test_a_plain_exception_classified_transient_is_retried() -> None:
 def test_exception_classified_invalid_request_fails_the_item_without_retry() -> None:
     """A plain exception classified invalid_request raises InvalidRequestError on the first attempt.
 
-    InvalidRequestError is a GenerationError, so in a batch it becomes the item's own failure
-    rather than touching the siblings; the classified exception stays reachable as __cause__.
+    InvalidRequestError fails one batch item and preserves __cause__.
     """
 
     async def scenario() -> None:
@@ -1448,8 +1349,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
 def test_exception_classified_unknown_exception_fails_the_item_without_retry() -> None:
     """A plain exception classified unknown_exception raises UnknownExceptionError on the first attempt.
 
-    UnknownExceptionError is a GenerationError, so in a batch it becomes the item's own failure
-    and the siblings run on. Nothing arrived, so the attempt it ends has no record.
+    UnknownExceptionError fails one batch item without an AttemptRecord.
     """
 
     async def scenario() -> None:
@@ -1475,8 +1375,7 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
 def test_exception_classified_declared_final_fails_the_item_with_a_record() -> None:
     """A plain exception classified declared_final raises ProviderDeclaredFinalError, unretried.
 
-    The request reached the provider, which answered, so the attempt has a record and it carries
-    ZERO_USAGE: nothing in that answer reported billing.
+    A provider response creates an AttemptRecord with ZERO_USAGE when it reports no Billing.
     """
 
     async def scenario() -> None:
@@ -1500,13 +1399,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
 
 
 def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_limit_quota() -> None:
-    """The terminal half ends the retry loop, and the pausing half still holds every other request.
-
-    Both halves matter: a verdict that only stopped would leave the siblings sending into the limit,
-    and one that only paused would spend the whole retry budget against the provider's own "false".
-    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, which is the
-    verdict naming the failure: the real classify calls a 429 invalid_request off its status.
-    """
+    """PauseAllDoNotRetry ends the item and pauses SharedBackoff."""
 
     async def scenario() -> None:
         """Drive one generate_one whose only failure parses to PauseAllDoNotRetry."""
@@ -1525,11 +1418,7 @@ def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_lim
 
 
 def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -> None:
-    """An attempt cut off mid-drain is a retried attempt billing the stream's in-flight report.
-
-    The assembled response that would state the attempt's billing never arrived, so the record's
-    usage and request id are what the stream had reported when the failure cut it off.
-    """
+    """A retried mid-drain failure records stream Billing and request ID."""
 
     async def scenario() -> None:
         """Exhaust a one-attempt budget on a stream that fails after its first item."""
@@ -1550,11 +1439,7 @@ def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -
 
 
 def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -> None:
-    """A TimedOutError cut out of a mid-drain hang carries what the stream had reported.
-
-    The cancellation lands inside the drain, so no record settles; the loop notes the stream's
-    reported billing on the ledger before closing it, and the deadline account reports it.
-    """
+    """TimedOutError preserves Billing reported before a mid-drain hang."""
 
     async def scenario() -> None:
         """Hang a stream after its first item and let a short deadline expire."""
@@ -1574,12 +1459,7 @@ def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -
 
 
 def test_a_settled_attempts_billing_is_counted_once_after_a_later_deadline_cut() -> None:
-    """Billing noted in flight is cleared when its attempt settles, so a record is not counted twice.
-
-    The first attempt's mid-drain failure notes the stream's billing, then its record carries the
-    same billing; the deadline then cuts the second attempt's open, and the account reports the
-    settled record's usage once, with nothing in flight.
-    """
+    """Settled Billing is removed from billing_in_flight."""
 
     async def scenario() -> None:
         """Fail one attempt mid-drain with billing reported, then hang the second attempt's open."""
@@ -1614,11 +1494,7 @@ def test_generate_reads_the_adapter_stream_request_id() -> None:
 
 
 def test_a_stream_protocol_error_is_retried_to_exhaustion() -> None:
-    """A StreamProtocolError is retried without classify and ends as RetriesExhaustedError.
-
-    The class is langchaint's own, so classify cannot place it; no item from the private drain
-    reached any caller, so a resend is safe, and each record carries the violation's text.
-    """
+    """StreamProtocolError retries without classify until exhaustion."""
 
     async def scenario() -> None:
         """Exhaust a two-attempt budget on a stream that violates the protocol every time."""
@@ -1651,11 +1527,7 @@ def test_a_close_that_raises_does_not_displace_a_generate_success() -> None:
 
 
 def test_a_mid_drain_exception_nobody_can_place_still_records_the_attempt() -> None:
-    """An unplaceable failure after the stream opened records that the attempt reached the provider.
-
-    The same classification on an open failure records nothing; here the stream was open, so the
-    record exists and bills ZERO_USAGE, the stream having reported nothing before the failure.
-    """
+    """An unplaceable open-stream failure records ZERO_USAGE."""
 
     async def scenario() -> None:
         """Fail the drain with an exception classify calls unknown_exception."""
@@ -1699,8 +1571,7 @@ def test_an_unplaceable_exception_fails_only_its_item() -> None:
 def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
     """A cancellation from outside generate_many takes the whole batch, settled items included.
 
-    The returned list is the batch's own frame's, so the cancellation destroys it before any caller
-    reads it.
+    Cancellation prevents the batch from returning its result list.
     """
 
     async def scenario() -> None:
@@ -1842,13 +1713,7 @@ def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
 
 
 def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> None:
-    """Pin every binding's static BoundLLM type, the pair the request-method overloads key on.
-
-    One binding returns a union: structured plus a ToolManager generates GenerateResult, whose
-    ToolCallTurn variant is the tool-call turn. Every other binding generates Response alone.
-    Every transition is exact, so dropping the ToolManager drops the ToolCallTurn variant with it.
-    It also pins tool_manager's own type, which is what a tool loop dispatches through.
-    """
+    """BoundLLM types reflect output type and ToolManager presence."""
     llm = LLM(_FakeAdapter())
     tool_manager = ToolManager([])
 
@@ -1941,8 +1806,7 @@ def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> N
 class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
     """A structured bound adapter handing every request one scripted outcome.
 
-    The ToolCallTurn split tests generate through it: _FakeStructuredBoundAdapter deliberately never
-    generates, and _FakeBoundAdapter is bound to str.
+    ToolCallTurn split tests generate through this adapter.
     """
 
     def __init__(self, outcome: ResponseOutcome[_Answer | None]) -> None:
@@ -1993,8 +1857,7 @@ def _structured_tool_bound_llm(
 ) -> BoundLLM[_Answer, ToolManager]:
     """Bind structured plus tools, then swap the scripted fake in for bind's never-generating one.
 
-    Swapping only _bound_adapter keeps the binding LLM.bind built, so _splits_tool_call_turns reads
-    the real response_format and tool_manager and the retry loops run unchanged over the scripted outcome.
+    Replacing _bound_adapter preserves response_format, tool_manager, and retry behavior.
     """
     bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
         response_format=_Answer, tools=ToolManager([])
@@ -2004,11 +1867,7 @@ def _structured_tool_bound_llm(
 
 
 def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_variant() -> None:
-    """A structured tool-bound turn that called tools reaches the caller as ToolCallTurn.
-
-    Its output is the unparsed None and its tool_calls are the turn's, what a tool loop dispatches;
-    a retry loop that dropped _splits_tool_call_turns would hand back a Response instead.
-    """
+    """A structured tool turn returns ToolCallTurn with output=None."""
 
     async def scenario() -> None:
         result = await _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN).generate_one("hi")
@@ -2298,12 +2157,7 @@ def test_generate_many_warm_cache_empty_batch_returns_empty() -> None:
 
 
 class _ClassifyRaisesAdapter(_FakeAdapter):
-    """A _FakeAdapter whose classify raises, standing in for a defect anywhere in langchaint.
-
-    classify runs inside the retry loop, past every handler that turns a request outcome into a
-    GenerationError, so what it raises reaches the outermost guard the way a defect in langchaint's
-    own machinery would.
-    """
+    """Raise a scripted defect from classify."""
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
@@ -2318,8 +2172,7 @@ class _ClassifyRaisesAdapter(_FakeAdapter):
 def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> None:
     """An Exception from langchaint's own machinery fails its item and no sibling.
 
-    Propagating it instead would discard the whole returned list, so a sibling that had already
-    settled would lose both its output and the account of what it spent.
+    generate_many returns the defect as one item without discarding settled siblings.
     """
 
     async def scenario() -> None:
@@ -2348,8 +2201,7 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
 def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
     """generate_one's caller sees the defect as an EscapedExceptionError, not the bare exception.
 
-    Its callers match on GenerationError to handle the failure, so a defect arriving as anything
-    else escapes past their handling entirely.
+    Defects propagate outside the GenerationError result channel.
     """
 
     async def scenario() -> None:
@@ -2404,11 +2256,7 @@ class _ClassifyRaisesOverStagedResponseAdapter(_ClassifyRaisesAdapter):
 
 
 def test_a_defect_over_a_staged_response_keeps_the_attempt_and_its_billing() -> None:
-    """A defect escaping after a 200 arrived leaves that attempt and what it billed on the record.
-
-    The response was paid for before the defect happened, so dropping the attempt would report the
-    call as having spent nothing when it spent one response's worth.
-    """
+    """A defect after response arrival preserves the attempt and Billing."""
 
     async def scenario() -> None:
         """Stage the response, raise from interpret, then raise again from classify placing it."""
@@ -2503,13 +2351,7 @@ def test_stream_cancelled_during_the_open_returns_the_permit() -> None:
 
 
 def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
-    """A cancellation unwinding the block sets abandoned to what the stream could state.
-
-    The record's attempt_records are empty because the streaming request is the in-flight attempt:
-    only completed attempts settle records on a stream.
-    This stream reports no running usage, which is what an openai stream does, so usage folds to
-    ZERO_USAGE and billing_in_flight is None.
-    """
+    """Cancellation records the stream's available in-flight state."""
 
     async def scenario() -> None:
         """Time out a consumer suspended on a hanging stream, then read the handle."""
@@ -2536,12 +2378,7 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
 
 
 def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> None:
-    """A stream that can state its running spend puts it on abandoned.usage.
-
-    No attempt settled, so the whole reported amount comes from billing_in_flight, and a caller
-    reads one paid total without adding two fields.
-    The read happens before the close, so a stream the close drops still reports.
-    """
+    """Abandoned stream Usage includes reported in-flight Billing."""
 
     async def scenario() -> None:
         """Time out a consumer on a hanging stream that reports a running spend."""
@@ -2617,8 +2454,7 @@ def test_a_stream_cancelled_during_the_open_sets_its_abandoned() -> None:
 def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
     """final() completing, or a consumer leaving the block voluntarily, leaves abandoned None.
 
-    Only a cancellation gets a record: an assembled Response reached the caller, and a voluntary
-    early exit is the caller walking away in live code.
+    Voluntary exit after Response creates no AbandonedCallError.
     """
 
     async def scenario() -> None:
@@ -2641,8 +2477,7 @@ def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
 def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
     """A cancellation after final() raised its GenerationError leaves abandoned None.
 
-    The RefusalError carried its usage to the caller, so an AbandonedCallError here would
-    double-count that spend and mislabel a concluded call as an in-flight abandonment.
+    RefusalError concludes the call without AbandonedCallError.
     """
 
     async def scenario() -> None:
@@ -2730,11 +2565,7 @@ def test_a_mid_stream_rate_limit_pauses_the_rate_limit_quota() -> None:
 
 
 class _RaisesItsOwnTransientErrorStream(_FakeStream):
-    """A stream that yields one item and then raises a TransientError it classified itself.
-
-    Mirrors an adapter that reads the provider's rate-limit verdict and its retry-after header and
-    states both, rather than leaving the handle to ask the adapter about a bare exception.
-    """
+    """Yield one item before raising a classified TransientError."""
 
     def __init__(self) -> None:
         """Hold the error to be raised, so a test can compare it by identity."""
@@ -2798,12 +2629,7 @@ class _CloseRaisesBaseExceptionStream(_FakeStream):
 
 
 def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
-    """The record survives a teardown that raises past every Exception handler.
-
-    __aexit__ closes before it sets abandoned, so that the record reports a returned permit and a
-    closed connection. Without the set in a finally, the one exception the close does not swallow
-    would take the cancelled stream's only account with it.
-    """
+    """A BaseException during close preserves the abandoned record."""
 
     async def scenario() -> None:
         """Cancel the block, then let the close raise on the way out."""
@@ -2835,12 +2661,7 @@ def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
 def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
     usage_reported: Usage | None, expected_usage: Usage
 ) -> None:
-    """The dropped attempt's record carries the running counters, which is zero only if none came.
-
-    The stream was paid for the items it delivered, and its terminal event never arrived, so the
-    running report is the only account of that spend. RetryUnavailableError concludes the call, so
-    this record is where the amount has to be.
-    """
+    """A dropped stream records its running Billing."""
 
     async def scenario() -> None:
         """Let the iteration fail after one item, then read the error's usage."""
@@ -2862,11 +2683,7 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
 
 
 def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> None:
-    """A failure after the first item concludes the call, so a cancellation after one sets nothing.
-
-    RetryUnavailableError hands the caller this call's CallRecord, so an AbandonedCallError would
-    report the same call twice and mislabel a concluded call as an in-flight abandonment.
-    """
+    """Cancellation after RetryUnavailableError creates no abandoned error."""
 
     async def scenario() -> None:
         """Absorb the mid-stream failure inside the block, then hang into the caller's deadline."""
@@ -2897,8 +2714,7 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
 def test_a_stream_cancelled_after_a_drain_failure_sets_no_abandoned() -> None:
     """A GenerationError raised while draining carries the call, so a cancellation sets nothing.
 
-    The error already handed the caller a CallRecord, so an AbandonedCallError here would report the
-    same call twice.
+    A concluded stream failure creates no AbandonedCallError.
     """
 
     async def scenario() -> None:
@@ -3024,11 +2840,7 @@ def test_stream_final_refusal_raises_without_retry() -> None:
 
 
 def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> None:
-    """An UnfinishedTurn from the stream's final() fails the call, carrying the adapter's reason.
-
-    The stream loop builds this error separately from the generate loop, and it is the one variant
-    with a field of its own, so the reason must survive the trip through both.
-    """
+    """Stream final preserves UnfinishedTurn.reason."""
 
     async def scenario() -> None:
         """Drain a stream whose final() reports UnfinishedTurn, then read the raised error."""
@@ -3050,8 +2862,7 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
 def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
     """A SchemaViolation from the stream's final() fails the call, carrying pydantic's rejection.
 
-    The stream loop builds this error separately from the generate loop, so the rejection must
-    survive the trip through both, and stay out of error_text on both.
+    Stream SchemaViolation preserves ValidationError outside error_text.
     """
 
     async def scenario() -> None:
@@ -3084,12 +2895,7 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
 def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
     stream: _FakeStream, expected_error: type[GenerationError]
 ) -> None:
-    """Each outcome the stream's final() reports fails the call with its own error, without retrying.
-
-    The stream loop builds these errors separately from the generate loop, so an outcome mapped
-    correctly on the generate path can still be mapped wrongly here. None is retried: the token cap,
-    the empty turn, and the overflowed context window all repeat on a resend.
-    """
+    """Final maps each terminal outcome to its GenerationError without retrying."""
 
     async def scenario() -> None:
         """Drain a stream whose final() reports the outcome, then read the raised error."""
@@ -3108,12 +2914,7 @@ def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
 
 
 def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unavailable() -> None:
-    """The outcome fails the item with RetryUnavailableError carrying the call, without reopening.
-
-    The outcome is read from the assembled response, so that stream is over and none is opened in
-    its place. That 200's billing and the fragment it carried are on its attempt record, beside the
-    TransientError the failure was classified as, which is also __cause__.
-    """
+    """A transient terminal outcome raises RetryUnavailableError without reopening."""
 
     async def scenario() -> None:
         """Drain a stream whose final() reports the failure, then read the raised error."""
@@ -3159,8 +2960,7 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
 def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned() -> None:
     """A cancellation after final() raised its RetryUnavailableError sets nothing.
 
-    That error carried the call, whose record holds the 200's billing, so an AbandonedCallError here
-    would double-count that spend and mislabel a concluded call as an in-flight abandonment.
+    UnfinishedTurnError concludes the call without AbandonedCallError.
     """
 
     async def scenario() -> None:
@@ -3186,8 +2986,7 @@ def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned
 def test_a_stream_that_drops_mid_turn_records_the_id_its_open_response_carried() -> None:
     """A dropped connection raises an error naming no request, and the open stream still has the header.
 
-    That failed attempt is the one someone takes to provider support, so reading only the error
-    would leave it with nothing.
+    Stream failures preserve the request ID for provider support.
     """
 
     async def scenario() -> None:
@@ -3239,12 +3038,7 @@ def test_streaming_reads_the_adapter_stream_request_id() -> None:
 
 
 def test_stream_retry_populates_attempt_records() -> None:
-    """An open_stream() failure precedes the successful attempt record.
-
-    The stream path stages the assembled response's identity too, so the succeeding record carries
-    what a sent one does, and the failed open carries the request id its error named.
-    The succeeding request id comes from AdapterStream.request_id().
-    """
+    """A retried open failure precedes a successful stream attempt."""
 
     async def scenario() -> None:
         """Open a stream whose first open_stream call fails, then drain it."""
@@ -3276,11 +3070,7 @@ def test_stream_retry_populates_attempt_records() -> None:
 
 
 def test_a_stream_stamps_its_first_item_and_not_a_later_one() -> None:
-    """The stamp lands after the attempt's start and before the second item arrives.
-
-    The stream spreads its items over a gap far wider than the work between them, so a stamp taken
-    on any later item would land past the bound asserted here.
-    """
+    """first_item_at_monotonic_seconds records the first item."""
 
     async def scenario() -> None:
         """Drain a stream that waits between its items and read the record it froze."""
@@ -3340,8 +3130,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
 def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened() -> None:
     """build_request refusing the messages fails the item before any stream is opened.
 
-    The handle builds the InvalidRequestError, so a caller reading model or attempt_records off it
-    succeeds; it carries no request, there being none to carry.
+    InvalidRequestError carries model and attempt_records without a request.
     """
 
     async def scenario() -> None:
@@ -3402,13 +3191,7 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
 
 
 def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
-    """A stream open the provider gave up on raises the item's failure instead of reopening.
-
-    The open loop retries every verdict _terminal_error_or_none does not name terminal, so treating
-    this one as a retry would spend the whole budget reopening a request the provider ended.
-    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, the same
-    naming the non-streaming loop does.
-    """
+    """A terminal open failure raises without reopening the stream."""
 
     async def scenario() -> None:
         """Enter a handle whose open failure parses to PauseAllDoNotRetry."""
@@ -3428,13 +3211,7 @@ def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
 
 
 def test_a_pause_all_do_not_retry_verdict_ends_an_open_stream_with_the_items_failure() -> None:
-    """A mid-stream failure the provider gave up on names the item's failure, not a retriable one.
-
-    test_stream_item_failure_after_open_is_not_retried is the same pull under a RetryThisOne
-    verdict, which raises RetryUnavailableError instead.
-    classify says invalid_request and the error is ProviderDeclaredFinalError anyway, the same
-    naming the non-streaming loop does.
-    """
+    """A terminal mid-stream failure raises ProviderDeclaredFinalError."""
 
     async def scenario() -> None:
         """Read a first-item failure that parses to PauseAllDoNotRetry."""
@@ -3485,13 +3262,7 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
 def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
     classify_result: ErrorClassification, expected_error: type[GenerationError]
 ) -> None:
-    """An open stream accounts for its attempt whatever verdict the adapter reaches on the error.
-
-    unknown_exception is the classification that has to work with no verdict at all: anthropic reports a
-    mid-stream failure as an error event on the 200 that carried the turn, so the adapter reads a
-    status the retry policy cannot place. The stream is open under every classification, so what the
-    provider reported for that attempt is readable and belongs on its record.
-    """
+    """Terminal stream errors preserve reported Usage for each classification."""
 
     async def scenario() -> None:
         """Let the iteration hit the failure after one item, then read the record."""
@@ -3513,12 +3284,7 @@ def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
 
 
 def test_an_unplaceable_mid_stream_error_records_the_attempt_with_nothing_reported() -> None:
-    """A stream open when the failure hit gets a record whether or not it reported any billing.
-
-    The record says the attempt reached the provider, and billing None on it says the provider
-    stated nothing, which is a different fact from the attempt never having happened. Reading the
-    stream's billing instead would collapse the two and drop this record.
-    """
+    """An open stream failure records the attempt without reported Billing."""
 
     async def scenario() -> None:
         """Let the iteration hit the failure after one item on a stream reporting no counters."""
@@ -3605,12 +3371,7 @@ def test_stream_final_is_idempotent() -> None:
 def test_stream_final_replays_every_error_that_concluded_the_call(
     stream: _FakeStream, expected_error: type[Exception]
 ) -> None:
-    """A second final() raises the first call's error again and records no second attempt.
-
-    Covers both routes to a conclusion, the outcome final() reads and the error draining raises,
-    because either one re-run would ask the adapter stream again and bill the same request twice
-    in the attempt records.
-    """
+    """Repeated final raises the stored error without another attempt."""
 
     async def scenario() -> None:
         """Call final() twice on a stream whose call cannot end in a Response."""
@@ -3724,17 +3485,10 @@ def test_max_concurrent_requests_bounds_batch_concurrency() -> None:
 
 
 def test_backoff_sleep_does_not_hold_the_permit() -> None:
-    """With max_concurrent_requests=1, a task backing off lets another request run.
+    """Private backoff releases a request permit.
 
-    The failure is not a rate limit, so nothing pauses admission.
-    Only a held permit could delay the second request.
-    What pins the release is the second request's own duration.
-    It is admitted while the first backs off, so it finishes in far less than that backoff.
-    first_task.done() cannot pin this alone.
-    A permit held across the sleep passes to the second request the moment the first retries.
-    So the first is unfinished under either placement.
-    The failure's retry_after_seconds floors the private wait.
-    The floor makes the backoff outlast the second request deterministically.
+    retry_after_seconds outlasts the second request.
+    The second request finishes while the first request waits.
     """
 
     async def scenario() -> None:
@@ -3784,11 +3538,7 @@ def test_stream_protocol_error_releases_the_permit() -> None:
 
 
 def test_stream_releases_its_permit_when_exhausted() -> None:
-    """Exhausting a stream returns its permit before the handle's block exits.
-
-    The re-admission sits inside the still-open block, so only the release on exhaustion can
-    satisfy it; after the block it would be satisfied by the release on block exit instead.
-    """
+    """Stream exhaustion releases its request permit before block exit."""
 
     async def scenario() -> None:
         """Drain one stream under max_concurrent_requests=1, then re-admit inside the still-open block."""
@@ -3843,13 +3593,7 @@ def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
 def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
     settled_attempts: int,
 ) -> None:
-    """timeout_seconds expiring in flight ends the call as TimedOutError carrying what it spent.
-
-    Nothing closes the cut-off attempt into a record: the deadline's cancellation is a
-    BaseException, so the retry loop's except clauses never see it, and freeze() closes only an
-    attempt whose response had arrived. AbandonedCallError.attempts adds that request back, so it
-    counts one more than there are records, and attempts == 0 is left meaning nothing went out.
-    """
+    """TimedOutError counts the in-flight request after settled attempts."""
 
     async def scenario() -> None:
         """Fail settled_attempts requests transiently, then hang the next past a deadline."""
@@ -3874,11 +3618,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
 
 
 def test_a_deadline_expiring_before_admission_reports_no_attempts() -> None:
-    """A call that never got admitted reports attempts == 0, so a caller can tell it never sent.
-
-    max_concurrent_requests is 1 and the holder never returns its permit, so the second call spends its whole
-    deadline waiting for admission and sends nothing.
-    """
+    """Admission timeout reports attempts=0."""
 
     async def scenario() -> None:
         """Hold the only permit, then run a second call under a deadline it cannot outlast."""
@@ -3943,12 +3683,7 @@ def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
 
 
 def test_a_batch_item_spends_no_budget_waiting_for_a_permit() -> None:
-    """One permit and four items: the last waits past its whole budget to start, and still succeeds.
-
-    Each open takes 0.15 seconds and only one item holds a permit at a time, so the fourth item
-    starts 0.45 seconds after the batch does, against a budget of 0.30. A deadline running from
-    when its task was created would have expired before it sent anything.
-    """
+    """Permit waits do not consume max_working_seconds_per_item."""
 
     async def scenario() -> None:
         """Queue four items behind one permit, each item working well inside its budget."""
@@ -3965,11 +3700,7 @@ def test_a_batch_item_spends_no_budget_waiting_for_a_permit() -> None:
 
 
 def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
-    """The budget still expires on an item that is admitted and gets nothing back.
-
-    The second item waits 0.15 seconds for the one permit, which costs it nothing, then hangs.
-    It is the hang that expires the budget, so the clock does run once the item is admitted.
-    """
+    """Work after admission consumes max_working_seconds_per_item."""
 
     async def scenario() -> None:
         """Let the first item answer, then hang the second one after it is admitted."""
@@ -4043,12 +3774,7 @@ def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
 
 
 def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
-    """Two attempts draw on one budget, so a retrying item does not get the budget twice.
-
-    Each attempt's open burns 0.12 seconds of a 0.20 second budget. Re-arming with the full
-    budget on the second admission would let both attempts finish; banking the remainder leaves
-    0.08 seconds, so the second attempt runs out and the item ends as a TimedOutError.
-    """
+    """Retries share one max_working_seconds_per_item budget."""
 
     async def scenario() -> None:
         """Fail the first attempt transiently, then time out inside the retry."""
@@ -4117,11 +3843,7 @@ def test_a_stream_deadline_expiring_mid_items_raises() -> None:
 
 
 def test_a_stream_deadline_stops_at_the_calls_conclusion() -> None:
-    """The deadline bounds the call, so a caller's work after final() is its own time.
-
-    A timer still armed past the conclusion would raise a TimedOutError for a call that produced a
-    Response, putting the same call in the archive twice and charging it the caller's work.
-    """
+    """Final closes the call deadline before caller work."""
 
     async def scenario() -> None:
         """Take the Response, then outlive the deadline inside the block."""
@@ -4137,11 +3859,7 @@ def test_a_stream_deadline_stops_at_the_calls_conclusion() -> None:
 
 
 def test_a_stream_deadline_stops_at_a_conclusion_an_item_pull_raised() -> None:
-    """A call concluded by a failing item pull closes the deadline, not only one final() concluded.
-
-    An item pull that ends the call stores its own conclusion and never reaches final(), so a
-    deadline left armed there would raise a second account of a call that already has one.
-    """
+    """A terminal item pull closes the call deadline."""
 
     async def scenario() -> None:
         """Take the UnknownExceptionError mid-iteration, then outlive the deadline in the block."""
@@ -4161,11 +3879,7 @@ def test_a_stream_deadline_stops_at_a_conclusion_an_item_pull_raised() -> None:
 
 
 def test_a_failed_stream_entry_leaves_no_armed_deadline() -> None:
-    """__aenter__ raising closes the deadline it opened, so no timer outlives the failed entry.
-
-    __aexit__ does not run when __aenter__ raises, so a scope left open would keep a timer that
-    cancels this task at an arbitrary later point, far outside the block.
-    """
+    """A failing __aenter__ closes its deadline."""
 
     async def scenario() -> None:
         """Fail an entry under a short deadline, then outlive that deadline uncancelled."""

@@ -1,36 +1,9 @@
 """The adapter contract.
 
-An adapter wraps one official SDK client and is the only place provider knowledge lives:
-converting the binding to SDK keyword arguments, sending, translating stream events, normalizing usage, computing cost,
-and reading failures (`parse` for the retry-or-pause verdict, `classify` for the terminal name).
-Adapters delegate stream assembly to the SDK and validate a structured response's text themselves:
-the SDKs validate inside the call that returns the response, where a rejection reaches the caller as
-an exception carrying neither the response nor its billing, and an adapter that validates in its own
-frame answers a rejection with a variant carrying both.
-
-Reporting model: an adapter reports one attempt; only the retry loop knows the call.
-So `open_stream` and `AdapterStream.final` return what came back, and an adapter never
-constructs a `GenerationError`, which is a verdict about a call it cannot see.
-What no variant can describe is an attempt the adapter read no outcome from: those stay SDK exceptions
-that propagate through the admitted() block, whose exit parses the `failure_types` ones.
-`AdapterStream.items` is the exception to the return contract, because an async iterator can only
-raise: a mid-stream failure reaches the retry loop as an exception and exits the block the same way.
-
-Billing before interpretation: `AdapterStream.final` hands back the SDK response object
-itself, and `billing_from_raw`, `identity_from_raw`, and `interpret` read it in separate calls the
-retry loop makes. The loop records the response, its `Billing`, and its `ResponseIdentity` the
-moment they arrive, so a raise from `interpret` still leaves the attempt and what it billed on the
-call's record.
-
-Binding model: `Adapter.bind_text` and `Adapter.bind_structured` convert the frozen prefix once.
-The frozen prefix includes `system_prompt`, `tool_schemas`, and `provider_executed_tools`.
-It also includes tool selection, inference parameters, and caching.
-`BoundAdapter.build_request` adds per-call `messages`.
-`open_stream` sends its `RequestParams`.
-Every attempt sends the same request.
-Adapters reject unsendable messages before the first attempt.
-The two bind methods fix the output type.
-Each method has one output type.
+An `Adapter` converts a `Binding`, sends requests, translates events, reports billing, and classifies failures.
+`AdapterStream.final` returns the SDK response so the retry loop records billing before `BoundAdapter.interpret` runs.
+`Adapter.bind_text` and `Adapter.bind_structured` precompute provider fields.
+`BoundAdapter.build_request` adds per-call `messages` and rejects unsendable input before a request starts.
 """
 
 import email.utils
@@ -64,36 +37,19 @@ _logger = logging.getLogger(__name__)
 type ErrorClassification = Literal[
     "transient", "invalid_request", "declared_final", "unknown_exception"
 ]
-"""What a retry loop does with a failure Adapter.parse gave no verdict, or verdicted DoNotRetry.
+"""The retry loop's action for an unparsed failure or `DoNotRetry`.
 
-A string classification, not an exception class; the retry loop maps it onto one.
-The retry-or-pause decision for a parseable provider failure is Adapter.parse's, so classify is
-consulted only for an exception outside Adapter.failure_types, and to name the terminal error for
-one parse verdicted DoNotRetry.
-"transient" is a transport failure that produced nothing parseable (a connection drop, a timeout):
-the retry loop retries it alone, as RetryThisOne with no retry_after.
-"invalid_request" is not retried: the provider rejected this request, so sending it again
-would be rejected again (the retry loop raises InvalidRequestError).
-"declared_final" is not retried: the provider answered with an error and named it,
-whether on an error status marked final or on a mid-stream error event
-(the retry loop raises ProviderDeclaredFinalError).
-"unknown_exception" is not retried either, and says the adapter could not place the exception at all
-(the retry loop raises UnknownExceptionError).
+`transient` retries this request.
+`invalid_request`, `declared_final`, and `unknown_exception` fail this request with distinct errors.
 """
 
 
 def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None:
-    """Parse the server-stated wait from response headers.
+    """Parse provider wait headers.
 
-    Three readings, in order, taking the first that yields a positive number: the non-standard
-    retry-after-ms header (milliseconds), which is the most precise; retry-after as float seconds;
-    and retry-after as an HTTP-date, accepted only in the form ending in "GMT" and converted by
-    subtracting the current wall-clock time. Both SDK clients read the three in this order
-    (anthropic 0.120.2, openai 2.51.0).
-    The HTTP-date reading is the one place langchaint reads wall-clock time, because a timestamp can
-    only be compared against wall-clock time; a clock skewed against the provider's misreads it, and
-    `SharedBackoff` caps this value at `longest_wait_seconds`.
-    None means no usable server-stated delay; non-positive values are treated as absent.
+    `retry-after-ms` contains milliseconds.
+    `retry-after` contains seconds or a GMT HTTP date.
+    Return `None` when neither header contains a positive delay.
     """
     retry_after_ms_header = headers.get("retry-after-ms")
     if retry_after_ms_header is not None:
@@ -349,15 +305,12 @@ def reject_extra_body_keys_the_adapter_populates(
     populated_keys: frozenset[str],
     normalized_key: Callable[[str], str] = str,
 ) -> None:
-    """Refuse a Binding.extra_body key the calling adapter populates itself.
+    """Reject colliding `extra_body` keys.
 
-    An adapter's bind path calls this with the wire names it sets as explicit keywords,
-    because the SDK merge would let extra_body silently override them.
-    normalized_key maps a caller's key to the form populated_keys holds, for an SDK whose merge
-    matches extra_body keys to wire keys loosely; the default compares keys as written.
+    `normalized_key` maps caller keys to the form used by `populated_keys`.
 
     Raises:
-        ValueError: extra_body holds a key that normalizes into populated_keys.
+        ValueError: An `extra_body` key normalizes into `populated_keys`.
     """
     if extra_body is None:
         return
@@ -371,18 +324,10 @@ def reject_extra_body_keys_the_adapter_populates(
 
 @dataclass(frozen=True, kw_only=True)
 class AdapterResult[OutputT]:
-    """One successful provider turn, normalized to langchaint terms.
+    """A successful provider turn normalized to langchaint values.
 
-    Everything interpret read off the response, and nothing the response itself already holds: the
-    retry loop keeps the response it passed to interpret, and that is the one a Response carries.
-
-    output is the assistant text (text bindings) or the response_format instance validated from the
-    turn's text (structured bindings).
-    A structured binding's output is None when the turn parsed no instance, which here means the model
-    called tools: the calls are on assistant_message, and no failure occurred.
-    A turn can both parse an instance and call tools, so tool_calls is what says whether a tool result
-    is owed.
-    assistant_message is the full turn including tool calls, for appending to a Sequence[Message].
+    `output` contains text or a validated `response_format` instance.
+    A structured tool-call turn has `output=None` and carries its calls on `assistant_message`.
     """
 
     output: OutputT
@@ -393,28 +338,14 @@ class AdapterResult[OutputT]:
 
 @dataclass(frozen=True, kw_only=True)
 class NoOutput:
-    """The shared shape of a 200 that produced no output: the turn it produced instead.
-
-    assistant_message is whatever turn the response carried, which every variant has one of and none
-    of them can return as the output: the sentences a refusal wrote, the text a schema violation
-    rejected, the fragment a run that failed had emitted. The retry loop puts it on the attempt's
-    record, so what the request bought reaches the caller even where the item fails. A response
-    carrying no turn at all gives an empty one.
-    """
+    """The `assistant_message` from a response that produced no output."""
 
     assistant_message: AssistantMessage
 
 
 @dataclass(frozen=True, kw_only=True)
 class Refusal(NoOutput):
-    """A completed 200 whose structured parse found the model refusing.
-
-    The retry loop records the attempt and fails the item with a RefusalError, without retrying.
-    Neither provider puts its explanation in one neutral place, so a caller wanting more than
-    assistant_message narrows the attempt's raw: anthropic reports it on Message.stop_details, and
-    openai in a refusal content part, which its other refusal condition
-    (incomplete_details.reason "content_filter") does not produce.
-    """
+    """A completed response whose structured parse found a refusal."""
 
     kind: Literal["refusal"] = "refusal"
 
@@ -432,17 +363,10 @@ class MaxCompletionTokensExceeded(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class SchemaViolation(NoOutput):
-    """A completed turn whose text is not an instance of the binding's response_format.
+    """A completed turn whose text fails `response_format` validation.
 
-    The retry loop records the attempt and fails the item with a SchemaViolationError, without
-    retrying.
-
-    validation_error_json is ValidationError.json(include_url=False), which travels to the caller on
-    that error. Every field pydantic reports is in it, the rejected value included, because a caller
-    reading it is deciding whether to change the model or the prompt. That is also why no part of it
-    reaches SchemaViolationError's message: pydantic writes the caller's own validator text into each
-    msg, so a validator naming the value it rejected would put generated content in every span.
-    The URLs are dropped, pointing at pydantic's error documentation rather than at this rejection.
+    `validation_error_json` preserves pydantic's error details and rejected values without documentation URLs.
+    It stays outside the exception message because validator text can contain generated content.
     """
 
     validation_error_json: str
@@ -468,12 +392,9 @@ class ProviderFailedTransiently(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class ProviderFailedTerminally(NoOutput):
-    """A billable 200 whose body reports a provider-side failure a resend would hit again.
+    """A billable response containing a terminal provider failure.
 
-    The retry loop records the attempt and fails the item with a ProviderFailedTerminallyError,
-    without retrying: what the body names is a property of the request, so the retry budget would buy
-    the same body at full price each time.
-    reason is the provider's own description of the failure, and travels to the caller on that error.
+    `reason` preserves the provider's description.
     """
 
     reason: str
@@ -484,9 +405,8 @@ class ProviderFailedTerminally(NoOutput):
 class EmptyTurn(NoOutput):
     """A completed turn that produced no instance and no ToolCall.
 
-    The retry loop records the attempt and fails the item with an EmptyTurnError, without retrying:
-    the model finished on its own terms and emitted nothing a structured binding can return, so a
-    resend is a fresh sample charged to a budget that means error recovery.
+    The retry loop records the attempt and raises `EmptyTurnError` without retrying.
+    A retry would request a new sample.
     """
 
     kind: Literal["empty_turn"] = "empty_turn"
@@ -496,8 +416,8 @@ class EmptyTurn(NoOutput):
 class ContextWindowExceeded(NoOutput):
     """A 200 reporting that the request overflowed the model's context window.
 
-    The retry loop records the attempt and fails the item with a ContextWindowExceededError, without
-    retrying: the same request overflows identically every time.
+    The retry loop records the attempt and raises `ContextWindowExceededError` without retrying.
+    The same request always overflows.
     """
 
     kind: Literal["context_window_exceeded"] = "context_window_exceeded"
@@ -505,13 +425,9 @@ class ContextWindowExceeded(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class UnfinishedTurn(NoOutput):
-    """A 200 that is not a finished turn, so its content is not the answer.
+    """A response whose partial content is not a finished answer.
 
-    Continuing such a turn means sending its content back for the provider to resume, which langchaint
-    has no code for, so presenting the partial content as the answer would be silently wrong data.
-    The retry loop records the attempt and fails the item with an UnfinishedTurnError.
-    reason states what the provider reported, naming the provider's own word, and becomes that error's
-    message.
+    `reason` preserves the provider's description.
     """
 
     reason: str
@@ -522,8 +438,8 @@ class UnfinishedTurn(NoOutput):
 class InvalidRequest:
     """A Sequence[Message] the adapter will not put on the wire; nothing was sent.
 
-    Raised by no one and billed by no one: the retry loop records no attempt and fails the item with
-    an InvalidRequestError. reason states what cannot be sent, and becomes that error's message.
+    The retry loop records no attempt and raises `InvalidRequestError` with `reason`.
+    Nothing was sent or billed.
     """
 
     reason: str
@@ -534,10 +450,9 @@ class InvalidRequest:
 class RequestParams(ABC):
     """One request, built once per call and sent once per attempt.
 
-    Each adapter declares its own subclass and narrows back to it with narrowed_request on the way
-    in, the same way it narrows a raw response.
-    Holds no credentials: the SDK client carries those, and a failure's request travels to wherever
-    the application archives its failures.
+    Each adapter defines a subclass that `narrowed_request` validates.
+    The SDK client holds credentials.
+    Failures carry the request for application storage.
     """
 
     @abstractmethod
@@ -560,12 +475,9 @@ def narrowed_request[RequestT: RequestParams](
 
 
 def request_json(request: RequestParams, *, omitted_class: type) -> str:
-    """Render request as a JSON object, dropping every field holding an omit sentinel.
+    """Render a request as JSON after removing `omitted_class` values.
 
-    omitted_class is the SDK's class for the value meaning "send no such field", so a dropped field
-    is one the request body does not carry, told apart from a field explicitly sent as null.
-    A value the json module cannot render becomes its str(), because a table build must not fail over
-    one cell of one row.
+    Convert unsupported JSON values to text.
     """
     return json.dumps(_without_omitted(asdict(request), omitted_class), default=_json_default)
 
@@ -628,8 +540,8 @@ class AdapterStream(ABC):
 
     The adapter translates SDK events into StreamItem values as they pass through;
     assembly stays in the SDK.
-    Carries no output type: the stream yields items and hands back the assembled response, and what
-    that response produced is BoundAdapter.interpret's answer.
+    The stream yields items and returns the assembled response.
+    `BoundAdapter.interpret` produces the output.
     """
 
     @abstractmethod
@@ -646,28 +558,21 @@ class AdapterStream(ABC):
         """Return the SDK response the stream's events assembled into, after the stream ends.
 
         Callable only after items() is exhausted; the adapter delegates assembly to the SDK stream manager.
-        Handing back the response rather than what it produced is what lets the retry loop record
-        the billing before interpreting it.
+        Returning the response lets the retry loop record billing before interpretation.
         """
         ...
 
     @abstractmethod
     def billing_reported(self) -> Billing | None:
-        """Return what the provider has reported billing, or None where the SDK reports nothing yet.
-
-        A counter the provider sends late is missing from it, so a caller that can still reach the
-        assembled response must read that instead. The callers are those that cannot: a stream cut
-        off by a cancellation, and one that broke before reaching its terminal event.
-        Callable at any point in the stream's life, including before its first item. No I/O.
-        """
+        """Return currently reported billing, or `None` before the SDK reports any."""
         ...
 
     @abstractmethod
     def request_id(self) -> str | None:
         """Return the request-id header of the response this stream is reading, when the SDK has one.
 
-        Callable at any point in the stream's life: the header arrives with the status line, before
-        the first event. No I/O.
+        The header arrives before the first event, so this method works throughout the stream.
+        This method performs no I/O.
         None where the SDK exposes no route to those headers, and None where the provider sent none.
         """
         ...
@@ -689,71 +594,49 @@ class BoundAdapter[OutputT](ABC):
     def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
         """Convert messages and the binding into the request every attempt of this call sends.
 
-        Called once per call, before the first attempt, so messages the adapter will not put on
-        the wire are found without a request going out and without a retry budget being spent on it.
-        Returns InvalidRequest with the reason in that case. No I/O.
+        Called once before the first attempt.
+        Returns `InvalidRequest` before any request or retry budget use.
+        Performs no I/O.
         """
         ...
 
     @abstractmethod
     def billing_from_raw(self, raw: BaseModel) -> Billing:
-        """Build what one response billed: its reported counters, priced at the tier it reports.
-
-        Called on every response the moment it arrives, before interpret. No I/O.
-        A response reporting no counters at all bills zero counters, at the served tier's prices.
+        """Price one response's reported counters before `interpret`.
 
         Raises:
-            TypeError: raw is not the SDK response type this bound adapter produces, which is a
-                defect in langchaint rather than anything a provider did.
-            ValueError: the response's reported counters are inconsistent, leaving a counter
-                negative.
+            TypeError: `raw` has the wrong SDK response type.
+            ValueError: Reported counters produce a negative normalized counter.
         """
         ...
 
     @abstractmethod
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Build ResponseIdentity from raw and request_id.
+        """Build `ResponseIdentity`.
 
-        Called on every response the moment it arrives, beside billing_from_raw. No I/O.
-        Return response_id as a str, converting it here where a provider's own is not one:
-        the adapter is the only place that knows the format, and langchaint invents no id.
-        request_id comes from the AdapterStream that produced raw.
+        Use `raw` and the stream's `request_id`.
 
         Raises:
-            TypeError: raw is not the SDK response type this bound adapter produces, which is a
-                defect in langchaint rather than anything a provider did.
+            TypeError: `raw` has the wrong SDK response type.
         """
         ...
 
     @abstractmethod
     def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
-        """Read one SDK response as the turn it produced, or as the reason it produced none. No I/O.
-
-        Every response goes through here, assembled by the SDK from its stream's events, so one
-        function per binding decides what a response means.
-        A response that produced no output is a returned variant, never a raise, so the retry loop
-        decides the item's fate with the attempt already recorded.
-
-        raw is typed BaseModel rather than the SDK response type because BoundAdapter is what
-        BoundLLM holds, and the neutral core imports no SDK.
+        """Return a normalized turn or a `NoOutputOutcome`.
 
         Raises:
-            TypeError: raw is not the SDK response type this bound adapter produces, which is a
-                defect in langchaint rather than anything a provider did.
+            TypeError: `raw` has the wrong SDK response type.
         """
         ...
 
     @abstractmethod
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open one streaming request and return the live stream.
-
-        Opening performs the connection I/O, so a connection failure raises here, before any event is yielded.
+        """Open a streaming request.
 
         Raises:
-            TypeError: request is not the RequestParams subclass this bound adapter builds, which is
-                a defect in langchaint rather than anything a provider did.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
-                They are the attempts this adapter read no outcome from.
+            TypeError: `request` has the wrong `RequestParams` subclass.
+            Exception: The SDK fails before returning the stream.
         """
         ...
 
@@ -785,47 +668,18 @@ def _require_provider_name(
 
 
 class Adapter(ABC):
-    """Base class for one adapter per provider SDK.
+    """Base class for a provider SDK adapter.
 
-    An adapter is constructed with the SDK client to use and the provider_name that client reaches,
-    which together are how Bedrock support arrives: pass AsyncAnthropicBedrock or AsyncBedrockOpenAI
-    instead of the direct client, with provider_name "aws.bedrock".
-    Credentials and endpoints belong to the SDK client.
+    The SDK client owns credentials and endpoints.
     """
 
     provider_name: str
-    """Which provider served the request, recorded on every Response and GenerationError.
-
-    The value comes from the OpenTelemetry GenAI convention's gen_ai.provider.name value set,
-    whose values include the four langchaint's own constructors write
-    ("anthropic", "openai", "aws.bedrock", "gcp.gemini"), and the tracing subpackage emits it
-    under that key, so a backend groups langchaint spans with any other instrumented client's.
-    Whoever constructs the adapter states it, because the SDK client class does not determine it:
-    one AsyncOpenAI carrying a base_url reaches any of several providers. For the client classes
-    langchaint does know, Adapter.__init__ raises ValueError on a stated value contradicting
-    provider_name_by_client_class.
-    When the company that trained the model and the platform serving it differ, the platform is the
-    value: the convention states the attribute may differ from the actual model provider, and its
-    worked example sets "aws.bedrock" for Bedrock spans (opentelemetry-semantic-conventions 0.64b0,
-    gen_ai.provider.name). Which company trained the model is read from the model identifier.
-    """
+    """The serving provider recorded on each result and error."""
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = {}
-    """The SDK client classes whose own auth and URL scheme fixes the provider they reach.
+    """SDK client classes that fix the serving provider.
 
-    Deliberately partial, and never a source for provider_name:
-    it holds only the platform client classes (the Bedrock and Azure ones),
-    because a base client reaches whatever its base_url points at.
-    Pointing an AsyncOpenAI at another vendor's OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached,
-    all of them gen_ai.provider.name values,
-    so a base client in this map would make __init__ raise for every one of them.
-    A client matching nothing here takes the caller's value.
-
-    Never enter a base client class: that invariant is what lets the lookup use isinstance.
-    An application's own subclass of a platform client is then still recognized as reaching that platform,
-    whatever it adds (headers, auth, instrumentation).
-    Enter AsyncOpenAI and isinstance would match AsyncBedrockOpenAI and AsyncAzureOpenAI through it,
-    since both subclass it.
+    Exclude base client classes that accept arbitrary endpoints.
     """
 
     def __init__(
@@ -836,25 +690,10 @@ class Adapter(ABC):
         provider_name: str,
         automatic_cache_breakpoints_default: bool,
     ) -> None:
-        """Validate `provider_name` and store the adapter-wide values.
-
-        client is checked here and not stored.
-        Its object annotation is the price of checking every adapter in one place.
-        `automatic_cache_breakpoints_default` resolves an unstated `LLM.bind` value.
-        Adapter authors must select it.
-
-        Rates are not stored here. Each provider's service tiers are its own words, so an adapter
-        holds a mapping from the tier its responses report to the table that prices that tier,
-        and no neutral shape spans the two key types. What the contract requires of an adapter is a
-        Billing, not that it hold a table for every tier its responses can report.
+        """Validate `provider_name` and store adapter-wide values.
 
         Raises:
-            ValueError: client is an instance of a class in provider_name_by_client_class
-                listed under a provider other than provider_name.
-                Such a request succeeds and bills normally
-                while every span it produces carries the wrong provider,
-                a defect nothing surfaces until telemetry is grouped by provider,
-                so the constructor raises before the first request.
+            ValueError: `client` fixes a provider that differs from `provider_name`.
         """
         _require_provider_name(
             client,
@@ -881,17 +720,12 @@ class Adapter(ABC):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output parsed into response_format.
+        """Bind structured output parsed into `response_format`.
 
-        The output type admits None because a turn holding tool calls parses to no instance while
-        being a success: the tool calls are the turn. Both SDKs type their parsed instance Optional
-        for the same reason. Every other turn that yields no instance is a NoOutputOutcome variant.
-
-        Pure conversion of the binding to SDK keyword arguments; no I/O.
+        A successful tool-call turn returns `None` because it contains no structured instance.
 
         Raises:
-            ValueError: the binding asks for something this adapter cannot send,
-                which is a defect to report before any request rather than a request to spend.
+            ValueError: `binding` contains unsupported values.
         """
         ...
 
@@ -910,33 +744,25 @@ class Adapter(ABC):
         """Map one failure_types exception to its verdict, for SharedBackoff's parse.
 
         A retry-after header never sets the verdict, only its retry_after.
-        Return a verdict for every input without raising, unknown statuses and error types
-        included, falling through to documented defaults; each provider's parse function names
-        its table and its defaults.
+        Return a verdict for every input without raising.
+        Each provider's `parse` documents defaults for unknown statuses and error types.
         """
         ...
 
     @abstractmethod
     def classify(self, error: Exception) -> ErrorClassification:
-        """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
+        """Classify an unparsed exception or name a terminal `DoNotRetry` error.
 
-        Consulted by the retry loop on the two failures the verdict does not settle: an exception
-        outside failure_types, where "transient" marks a transport failure the loop retries alone,
-        and a failure parse verdicted DoNotRetry, where the terminal name picks the GenerationError.
-        Every classification fails at most its own item.
-        A provider states a status, never whether the binding or this one request caused it.
-        A binding defect langchaint can detect raises at construction or bind time instead, before any request is sent.
-        Anything the adapter cannot place must map to "unknown_exception",
-        which fails the one item without a retry, so bugs surface without being retried silently.
+        Return `unknown_exception` for an unrecognized exception.
         """
         ...
 
     def request_id_from_error(self, error: Exception) -> str | None:  # noqa: ARG002
         """Return the request-id header carried by error, when the SDK exposes one.
 
-        The id provider support asks for, on an attempt that failed rather than returning a
-        response; identity_from_raw carries it on the attempts that returned one.
-        The base implementation knows no SDK types and returns None; adapters override it to read
-        their SDK exception's own attribute.
+        Provider support uses this id for failed attempts.
+        `identity_from_raw` handles responses.
+        The base implementation returns `None` because it knows no SDK types.
+        Adapters override it to read the SDK exception attribute.
         """
         return None

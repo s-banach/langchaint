@@ -1,11 +1,6 @@
-"""Token accounting and the per-category costs that travel with it.
+"""Token accounting and per-category costs.
 
-The three input counters are a disjoint partition of all input tokens, so their sum is the total;
-there is no bare input_tokens field, because Anthropic's field of that name excludes cache reads
-while OpenAI's equivalent includes them.
-
-The costs ride on Usage rather than beside it so the two can never desynchronize:
-they are born together in one price() call, and one fold sums both.
+The three `input_tokens_*` counters partition all input tokens.
 """
 
 from collections.abc import Iterable
@@ -16,36 +11,12 @@ from langchaint.checked_copy import CheckedCopyModel
 
 
 class Usage(CheckedCopyModel):
-    """Token counts for one request, normalized across providers, plus what each cost.
+    """Provider-reported token counts and estimated costs for one request.
 
-    The counters are provider-reported facts.
-    The five costs are langchaint estimates.
-    Adapters use provider counters and configured service-tier rates.
-    Costs are stored because one counter can use several rates.
-    Anthropic cache writes demonstrate this.
-    input_tokens_cache_write combines five-minute and one-hour writes.
-    The raw usage retains both counts.
-    No validator cross-checks a cost against its counter; that would require the table here.
-
-    output_tokens_reasoning is the reasoning share of output_tokens
-    (Anthropic thinking_tokens, OpenAI reasoning_tokens); whether a provider counts it inside output_tokens
-    is an unverified provider fact, so no validator relates the two. It has no cost of its own:
-    reasoning tokens bill at the output rate, inside output_tokens_cost_in_usd.
-
-    A category costs NaN when its counter is nonzero and no rate priced it, which is a response
-    served at a service tier the adapter holds no table for. Every sum containing it is NaN, and the
-    test for it is math.isnan, because nan > limit and nan < limit are both False.
-
-    provider_executed_tool_cost_in_usd aggregates provider-executed tool charges.
-    Provider-specific evidence remains on raw provider responses.
-    NaN signals missing pricing coverage for provider output that proves a charge.
-
-    Every counter is non-negative by validation, so a defect that computes a negative count
-    cannot pass silently.
-    Cost fields have no non-negative constraint.
-    Such a constraint rejects NaN and would destroy unpriceable output.
-    Caller-supplied token rates remain unvalidated.
-    Negative token rates yield negative token costs.
+    Validation rejects negative counters.
+    `input_tokens_cache_write` combines all cache-write durations.
+    `provider_executed_tool_cost_in_usd` aggregates provider-executed tool charges.
+    Cost fields accept NaN and negative caller-supplied rates.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -72,7 +43,7 @@ class Usage(CheckedCopyModel):
 
     @property
     def cost_in_usd(self) -> float:
-        """What the request cost in total, the sum of the five categories."""
+        """Sum the five cost categories."""
         return (
             self.input_tokens_cache_read_cost_in_usd
             + self.input_tokens_cache_write_cost_in_usd
@@ -83,19 +54,7 @@ class Usage(CheckedCopyModel):
 
     @staticmethod
     def sum_of(usages: Iterable["Usage"]) -> "Usage":
-        """Aggregate several usages into one; the empty iterable returns ZERO_USAGE.
-
-        The import-free way to total usage across several Responses:
-        Usage.sum_of(response.usage for response in responses), no ZERO_USAGE import at the call site.
-
-        Counters add. Within one model that is meaningful, and across models the sum is a plausible
-        number whose meaning is the caller's to judge. Costs add correctly in every case, including
-        across models, service tiers, and tables, so a folded Usage reports a correct breakdown as
-        well as a correct total.
-
-        There is no __add__ to reach this through: a + b is unlabeled, so it reads as arithmetic and
-        hides the claim being made, where a named call makes the caller state it.
-        """
+        """Sum counters and costs; an empty iterable returns `ZERO_USAGE`."""
         input_tokens_cache_read = 0
         input_tokens_cache_write = 0
         input_tokens_cache_none = 0
@@ -143,5 +102,4 @@ ZERO_USAGE: Usage = Usage(
     output_tokens_cost_in_usd=0.0,
     provider_executed_tool_cost_in_usd=0.0,
 )
-"""What sum_of returns for an empty iterable, and what a non-billing attempt or a
-200 reporting no usage normalizes to."""
+"""Usage for an empty sum or an attempt with no reported billing."""

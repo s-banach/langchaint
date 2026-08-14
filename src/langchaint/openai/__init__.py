@@ -1,4 +1,4 @@
-"""The openai backend provides LLM and embedding construction, adapters, catalogs, and pricing.
+"""Construct OpenAI and Bedrock `LLM` values and OpenAI `EmbeddingModel` values.
 
 Importing this subpackage requires `openai`.
 `OpenAI.model` uses the Responses API and reports `provider_name="openai"`.
@@ -14,16 +14,14 @@ Missing optional rates produce NaN token costs.
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
 File-search prices use USD per invocation.
-`scripts/pricing/litellm-pricing-snapshot.json` supplies token prices.
-Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
-`scripts/pricing/provider-pricing-metadata.json` supplies tool and regional prices.
-Source: https://developers.openai.com/api/docs/pricing.
+Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+Tool and regional price source: https://developers.openai.com/api/docs/pricing.
 Embedding batching parameters come from the OpenAI embeddings guide.
 Source: https://developers.openai.com/api/docs/guides/embeddings.
 Cataloged embedding model dimensions come from the OpenAI model catalog.
 Source: https://developers.openai.com/api/docs/models/all.
 `OpenAI.model(pricing=...)` replaces cataloged estimates.
-`OpenAIBedrock.model(pricing=...)` accepts caller rates.
+`OpenAIBedrock.model(pricing=...)` uses caller rates.
 The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 `PROMPT_CACHE_OPTIONS_MODELS` lists that family.
 """

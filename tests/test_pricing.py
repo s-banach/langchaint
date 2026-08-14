@@ -1,8 +1,4 @@
-"""Offline tests for the neutral pricing arithmetic: category_cost and Billing.
-
-These import no SDK. A rate table is provider-shaped and lives in the backend subpackage whose
-adapter spends it, so what a table's price() produces is tested in the adapter test modules.
-"""
+"""Test provider-neutral pricing arithmetic without SDK imports."""
 
 import math
 

@@ -46,13 +46,7 @@ def stated_billing(
     input_cache_none_usd_per_million_tokens: float = math.nan,
     usage_raw: BaseModel | None = None,
 ) -> Billing:
-    """Carry a Usage a test stated outright as the Billing an attempt record holds.
-
-    The tier is filler and every rate defaults to NaN: a test that states its costs on the Usage is
-    exercising what the tree does with a Billing, not how a rate table built one. A test of
-    cache_savings_in_usd states the one rate that property reads.
-    usage_raw defaults to None, the provider having reported no usage object.
-    """
+    """Build Billing from test-stated Usage and optional cache rate."""
     return Billing(
         usage=usage,
         service_tier="stub",
@@ -138,8 +132,7 @@ def package_modules() -> Iterator[ModuleType]:
 def random_returns_zero() -> float:
     """Stand in for random.random, returning zero.
 
-    Patched over the random.random shared_backoff draws waits from, this makes every drawn wait its
-    ceiling. A test can then state the delay the retry loop waits.
+    Patching random.random with this function makes each wait equal its ceiling.
     """
     return 0.0
 
@@ -150,13 +143,7 @@ def status_error[ErrorT: openai.APIStatusError](
     headers: dict[str, str] | None = None,
     error_code: str | None = None,
 ) -> ErrorT:
-    """Build an openai status exception around a constructed httpx2.Response.
-
-    error_code fills the body's code the way the SDK reads it onto the exception; the SDK gets
-    the body with the error envelope already unwrapped, so the dict here carries code directly.
-    The body's type is always insufficient_quota, the ambiguous value parse must not decide by.
-    None builds the exception a non-JSON body produces, whose code attribute is None.
-    """
+    """Build an openai status exception with optional error_code."""
     response = httpx2.Response(
         status_code,
         request=httpx2.Request("POST", "https://api.openai.com"),
@@ -171,24 +158,12 @@ def status_error[ErrorT: openai.APIStatusError](
 
 
 def connection_error() -> openai.APIConnectionError:
-    """Build the openai SDK's transport-failure exception, which carries a request and no response."""
+    """Build an openai transport exception."""
     return openai.APIConnectionError(request=httpx2.Request("POST", "https://api.openai.com"))
 
 
 def openai_sdk_errors_and_classifications() -> Mapping[Exception, ErrorClassification]:
-    """Return the whole exception table classify_openai shares across both openai adapters.
-
-    openai 3.0.0 provides each class for its listed status code.
-    Bare `APIStatusError` rows cover statuses without dedicated classes.
-    The classification reads `status_code` because those rows share one exception class.
-    APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
-    isinstance.
-    A status row states the name a DoNotRetry failure takes, never whether it is retried:
-    a 200, a mid-stream error raised on the live response, is declared_final;
-    every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
-    declared_final, and any other status is unknown_exception.
-    ValueError stands in for an exception the adapters cannot place.
-    """
+    """Return shared openai error classification cases."""
     return {
         connection_error(): "transient",
         openai.APITimeoutError(httpx2.Request("POST", "https://api.openai.com")): "transient",
@@ -214,16 +189,7 @@ def openai_sdk_errors_and_classifications() -> Mapping[Exception, ErrorClassific
 
 
 def openai_sdk_errors_and_verdicts() -> Mapping[Exception, Verdict]:
-    """Return the parse_openai rows both openai adapters share.
-
-    The rows cover every listed status, both fallthrough defaults, and both TransientError forms.
-    The statuses and codes come from the error-code guide parse_openai's docstring cites,
-    plus the rows each table's docstring sources from the SDK;
-    the rows without an error_code exercise the exception a non-JSON body produces.
-    451 and 599 are the unlisted statuses, one per default: 451 takes the sub-500 DoNotRetry
-    and 599 the 5xx RetryThisOne.
-    The PauseAllDoNotRetry row is a 429 the provider's own x-should-retry marked final.
-    """
+    """Return shared openai error verdict cases."""
     return {
         status_error(openai.RateLimitError, 429, {"retry-after": "7"}): PauseAll(retry_after=7.0),
         status_error(

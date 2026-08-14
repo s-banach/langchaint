@@ -92,10 +92,7 @@ def _field_annotation(model: type[BaseModel], name: str) -> object:
 
 
 def _type_literals_of_union(annotation: object) -> set[str]:
-    """Collect the value of each variant's `type` field literal, over a union or an Annotated one.
-
-    Both SDKs discriminate their event unions on a `type` field holding a one-value Literal, which
-    is the string the adapters branch on.
+    """Collect each variant's type Literal value.
 
     Raises:
         AssertionError: a variant has no `type` field.
@@ -119,8 +116,7 @@ def _is_required(model: type[BaseModel], name: str) -> bool:
 def test_anthropic_cache_counters_stay_optional_ints() -> None:
     """The anthropic cache counters are Optional[int], which is what the `or 0` in the adapter reads.
 
-    _billing_from_sdk_usage writes `usage.cache_read_input_tokens or 0`. Were these to become required
-    ints, the `or 0` would still be correct but pointless.
+    Anthropic cache-read counters remain optional integers.
     """
     for name in ("cache_read_input_tokens", "cache_creation_input_tokens"):
         assert _field_annotation(AnthropicUsage, name) == (int | None), name
@@ -137,8 +133,7 @@ def test_anthropic_unguarded_counters_stay_required_ints() -> None:
 def test_anthropic_cache_creation_keeps_both_ttl_counters() -> None:
     """The two-TTL split the adapter prices at different rates is still two required int fields.
 
-    The adapter prices ephemeral_1h_input_tokens and ephemeral_5m_input_tokens separately when
-    cache_creation is present.
+    The adapter prices both cache-write TTL counters separately.
     """
     for name in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
         assert _field_annotation(CacheCreation, name) is int, name
@@ -152,12 +147,7 @@ def test_anthropic_reasoning_counter_is_thinking_tokens() -> None:
 
 
 def test_openai_usage_counters_stay_required_ints() -> None:
-    """The openai counters are required ints, which is why the adapter subtracts them unguarded.
-
-    _billing_from_response computes the uncached count as input_tokens minus cached_tokens minus
-    cache_write_tokens with no None handling. An optional field here would raise a TypeError on
-    every response that omitted it.
-    """
+    """OpenAI input token counters are required integers."""
     assert _field_annotation(ResponseUsage, "input_tokens") is int
     assert _is_required(ResponseUsage, "input_tokens")
     for name in ("cached_tokens", "cache_write_tokens"):
@@ -170,9 +160,7 @@ def test_openai_usage_counters_stay_required_ints() -> None:
 def test_openai_usage_details_objects_are_not_optional() -> None:
     """input_tokens_details and output_tokens_details are non-nullable, so the adapter reaches into them directly.
 
-    Requiredness alone would not do: an annotation widened to `| None` with no default stays
-    required, and _billing_from_response's details.cached_tokens read would raise AttributeError on
-    every response.
+    OpenAI cached_tokens remains a required integer.
     """
     for name in ("input_tokens_details", "output_tokens_details"):
         assert _is_required(ResponseUsage, name), name
@@ -290,15 +278,7 @@ def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
 
 
 def test_every_openai_error_code_has_a_disposition() -> None:
-    """Every ResponseError.code value is a key of the table saying whether a resend may get past it.
-
-    A code openai adds and the table lacks is reported as ProviderFailedTerminally, so the item
-    fails once at the cost of one attempt rather than being retried; this test is what says whether
-    that fallback was reached by a genuinely new code or by a value the table forgot.
-    The check is one-directional because langchaint supports a range of openai versions: the table
-    keeps a code an older SDK in that range does not declare, which costs a dict entry that cannot
-    be reached and nothing else.
-    """
+    """_DISPOSITION_BY_ERROR_CODE covers each ResponseError.code value."""
     annotation = _field_annotation(ResponseError, "code")
     codes = set(typing.get_args(annotation))
     assert codes <= set(openai_shared._DISPOSITION_BY_ERROR_CODE)
@@ -369,24 +349,13 @@ def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
 
 
 def test_both_sdk_clients_retry_twice_by_default() -> None:
-    """Both SDKs retry internally unless told otherwise, which is why every client is built with max_retries=0.
-
-    A default of 0 would make langchaint's max_attempts count true without the parameter; a default
-    above 0 that langchaint failed to override would make each langchaint attempt several requests,
-    so the AttemptRecord count and the pacing would both understate what the account was charged.
-    """
+    """Each SDK defaults to two internal retries."""
     assert anthropic.DEFAULT_MAX_RETRIES == 2
     assert openai.DEFAULT_MAX_RETRIES == 2
 
 
 def test_openai_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
-    """An unlisted status is the bare APIStatusError, which is why classify branches on the status.
-
-    413 is the named case: openai raises the bare APIStatusError for it, so a class list would drop
-    it, and would drop whatever status the provider adds next the same way.
-    529 is listed to pin the other half of the anthropic comparison: openai has no class of its own
-    for it and reaches InternalServerError through the 5xx branch.
-    """
+    """OpenAI uses APIStatusError for unlisted status codes."""
     client = openai.OpenAI(api_key="k")
     listed = {
         400: openai.BadRequestError,
@@ -411,13 +380,7 @@ def test_openai_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
 
 
 def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
-    """The anthropic half of the same claim: an unlisted status is the bare APIStatusError.
-
-    The two lists differ, which is itself the reason neither adapter classifies by exception class:
-    anthropic gives 413 and 529 their own classes while openai maps 413 to the bare APIStatusError
-    and 529 to InternalServerError alongside every other 5xx, so one shared class list would be wrong
-    for both.
-    """
+    """Anthropic uses APIStatusError for unlisted status codes."""
     client = anthropic.Anthropic(api_key="k")
     listed = {
         400: anthropic.BadRequestError,
@@ -443,11 +406,7 @@ def test_anthropic_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
 
 
 def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
-    """Return every status this client's own _make_status_error gives a status-specific class.
-
-    APIStatusError and InternalServerError are the catch-alls and carry no status_code class
-    attribute at all, so the getattr default is what tells them from a named status.
-    """
+    """Return statuses with client-specific error classes."""
     named: set[int] = set()
     for status_code in range(400, 600):
         if isinstance(
@@ -466,18 +425,7 @@ def _statuses_with_a_dedicated_class(client: _SupportedClient) -> set[int]:
 
 
 def test_every_status_a_supported_client_names_is_in_one_of_the_verdict_tables() -> None:
-    """Every status a supported client gives its own error class is a row of that parse's tables.
-
-    A status in no table takes a status-family default and records a fallthrough entry, and that
-    entry exists to name a status the tables should learn; one the SDK already names teaches an
-    operator nothing.
-    Which statuses get a dedicated class depends on the client class, not the package.
-    anthropic's three clients each define their own _make_status_error; openai's three inherit
-    AsyncOpenAI's (anthropic 0.121.0, openai 3.0.0).
-    Sweeping every client class the two SDKs' adapters accept covers a release that overrides one more.
-    The check is one-directional, for the reason test_every_openai_error_code_has_a_disposition
-    gives: a table legitimately holds a status no client class names, 500 and 504 among them.
-    """
+    """Verdict tables cover each client-specific status class."""
     clients_and_listed_statuses = (
         (AsyncAnthropic(api_key="k"), _ANTHROPIC_LISTED_STATUSES),
         (
@@ -504,11 +452,7 @@ def test_every_status_a_supported_client_names_is_in_one_of_the_verdict_tables()
 
 
 def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
-    """Every status google-genai's own default retry policy retries, langchaint retries or pauses.
-
-    This set is the evidence gemini's _RETRY_THIS_ONE_STATUSES cites for its 408 and 502 rows, so a
-    set the SDK narrows leaves that citation naming statuses it no longer holds.
-    """
+    """Gemini retry tables cover the SDK retryable statuses."""
     assert set(_api_client._RETRY_HTTP_STATUS_CODES) <= (
         generate_content_adapter._PAUSE_STATUSES
         | generate_content_adapter._RETRY_THIS_ONE_STATUSES
@@ -523,12 +467,7 @@ def test_anthropic_content_block_deltas_carry_the_two_kinds_of_text_the_stream_y
 
 
 def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches_on() -> None:
-    """The stream branches on these five event types; a rename changes what it yields unnoticed.
-
-    Reasoning arrives on two independent channels the adapter forwards without choosing between them.
-    A renamed delta type drops that text from the stream; a renamed done type drops every separator
-    between reasoning parts, leaving them concatenated into one run.
-    """
+    """ResponseStreamEvent includes each handled reasoning event type."""
     type_values = _type_literals_of_union(ResponseStreamEvent)
     assert "response.output_text.delta" in type_values
     assert "response.reasoning_summary_text.delta" in type_values
@@ -538,25 +477,14 @@ def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches
 
 
 def test_the_schema_builders_both_adapters_call_are_still_where_they_were() -> None:
-    """Both adapters build the structured request's schema themselves, with these two SDK calls.
-
-    Each adapter imports its own at module top, so an SDK that moves either breaks importing that
-    backend subpackage. Naming both here says which symbol moved, and openai's is the likelier to
-    move: it lives in openai.lib._parsing._responses, a private module.
-    Each adapter's own test file pins that its binding sends what these calls return.
-    """
+    """Each structured-output schema builder remains callable."""
     assert "transform_schema" in anthropic.__all__
     assert callable(anthropic.transform_schema)
     assert callable(type_to_text_format_param)
 
 
 def test_the_cache_breakpoint_keys_both_adapters_write_still_exist() -> None:
-    """The cache-breakpoint key each adapter writes, on every param type it writes it on.
-
-    `pyrefly check` rejects a write to a key the SDK's TypedDict lacks, so it is the gate a rename
-    trips first; this names the two keys and the nine param types in one place, and its failure
-    message names the class that dropped one.
-    """
+    """Each SDK parameter type contains its cache-breakpoint key."""
     anthropic_params = (
         TextBlockParam,
         ImageBlockParam,

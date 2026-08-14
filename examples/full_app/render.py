@@ -1,9 +1,4 @@
-"""The console renderer standing in for a UI.
-
-One line per event, indented by the emitting run's depth in the agent tree. Everything it draws comes off
-the event itself, which is the property the event vocabulary exists to have: a UI never looks back into
-the orchestrator to redraw a token counter.
-"""
+"""Render each event as one line indented by agent_path depth."""
 
 from events import (
     AgentCancelled,
@@ -21,7 +16,7 @@ from events import (
 
 
 def render(event: Event) -> str:
-    """Draw one event as a single line, indented by its depth in the agent tree."""
+    """Render one event indented by agent_path depth."""
     indent = "  " * (event.agent_path.count("/"))
     return f"{indent}{_render_body(event)}"
 

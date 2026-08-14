@@ -1,14 +1,7 @@
-"""Tracing wrappers driven by fake adapters and an in-memory exporter.
+"""Test tracing with fake adapters and an in-memory exporter.
 
-The fake adapters are the ones test_bound_llm builds; here they feed the tracing wrapper instead of the plain BoundLLM.
-TracedToolManager is driven directly with constructed ToolCalls; its spans land in the same exporter.
-A locally built TracerProvider with a _SchemaValidatingSpanProcessor and an InMemorySpanExporter captures
-every span, so the assertions read span names, kinds, statuses, attributes, events,
-and parentage without any collector or network access.
-
-That processor also validates every structured payload attribute against the vendored GenAI JSON
-schemas in tests/semconv_genai, so conformance is checked on the spans the tests already build rather
-than on fixtures written for the schemas.
+_SchemaValidatingSpanProcessor validates payload attributes against tests/semconv_genai.
+The tests inspect recorded span names, kinds, statuses, attributes, events, and parents.
 """
 
 import asyncio
@@ -102,50 +95,27 @@ from tests.test_bound_llm import (
 _SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
 
 _PAYLOAD_SCHEMA_FILES: Mapping[str, str] = refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES
-"""Each structured payload attribute the tracing module emits, mapped to its vendored schema.
-
-Taken from the refresh script rather than restated, because that map is what decides which schemas
-are fetched and how SOURCE.md labels them, so a second copy could only ever prove the two copies
-agree. test_vendored_schemas_and_the_payload_attributes_account_for_each_other checks the map
-against three independent sources instead: a key the tracing module never writes fails its
-emitted-keys assertion, a schema file no attribute claims fails its vendored-set assertion, and a
-pair whose filename is not the one upstream's naming implies fails its derivation assertion.
-"""
+"""Map each structured payload attribute to its vendored schema."""
 
 _VALIDATED_PAYLOAD_ATTRIBUTES: set[str] = set()
-"""Every payload attribute _validate_payload_attributes has actually checked.
-
-A schema validates nothing if no test produces its attribute, and that silence is otherwise
-invisible: the assertions comparing declared keys against the tracing module's source stay green
-whether or not any span ever carries the key.
-test_every_payload_attribute_reaches_validation reads this set to fail instead.
-"""
+"""Track payload attributes checked by _validate_payload_attributes."""
 
 _UNVALIDATED_PAYLOAD_ATTRIBUTES = frozenset({"gen_ai.tool.call.arguments"})
-"""Payload attributes whose schema the module deliberately does not satisfy.
+"""Skip schema validation for malformed tool-call argument text.
 
-gen_ai.tool.call.arguments is typed `type: object` with no alternative variant, and its convention note
-says only "It's expected to be an object - in case a serialized string is available to the
-instrumentation, the instrumentation SHOULD do the best effort to deserialize it to an object".
-Both are silent on what to emit when a model's arguments are not a JSON object, which is a routine
-outcome the DispatchInvalidToolArgs variant exists to report. The module shows the text the model
-actually sent (_tool_call_arguments), so the payload is a JSON string on that path and does not
-conform. The gap is the convention's: it models no representation for malformed tool arguments,
-so conforming here would mean dropping evidence of the failure from the span.
-Validation is therefore skipped rather than the module changed, and only on that path:
-_validate_payload_attributes still validates a listed attribute whose payload is an object.
+The schema accepts objects, while DispatchInvalidToolArgs preserves non-object text.
+_validate_payload_attributes still validates this attribute when it contains an object.
 """
 
 
 @functools.cache
 def _payload_schema(file: str) -> Mapping[str, object]:
-    """Load one vendored schema, cached because every ending span consults them.
+    """Load and cache one vendored schema.
 
     Raises:
         OSError: the vendored file could not be read.
         json.JSONDecodeError: the file does not hold JSON.
-        AssertionError: the file holds JSON that is not an object, so a refresh wrote
-            something that is not a schema.
+        AssertionError: the file contains a non-object JSON value.
     """
     schema = json.loads((_SEMCONV_GENAI_DIR / file).read_text())
     assert isinstance(schema, dict), f"{file} does not hold a JSON object"
@@ -153,26 +123,11 @@ def _payload_schema(file: str) -> Mapping[str, object]:
 
 
 def _validate_payload_attributes(span: ReadableSpan) -> None:
-    """Check every payload attribute on one span against the schema the convention attaches to it.
+    """Validate one span's structured payload attributes.
 
-    The attributes hold JSON strings because OTel attribute values cannot nest, so each is parsed
-    before validation. An attribute absent from _PAYLOAD_SCHEMA_FILES is a scalar the convention
-    types directly and needs no schema. One in _UNVALIDATED_PAYLOAD_ATTRIBUTES is skipped only where
-    its documented disagreement lies, on a payload that is not a JSON object, so the same attribute
-    carrying an object is validated like any other and the exemption costs only the path it names.
-
-    What the upstream schemas enforce is weaker than "the payload is correct", and the difference
-    matters when a green run is read as the convention having moved compatibly. Every schema that
-    lists element types ends its anyOf in a catch-all variant constraining almost nothing, so an element
-    whose type is unrecognized or whose required fields are missing matches that variant and passes:
-    GenericPart (requiring only a string type) for gen_ai.input.messages, gen_ai.output.messages,
-    and gen_ai.system_instructions, and GenericToolDefinition (type and name) for
-    gen_ai.tool.definitions. What survives for the message attributes is the message envelope,
-    an array of objects carrying role and a parts array of objects, plus finish_reason on each
-    gen_ai.output.messages element. gen_ai.tool.call.result is weaker still, its whole schema being
-    an object with no required property, so any object passes.
-    Emitted element shapes are pinned by the exact-equality assertions in this module instead, which
-    catch a renamed type or a dropped field that these schemas admit.
+    Each payload is a JSON string.
+    _UNVALIDATED_PAYLOAD_ATTRIBUTES skips non-object tool arguments.
+    Exact-equality assertions test fields that the schemas leave optional.
 
     Raises:
         AssertionError: a payload does not conform, is not a JSON string, or does not parse,
@@ -200,21 +155,11 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
 
 
 class _SchemaValidatingSpanProcessor(SimpleSpanProcessor):
-    """A SimpleSpanProcessor that validates payload attributes as each span ends.
-
-    Validating here rather than in each assertion covers every span that reaches it, including spans
-    built by tests written for something else, and a test added later inherits the check by using
-    _in_memory_tracer, the one helper here that builds a recording tracer and the only place this
-    processor is installed.
-    The check sits in the processor rather than in the exporter because SimpleSpanProcessor.on_end
-    wraps the export call in `except Exception` and only logs, so an exporter that raised would be
-    swallowed and the suite would stay green while validating nothing. Span.end calls on_end with no
-    such guard, so raising before delegating reaches the test.
-    """
+    """Validate payload attributes before exporting each span."""
 
     @override
     def on_end(self, span: ReadableSpan) -> None:
-        """Validate the ending span's payload attributes, then hand it to the exporter.
+        """Validate and export the ending span.
 
         Raises:
             AssertionError: the span carries a payload that does not conform to its schema.
@@ -224,7 +169,7 @@ class _SchemaValidatingSpanProcessor(SimpleSpanProcessor):
 
 
 def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
-    """Build a fresh recording tracer whose spans are schema-validated, then land in an exporter."""
+    """Build a schema-validating in-memory tracer."""
     exporter = InMemorySpanExporter()
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(_SchemaValidatingSpanProcessor(exporter))
@@ -240,8 +185,7 @@ class _RaisingSpanProcessor(SpanProcessor):
     """A SpanProcessor whose on_end raises.
 
     Span.end calls on_end with no guard of its own, so this raise reaches whatever ended the span.
-    Raising here rather than from an exporter is what makes the raise observable: the bundled
-    SimpleSpanProcessor catches its exporter's failure and only logs.
+    on_end raises observably before SimpleSpanProcessor catches exporter failures.
     """
 
     @override
@@ -264,8 +208,7 @@ def _raising_processor_tracer() -> trace.Tracer:
 def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None:
     """A broken SpanProcessor costs the telemetry, never the result the call returned.
 
-    Every entry point that owns a span is driven, because a guard added to one of them and missed on
-    another is the failure this asserts against: each ends its span on its own path.
+    Each span-owning entry point suppresses SpanProcessor failures.
     """
 
     async def scenario() -> None:
@@ -327,13 +270,7 @@ class _IsRecordingRaisesTracer(trace.NoOpTracer):
 
 
 def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -> None:
-    """A span implementation that raises from is_recording costs the telemetry, never the error.
-
-    The read runs while the InvalidRequestError unwinds, so an unguarded one replaces the error the
-    caller came for with the span's RuntimeError.
-    capture_message_content is True so _apply_content_attributes reads the span at span start, not
-    only _apply_result_attributes as the InvalidRequestError unwinds.
-    """
+    """A broken span cannot replace InvalidRequestError."""
 
     async def scenario() -> None:
         """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
@@ -480,8 +417,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
 def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None:
     """A rejected request takes error status under its own error.type, not the base class name.
 
-    error.type is the low-cardinality key a backend groups failures by, so a provider rejection and
-    an error langchaint could not name must not land in one bucket.
+    error.type distinguishes provider rejection from unknown errors.
     """
 
     async def scenario() -> None:
@@ -531,8 +467,7 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
 def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> None:
     """The traced handle surfaces the wrapped handle's abandoned, the only account of a cut-off stream.
 
-    Without the pass-through a caller who wrapped their LLM in TracedLLM would lose it, the wrapper
-    being the object they hold.
+    TracedLLM preserves the source LLM's async context manager.
     """
 
     async def scenario() -> None:
@@ -574,13 +509,7 @@ async def _drain_by_final(handle: TracedStreamHandle[str]) -> None:
 def test_a_traced_streams_expired_deadline_takes_error_status(
     drain: Callable[[TracedStreamHandle[str]], Awaitable[None]],
 ) -> None:
-    """timeout_seconds expiring is the call's result, so the span records it however the block drains.
-
-    The expiry reaches the wrapper as a cancellation, in __anext__ or in final(), and becomes a
-    TimedOutError only at the inner __aexit__. A wrapper that closed the span on the cancellation
-    would leave untraced the same failure generate_one records in full, and it takes both drains to
-    catch that, since either method could keep its own close.
-    """
+    """Stream deadlines record TimedOutError for each drain method."""
 
     async def scenario() -> None:
         """Drain a stream that stalls after its first item, under a deadline it outlasts."""
@@ -610,8 +539,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
 def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
     """A cancellation reaching a traced batch ends each started item's span, with no status set.
 
-    The span is all a cut-off item leaves behind, so a wrapper that ended one only on a result would
-    leak a span per item the cancellation caught mid-request.
+    Batch cancellation ends each started item span.
     """
 
     async def scenario() -> None:
@@ -657,12 +585,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
 
 
 def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> None:
-    """A mixed batch emits the spans its items would emit one by one, and nothing around them.
-
-    Each item is one outbound call and gets the CLIENT chat span generate_one gives one call,
-    attributed from that item's own outcome. A span over the batch would be the one clue in the
-    traces that generate_many was called rather than generate_one, and there is none.
-    """
+    """generate_many emits one chat span per item."""
 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
@@ -837,12 +760,7 @@ def test_stream_never_entered_emits_no_span() -> None:
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
-    """A stream that raises after its first item ends the span the way final()'s failures do.
-
-    The failure concludes the call as a RetryUnavailableError, so the span carries that class in
-    error.type and one attempt_failed event, and records no exception event: which method the
-    failure surfaced from must not change the span a class produces.
-    """
+    """A stream failure records RetryUnavailableError and attempt_failed."""
 
     async def _drain(traced: TracedLLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
@@ -873,8 +791,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes() -> None:
     """Retries exhausted while opening ends the span the way a failure read from final() does.
 
-    __aenter__ raises a GenerationError like any other, so its span carries error.type and the
-    call's attributes rather than a bare exception event; which method raised must not decide that.
+    __aenter__ GenerationError records error.type and call attributes.
     """
 
     async def scenario() -> None:
@@ -1020,12 +937,7 @@ def test_traced_bind_and_rebind_forward_max_attempts() -> None:
 
 
 def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
-    """A custom attribute_mapper displaces every mapped gen_ai key, keeping only the required one.
-
-    The mapper owns the result-derived attributes, so none of gen_ai_attributes' keys survive it.
-    gen_ai.operation.name is the exception by design: the wrapper sets it at span start, before the
-    mapper runs, because the convention marks it required on the span kinds it defines.
-    """
+    """A custom attribute_mapper replaces default result attributes."""
 
     async def scenario() -> None:
         """Generate under a two-key mapper and assert the span carries those two plus the required one."""
@@ -1222,8 +1134,7 @@ def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> Spa
     """Pin the mapper covariance: a Response[_Answer] must satisfy the Response[object] parameter.
 
     pyrefly type-checks this module,
-    so a break in Response's inferred OutputT covariance surfaces as a type error on the call below
-    rather than as a runtime surprise.
+    Response OutputT covariance is checked statically by the call below.
     """
     return mapper(response)
 
@@ -1301,12 +1212,7 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
 
 
 def test_gen_ai_attributes_is_public_and_composable() -> None:
-    """A custom mapper extending gen_ai_attributes lands every standard key plus the added one.
-
-    The extension is a value derived from the result, the case a mapper exists for:
-    a constant would ride in through extra_attributes instead.
-    Deriving it also proves the mapper receives the real result, not a stand-in carrying only the mapped keys.
-    """
+    """A custom mapper can extend gen_ai_attributes with result data."""
 
     async def scenario() -> None:
         """Generate under a composed mapper and check a standard key and the derived key."""
@@ -1356,8 +1262,7 @@ async def _unserializable_schema_tool_function(_args: Mapping[str, object]) -> s
 def _unserializable_schema_tool() -> JSONSchemaTool:
     """Build a tool whose args_schema json.dumps cannot serialize.
 
-    args_schema is Mapping[str, object] the application supplies verbatim, so it can hold a value with no
-    JSON form; the set below is the smallest one.
+    args_schema may contain application values without a JSON form.
     """
     return JSONSchemaTool(
         name="broken",
@@ -1446,14 +1351,7 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     expected_outcome_type: type[DispatchOutcome],
     expected_error_type: str | None,
 ) -> None:
-    """Every dispatch emits one INTERNAL execute_tool span carrying the call's identity keys.
-
-    error.type is the one attribute the outcome decides, and its absence is what makes the span OK.
-    The function_authored_failure row shares the DispatchHandled variant with the handled row and
-    differs only in the ToolMessage's is_error, so classifying by variant alone fails it. The
-    unknown_tool row names a tool the manager does not hold, so the span is named for the name the
-    model called rather than for a tool that exists.
-    """
+    """Each dispatch emits one execute_tool span classified by its outcome."""
     expected_attributes: dict[str, object] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_call.name,
@@ -1617,8 +1515,7 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
 ) -> None:
     """A non-colliding extra lands on the span, and a dispatch-set key of the same name wins.
 
-    A dispatch span does not route through the helper the generate spans use, so the ordering is
-    written twice and a test of one site does not cover the other.
+    Dispatch spans apply extras independently of generate spans.
     """
 
     async def scenario() -> None:
@@ -1663,18 +1560,10 @@ def test_generate_many_passes_warm_cache_through() -> None:
 
 
 def test_each_convention_defined_span_kind_carries_the_required_operation_name() -> None:
-    """gen_ai.operation.name is set on every span this module opens.
-
-    One test over every kind rather than one assertion added to each kind's own test:
-    a required attribute missing from one span-opening site is the failure worth catching,
-    and that is visible only by covering the sites together.
-    The values are read in end order rather than keyed by span name, because three of the four
-    spans share the name "chat fake-model"; keying by name would collapse them and let a wrong
-    value on one of the three pass.
-    """
+    """Each traced span carries its required gen_ai.operation.name."""
 
     async def scenario() -> None:
-        """Open one span of each kind and read the operation name each carries, in end order."""
+        """Open each span kind and inspect completion order."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
         bound = traced.bind()
@@ -1816,12 +1705,7 @@ def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() 
 
 
 def test_agent_span_extra_attributes_cannot_displace_identity_or_usage_keys() -> None:
-    """An extra sharing a key with an identity or usage attribute loses the collision.
-
-    Same rule as every Traced class's extra_attributes: what this module sets itself wins. The extras
-    are set first at exit and the identity keys are set again after them, so even the keys written at
-    span start cannot be displaced by an exit-time extra.
-    """
+    """Agent identity and Usage attributes override colliding extras."""
     tracer, exporter = _in_memory_tracer()
     spent = Usage(
         input_tokens_cache_read=0,
@@ -1859,12 +1743,7 @@ def test_agent_span_extra_attributes_cannot_displace_identity_or_usage_keys() ->
 def test_agent_span_logs_a_raising_usage_callable_instead_of_propagating(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A raise from usage() or extra_attributes() is logged, never propagated.
-
-    The callables run in agent_span's finally, so propagating would displace the exception already
-    unwinding the loop; here the body's RuntimeError must survive both callables raising, and the
-    extras guard is separate from the usage guard, so neither failure hides the other's log line.
-    """
+    """Exit attribute failures log without replacing the body error."""
     tracer, exporter = _in_memory_tracer()
 
     def raising_usage() -> Usage:
@@ -1895,12 +1774,7 @@ def test_agent_span_logs_a_raising_usage_callable_instead_of_propagating(
 
 
 def test_agent_span_ends_even_when_the_exit_attribute_pass_raises_a_base_exception() -> None:
-    """A usage() that raises past the Exception guards still leaves the span ended.
-
-    The exit attributes are set in a finally of their own, inside the finally that ends the span,
-    so no failure of the attribute pass can leave the span open. A BaseException is the case the
-    per-callable guards do not cover, and an unended span is invisible to every exporter.
-    """
+    """A BaseException from usage still ends the agent span."""
     tracer, exporter = _in_memory_tracer()
 
     def raising_usage() -> Usage:
@@ -1921,27 +1795,13 @@ def test_agent_span_ends_even_when_the_exit_attribute_pass_raises_a_base_excepti
 
 
 def _emitted_convention_keys() -> set[str]:
-    """Collect every quoted gen_ai.* literal in the tracing module's source.
-
-    Reads the source rather than a hand-kept list, so a key added to the module without a matching
-    constant is caught by the next run instead of by a reader noticing.
-    Bare gen_ai.* mentions in the module docstring carry no quote and are not collected.
-    """
+    """Collect quoted gen_ai.* literals from the tracing module."""
     source = pathlib.Path(inspect.getfile(langchaint.tracing)).read_text()
     return set(re.findall(r'"(gen_ai\.[a-z_.]+)"', source))
 
 
 def test_emitted_convention_keys_are_defined_at_the_pinned_revision() -> None:
-    """Every gen_ai.* key the module emits, and error.type, resolves in the installed semantic conventions.
-
-    opentelemetry-api does not depend on semantic-conventions, which is why the module writes bare string
-    literals; importing semconv at runtime would break its api-only import tenet.
-    opentelemetry-sdk pins opentelemetry-semantic-conventions exactly and the tests already require the sdk,
-    so the constants are present here and absent from the runtime dependency set.
-    Because that pin is exact, this also fires on an sdk bump, which is when a renamed or withdrawn key
-    needs to be heard about.
-    It cannot check that a key is semantically right, nor check payload shapes.
-    """
+    """Each emitted convention key exists in the installed conventions."""
     defined = {
         value
         for name, value in vars(gen_ai_semconv).items()
@@ -1954,22 +1814,9 @@ def test_emitted_convention_keys_are_defined_at_the_pinned_revision() -> None:
 
 
 def test_vendored_schemas_and_the_payload_attributes_account_for_each_other() -> None:
-    """The schema files on disk, the attributes claiming them, and the module's emitted keys agree.
+    """Vendored schemas match mapped and emitted payload attributes.
 
-    Three sets that drift apart independently: the schemas refreshed into semconv_genai, the
-    attribute-to-schema pairing that decides what is fetched and how SOURCE.md labels it, and the
-    keys the tracing module writes. A schema nobody claims is dead weight nothing validates, and a
-    claimed attribute the module never emits both mislabels SOURCE.md and leaves its schema
-    validating nothing, so each direction fails here rather than passing quietly.
-    Whether a claimed attribute reaches a span is a separate question, since a key can be emitted
-    somewhere in the module and still never appear in a test; that is
-    test_every_payload_attribute_reaches_validation.
-    Those three set comparisons all survive a mispairing, two payload attributes trading schemas,
-    because a swap changes neither set. The pairing is checked by derivation instead: upstream names
-    each schema file after the attribute it describes, dots and underscores becoming dashes, so the
-    expected filename follows from the key and a swap fails without a second copy of the map to
-    compare against. An upstream file that breaks that naming fails here too, which is the reason
-    ATTRIBUTE_SCHEMA_FILES stays a written-out map rather than a comprehension over the keys.
+    Each schema filename is derived from its payload attribute.
     """
     vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
     assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
@@ -2069,21 +1916,11 @@ def test_refresh_validates_registry_before_writing(
 
 
 def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:
-    """The payload _UNVALIDATED_PAYLOAD_ATTRIBUTES exempts is still one the schema rejects.
-
-    An exemption that outlives the disagreement it was written for is dead weight nothing reports,
-    so this asserts the violation rather than the conformance: it fails when upstream gives
-    gen_ai.tool.call.arguments a variant that admits a non-object, which is the moment to delete the
-    exemption and let the payload validate like every other.
-    It reads the attribute off a real dispatch, so what is checked is the value the module emits.
-    Producing a violating payload takes a scenario written for the one attribute, so the exempt set
-    is pinned whole here instead of iterated: a second exemption fails this assertion, which is the
-    request for the scenario that would justify it.
-    """
+    """The exempted payload still violates its schema."""
     assert frozenset({"gen_ai.tool.call.arguments"}) == _UNVALIDATED_PAYLOAD_ATTRIBUTES
 
     async def scenario() -> None:
-        """Dispatch a call whose arguments are not JSON and confirm the emitted payload violates."""
+        """Dispatch malformed arguments and validate the emitted payload."""
         tracer, exporter = _in_memory_tracer()
         tool_manager = TracedToolManager(
             [_echo_tool()], tracer=tracer, capture_message_content=True
@@ -2098,18 +1935,10 @@ def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:
 
 
 def test_every_payload_attribute_reaches_validation() -> None:
-    """Each schema is exercised by a payload a span actually carried, not merely declared.
-
-    A vendored schema whose attribute no span produces validates nothing, and every other assertion
-    here stays green while that is true, since they compare declared keys against the tracing
-    module's source rather than against emitted spans.
-    This drives the two span kinds that between them carry all six attributes rather than reading
-    what earlier tests happened to leave behind, so it reports the same way whether the suite runs
-    whole or one test at a time.
-    """
+    """Each payload attribute reaches schema validation."""
 
     async def scenario() -> None:
-        """Generate over a full Sequence[Message], then dispatch a tool call with object arguments."""
+        """Generate and dispatch values containing each payload attribute."""
         tracer, _exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
         bound = traced.bind(
@@ -2128,15 +1957,7 @@ def test_every_payload_attribute_reaches_validation() -> None:
 
 
 def test_a_payload_that_violates_its_schema_fails_the_span() -> None:
-    """A span carrying a malformed payload raises as it ends, so the validation cannot silently no-op.
-
-    Every other assertion here passes when the payloads conform, so all of them stay green if the
-    validation stops running at all, the failure mode that would make the whole schema apparatus
-    look healthy while testing nothing. A raise that the span pipeline swallows rather than
-    propagates is one way to reach it, which is why this asserts the failure arrives at the caller
-    and not merely that the validator raises.
-    gen_ai.output.messages is an array of messages, so a bare object violates it.
-    """
+    """Span completion propagates payload schema violations."""
     tracer, _exporter = _in_memory_tracer()
     with (
         pytest.raises(AssertionError, match=re.escape("gen_ai.output.messages violates")),
@@ -2229,14 +2050,10 @@ def _captured(exporter: InMemorySpanExporter, key: str) -> object:
 
 
 def test_capture_off_leaves_every_content_key_off_the_span() -> None:
-    """capture_message_content False emits none of the four content keys, even with all four sources present.
-
-    Kept separate from the absent-source tests below: those omit a key because its source is empty,
-    and would pass vacuously against a capture-off implementation.
-    """
+    """capture_message_content=False omits content attributes with populated sources."""
 
     async def scenario() -> None:
-        """Generate under a binding carrying a system prompt and a tool, with capture off."""
+        """Generate with populated content sources and capture disabled."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
@@ -2388,13 +2205,7 @@ def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data(
 def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_array(
     adapter: _FakeAdapter,
 ) -> None:
-    """A turn without readable text emits a message with empty parts.
-
-    The empty array is the deliberate exception to the omit-an-absent-source rule: there was an
-    assistant turn, and it held nothing the convention's parts can carry. Both convention parts
-    require a content string, so both empty ReasoningPart.text values are excluded.
-    ReasoningPart.raw reaches no span.
-    """
+    """A turn without readable text records empty output parts."""
 
     async def scenario() -> None:
         """Generate the turn and read the output messages back."""
@@ -2558,8 +2369,7 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
 ) -> None:
     """A JSONSchemaTool args_schema json.dumps cannot serialize leaves the call and its result intact.
 
-    Serializing it raises inside the tracing wrapper, which catches it the same way it catches a raising
-    AttributeMapper.
+    The tracing wrapper catches serialization errors.
     The three input keys build as one dict, so the failure drops all three rather than a subset.
     """
 
@@ -2590,14 +2400,7 @@ def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_calle
 def test_unserializable_content_leaves_the_stream_and_its_span_intact(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The stream path holds the same guarantee generate_one does, at _start_span.
-
-    _start_span is the one site on this path a reachable value can fail at.
-    An unserializable args_schema reaches json.dumps only through _input_content_attributes;
-    every field final()'s output build serializes is typed str.
-    _start_span runs in __aenter__ outside its own try, so an unguarded raise there would both
-    kill the stream before it opens and orphan the span.
-    """
+    """Unserializable input content preserves the stream and span."""
 
     async def scenario() -> None:
         """Stream to completion with the unserializable tool bound, then read the span and the log."""
@@ -2695,13 +2498,7 @@ def test_tool_span_captures_arguments_and_result_under_capture() -> None:
 def test_tool_span_arguments_fall_back_when_the_parse_cannot_re_serialize_as_json(
     args_json: str,
 ) -> None:
-    """Input whose parse does not round-trip as JSON falls back to the raw text.
-
-    Python's json accepts and emits Infinity and NaN, which JSON has no syntax for, and reaches them
-    from ordinary input too (1e400 overflows to inf). Emitting the parsed value would put a bare
-    Infinity or NaN token on the span, which a strict consumer rejects, so these route to the
-    raw-text fallback and go out as a JSON string instead.
-    """
+    """Non-finite argument values fall back to args_json."""
 
     async def scenario() -> None:
         """Dispatch a call carrying the number and read the attribute back."""
@@ -2716,13 +2513,7 @@ def test_tool_span_arguments_fall_back_when_the_parse_cannot_re_serialize_as_jso
 
 
 def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_parse() -> None:
-    """Malformed argument text is preserved on the span, as a JSON string rather than as raw bytes.
-
-    The deserialization is best effort, so the span still shows what the model emitted rather than
-    dropping the key or raising; the outcome is the DispatchInvalidToolArgs variant reporting the same input.
-    The attribute goes out through the same re-serialization as a parsed value, so the text arrives
-    quoted and escaped; a consumer decodes the attribute and gets the original back.
-    """
+    """Malformed args_json is preserved as a JSON string."""
 
     async def scenario() -> None:
         """Dispatch a call whose argument text is not JSON and read the attribute back."""
@@ -2740,13 +2531,7 @@ def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_pa
 
 
 def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
-    """A parsed argument object nests inside gen_ai.input.messages; unparseable text stays a string there.
-
-    This is the site where the nesting matters: the parts array is serialized as a whole, so a parsed
-    object arrives as nested JSON rather than as a string a consumer decodes a second time.
-    One turn carrying both kinds pins them against each other, so an implementation that parsed every
-    call, dropping or raising on the second, fails here.
-    """
+    """Input tool calls preserve parsed objects and malformed text."""
 
     async def scenario() -> None:
         """Generate over a turn holding one parseable and one unparseable tool call."""
@@ -2786,13 +2571,7 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
 def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
     args_json: str, expected: object
 ) -> None:
-    """Best effort covers any JSON value, not only an object, so a non-object nests rather than falling back.
-
-    The convention expects an object here and every other argument test feeds one, so an implementation
-    that parsed and then kept the text unless the result was a dict would pass all of them.
-    A model producing a non-object is what the DispatchInvalidToolArgs variant reports; the span records
-    the value it produced.
-    """
+    """Input tool calls preserve parsed non-object values."""
 
     async def scenario() -> None:
         """Generate over a turn whose tool call carries a non-object argument value."""
@@ -2814,12 +2593,7 @@ def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
 
 
 def test_an_ordinary_float_argument_survives_the_parse() -> None:
-    """A finite float nests as the number it is, so the number hooks reject only what cannot round-trip.
-
-    The other argument tests carry strings and integers, which reach json.loads' parse_int, never its
-    parse_float; without this case a parse_float that rejected every input would pass them all,
-    since the non-finite cases expect the fallback anyway.
-    """
+    """A finite float remains numeric in traced tool arguments."""
 
     async def scenario() -> None:
         """Generate over a turn whose tool call carries a finite float and read the arguments back."""
@@ -2866,13 +2640,7 @@ def test_tool_span_capture_off_omits_both_content_keys() -> None:
 
 
 def test_tool_span_captures_the_result_on_both_variants_where_no_tool_ran() -> None:
-    """gen_ai.tool.call.result is recorded on both failure variants, beside the error.type saying why.
-
-    The convention defines the key as the result "if any and if execution was successful", so recording it
-    here is the deliberate departure the TracedToolManager docstring states.
-    Pinned in both directions on each variant: the langchaint-rendered correction is what the model reads and
-    adapts to, and error.type on the same span is what tells a consumer no tool produced it.
-    """
+    """Tool failure spans record the model-facing result and error.type."""
 
     async def scenario() -> None:
         """Dispatch an off-list name and an invalid-argument call under capture, checking each span."""
@@ -2907,20 +2675,11 @@ _CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"
 def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
     *, capture_message_content: bool
 ) -> None:
-    """A rejected 200's turn reaches the span as gen_ai.output.messages under capture, and nowhere else.
-
-    The failure spends two attempts, so the per-attempt event loop runs over a record holding the turn;
-    a single-attempt case would leave the most exposed site unexercised.
-    The False run pins that no unconditional site leaks the turn, the True run that the one gated
-    emission is the only route it takes.
-    error_text and __str__ carry the reason only under either value, because the tracing layer writes
-    both into spans whatever the caller configured; the turn reaches the caller off the error and
-    off its attempt row instead.
-    """
+    """A failed turn reaches spans only through gated gen_ai.output.messages."""
     turn = AssistantMessage(turn=(TextPart(text=_CONTENT_SENTINEL),))
 
     async def scenario() -> None:
-        """Fail one attempt transiently, reject the next 200, and inspect every channel."""
+        """Fail two attempts and inspect content channels."""
         adapter = _FakeAdapter(
             failures=[
                 TransientError("the first attempt failed"),
@@ -2958,15 +2717,10 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
 
 
 def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reason() -> None:
-    """finish_reason is required on every output message, so a failure with no stop reason says "error".
-
-    An UnfinishedTurn carries the turn the 200 held and its error fixes no stop_reason, which is the
-    one combination that reaches the fallback. The tracer validates the payload against the vendored
-    schema on span end, so an omitted or off-enum value fails here.
-    """
+    """A failed turn without stop_reason records finish_reason="error"."""
 
     async def scenario() -> None:
-        """Drive an unfinished turn under capture and read the finish reason back off the span."""
+        """Capture an unfinished turn's finish_reason."""
         adapter = _FakeAdapter(
             failures=[
                 _billed(UnfinishedTurn(assistant_message=_REJECTED_TURN, reason="in_progress"))

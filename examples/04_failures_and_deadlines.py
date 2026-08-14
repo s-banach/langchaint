@@ -14,7 +14,7 @@ from langchaint.openai import OpenAI
 
 
 async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationError]:
-    """Run a batch under a deadline, then send every failed item to a second provider.
+    """Run a batch and send failed items to a second provider.
 
     Raises:
         OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.
@@ -31,7 +31,6 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     )
     fallback = openai.model("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
 
-    # This media_type is invalid for anthropic.
     scanned_page: list[Message] = [
         UserMessage(
             content=[
@@ -46,7 +45,7 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
         "The new compiler release cuts build times roughly in half.",
     ]
 
-    # The item clock stops during admission waits.
+    # Admission waits pause each item's clock.
     results = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
 
     for index, result in enumerate(results):
@@ -56,6 +55,6 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
         print(f"item {index} failed with {type(result).__name__}: {result.error_text}")
         print(f"item {index} billed {result.usage.cost_in_usd} USD before failing")
 
-        # `generate_one` raises if the fallback also fails.
+        # generate_one raises when fallback fails.
         results[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
     return results

@@ -1,8 +1,6 @@
-"""Gemini generateContent adapter tests over constructed SDK objects.
+"""Test Gemini generateContent with constructed SDK objects.
 
-These pin behavior the type checker cannot: the usage partition and its long-prompt repricing,
-finish-reason mapping, the thought-signature pairing and its replay, tool-call id synthesis and
-FunctionResponse name recovery, the adapter-owned stream assembly, and the parse and classify tables.
+Tests cover Usage, stop reasons, reasoning, tool calls, streams, and errors.
 """
 
 import asyncio
@@ -263,8 +261,7 @@ def _api_error(
 ) -> errors.APIError:
     """Build an APIError as raise_for_response builds one, its body the {"error": ...} envelope.
 
-    A response is attached only when headers are stated, so the RetryInfo rows also exercise the
-    response-less raise path a mid-stream error chunk takes.
+    RetryInfo rows exercise errors with and without responses.
     """
     details: list[dict[str, object]] = []
     if retry_delay is not None:
@@ -640,11 +637,7 @@ def test_service_tier_lands_on_the_config() -> None:
 def test_extra_body_keys_the_adapter_populates_are_refused(
     extra_body: Mapping[str, object],
 ) -> None:
-    """A key the adapter populates raises at bind in any spelling the SDK merge would match.
-
-    The SDK matches extra_body keys to wire keys ignoring case and underscores, so the rows cover
-    the documented spellings and the normalized ones that would otherwise slip past an exact check.
-    """
+    """Binding rejects extra_body keys that duplicate adapter fields."""
     with pytest.raises(ValueError, match="collide"):
         _ = _adapter().bind_text(_binding(extra_body=extra_body))
 
@@ -907,8 +900,7 @@ def test_a_thought_part_replays_byte_identical() -> None:
 def test_an_executable_code_part_becomes_a_raw_part_and_replays_as_itself() -> None:
     """An executable_code Part becomes RawPart and returns unchanged.
 
-    The response was billed for that part, so dropping it would destroy output the caller paid for
-    and leave a tool loop continuing from a turn the model did not produce.
+    The billed raw part remains in the turn for replay.
     """
     original = types.Part(
         executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
@@ -1652,12 +1644,7 @@ def test_close_closes_the_sdk_iterator() -> None:
 
 
 def test_open_stream_performs_the_connection_io(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A first-pull failure raises from open_stream, and a pulled first chunk still streams first.
-
-    The SDK's generate_content_stream returns an unstarted async generator whose first pull does
-    the connection I/O, so open_stream must pull the first chunk for BoundAdapter.open_stream's
-    connection-I/O contract to hold.
-    """
+    """open_stream pulls and preserves the first chunk."""
     adapter = _adapter()
     bound = adapter.bind_text(_binding())
     request = bound.build_request([UserMessage(content="hi")])
@@ -1713,12 +1700,7 @@ def _executable_code_part() -> types.Part:
 def _reasoning_turn_response(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
 ) -> types.GenerateContentResponse:
-    """One thought part carrying signature bytes, one executable_code part, then one text part.
-
-    The SDK models forbid unknown keys, so no fixture can carry a key the installed SDK does not
-    name; the signature bytes are the payload an adapter that rebuilt parts from its own model
-    would drop.
-    """
+    """Build reasoning, executable-code, and text parts."""
     return _response(
         [
             types.Part(thought=True, text="check first", thought_signature=b"\x00\x01sig"),
@@ -1783,8 +1765,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
         """Return one turn as assembled_response builds it and as a whole response.
 
-        The turn ends with the executable_code part, so the assembly is read on a part the adapter
-        models nothing inside as well as on the text it merges.
+        Assembly preserves terminal executable_code and merged text.
         """
         chunks = [
             _response([types.Part(text="Hel")], finish_reason=None),
@@ -1810,13 +1791,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the adapter's whole exception table.
-
-        The transport rows are the failures the SDK's own retry predicate names retryable.
-        A status row states the name a DoNotRetry failure takes, never whether it is retried:
-        every 4xx is this request's rejection, and any other code is one langchaint has no
-        account of. ValueError stands in for an exception the adapter cannot place.
-        """
+        """Return Gemini error classification cases."""
         return {
             httpx.ConnectError("no route"): "transient",
             httpx.ReadTimeout("slow"): "transient",
@@ -1831,12 +1806,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the parse rows: every listed status, both defaults, both retry-after sources.
-
-        The statuses come from the troubleshooting page parse_gemini's docstring cites, plus the
-        408 and 502 rows it sources from the SDK's own retryable set; 418 and 599 exercise the
-        two fallthrough defaults.
-        """
+        """Return Gemini error verdict cases."""
         return {
             _api_error(429, headers={"retry-after": "7"}): PauseAll(retry_after=7.0),
             _api_error(429, retry_delay="32s"): PauseAll(retry_after=32.0),

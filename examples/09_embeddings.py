@@ -1,4 +1,4 @@
-"""Create retrieval embeddings and generation through one `OpenAI`."""
+"""Create retrieval embeddings and generation through one OpenAI."""
 
 import numpy as np
 

@@ -22,7 +22,7 @@ async def get_weather(args: WeatherArgs) -> str:
 
 
 async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
-    """Trace each generation and dispatch until the model returns text.
+    """Trace generation and dispatch until the model returns text.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

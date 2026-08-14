@@ -1,9 +1,6 @@
-"""OpenAI Responses adapter helpers over constructed SDK objects.
+"""Test OpenAI Responses with constructed SDK objects.
 
-These pin behavior the type checker cannot:
-the usage partition derived by subtracting cache counts from input_tokens and its cross-check, cost arithmetic,
-input-item placement, tool-choice translation, stop-reason derivation (the API reports no finish reason),
-the zero-usage fallback when a response omits usage, and the request fields the binding precomputes.
+Tests cover Usage, input items, tool choice, stop reasons, streams, and requests.
 """
 
 import asyncio
@@ -472,8 +469,7 @@ def test_stop_reason_mapping(
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """A refusal content part becomes a TextPart, so the refused turn replays as the model wrote it.
 
-    Dropped instead, the turn holds no TurnPart values and sends nothing back, which reopens the
-    Sequence[Message] at the point the model declined.
+    The refusal remains in the turn for replay.
     """
     assistant_message = _assistant_message_from(
         _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
@@ -522,8 +518,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
 def test_a_built_in_tool_call_becomes_a_raw_part_and_replays_as_itself() -> None:
     """A built-in tool call becomes RawPart and returns unchanged.
 
-    The response was billed for that item, so dropping it would destroy output the caller paid for
-    and leave a tool loop continuing from a turn the model did not produce.
+    The billed raw item remains in the turn for replay.
     """
     response = _response(usage=None, output=[_WEB_SEARCH_OUTPUT_ITEM, _TEXT_OUTPUT_ITEM])
     assistant_message = _assistant_message_from(response)
@@ -578,16 +573,7 @@ def _reasoning_item(
 def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_without_text(
     summary: tuple[str, ...], content: tuple[str, ...] | None, expected_text: str | None
 ) -> None:
-    r"""Parts join on a blank line. Empty joined text leaves ReasoningPart.text as None.
-
-    Content is the reasoning the summary is a rendering of, so it wins wherever it has text.
-    Branching on whether the content list is present, rather than on the text it joins to, drops a
-    summary into an unreportable None whenever content is present but empty.
-    Parts join on a blank line because each is a separately delimited unit, and joining on the empty
-    string runs one part's last line into the next one's first.
-    Present-but-empty parts are what a trailing falsy check alone misses: two of them join into
-    "\n\n", which is truthy, so it would reach a span as a reasoning part carrying nothing.
-    """
+    """Reasoning text prefers content, joins parts, and excludes empty text."""
     response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
     reasoning_part = _assistant_message_from(response).turn[0]
     assert isinstance(reasoning_part, ReasoningPart)
@@ -595,10 +581,7 @@ def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_with
 
 
 def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item() -> None:
-    """A message item with two text parts yields two adjacent TextParts.
-
-    On consume, the maximal adjacent run re-joins into one assistant message item.
-    """
+    """Output splits text parts and input rejoins adjacent text parts."""
     two_part_message: dict[str, object] = {
         "type": "message",
         "id": "m1",
@@ -615,12 +598,7 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
 
 
 def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
-    """A produced ReasoningPart re-validates equal from JSON.
-
-    Persistence serializes Sequence[Message] through TypeAdapter.
-    Replay under store=False re-reads encrypted_content from ReasoningPart.raw.
-    The round trip must restore ReasoningPart.raw exactly.
-    """
+    """ReasoningPart.raw survives Message JSON serialization."""
     reasoning_item = _reasoning_item(summary=("thought it over",))
     reasoning_item["encrypted_content"] = "enc-1"
     response = _response(usage=None, output=[reasoning_item, _TEXT_OUTPUT_ITEM])
@@ -750,8 +728,7 @@ def _adapter(
 ) -> OpenAIResponsesAdapter:
     """Build an adapter over a keyless client, valid because no request is sent.
 
-    supports_prompt_cache_options defaults True, the gpt-5.6-and-later case, so every caller
-    that does not name it exercises the path where a binding's caching value reaches the wire.
+    supports_prompt_cache_options=True sends the binding's cache setting.
     """
     return OpenAIResponsesAdapter(
         client=AsyncOpenAI(api_key="test"),
@@ -800,13 +777,7 @@ def test_request_assembles_the_reasoning_object_key_by_key(
     reasoning_effort: ReasoningEffort | None,
     expected_reasoning: dict[str, str] | None,
 ) -> None:
-    """A key travels only where it is set, and neither set sends no reasoning object at all.
-
-    A summary is reached through the same object effort travels in, so gating that object on effort
-    would silently ask for no summary whenever a caller set one without an effort. An explicit null
-    summary is a different request from omitting the key, which is what key-by-key assembly buys
-    over one Reasoning(effort=..., summary=...) call.
-    """
+    """The request includes only stated reasoning fields."""
     precomputed_fields = _adapter(reasoning_summary=reasoning_summary)._precompute_fields(
         _binding(automatic_cache_breakpoints=True, reasoning_effort=reasoning_effort)
     )
@@ -858,12 +829,7 @@ def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises(
 
 
 def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
-    """LLM.bind raises, so one bad configuration fails once rather than per item in a batch.
-
-    bind converts eagerly, so this asserts the raise is not deferred to a request method, where a
-    generate_many would send one doomed request per item and return one failure row per item.
-    The match names the model, which is what tells a caller with several LLMs which one refused.
-    """
+    """LLM.bind rejects unsupported cache configuration before requests."""
     llm = LLM(_adapter(supports_prompt_cache_options=False))
     with pytest.raises(ValueError, match="model 'm'"):
         _ = llm.bind(automatic_cache_breakpoints=False)
@@ -872,8 +838,7 @@ def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     """A stated service_tier lands on the request; None leaves the omit sentinel.
 
-    The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
-    different request from omitting the key.
+    The sentinel omits an unstated tier from the request.
     """
     binding = _binding(automatic_cache_breakpoints=True)
     assert isinstance(_adapter()._precompute_fields(binding).service_tier, openai.Omit)
@@ -1088,8 +1053,7 @@ def test_the_request_sends_extra_body_by_reference(
 class _FakeSDKStream(AsyncResponseStream[None]):
     """Replays constructed events without a connection.
 
-    Overrides exactly the surface _OpenAIStream uses (iteration, close, and the _response its
-    headers are read off);
+    Overrides iteration, close, and _response for _OpenAIStream.
     the base __init__ is deliberately not called, so the untouched base machinery stays unusable.
     """
 
@@ -1161,8 +1125,7 @@ def _kwarg_sent[OutputT](
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
     """The stream's own response is the only channel a streamed turn has for the header.
 
-    The response the SDK assembles from the events never carries it, so a null here would leave
-    every streaming call with no id to take to provider support.
+    _response supplies the streamed request ID for provider support.
     """
     assert _stream([], {"x-request-id": "req_stream"}).request_id() == "req_stream"
     assert _stream([]).request_id() is None
@@ -1295,8 +1258,7 @@ def test_stream_yields_both_reasoning_channels_as_reasoning_deltas() -> None:
 def test_a_summary_part_boundary_streams_the_assembled_reasoning_part_separator() -> None:
     """A part's done event puts a blank line before the next part's first delta.
 
-    The API breaks between two parts structurally and never sends it as text, so deltas concatenated
-    without it run the parts together.
+    A structural part boundary inserts a blank line between reasoning parts.
 
     The streamed text must match the completed ReasoningPart.text.
     """
@@ -1337,7 +1299,7 @@ def test_the_reasoning_text_channel_separates_its_parts_the_same_way() -> None:
 def test_a_pending_separator_crosses_from_one_reasoning_channel_to_the_other() -> None:
     """A summary part's done event separates it from a content delta, the next reasoning text.
 
-    The pending separator belongs to the stream, not to the channel that armed it.
+    The pending separator belongs to the stream, not to the channel that created it.
     """
     translated = _collected_items([
         _summary_delta_event("First.", 0, 1),
@@ -1368,13 +1330,7 @@ def test_a_pending_separator_crosses_from_one_reasoning_channel_to_the_other() -
 def test_a_summary_part_that_streamed_no_text_leaves_the_next_part_unseparated(
     replay_events: Sequence[ResponseStreamEvent],
 ) -> None:
-    """A part that streamed no text arms nothing, so the reasoning never opens on a blank line.
-
-    A summary part holding no text is dropped from ReasoningPart.text, and the stream owes the
-    same: a separator falls between two reasoning deltas or not at all. An empty delta is not text
-    either, so counting it as one would open the reasoning on a blank line, its part having
-    contributed nothing for a separator to follow.
-    """
+    """An empty summary part does not add a separator."""
     assert _collected_items(replay_events) == [ReasoningDelta(text="thought it over")]
 
 
@@ -1390,7 +1346,7 @@ def test_an_empty_delta_does_not_consume_the_pending_separator() -> None:
 
 
 def test_an_empty_delta_keeps_the_separator_for_the_next_delta_that_carries_text() -> None:
-    """The separator armed before a dropped delta still falls before the next part's text."""
+    """A pending separator before a dropped delta remains before the next part's text."""
     translated = _collected_items([
         _summary_delta_event("First.", 0, 1),
         _summary_done_event("First.", 0, 2),
@@ -1404,8 +1360,7 @@ def test_an_empty_delta_keeps_the_separator_for_the_next_delta_that_carries_text
 def test_a_done_event_with_no_delta_after_it_streams_no_trailing_separator() -> None:
     """The separator precedes the next reasoning delta, so a last part contributes none.
 
-    Answer text following the done event is untouched: only a reasoning delta consumes a pending
-    separator.
+    Only a reasoning delta consumes a pending separator.
     """
     translated = _collected_items([
         _summary_delta_event("thought it over", 0, 1),
@@ -1419,8 +1374,8 @@ def test_a_done_event_with_no_delta_after_it_streams_no_trailing_separator() -> 
 def test_stream_yields_argument_fragments_then_one_complete_tool_call() -> None:
     """A function_call's argument deltas yield ToolCallDelta items named through its added event.
 
-    The concatenated fragments are exactly the completed call's args_json, an empty fragment
-    yields nothing, and message item lifecycles are dropped.
+    Argument fragments concatenate into args_json.
+    Empty fragments and message lifecycles yield nothing.
     """
     message_added = ResponseOutputItemAddedEvent.model_validate({
         "type": "response.output_item.added",
@@ -1543,12 +1498,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
 
 
 def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -> None:
-    """A failed terminal ends the stream without a StreamProtocolError, and interpret reports the failure.
-
-    The API reported the run as not finished, so whatever text had accumulated is a fragment;
-    returning it as a Response would present that fragment as the turn. final() hands back the
-    response the run billed for, which billing_from_raw prices.
-    """
+    """A failed terminal returns raw for failure interpretation and Billing."""
 
     async def scenario() -> None:
         adapter_stream = _stream([
@@ -1570,14 +1520,7 @@ def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -
 
 
 def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() -> None:
-    """A terminal response holding an output item the strict model rejects still assembles.
-
-    The SDK builds a non-completed terminal response leniently, tolerating an item type it does not
-    model, so validating that response against the SDK's own strict model would raise
-    ValidationError and destroy a partial answer the caller has already been billed for.
-    final() hands back that object itself (identity, not equality): an equal copy would silently
-    introduce the per-request deep copy the no-rewrap rule bans.
-    """
+    """Final preserves a leniently constructed terminal response by identity."""
     unmodelled_item: dict[str, object] = {"type": "quantum_tool_call", "id": "q1"}
     leniently_built = construct_type_unchecked(
         type_=OpenAIResponse,
@@ -1624,12 +1567,7 @@ def test_final_before_items_are_exhausted_raises() -> None:
 
 
 def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -> None:
-    """An error event with no terminal response ends the drain as an APIStatusError.
-
-    The SDK forwards the event without raising, so this raise is the only path a mid-stream
-    failure has into parse_openai. The error carries the live response's 200 status, the event's
-    code where parse reads it, and the event's message unabridged.
-    """
+    """An error event without a terminal response raises APIStatusError."""
 
     async def scenario() -> None:
         adapter_stream = _stream([
@@ -1701,12 +1639,7 @@ def _structured_response(
     tool_call: bool = False,
     error: ResponseError | None = None,
 ) -> OpenAIResponse:
-    """Build a response whose message carries the given output text, or a refusal block.
-
-    text None gives a message with no content at all, the turn that carried nothing to validate;
-    refusal replaces the text part with a refusal part.
-    tool_call appends a function_call output item, which is what makes the turn a tool call.
-    """
+    """Build a response with optional text, refusal, and tool call."""
     content: list[object] = []
     if refusal:
         content.append({"type": "refusal", "refusal": "I can't help with that"})
@@ -1764,8 +1697,7 @@ def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> N
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
     """A completed turn whose text the response_format rejects is SchemaViolation.
 
-    validation_error_json names the rejected field, what rejected it, and the value, which is what
-    tells a caller whether to change the model or the prompt.
+    validation_error_json preserves the field, constraint, and rejected value.
     """
     outcome = _structured_parse(_structured_response('{"city": "Nairobi", "celsius": "SENTINEL"}'))
     assert isinstance(outcome, SchemaViolation)
@@ -1777,8 +1709,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """An incomplete turn whose JSON stopped mid-object is the truncation, not a schema violation.
 
-    This is the response the SDK's own parse raised on; reporting it as a variant is what lets the
-    retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
+    Truncated JSON at max_output_tokens returns MaxCompletionTokensExceeded.
     """
     outcome = _structured_parse(
         _structured_response(
@@ -1820,8 +1751,7 @@ def _text_bound() -> _BoundOpenAIText:
 def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
     """A refused turn's output is the text the model wrote, not the empty output_text.
 
-    The Response the caller reads then carries the same sentences in output and in
-    assistant_message.text, which is what a refusal under the anthropic adapter carries too.
+    Response.output and assistant_message.text carry the same refusal text.
     """
     response = _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM])
     result = _assert_result(_text_bound().interpret(response))
@@ -1829,12 +1759,7 @@ def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
 
 
 def test_identity_reads_the_responses_own_id_and_served_model() -> None:
-    """Both values come off the response verbatim, neither from the id the binding sent.
-
-    The response names a model other than the adapter's, so reading the sent id would fail here.
-    A response the SDK did not parse from an HTTP response body carries no request id, which is the
-    state every streamed response is in.
-    """
+    """ResponseIdentity uses the served model and optional request ID."""
     identity = _text_bound().identity_from_raw(
         _response(usage=None, model="m-2026-01-01"), request_id=None
     )
@@ -1861,8 +1786,7 @@ def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_valid
 def test_a_failed_run_carrying_a_refusal_takes_the_failure_variant_under_both_bindings() -> None:
     """A failed status wins over the refusal test, so one response does not split by binding.
 
-    Were the refusal tested first, the structured binding would report Refusal (a terminal
-    RefusalError) for a response the text binding retries.
+    Structured binding classifies incomplete before refusal.
     """
     structured_outcome = _structured_parse(
         _structured_response(None, refusal=True, status="failed", error=_SERVER_ERROR)
@@ -1954,8 +1878,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_
 def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> None:
     """An incomplete response for content_filter is Refusal, so the item fails once.
 
-    Retrying would send the same blocked request again for the whole retry budget
-    and bill for each attempt.
+    A blocked request returns a terminal failure without retries.
     """
     outcome = _structured_parse(
         _structured_response(
@@ -1994,9 +1917,7 @@ def test_the_structured_request_sends_the_text_parameter(
 ) -> None:
     """open_stream puts the precomputed text parameter on the request.
 
-    A request that dropped it would ask for no schema at all, and every turn would come back as
-    prose the response_format rejects, reported as the caller's model being wrong rather than as
-    the request that omitted its schema.
+    The request preserves the response schema in text.
     """
     adapter = _adapter()
     structured_bound = _BoundOpenAIStructured(
@@ -2012,8 +1933,7 @@ def test_the_structured_request_sends_the_text_parameter(
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
     """as_json holds the binding's precomputed fields and this call's converted input.
 
-    temperature is absent rather than null, because the binding set none and the request body carries
-    no such key.
+    An unstated temperature is absent from the request.
     """
     request = _structured_bound().build_request([UserMessage(content="hi")])
     assert isinstance(request, _OpenAIRequestParams)
@@ -2075,15 +1995,7 @@ def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> No
 
 
 def test_parse_openai_applies_a_directive_to_a_spend_limit_429_by_its_verdict() -> None:
-    """A spend-limit 429 is already DoNotRetry, so the directive moves it like any other one.
-
-    "false" leaves `DoNotRetry` and starts no pause.
-    The credits ran out.
-    "true" promotes the verdict to `RetryThisOne`.
-    OpenAI's client also retries this response.
-    `_should_retry` reads the header before `error.code`.
-    A guard written on the status instead of the verdict would pause here.
-    """
+    """x-should-retry overrides a spend-limit DoNotRetry verdict."""
     exhausted = status_error(
         openai.RateLimitError, 429, {"x-should-retry": "false"}, "credit_balance_exhausted"
     )
@@ -2097,8 +2009,7 @@ def test_parse_openai_applies_a_directive_to_a_spend_limit_429_by_its_verdict() 
 def test_parse_openai_ignores_a_retry_directive_on_the_streams_200_status() -> None:
     """A 200's headers belong to a request the provider accepted, so they judge no failure.
 
-    The failure is a mid-stream error event raised on that live response, which the SDK never
-    consults its retry predicate about, so the error code alone decides.
+    A mid-stream error at status 200 uses its error code.
     """
     throttled = status_error(
         openai.APIStatusError, 200, {"x-should-retry": "false"}, "rate_limit_exceeded"
@@ -2126,8 +2037,9 @@ def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> No
 def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
     """A 200 is a mid-stream error event's raise, so the code picks the verdict the status cannot.
 
-    server_error resends one attempt; rate_limit_exceeded pauses every sharing task, as its 429
-    form does; a terminal code does not retry and, being a listed row, leaves the counter alone.
+    server_error retries one request.
+    rate_limit_exceeded pauses SharedBackoff.
+    Terminal codes do not retry.
     """
     before = dict(PARSE_FALLTHROUGH_COUNTS)
     server_error = status_error(openai.APIStatusError, 200, error_code="server_error")
@@ -2152,8 +2064,8 @@ def test_parse_openai_counts_a_status_200_code_outside_the_table_as_a_fallthroug
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
     """The override reports the header the SDK read off the error response, None for any other error.
 
-    openai sends the id in x-request-id; a response without that header and an exception that never
-    reached one both give None.
+    OpenAI sends the request ID in x-request-id.
+    Missing headers return None.
     """
     adapter = _adapter()
     assert (
@@ -2272,13 +2184,9 @@ def test_request_str_system_travels_as_instructions_with_an_empty_prefix() -> No
 
 
 def _conformance_output() -> list[object]:
-    """Build a reasoning item, a built-in web search call, then a message item.
+    """Build reasoning, web-search, and message items.
 
-    The three map one to one onto their wire items.
-    The reasoning item carries a key the installed SDK does not name. An adapter that rebuilt the
-    item from its own pinned model would drop that key, which the API rejects on replay because
-    encrypted_content must arrive byte-identical.
-    The web search call has no other TurnPart variant.
+    The reasoning item carries an extra raw field.
     """
     return [
         _REASONING_OUTPUT_ITEM | {"field_newer_than_sdk": "x"},
@@ -2316,8 +2224,7 @@ class TestOpenAIResponsesConformance(AdapterConformance):
     def response_with_impossible_counters(self) -> BaseModel:
         """Return a turn whose cache counts sum past input_tokens.
 
-        The uncached counter is the subtraction, so counts summing past the total drive it below
-        zero.
+        Excess cache counts make the derived uncached counter negative.
         """
         return _response(
             usage=ResponseUsage(

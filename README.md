@@ -5,17 +5,15 @@ Alpha: the API is unstable and may change without notice.
 
 ## Purpose
 
-langchaint provides `BoundLLM` and `EmbeddingModel` as provider-neutral async interfaces.  
+langchaint provides provider-neutral async `BoundLLM` and `EmbeddingModel` interfaces.
 langchaint provides no agent class or agent loop.
-langchaint uses pyrefly with the strict `all` preset.
-Applications should use langchaint with a strict type checker.
-langchaint relies on static checking for argument types.
-langchaint does not repeat every argument type check at runtime.
+langchaint uses pyrefly's strict `all` preset.
+Applications should use a strict type checker because langchaint leaves argument-type checks to static checking.
 
 ## Install and authenticate
 
 langchaint requires Python 3.13 or newer.
-Applications install and pin each provider SDK directly.
+Applications install and pin each provider SDK.
 langchaint declares no dependency extras.
 Top-level `import langchaint` requires no provider SDK or `numpy`.
 Backend imports report missing dependencies through `ModuleNotFoundError`.
@@ -30,9 +28,9 @@ Backend imports report missing dependencies through `ModuleNotFoundError`.
 | OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `openai` (`numpy` and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
 | Amazon Bedrock | `OpenAIBedrock` | `LLM` | `openai[bedrock]` | AWS credential provider chain |
 
-Every listed class accepts `client=` for SDK client configuration.
-The Amazon Bedrock classes use the AWS credential provider chain.
-This includes environment credentials, profiles, SSO, containers, and instance roles.
+Every listed class accepts `client=`.
+Amazon Bedrock classes use the AWS credential provider chain.
+It includes environment credentials, profiles, SSO, containers, and instance roles.
 Pass `aws_region=` to select a Bedrock region explicitly.
 
 ## Generation quickstart
@@ -55,7 +53,7 @@ asyncio.run(main())
 
 `response.output` is assistant text.
 `regional_processing=False` uses the standard `1.0` token-price multiplier.
-Set it to `True` when the configured endpoint uses regional processing.
+Use `regional_processing=True` for an endpoint with regional processing.
 Pass a Pydantic model to `LLM.bind(response_format=...)` for validated structured output.
 
 ## Embedding quickstart
@@ -87,7 +85,7 @@ asyncio.run(main())
 ```
 
 `EmbeddingModel.embed()` requires `task` for every adapter.
-The OpenAI adapter sends no corresponding request field.
+The OpenAI adapter sends no `task` request field.
 `EmbeddingModel.embed()` returns normalized `Float2D` values with `numpy.float32` elements.
 Each input produces one row.
 
@@ -106,9 +104,8 @@ terra = openai.model("gpt-5.6-terra")
 sol = openai.model("gpt-5.6-sol")
 ```
 
-Both `terra` and `sol` use `openai.client` and one `SharedBackoff`.
-`max_concurrent_requests` applies across both `LLM` values.
-`max_request_starts_per_second` applies across both `LLM` values.
+`terra` and `sol` share `openai.client` and one `SharedBackoff`.
+`max_concurrent_requests` and `max_request_starts_per_second` apply across both `LLM` values.
 An `EmbeddingModel` from `openai.embedding_model()` uses the same client and `SharedBackoff`.
 
 Pass an SDK client to close it directly.
@@ -127,23 +124,19 @@ await client.close()
 
 ## Binding and results
 
-Call `LLM.bind()` before generating.
-`BoundLLM` provides `generate_one`, `generate_many`, and `stream_one`.
-`BoundLLM.rebind()` replaces selected binding fields.
-Pass `tools=[tool]` to `LLM.bind()`, then dispatch through `BoundLLM.tool_manager`.
+Call `LLM.bind()` before `generate_one`, `generate_many`, or `stream_one`.
+Use `BoundLLM.rebind()` to replace selected binding fields.
+Pass `tools=[tool]` to `LLM.bind()` and dispatch through `BoundLLM.tool_manager`.
 `LLM.bind(max_attempts=...)` limits requests for one `GenerationInput`, including the first.
-An embedding batch contains inputs sent together during each attempt.
-`embedding_model(max_attempts=...)` limits requests for one embedding batch, including the first.
-`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default`.
-Pass `automatic_cache_breakpoints` to override `Adapter.automatic_cache_breakpoints_default`.
+`embedding_model(max_attempts=...)` limits requests for one batch of inputs sent together, including the first.
+`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` unless `automatic_cache_breakpoints` overrides it.
 `cache_breakpoint=True` requests an explicit breakpoint at that `ContentPart`.
 `GenerateResult` and `GenerationError` include paid `Usage` across attempts.
 
 ## More examples
 
-[`examples/README.md`](examples/README.md) indexes focused examples and migration guidance.
-The examples cover structured output, batches, streaming, tools, tracing, pricing, and failures.
-They also cover prompt caching, reasoning, embeddings, and complete application structure.
+[`examples/README.md`](examples/README.md) indexes migration guidance and examples.
+The examples cover structured output, batches, streaming, tools, tracing, pricing, failures, prompt caching, reasoning, embeddings, and application structure.
 
 ## Development
 

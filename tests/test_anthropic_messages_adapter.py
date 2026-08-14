@@ -234,12 +234,7 @@ def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
 
 
 def test_billing_counts_the_writes_it_bills_for() -> None:
-    """The cache-write counters read the same source the cost does, so the two cannot disagree.
-
-    cache_creation_input_tokens and the cache_creation split are separate optional SDK fields with
-    no documented relationship, so a response carrying only the split would otherwise report a
-    cost covering 30 written tokens and a counter saying none were written.
-    """
+    """Cache-write counters and cost use the cache_creation split."""
     usage = _billing_from_sdk_usage(
         at.Usage(
             input_tokens=100,
@@ -432,11 +427,7 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
 
 
 def test_the_stored_write_price_is_the_blend_of_what_the_two_ttls_billed() -> None:
-    """A response mixing both write TTLs stores one write price, and it reproduces the write cost.
-
-    Usage collapses the two write counters into one, so neither TTL's own rate reproduces the cost;
-    the blend does, which is what lets a stored record reprice itself without the split counts.
-    """
+    """Mixed write TTLs store a blended cache-write price."""
     billing = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING)
     usage = billing.usage
     assert usage.input_tokens_cache_write == 30
@@ -548,11 +539,7 @@ def test_cache_ttl_is_stored_on_the_adapter() -> None:
     ],
 )
 def test_stop_reason_mapping(raw: str | None, expected: str) -> None:
-    """Recognized stop reasons map to their neutral name; everything else becomes other.
-
-    The overflow is the one that is renamed rather than passed through, and it must not fall to
-    "other": on a text binding, stop_reason is the only signal the caller gets for it.
-    """
+    """Map recognized stop reasons and use other as fallback."""
     assert _normalized_stop_reason(raw) == expected
 
 
@@ -643,8 +630,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
 def test_empty_thinking_text_normalizes_to_none() -> None:
     """A thinking block whose text is "" yields text None, the single text-free condition.
 
-    The openai adapter cannot produce "", so storing it here would give ReasoningPart.text
-    two values to test for, one of them provider-specific.
+    ReasoningPart.text uses None for missing reasoning across adapters.
     """
     message = _message_with_content([
         at.ThinkingBlock(type="thinking", thinking="", signature="sig")
@@ -675,8 +661,7 @@ def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
 def test_a_server_tool_block_becomes_a_raw_part_and_replays_as_itself() -> None:
     """A server tool block becomes RawPart and returns unchanged.
 
-    The response was billed for that block, so dropping it would destroy output the caller paid for
-    and leave a tool loop continuing from a turn the model did not produce.
+    The billed raw block remains in the turn for replay.
     """
     assistant_message = _assistant_message_from(
         _message_with_content([
@@ -906,8 +891,7 @@ def test_wire_tool_choice_carries_the_inverted_parallel_flag(
 ) -> None:
     """Neutral required maps to any, and every form carrying the flag inverts it.
 
-    disable_parallel_tool_use is the inverse of the neutral parallel_tool_calls, so a form that
-    passed it through unchanged would ask for the opposite of what the caller stated.
+    disable_parallel_tool_use inverts parallel_tool_calls.
     """
     assert _wire_tool_choice(tool_choice, parallel_tool_calls=parallel_tool_calls) == {
         **expected_without_parallel_flag,
@@ -1227,8 +1211,7 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     """A stated service_tier lands on the request; None leaves the omit sentinel.
 
-    The sentinel is what keeps an unstated tier off the wire: sending an explicit null would be a
-    different request from omitting the key.
+    The sentinel omits an unstated tier from the request.
     """
     binding = _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
     assert isinstance(_adapter()._precompute_fields(binding).service_tier, anthropic.Omit)
@@ -1275,14 +1258,7 @@ def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
 
 
 class _FakeSDKMessageStream(AsyncMessageStream[None]):
-    """Replays constructed events without a connection.
-
-    Overrides exactly the surface _AnthropicStream uses (iteration, close,
-    the current_message_snapshot the stop-reason check reads, and the response its headers are read
-    off); the base __init__ is deliberately not called,
-    so the untouched base machinery stays unusable.
-    The inherited request_id property is left in place, so a test of it exercises the SDK's own read.
-    """
+    """Replay constructed events without a connection."""
 
     def __init__(  # pyrefly: ignore[missing-super-call]
         self,
@@ -1351,11 +1327,7 @@ def _anthropic_stream(
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
-    """The stream's own response is the only channel a streamed turn has for the header.
-
-    The message the SDK assembles from the events never carries it, so a null here would leave every
-    streaming call with no id to take to provider support.
-    """
+    """Read a streamed request ID from the stream response."""
     snapshot = _message_snapshot("end_turn")
     with_header = _anthropic_stream([], snapshot, {"request-id": "req_stream"})
     assert with_header.request_id() == "req_stream"
@@ -1411,13 +1383,7 @@ def _collected_items(
 
 
 def test_stream_yields_bare_text_argument_fragments_and_one_complete_tool_call() -> None:
-    """Text deltas pass through as the SDK's own strings.
-
-    Each non-empty argument fragment yields a ToolCallDelta carrying the id and name the
-    snapshot's tool_use block holds, and their concatenation is the completed call's args_json.
-    A closing tool_use block yields one complete ToolCall whose args_json is the JSON text of the SDK-accumulated input;
-    empty argument fragments and text block closes yield nothing.
-    """
+    """Stream text, argument fragments, and completed ToolCall values."""
 
     def args_fragment(partial_json: str) -> at.RawContentBlockDeltaEvent:
         return at.RawContentBlockDeltaEvent(
@@ -1474,12 +1440,7 @@ def test_a_server_tool_use_blocks_argument_fragments_yield_nothing() -> None:
 
 
 def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
-    """A block's stop event puts a blank line before the next block's first delta.
-
-    A turn's reasoning arrives as one or more thinking blocks, and the break between two of them is
-    a block boundary the API never sends as text, so deltas concatenated without it run the two
-    blocks together.
-    """
+    """A block boundary separates reasoning text with a blank line."""
     translated = _collected_items([
         _thinking_delta_event("First, water ", 0),
         _thinking_delta_event("evaporates.", 0),
@@ -1493,8 +1454,7 @@ def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
 def test_a_block_stop_with_no_delta_after_it_streams_no_trailing_separator() -> None:
     """The separator precedes the next thinking delta, so a last block contributes none.
 
-    Answer text following the block stop is untouched: only a thinking delta consumes a pending
-    separator.
+    Only a thinking delta consumes a pending separator.
     """
     translated = _collected_items([
         _thinking_delta_event("thought it over", 0),
@@ -1515,7 +1475,7 @@ def test_a_thinking_delta_carrying_no_characters_is_dropped_rather_than_streamed
 
 
 def test_an_empty_thinking_delta_keeps_the_separator_for_the_next_delta_with_text() -> None:
-    """The separator armed before a dropped delta still falls before the next block's text."""
+    """A pending separator before a dropped delta remains before the next block's text."""
     translated = _collected_items([
         _thinking_delta_event("First.", 0),
         _thinking_block_stop_event("First.", 0),
@@ -1548,8 +1508,7 @@ def test_a_redacted_thinking_block_streams_no_text_and_no_extra_blank_line() -> 
 def test_a_redacted_block_after_a_thinking_block_with_no_text_arms_no_separator() -> None:
     """A redacted block does not separate what its neighbors left unseparated.
 
-    The preceding block streamed nothing, so no reasoning text precedes the redacted one and the
-    stream opens on the next block's own text.
+    An empty preceding block adds no separator before redacted reasoning.
     """
     redacted_stop = ParsedContentBlockStopEvent(
         type="content_block_stop",
@@ -1647,8 +1606,7 @@ def _kwarg_sent[OutputT](
 def test_identity_reads_the_messages_own_id_and_served_model() -> None:
     """Both values come off the message verbatim, neither from the id the binding sent.
 
-    A message the SDK did not parse from an HTTP response body carries no request id, which is the
-    state every streamed message is in.
+    A streamed message carries no request ID.
     """
     identity = _structured_bound().identity_from_raw(_message_with_content([]), request_id=None)
     assert identity == ResponseIdentity(
@@ -1680,11 +1638,7 @@ def _structured_message(
 
 
 def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config() -> None:
-    """output_config carries the schema messages.parse(output_format=Model) would have sent, beside the bound effort.
-
-    The adapter sends the schema itself so it can validate the response text in its own frame; this
-    is what keeps the request unchanged by that move, the binding's own effort key included.
-    """
+    """output_config carries the response schema and bound effort."""
     adapted_type: TypeAdapter[_StructuredReport] = TypeAdapter(_StructuredReport)
     assert _structured_bound()._precomputed_fields.output_config == {
         "effort": "high",
@@ -1695,12 +1649,7 @@ def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config()
 def test_the_structured_request_sends_the_output_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_stream puts the precomputed output_config on the request.
-
-    A request carrying the binding's own output_config instead would ask for no schema at all, and
-    every turn would come back as prose the response_format rejects, reported as the caller's model
-    being wrong rather than as the request that omitted its schema.
-    """
+    """open_stream sends the precomputed output_config."""
     structured_bound = _structured_bound()
     output_config = _kwarg_sent(monkeypatch, structured_bound, "output_config")
     assert output_config == structured_bound._precomputed_fields.output_config
@@ -1806,8 +1755,7 @@ def test_structured_bind_reports_a_text_free_turn_by_its_stop_reason(
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
     """A finished turn whose text the response_format rejects is SchemaViolation.
 
-    validation_error_json names the rejected field, what rejected it, and the value, which is what
-    tells a caller whether to change the model or the prompt.
+    validation_error_json preserves the field, constraint, and rejected value.
     """
     outcome = _structured_parse(_structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}'))
     assert isinstance(outcome, SchemaViolation)
@@ -1817,11 +1765,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
-    """A max_tokens turn whose JSON stopped mid-object is the truncation, not a schema violation.
-
-    This is the response the SDK's own parse raised on; reporting it as a variant is what lets the
-    retry loop fail the item with MaxCompletionTokensExceededError against the attempt it recorded.
-    """
+    """Truncated JSON at max_tokens returns MaxCompletionTokensExceeded."""
     outcome = _structured_parse(_structured_message('{"city": "Nair', stop_reason="max_tokens"))
     assert isinstance(outcome, MaxCompletionTokensExceeded)
 
@@ -1864,12 +1808,7 @@ def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
 
 
 def test_parse_anthropic_reads_retry_after_from_the_headers_without_letting_it_pick() -> None:
-    """A retry-after header fills the verdict's retry_after and never changes which verdict.
-
-    The header parsing itself is tested in tests/test_adapter.py against the shared function;
-    what is provider-specific is where the headers are found. httpx.Headers is case-insensitive,
-    so the lookup keeps working whatever case the server sent.
-    """
+    """retry-after sets retry_after without changing the verdict type."""
     assert parse_anthropic(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(
         retry_after=1.5
     )
@@ -1902,12 +1841,7 @@ def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_sta
 
 
 def test_parse_anthropic_obeys_a_retry_directive_over_the_status_tables() -> None:
-    """x-should-retry overrides the table verdict, which is what both SDK clients do with it.
-
-    "false" on a 500 stops a status the table retries, and "true" on a 400 retries one it stops.
-    "true" over a pausing verdict leaves it pausing: the directive speaks for this request, and
-    dropping the pause would leave every sibling sending into the same rate limit.
-    """
+    """x-should-retry overrides status-table retry decisions."""
     final_500 = _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"})
     assert parse_anthropic(final_500) == DoNotRetry()
     retryable_400 = _status_error(
@@ -1921,16 +1855,7 @@ def test_parse_anthropic_obeys_a_retry_directive_over_the_status_tables() -> Non
 
 
 def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> None:
-    """A "false" directive stops this request.
-
-    The pausing verdict still pauses the rate-limit quota.
-
-    The 429 says the rate-limit quota is throttled.
-    The directive says this request will not come back.
-    `PauseAllDoNotRetry` carries both outcomes.
-    The second row is at status 418, in no table: the pause comes from the error type there, so a
-    guard written on the status instead of the verdict would drop it.
-    """
+    """x-should-retry=false preserves a required SharedBackoff pause."""
     throttled = _status_error(
         anthropic.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
     )
@@ -1942,11 +1867,7 @@ def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> No
 
 
 def test_parse_anthropic_ignores_a_retry_directive_on_the_streams_200_status() -> None:
-    """A 200's headers belong to a request the provider accepted, so they judge no failure.
-
-    The failure is a mid-stream error event raised on that live response, which the SDK never
-    consults its retry predicate about, so the error type alone decides.
-    """
+    """A mid-stream error ignores retry headers from status 200."""
     overloaded = _status_error(
         anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
     )
@@ -1958,11 +1879,7 @@ def test_parse_anthropic_ignores_a_retry_directive_on_the_streams_200_status() -
 
 
 def test_parse_anthropic_retries_a_transient_type_at_the_streams_200_status() -> None:
-    """api_error and timeout_error retry at any status, counted where the status is unlisted.
-
-    A mid-stream error event raises carrying the live response's 200 status, so the error type is
-    the failure's one signal; the count is what keeps the odd status-type pair visible.
-    """
+    """api_error and timeout_error retry by error type and count unlisted statuses."""
     before = dict(PARSE_FALLTHROUGH_COUNTS)
     for transient_type in ("api_error", "timeout_error"):
         failed = _status_error(anthropic.APIStatusError, 200, error_type=transient_type)
@@ -1974,8 +1891,8 @@ def test_parse_anthropic_retries_a_transient_type_at_the_streams_200_status() ->
 def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else() -> None:
     """The override reports the header the SDK read off the error response, None for any other error.
 
-    anthropic sends the id in request-id; a response without that header and an exception that never
-    reached one both give None.
+    Anthropic sends the request ID in request-id.
+    Missing headers return None.
     """
     adapter = _adapter()
     assert adapter.request_id_from_error(_rate_limit_error({"request-id": "req_429"})) == "req_429"
@@ -1991,8 +1908,8 @@ def _status_error[ErrorT: anthropic.APIStatusError](
 ) -> ErrorT:
     """Build one of the SDK's status exceptions around a constructed httpx response.
 
-    error_type fills the body's error.type the way the SDK reads it onto the exception; None
-    builds the exception a non-JSON body produces, whose type attribute is None.
+    error_type fills the SDK exception's error.type.
+    None represents a non-JSON body.
     """
     response = httpx.Response(
         status_code,
@@ -2185,11 +2102,7 @@ def test_build_request_reports_an_unsendable_sequence_as_invalid_request() -> No
 
 
 def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> None:
-    """A replayed tool call whose args_json is not JSON is an InvalidRequest, not a raise.
-
-    args_json is caller data that nothing validates on the way in, so a batch item carrying one must
-    fail on its own rather than escape the retry loop and cancel its siblings.
-    """
+    """Malformed replayed args_json returns InvalidRequest."""
     messages = [
         AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
         ToolMessage(tool_call_id="c1", content="ok"),
@@ -2200,13 +2113,7 @@ def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> 
 
 
 def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_request() -> None:
-    """A stored payload with no type key is no content block, so nothing is sent.
-
-    RawPart.raw without a type key reaches this path.
-    `automatic_cache_breakpoints=True` makes the wire path read that key to place the
-    breakpoint: passing the payload through raises KeyError out of build_request, which names a
-    langchaint defect for a request no defect produced.
-    """
+    """RawPart.raw without type produces no content block."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
@@ -2224,8 +2131,7 @@ def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_reques
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
     """as_json holds the binding's precomputed fields and this call's converted messages.
 
-    temperature is absent rather than null, because the binding set none and the request body carries
-    no such key.
+    An unstated temperature is absent from the request.
     """
     request = _structured_bound().build_request([UserMessage(content="hi")])
     assert isinstance(request, _AnthropicRequestParams)
@@ -2444,16 +2350,10 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
 
 
 def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
-    """The running snapshot is readable only once an event has been accumulated.
-
-    The SDK builds the snapshot from message_start and asserts on a read before that, so the
-    adapter reports None until its first pull and prices the snapshot from then on.
-    The snapshot carries input_tokens and output_tokens as required fields, so a mid-stream read
-    always has counters to report.
-    """
+    """billing_reported returns None before the first event and Billing after it."""
 
     async def scenario() -> tuple[Billing | None, Billing | None]:
-        """Read the running billing before pulling anything, then after one item."""
+        """Read billing before and after one stream item."""
         adapter_stream = _anthropic_stream(
             [_text_delta_event("he", 0)], _message_snapshot("end_turn")
         )
@@ -2468,14 +2368,10 @@ def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot
 
 
 def _turn_content() -> list[at.ContentBlock]:
-    """Build a thinking block, a server tool call, then a text block.
+    """Build reasoning, server-tool-call, and text blocks.
 
-    The thinking block carries a key the installed SDK does not name; model_construct rather than
-    the constructor, because the extra key is the point and the constructor of a pinned SDK model
-    has no field for a key that SDK does not name.
-    The server tool call has no other TurnPart variant.
-    The text block stays last, so the request's automatic cache marker lands on it rather than on a
-    block whose stored dump an invariant compares against the wire.
+    The reasoning block carries an extra raw field.
+    The final text block receives the automatic cache marker.
     """
     return [
         at.ThinkingBlock.model_construct(
@@ -2561,19 +2457,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the adapter's whole exception table.
-
-        Each status code is the one the SDK raises that class for, read from anthropic 0.120.2;
-        the bare APIStatusError rows are the statuses the SDK maps to no class of its own,
-        which is why the adapter reads the status rather than the exception class.
-        APITimeoutError subclasses APIConnectionError, so timeouts reach transient through that
-        isinstance, and RetryableError carries no response at all.
-        A status row states the name a DoNotRetry failure takes, never whether it is retried:
-        a 200, a mid-stream error event's raise on the live response, is declared_final;
-        every 4xx is invalid_request whatever x-should-retry says, a 5xx marked final is
-        declared_final, and any other status is unknown_exception.
-        ValueError stands in for an exception the adapter cannot place.
-        """
+        """Return Anthropic error classification cases."""
         return {
             _connection_error(): "transient",
             anthropic.APITimeoutError(
@@ -2608,15 +2492,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the parse rows: every listed status, both defaults, both TransientError forms.
-
-        The statuses and error types come from the errors page parse_anthropic's docstring cites,
-        plus the rows each table's docstring sources from the SDK;
-        the rows without an error_type exercise the exception a non-JSON body produces.
-        451 and 502 are the unlisted statuses, one per default: 451 takes the sub-500 DoNotRetry
-        and 502 the 5xx RetryThisOne.
-        The PauseAllDoNotRetry row is a 429 the provider's own x-should-retry marked final.
-        """
+        """Return Anthropic error verdict cases."""
         return {
             _status_error(
                 anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"

@@ -1,75 +1,66 @@
-"""Adapter for Google's generateContent API over the google-genai SDK.
+"""Implement Gemini `generateContent` through the google-genai SDK.
 
-Verified against google-genai 2.16.0:
-- The client never retries unless retry options are set: `retry_args(None)` stops after one attempt.
-  Every request this adapter builds carries `HttpOptions(retry_options=HttpRetryOptions(attempts=1))`,
-  and a per-request `http_options` patches over the client's own field by field,
-  so `max_attempts` stays true for any client the caller passes.
-- `generate_content_stream` yields `GenerateContentResponse` chunks and the SDK has no stream
-  assembler, so `assembled_response` here is the assembly; see its docstring for the merge rule.
-  A mid-stream error chunk raises `errors.APIError` from the iterator, carrying the body's code.
-- `errors.APIError` carries `code`, `status`, `message`, `details`, and an optional httpx `response`;
-  no request-id attribute exists, and no response field models one.
-- `usage_metadata.prompt_token_count` includes `cached_content_token_count`, and
-  `total_token_count` is prompt + candidates + tool_use_prompt + thoughts, so thoughts sit outside
-  candidates. No cache-write counter exists: Gemini bills no cache writes.
-  That implicit cache reads land in `cached_content_token_count` is stated on
-  https://ai.google.dev/gemini-api/docs/caching (read 2026-08-03).
-- `Part.thought` marks reasoning and `Part.thought_signature` is bytes; the SDK models serialize
-  bytes as base64 in JSON mode and validate them back, so a `mode="json"` dump is the
-  round-trippable form ReasoningPart.raw carries.
-- The SDK models forbid unknown keys, so a stored dump another provider produced has no wire route
-  and build_request reports it as InvalidRequest.
-- The SDK enums construct unknown values as synthetic members with a UserWarning, so an effort or
-  tier word the SDK does not know still reaches the wire as given.
-- `FunctionResponse.response` documents the "output" and "error" keys as function output and error
-  details, which is where ToolMessage.content and is_error go.
+The following SDK facts were verified against google-genai 2.16.0.
+`retry_args(None)` permits one attempt.
+Every request sets `HttpRetryOptions(attempts=1)` through per-request `http_options`.
+The per-request value replaces the client value and preserves `max_attempts` for passed clients.
+`generate_content_stream` yields `GenerateContentResponse` chunks without assembling them.
+`assembled_response` assembles the chunks.
+A mid-stream error raises `errors.APIError` with the response body code.
+`errors.APIError` has `code`, `status`, `message`, `details`, and an optional `httpx.Response`.
+It has no request-id attribute, and its response has no request-id field.
 
-Reasoning replay, from https://ai.google.dev/gemini-api/docs/thinking (read 2026-08-03): thought
-signatures must be resent exactly as received, and they appear on thought steps and built-in tool
-steps. The adapter therefore emits a ReasoningPart for every part carrying `thought` or a
-`thought_signature` and restores it verbatim with `Part.model_validate_json`. A signature-carrying
-part that also holds answer text or a function call additionally yields its TextPart or ToolCall,
-so consumers see the turn's content; on replay ReasoningPart.raw already carries that
-payload, and the following TurnPart is skipped when it matches, keeping the wire form
-byte-identical to what arrived.
+`usage_metadata.prompt_token_count` includes `cached_content_token_count`.
+`total_token_count` sums prompt, candidate, tool-use prompt, and thought tokens.
+Gemini reports no cache-write counter and bills no cache writes.
+Implicit cache reads appear in `cached_content_token_count`.
+Source: https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03.
 
-Caching: generateContent has no request field enabling, disabling, or marking implicit caching, so
-`automatic_cache_breakpoints` True and False build identical requests, implicit cache reads bill at
-the cache-read rate under either value, and no cache write is ever billed. A user-placed
-`cache_breakpoint` mark has no wire form either; silently dropping it would misstate the request,
-so a marked system part raises ValueError at bind and a marked message part returns InvalidRequest.
-An explicit cache resource is reachable through extra_body as `{"cachedContent": ...}`.
+`Part.thought` marks reasoning, and `Part.thought_signature` contains bytes.
+JSON-mode SDK dumps encode bytes as base64 and validate them back.
+`ReasoningPart.raw` stores that JSON-mode dump.
+SDK models reject unknown keys, so another provider's dump returns `InvalidRequest`.
+SDK enums preserve unknown effort and tier values as synthetic enum values with `UserWarning`.
+`FunctionResponse.response` uses `"output"` and `"error"` for `ToolMessage.content` and `ToolMessage.is_error`.
 
-ContentPart mappings verified against google-genai 2.17.0:
-- `ImagePart` becomes `Part.inline_data`.
+Thought signatures require exact replay on thought and built-in tool steps.
+Source: https://ai.google.dev/gemini-api/docs/thinking, read 2026-08-03.
+The adapter emits `ReasoningPart` for each part with `thought` or `thought_signature`.
+`Part.model_validate_json` restores each part unchanged.
+A signed part may also emit `TextPart` or `ToolCall` for its answer text or function call.
+Replay skips a matching following `TurnPart` because `ReasoningPart.raw` already contains its data.
+
+`generateContent` has no request field for implicit caching.
+Both `automatic_cache_breakpoints` values produce the same request and cache-read billing.
+Gemini never bills a cache write.
+A marked system part raises `ValueError`, and a marked message part returns `InvalidRequest`.
+`extra_body={"cachedContent": ...}` selects an explicit cache resource.
+
+Content mappings were verified against google-genai 2.17.0.
+- `ImagePart` and `AudioPart` become `Part.inline_data`.
 - `ImageUrlPart` becomes `Part.file_data`.
-- `AudioPart` becomes `Part.inline_data`.
-- `ImagePart` and `AudioPart` become `FunctionResponsePart.inline_data` inside `ToolMessage`.
-- `ImageUrlPart` becomes `FunctionResponsePart.file_data` inside `ToolMessage`.
+- Inside `ToolMessage`, `ImagePart` and `AudioPart` become `FunctionResponsePart.inline_data`.
+- Inside `ToolMessage`, `ImageUrlPart` becomes `FunctionResponsePart.file_data`.
+- `Part.tool_call` and `Part.tool_response` carry provider-executed tool evidence.
 
-Provider-tool mappings were verified against google-genai 2.17.0.
-`Part.tool_call` and `Part.tool_response` carry server invocation evidence.
-
-Mapping decisions:
-- ToolMessage becomes a `function_response` part inside a user-role Content; consecutive tool
-  messages group into one Content. The FunctionResponse `name` is recovered from the ToolCall whose
-  id matches `tool_call_id`, so a tool_call_id matching no earlier call is InvalidRequest.
-- `FunctionCall.id` is optional on the wire; ToolCall.id is required, so the adapter uses the
-  provider's id when present and the function name otherwise, and on replay sends the id only when
-  it differs from the name. When the provider issues no ids, two same-name calls in one turn share
-  an id and their results align by order.
-- `reasoning_effort` "none" sends `thinking_budget=0`, Gemini's disable form. Every other value
-  sends `thinking_level` as the word upper-cased plus `include_thoughts=True` (which is what
-  returns readable thought summaries), passed through as given so a value or model the provider
-  rejects surfaces as its own error.
-- `parallel_tool_calls` False raises at bind: no wire form disables parallel function calls.
-- `stop_reason`: MAX_TOKENS is "max_tokens"; the refusal finish reasons are "refusal"; STOP is
-  "tool_use" when the turn holds a ToolCall and "end_turn" otherwise, because Gemini has no tool
-  finish reason; everything else is "other".
-- ContextWindowExceeded, ProviderFailedTransiently, and ProviderFailedTerminally are never
-  constructed: Gemini reports those conditions as error statuses or mid-stream error chunks, never
-  as a parseable failure body on a completed 200.
+Request and response mappings:
+- `ToolMessage` becomes `function_response` inside user-role `Content`.
+- Consecutive `ToolMessage` values share one `Content`.
+- `FunctionResponse.name` comes from the earlier `ToolCall` matching `tool_call_id`.
+- A missing match returns `InvalidRequest`.
+- `FunctionCall.id` is optional, while `ToolCall.id` is required.
+- The adapter uses the function name when the provider omits the id.
+- Replay sends the id only when it differs from the function name.
+- Same-name calls without provider ids share an id and match results by order.
+- `reasoning_effort="none"` sends `thinking_budget=0`.
+- Other values send uppercase `thinking_level` with `include_thoughts=True` and pass through unchanged.
+- The provider reports unsupported values through its own error.
+- `parallel_tool_calls=False` raises at bind because Gemini has no disabling field.
+- `MAX_TOKENS` maps to `"max_tokens"`, and refusal reasons map to `"refusal"`.
+- `STOP` maps by `ToolCall` presence to `"tool_use"` or `"end_turn"`.
+- Other finish reasons map to `"other"`.
+- Gemini reports terminal conditions through statuses or stream errors instead of a completed 200 failure body.
+- The adapter does not construct `ContextWindowExceeded`, `ProviderFailedTransiently`, or `ProviderFailedTerminally`.
 """
 
 import json
@@ -275,11 +266,10 @@ category_cost(0, NaN) is 0.0, so nothing NaN-poisons.
 
 @dataclass(frozen=True, kw_only=True)
 class GeminiPricingTable:
-    """One model's rates at one served tier, with the long-prompt repricing some models carry.
+    """Store one model's rates for one served tier.
 
-    Google prices some models by prompt length: above long_prompt_threshold_tokens prompt tokens,
-    input, cache read, and output all reprice at long_prompt_rates. Models without the split leave
-    both long fields None.
+    Above long_prompt_threshold_tokens, long_prompt_rates prices input, cache reads, and output.
+    Models without this pricing leave both long-prompt fields None.
     """
 
     rates: GeminiRates
@@ -315,8 +305,7 @@ class GeminiPricingTable:
         """Price one response's counters, at the long-prompt rates when the prompt crosses the threshold.
 
         prompt_token_count excludes the tool-execution input the categories include.
-        The cache-write counter is zero with a NaN price: no write is ever billed, and
-        _NO_CACHE_WRITE_RATE says why that poisons nothing.
+        The zero cache-write counter costs zero despite its NaN price.
 
         Raises:
             pydantic.ValidationError: a counter is negative.
@@ -418,14 +407,13 @@ def _billing_from_usage(
 ) -> Billing:
     """Price the reported counters at the table the served tier selects.
 
-    prompt_token_count includes cached_content_token_count (google-genai 2.16.0 field description
-    for explicit caches; https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03, for
-    implicit reads landing in the same counter), so cache_none is their difference.
-    thoughts_token_count sits outside candidates_token_count (the SDK's total_token_count
-    description sums them beside prompt), so output is their sum and reasoning is the thoughts
-    share. tool_use_prompt_token_count counts tool-execution results fed back as input and sits
-    outside prompt_token_count (same total_token_count description); it joins cache_none, where the
-    uncached input rate prices it.
+    prompt_token_count includes cached_content_token_count (google-genai 2.16.0 field description).
+    This includes implicit cache reads (https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03).
+    Their difference is input_tokens_cache_none.
+    thoughts_token_count is outside candidates_token_count.
+    output_tokens is their sum, and output_tokens_reasoning is thoughts_token_count.
+    Source: google-genai 2.16.0 total_token_count field description.
+    tool_use_prompt_token_count is outside prompt_token_count and uses the uncached input rate.
     None usage_metadata bills zero counters at the "ON_DEMAND" table's prices.
 
     Raises:
@@ -596,12 +584,9 @@ def _billing_from_response(
 
 
 class _NotSendableError(Exception):
-    """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
+    """Report a Sequence[Message] that this adapter cannot send.
 
-    Never leaves this module: _request_contents turns it into the InvalidRequest that build_request
-    returns. It exists because a Sequence[Message] is found unsendable several frames below
-    build_request, in per-part converters whose callers would each have to thread a union outward
-    otherwise.
+    _request_contents converts this exception to InvalidRequest.
     """
 
     def __init__(self, reason: str) -> None:
@@ -613,9 +598,7 @@ class _NotSendableError(Exception):
 def _tool_call_from(function_call: types.FunctionCall) -> ToolCall:
     """Build the neutral ToolCall, synthesizing the id from the name when the provider sent none.
 
-    FunctionCall.name is optional on the SDK model; a call without one is unusable, and inventing a
-    name would misstate the turn, so it passes through as the empty string and fails loudly at
-    dispatch or on replay.
+    An absent FunctionCall.name becomes an empty string and fails during dispatch or replay.
     """
     name = function_call.name or ""
     return ToolCall(
@@ -626,21 +609,13 @@ def _tool_call_from(function_call: types.FunctionCall) -> ToolCall:
 
 
 def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
-    """Build the langchaint assistant turn from a candidate's content, part order preserved.
+    """Build `AssistantMessage` from candidate parts in order.
 
-    A part carrying `thought` or a `thought_signature` becomes a ReasoningPart holding the part's
-    JSON-mode dump, the round-trippable form for the signature bytes; the module docstring names
-    the resend-exactly source. A signature-carrying part that also holds a function call or
-    non-thought text additionally yields its ToolCall or TextPart, so the turn's consumers see the
-    content; _assistant_wire_parts skips that TurnPart during replay.
-    Thought text goes on ReasoningPart.text and nowhere else.
-    A part that yields none of those three, executable_code and code_execution_result among them,
-    becomes a RawPart holding the same dump, so the turn carries what the response was billed
-    for. Empty text is no text, so a part whose text is the empty string yields no TextPart; where
-    it carries no function call and no reasoning it becomes a RawPart, and one carrying
-    nothing at all replays as the empty-text part that arrived.
-    Absent content or parts is an empty turn (a SAFETY candidate can carry a finish_reason and no
-    content).
+    Thought or signed parts become replayable `ReasoningPart` values.
+    Signed answer text and function calls also produce `TextPart` or `ToolCall`.
+    Unmodeled parts become replayable `RawPart` values.
+    Empty text becomes `RawPart` only when the part has no other modeled value.
+    Missing content or parts produces an empty turn.
     """
     parts = content.parts if content is not None and content.parts is not None else []
     turn: list[TurnPart] = []
@@ -667,8 +642,7 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
     """Convert one ToolCall back to its wire form, omitting an id that was synthesized from the name.
 
     Raises:
-        _NotSendableError: args_json parses to something other than a JSON object; the wire field
-            holds the parsed arguments object, so nothing else has a wire form.
+        _NotSendableError: args_json does not contain a JSON object.
         json.JSONDecodeError: args_json is not valid JSON.
     """
     args = json.loads(tool_call.args_json)
@@ -692,9 +666,7 @@ def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> type
     part_description names the ReasoningPart or RawPart.
 
     Raises:
-        _NotSendableError: raw does not restore to a Part. The SDK models forbid unknown keys, so a
-            dump another provider produced has no Gemini wire route; a raw holding a value JSON
-            cannot represent fails the same way.
+        _NotSendableError: raw does not restore to a Part.
     """
     try:
         return types.Part.model_validate_json(json.dumps(raw))
@@ -708,8 +680,7 @@ def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> type
 def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) -> bool:
     """Whether TurnPart repeats payload already carried by replayed_part.
 
-    _assistant_message_from pairs a signature-carrying part with the ToolCall or TextPart holding
-    its consumer-facing payload; this is the replay-side match that keeps the pair one wire part.
+    _assistant_message_from pairs a signature-carrying part with the ToolCall or TextPart that holds its payload.
     A part without a match goes on the wire itself.
     """
     function_call = replayed_part.function_call
@@ -736,15 +707,13 @@ def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) ->
 def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Part]:
     """Convert one AssistantMessage to wire parts in turn order.
 
-    A ReasoningPart restores to the Part that produced it; when that part carries a function call
-    or non-thought text, the paired TurnPart follows it and
-    is skipped, so the pair goes back as the one part that arrived. An empty TextPart yields nothing.
+    A ReasoningPart restores its source Part.
+    A following TurnPart with the same payload is skipped.
+    An empty TextPart yields nothing.
     A RawPart restores the same way and carries no such pair.
 
     Raises:
-        _NotSendableError: ReasoningPart.raw or RawPart.raw does not restore to a Gemini Part (from
-            _part_from_dump), or a tool call's args_json is not a JSON object (from
-            _function_call_from).
+        _NotSendableError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     parts: list[types.Part] = []
@@ -889,14 +858,12 @@ def _function_response_part(
 def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     """Convert messages to wire contents.
 
-    Consecutive tool messages group into one user-role Content. Assistant turns record their
-    ToolCall ids and names as they pass, which is where a later ToolMessage's FunctionResponse
-    name comes from.
+    Consecutive ToolMessage values form one user-role Content.
+    Assistant turns supply ToolCall names for later FunctionResponse values.
 
     Raises:
         _NotSendableError: a message is unsendable; each per-part converter names its condition.
-        json.JSONDecodeError: a tool call's args_json is not valid JSON
-            (from _assistant_wire_parts).
+        json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     contents: list[types.Content] = []
     pending_function_responses: list[types.Part] = []
@@ -925,9 +892,7 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
 def _request_contents(messages: Sequence[Message]) -> list[types.Content] | InvalidRequest:
     """Convert messages, or report them unsendable.
 
-    The one place a Sequence[Message] this adapter will not put on the wire becomes an
-    InvalidRequest. An unparseable tool_call.args_json is one of those: the wire field holds the
-    parsed arguments object, so text that is not JSON has nowhere to go.
+    An unsendable Sequence[Message] becomes InvalidRequest. This includes unparseable tool_call.args_json.
     """
     try:
         return _wire_contents(messages)
@@ -949,11 +914,9 @@ class _GeminiRequestParams(RequestParams):
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default.
 
-        genai has no omit sentinel (absence is None), so instead of request_json this dumps the SDK
-        models with exclude_none. http_options is excluded as transport configuration rather than
-        request body, except its extra_body, which the SDK merges into the wire body and so is part
-        of the request; a value json cannot render becomes its str(), because a table build must not
-        fail over one cell of one row.
+        exclude_none omits absent SDK fields.
+        http_options is transport configuration, but extra_body enters the request body.
+        An unsupported JSON value becomes str(value) so table construction cannot fail on one cell.
         """
         body: dict[str, object] = {
             "model": self.model,
@@ -1008,19 +971,16 @@ _ADAPTER_POPULATED_GENERATION_CONFIG_KEYS = frozenset({
     "responsemimetype",
     "responsejsonschema",
 })
-"""The generationConfig leaves the adapter populates, stored as _normalized_wire_key spells them.
+"""The generationConfig terminal keys the adapter populates, normalized by _normalized_wire_key.
 
-Unlisted leaves (topK, seed, stopSequences) pass through, which is what keeps unmapped generation
-parameters reachable.
+Unlisted terminal keys such as topK, seed, and stopSequences pass through.
 """
 
 
 def _normalized_wire_key(key: str) -> str:
     """Normalize a wire-body key the way the SDK matches extra_body keys to wire keys.
 
-    The SDK's recursive_dict_update matches keys ignoring case and underscores
-    (google-genai 2.16.0 _normalize_key_for_matching), so a collision check comparing spellings
-    exactly would let "systeminstruction" merge over systemInstruction.
+    google-genai 2.16.0 _normalize_key_for_matching ignores case and underscores.
     """
     return key.replace("_", "").lower()
 
@@ -1028,16 +988,13 @@ def _normalized_wire_key(key: str) -> str:
 def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
     """Refuse the extra_body keys whose SDK merge would silently override the binding.
 
-    The SDK merges extra_body into the wire body recursively with extra_body winning on a matched
-    leaf, matching keys as _normalized_wire_key states, so the comparison normalizes both sides:
-    the top-level keys the adapter populates are refused, and inside a generationConfig entry the
-    leaves the adapter populates are refused while the rest pass.
+    The SDK recursively merges extra_body into the wire body.
+    extra_body wins matched terminal keys.
+    _normalized_wire_key compares both mappings.
+    Populated top-level keys and generationConfig terminal keys are refused.
 
     Raises:
-        ValueError: extra_body holds a refused key, or a key matching generationConfig holds
-            something other than an object, which the merge would substitute wholesale for the
-            generationConfig fields the adapter populates.
-            Also raised when generationConfig contains a non-string key.
+        ValueError: extra_body has a refused key, or generationConfig has an invalid shape or key.
     """
     if extra_body is None:
         return
@@ -1046,7 +1003,7 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
         if _normalized_wire_key(key) != "generationconfig":
             continue
         if not isinstance(nested, Mapping):
-            # TRY004 is suppressed because a bind defect is ValueError by the Adapter.bind_text contract.
+            # `Adapter.bind_text` requires `ValueError` for binding defects.
             raise ValueError(  # noqa: TRY004
                 f"extra_body key {key!r} must map to an object: the SDK merge would substitute "
                 f"a non-object value for the generationConfig fields the adapter populates"
@@ -1073,12 +1030,9 @@ def _reject_extra_body_keys(extra_body: Mapping[str, object] | None) -> None:
 def _retry_after_seconds_from_retry_info(details: object) -> float | None:
     """Read the RetryInfo-stated wait from an APIError's details, None on any shape mismatch.
 
-    details is the error body, which is the whole {"error": {...}} envelope or the inner error dict
-    depending on the raise path (google-genai 2.16.0 errors.py), so the read starts at
-    details.get("error", details). The RetryInfo entry's shape comes from
-    google/rpc/error_details.proto, its "@type" the type URL and its retryDelay a protobuf
-    Duration, whose JSON encoding is decimal seconds suffixed "s" ("32s"); the wire shape is not
-    introspectable, so the read is defensive throughout.
+    google-genai 2.16.0 errors.py supplies the error envelope or its inner error dict.
+    RetryInfo uses the google/rpc/error_details.proto shape.
+    retryDelay is a protobuf Duration encoded as decimal seconds plus "s".
     """
     if not isinstance(details, Mapping):
         return None
@@ -1115,20 +1069,15 @@ def _retry_after_seconds_from_error(failure: errors.APIError) -> float | None:
 
 
 def parse_gemini(failure: Exception) -> Verdict:
-    """Map one GeminiGenerateContentAdapter.failure_types exception to its verdict.
+    """Classify one failure by the documented status table.
 
-    The listed rows come from the troubleshooting page,
-    https://ai.google.dev/gemini-api/docs/troubleshooting (read 2026-08-03):
-    _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne (408 and 502 from the
-    SDK's own retryable set, as that constant's docstring states), and _DO_NOT_RETRY_STATUSES are
-    DoNotRetry.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged: an
-    unlisted status of 500 or above is RetryThisOne, one attempt's server-side failure; anything
-    else is DoNotRetry, matching the page's rule that 4xx names this request's defect.
-    The status picks the verdict; a retry-after only fills its retry_after, read from the response
-    headers and then from the body's RetryInfo detail.
-    A TransientError takes verdict_from_transient_error's shared mapping.
-    Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
+    Source: https://ai.google.dev/gemini-api/docs/troubleshooting, read 2026-08-03.
+    Statuses 408 and 502 also come from the SDK retryable set.
+    Unlisted statuses of 500 or above return `RetryThisOne`.
+    Other unlisted statuses return `DoNotRetry`.
+    Response headers take precedence over body `RetryInfo` for `retry_after`.
+    `TransientError` uses `verdict_from_transient_error`.
+    Exceptions outside `failure_types` return `DoNotRetry`.
     """
     if isinstance(failure, TransientError):
         return verdict_from_transient_error(failure)
@@ -1161,8 +1110,7 @@ def parse_gemini(failure: Exception) -> Verdict:
 class GeminiGenerateContentAdapter(Adapter):
     """Adapter over a genai.Client, reaching the Gemini Developer API or Vertex AI.
 
-    One client class serves both platforms; client.vertexai says which one a client reaches, so
-    provider_name_by_client_class stays empty and __init__ checks the flag itself.
+    client.vertexai selects the platform, so __init__ validates provider_name.
     """
 
     def __init__(
@@ -1174,28 +1122,17 @@ class GeminiGenerateContentAdapter(Adapter):
         provider_name: str,
         service_tier: GeminiServiceTier | None = None,
     ) -> None:
-        """Store the SDK client, which owns credentials and endpoints.
+        """Store the SDK client and request pricing without sending a request.
 
-        provider_name says which platform the client reaches: "gcp.gemini" for the Developer API,
-        "gcp.vertex_ai" for Vertex AI (both from the OTel gen_ai.provider.name value set).
-        The client is stored as constructed: retry suppression is per-request (the module docstring
-        names the mechanism), so no client copy is needed.
-
-        pricing holds one table per traffic_type word a response can report
-        (GeminiPricedServiceTier names the vocabulary), and a response reporting a word absent from
-        it costs NaN. The "ON_DEMAND" key is required because every response that reports no
-        traffic_type prices there.
-        service_tier is what the request asks for, None sending nothing. It cannot decide the
-        price: the request and response vocabularies are disjoint, and the traffic_type the
-        response reports is what selects the table, so a "flex" request needs a pricing entry for
-        the tier its responses report.
+        `provider_name` records the provider reached by `client`; a Vertex AI client requires `"gcp.vertex_ai"`.
+        Per-request options disable retries without copying the client.
+        `pricing` maps each `GeminiPricedServiceTier` to rates.
+        Missing reported tiers cost NaN.
+        Missing `traffic_type` uses `"ON_DEMAND"`.
+        `service_tier` requests a tier, while reported `traffic_type` selects pricing.
 
         Raises:
-            ValueError: pricing has no "ON_DEMAND" key; or client.vertexai is True under a
-                provider_name other than "gcp.vertex_ai", a request that succeeds and bills
-                normally while every span it produces carries the wrong provider.
-                A non-Vertex client takes the caller's value, since its base_url decides what it
-                reaches.
+            ValueError: `pricing` lacks `"ON_DEMAND"` or a Vertex client uses another `provider_name`.
         """
         require_pricing_key(pricing, key=_ON_DEMAND_TIER, model=model)
         if client.vertexai and provider_name != _VERTEX_PROVIDER_NAME:
@@ -1216,23 +1153,16 @@ class GeminiGenerateContentAdapter(Adapter):
     def _bound_config(
         self, binding: Binding, *, response_json_schema: dict[str, object] | None
     ) -> tuple[types.GenerateContentConfig, frozenset[str]]:
-        """Convert the binding to the one GenerateContentConfig every request of this binding sends.
+        """Convert one binding to its shared `GenerateContentConfig`.
 
-        The SDK's own config type is the container for the frozen prefix, so no precomputed-fields
-        dataclass stands beside it. Every config carries the retry-suppressing http_options and, for
-        a structured binding, response_json_schema with response_mime_type "application/json".
+        Every config disables SDK retries.
+        Structured configs send `response_json_schema` with `response_mime_type="application/json"`.
 
         Raises:
-            pydantic.ValidationError: a provider-executed mapping fails `types.Tool` validation.
-            ValueError: the binding asks for something this adapter cannot send: a marked system
-                part or parallel_tool_calls False (neither has a Gemini wire form), an empty
-                system_prompt parts tuple, or a refused extra_body key (from
-                _reject_extra_body_keys). Also raised for provider_executed_tools with non-auto
-                tool_choice.
-                Provider-executed tools require a Gemini 3 model.
-                `provider_executed_tools` require the Gemini Developer API.
-                google-genai 2.17.0 lacks `include_server_side_tool_invocations` on Vertex AI.
-                Configured charged rates must be finite and nonnegative.
+            pydantic.ValidationError: A provider-executed tool fails `types.Tool` validation.
+            ValueError: A marked system part, disabled parallel calls, empty `system_prompt`, or reserved key is used.
+            ValueError: Provider-executed tools use a non-auto choice, a pre-Gemini-3 model, or Vertex AI.
+            ValueError: A configured charged rate is not finite and nonnegative.
         """
         _reject_extra_body_keys(binding.extra_body)
         if not binding.parallel_tool_calls:
@@ -1311,8 +1241,7 @@ class GeminiGenerateContentAdapter(Adapter):
                 thinking_level=types.ThinkingLevel(reasoning_effort.upper()),
                 include_thoughts=True,
             )
-        # dict(binding.extra_body): HttpOptions.extra_body is declared dict, so the Mapping is
-        # shallow-copied to satisfy it; the values pass through by reference.
+        # `HttpOptions.extra_body` requires a `dict`, and the copied values retain their identities.
         return (
             types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -1384,11 +1313,8 @@ class GeminiGenerateContentAdapter(Adapter):
     def classify(self, error: Exception) -> ErrorClassification:
         """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
-        httpx.TimeoutException and httpx.ConnectError are the transport failures the SDK's own
-        retry predicate names retryable (google-genai 2.16.0 retry_args), arriving unparsed:
-        transient.
-        An APIError only arrives here after parse verdicted DoNotRetry; a 4xx code is this
-        request's rejection, and any other code is one langchaint has no account of.
+        google-genai 2.16.0 retry_args classifies both httpx exceptions as retryable transport failures.
+        A 4xx APIError is an invalid request. Any other APIError is unknown_exception.
         Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
@@ -1403,8 +1329,7 @@ class GeminiGenerateContentAdapter(Adapter):
 class _ResponseAccumulator:
     """Assembles streamed chunks into one GenerateContentResponse; assembled_response's engine.
 
-    The attributes are the last-seen scalars and the merged parts, public because _GeminiStream
-    reads them mid-stream (billing_reported, the terminal-event check) before response() is built.
+    _GeminiStream reads the public accumulated values before response() is built.
     """
 
     def __init__(self) -> None:
@@ -1420,11 +1345,9 @@ class _ResponseAccumulator:
     def add(self, chunk: types.GenerateContentResponse) -> None:
         """Fold one chunk in: scalars take the last non-None value, parts append or merge.
 
-        Merge rule: only a chunk's first part can continue the last accumulated part, because parts
-        arriving as separate entries of one chunk's list are distinct parts. It continues it when
-        both are text-only with the same thought flag and the accumulated one carries no
-        thought_signature: the text concatenates and the incoming signature is adopted, so a
-        signature always ends the part carrying it.
+        Only the first part can continue the last accumulated part.
+        Continuation requires text-only parts with equal thought values and no prior thought_signature.
+        Their text concatenates, and the incoming thought_signature ends the merged part.
         """
         if chunk.usage_metadata is not None:
             self.usage_metadata = chunk.usage_metadata
@@ -1491,8 +1414,7 @@ class _ResponseAccumulator:
 def _is_text_only(part: types.Part) -> bool:
     """Whether text is the part's only payload, the precondition for merging it into a neighbor.
 
-    Read off the dump rather than off named fields, so a payload field this module does not
-    enumerate (a new SDK media kind) makes the part unmergeable instead of silently dropped.
+    Inspect the dump so an unmodeled payload field prevents merging.
     """
     payload_keys = part.model_dump(exclude_none=True).keys() - {"thought", "thought_signature"}
     return payload_keys == {"text"}
@@ -1524,9 +1446,8 @@ def assembled_response(
 ) -> types.GenerateContentResponse:
     """Assemble streamed chunks into the one response a whole call would have returned.
 
-    The SDK has no stream assembler, so this is the adapter's own; _ResponseAccumulator.add states
-    the merge rule. Public for adapter-author tests, which run a chunk list through it beside an
-    identically shaped whole response.
+    _ResponseAccumulator.add defines the merge rule.
+    Adapter conformance tests compare this result with a whole response.
     """
     accumulator = _ResponseAccumulator()
     for chunk in chunks:
@@ -1547,10 +1468,7 @@ class _GeminiStream(AdapterStream):
     ) -> None:
         """Store the SDK iterator and the chunk open_stream pulled ahead of it.
 
-        first_chunk is the chunk open_stream pulled to perform the connection I/O; items() and
-        the accumulator process it ahead of chunks. None means no chunk was pulled ahead: a
-        stream the provider ended empty, or a directly constructed stream whose chunks hold
-        everything.
+        first_chunk precedes chunks. None means open_stream pulled no chunk.
         """
         self._chunks = chunks
         self._pricing = pricing
@@ -1572,24 +1490,18 @@ class _GeminiStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate chunks into answer text chunks, reasoning text deltas, and completed tool calls.
+        """Translate chunks into answer text, reasoning deltas, and complete tool calls.
 
-        Function calls arrive whole in one part, so each yields one complete ToolCall and no ToolCallDelta.
-        A turn's reasoning arrives as thought-part text slices, and a reasoning part ends where its
-        thought_signature arrives or where another part follows it in the same chunk's list, the
-        two boundaries _ResponseAccumulator.add's merge rule keeps. Each boundary between two
-        reasoning parts that both streamed text reaches the caller as a REASONING_PART_SEPARATOR
-        delta before the next part's first delta.
+        Each function call arrives whole and yields no `ToolCallDelta`.
+        A thought signature or following part ends a reasoning part.
+        `REASONING_PART_SEPARATOR` separates reasoning parts that emitted text.
 
         Yields:
-            Stream items; a part langchaint does not model streams nothing and reaches the caller
-            in the turn final()'s assembled response carries.
+            Stream items for parts langchaint models.
 
         Raises:
-            StreamProtocolError: the stream ended having seen neither a finish_reason nor a
-                block_reason.
-            errors.APIError: a mid-stream error chunk raises from the SDK iterator; it propagates
-                to the retry loop, which parses it.
+            StreamProtocolError: The stream ends without `finish_reason` or `block_reason`.
+            errors.APIError: The SDK iterator receives a mid-stream error.
         """
         reasoning_delta_yielded = False
         separator_pending = False
@@ -1647,8 +1559,7 @@ class _GeminiStream(AdapterStream):
     async def close(self) -> None:
         """Close the SDK's chunk iterator; an async generator's aclose is idempotent.
 
-        The SDK returns an async generator; an iterator without aclose (a test double) holds no
-        connection of its own, so there is nothing to close.
+        A test iterator without aclose has no connection to close.
         """
         if isinstance(self._chunks, AsyncGenerator):
             await self._chunks.aclose()
@@ -1657,9 +1568,8 @@ class _GeminiStream(AdapterStream):
 def _as_response(raw: BaseModel) -> types.GenerateContentResponse:
     """Narrow a raw response to the SDK response this adapter produces.
 
-    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
-    so another type is a defect in langchaint and not a provider behavior.
+    BoundAdapter accepts BaseModel because the neutral core imports no SDK.
+    This adapter produces GenerateContentResponse.
 
     Raises:
         TypeError: raw is not a genai GenerateContentResponse.
@@ -1682,10 +1592,9 @@ def _finished_turn_or_no_output(
 ) -> _FinishedTurn | Refusal | UnfinishedTurn:
     """Read the first candidate as a finished turn, or report why no turn can be read.
 
-    No candidates with a block_reason is the provider declining the prompt: Refusal with an empty
-    turn. No candidates without one is a response langchaint cannot read a turn from, and so is a
-    candidate without a finish_reason, the in-progress state of a turn that never closed: both are
-    UnfinishedTurn, carrying whatever partial turn the candidate held.
+    No candidates with block_reason becomes Refusal with an empty turn.
+    No candidates without block_reason becomes UnfinishedTurn.
+    A candidate without finish_reason also becomes UnfinishedTurn and preserves its partial turn.
     """
     candidates = response.candidates
     if not candidates:
@@ -1787,10 +1696,9 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
     async def open_stream(self, request: RequestParams) -> AdapterStream:
         """Open one generate_content_stream and return the live stream; connection failures raise here.
 
-        The SDK's generate_content_stream returns an unstarted async generator, so its await does
-        no connection I/O (google-genai 2.16.0); pulling the first chunk here is what performs it,
-        and the stream yields that chunk back first, so a connection failure raises before any
-        event is yielded, as the BoundAdapter.open_stream contract states.
+        In google-genai 2.16.0, awaiting generate_content_stream returns an unstarted async generator.
+        Pulling first_chunk performs connection I/O before any event is yielded.
+        _GeminiStream yields first_chunk first.
 
         Raises:
             TypeError: request was built by another adapter.
@@ -1830,9 +1738,7 @@ class _BoundGeminiText(_BoundGemini[str]):
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn, whose concatenated text is this binding's output.
 
-        Every finished turn is a result: a refusal or a truncation still carries whatever text the
-        model wrote, its condition named by the stop reason, and no schema stands between that text
-        and the output.
+        Every finished turn returns its text. stop_reason reports refusal or truncation.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
@@ -1862,11 +1768,9 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
     def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
-        Validating here rather than in the SDK is what puts the response and its text in scope when
-        the text is rejected; the anthropic adapter's _parsed_outcome states the shared reasoning,
-        and the ordering matches it: the finish reason is read before the rejection, so text the
-        token cap cut mid-object is reported as the truncation and not as a violation of the schema
-        it was closing.
+        Local validation preserves the response and rejected text.
+        A non-finished reason takes precedence over schema validation.
+        MAX_TOKENS takes precedence over SchemaViolation.
         """
         validation_error: ValidationError | None = None
         text = finished_turn.assistant_message.text

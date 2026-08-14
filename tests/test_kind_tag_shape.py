@@ -1,16 +1,8 @@
-"""The shape of the kind tag, checked structurally over every tagged union langchaint defines.
+"""Verify kind values across langchaint tagged unions.
 
-The unions are discovered by importing every langchaint module and reading its type aliases, so a
-union added anywhere is covered the moment it exists. A tagged union is one whose variants all
-annotate kind, so a union with a builtin variant, which cannot hold a tag, is out of scope rather
-than a failure.
-
-Two invariants hold whatever the union: two variants never share a tag, and every word of a tag comes
-from its own class's name. Together they are what lets a match on kind route each variant to its own
-case.
-The naming check is a subsequence test because a variant drops the words its siblings all share
-(UserMessage tags "user"), and a variant of two unions carries one tag under both, so the words
-dropped are not a function of any single union's membership.
+Discovery reads type aliases from each langchaint module.
+Each tagged union has distinct kind values.
+Each kind value contains an ordered subset of its class name's words.
 """
 
 import inspect
@@ -22,14 +14,13 @@ from tests.helpers import package_modules
 
 
 def _flatten_union(annotation: object) -> list[type]:
-    """List the concrete classes an annotation resolves to, unwrapping aliases and generics."""
+    """Return concrete classes from an annotation."""
     aliased = getattr(annotation, "__value__", None)
     if aliased is not None:
         return _flatten_union(aliased)
     if getattr(annotation, "__metadata__", None) is not None:
         return _flatten_union(getattr(annotation, "__origin__", None))
-    # Both origins occur and are distinct objects on 3.13: | builds typing.Union when an operand is
-    # a typing object, and types.UnionType otherwise.
+    # Python 3.13 uses typing.Union or types.UnionType based on the operands.
     if get_origin(annotation) in (Union, UnionType):
         return [
             variant for argument in get_args(annotation) for variant in _flatten_union(argument)
@@ -41,7 +32,7 @@ def _flatten_union(annotation: object) -> list[type]:
 
 
 def _tagged_unions() -> dict[str, tuple[type, ...]]:
-    """Map each langchaint type alias whose variants all declare kind to those variants."""
+    """Map each tagged type alias to its variants."""
     found: dict[str, tuple[type, ...]] = {}
     for module in package_modules():
         for attribute_name, value in vars(module).items():
@@ -56,7 +47,7 @@ def _tagged_unions() -> dict[str, tuple[type, ...]]:
 
 
 def _tag_of(variant: type) -> str:
-    """Read the one string a variant's kind Literal holds."""
+    """Return the string in a variant's kind Literal."""
     annotations = inspect.get_annotations(variant)
     literal_arguments = get_args(annotations["kind"])
     assert len(literal_arguments) == 1, f"{variant.__name__}.kind holds no single Literal value"
@@ -84,12 +75,7 @@ _TAGGED_UNIONS = _tagged_unions()
 
 
 def test_discovery_finds_the_known_unions_with_their_variants_intact() -> None:
-    """Discovery reaches both the pydantic unions and the outcome unions, and every variant of each.
-
-    Every check below passes vacuously on a union discovery dropped, and passes just as quietly on
-    one it found but flattened to a single variant, so a walk that stops early has to fail here.
-    A union of one variant is not a union, which is what makes the lower bound safe to assert.
-    """
+    """Discovery finds known unions with multiple variants."""
     assert {"Message", "ContentPart", "TurnPart", "ResponseOutcome", "GenerateResult"} <= set(
         _TAGGED_UNIONS
     )
@@ -102,11 +88,7 @@ def test_discovery_finds_the_known_unions_with_their_variants_intact() -> None:
 
 
 def test_no_union_gives_two_variants_the_same_tag() -> None:
-    """Within one union every tag is distinct, so a tag identifies one variant.
-
-    A variant that copied a sibling's tag would take the sibling's case in every match on kind,
-    leaving its own case dead, and pyrefly reports neither the duplicate nor the dead case.
-    """
+    """Each kind value identifies one variant of a tagged union."""
     collisions = {}
     for union_name, variants in _TAGGED_UNIONS.items():
         tags = [_tag_of(variant) for variant in variants]

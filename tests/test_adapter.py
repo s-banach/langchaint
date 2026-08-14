@@ -1,12 +1,7 @@
-"""The neutral adapter helpers, driven directly rather than through either backend.
+"""Test provider-neutral adapter helpers.
 
-retry_after_seconds_from_headers is reached in production only through parse_anthropic and
-parse_openai, so the backend test modules cover each parse reading its own SDK's
-exception. What they cannot state is the parsing itself, which is one function shared by both:
-the header precedence, the units, and which malformed value falls through to the other header.
-request_json and narrowed_request are the same shape: each adapter calls them with its own SDK's
-omit class and its own request subclass, and what is shared is the walk and the narrowing, exercised
-here against stand-ins for both.
+retry_after_seconds_from_headers tests header precedence and units.
+request_json and narrowed_request tests use local request values.
 """
 
 import json
@@ -60,14 +55,7 @@ from langchaint.adapter import (
     ],
 )
 def test_retry_after_seconds_from_headers(headers: dict[str, str], expected: float | None) -> None:
-    """The precise header wins, values are seconds, and an unusable value is absent rather than zero.
-
-    A returned 0.0 would be a wait the rate limiter honors as "no wait", so a server sending 0 or a
-    negative must be indistinguishable from a server sending nothing.
-    An unusable retry-after-ms falls through to retry-after, because the millisecond header is the
-    optional refinement of the standard one, not a replacement that voids it. A malformed
-    retry-after ends the parse there, including where the millisecond header already fell through.
-    """
+    """Parse positive retry-after headers in seconds with millisecond precedence."""
     assert retry_after_seconds_from_headers(headers) == expected
 
 
@@ -76,14 +64,14 @@ class _Omit:
 
 
 class _Nested(BaseModel):
-    """Stands in for an SDK model an adapter passes by instance, which json rejects."""
+    """Provide a nested pydantic request value."""
 
     depth: int
 
 
 @dataclass(frozen=True, kw_only=True)
 class _Request(RequestParams):
-    """One request holding a value of every kind the walk has to place."""
+    """Provide each request value shape under test."""
 
     model: str
     temperature: float | _Omit
@@ -93,17 +81,12 @@ class _Request(RequestParams):
 
     @override
     def as_json(self) -> str:
-        """Render through the shared walk, as each adapter's own as_json does."""
+        """Serialize through request_json."""
         return request_json(self, omitted_class=_Omit)
 
 
 def test_request_json_drops_omitted_fields_and_keeps_every_sent_one() -> None:
-    """An omitted field is absent from the object, which is what the request body does with it.
-
-    Writing it as null would say the request sent null, a value the providers reject, and writing the
-    sentinel's repr would put a memory address in an archive.
-    A nested omit goes too: the walk recurses, so a field of a field is placed by the same rule.
-    """
+    """request_json recursively removes omitted fields."""
     request = _Request(
         model="m",
         temperature=_Omit(),
@@ -118,10 +101,7 @@ def test_request_json_drops_omitted_fields_and_keeps_every_sent_one() -> None:
 
 
 def test_request_json_renders_a_model_an_adapter_passes_by_instance() -> None:
-    """A pydantic value inside the request becomes its fields, not its repr.
-
-    json rejects it outright, so without this the whole cell would be one unreadable string.
-    """
+    """request_json serializes nested pydantic values by field."""
     request = _Request(model="m", temperature=0.5, reasoning=_Nested(depth=2))
     assert json.loads(request.as_json()) == {
         "model": "m",
@@ -145,8 +125,7 @@ class _OtherRequest(RequestParams):
 def test_narrowed_request_hands_back_the_adapters_own_and_refuses_every_other() -> None:
     """A request another adapter built raises rather than reaching that adapter's own open_stream.
 
-    Mixing them is a defect in langchaint, not anything a provider did, so it stops before any I/O
-    and names the class that arrived.
+    Mixing them raises before I/O and names the unexpected class.
     """
     own = _Request(model="m", temperature=0.5)
     assert narrowed_request(own, _Request) is own

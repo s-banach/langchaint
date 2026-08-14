@@ -1,9 +1,8 @@
-"""A scriptable offline adapter so the example runs with no network.
+"""Provide a scripted offline adapter for the example.
 
-A script is a list of turns keyed by a tag the binding carries in its system prompt,
-so one adapter serves every agent in the graph and each agent gets its own scripted turns.
-Each turn is either text (ends that agent's loop) or tool calls (the loop dispatches and comes back).
-delay_seconds on a turn makes its open suspend, which is how the timeout layers get exercised.
+Each binding's system prompt selects a list of turns by tag.
+Text ends a loop, and tool calls continue it.
+delay_seconds suspends open_stream to exercise timeouts.
 """
 
 import asyncio
@@ -43,17 +42,13 @@ from langchaint.call import ResponseIdentity
 
 
 class FakeRaw(BaseModel):
-    """Stands in for the SDK response model an adapter holds in raw.
-
-    turn_index names the scripted turn this response came from, standing in for the fields a real
-    adapter reads the turn and the counters off.
-    """
+    """Identify the scripted turn represented by raw."""
 
     turn_index: int
 
 
 def _turn_index(raw: BaseModel) -> int:
-    """Narrow a raw response to the scripted one and return the turn it came from.
+    """Return the scripted turn index from raw.
 
     Raises:
         TypeError: raw is not a FakeRaw.
@@ -75,11 +70,7 @@ _TURN_USAGE = Usage(
     output_tokens_cost_in_usd=0.004,
     provider_executed_tool_cost_in_usd=0.0,
 )
-"""What one scripted turn bills, so a lost fold is visible as a round number of cents.
-
-The costs are stated, not priced from the counters.
-A real adapter prices what the provider reported; this one reports round numbers.
-"""
+"""Bill each scripted turn $0.01."""
 
 
 _TURN_BILLING = Billing(
@@ -91,16 +82,15 @@ _TURN_BILLING = Billing(
     cache_write_usd_per_million_tokens=75.00,
     output_usd_per_million_tokens=200.00,
 )
-"""The rates behind _TURN_USAGE's costs, so counter times rate reproduces each stated cost."""
+"""Price the counters in _TURN_USAGE."""
 
 
 @dataclass
 class Turn:
-    """One scripted assistant turn.
+    """Configure one scripted assistant turn.
 
-    text ends the agent loop; tool_calls make the loop dispatch and generate again.
-    delay_seconds suspends inside open_stream, which is what a per-call timeout races against.
-    error, when set, is raised instead of returning, after the delay.
+    text ends the loop, and tool_calls continue it.
+    delay_seconds suspends open_stream before error is raised or output is returned.
     """
 
     text: str | None = None
@@ -111,14 +101,14 @@ class Turn:
 
 @dataclass
 class Script:
-    """The turns one agent tag plays, in order, plus a count of opens it received."""
+    """Track one agent tag's turns and opens."""
 
     turns: list[Turn]
     opens: int = 0
 
 
 class ScriptedAdapter(Adapter):
-    """One adapter serving every agent; the binding's system prompt selects the script."""
+    """Serve every agent from scripts selected by system prompt."""
 
     def __init__(self, scripts: dict[str, list[Turn]]) -> None:
         """Store one Script per agent tag."""
@@ -134,33 +124,33 @@ class ScriptedAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Hand out a bound adapter reading the script the system prompt names."""
+        """Bind to the script named by the system prompt."""
         return _ScriptedBoundAdapter(self, _tag_of(binding))
 
     @override
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT]:
-        """Reject a structured binding: the example reads structured output from tool arguments."""
+        """Reject structured bindings because tools carry structured output."""
         raise NotImplementedError
 
     failure_types: ClassVar[tuple[type[Exception], ...]] = (TransientError,)
 
     @override
     def parse(self, failure: Exception) -> Verdict:
-        """Map a TransientError with the shared rule; the example scripts nothing else transient."""
+        """Map TransientError with verdict_from_transient_error."""
         if isinstance(failure, TransientError):
             return verdict_from_transient_error(failure)
         return DoNotRetry()
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify every error as unknown_exception so nothing silently retries in the example."""
+        """Classify every error as unknown_exception."""
         return "unknown_exception"
 
 
 def _tag_of(binding: Binding) -> str:
-    """Read the agent tag out of the binding's system prompt, which every binding in the example starts with."""
+    """Read the agent tag from the system prompt."""
     system_prompt = binding.system_prompt
     if isinstance(system_prompt, str) and system_prompt.startswith("["):
         return system_prompt[1 : system_prompt.index("]")]
@@ -169,18 +159,18 @@ def _tag_of(binding: Binding) -> str:
 
 @dataclass(frozen=True, kw_only=True)
 class _ScriptedRequest(RequestParams):
-    """What a scripted attempt would have put on the wire, which is the messages and nothing else."""
+    """Store the messages for one scripted attempt."""
 
     messages: tuple[Message, ...]
 
     @override
     def as_json(self) -> str:
-        """Render the messages as a JSON array of each message's dump."""
+        """Serialize the messages as JSON."""
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
 class _ScriptedBoundAdapter(BoundAdapter[str]):
-    """Plays one agent's scripted turns in order."""
+    """Play one agent's scripted turns in order."""
 
     def __init__(self, adapter: ScriptedAdapter, tag: str) -> None:
         self._adapter = adapter
@@ -188,12 +178,12 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> Billing:
-        """Report what one scripted turn bills, the same round numbers for every turn."""
+        """Return the constant billing for one turn."""
         return _TURN_BILLING
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Read the scripted response id and use request_id.
+        """Build the scripted response identity.
 
         Raises:
             TypeError: raw is not a FakeRaw.
@@ -206,7 +196,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
     @override
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
-        """Build the result the scripted turn this response names describes.
+        """Build the result for the scripted turn.
 
         Raises:
             TypeError: raw is not a FakeRaw.
@@ -227,12 +217,12 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams:
-        """Build the request the scripted attempts ignore; the script decides what comes back."""
+        """Build a request containing the messages."""
         return _ScriptedRequest(messages=tuple(messages))
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open a stream over the next scripted turn for this tag, after its delay.
+        """Open the next scripted turn after its delay.
 
         Raises:
             Exception: the turn's scripted error, whatever type it carries.
@@ -252,14 +242,10 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
 
 class _ScriptedTurnStream(AdapterStream):
-    """One scripted attempt's stream: it yields no items and assembles the turn's response.
-
-    The example never iterates a stream itself; the retry loop drains this privately, so items()
-    yielding nothing loses nothing.
-    """
+    """Assemble one scripted response without yielding items."""
 
     def __init__(self, *, raw: FakeRaw) -> None:
-        """Hold the response final() returns."""
+        """Store the response returned by final."""
         self._raw = raw
 
     @override
@@ -269,33 +255,33 @@ class _ScriptedTurnStream(AdapterStream):
 
     @override
     async def final(self) -> FakeRaw:
-        """Return the response naming the scripted turn."""
+        """Return the scripted response."""
         return self._raw
 
     @override
     def billing_reported(self) -> None:
-        """None: the scripted turn bills only through its assembled response."""
+        """Report no billing before final."""
 
     @override
     def request_id(self) -> str | None:
-        """Return no request id for scripted streams."""
+        """Return no request ID."""
         return None
 
     @override
     async def close(self) -> None:
-        """Nothing to release."""
+        """Release no resources."""
 
 
 _CALL_IDS = itertools.count(1)
 
 
 def call(name: str, args_json: str) -> ToolCall:
-    """Build a ToolCall with a fresh id, so scripted calls never collide."""
+    """Build a ToolCall with a unique ID."""
     return ToolCall(id=f"call-{next(_CALL_IDS)}", name=name, args_json=args_json)
 
 
 def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
-    """Wrap a `ScriptedAdapter` in an `LLM` with fast request pacing."""
+    """Build an LLM with ScriptedAdapter and fast request pacing."""
     adapter = ScriptedAdapter(scripts)
     return LLM(
         adapter,

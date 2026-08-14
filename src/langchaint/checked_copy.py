@@ -1,21 +1,7 @@
-"""CheckedCopyModel, the base of langchaint's pydantic models: a key that is not a field is an error.
+"""A pydantic base that rejects unknown keys during construction and `model_copy`.
 
-Construction and validation are covered by extra="forbid", which the hook below requires of every
-subclass: pydantic's "ignore" default would drop a misspelled field name silently, leaving an object
-without the value its caller supplied. The cost is that a Sequence[Message] written by a newer langchaint
-raises when an older one loads it, instead of the added field being discarded.
-The hook also rejects a subclass that defines __init__, so every model here keeps pydantic's
-generated keyword-only constructor and one error shape. A positional constructor, the custom
-__init__ that would let a message read UserMessage("Hello"), is rejected: pydantic binds the raw
-input to such a signature before extra="forbid" is consulted, so both a surplus key and a missing
-field raise TypeError naming no location. Giving that __init__ a **extra parameter routes a surplus
-key past binding but does nothing for a missing field, and absorbs a misspelled optional argument
-that the generated constructor would have failed at check time.
-model_copy needs its own override, because it applies update without validation and so never
-consults extra: the key would land in the instance __dict__, where a same-named property shadows it
-and model_dump ignores it. It raises TypeError, as dataclasses.replace does for an unknown field.
-model_construct is left as pydantic ships it, dropping the key silently, since it exists to skip
-validation on data the caller vouches for.
+Subclasses must forbid extra keys and use pydantic's generated constructor.
+`model_construct` retains pydantic's unvalidated behavior.
 """
 
 from collections.abc import Mapping
@@ -38,27 +24,15 @@ def _bad_update_key_message(model_class: type[BaseModel], key: str) -> str:
 
 
 class CheckedCopyModel(BaseModel):
-    """Base class on which a key that is not a field raises, whether it arrives by construction or copy."""
+    """Reject unknown keys during construction and `model_copy`."""
 
     @classmethod
     @override
     def __pydantic_init_subclass__(cls, **kwargs: object) -> None:
-        """Require the subclass to forbid extra keys and to leave __init__ to pydantic.
-
-        Together those two make construction reject a key that is not a field, with a located
-        ValidationError.
-        The **kwargs pass-through is the hook's signature: pydantic forwards class-definition keyword arguments.
-
-        The config is checked before __init__, so each message names a fix that is the whole
-        remaining fix.
+        """Require `extra="forbid"` and pydantic's generated constructor.
 
         Raises:
-            TypeError: the subclass does not set extra="forbid". Leaving pydantic's "ignore"
-                default drops a misspelled key silently, and the fix is to set "forbid"; "allow"
-                keeps unknown keys as meaningful data that model_copy would wrongly reject, and
-                the fix is to not inherit this base.
-            TypeError: the subclass defines its own __init__, which pydantic binds the raw input to
-                before extra="forbid" is consulted, so a bad key raises an unlocated TypeError.
+            TypeError: The subclass permits extra keys or defines `__init__`.
         """
         super().__pydantic_init_subclass__(**kwargs)
         extra = cls.model_config.get("extra")
@@ -90,15 +64,12 @@ class CheckedCopyModel(BaseModel):
     def model_copy(
         self, *, update: Mapping[str, object] | None = None, deep: bool = False
     ) -> Self:
-        """Copy with the update keys checked against the model's fields before pydantic's unvalidated copy.
+        """Copy after checking that every update key names a field.
 
-        Field values still bypass validation, as on pydantic's model_copy:
-        a wrong value on a legitimate field key is stored and visible at first use,
-        unlike a dropped key, and catching it would revalidate the nested tree on every copy.
+        Field values retain pydantic's unvalidated `model_copy` behavior.
 
         Raises:
-            TypeError: an update key is not a field of this model,
-                so pydantic's unvalidated copy would drop it silently instead of applying it.
+            TypeError: An update key does not name a field.
         """
         if update:
             for key in update:

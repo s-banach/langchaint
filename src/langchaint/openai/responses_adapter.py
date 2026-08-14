@@ -1,95 +1,55 @@
-"""Adapter for the OpenAI Responses API over the official SDK.
+"""Implement the OpenAI Responses API through the official openai SDK.
 
-Verified against openai 2.45.0:
-- A structured binding sends `text.format` built by `type_to_text_format_param(Model)`, the same
-  `text` parameter `responses.parse(text_format=Model)` builds, and validates the response text itself.
-  The SDK validates inside `parse`, and inside the stream on `response.output_text.done` while its
-  terminal response is still unset, so a rejection raised there reaches langchaint with neither the
-  response nor its billing attached.
-  `type_to_text_format_param` lives in `openai.lib._parsing._responses`, a private module, so an SDK
-  upgrade can move it; `tests/test_provider_facts.py` pins the import.
-- `responses.stream(...)` returns a manager whose entered stream yields typed events and assembles the response.
-  Usage and status arrive on the terminal `response.completed`, `response.incomplete`,
-  or `response.failed` event's response;
-  the adapter captures that response itself because the SDK's `get_final_response()`
-  raises RuntimeError unless the terminal event is `response.completed`.
-- `prompt_cache_options` controls caching per request. Its own and its `mode` field's SDK docstrings
-  state the caching rules this adapter is built on: the parameter is supported on gpt-5.6 and later;
-  `{"mode": "explicit"}` with no explicit breakpoints disables caching;
-  implicit mode writes up to the latest three explicit breakpoints and explicit mode up to the
-  latest four, older marks staying readable for matching; and `ttl` takes "30m" as its only value,
-  so there is no TTL to configure and this adapter has no counterpart to the anthropic adapter's `cache_ttl`.
-  The adapter sends the parameter for `automatic_cache_breakpoints=False`.
-  With `automatic_cache_breakpoints=True`,
-  the provider's implicit caching is left in place and nothing is sent.
-  `automatic_cache_breakpoints=False` requires a model accepting `prompt_cache_options`.
-- A part with cache_breakpoint True becomes `prompt_cache_breakpoint: {"mode": "explicit"}` on its wire part,
-  under either binding value, and the adapter sends every mark and caps nothing,
-  the per-request write limits above being the API's to apply.
-  With `automatic_cache_breakpoints=False` on a model accepting `prompt_cache_options`,
-  marked parts are what re-enables caching at exactly those boundaries.
-- The API stores responses server-side for later retrieval by default;
-  the adapter always sends `store=False`: the caller's `GenerationInput` is the whole state,
-  and a stored copy would be an unused side effect.
-- The adapter sends `include=["reasoning.encrypted_content"]` on every request,
-  so reasoning items come back with `encrypted_content` populated and round-trip statelessly under `store=False`.
-  The SDK documents `include` as what populates `encrypted_content`;
-  a live run on 2026-07-17 saw it populated without the flag, undocumented behavior the adapter does not rely on.
-- `reasoning.summary` carries the constructor's `reasoning_summary`.
-  The SDK types it as "auto", "concise", or "detailed" and describes it as a summary of the reasoning
-  the model performed; `generate_summary` carries the same values and the SDK marks it deprecated in
-  favor of `summary`, so it is never sent.
-  `reasoning.effort` and `reasoning.summary` are assembled key by key so an unset one is omitted
-  rather than sent as an explicit null.
+The following SDK facts were verified against openai 2.45.0.
+A structured binding builds `text.format` with `type_to_text_format_param` and validates response text itself.
+SDK parsing may reject text before the terminal response exposes its billing.
+`type_to_text_format_param` is a private SDK function that may move between SDK versions.
+`responses.stream` yields typed events and assembles the response.
+Usage and status arrive with `response.completed`, `response.incomplete`, or `response.failed`.
+`get_final_response()` raises unless the terminal event is `response.completed`.
 
-Cache writes bill starting with gpt-5.6, so the OpenAIPricingTable's cache-write rate applies here too.
-That is a price rather than a wire fact, so it comes from the page the subpackage docstring cites,
-not from the SDK.
+`prompt_cache_options` supports gpt-5.6 and later.
+`{"mode": "explicit"}` without breakpoints disables caching.
+Implicit mode writes through the latest three breakpoints.
+Explicit mode writes through the latest four breakpoints.
+Older breakpoints remain available for matching.
+`ttl` accepts only `"30m"`.
+`automatic_cache_breakpoints=False` sends explicit mode and requires `prompt_cache_options` support.
+`automatic_cache_breakpoints=True` sends no `prompt_cache_options` and preserves implicit caching.
+Every marked part sends `prompt_cache_breakpoint: {"mode": "explicit"}`.
+The adapter sends every breakpoint and lets the API enforce its write limits.
+Marked parts re-enable caching under `automatic_cache_breakpoints=False`.
 
-`usage.input_tokens` includes `input_tokens_details.cached_tokens` and
-`input_tokens_details.cache_write_tokens`, so it is the provider-reported all-inclusive input total
-the Usage partition is checked against. That one is verified by docs rather than by introspection:
-the SDK documents no relationship among the input counters,
-so `_billing_from_response` carries the page that does.
+The API stores responses by default.
+The adapter sends `store=False` because `GenerationInput` contains the complete state.
+Every request includes `reasoning.encrypted_content` so reasoning can replay under `store=False`.
+`reasoning.summary` accepts `"auto"`, `"concise"`, or `"detailed"`.
+The deprecated `generate_summary` accepts the same values, so the adapter sends only `reasoning.summary`.
+The adapter omits unset `reasoning.effort` and `reasoning.summary` keys.
 
-ContentPart mappings verified against openai 2.53.0:
-- `ImagePart` becomes `image_url` containing a data URL.
+Content mappings were verified against openai 2.53.0.
+- `ImagePart` becomes a data URL in `image_url`.
 - `ImageUrlPart.url` becomes `image_url` unchanged.
-- `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `InvalidRequest` inside `UserMessage` and `ToolMessage`.
+- Web search and file search produce distinct output item types.
 
-Provider-executed tool mappings were verified against openai 2.53.0.
-Web search and file search return distinct output item types.
-
-Mapping decisions:
-- A str system_prompt travels as the `instructions` parameter, not as an input item;
-  a parts system_prompt travels as a developer-role input message first in every request's input,
-  the message the SDK documents `instructions` as inserting, because only input message parts
-  carry prompt_cache_breakpoint.
-- An AssistantMessage re-feeds its TurnPart values in emission order,
-  which the API requires for replay under store=False:
-  a ReasoningPart is its reasoning item re-sent unchanged,
-  a RawPart re-sends its stored item unchanged,
-  a ToolCall one `function_call` item,
-  and a maximal run of adjacent TextParts one assistant message item;
-  ToolMessage becomes a `function_call_output` item keyed by call_id.
-  The API has no is_error flag, so the error text in output is the only error signal.
-- The API reports no finish reason; stop_reason is derived: a `ResponseOutputRefusal` content block means refusal,
-  else any `function_call` output item means tool_use, otherwise status "completed" means end_turn,
-  status "incomplete" means max_tokens or refusal by its reason ("max_output_tokens" or
-  "content_filter", the only two the SDK types), and anything else is "other".
-- A `ResponseOutputRefusal` content part becomes a TextPart, so the refusal the model wrote is the
-  turn's text and replays as text. anthropic's ContentBlock union has no refusal variant
-  (anthropic 0.120.0), so there a refusal arrives as ordinary text with stop_reason "refusal";
-  mapping openai's part to a TextPart gives the two providers one neutral shape and leaves the stop
-  reason as the signal on both.
-- Status "failed" is the API reporting that the run did not finish (`response.error` names why), so
-  whatever it emitted is a fragment rather than the turn. Both bindings report it as the variant
-  `_provider_failure` picks off `response.error.code`, carrying that response's billing, and a
-  structured binding does so whether or not the fragment happened to validate.
-- Streaming yields the SDK's own answer delta strings unwrapped, each reasoning delta in a ReasoningDelta,
-  each argument fragment in a ToolCallDelta, and each tool call once, complete, from its
-  `response.output_item.done` event.
-  Usage, cost, and stop reason arrive only on final()'s AdapterResult.
+Request and response mappings:
+- A string `system_prompt` becomes `instructions`.
+- A parts `system_prompt` becomes the first developer-role input message because only parts support breakpoints.
+- `AssistantMessage` replays `TurnPart` values in emission order under `store=False`.
+- `ReasoningPart` and `RawPart` replay their stored items unchanged.
+- `ToolCall` becomes `function_call`, and adjacent `TextPart` values become one assistant message.
+- `ToolMessage` becomes `function_call_output` keyed by `tool_call_id`.
+- The API has no `is_error` field, so `ToolMessage.content` carries the error signal.
+- `ResponseOutputRefusal` becomes `TextPart` and maps to `stop_reason="refusal"`.
+- Anthropic 0.120.0 represents refusals as text with the same `stop_reason`.
+- A `function_call` output item maps to `stop_reason="tool_use"`.
+- Status `"completed"` maps to `"end_turn"`.
+- Status `"incomplete"` maps `"max_output_tokens"` to `"max_tokens"` and `"content_filter"` to `"refusal"`.
+- Other outcomes map to `"other"`.
+- Status `"failed"` returns `_provider_failure` with billing, even when emitted text validates.
+- Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one `ToolCall` per completed item.
+- `final()` supplies usage, cost, and stop reason.
 """
 
 from abc import ABC
@@ -224,10 +184,8 @@ def _wire_reasoning(
 ) -> Reasoning | Omit:
     """Assemble the reasoning object from the keys that are set, omitting it when neither is.
 
-    Reasoning is a total=False TypedDict whose effort and summary are both Optional, so passing None
-    type-checks and sends an explicit null, a different request from omitting the key.
-    The other keys the TypedDict carries (context, mode, and the deprecated generate_summary alias
-    of summary) are not mapped, so they are never sent.
+    `Reasoning` permits explicit `None`, which differs from omitting a key.
+    The adapter never sends `context`, `mode`, or deprecated `generate_summary`.
     """
     reasoning: Reasoning = {}
     if effort is not None:
@@ -241,21 +199,15 @@ def _wire_reasoning(
 class _OpenAIPrecomputedFields:
     """The typed request fields one binding precomputes.
 
-    Fields set to the SDK's omit sentinel leave the provider default in place; passing them as explicit keywords
-    (never **kwargs) keeps the SDK's overload resolution intact.
-    instructions is the bound str system prompt; a parts system prompt travels in input_prefix instead.
+    The SDK `omit` sentinel preserves provider defaults.
+    Explicit keywords preserve SDK overload resolution.
     tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
-    include is always ["reasoning.encrypted_content"]:
-    the adapter re-feeds the whole Sequence[Message] every turn, so every response's reasoning items
-    must carry the payload a later request replays.
+    `include` always contains `"reasoning.encrypted_content"` for later replay.
     """
 
     model: str
     instructions: str | None
     input_prefix: list[ResponseInputItemParam]
-    """Items sent ahead of the Sequence[Message] every request: a system_prompt bound as parts becomes
-    one developer-role input message here (its parts carry prompt_cache_breakpoint marks,
-    which the instructions string cannot), and a str or absent system_prompt leaves it empty."""
 
     max_output_tokens: int | Omit
     temperature: float | Omit
@@ -342,9 +294,7 @@ def _tool_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInpu
 def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
     """Convert one UserMessage to a user message item.
 
-    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part;
-    the API writes up to the latest four breakpoints per request (three in implicit mode)
-    and treats older ones as read-only, so every mark is sent and no client-side cap applies.
+    Marked parts send `prompt_cache_breakpoint`.
 
     Raises:
         _NotSendableError: content holds AudioPart.
@@ -425,13 +375,9 @@ def _function_call_output(
 def _replayed_item(raw: Mapping[str, object]) -> ResponseInputItemParam:
     """Copy one stored SDK dump into the input item it came from, unread and unchanged.
 
-    The dict is the producing SDK item's model_dump; when this adapter produced it, its shape is the
-    wire param's by construction, so the cast holds. A dump another provider produced is not this
-    shape; it is passed through unchanged, never dropped or neutralized here (trimming is the app's
-    job), and left to the API. Reconstructing it field by field would risk changing the payload the
-    API re-reads.
-    The shallow copy keeps the wire path from ever aliasing the frozen message's stored payload into
-    a mutable request structure.
+    This adapter's SDK dump already matches the wire parameter.
+    Another provider's dump passes through unchanged for the API to validate.
+    The copy prevents mutable request state from changing the stored payload.
     """
     # cast: a deliberately-opaque value re-enters the typed API whose own serialization produced it.
     return cast("ResponseInputItemParam", dict(raw))
@@ -441,14 +387,10 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
     """Convert one AssistantMessage to its input items in turn order.
 
     The API requires the original item order for replay under store=False.
-    A maximal run of adjacent TextParts becomes one assistant message item whose content joins their texts
-    (turn carries no message-item boundary, so the run is the inverse of the produce rule's per-part split);
-    each ToolCall becomes a function_call item keyed by call_id,
-    which the paired ToolMessage's function_call_output references.
-    ReasoningPart.raw and RawPart.raw go to the wire unchanged, routed by their own
-    type key, so encrypted_content replays byte-identical.
-    A dump another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly.
+    Adjacent `TextPart` values become one assistant message item.
+    Each `ToolCall` becomes `function_call` keyed by `call_id`.
+    `ReasoningPart.raw` and `RawPart.raw` replay unchanged by their `type` keys.
+    The API validates another provider's unknown `type` key.
     """
     items: list[ResponseInputItemParam] = []
     pending_texts: list[str] = []
@@ -535,19 +477,12 @@ def _wire_tools(
 def _provider_failure(
     response: OpenAIResponse, *, assistant_message: AssistantMessage
 ) -> ProviderFailedTransiently | ProviderFailedTerminally:
-    """Report a failed status as the variant its error code's disposition selects.
+    """Return the failure variant selected by `response.error.code`.
 
-    A failed status is the API saying no generation completed, so whatever output items the response
-    holds are a fragment rather than the turn. Both variants carry that fragment as their turn.
-
-    reason is response.error.message verbatim, the only description of a condition langchaint does
-    not model; a response reporting the failure with no error object at all gets langchaint's own
-    sentence, which says exactly that.
-    An error code outside the table is terminal: retrying is what spends the budget, so a code nobody
-    classified fails the item rather than being resent at full price.
-    rate_limit_exceeded sets is_rate_limit, which the retry loop's TransientError carries into the
-    admitted() block's exit, where parse maps it to PauseAll and pauses admission the way a 429
-    status does. Neither variant carries a server-stated wait, so the pause runs for the drawn wait.
+    Both variants carry emitted fragments in `assistant_message`.
+    `reason` preserves `response.error.message` verbatim.
+    Missing errors and unknown codes produce terminal failures.
+    `rate_limit_exceeded` produces a rate-limit transient failure without a server-stated wait.
     """
     error = response.error
     if error is None:
@@ -576,9 +511,8 @@ def _has_refusal(response: OpenAIResponse) -> bool:
 def _as_response(raw: BaseModel) -> OpenAIResponse:
     """Narrow a raw response to the SDK response this adapter produces.
 
-    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
-    so another type is a defect in langchaint and not a provider behavior.
+    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
+    This adapter's stream produces every valid value.
 
     Raises:
         TypeError: raw is not an openai Response.
@@ -591,9 +525,8 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
 def _first_output_text(response: OpenAIResponse) -> str | None:
     """Return the text of the turn's first output_text content part, None when it holds none.
 
-    The part a structured turn's instance is validated from. Reading the first part matches what the
-    SDK's own parse yields for every response it does not raise on: it validates every output_text
-    part and returns the first instance, so a response whose first part is not the instance raises there.
+    Structured output validation uses this part.
+    SDK parsing validates every `output_text` part and returns the first instance.
     """
     for item in response.output:
         if item.type == "message":
@@ -606,9 +539,7 @@ def _first_output_text(response: OpenAIResponse) -> str | None:
 def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
     """Derive the stop reason; the API reports no finish reason field.
 
-    Status "incomplete" with reason "content_filter" is a refusal: the provider's filter blocked
-    the turn, so the structured path fails the item under RefusalError's no-retry policy instead
-    of spending the retry budget resending a request the filter blocks every time.
+    An incomplete `content_filter` result maps to `refusal` without retry.
     """
     if _has_refusal(response):
         return "refusal"
@@ -632,22 +563,10 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
 
 
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:
-    """Join a reasoning item's readable text, None when it holds none.
+    """Join non-empty reasoning parts with `REASONING_PART_SEPARATOR`.
 
-    The text arrives in parts, several per item: the SDK types summary and content as lists, and the
-    stream carries one summary_index or content_index per part, each accumulating its own text
-    deltas, so a part is a separately delimited unit and the parts join on a blank line rather than
-    concatenating into one run.
-    Asking for a summary is what the constructor's reasoning_summary does.
-
-    content wins over summary where both hold text: the SDK types a content element reasoning_text
-    and a summary element summary_text (openai 2.48.0), so content is the reasoning a model wrote and
-    summary is a rendering of it.
-    Which of the two a given model fills is request-time behavior SDK introspection cannot show, so
-    the adapter reads both; reading only one would drop returned text into an unreportable None.
-
-    Empty parts are dropped before the join, so an item whose parts are all empty yields None
-    rather than the separator alone; text-free stays the single condition text is None.
+    Reasoning content takes precedence over its summary in openai 2.48.0.
+    Empty content and summary parts produce `None`.
     """
     summary = REASONING_PART_SEPARATOR.join(part.text for part in item.summary if part.text)
     content = REASONING_PART_SEPARATOR.join(part.text for part in item.content or () if part.text)
@@ -657,13 +576,9 @@ def _reasoning_text(item: ResponseReasoningItem) -> str | None:
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     """Build the langchaint assistant turn from the output items, item order preserved.
 
-    A reasoning item becomes a ReasoningPart carrying the item's own model_dump for verbatim replay,
-    beside the readable text _reasoning_text extracts from it;
-    a message item becomes one TextPart per content part it holds, in their order, from an
-    output_text part and from a refusal part alike, because the sentences the model wrote to refuse
-    are the turn's text and a turn built without them replays as nothing;
-    every other item, a built-in tool call among them, becomes a RawPart holding the item's
-    own model_dump, so the turn carries what the response was billed for.
+    Reasoning items become replayable `ReasoningPart` values with readable text.
+    Message content becomes ordered `TextPart` values, including refusals.
+    Other items become replayable `RawPart` values.
     """
     turn: list[TurnPart] = []
     for item in response.output:
@@ -693,31 +608,20 @@ def _billing_from_response(
     *,
     regional_processing: bool = False,
 ) -> Billing:
-    """Price counters using the reported `service_tier`.
+    """Price response counters at the reported `service_tier`.
 
-    The whole response is the argument, not its usage: the tier that selects the rates is on the
-    response and the counters are on the usage, and pricing one response's counters at another
-    response's tier is the mistake worth making impossible.
-
-    input_tokens is the all-inclusive input total,
-    so the uncached counter is the remainder after subtracting cached and cache-write tokens.
-    The SDK documents no relationship among the input counters, so the source is the provider's
-    prompt-caching page, whose worked example reports 1920 cached tokens inside a 2006-token
-    prompt total, read 2026-07-25:
-    https://developers.openai.com/api/docs/guides/prompt-caching
-    output_tokens_details and its reasoning_tokens counter are both required on the SDK Usage.
-
-    OpenAI's web-search guide says only `search` actions incur tool-call costs.
-    This was read 2026-08-09:
-    https://developers.openai.com/api/docs/guides/tools-web-search
-    Each `file_search_call` incurs one file-search call fee.
-    Source: https://developers.openai.com/api/docs/pricing
+    `input_tokens` includes cached and cache-write tokens.
+    Source: https://developers.openai.com/api/docs/guides/prompt-caching, read 2026-07-25.
+    `output_tokens_details.reasoning_tokens` is required.
+    Only web-search `search` actions incur invocation costs.
+    Source: https://developers.openai.com/api/docs/guides/tools-web-search, read 2026-08-09.
+    Each `file_search_call` incurs one file-search fee.
+    Source: https://developers.openai.com/api/docs/pricing.
 
     A response without usage bills zero counters.
 
     Raises:
-        pydantic.ValidationError: the counters leave input_tokens_cache_none negative, a response
-            over-reporting its cache counters, so the priced Usage rejects it.
+        pydantic.ValidationError: Cache counters exceed `input_tokens`.
     """
     service_tier = _priced_tier(response.service_tier)
     usage = response.usage
@@ -805,47 +709,26 @@ class OpenAIResponsesAdapter(Adapter):
         reasoning_summary: ReasoningSummary | None = None,
         service_tier: OpenAIServiceTier | None = None,
     ) -> None:
-        """Store the SDK client, which owns credentials and endpoints.
+        """Store request and pricing configuration without sending a request.
 
         The stored client disables SDK retries.
-        langchaint's retry loop owns retrying and counts every request.
-
-        reasoning_summary asks the API for readable text, which reaches ReasoningPart.text where the
-        reasoning item carries no reasoning text of its own;
-        None sends no summary field and leaves the provider default in place.
-        A model may return no summary even when one is requested.
-        It is a constructor parameter rather than an InferenceParams field because InferenceParams
-        is neutral and anthropic has no reasoning summary of its own.
-
-        provider_name says which provider the client reaches: "openai" for AsyncOpenAI,
-        "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI.
-        `OpenAI.model` passes "openai".
-        `OpenAIBedrock.model` passes "aws.bedrock".
-        The two platform classes are in provider_name_by_client_class, so a value contradicting
-        either makes Adapter.__init__ raise; an AsyncOpenAI takes the provider_name its caller
-        states, since its base_url decides what it reaches.
-
-        supports_prompt_cache_options says whether the model accepts the prompt_cache_options
-        request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
+        `reasoning_summary` requests readable reasoning text.
+        `None` preserves the provider default, and a requested summary may still be absent.
+        `provider_name` identifies OpenAI, Bedrock, or Azure.
+        Bedrock and Azure clients require their fixed `provider_name` values.
+        `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
+        `supports_prompt_cache_options` identifies gpt-5.6-and-later support in openai 2.45.0.
         `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
-        It has no default because a wrong value fails either way: True on a model without the
-        parameter risks a rejected request, and False on one with it refuses a binding the model
-        would have accepted.
         `OpenAI.model` derives cataloged values from `PROMPT_CACHE_OPTIONS_MODELS`.
         It requires the parameter for uncataloged identifiers.
         `OpenAIBedrock.model` always requires it because Bedrock ids have no catalog.
-        It is a parameter here rather than a lookup on model because model is a str whose namespace
-        this adapter cannot know: it serves the platforms provider_name_by_client_class maps and
-        every OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.
-
-        `pricing` holds this model's rates and modifiers.
+        `pricing` supplies rates and modifiers.
         `regional_processing=False` uses the standard `1.0` token-price multiplier.
         `regional_processing=True` applies the regional token-price multiplier.
-        service_tier is what the request asks for, None sending nothing. It cannot decide the price:
-        the API documents the reported mode as possibly different from the requested one.
+        `service_tier` requests a tier, while the reported tier selects pricing.
 
         Raises:
-            ValueError: `provider_name` contradicts the client's class.
+            ValueError: `provider_name` contradicts a Bedrock or Azure client class.
         """
         super().__init__(
             client=client,
@@ -863,18 +746,11 @@ class OpenAIResponsesAdapter(Adapter):
     def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 
-        A str system_prompt travels as the instructions parameter,
-        which the SDK documents as "a system (or developer) message inserted into the model's context".
-        A parts system_prompt travels as that message itself, a developer-role input message
-        first in every request's input, because only input message parts carry prompt_cache_breakpoint.
-
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
-                Also raised when extra_body holds a key in
-                _ADAPTER_POPULATED_WIRE_KEYS.
-                Also raised for unsupported provider-executed tool `type` values.
-                Provider-executed tools require `provider_name="openai"`.
-                Configured charged rates must be finite and nonnegative.
+            ValueError: `extra_body` contains a key in `_ADAPTER_POPULATED_WIRE_KEYS`.
+            ValueError: A provider-executed tool type is unsupported or uses another provider.
+            ValueError: A configured charged rate is not finite and nonnegative.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
@@ -1019,39 +895,27 @@ class _OpenAIStream(AdapterStream):
         The terminal event's response is kept for final(), which must not call the SDK's get_final_response():
         that raises RuntimeError unless the terminal event is response.completed.
 
-        forming_calls is keyed by output_index, the one identifier required on both of its event
-        types (the item's own id is optional).
-        The SDK's stream state asserts that the added event precedes the item's deltas, so the
-        lookup cannot miss.
+        `forming_calls` uses required `output_index` because item ids are optional.
+        The SDK emits the added event before its deltas.
 
         Reasoning arrives on two independent event types and both are forwarded:
         summary deltas, which the constructor's reasoning_summary asks for,
         and reasoning text deltas from a model that fills the reasoning item's content.
         A stream yielding no ReasoningDelta is a model returning no readable reasoning.
 
-        Reasoning text arrives in parts, and the API breaks between two parts structurally, never
-        as text: each part ends with its own done event instead. That done event puts a
-        REASONING_PART_SEPARATOR delta before the next part's first delta, so a caller
-        concatenating ReasoningDelta text gets those breaks as characters.
-        A part holding no text is not a part: a delta carrying no characters is dropped, and a
-        separator falls only between two parts that streamed text, so the reasoning never opens or
-        ends on a blank line and never doubles one. That is the rule _reasoning_text applies when it
-        drops empty parts before joining.
-        A pending separator is scoped to neither one item nor one channel: whichever reasoning delta
-        comes next consumes it.
+        Done events delimit reasoning parts without text.
+        `REASONING_PART_SEPARATOR` precedes the next non-empty reasoning delta.
+        Empty deltas emit no text or separator.
+        The next reasoning delta from either channel consumes a pending separator.
 
         Yields:
-            Stream items; SDK events langchaint does not model (built-in tool activity) stream
-            nothing and reach the caller in the turn final()'s response carries.
+            Stream items for SDK events langchaint models.
 
         Raises:
-            openai.APIStatusError: the stream ended without a terminal response after an error
-                event; raised on the live response, so it carries the 200 status and the open
-                request's headers, with the event's code, message, and param as its body. The SDK
-                itself never raises on the event (openai 2.51.0 forwards it accumulated-only), so
-                this raise is what turns a mid-stream error into a failure parse can verdict.
-            StreamProtocolError: the stream ended with neither a terminal response nor an error
-                event.
+            openai.APIStatusError: The stream ends after an error event without a terminal response.
+                It carries status 200, request headers, and the event body.
+                OpenAI 2.51.0 does not raise this event itself.
+            StreamProtocolError: The stream ends without a terminal response or error event.
         """
         error_event: ResponseErrorEvent | None = None
         reasoning_delta_yielded = False
@@ -1121,10 +985,8 @@ class _OpenAIStream(AdapterStream):
     async def final(self) -> OpenAIResponse:
         """Return the terminal event's response, exactly as the SDK built it.
 
-        It is never re-validated into another model: the SDK constructs a response leniently and
-        tolerates an output item type or an enum value it does not model, so validating that
-        response against the SDK's own strict model can raise pydantic's ValidationError over a
-        response whose partial output and billing the caller is owed.
+        The adapter preserves the lenient SDK response without revalidation.
+        Revalidation could reject unmodeled output and discard partial output or billing.
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so no terminal response was captured.
@@ -1137,9 +999,8 @@ class _OpenAIStream(AdapterStream):
     def billing_reported(self) -> Billing | None:
         """Return terminal billing or NaN for incomplete charged provider tools.
 
-        The SDK's stream state accumulates the response's output items and no counters
-        (openai 2.45.0), and ResponseUsage arrives on the response the completed event carries,
-        which is exactly the event a stream that ends early never receives.
+        OpenAI 2.45.0 stream state accumulates output items without counters.
+        `ResponseUsage` arrives only with the terminal response.
         """
         if self._terminal_response is not None:
             return _billing_from_response(
@@ -1197,8 +1058,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
 
         Raises:
             TypeError: raw is not an openai Response.
-            pydantic.ValidationError: the response over-reports its cache counters, leaving the
-                derived uncached-input counter negative.
+            pydantic.ValidationError: Cache counters exceed total input tokens.
         """
         return _billing_from_response(
             _as_response(raw),
@@ -1280,15 +1140,9 @@ class _BoundOpenAIText(_BoundOpenAI[str]):
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn's text as this binding's output, or report the run openai says failed.
 
-        A failed status means the run did not finish, and response.error names why, so the output
-        items hold whatever had been emitted rather than the turn; reporting that as a Response would
-        present a fragment as the answer. _provider_failure states which variant the error code picks.
-        An incomplete status is deliberately not this case: a turn cut off at the token cap or by a
-        content filter is the answer as far as it got, and stop_reason ("max_tokens" or "refusal")
-        is how the caller sees that.
-        The text is the assistant turn's, not response.output_text: output_text concatenates the
-        output_text content parts alone, so a refusal turn would come back with an empty output while
-        the same Response's assistant_message carried the sentences the model wrote to refuse.
+        A failed status returns `_provider_failure` because emitted items are fragments.
+        An incomplete status returns partial text with `max_tokens` or `refusal`.
+        `assistant_message.text` includes refusal text that `response.output_text` omits.
 
         Raises:
             TypeError: raw is not an openai Response.
@@ -1312,10 +1166,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
     ) -> None:
         """Precompute the request's text parameter, the JSON-schema format this binding asks for.
 
-        The format is built by the same type_to_text_format_param call responses.parse makes, so the
-        request carries what passing text_format would have sent.
-        It replaces the binding's omitted text field, so every request this binding builds carries it
-        and the two bindings send the same fields.
+        `type_to_text_format_param` matches `responses.parse(text_format=...)`.
+        The format replaces the omitted binding field in every request.
         """
         self._adapter = adapter
         self._response_format = response_format
@@ -1331,26 +1183,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
     ) -> NoOutputOutcome:
         """Report why the turn produced no instance and no tool call.
 
-        validation_error is pydantic's rejection of the turn's text, None when the turn carried no
-        text to validate. On a completed turn the two answers are SchemaViolation and EmptyTurn;
-        everywhere else the status names the failure and the rejection adds nothing.
-
-        Each variant carries assistant_message, so the turn a rejected 200 did produce reaches the
-        caller on the failure.
-        No variant carries a stop reason: each GenerationError subclass fixes it, and _normalized_stop_reason, used
-        here only to detect the refusal, tests a function_call item ahead of the response status,
-        which is right for what a Response reports and wrong for a truncated turn.
-        A failed status is tested first, ahead of the refusal and the truncation: the API is reporting
-        that the run did not finish, so whatever items it emitted are a fragment, and a refusal part
-        among them is no more the turn than a text part is. Testing the refusal first would make one
-        response Refusal here and a provider failure on the text binding, which reads the same
-        status first.
-        A content-filtered response reaches Refusal through the stop reason, so it fails the
-        item once instead of being retried at full price for an outcome that will not change.
-        The completed status is what SchemaViolation and EmptyTurn are tested on, so a status
-        reporting that the run never finished cannot be reported as a turn that finished.
-        Every remaining status is a run that stopped short of a turn, which is UnfinishedTurn
-        naming the status.
+        Failed status takes precedence because emitted items are fragments.
+        Refusal and truncation take precedence over validation.
+        Completed text with `validation_error` returns `SchemaViolation`.
+        Completed output without text returns `EmptyTurn`.
+        Other statuses return `UnfinishedTurn`.
+        Every variant carries `assistant_message`.
         """
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
@@ -1379,18 +1217,10 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
     ) -> ResponseOutcome[ModelT | None]:
         """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
 
-        Validating here rather than in the SDK is what puts the response and its text in scope when
-        the text is rejected: the variant returned for a rejection is one the retry loop can place
-        against the attempt it already recorded, where a raise from inside the SDK is not.
-
-        A failed status is rejected even when the text validates: the run did not finish, and
-        response.error names why, so an instance built from the fragment it had emitted would be
-        presented as the answer. _no_instance reports it as the failure variant _provider_failure chose.
-
-        None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
-        message carries, so a turn whose text is not the instance yields no instance without anything
-        having gone wrong. The instance wins where a completed turn carries both, because a turn that
-        produced the instance answered the request whether or not it also called a tool.
+        Validation occurs after the attempt records its response and billing.
+        Failed status returns `_provider_failure` even when fragment text validates.
+        A valid instance takes precedence over tool calls.
+        A tool-call turn without an instance returns `None`.
         """
         validation_error: ValidationError | None = None
         text = _first_output_text(response)

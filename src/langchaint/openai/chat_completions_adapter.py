@@ -1,86 +1,65 @@
-"""Adapter for the Chat Completions API over the official openai SDK.
+"""Implement Chat Completions through the official openai SDK.
 
-Chat Completions is the API OpenAI-compatible providers serve, so this adapter is the route to
-DeepSeek, Groq, and xAI through an AsyncOpenAI whose base_url points at them;
-langchaint.deepseek wraps it for DeepSeek.
+Streaming behavior was verified against openai 2.51.0.
 
-Verified against openai 2.51.0:
-- `create(stream=True)` is the request path.
-  It returns `AsyncStream[ChatCompletionChunk]` and performs the HTTP send inside the awaited call.
-  The SDK's `chat.completions.stream()` helper is not usable here:
-  it raises ValueError for any input tool whose `strict` is not True,
-  and the schemas the ToolManager generates are non-strict.
-- `ChatCompletionStreamState` assembles chunks into the snapshot `final()` returns.
-  Constructed bare (no input_tools, no response_format), its `has_parseable_input` is False,
-  which gates off the `LengthFinishReasonError` and `ContentFilterFinishReasonError` raises
-  inside `handle_chunk`.
-  `get_final_completion` is never called: it raises those two unconditionally on finish_reason
-  "length" or "content_filter", which would destroy a truncated response and its billing.
-  The structured binding validates the response text itself and sends its response_format with
-  `"strict": False`, so no SDK frame validates where the response is out of scope.
-- `handle_chunk` returns the events it assembled, so fragment merging stays in the SDK:
-  a `content.delta` event carries answer text, and a `tool_calls.function.arguments.done` event
-  carries the completed name, the accumulated arguments, and the call's index, whose id is read
-  off `current_completion_snapshot` at that index.
-  A sparse or out-of-order tool-call fragment index raises IndexError inside `handle_chunk`.
-- The state's accumulation assigns `usage` from every chunk, resetting it to None on a chunk
-  carrying none, and everything else, `service_tier` included, only from the first chunk.
-  The stream therefore tracks the last non-None usage itself, and `final()` patches it onto a
-  snapshot whose own usage a trailing chunk reset.
-  `stream_options={"include_usage": True}` is what produces the usage-bearing final chunk.
-- The SDK base model allows extra fields and `model_dump` includes them, so a provider's
-  `reasoning_content` survives on `ChatCompletionMessage`, on `ChoiceDelta`, and through stream
-  assembly, where string extras concatenate across deltas.
-- A mid-stream SSE payload carrying `error` makes the chunk iterator raise the bare
-  `openai.APIError`; the four raise sites in `openai._streaming` are the only bare-APIError
-  constructions in the SDK, so `type(error) is openai.APIError` selects exactly them and every
-  subclass (APIStatusError, APIConnectionError, APIResponseValidationError) propagates untouched.
-  `items()` re-raises the bare error as an APIStatusError on the live 200 response, so
-  `parse_openai` verdicts it by its error code: a transient code retries, and a terminal or
-  unlisted code fails the item.
-- `Choice.finish_reason` is statically a required Literal, but a snapshot is built leniently,
-  so it reads None at runtime on a stream that never closed.
-  `choices` is a required list that can be empty.
-- `CompletionUsage` requires `prompt_tokens`, `completion_tokens`, and `total_tokens`;
-  `prompt_tokens_details` (`cached_tokens`, `cache_write_tokens`) and
-  `completion_tokens_details` (`reasoning_tokens`) are Optional, each counter included.
-- `ChatCompletionToolMessageParam.content` is text-only.
-- `prompt_cache_options` and part-level `prompt_cache_breakpoint` take the same values as on the
-  Responses API, and the adapter maps `automatic_cache_breakpoints` and marked parts exactly as
-  Binding.automatic_cache_breakpoints's docstring states for the openai adapters.
+OpenAI-compatible providers serve Chat Completions through `AsyncOpenAI.base_url`.
+`langchaint.deepseek` configures this adapter for DeepSeek.
 
-ContentPart mappings verified against openai 2.53.0:
-- `ImagePart` becomes `image_url.url` containing a data URL.
+`create(stream=True)` sends the request and returns `AsyncStream[ChatCompletionChunk]`.
+`chat.completions.stream()` rejects any input tool whose `strict` is not `True`.
+`ToolManager` produces non-strict schemas, so this adapter uses `create(stream=True)`.
+`ChatCompletionStreamState` assembles chunks for `final()`.
+Without `input_tools` or `response_format`, `handle_chunk` preserves length and content-filter responses.
+`get_final_completion` raises on those responses, so this adapter does not call it.
+The structured binding sends `"strict": False` and validates response text after assembly.
+
+`handle_chunk` returns assembled events.
+`content.delta` carries answer text.
+`tool_calls.function.arguments.done` carries the name, arguments, and index.
+The adapter reads the call id from `current_completion_snapshot` at that index.
+A sparse or out-of-order index makes `handle_chunk` raise `IndexError`.
+`ChatCompletionStreamState` replaces `usage` with every chunk and takes other fields from the first chunk.
+The adapter preserves the last reported `usage` when a trailing chunk resets it.
+`stream_options={"include_usage": True}` requests the final usage chunk.
+
+The SDK preserves extra fields through `model_dump` and stream assembly.
+String extras concatenate across deltas.
+This preserves `reasoning_content` on `ChatCompletionMessage` and `ChoiceDelta`.
+A mid-stream SSE `error` makes the iterator raise `openai.APIError`.
+Only `openai._streaming` constructs that exact type in openai 2.51.0.
+`items()` converts that error to `APIStatusError` on the live response for `parse_openai`.
+Subclasses of `openai.APIError` propagate unchanged.
+An unclosed stream may produce `Choice.finish_reason=None` despite its required `Literal` type.
+The required `choices` list may be empty.
+
+`CompletionUsage` requires `prompt_tokens`, `completion_tokens`, and `total_tokens`.
+Its optional details contain cached, cache-write, and reasoning counters.
+`ChatCompletionToolMessageParam.content` accepts only text.
+Cache parameters match the Responses API values and follow `Binding.automatic_cache_breakpoints`.
+
+Content mappings were verified against openai 2.53.0.
+- `ImagePart` becomes a data URL in `image_url.url`.
 - `ImageUrlPart.url` becomes `image_url.url` unchanged.
-- `AudioPart` supports `audio/wav` and `audio/mpeg` inside `UserMessage`.
+- `AudioPart` accepts `audio/wav` and `audio/mpeg` inside `UserMessage`.
 - `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `InvalidRequest`.
 - `ChatCompletionMessage.audio` remains available through `Response.raw`.
 
-Mapping decisions:
-- A str system_prompt becomes one system-role message first in every request;
-  a parts system_prompt becomes one system-role message of text parts,
-  which carry prompt_cache_breakpoint marks.
-- An AssistantMessage replays as one assistant message param, because this wire holds a turn as
-  one object rather than as items: the turn's texts join into its `content`, each ToolCall
-  becomes one entry of its `tool_calls`, and ReasoningPart.raw merges into the param,
-  putting `reasoning_content` beside `content` in the one message DeepSeek requires it on.
-  Outside a tool loop, the API ignores replayed `reasoning_content`.
-  Inside a tool loop, omission produces a 400
-  (https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03).
-  openai's Chat Completions returns no reasoning field, so it produces no ReasoningPart.
-- `message.refusal` becomes a TextPart in the turn, so the sentences the model wrote to refuse
-  are the turn's text and replay as assistant content; the stop reason is "refusal", tested
-  ahead of the finish_reason rows, so a refusal arriving with finish_reason "stop" reports it.
-- The finish_reason rows: "stop" is "end_turn" or "tool_use" by the turn's calls,
-  "tool_calls" is "tool_use", "length" is "max_tokens", "content_filter" is "refusal",
-  and "function_call" or an unknown value is "other".
-- Streaming yields the SDK's own answer delta strings unwrapped, each `reasoning_content` delta
-  in a ReasoningDelta, each argument fragment in a ToolCallDelta, and each tool call once, complete.
-  A fragment arriving while the snapshot's id for that call is still None is held back.
-  It is prefixed to the next fragment that yields, so no delta carries a fabricated id.
-  An OpenAI-compatible provider may omit the id on early fragments.
-  `reasoning_content` is one concatenated string, so no part separator ever applies.
-  Usage, cost, and stop reason arrive only on final()'s AdapterResult.
+Request and response mappings:
+- A string `system_prompt` becomes the first system-role message.
+- A parts `system_prompt` becomes one system-role message.
+- `AssistantMessage` becomes one assistant message parameter.
+- Its texts fill `content`, each `ToolCall` fills `tool_calls`, and `ReasoningPart.raw` supplies extra fields.
+- DeepSeek requires replayed `reasoning_content` during a tool loop.
+- Source: https://api-docs.deepseek.com/guides/thinking_mode, read 2026-08-03.
+- `message.refusal` becomes `TextPart` and sets `stop_reason="refusal"`, including with `finish_reason="stop"`.
+- `finish_reason="stop"` maps by tool calls to `"end_turn"` or `"tool_use"`.
+- `"tool_calls"`, `"length"`, and `"content_filter"` map to `"tool_use"`, `"max_tokens"`, and `"refusal"`.
+- `"function_call"` and unknown values map to `"other"`.
+- Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one complete `ToolCall`.
+- The adapter delays fragments until their call id exists and prepends them to the next emitted fragment.
+- OpenAI-compatible providers may omit ids on early fragments.
+- `reasoning_content` forms one string without separators.
+- `final()` supplies usage, cost, and stop reason.
 """
 
 import base64
@@ -249,8 +228,7 @@ class _NotSendableError(Exception):
     """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
 
     Never leaves this module: build_request turns it into the InvalidRequest it returns.
-    It exists because a Sequence[Message] is found unsendable below build_request, in a per-part
-    converter whose callers would each have to thread a union outward otherwise.
+    Per-part converters raise it when a `Sequence[Message]` is unsendable.
     """
 
     def __init__(self, reason: str) -> None:
@@ -262,8 +240,8 @@ class _NotSendableError(Exception):
 def _reasoning_content_extra(model: BaseModel) -> str | None:
     """Read a non-empty reasoning_content string off a model's extra fields, None where there is none.
 
-    reasoning_content is no field of the installed SDK's models, so a provider that returns it
-    (DeepSeek) lands it in model_extra, on the whole message and on each stream delta alike.
+    The SDK models omit `reasoning_content`.
+    DeepSeek returns it through `model_extra` on messages and stream deltas.
     """
     extra = model.model_extra
     if extra is None:
@@ -427,8 +405,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
         param["content"] = "".join(texts)
     if tool_calls:
         param["tool_calls"] = tool_calls
-    # ReasoningPart.raw keys are deliberately wider than the assistant param TypedDict, under
-    # "Honor user inputs faithfully"; the cast is that boundary.
+    # cast: `ReasoningPart.raw` deliberately exceeds the assistant parameter `TypedDict`.
     return cast("ChatCompletionMessageParam", param)
 
 
@@ -479,9 +456,8 @@ def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[ChatCompletionFunc
 def _as_chat_completion(raw: BaseModel) -> ChatCompletion:
     """Narrow a raw response to the SDK response this adapter produces.
 
-    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
-    so another type is a defect in langchaint and not a provider behavior.
+    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
+    This adapter's stream produces every valid value.
 
     Raises:
         TypeError: raw is not an openai ChatCompletion.
@@ -547,9 +523,8 @@ class _FinishedTurn:
 def _finished_turn_or_unfinished(completion: ChatCompletion) -> _FinishedTurn | UnfinishedTurn:
     """Read the first choice as a finished turn, or report why no turn can be read.
 
-    No choices at all is a response langchaint cannot read a turn from, and so is a choice whose
-    finish_reason reads None at runtime, the in-progress state of a stream that never closed:
-    both are UnfinishedTurn, carrying whatever partial turn the choice held.
+    Missing choices and `finish_reason=None` return `UnfinishedTurn`.
+    The result carries any partial turn.
     """
     if not completion.choices:
         return UnfinishedTurn(
@@ -603,9 +578,8 @@ def _adapter_result[OutputT](
 def cache_read_tokens_from_usage_openai(usage: CompletionUsage) -> int:
     """Read the cache-read counter openai reports: prompt_tokens_details.cached_tokens, 0 absent.
 
-    The default cache_read_tokens_from_usage of OpenAIChatCompletionsAdapter; an OpenAI-compatible
-    provider reporting cache reads through an extra usage field supplies its own reader, as
-    langchaint.deepseek does.
+    This is the default `OpenAIChatCompletionsAdapter.cache_read_tokens_from_usage`.
+    Providers with extra usage fields supply another reader.
     """
     details = usage.prompt_tokens_details
     if details is None:
@@ -619,29 +593,19 @@ def _billing_from_chat_completion(
     pricing: OpenAIPricingTable,
     cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
 ) -> Billing:
-    """Price counters using the reported `service_tier`.
+    """Price response counters at the reported `service_tier`.
 
-    The whole response is the argument, not its usage: the tier that selects the rates is on the
-    response and the counters are on the usage, and pricing one response's counters at another
-    response's tier is the mistake worth making impossible.
-
-    prompt_tokens is the all-inclusive input total, so the uncached counter is the remainder after
-    subtracting the cache-read and cache-write counters.
-    The SDK documents no relationship among the input counters, so the source is the provider's
-    prompt-caching page, whose worked example reports 1920 cached tokens inside a 2006-token
-    prompt total, read 2026-07-25:
-    https://developers.openai.com/api/docs/guides/prompt-caching
-    DeepSeek partitions the same total: its prompt_cache_hit_tokens and prompt_cache_miss_tokens
-    sum to prompt_tokens (https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03).
-    cache_read_tokens_from_usage reads the cache-read counter, because an OpenAI-compatible
-    provider may report it through an extra usage field; the write counter is
-    prompt_tokens_details.cache_write_tokens, 0 where the details object is absent.
+    `prompt_tokens` includes cached and cache-write tokens.
+    Source: https://developers.openai.com/api/docs/guides/prompt-caching, read 2026-07-25.
+    DeepSeek cache-hit and cache-miss counters also sum to `prompt_tokens`.
+    Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
+    `cache_read_tokens_from_usage` supports provider-specific cache-read fields.
+    Missing `prompt_tokens_details` means zero cache-write tokens.
 
     A response without usage bills zero counters.
 
     Raises:
-        pydantic.ValidationError: the counters leave input_tokens_cache_none negative, a response
-            over-reporting its cache counters, so the priced Usage rejects it.
+        pydantic.ValidationError: Cache counters exceed `prompt_tokens`.
     """
     service_tier = _priced_tier(completion.service_tier)
     usage = completion.usage
@@ -688,8 +652,7 @@ def _billing_from_chat_completion(
 def _wire_response_format(response_format: type[BaseModel]) -> ResponseFormatJSONSchema:
     """Build the response_format the structured binding sends for the caller's model.
 
-    strict is False because the adapter validates the response text itself; the module docstring
-    states what that keeps out of the SDK's frames.
+    `strict=False` leaves validation to the adapter after response assembly.
     """
     json_schema: JSONSchema = {
         "name": response_format.__name__,
@@ -702,9 +665,8 @@ def _wire_response_format(response_format: type[BaseModel]) -> ResponseFormatJSO
 class OpenAIChatCompletionsAdapter(Adapter):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
-    All three expose the same chat.completions.create method and with_options,
-    so the adapter logic is identical across the first-party API, Bedrock, Azure, and every
-    OpenAI-compatible endpoint a base AsyncOpenAI's base_url reaches.
+    All three expose `chat.completions.create` and `with_options`.
+    `AsyncOpenAI.base_url` also supports OpenAI-compatible providers.
     The client parameter is annotated AsyncOpenAI because the other two subclass it;
     provider_name_by_client_class is what tells them apart.
     """
@@ -727,40 +689,21 @@ class OpenAIChatCompletionsAdapter(Adapter):
         ] = cache_read_tokens_from_usage_openai,
         service_tier: OpenAIServiceTier | None = None,
     ) -> None:
-        """Store the SDK client, which owns credentials and endpoints.
+        """Store request and pricing configuration without sending a request.
 
         The stored client disables SDK retries.
-        langchaint's retry loop owns retrying and counts every request.
-
-        provider_name says which provider the client reaches: "openai" for OpenAI's own endpoint,
-        "aws.bedrock" for AsyncBedrockOpenAI, "azure.ai.openai" for AsyncAzureOpenAI, and the
-        provider an AsyncOpenAI's base_url reaches for a compatible endpoint ("deepseek", "groq").
-        The two platform classes are in provider_name_by_client_class, so a value contradicting
-        either makes Adapter.__init__ raise; an AsyncOpenAI takes the provider_name its caller
-        states, since its base_url decides what it reaches.
-
-        supports_prompt_cache_options says whether the model accepts the prompt_cache_options
-        request parameter, which openai documents as gpt-5.6-and-later (openai 2.45.0).
-        `supports_prompt_cache_options` sets `Adapter.automatic_cache_breakpoints_default` to its inverse.
-        It has no default because a wrong value fails either way: True on a model without the
-        parameter risks a rejected request, and False on one with it refuses a binding the model
-        would have accepted.
-        It is a parameter here rather than a lookup on model because model is a str whose namespace
-        this adapter cannot know: it serves every OpenAI-compatible endpoint.
-
-        cache_read_tokens_from_usage reads the cache-read counter off a response's usage.
-        The default reads what openai reports, prompt_tokens_details.cached_tokens; it is a
-        parameter because an OpenAI-compatible provider may report the counter through an extra
-        usage field, as DeepSeek does, and pricing those reads at the uncached rate would
-        over-report the cost of every cached request.
-        langchaint.deepseek passes cache_read_tokens_from_usage_deepseek.
-
-        `pricing` holds this model's rates and modifiers.
-        service_tier is what the request asks for, None sending nothing. It cannot decide the price:
-        the API documents the reported mode as possibly different from the requested one.
+        `provider_name` identifies the provider reached by the client.
+        Bedrock and Azure clients require their fixed `provider_name` values.
+        `AsyncOpenAI` uses the caller's value because `base_url` selects its provider.
+        `supports_prompt_cache_options` identifies gpt-5.6-and-later support documented by openai 2.45.0.
+        It sets `Adapter.automatic_cache_breakpoints_default` to the inverse value.
+        `cache_read_tokens_from_usage` reads provider-specific cache-read counters.
+        The default reads `prompt_tokens_details.cached_tokens`.
+        `pricing` supplies rates and modifiers.
+        `service_tier` requests a tier, while the reported tier selects pricing.
 
         Raises:
-            ValueError: `provider_name` contradicts the client's class.
+            ValueError: `provider_name` contradicts a Bedrock or Azure client class.
         """
         super().__init__(
             client=client,
@@ -781,9 +724,8 @@ class OpenAIChatCompletionsAdapter(Adapter):
 
         Raises:
             ValueError: `automatic_cache_breakpoints=False` requires `prompt_cache_options` support.
-                Also raised when extra_body holds a key in
-                _ADAPTER_POPULATED_WIRE_KEYS. Also raised when provider_executed_tools is nonempty.
-                Also raised when extra_body contains web_search_options.
+            ValueError: `extra_body` contains a key in `_ADAPTER_POPULATED_WIRE_KEYS` or `web_search_options`.
+            ValueError: `provider_executed_tools` is nonempty.
         """
         if binding.provider_executed_tools:
             raise ValueError(
@@ -927,11 +869,9 @@ class _ChatCompletionsStream(AdapterStream):
             Every chunk the SDK stream yields.
 
         Raises:
-            openai.APIStatusError: an SSE payload carried an error object, which the SDK raises as
-                the bare openai.APIError; raised on the live response, so it carries the 200
-                status and the open request's headers, with the SDK error's own body.
-                The identity test selects exactly the bare class, the module docstring naming why,
-                so every APIError subclass propagates untouched.
+            openai.APIStatusError: An SSE payload contains an error object.
+                The error carries status 200, request headers, and the SDK error body.
+                `APIError` subclasses propagate unchanged.
         """
         chunk_iterator = aiter(self._sdk_stream)
         while True:
@@ -953,19 +893,16 @@ class _ChatCompletionsStream(AdapterStream):
     async def items(self) -> AsyncIterator[StreamItem]:
         """Translate chunks into StreamItem values.
 
-        Each chunk feeds the SDK's stream state, whose returned events carry the answer deltas and
-        the completed tool calls; a reasoning_content delta is read off the chunk in hand, which
-        the events do not carry, and yielded ahead of that chunk's events.
-        The last non-None usage is tracked here for final() and billing_reported(), because the
-        state's accumulation resets usage on every chunk that carries none.
+        SDK events carry answer deltas and completed tool calls.
+        Each chunk supplies `reasoning_content` before its SDK events.
+        The stream tracks the last non-`None` usage because SDK accumulation may reset it.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.
 
         Raises:
             openai.APIStatusError: _chunks rewrapped the SDK's mid-stream error raise.
-            StreamProtocolError: the SDK's state rejected a tool-call fragment index, or the
-                stream ended without any choice reporting a finish_reason, so no turn closed.
+            StreamProtocolError: The SDK rejects a tool-call index or the stream ends without `finish_reason`.
         """
         finish_reason_seen = False
         pending_args: dict[int, str] = {}
@@ -1020,9 +957,8 @@ class _ChatCompletionsStream(AdapterStream):
     async def final(self) -> ChatCompletion:
         """Return the response the SDK's state assembled.
 
-        It is never re-validated into another model: the state constructs its snapshot leniently,
-        and validating that snapshot against the SDK's own strict model could raise over a
-        response whose partial output and billing the caller is owed.
+        The adapter preserves the lenient SDK snapshot without revalidation.
+        Revalidation could reject partial output and billing.
 
         Raises:
             StreamProtocolError: items() was not exhausted first, so there is nothing assembled.
@@ -1035,8 +971,8 @@ class _ChatCompletionsStream(AdapterStream):
     def billing_reported(self) -> Billing | None:
         """Return what the tracked usage bills at the snapshot's tier, or None before one arrives.
 
-        The provider sends usage on the trailing chunk stream_options asks for, so a stream cut
-        off early reports None and the caller records what it knows: nothing yet.
+        `stream_options` requests usage on the trailing chunk.
+        An earlier cutoff returns `None`.
         """
         if self._last_usage is None:
             return None
@@ -1077,8 +1013,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
-            pydantic.ValidationError: the response over-reports its cache counters, leaving the
-                derived uncached-input counter negative.
+            pydantic.ValidationError: Cache counters exceed total input tokens.
         """
         return _billing_from_chat_completion(
             _as_chat_completion(raw),
@@ -1165,9 +1100,7 @@ class _BoundChatCompletionsText(_BoundChatCompletions[str]):
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn, whose concatenated text is this binding's output.
 
-        Every finished turn is a result: a refusal or a truncation still carries whatever text the
-        model wrote, its condition named by the stop reason, and no schema stands between that text
-        and the output.
+        Refusals and truncations still return their text with a matching stop reason.
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
@@ -1190,8 +1123,7 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
     ) -> None:
         """Precompute the request's response_format parameter, the JSON-schema format this binding asks for.
 
-        It replaces the binding's omitted response_format field, so every request this binding
-        builds carries it and the two bindings send the same fields.
+        It replaces the omitted binding field in every request.
         """
         self._adapter = adapter
         self._response_format = response_format

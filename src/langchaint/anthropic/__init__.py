@@ -1,10 +1,9 @@
-"""The anthropic backend provides LLM construction, the Messages adapter, catalogs, and pricing.
+"""Construct Anthropic and Bedrock `LLM` values with cataloged pricing.
 
 Importing this subpackage requires `anthropic`.
 `Anthropic.model` sends the stated model identifier verbatim.
 `AnthropicBedrock.model` sends the stated Bedrock identifier verbatim.
 `ANTHROPIC_BEDROCK` lists preferred identifiers and their `BedrockRouting` values.
-Anthropic 0.120.0 constructs both Bedrock client classes without network requests.
 
 Cataloged Anthropic models receive `ANTHROPIC_PRICING`.
 Cataloged Bedrock models receive `ANTHROPIC_BEDROCK_PRICING`.
@@ -16,10 +15,8 @@ Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
-`scripts/pricing/litellm-pricing-snapshot.json` supplies token prices.
-Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
-`scripts/pricing/provider-pricing-metadata.json` supplies tool and modifier prices.
-Source: https://platform.claude.com/docs/en/about-claude/pricing.
+Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+Tool and modifier price source: https://platform.claude.com/docs/en/about-claude/pricing.
 Cache reads cost 0.1 times base input.
 Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.

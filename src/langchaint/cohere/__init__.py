@@ -1,9 +1,9 @@
-"""The Cohere backend provides `CohereBedrock` and model catalogs.
+"""Construct cataloged Cohere `EmbeddingModel` values for Bedrock.
 
 Importing this subpackage requires `boto3`.
 Every cataloged model identifier is sent verbatim.
 `CohereBedrock` creates its default client before the first request admission.
-Its embedding models share that client and one `SharedBackoff`.
+Each `EmbeddingModel` shares that client and one `SharedBackoff`.
 AWS v4 documentation shows list and float-keyed response forms.
 
 Request source: https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-embed.html.
@@ -116,7 +116,7 @@ _DIMENSION_UNSET = object()
 def _parse_cohere_bedrock(failure: Exception) -> Verdict:
     """Map one Bedrock `ClientError` to its retry verdict.
 
-    `botocore==1.43.67` maps Bedrock error responses to `ClientError`.
+    `botocore==1.43.67` maps Bedrock errors to `ClientError`.
     Its service model marks `ThrottlingException` as throttling.
     It marks `ModelNotReadyException` as transient without throttling.
     Statuses 408, 500, and 503 also identify transient errors.

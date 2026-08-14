@@ -1,4 +1,4 @@
-"""A tool loop under tool_choice="required", ending when the model calls a CaptureTool."""
+"""Run a required tool loop until CaptureTool returns output."""
 
 from pydantic import BaseModel
 
@@ -14,13 +14,13 @@ from langchaint.openai import OpenAI
 
 
 class SearchArgs(BaseModel):
-    """What to search the corpus for."""
+    """Define corpus search arguments."""
 
     query: str
 
 
 class FinalResponse(BaseModel):
-    """The agent's answer and the sources behind it."""
+    """Store the answer and its sources."""
 
     answer: str
     sources: list[str]
@@ -28,12 +28,14 @@ class FinalResponse(BaseModel):
 
 @tool(description="Search the corpus for a topic.")
 async def search(args: SearchArgs) -> str:
-    """Return what the model reads as the search result."""
+    """Return a corpus search result."""
     return f"Three sources discuss {args.query}."
 
 
 async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalResponse:
-    """Loop until the model submits final_response, forcing that call on the last turn.
+    """Run until final_response captures output.
+
+    The last turn forces final_response.
 
     Raises:
         OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.

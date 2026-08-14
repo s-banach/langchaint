@@ -1,8 +1,7 @@
 # Examples
 
-Each file demonstrates one subject.
-Numbered examples expose one callable entry point.
-Most examples construct backend classes directly to keep request code visible.
+Each numbered file has one subject and one callable entry point.
+Most examples construct backend classes directly to show request code.
 `04_failures_and_deadlines.py` coordinates requests across `Anthropic` and `OpenAI`.
 
 | File | Shows |
@@ -22,5 +21,4 @@ Most examples construct backend classes directly to keep request code visible.
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | LangChain migration by API concept |
 | [`full_app/`](full_app/README.md) | Offline progress-event application architecture |
 
-Read `MIGRATING_FROM_LANGCHAIN.md` first.
-Continue with `01_basics.py` and `02_tool_loop.py`.
+Read `MIGRATING_FROM_LANGCHAIN.md`, `01_basics.py`, then `02_tool_loop.py`.

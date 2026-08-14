@@ -1,45 +1,11 @@
-"""A multi-agent app that reports progress through callbacks.
+"""Run a multi-agent app that reports progress through on_event.
 
-The app hands every run one on_event callback, and a run reports by calling it; nothing here is an
-async iterator.
+AgentRun.final installs GuiEmitter, opens the agent span, emits terminal events, and drives run.
+on_event executes synchronously inside the run.
+TimedOutError lets the loop record a timed-out call and continue.
 
-AgentRun splits the agent into two roles. The base class owns final(), the single entry point: it
-installs the run's GuiEmitter, opens the agent span around the loop, emits AgentStarted and the
-terminal event, and returns the answer or re-raises the failure. The application subclasses it and
-writes only run(), a plain coroutine, calling self.on_event(event) as it goes.
-
-on_event runs inside the run's frame, so a consumer that blocks in it slows the run down. A consumer
-wanting its own pace passes on_event=queue.put_nowait and drains the queue itself; the decoupling is
-the consumer's choice, never the shape's.
-
-Each turn passes config.generate_one_timeout_seconds to generate_one.
-langchaint owns that deadline.
-A TimedOutError lets the loop record the call and continue.
-
-Two capabilities ride on contextvars, the same mechanism that nests OTel spans across tasks:
-
-    Each run's final() installs its own GuiEmitter, so a tool function reports progress into the
-    on_event of whichever run dispatched it (search does, through events.current_gui_emitter).
-    Threading cannot do this without a parameter on every tool, because a tool function holds no
-    handle on its run.
-
-    delegate constructs its sub-run with the same on_event as every other run, so a three-level tree
-    reports to one consumer in real time while delegate stays an ordinary langchaint tool returning a
-    value.
-
-Only the emitter is ambient. The run registry and on_event stay constructor arguments, where a missing
-value is a TypeError at the call site instead of a LookupError at the first read inside an agent; the
-emitter is ambient because for it there is no call site to thread through.
-
-The state a failure must leave behind lives on this object, never in the coroutine frame doing the
-work: a timeout cancels the frame, and anything local to it is gone. The record follows the same
-rule: each run appends every TurnRecord to its own turn_log at the moment it happens, and every run
-registers itself at construction. Any metric a consumer
-could want is a post-run fold over the registered runs' ordered logs; a parent's subtree total is
-the fold filtered by path prefix. A CancelledError is a BaseException that passes through every
-`except Exception` in the tree, so a design that carries a sub-run's records home on a return path
-loses them when that path never runs; records already written need no carrying, so nothing can be
-dropped.
+Each run registers at construction and appends settled TurnRecord values to turn_log.
+Usage is derived from the registered runs' turn_log values.
 """
 
 import asyncio
@@ -96,11 +62,7 @@ from langchaint.tracing import TracedBoundLLM, TracedLLM, agent_span
 
 @dataclass(frozen=True)
 class LlmTurn:
-    """One settled generate call, held as the Response langchaint returned.
-
-    response carries the assistant message, the call's usage and the raw SDK payload by reference,
-    so the record loses nothing of the call; turn_number is the same number max_turns bounds.
-    """
+    """Record one successful generate call."""
 
     turn_number: int
     response: Response[str]
@@ -108,11 +70,7 @@ class LlmTurn:
 
 @dataclass(frozen=True)
 class LlmFailure:
-    """One generate call that did not produce a response, held as the GenerationError describing it.
-
-    error.usage is what the call billed, which is why a failure is a record and not only a raise.
-    A call that ran out of time lands here too, as a TimedOutError.
-    """
+    """Record one failed or timed-out generate call and its billing."""
 
     turn_number: int
     error: GenerationError
@@ -120,12 +78,7 @@ class LlmFailure:
 
 @dataclass(frozen=True)
 class ToolTurn:
-    """One tool call answered within a turn; a turn with several calls appends several of these.
-
-    tool_message is the reply the model reads, budget declines included. reported_usage is spend
-    the tool reported through app_data, ZERO_USAGE when it reported none; a delegate call reports
-    none, because its sub-run writes its own turn_log.
-    """
+    """Record one settled tool call and its reported Usage."""
 
     turn_number: int
     tool_name: str
@@ -134,18 +87,11 @@ class ToolTurn:
 
 
 type TurnRecord = LlmTurn | LlmFailure | ToolTurn
-"""One record in a run's ordered turn_log, the full account of what the run did and spent.
-
-Any metric a consumer could want is a post-run fold over these records.
-"""
+"""One entry in a run's ordered turn_log."""
 
 
 def _spend_of(record: TurnRecord) -> Usage:
-    """Return what one record billed, the fold step that turns an ordered turn_log into a total.
-
-    A timed-out call's LlmFailure contributes what its settled attempts billed. The attempt the
-    deadline cut off may have gone on to bill server-side, which no client-side channel reports.
-    """
+    """Return one record's reported Usage."""
     match record:
         case LlmTurn():
             return record.response.usage
@@ -171,19 +117,10 @@ def _check_cost_limit(usage: Usage, max_cost_in_usd: float | None) -> None:
 
 
 class AgentRun(ABC):
-    """The reporting half of an agent: the emitter install, the span, and the terminal events.
+    """Report one agent's execution through on_event.
 
-    A subclass supplies run(), its loop, as a coroutine, and calls on_event as it goes. Awaiting final()
-    drives that loop to the answer, and the outcome rides final()'s return and raise; the accounting
-    stays on this object, readable whatever the outcome.
-
-    AgentStarted, AgentFinished and AgentFailed are emitted here, because this class is what knows how
-    the run ended. A subclass emits only what happens inside its loop.
-
-    turn_log is the run's append-only ordered record: the loop appends one TurnRecord per settled
-    generate call, per failed one, per answered tool call, and per call its deadline cut off. Any
-    metric a consumer could want is a fold over the logs, never a running sum, so there is no second
-    copy of any record to drift from.
+    Subclasses implement run and append settled calls to turn_log.
+    final installs GuiEmitter, opens the span, and emits terminal events.
     """
 
     def __init__(
@@ -195,16 +132,10 @@ class AgentRun(ABC):
         registry: dict[str, "AgentRun"],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Fix the run's identity, limits and on_event; a subclass adds whatever its loop needs.
-
-        The run registers itself in registry here, at construction rather than at start, so a run
-        cancelled mid-flight is still in every report folded over the registry.
+        """Store and register the run.
 
         Raises:
-            ValueError: registry already holds agent_path. A registry row is the run object itself,
-                its turn_log and counters held by reference, so two runs cannot share one and a
-                silent replacement would drop the first run's records from every fold. A spawner that
-                reuses an agent name disambiguates the path, as delegate does with its spawn index.
+            ValueError: registry already contains agent_path.
         """
         if agent_path in registry:
             raise ValueError(
@@ -223,27 +154,20 @@ class AgentRun(ABC):
 
     @abstractmethod
     async def run(self) -> str:
-        """Drive this agent's loop to its final answer, calling on_event as it goes.
-
-        A coroutine, never a generator: the base class awaits it under the run's span, and a `yield`
-        here would make it an async generator that cannot be awaited at all.
+        """Run the agent and report progress through on_event.
 
         Returns:
-            The run's final answer. Raising instead is how a run fails; the base class reports it.
+            The final answer.
         """
 
     @property
     def own_usage(self) -> Usage:
-        """The run's own spend, folded from turn_log; a sub-run's records live on its own log."""
+        """Sum this run's turn_log Usage."""
         return Usage.sum_of(_spend_of(record) for record in self.turn_log)
 
     @property
     def usage(self) -> Usage:
-        """The run's own spend plus every sub-run beneath it, folded from the registry by path prefix.
-
-        The prefix fold is what hands a parent its subtree's total without any run having carried a
-        number home, and it counts each record exactly once because each lives on exactly one log.
-        """
+        """Sum this run's Usage and its descendant runs' Usage."""
         return Usage.sum_of(
             run.own_usage
             for path, run in self.registry.items()
@@ -251,19 +175,11 @@ class AgentRun(ABC):
         )
 
     def span_attributes(self) -> Mapping[str, str | int | float | bool]:
-        """Extra attributes to set on the agent span when the run ends; override to add.
-
-        Called after the loop leaves, so a subclass reports final counters here rather than tracking a
-        span it does not own.
-        """
+        """Return agent span attributes after run finishes."""
         return {}
 
     async def final(self) -> str:
-        """Drive the run to its answer, reporting through on_event as it goes.
-
-        The run's GuiEmitter is installed for the duration and reset on the way out, so a tool
-        function dispatched by this run reports to this run's on_event, and a sub-run started inside
-        a tool restores its parent's emitter when it ends.
+        """Run the agent with its GuiEmitter and span.
 
         Raises:
             Exception: whatever run() failed with; AgentFailed is emitted before the re-raise.
@@ -303,12 +219,7 @@ class AgentRun(ABC):
 
 
 class ReActAgent(AgentRun):
-    """The example's loop, written as the application's half of the contract: one coroutine.
-
-    The per-call deadline uses generate_one's `timeout_seconds`.
-    Events go through on_event.
-    AgentRun owns the span.
-    """
+    """Implement the example's generate and tool loop."""
 
     def __init__(
         self,
@@ -321,7 +232,7 @@ class ReActAgent(AgentRun):
         bound: TracedBoundLLM[str, ToolManager],
         prompt: str,
     ) -> None:
-        """Add what this loop needs on top of what every run needs."""
+        """Store the loop state."""
         super().__init__(
             agent_path=agent_path,
             config=config,
@@ -338,26 +249,19 @@ class ReActAgent(AgentRun):
 
     @override
     def span_attributes(self) -> Mapping[str, str | int | float | bool]:
-        """Report the turn count on the agent span, which only this loop knows."""
+        """Return the final turn count for the agent span."""
         return {"langchaint.agent.turns": self.turn_number}
 
     @override
     async def run(self) -> str:
-        """Drive the turn loop to a final answer.
+        """Run generate and tool turns until the agent answers.
 
-        A run with config.self_correction_enabled does not accept a final answer until some critique
-        has returned an approval; until then the answer is appended and sent back with an instruction
-        to critique, and config.max_turns is what bounds that.
-
-        Each turn carries config.generate_one_timeout_seconds. Every outcome reaches
-        turn_log through the same append below, because a call that ran out of time comes back as a
-        TimedOutError rather than as a cancellation: the loop is still running when it arrives, so
-        it has somewhere to put the record.
+        config.self_correction_enabled requires critique approval.
+        Each generate_one call uses config.generate_one_timeout_seconds.
+        Each settled outcome is appended to turn_log.
 
         Raises:
-            GenerationError: a generate call failed after its retries, TimedOutError excepted; an
-                LlmFailure holding it is appended to turn_log before the raise. A call outrunning
-                config.generate_one_timeout_seconds is recorded, then retried next turn.
+            GenerationError: a generate call fails after its retries, except TimedOutError.
             RuntimeError: `max_turns` elapsed, or configured cost cannot permit another turn.
             DispatchExceptionGroup: a tool function raised; the settled siblings are folded first.
             asyncio.CancelledError: an outer deadline cancelled the run.
@@ -383,8 +287,7 @@ class ReActAgent(AgentRun):
                 self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
                 if not isinstance(error, TimedOutError):
                     raise
-                # The dropped call appended nothing to self.messages, so the next turn resends it
-                # unchanged.
+                # The timed-out call leaves self.messages unchanged for the next turn.
                 self.on_event(
                     LlmCallAbandoned(
                         agent_path=self.agent_path,
@@ -420,17 +323,12 @@ class ReActAgent(AgentRun):
         )
 
     async def _dispatch_all(self, tool_calls: Sequence[ToolCall]) -> None:
-        """Announce every call, dispatch what the budget affords, then settle each one.
+        """Announce, dispatch, and settle each tool call.
 
-        Every call is announced before any dispatch starts, so a UI shows the whole fan-out at once
-        rather than one call appearing per completion.
-        A call over config.max_tool_calls is declined through dispatch_many's precomputed argument,
-        so one dispatch_many call answers the whole batch, with declines in call order.
+        Calls above config.max_tool_calls are declined through precomputed.
 
         Raises:
-            DispatchExceptionGroup: one or more tool functions raised. Its completed_outcomes are
-                folded and emitted before the re-raise, so a sibling that settled and reported spend
-                is accounted for even though the turn does not finish.
+            DispatchExceptionGroup: one or more tool functions raise after completed_outcomes settle.
             RuntimeError: ToolCall.id repeats.
             asyncio.CancelledError: an outer deadline cancelled the run mid-dispatch.
         """
@@ -449,8 +347,7 @@ class ReActAgent(AgentRun):
         _validate_tool_call_ids(tool_calls)
         remaining = max(0, self.config.max_tool_calls - self.tool_calls_made)
         affordable_ids = {tool_call.id for tool_call in tool_calls[:remaining]}
-        # Charged where the calls are dispatched rather than where they settle, so a turn that raises
-        # partway still spends the budget it used.
+        # Dispatch consumes the budget even when settlement raises.
         self.tool_calls_made += len(affordable_ids)
 
         def _decline_over_budget(tool_call: ToolCall) -> ToolMessage | None:
@@ -470,26 +367,17 @@ class ReActAgent(AgentRun):
             self._settle_outcomes(tool_calls, group.completed_outcomes)
             raise
         self._settle_outcomes(tool_calls, outcomes)
-        # Every call the model made gets a reply in its original order, declined ones included:
-        # a provider rejects a turn whose tool calls are not all answered.
+        # Preserve call order and answer declined calls.
         for outcome in outcomes:
             self.messages.append(outcome.tool_message)
 
     def _settle_outcomes(
         self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyOutcome]
     ) -> None:
-        """Record each settled outcome on turn_log and emit its ToolResponse.
+        """Record each outcome and emit ToolResponse.
 
-        Outcomes are matched to calls by tool_call_id rather than by position: a
-        DispatchExceptionGroup's completed_outcomes covers only the calls that settled, so it is
-        shorter than the calls dispatched and no index of it lines up with tool_calls.
-
-        app_data is read here, at its type.
-        A Usage is spend the tool reported, carried only by DispatchHandled:
-        the invalid-args, unknown-tool, and budget-declined variants are calls that billed nothing,
-        and delegate reports None, because a sub-run wrote its own turn_log
-        and folding a reported total would count the whole subtree twice.
-        An approving CritiqueVerdict is what releases a self-correcting run to answer.
+        tool_call_id matches partial outcomes to their calls.
+        DispatchHandled may carry reported Usage or CritiqueVerdict through app_data.
 
         Raises:
             RuntimeError: An outcome repeats or names an unknown tool_call_id.
@@ -538,12 +426,7 @@ class ReActAgent(AgentRun):
 
 
 def top_level_path(name: str) -> str:
-    """Build the agent path of a top-level node, which a sub-run's path is built under.
-
-    One function rather than a literal at each site: a sub-run's spend is read back as a prefix fold
-    under its parent's path, so a path written twice and changed once loses the whole subtree from
-    the parent's total without any error.
-    """
+    """Build a top-level agent_path."""
     return f"root/{name}"
 
 
@@ -551,10 +434,7 @@ def _tools_for(
     config: AgentConfig,
     tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
 ) -> Sequence[Tool[BaseModel | Mapping[str, object] | None]]:
-    """`self_correction_enabled` adds one fresh critique tool.
-
-    Every run uses this function, including delegated runs.
-    """
+    """Add a fresh critique tool when self_correction_enabled."""
     return [*tools, build_critique_tool()] if config.self_correction_enabled else tools
 
 
@@ -567,31 +447,16 @@ def build_delegate_tool(
     registry: dict[str, AgentRun],
     on_event: Callable[[Event], None],
 ) -> PydanticTool[DelegateArgs, None]:
-    """Build delegate, whose function drives a whole sub-agent and reports it as it runs.
+    """Build a delegate tool that runs and reports a specialist sub-agent.
 
-    The sub-run is constructed with the same on_event as every other run, so the specialist's events
-    reach the same consumer the parent's do, in real time, while delegate stays an ordinary langchaint
-    tool returning a value.
-
-    Each call spawns a fresh run at "{parent_path}/{name}#{spawn_index}": an agent's name is not
-    unique within a parent, and a registry row is one run held by reference, so identity is per
-    spawn and AgentRun.__init__ rejects a duplicate path. The index rides the agent_path, the one
-    identity every event carries, so a UI showing two spawns of one name shows two runs.
-
-    The sub-run's span nests under this tool's span with no bookkeeping: final() runs in the frame
-    delegate is awaiting in, which is the one the tool span is current in.
-
-    Nothing rides back through app_data, because the sub-run wrote its own turn_log and the parent's
-    total is a path prefix fold over the registered runs' logs. The sub-run registers at construction
-    (in AgentRun.__init__), so a run cancelled mid-flight is still in the record.
+    Each call appends a spawn index to agent_path.
+    The sub-agent shares on_event and records Usage in its own turn_log.
     """
     spawn_counter = itertools.count()
 
     @tool(description="Delegate a focused question to the specialist sub-agent.")
     async def delegate(args: DelegateArgs) -> ToolOutputExplicit[None]:
-        """Run the specialist to its answer; its spend is already on its log.
-
-        `_tools_for` adds a fresh critique tool for each configured spawn.
+        """Run the specialist and return its answer.
 
         Raises:
             DispatchExceptionGroup: A specialist tool function raised.
@@ -615,8 +480,7 @@ def build_delegate_tool(
         except DispatchExceptionGroup:
             raise
         except Exception as error:
-            # A sub-agent failure becomes data the parent model can use.
-            # DispatchExceptionGroup is a tool-function defect and propagates.
+            # Return sub-agent failures to the parent model.
             return ToolOutputExplicit(
                 content=f"The specialist failed: {describe_error(error)}. Answer without it.",
                 app_data=None,
@@ -641,11 +505,7 @@ def _validate_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
 
 
 class App:
-    """The graph, built from ReActAgents that all report to one on_event.
-
-    An app running a single top-level agent needs no App at all: constructing an AgentRun and awaiting
-    final() is the whole apparatus.
-    """
+    """Run a graph of ReActAgent values through one on_event callback."""
 
     def __init__(
         self,
@@ -656,16 +516,9 @@ class App:
         on_event: Callable[[Event], None],
         capture_message_content: bool,
     ) -> None:
-        """Store the launch-time config of every agent, and wrap the LLM for tracing here.
+        """Store agent config and wrap llm for tracing.
 
-        Wrapping inside the app rather than accepting a TracedLLM keeps one provider exporting the
-        generate spans, the tool spans and the agent spans alike. A caller-wrapped LLM picks the
-        provider for the generate spans alone, and with the global provider and none configured those
-        are non-recording: the agent and tool spans arrive with holes in them and nothing reports an
-        error.
-
-        `capture_message_content` configures `self._llm` and each constructed `TracedToolManager`.
-        The required value makes message capture explicit.
+        capture_message_content configures each traced LLM and ToolManager.
         """
         self._llm = TracedLLM(llm, capture_message_content=capture_message_content, tracer=tracer)
         self._configs = configs
@@ -678,7 +531,7 @@ class App:
 
     @property
     def runs(self) -> Mapping[str, AgentRun]:
-        """Every run the tree started, sub-agents included, keyed by agent path."""
+        """Return all runs keyed by agent_path."""
         return self._runs
 
     def _build_run(
@@ -688,7 +541,7 @@ class App:
         tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
         prompt: str,
     ) -> ReActAgent:
-        """Construct one node's agent from its config and register it."""
+        """Build and register one graph node."""
         config = self._configs[name]
         return ReActAgent(
             agent_path=top_level_path(name),
@@ -706,10 +559,7 @@ class App:
         )
 
     async def _settle_node(self, run: AgentRun) -> None:
-        """Await one node's outcome and record it, so the next phase can read it.
-
-        Generation and agent-limit failures become entries in failures.
-        DispatchExceptionGroup and cancellation propagate.
+        """Await one node and record its answer or failure.
 
         Raises:
             DispatchExceptionGroup: A tool function raised.
@@ -723,28 +573,16 @@ class App:
             self.failures[run.agent_path] = describe_error(error)
 
     async def run(self) -> None:
-        """Run the graph, reporting every event of the tree through on_event.
+        """Run each graph node and report its events through on_event.
 
-        A sub-agent's events arrive through the same on_event, because delegate constructs its
-        sub-run with it, so all three levels reach one consumer with no forwarding.
-
-        Adding a phase is more straight-line code in this frame: another awaited _settle_node, or a
-        TaskGroup of them for concurrent nodes.
-
-        The whole-app deadline is the caller's asyncio.timeout around this call. Its cancellation
-        lands in whatever frame is running, and the TaskGroup awaits every child's unwind before
-        letting it propagate, so every turn that had settled is on its run's turn_log when the
-        caller's except reads it. A call still in flight is not: the cancellation destroys the frame
-        holding its account.
+        TaskGroup waits for researcher cancellation before propagating it.
 
         Raises:
             asyncio.CancelledError: an outer deadline cancelled the graph mid-run.
             DispatchExceptionGroup: A synthesize tool function raised.
             ExceptionGroup: A concurrent researcher tool function raised.
         """
-        # delegate is built before the run that owns it, so both take the path from one function
-        # rather than the tool repeating it as a literal; climate_name feeds both calls so the
-        # parent path and the run name cannot drift apart.
+        # Use climate_name for the run and the delegate's parent_path.
         climate_name = "research_climate"
         delegate_tool = build_delegate_tool(
             llm=self._llm,

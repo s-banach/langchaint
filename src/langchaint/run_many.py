@@ -1,8 +1,6 @@
-"""Run many run_ones concurrently under a bound on how many are pending at once.
+"""Run zero-argument async callables under a pending-task bound.
 
-A run_one is pending from the moment run_many starts its task until that task settles.
-max_pending caps the pending count, creating each task as an earlier one settles.
-This module models nothing about LLMs and imports nothing from langchaint.
+`max_pending` limits tasks from creation through completion.
 """
 
 import asyncio
@@ -16,8 +14,7 @@ _MAX_PENDING_TASKS_WITHOUT_A_CONCURRENCY_BOUND = 1000
 def max_pending_for_requests(max_concurrent_requests: int | None) -> int:
     """Derive the pending task bound from the request concurrency bound.
 
-    The extra tasks keep permits supplied while retries wait privately.
-    An absent concurrency bound still receives a finite pending task bound.
+    Extra tasks keep request permits supplied during retry waits.
 
     Raises:
         ValueError: `max_concurrent_requests` is boolean or below one.
@@ -37,23 +34,17 @@ async def run_many[OutputT](
     *,
     max_pending: int | None,
 ) -> list[OutputT]:
-    """Run every run_one and return results in run_ones order.
+    """Run each `run_one` and preserve input order.
 
-    asyncio.create_task rejects other Awaitable implementations.
-    Bind every argument before passing each run_one.
-    max_pending None starts every run_one at once.
-    Each run_one runs in its own task, so its ContextVar changes reach no other run_one.
-    run_one references are stored before the first task starts.
-    Later run_ones mutations change nothing.
-    A failure cancels the tasks still pending, waits for them to settle, then propagates.
-    Neither a failure nor an outer cancellation starts a further run_one.
-    Where one wait wave carries several failures, the lowest run_one index propagates.
+    `max_pending=None` starts every call concurrently.
+    A failure cancels and settles pending tasks before propagating.
+    Concurrent failures propagate by the lowest input index.
 
     Raises:
-        ValueError: max_pending is a bool, or an int below 1.
-        TypeError: A run_one returned something other than a Coroutine.
-        asyncio.CancelledError: an outer scope cancelled this call.
-        BaseException: A run_one raised it.
+        ValueError: `max_pending` is boolean or below one.
+        TypeError: A `run_one` returns a non-coroutine.
+        asyncio.CancelledError: The caller cancels this function.
+        BaseException: A `run_one` raises it.
     """
     # bool is rejected explicitly because it subclasses int, so a type checker admits True here.
     if max_pending is not None and (isinstance(max_pending, bool) or max_pending < 1):
@@ -90,10 +81,7 @@ async def run_many[OutputT](
             if failure_to_raise is not None:
                 raise failure_to_raise  # noqa: TRY301 (handler below settles the pending tasks)
     except BaseException:
-        # cancel() requests cancellation, but the task may remain active.
-        # Its coroutine resumes to handle CancelledError.
-        # Await every task before propagating.
-        # No task outlives its run_many call.
+        # Settle every task before propagating.
         for task in pending_run_one_index_by_task:
             _ = task.cancel()
         while pending_run_one_index_by_task:

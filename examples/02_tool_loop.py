@@ -25,7 +25,7 @@ async def get_weather(args: WeatherArgs) -> str:
 
 
 async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
-    """Dispatch tool turns until the model returns `FinalAnswer`.
+    """Dispatch tools until the model returns FinalAnswer.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

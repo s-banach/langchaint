@@ -1,12 +1,6 @@
-"""OpenAI Chat Completions adapter helpers over constructed SDK objects.
+"""Test OpenAI Chat Completions with constructed SDK objects.
 
-These pin behavior the type checker cannot:
-the usage partition derived by subtracting cache counters from prompt_tokens,
-the pluggable cache-read counter both readers exercise,
-the one-assistant-param turn round trip with reasoning_content merged beside content,
-finish_reason normalization, the runtime-None finish_reason a lenient snapshot admits,
-stream event translation with the SDK's own state, the mid-stream bare-APIError rewrap,
-and the request fields the binding precomputes.
+Tests cover Usage, assistant messages, stop reasons, streams, errors, and requests.
 """
 
 import asyncio
@@ -182,8 +176,7 @@ def _completion(
 def _lenient_completion(finish_reason: str | None) -> ChatCompletion:
     """Build the runtime shape strict validation rejects: a finish_reason outside the SDK's Literal.
 
-    The SDK's stream state constructs its snapshot leniently, so None and unknown values are
-    runtime states interpret meets.
+    interpret handles None and unknown stop reasons from lenient SDK snapshots.
     """
     completion = construct_type_unchecked(
         value={
@@ -328,8 +321,7 @@ def _deepseek_usage() -> CompletionUsage:
 def test_the_deepseek_reader_prices_cache_hits_as_cache_reads() -> None:
     """prompt_cache_hit_tokens becomes the cache-read counter and the miss remainder stays uncached.
 
-    Through the openai reader the same usage reads as all-uncached, which is the 50x over-report
-    cache_read_tokens_from_usage exists to prevent.
+    cache_read_tokens_from_usage prevents treating cached tokens as uncached tokens.
     """
     billing = _billing_from_chat_completion(
         _completion(usage=_deepseek_usage()),
@@ -485,8 +477,7 @@ def test_build_request_rejects_two_deprecated_function_calls() -> None:
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """The refusal becomes a TextPart, so the refused turn replays as the model wrote it.
 
-    Dropped instead, the turn holds no TurnPart values and sends nothing back, which reopens the
-    Sequence[Message] at the point the model declined.
+    The refusal remains in the turn for replay.
     """
     assistant_message = _assistant_message_from(
         ChatCompletionMessage.model_validate({"role": "assistant", "refusal": "I can't help"})
@@ -662,8 +653,7 @@ def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> N
 def _adapter(*, supports_prompt_cache_options: bool = True) -> OpenAIChatCompletionsAdapter:
     """Build an adapter over a keyless client, valid because no request is sent.
 
-    supports_prompt_cache_options defaults True, the gpt-5.6-and-later case, so every caller
-    that does not name it exercises the path where a binding's caching value reaches the wire.
+    supports_prompt_cache_options=True sends the binding's cache setting.
     """
     return OpenAIChatCompletionsAdapter(
         client=AsyncOpenAI(api_key="test"),
@@ -898,8 +888,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
     """An extra_body key that open_stream passes as its own keyword raises at bind time.
 
-    stream is in the rejected set: the SDK merges extra_body over the named parameters with
-    extra_body winning, and the stream path depends on it.
+    extra_body cannot override stream.
     """
     with pytest.raises(ValueError, match="temperature"):
         _ = _adapter()._precompute_fields(_binding(extra_body={"temperature": 0.5}))
@@ -999,8 +988,7 @@ def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> N
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
     """A finished turn whose text the response_format rejects is SchemaViolation.
 
-    validation_error_json names the rejected field, what rejected it, and the value, which is what
-    tells a caller whether to change the model or the prompt.
+    validation_error_json preserves the field, constraint, and rejected value.
     """
     outcome = _structured_parse(
         _structured_completion('{"city": "Nairobi", "celsius": "SENTINEL"}')
@@ -1020,8 +1008,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_
 def test_structured_bind_reports_the_truncation_on_a_tool_call_cut_by_the_token_cap() -> None:
     """A length-finished turn carrying tool calls is the truncation, never a dispatchable turn.
 
-    The ordinary shape is arguments cut mid-JSON, so returning None here would hand the
-    application a ToolCall whose args_json does not parse.
+    Incomplete tool arguments return UnfinishedTurn.
     """
     outcome = _structured_parse(
         _structured_completion(None, finish_reason="length", tool_call=True)
@@ -1128,12 +1115,7 @@ def test_identity_reads_response_fields_and_adapter_stream_request_id() -> None:
 
 
 class _FakeSDKStream(AsyncStream[ChatCompletionChunk]):
-    """Replays constructed chunks, raising where the replay holds an exception, without a connection.
-
-    Overrides exactly the surface _ChatCompletionsStream uses (iteration, close, and the response
-    its headers are read off); the base __init__ is deliberately not called, so the untouched base
-    machinery stays unusable.
-    """
+    """Replay constructed chunks and exceptions without a connection."""
 
     def __init__(  # pyrefly: ignore[missing-super-call]
         self,
@@ -1262,13 +1244,7 @@ def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concate
 def test_stream_yields_argument_fragments_then_one_complete_tool_call(
     id_carrying_fragment_index: int, expected_deltas: list[ToolCallDelta]
 ) -> None:
-    """Fragment merging stays in the SDK, and ids come off the assembled snapshot.
-
-    A fragment with the id known yields a ToolCallDelta at once.
-    A fragment before the id arrives is held back and prefixed to the next fragment that yields.
-    An OpenAI-compatible provider may omit the id on early fragments.
-    Either way the concatenated deltas are the completed call's args_json.
-    """
+    """Tool-call fragments yield deltas and one assembled ToolCall."""
     fragments: list[dict[str, object]] = [
         {"index": 0, "type": "function", "function": {"name": "lookup", "arguments": '{"q"'}},
         {"index": 0, "function": {"arguments": ": 1"}},
@@ -1342,11 +1318,7 @@ def test_final_before_items_are_exhausted_raises() -> None:
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
-    """The stream's own response is the only channel a streamed turn has for the header.
-
-    The snapshot the SDK's state assembles never carries it, so a null here would leave every
-    streaming call with no id to take to provider support.
-    """
+    """Read a streamed request ID from the stream response."""
     assert _stream([], {"x-request-id": "req_stream"}).request_id() == "req_stream"
     assert _stream([]).request_id() is None
 
@@ -1441,8 +1413,7 @@ def test_every_request_streams_and_asks_for_the_usage_chunk(
 def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_field() -> None:
     """as_json holds the binding's precomputed fields and this call's converted messages.
 
-    temperature is absent rather than null, because the binding set none and the request body
-    carries no such key.
+    An unstated temperature is absent from the request.
     """
     adapter = _adapter()
     bound = _BoundChatCompletionsText(
@@ -1462,8 +1433,7 @@ def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_fi
 def _conformance_message() -> dict[str, object]:
     """Return an assistant message whose reasoning_content is the key the installed SDK does not name.
 
-    An adapter that rebuilt the message from the SDK's pinned model would drop that key, which
-    DeepSeek requires byte-identical on replay inside a tool loop.
+    Replay preserves the extra reasoning_content key byte-for-byte.
     """
     return {"content": "hey", "reasoning_content": "thought it over"}
 
@@ -1495,8 +1465,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
     def response_with_impossible_counters(self) -> BaseModel:
         """Return a turn whose cache counters sum past prompt_tokens.
 
-        The uncached counter is the subtraction, so counters summing past the total drive it below
-        zero.
+        Excess cache counters make the derived uncached counter negative.
         """
         return _completion(
             usage=CompletionUsage.model_validate({

@@ -1,9 +1,4 @@
-"""SharedBackoff driven directly, without any adapter.
-
-Each test drives admitted() blocks by hand to pin the entry, exit, pause, and ceiling behavior.
-The async tests use real short waits; the ceiling arithmetic tests drive _record and
-_set_wait_ceiling under a fake clock, which no timer reads because no request queues there.
-"""
+"""Test SharedBackoff admission, pauses, and wait ceilings."""
 
 import asyncio
 import time
@@ -82,8 +77,7 @@ def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
 def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
     """Report whether every permit is free: none held, none leaked, no live waiter queued.
 
-    Reads the semaphore's _value, which is CPython-private, because no public attribute exposes the
-    count; a stdlib rename breaks these tests visibly, not the shipped code.
+    Read CPython's private semaphore count for tests.
     """
     permits = shared_backoff._permits
     assert permits is not None

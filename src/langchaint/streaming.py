@@ -1,20 +1,9 @@
 """The stream handle.
 
-A StreamHandle is three things at once:
-an async iterator of StreamItem values,
-the source of the assembled success variant via final(),
-and an async context manager whose entry opens the request and whose exit closes it.
-A handle is unusable outside its `async with` block, so neither iterating nor final() can start a request.
-Assembling the turn and reading what it produced live behind AdapterStream.final();
-the handle owns retry, pacing, and accounting.
-Transient failures before open_stream() returns are retried.
-Failures from an open stream are never retried.
-Each open attempt is its own SharedBackoff admitted() block, and a successful open leaves the
-block held, so the admission spans the stream from opening until it closes or exhausts and a
-long-lived stream holds its permit for its whole life.
-An iterator failure exits the block with its verdict.
-A transient iterator failure ends the call as RetryUnavailableError.
-An assembled response can also end the call that way.
+`StreamHandle` opens inside `async with` and yields `StreamItem` values.
+`final` drains remaining items and returns the assembled result.
+Open failures can retry; failures after opening cannot retry.
+One `SharedBackoff.admitted` block spans the open stream's lifetime.
 """
 
 import asyncio
@@ -90,9 +79,10 @@ async def _close_stream_quietly(
 ) -> None:
     """Close one attempt's stream, logging a close failure rather than raising it.
 
-    The request the stream belonged to has already ended, so an exception out of the close would
-    only displace the result or the error the caller came for; failure_log_message names what
-    stands despite the failure. A BaseException propagates.
+    The request has already ended.
+    A close exception would displace its result or error, so this function logs the exception.
+    `failure_log_message` names the preserved result.
+    A `BaseException` propagates.
     """
     try:
         await adapter_stream.close()
@@ -101,19 +91,11 @@ async def _close_stream_quietly(
 
 
 class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
-    """One stream: an item iterator, a final-result source, a context manager.
+    """An async context manager and iterator for one streamed call.
 
-    Iterate for items as they arrive; await final() at any point in the block to drain silently and get the result.
-    The request opens on entry, so open failures surface there rather than at the first item.
-
-    ToolTurnT is the type final() can return besides Response[OutputT]:
-    ToolCallTurn[OutputT] on a structured tool-bound binding, and the default Never everywhere else,
-    which stream_one's overloads state so only that binding's callers see the variant.
-
-    max_attempts bounds requests sent before open_stream() returns.
-    Failures from an open stream are never retried.
-    Transient iterator failures end the call as RetryUnavailableError.
-    Call stream_one again to retry after that error.
+    Entry opens the request; `final` drains items and returns `Response` or `ToolTurnT`.
+    `max_attempts` applies only before the stream opens.
+    An open-stream transient failure raises `RetryUnavailableError`.
     """
 
     def __init__(
@@ -129,8 +111,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     ) -> None:
         """Store the request; called by BoundLLM.stream_one only.
 
-        splits_tool_call_turns is whether the binding is structured and tool-bound, which is what
-        _success_variant needs to conclude a tool-call turn as ToolCallTurn.
+        `splits_tool_call_turns` identifies a structured tool-bound binding.
+        `_success_variant` uses it to return `ToolCallTurn`.
         """
         self._adapter = adapter
         self._bound_adapter = bound_adapter
@@ -183,8 +165,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Every open attempt gets the same request.
 
         Raises:
-            InvalidRequestError: build_request returned InvalidRequest, so nothing
-                can go out for this call.
+            InvalidRequestError: `build_request` returned `InvalidRequest`, so nothing can be sent.
         """
         if self._request is None:
             built = self._bound_adapter.build_request(self._messages)
@@ -197,8 +178,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Open the request and return self.
 
         Raises:
-            InvalidRequestError: build_request returned InvalidRequest, or the open
-                failure was classified as a rejection of the request.
+            InvalidRequestError: `build_request` returned `InvalidRequest`, or the provider rejected the request.
             RuntimeError: This handle was already entered.
             ProviderDeclaredFinalError: the provider declared the open failure final.
             UnknownExceptionError: the adapter could not place the open failure.
@@ -238,25 +218,14 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the underlying connection and finish the handle.
+        """Close the deadline, connection, and admission.
 
-        A CancelledError exiting the block sets abandoned, unless a conclusion already gave the
-        caller an account of the call (_set_abandoned states which conclusions do).
-        A consumer that leaves the block early without an exception chose to walk away in live
-        code, so only the cancellation, which destroys the frames that could have observed the
-        stream, gets a record.
-        An expired timeout_seconds raises TimedOutError in place of that cancellation, and leaves
-        abandoned unset, so one cut-off call produces one account.
-
-        The deadline closes before the connection does. A timer still armed while the close is
-        awaited could cancel the close itself, and _close_adapter_stream catches only Exception, so
-        the connection would be left open.
+        Cancellation sets `abandoned` unless a result already records the call.
+        An expired `timeout_seconds` raises `TimedOutError` instead.
 
         Raises:
-            TimedOutError: timeout_seconds expired before the block finished.
-            BaseException: the adapter stream's close raised something that is not an Exception;
-                it propagates in place of whatever was unwinding the block, an expired deadline
-                included, because a call whose account nobody will read is not worth an account.
+            TimedOutError: `timeout_seconds` expires before the block finishes.
+            BaseException: Closing the adapter stream raises a non-`Exception` value.
         """
         self._state = "finished"
         # Read before the close, which drops the stream that reports it.
@@ -275,16 +244,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             raise self._timed_out_error(billing_in_flight) from None
 
     async def _close_deadline(self, exc: BaseException | None) -> bool:
-        """Close the deadline scope, reporting whether it was this deadline that expired.
+        """Close the deadline and return whether it caused the current cancellation.
 
-        Disarms the timer, so nothing this handle opened can cancel the caller's task once the call
-        is over. Idempotent: a second call finds no scope and reports False, which is what lets the
-        conclusion sites, __aenter__'s failure path, and __aexit__ each close it without checking
-        what the others did.
-
-        True means the cancellation now unwinding is this deadline's own, which asyncio.timeout
-        reports by raising TimeoutError from its __aexit__. An outer cancellation leaves the scope
-        with nothing to absorb, so it reports False and propagates untouched.
+        Repeated calls return `False`.
         """
         if self._deadline is None:
             return False
@@ -313,31 +275,21 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return self._adapter_stream.billing_reported()
 
     def _set_abandoned(self, billing_in_flight: Billing | None) -> None:
-        """Set abandoned, unless the conclusion already accounted for the call.
+        """Set `abandoned` when no conclusion already accounts for the call.
 
-        A success variant and a GenerationError each hand the caller this call's CallRecord, naming
-        the model and the attempts to reconcile against.
-        Setting it after one would report the same call twice and mislabel a concluded call as an
-        in-flight abandonment.
-        A StreamProtocolError hands over neither, so a cancellation following one still gets an
-        account: it is the only one of the stream that was opened.
-        billing_in_flight is what the adapter could state of the attempt still open when the
-        cancellation arrived.
+        Include billing reported by the interrupted attempt.
         """
         if self._conclusion_carried_the_call:
             return
         self.abandoned = _abandoned_call_error(AbandonedCallError, self._ledger, billing_in_flight)
 
     async def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
-        """Exit the held admitted() block and return the verdict it recorded, None without one.
+        """Exit the held admission and return its `Verdict`.
 
-        exc is what the block ends with: a failure_types entry is parsed and its verdict
-        recorded, and anything else, None included, only returns the permit.
-        Idempotent: a later call finds no admission and returns None, which is what lets every
-        closing path exit without checking what the others did.
+        Repeated calls return `None`.
 
         Raises:
-            ParserContractError: the adapter's parse violated its contract on the failure exc carried.
+            ParserContractError: `Adapter.parse` violates its contract.
         """
         if self._admission is None:
             return None
@@ -350,15 +302,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return admission.verdict
 
     async def _close_adapter_stream(self) -> None:
-        """Close the provider connection and exit the admitted() block, whatever the close does.
+        """Close the provider connection and release admission.
 
-        The admission exit sits in a finally rather than after the close, so a BaseException out
-        of the close returns the permit too.
-        A failing path that already exited the block with its failure leaves this exit nothing to
-        do, _exit_admission being idempotent.
-        The stream is dropped before the close is awaited, so a teardown that fails is attempted
-        once: __aexit__, which closes again after the paths that close mid-stream, finds nothing to
-        close.
+        Release admission even when closing raises.
         """
         adapter_stream = self._adapter_stream
         self._adapter_stream = None
@@ -379,9 +325,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     ) -> TransientError:
         """Wrap one attempt failure as the TransientError its attempt record carries.
 
-        An exception that already is a TransientError is its own wrapper, so an adapter that stated
-        retry_after_seconds and is_rate_limit itself keeps them; message is then unused, because
-        replacing the adapter's own text would lose what it said.
+        Return an existing `TransientError` unchanged.
+        This preserves its `retry_after_seconds`, `is_rate_limit`, and message.
         The wrapper takes the verdict's capped retry_after and calls a PauseAll a rate limit;
         a failure outside failure_types has no verdict and carries neither.
         """
@@ -414,9 +359,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def _backoff_or_exhaust(self, exc: Exception, verdict: Verdict | None) -> None:
         """Wait before the next open attempt, as the failure's verdict asks.
 
-        On PauseAll there is no wait of our own, because the next admitted() entry already holds
-        until the shared pause ends. Every other failure waits out the PrivateBackoff, floored by
-        a RetryThisOne's stated retry_after.
+        `PauseAll` relies on the next `admitted()` wait.
+        Every other failure waits for `PrivateBackoff`.
+        `RetryThisOne.retry_after` sets that wait's floor.
 
         Raises:
             RetriesExhaustedError: the recorded failure spent the last attempt.
@@ -436,21 +381,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     ) -> GenerationError | None:
         """Map one attempt failure to its terminal error.
 
-        Return None when the adapter classifies the failure as transient.
-
-        Reached only for exceptions, which by the adapter contract are attempts the adapter read no
-        outcome from: what it did read it reports as a ResponseOutcome variant, which this handle
-        matches instead.
-        verdict is what the failure's admitted() block recorded: a failure_types exc is terminal
-        on a terminal verdict, and an exc outside failure_types has no verdict and is terminal unless
-        classify calls it transient (a transport failure that produced nothing parseable).
-        A terminal failure's name is mapped exactly as BoundLLM._terminal_error maps it; anything
-        classify cannot place lands on UnknownExceptionError.
-
-        stream_billing is what the open stream has reported.
-        It is None when no stream is open.
-        It is also None when the open stream reported nothing.
-
+        Record `stream_billing` when the stream reached the provider.
         """
         request_id = self._adapter.request_id_from_error(exc)
         if request_id is None and self._adapter_stream is not None:
@@ -492,8 +423,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
         """Build this handle's InvalidRequestError, chained to cause when there is one.
 
-        cause is None where build_request returned InvalidRequest: nothing went out
-        and no exception was involved.
+        `cause` is `None` when `build_request` returns `InvalidRequest` before sending anything.
         """
         invalid_request = InvalidRequestError(
             reason=reason, call=self._ledger.freeze(), request=self._request
@@ -506,22 +436,17 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return self
 
     async def _open_stream_with_retries(self) -> None:
-        """Take the call's request, then open one adapter stream, retrying transient failures.
+        """Open an adapter stream and retry transient open failures.
 
-        Each attempt uses one `admitted()` block.
-        A failure exits that block before any wait.
-        Waiting tasks hold no permits during backoff.
-        Every failure verdict reaches the `SharedBackoff`.
-        A successful stream holds its permit until completion.
-        Cancellation also exits the block.
+        Each attempt uses one `admitted` block and releases it before backoff.
+        A successful stream holds admission until completion.
 
         Raises:
-            InvalidRequestError: build_request returned InvalidRequest, or the open
-                failure was classified as a rejection of the request.
-            ProviderDeclaredFinalError: the provider declared the open failure final.
-            UnknownExceptionError: the adapter could not place the open failure.
-            RetriesExhaustedError: the attempts spent the retry budget.
-            ParserContractError: the adapter's parse violated its contract on a failed open.
+            InvalidRequestError: The adapter or provider rejects the request.
+            ProviderDeclaredFinalError: The provider declares the open failure terminal.
+            UnknownExceptionError: The adapter cannot classify the open failure.
+            RetriesExhaustedError: Open failures consume `max_attempts`.
+            ParserContractError: `Adapter.parse` violates its contract.
         """
         request = self._request_for_this_call()
         while self._adapter_stream is None:
@@ -549,18 +474,15 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def __anext__(self) -> StreamItem:
         """Return the next item.
 
-        Every error except StopAsyncIteration finishes the handle.
-        Every Exception becomes the conclusion final() replays.
-
         Raises:
-            RetryUnavailableError: an open stream failed transiently.
-            InvalidRequestError: the adapter classified an item error as an invalid request.
-            ProviderDeclaredFinalError: the provider declared an item error final.
-            UnknownExceptionError: the adapter could not classify an item exception.
-            StreamProtocolError: the provider's event stream ended without a terminal event; propagates unchanged.
-            ParserContractError: the adapter's parse violated its contract on an item failure.
-            StopAsyncIteration: the stream is exhausted.
-            RuntimeError: the handle is unopened or finished.
+            RetryUnavailableError: The open stream fails transiently.
+            InvalidRequestError: The adapter classifies an item error as an invalid request.
+            ProviderDeclaredFinalError: The provider declares an item error terminal.
+            UnknownExceptionError: The adapter cannot classify an item exception.
+            StreamProtocolError: The event stream ends without a terminal event.
+            ParserContractError: `Adapter.parse` violates its contract.
+            StopAsyncIteration: The stream is exhausted.
+            RuntimeError: The handle is unopened or finished.
         """
         if self._state != "open":
             raise RuntimeError(
@@ -624,35 +546,26 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     @overload
     async def final(self) -> "Response[OutputT] | ToolTurnT": ...
     async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
-        """Drain any remaining items silently and return the success variant.
+        """Drain remaining items and return the stored result.
 
-        Idempotent once a conclusion exists: the call's conclusion is stored once, whether this
-        method produced it, a caller's own iteration produced it, or the adapter stream raised it.
-        Every later call returns or raises it again without asking the adapter stream anything.
-        Without that store, a second call would append a second AttemptRecord for the one request made.
-        A 200 that produced no output is detected only here, when the adapter reads the assembled
-        message: the adapter reports which one it was and this method builds the GenerationError from
-        it, without retrying;
-        it reaches the caller carrying the attempt records this handle built.
+        Repeated calls return or raise the same conclusion without reading the stream again.
+        A response with no output becomes a terminal `GenerationError`.
 
         Raises:
-            StreamProtocolError: the provider's event stream ended without a terminal event.
-            InvalidRequestError: the adapter classified an item error as an invalid request.
-            ProviderDeclaredFinalError: the provider declared an item error final.
-            UnknownExceptionError: the adapter could not classify an item exception.
-            RefusalError: the adapter reported the assembled response as Refusal,
-                carrying this handle's attempt records.
-            MaxCompletionTokensExceededError: the adapter reported it as MaxCompletionTokensExceeded; likewise.
-            EmptyTurnError: the adapter reported it as EmptyTurn; likewise.
-            SchemaViolationError: the adapter reported it as SchemaViolation; likewise.
-            ContextWindowExceededError: the adapter reported it as ContextWindowExceeded; likewise.
-            UnfinishedTurnError: the adapter reported it as UnfinishedTurn; likewise.
-            ProviderFailedTerminallyError: the adapter reported it as ProviderFailedTerminally; likewise.
-            RetryUnavailableError: iteration failed transiently after open_stream() returned.
-                An assembled response can also report ProviderFailedTransiently.
-            ParserContractError: draining hit a failure whose parse violated its contract.
-            RuntimeError: the handle is unopened, or it is finished with no conclusion stored
-                (drained to exhaustion, then left the block).
+            StreamProtocolError: The event stream ends without a terminal event.
+            InvalidRequestError: The adapter classifies an item error as an invalid request.
+            ProviderDeclaredFinalError: The provider declares an item error terminal.
+            UnknownExceptionError: The adapter cannot classify an item exception.
+            RefusalError: The assembled response contains a refusal.
+            MaxCompletionTokensExceededError: Structured output reaches its token limit.
+            EmptyTurnError: The assembled response contains no output.
+            SchemaViolationError: Structured output fails validation.
+            ContextWindowExceededError: The request exceeds the context window.
+            UnfinishedTurnError: The assembled response contains an unfinished turn.
+            ProviderFailedTerminallyError: The assembled response reports a terminal provider failure.
+            RetryUnavailableError: The open stream fails transiently.
+            ParserContractError: `Adapter.parse` violates its contract.
+            RuntimeError: The handle is unopened or finished without a stored conclusion.
         """
         if self._conclusion is None:
             if self._state != "open":
@@ -711,8 +624,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Build what this outcome concludes the call with: the success variant, or the error to raise.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
-        Every outcome closes the staged response into this attempt's record before the result is
-        built, so the call it freezes into the result holds the terminal response and what it billed.
+        Every outcome records the staged response before building the result.
+        The frozen call therefore includes the terminal response and billing.
         raw is that response, which only a success carries onward.
         """
         if outcome.kind == "provider_failed_transiently":

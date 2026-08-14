@@ -1,8 +1,6 @@
-"""Drive task_stream.py through every failure layer and print what the UI saw.
+"""Run each task_stream.py scenario and print its events.
 
-SCENARIOS is the run configuration, committed as data: each row names the script to play and the limits
-to play it under, so narrowing a run means editing a row that shows in `git diff` rather than passing an
-argument that leaves no trace. main() takes no arguments for the same reason.
+SCENARIOS stores the scripts and limits as committed run configuration.
 """
 
 import asyncio
@@ -19,12 +17,10 @@ from task_stream import App
 
 @dataclass(frozen=True)
 class Scenario:
-    """One row of the run table: which script to play and the limits to play it under.
+    """Configure one named scenario.
 
-    script_name is separate from name because tool_budget is the happy script run under a smaller
-    budget, so it perturbs the config rather than the script.
-    climate_max_tool_calls of None leaves AgentConfig's own default in place, so the default has one
-    home and cannot drift from a copy written here.
+    script_name lets tool_budget reuse the happy script with a smaller limit.
+    None for climate_max_tool_calls preserves AgentConfig's default.
     """
 
     name: str
@@ -44,17 +40,12 @@ SCENARIOS = (
 
 
 def print_event(event: Event) -> None:
-    """Render one event as a single line and print it; every scenario's App gets this as on_event."""
+    """Render and print one event."""
     print(render(event))
 
 
 def build_app(scenario: Scenario) -> App:
-    """Build the App over one scenario's scripted LLM and configs.
-
-    Wrapping for tracing is unconditional and happens inside App: with no TracerProvider configured
-    this run gets non-recording spans, so tracing costs nothing here and enabling it is SDK
-    configuration, never a change to this file.
-    """
+    """Build an App for one scenario."""
     configs = build_configs()
     if scenario.climate_max_tool_calls is not None:
         configs["research_climate"] = replace(
@@ -70,7 +61,7 @@ def build_app(scenario: Scenario) -> App:
 
 
 async def run_scenario(scenario: Scenario) -> None:
-    """Run one scenario end to end and print the event stream, then the outcome."""
+    """Run one scenario and print its events and outcome."""
     app = build_app(scenario)
     print(f"\n=== {scenario.name} (app timeout {scenario.app_timeout_seconds}s) ===")
     timed_out = False
@@ -78,13 +69,12 @@ async def run_scenario(scenario: Scenario) -> None:
         async with asyncio.timeout(scenario.app_timeout_seconds):
             await app.run()
     except TimeoutError:
-        # The turn logs are already final here: the cancellation unwound the whole tree before the
-        # TimeoutError reached this frame.
+        # Cancellation finalizes the turn logs before TimeoutError reaches this frame.
         timed_out = True
         print("!! whole-app timeout fired")
     print(f"--- final answer: {app.final_answer!r}")
     print(f"--- app timed out: {timed_out}")
-    # Any metric one could want is a fold over each run's ordered turn_log; none is computed here.
+    # Derive metrics from each run's ordered turn_log.
 
 
 async def main() -> None:

@@ -1,17 +1,8 @@
-"""The kind tag as a type-checked contract, on every union whose classes carry one.
+"""Verify that kind narrows each tagged union.
 
-Each union gets a match on kind whose cases read a field only some variants carry: that body fails to
-type-check unless the tag narrows the subject, so a regressed discriminator is a check-time error
-rather than a runtime AttributeError.
-GenerateResult's variants share every field name, so its match asserts the narrowed type of output,
-which only the tag makes non-optional in the response case.
-Each union also gets a one-case match carrying a non-exhaustive-match suppression.
-pyrefly reports an unused suppression as an error, so if the tag ever stops driving exhaustiveness
-the suppression goes unused and the check fails; a union that gains a variant fails in the full match
-beside it.
-The full matches are exercised at runtime too, so a subject reaching no case fails an assertion.
-That no two variants share a tag, which is what keeps a variant out of a sibling's case, is checked in
-test_kind_tag_shape.py.
+Each exhaustive match reads variant-specific fields.
+Each partial match requires a non-exhaustive-match suppression.
+Runtime tests exercise each branch of the match statements.
 """
 
 from typing import assert_type
@@ -68,7 +59,7 @@ _TOOL_MESSAGE = ToolMessage(tool_call_id="c1", content="ok")
 
 
 _CALL = call_record((attempt_record(error=None),), elapsed_seconds=1.0)
-"""One successful attempt's history, the fixed filler both GenerateResult variants carry."""
+"""Provide shared CallRecord data for GenerateResult values."""
 
 
 def _by_message_kind(message: Message) -> object:
@@ -158,11 +149,7 @@ def _by_dispatch_many_outcome_kind_missing_a_variant(outcome: DispatchManyOutcom
 
 
 def _by_response_outcome_kind(outcome: ResponseOutcome[str]) -> object:
-    """Cover ResponseOutcome, the union every retry loop matches an attempt's outcome over.
-
-    A match over it is exhaustive only if a match over NoOutputOutcome is, since those are its
-    no-output variants.
-    """
+    """Exercise an exhaustive match on ResponseOutcome."""
     match outcome.kind:
         case "adapter_result":
             return outcome.output
@@ -191,11 +178,7 @@ def _by_response_outcome_kind_missing_a_variant(outcome: ResponseOutcome[str]) -
 
 
 def _by_generate_result_kind(result: GenerateResult[int]) -> object:
-    """Cover GenerateResult, whose variants share every field name.
-
-    The tag's work is output's optionality, so each case asserts the type the tag narrowed output
-    to, standing where the other functions read a variant-only field.
-    """
+    """Verify that kind narrows GenerateResult.output."""
     match result.kind:
         case "response":
             assert_type(result.output, int)
@@ -212,7 +195,7 @@ def _by_generate_result_kind_missing_a_variant(result: GenerateResult[int]) -> o
 
 
 def _by_stream_item_kind(item: StreamItem) -> object:
-    """Cover StreamItem, whose str variant carries no tag because a builtin cannot hold one."""
+    """Exercise an exhaustive match on StreamItem."""
     if isinstance(item, str):
         return item
     match item.kind:

@@ -1,13 +1,7 @@
-"""The generate results: the success variants Response and ToolCallTurn, and the terminal GenerationError.
+"""Generation results and their calls-table and attempts-table conversion.
 
-A generate that succeeds returns a GenerateResult variant.
-One that ends terminally raises or returns a GenerationError.
-Terminal ends: retries exhausted, a refusal, truncation at the token cap, or a provider error langchaint does not retry.
-All three carry the CallRecord their retry loop froze.
-A call's history survives only if the result carries it: attempt_records is that history.
-On a success variant every record but the last failed and the last succeeded.
-On a GenerationError the records describe the terminal outcome.
-to_tables flattens results to two tables of scalars, one row per result and one row per attempt, joined on call_id.
+`Response`, `ToolCallTurn`, and `GenerationError` carry the call's `CallRecord`.
+`to_tables` emits one row per call and one row per recorded attempt.
 """
 
 from collections.abc import Iterable
@@ -39,8 +33,7 @@ type RowValue = str | int | float | bool | None
 class _SuccessCarrier(_CallCarrier):
     """The invariants and folds the success variants share; the fields stay on each variant.
 
-    A deriving frozen dataclass declares every field itself, assistant_message included, because this
-    class is not a dataclass and _CallCarrier explains why that split exists.
+    `_SuccessCarrier` is not a dataclass, so each frozen subclass declares its fields.
     """
 
     assistant_message: AssistantMessage
@@ -67,10 +60,9 @@ class _SuccessCarrier(_CallCarrier):
     def usage(self) -> Usage:
         """The paid total across every attempt of the call, carrying cost_in_usd, the number to bill on.
 
-        A call that retried a billed 200 (an empty structured parse retried as transient) counts every such
-        attempt, so this can exceed the tokens of the single answer in output; usage_successful_attempt is
-        that single answer's own usage. This is the same paid-total scope as GenerationError.usage,
-        so the two mean the same thing.
+        Every billed retry contributes usage.
+        This total can exceed the final output's `usage_successful_attempt`.
+        `GenerationError.usage` uses the same paid-total scope.
         """
         return Usage.sum_of(record.usage for record in self.attempt_records)
 
@@ -91,29 +83,12 @@ class _SuccessCarrier(_CallCarrier):
 
 @dataclass(frozen=True, kw_only=True)
 class Response[OutputT](_SuccessCarrier):
-    """One successful generate result.
+    """One successful generation result.
 
-    output is the assistant text, or the response_format instance validated from the turn's text.
-    It is never None: on a structured tool-bound binding a turn that called tools is a ToolCallTurn,
-    and a turn that produced no instance fails the call with a GenerationError.
-    On a text tool-bound binding every turn is a Response, so there tool_calls is what says whether
-    this turn owes the model a tool result.
-    call is this call's history: model, provider_name, attempt_records, started_at_monotonic_seconds,
-    and elapsed_seconds read off it.
-    attempts counts its records.
-    Every attempt record but the last failed and the last succeeded.
-    assistant_message is the adapter-built turn exactly as the provider produced it,
-    the whole ordered turn, held by reference for appending to a Sequence[Message].
-    Rebuilding it from output and tool_calls is lossy (it drops reasoning and the element order)
-    and is the rewrap this field exists to prevent.
-    The last attempt record holds the same object, because the record is where every attempt's turn
-    goes and this one is the attempt that succeeded.
-    raw is the SDK's own response model, held by reference (no dump, no copy; call raw.model_dump() for a dict);
-    on streams it comes from the SDK-assembled final message.
-    It is a live, mutable pydantic object shared with the adapter, so despite the frozen dataclass around it,
-    treat it read-only and raw.model_copy() before mutating.
-    usage and usage_successful_attempt are two scopes, both folded from attempt_records (see their docstrings):
-    usage is the paid total across every attempt, usage_successful_attempt the single kept answer's own.
+    `output` contains assistant text or a validated `response_format` instance.
+    `assistant_message` preserves the complete ordered turn for reuse.
+    `raw` holds the mutable SDK response by reference; copy it before mutation.
+    `usage` covers every attempt; `usage_successful_attempt` covers the final attempt.
     """
 
     output: OutputT
@@ -128,15 +103,10 @@ class Response[OutputT](_SuccessCarrier):
 
 @dataclass(frozen=True, kw_only=True)
 class ToolCallTurn[OutputT](_SuccessCarrier):
-    """One successful generate result whose turn called tools, owing the model one ToolMessage per call.
+    """A structured result that requires one `ToolMessage` per tool call.
 
-    Only the structured tool-bound binding returns this variant; a text binding's tool calls ride a
-    Response, whose str output always exists.
-    output is the response_format instance the turn's text also parsed to, None on a turn of tool
-    calls alone.
-    To continue the call, dispatch tool_calls (ToolManager.dispatch or dispatch_many), append
-    assistant_message and the tool results to the Sequence[Message], and generate again.
-    Every other field means what Response's field of the same name means; read it there.
+    `output` contains a parsed instance or `None` for a tool-only turn.
+    Dispatch `tool_calls`, then append `assistant_message` and the results before generating again.
     """
 
     output: OutputT | None
@@ -152,8 +122,7 @@ class ToolCallTurn[OutputT](_SuccessCarrier):
         """Enforce the shared success invariants, then this variant's own: the turn holds a tool call.
 
         Raises:
-            ValueError: a shared success check failed (_SuccessCarrier.__post_init__ names them), or
-                the turn holds no tool call.
+            ValueError: A check in `_SuccessCarrier.__post_init__` failed, or the turn has no tool call.
         """
         super().__post_init__()
         if not self.assistant_message.tool_calls:
@@ -171,12 +140,12 @@ def _success_variant[OutputT](
 ) -> GenerateResult[OutputT]:
     """Build the success variant one adapter_result outcome concludes its call with.
 
-    splits_tool_call_turns is whether the binding is structured and tool-bound, the one binding
-    whose tool-call turns are ToolCallTurn; under False every turn is a Response.
+    `splits_tool_call_turns` identifies a structured tool-bound binding.
+    It returns `ToolCallTurn` for tool calls and `Response` otherwise.
 
     Raises:
-        ValueError: the variant's __post_init__ rejected the records or the turn; both retry loops
-            construct from a freshly frozen success, so a raise here is a langchaint defect.
+        ValueError: The variant's `__post_init__` rejected the records or turn.
+            Retry loops pass a fresh success, so this error indicates a langchaint defect.
     """
     result_class: type[Response[OutputT]] | type[ToolCallTurn[OutputT]] = (
         ToolCallTurn if splits_tool_call_turns and assistant_message.tool_calls else Response
@@ -193,21 +162,9 @@ def _success_variant[OutputT](
 def _abandoned_call_error[ErrorT: AbandonedCallError](
     error_class: type[ErrorT], ledger: _CallLedger, billing_in_flight: Billing | None = None
 ) -> ErrorT:
-    """Freeze a cut-off call's ledger into the error that accounts for it.
+    """Freeze an interrupted call into `AbandonedCallError` or `TimedOutError`.
 
-    Call while the exception that cut the call off unwinds, after the in-flight permit has been
-    returned and, on the stream path, after the connection has closed, so nothing the ledger reports
-    is still moving.
-    billing_in_flight defaults to None, which is what a caller with no channel for observing an
-    in-flight attempt states; only an open stream has one.
-    error_class selects which account is built: AbandonedCallError for a cancellation, TimedOutError
-    for a deadline langchaint owned.
-
-    The freeze runs before the in-flight attempt is read, because it closes a response that had
-    arrived and been staged into an ordinary record carrying that response's own billing. What is in
-    flight afterwards is the attempt that got no record at all, so one request is either a record or
-    the in-flight attempt and never both, and a report of what a recorded attempt billed is dropped
-    here rather than added on top of the record that already states it.
+    Include `billing_in_flight` only when the ledger still has an unrecorded request.
     """
     call = ledger.freeze()
     started_at_monotonic_seconds = ledger.in_flight_attempt_started_at_monotonic_seconds
@@ -223,8 +180,8 @@ def _abandoned_call_error[ErrorT: AbandonedCallError](
 class Tables(NamedTuple):
     """The two tables to_tables builds, joined on call_id.
 
-    A NamedTuple so the two unpack positionally and read by name, and so neither is mistaken for the
-    other at a call site where both are list[dict[str, RowValue]].
+    `NamedTuple` supports positional unpacking and named access.
+    The field names distinguish the two identically typed lists.
     """
 
     calls: list[dict[str, RowValue]]
@@ -234,8 +191,7 @@ class Tables(NamedTuple):
 def _output_cell(output: object) -> str | None:
     """Flatten one output to its cell: a pydantic instance as its JSON, anything else as its str.
 
-    None stays None rather than becoming "None", which would write a word into a column readers scan
-    for real output.
+    `None` stays `None` so the output column contains no false text.
     """
     if output is None:
         return None
@@ -252,21 +208,11 @@ def _request_cell(result: CallResult[object]) -> str | None:
 
 
 def _call_row(*, call_id: int, result: CallResult[object]) -> dict[str, RowValue]:
-    """One row of the calls table: what is measured at the call rather than summed from its attempts.
+    """Build one call-level row.
 
-    error_summary is how the call ended, the carrier's own __str__, and None on a success. It is not
-    error_text: RetriesExhaustedError.error_text folds every attempt's error into one string, and
-    those errors have rows of their own in the attempts table.
-    output is the parsed result, None on a failure and None on a ToolCallTurn that parsed no
-    instance, which stop_reason "tool_use" tells apart.
-    request_json is what every attempt of a failed call sent, rendered as a JSON object. It is None
-    on a success, whose request is reconstructible from the Sequence[Message] and the binding the caller
-    still holds, and None on a failure the adapter declared before building a request.
-    It holds the whole prompt, so a caller writing this table somewhere the outputs may not go drops
-    the column.
-    elapsed_seconds belongs here because it spans the admission waits and backoff sleeps no attempt
-    bracket covers, so it is its own measurement rather than a fold. Spend is not: every billing
-    column sits in the attempts table and a caller sums what they need.
+    `error_summary` describes a terminal error; attempt errors stay in the attempts table.
+    `request_json` contains the full failed request when available.
+    `elapsed_seconds` includes admission and backoff waits.
     """
     return {
         "call_id": call_id,
@@ -289,25 +235,11 @@ def _attempt_row(
     record: AttemptRecord,
     call_started_at_monotonic_seconds: float,
 ) -> dict[str, RowValue]:
-    """One row of the attempts table: what one request billed, produced, and took.
+    """Build one attempt-level row.
 
-    The timing columns are durations, not clock readings, because AttemptRecord's stamps are raw
-    time.monotonic() values that mean nothing outside the process that took them.
-    started_after_seconds places the attempt on the call's timeline, so the gap between one row's
-    start and the previous row's end is the admission wait or backoff sleep between them, and the
-    first row's own value is the admission wait before the first request went out.
-    seconds_to_first_item is how long this attempt's stream took to yield anything, None on a
-    non-stream attempt and on a stream that yielded nothing.
-    model_served and response_id are what the provider said about the response this attempt
-    received, both None where none arrived; the calls table's model beside them is the id langchaint
-    sent.
-    request_id is the request-id header, which provider support asks for. It is filled on an attempt
-    that failed too, read off the SDK's own error there, and on a streamed attempt it comes from the
-    open stream. None where none of those had one.
-    error_text is this attempt's own error, None where it has none, which includes an attempt whose
-    failure was the call's rather than the attempt's (a rejected request, a provider-declared final
-    error, an exception the adapter could not place); the calls row's error_summary carries those.
-    _billing_cells fills the rest, from what the provider reported.
+    Timing fields are durations from the call or attempt start.
+    Response identifiers are `None` when no response supplied them.
+    `error_text` contains this attempt's transient error.
     """
     return _billing_cells(record.billing) | {
         "call_id": call_id,
@@ -342,14 +274,9 @@ def _cut_off_attempt_row(
     call_started_at_monotonic_seconds: float,
     billing_in_flight: Billing | None,
 ) -> dict[str, RowValue]:
-    """Return the attempts row for the request that was in flight when a call was cut off.
+    """Build the attempts row for an interrupted in-flight request.
 
-    It fills the same columns as a settled attempt's row so one SUM over cost_in_usd closes the
-    archive to the total the carriers report.
-    The columns describing how the attempt ended are None because nobody observed it ending:
-    elapsed_seconds, seconds_to_first_item, error_text, and everything a response would have said
-    about itself. kept is false, no turn having become an answer.
-    started_after_seconds places the request on the call's timeline the same way a settled row does.
+    End, response, and error fields are `None` because the request did not settle.
     """
     return _billing_cells(billing_in_flight) | {
         "call_id": call_id,
@@ -369,14 +296,10 @@ def _cut_off_attempt_row(
 
 
 def _billing_cells(billing: Billing | None) -> dict[str, RowValue]:
-    """Return the attempts columns the provider's report fills, all None where it reported nothing.
+    """Build provider-reported billing cells for one attempt.
 
-    None rather than zero keeps "the provider reported nothing" distinct from "the provider billed
-    zero"; zeros would sum the two together.
-    Shared by a settled attempt's row and a cut-off attempt's, so one definition fixes the names.
-    usage_raw_json is the provider's own usage object as it reported it, which is what keeps the
-    billing detail the neutral counters merge or drop alive past the process. None where the
-    provider reported no usage, which is not the same as there being no billing at all.
+    Return `None` values when the provider reports no billing.
+    `usage_raw_json` preserves provider-specific usage fields.
     """
     usage = None if billing is None else billing.usage
     usage_raw = None if billing is None else billing.usage_raw
@@ -419,25 +342,12 @@ def _billing_cells(billing: Billing | None) -> dict[str, RowValue]:
 
 
 def to_tables[OutputT](results: CallResult[OutputT] | Iterable[CallResult[OutputT]]) -> Tables:
-    """Flatten results to a calls table and an attempts table of scalars, joined on call_id.
+    """Flatten results into calls and attempts tables joined by `call_id`.
 
-    A success and a failure fill the same keys in each table, so a mixed batch is one pair of tables.
-    Every column sits at the grain of the thing it is true of: a call fact repeated across attempt
-    rows would assert it of attempts it is not true of.
-
-    call_id is the result's position in the results given here, which is what joins an attempt row
-    back to the call it belongs to. A caller concatenating the output of two to_tables calls offsets
-    the second, since each numbers from zero.
-    kept marks the attempt whose turn became the answer: the last attempt of a success variant, and no
-    attempt of a GenerationError.
-    An AbandonedCallError cut off mid-request gets one attempts row past its records, for the
-    request that was in flight, so summing cost_in_usd over the archive reaches the total the
-    carriers report.
-    A single result is accepted in place of an iterable, and is told apart by not being iterable,
-    which no success variant or GenerationError is.
-
-    Repricing held rows is a join against the caller's own rate table on model, provider_name, and
-    service_tier: the first two are call columns and the third an attempt column.
+    `call_id` is each result's position in `results`.
+    `kept` marks the final attempt of a successful call.
+    An interrupted in-flight request gets an extra attempts row.
+    A single result is accepted in place of an iterable.
     """
     call_results = list(results) if isinstance(results, Iterable) else [results]
     calls: list[dict[str, RowValue]] = []

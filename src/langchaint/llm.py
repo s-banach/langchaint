@@ -1,18 +1,8 @@
 """Provider-neutral `LLM` construction and binding.
 
-`LLM` combines one `Adapter` and one `SharedBackoff`.
-`LLM` has no generation methods.
-`LLM.bind()` freezes the cacheable prompt prefix.
-It also fixes the output type and precomputes SDK arguments.
-`tools=` constructs `ToolManager` from a sequence or binds an existing `ToolManager` unchanged.
-The returned `BoundLLM` accepts per-request `GenerationInput` values.
-`BoundLLM.rebind()` changes parameters.
-One `SharedBackoff.admitted()` block spans each request attempt.
-Provider failures leave a `Verdict` on `Admission.verdict`.
-`PauseAll` pauses every request sharing the `SharedBackoff`.
-`RetryThisOne` waits through `PrivateBackoff` between attempts.
-`DoNotRetry` becomes the item's `GenerationError`.
-`PauseAllDoNotRetry` pauses shared requests and stops this item.
+`LLM.bind` freezes a prompt prefix and returns `BoundLLM`.
+Each request attempt runs inside `SharedBackoff.admitted`.
+`PauseAll` pauses shared requests; `RetryThisOne` retries only the current request.
 """
 
 import asyncio
@@ -78,16 +68,7 @@ from langchaint.tools import Tool, ToolManager
 
 
 class _StreamObservations(NamedTuple):
-    """What the retry loop saw of one attempt's stream, read before the close dropped it.
-
-    billing is what the provider had reported when a failure cut the stream off: None where the
-    stream never opened, where it reported nothing, and where it concluded normally, a staged
-    response then stating the attempt's billing itself. A counter the provider sends late is
-    missing from it.
-    request_id is the request-id header the stream carried, None where it had none or never opened.
-    opened says whether open_stream returned, which is what lets a failure nobody can classify
-    still record that the attempt reached the provider.
-    """
+    """Billing, request ID, and open status captured before a failed stream closes."""
 
     billing: Billing | None
     request_id: str | None
@@ -116,9 +97,8 @@ type GenerationInput = str | Sequence[Message]
 class Deadline(Protocol):
     """The scope one call runs inside, told when the call waits to be admitted and when it is.
 
-    Waiting to be admitted is waiting behind everything else sharing the SharedBackoff, first for a
-    permit and then for the admission queue. Whether that time counts against the call is the only
-    thing the implementations disagree on.
+    Admission waits include the `SharedBackoff` permit and admission queue.
+    Implementations differ only in whether that wait counts against the call.
     """
 
     @property
@@ -138,12 +118,11 @@ class Deadline(Protocol):
 class WallClockDeadline:
     """A deadline that runs from construction to the result, whatever the call waits on.
 
-    This is what generate_one's timeout_seconds asks for: a caller blocked on one call wants an
-    answer or a failure within that many seconds, and a wait for admission is time it spent waiting.
+    `generate_one.timeout_seconds` includes admission waits.
     """
 
     def __init__(self, timeout_seconds: float | None) -> None:
-        """Arm the scope now, or open one that never expires when timeout_seconds is None."""
+        """Create the scope with timeout_seconds; None disables expiration."""
         self.scope: asyncio.Timeout = asyncio.timeout(timeout_seconds)
 
     def suspend_until_admitted(self) -> None:
@@ -160,7 +139,7 @@ class WorkingTimeDeadline:
     """
 
     def __init__(self, max_working_seconds: float | None) -> None:
-        """Open the scope unarmed; the first resume_on_admission arms it with the budget."""
+        """Create a scope without expiration; resume_on_admission schedules the budget."""
         self.scope: asyncio.Timeout = asyncio.timeout(None)
         self._seconds_left = max_working_seconds
 
@@ -249,14 +228,7 @@ def _resolve_tool_manager(
 
 
 class GenerateItem[OutputT](Protocol):
-    """Runs one item of a batch.
-
-    BoundLLM.generate_many passes its own _generate_one_any_binding. A wrapper passes an
-    implementation that calls the same method and does its own work around it, which is how one call
-    of a batch gets treated exactly as generate_one treats one call.
-    Pass deadline through: an implementation that dropped it would silently give its items no
-    deadline at all. It belongs to this item alone, so hand it to one call and no other.
-    """
+    """Run one batch item."""
 
     async def __call__(
         self, generation_input: GenerationInput, *, deadline: Deadline
@@ -369,23 +341,17 @@ class LLM:
     ) -> "BoundLLM[Any, Any]":
         """Freeze the prompt prefix and fix the output type.
 
-        response_format=Model gives BoundLLM[Model] whose output is a validated Model.
-        Absent, bind gives BoundLLM[str] whose output is the assistant text.
-        `tools=ToolManager(...)` binds that `ToolManager` unchanged.
-        A `tools` sequence constructs `ToolManager`.
-        A tool-bound structured request may return a `ToolCallTurn`; see `BoundLLM`.
+        `response_format` sets `OutputT`; its absence uses `str`.
+        A `tools` sequence constructs `ToolManager`; an existing `ToolManager` retains its identity.
         `automatic_cache_breakpoints=None` uses `Adapter.automatic_cache_breakpoints_default`.
-        max_attempts counts requests sent including the first, so 1 means no retrying.
-        Ad-hoc use is llm.bind(automatic_cache_breakpoints=False).generate_one(...).
-        Binding.extra_body documents extra_body: the merge precedence and the colliding-key raise.
+        `max_attempts` counts requests including the first.
 
         Raises:
-            ValueError: A `tools` sequence contains duplicate names.
-                Also raised when `system_prompt` is an empty sequence of parts.
-                Pass `None` to bind no system prompt.
-                The adapter also raises for unsupported `automatic_cache_breakpoints`.
-                The adapter also raises when `extra_body` contains an adapter-populated key.
-                Also raised when `max_attempts` is a bool or below one.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `automatic_cache_breakpoints` is unsupported.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_attempts` is boolean or below one.
         """
         tool_manager = _resolve_tool_manager(tools)
         binding = _build_binding(
@@ -416,23 +382,11 @@ class LLM:
 
 
 class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
-    """One frozen prefix plus the request methods; constructed by LLM.bind.
+    """A frozen prompt prefix with generation and streaming methods.
 
-    OutputT is what the binding asks the model for: str, or the response_format instance.
-    ToolManagerT is the bound tool_manager's type, ToolManager or None.
-    The tool_manager property returns it.
-    A tool loop therefore dispatches through the binding it was handed.
-    ToolManagerT is also what the request methods overload on.
-    A structured BoundLLM[Model, ToolManager] generates GenerateResult[Model]: a tool-call turn is
-    the ToolCallTurn variant, so the Response variant's output is never None.
-    Every other combination generates Response[OutputT] alone.
-    Keeping the variants out of OutputT is what lets rebind add and remove a tool_manager.
-    The parameter defaults to None, so BoundLLM[Model] annotates the common binding.
-    A tool-bound one names both, BoundLLM[Model, ToolManager].
-    bind writes ToolManager as the type argument for every manager, subclasses included.
-
-    tool_manager is kept for tool dispatch;
-    the provider only ever sees the converted schemas inside the binding.
+    `OutputT` is `str` or the validated `response_format` type.
+    A structured binding with `ToolManager` returns `ToolCallTurn` for tool-call turns.
+    `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
     def __init__(
@@ -630,27 +584,20 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_attempts: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
     ) -> "BoundLLM[Any, Any]":
-        """Return a new BoundLLM with these fields replaced; a left-out field keeps its value.
+        """Return a new `BoundLLM` with specified fields replaced.
 
-        `response_format` sets `OutputT` in the overload return type.
-        `tools` sets `ToolManagerT`.
-        Omitting `tools` preserves the bound `ToolManagerT`.
-        Passing `tools=None` removes the bound `ToolManager`.
-        Passing `tools=ToolManager(...)` preserves that object's identity.
-        `inference_params` replaces the complete bound value.
+        Omitting a field preserves its value.
+        `response_format` sets `OutputT`; `tools` sets `ToolManagerT`.
+        `tools=None` removes `ToolManager`; an existing `ToolManager` retains its identity.
+        `inference_params` replaces the complete value.
         `automatic_cache_breakpoints=None` reads `Adapter.automatic_cache_breakpoints_default`.
-        `Binding.automatic_cache_breakpoints` stores the result.
-        `rebind` converts the new binding to SDK arguments without I/O.
-        Provider cache preservation depends on changed fields, provider, and model.
-        Measure cache behavior on the deployed configuration.
 
         Raises:
-            ValueError: A `tools` sequence contains duplicate names.
-                Also raised when `system_prompt` is an empty sequence of parts.
-                Pass `None` to bind no system prompt.
-                The adapter also raises for unsupported `automatic_cache_breakpoints`.
-                The adapter also raises when `extra_body` contains an adapter-populated key.
-                Also raised when `max_attempts` is a bool or below one.
+            ValueError: `tools` contains duplicate names.
+            ValueError: `system_prompt` is an empty sequence.
+            ValueError: `automatic_cache_breakpoints` is unsupported.
+            ValueError: `extra_body` contains an adapter-populated key.
+            ValueError: `max_attempts` is boolean or below one.
         """
         if isinstance(tools, Unchanged):
             tool_manager = self.tool_manager
@@ -719,21 +666,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         request: RequestParams,
         observations: _StreamObservations,
     ) -> GenerationError:
-        """Name this item's terminal failure from the verdict, else from classify's reading of exc.
+        """Convert a terminal verdict or `classify` result to `GenerationError`.
 
-        `PauseAllDoNotRetry` becomes `declared_final` without `classify()`.
-        A provider directive states this request will not succeed.
-        `ProviderDeclaredFinalError` names that outcome.
-        `classify()` could otherwise return `invalid_request` for status 429.
-        Every other failure takes classify. Reached on a terminal verdict and on an exception
-        outside failure_types that classify did not call transient, so the "transient" value cannot
-        arrive; if a classify defect produces one anyway, it lands on the unknown_exception default
-        with everything else out of place.
-        Every record written here bills observations.billing, what the failure's stream had
-        reported in flight, so a terminal failure's spend still reaches the caller; a staged
-        response's own billing wins where one arrived.
-
-        StreamHandle carries its own copy of this mapping; what the two retry loops share is the ledger in call.py.
+        Attempt records preserve in-flight billing and the staged response.
         """
         classification: ErrorClassification = (
             "declared_final"
@@ -777,25 +712,13 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         request: RequestParams,
         observations: _StreamObservations,
     ) -> None:
-        """Record one verdicted attempt, then wait whatever the verdict asks before the next.
+        """Record a verdicted attempt and apply its retry delay.
 
-        exc is a failure_types exception, so the admitted() block's exit parsed it and left the
-        verdict on admission.verdict. A verdict of None is folded into the terminal branch: the
-        exit parses every failure_types exception, so a None reaching here has no verdict to act
-        on.
-        The attempt's record carries a TransientError: exc itself when it is one, otherwise one
-        wrapping exc with the verdict's capped retry_after. It bills observations.billing, what
-        the attempt's stream had reported when the failure cut it off, so a retried attempt's
-        spend reaches the caller; a staged response's own billing wins where one arrived.
-        On RetryThisOne the wait is the PrivateBackoff's, floored by the verdict's retry_after;
-        on PauseAll there is no wait of our own, because the next admitted() entry already holds
-        until the shared pause ends. Neither waits after the last attempt.
-        assistant_message is the turn a 200 the provider filled with a failure still carried, and
-        None where the attempt received no response.
+        `RetryThisOne` uses `PrivateBackoff`; shared pauses apply at the next admission.
+        No delay follows the final attempt.
 
         Raises:
             GenerationError: A terminal verdict stops this request.
-                `PauseAllDoNotRetry` also leaves shared requests paused.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         verdict = admission.verdict
@@ -831,18 +754,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         request: RequestParams,
         observations: _StreamObservations,
     ) -> GenerationError | None:
-        """Record one transport failure and wait, or return the terminal error for it.
+        """Retry a transient transport failure or return its terminal error.
 
-        exc is outside failure_types, so it exited the admitted() block unparsed and unrecorded
-        there. Two failures are retried here, as RetryThisOne with no retry_after and with no wait
-        after the last attempt. One is a failure classify calls "transient", a transport failure
-        that produced nothing parseable. The other is a StreamProtocolError: a stream the
-        transport ended without its terminal event and without any provider-reported error, which
-        classify cannot place because the class is langchaint's own. No item from the drained
-        stream reached any caller, so a resend is safe, and a violation that persists ends as
-        RetriesExhaustedError whose attempt records each carry this text.
-        For anything else this returns the GenerationError _terminal_error names,
-        and the caller raises it so the raise sits beside the except clause that caught exc.
+        `StreamProtocolError` also retries because generated items have not reached the caller.
+        No delay follows the final attempt.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         if not isinstance(exc, StreamProtocolError) and self.adapter.classify(exc) != "transient":
@@ -882,59 +797,26 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         ledger: _CallLedger,
         deadline: Deadline,
     ) -> GenerateResult[OutputT | None]:
-        """Run the retry loop every generate method shares, under the caller's deadline.
+        """Run generation attempts under `deadline` and record each outcome.
 
-        ledger is the caller's own empty ledger (the retry budget counts its attempts), recorded
-        into as each attempt settles. Every GenerationError and the success variant are built from
-        ledger.freeze(), the one site a call's elapsed_seconds is computed.
-
-        deadline bounds this whole loop, and which of the loop's waits spend it is the deadline's
-        own question to answer. Expiring raises TimedOutError, whose docstring says why the scope
-        has to sit in this frame.
-        A cancellation from any scope but this one is the caller's own order and propagates
-        untouched. expired() is what tells the two apart: a TimeoutError this scope did not raise
-        came from under the loop unclassified, and re-raising it hands it to the same wrapping every
-        other unclassified exception gets.
-
-        The adapter reports one attempt as a ResponseOutcome variant and never as a GenerationError,
-        so this loop matches the variant and constructs the item's GenerationError here, where the
-        attempts and the timing are known.
-        Each arrived response is staged on the ledger with its billing before anything is read off it,
-        so an exception from that read still leaves the attempt and its billing on the record.
-        Each attempt spans one admitted() block, held for the request only;
-        backoff sleeps sit outside the block so a waiting task does not hold a permit.
-        Each provider failure exits its block before another request starts.
-        A rate-limit error pauses the rate-limit quota.
-        Every attempt is timed onto an AttemptRecord whose bracket is the request only,
-        excluding the admission wait and the backoff sleep,
-        so a slow request is distinguishable from time spent rate limited.
+        Each request runs inside one `SharedBackoff.admitted` block.
+        Billing is recorded before response interpretation.
+        Backoff waits run outside admission.
 
         Raises:
-            InvalidRequestError: build_request returned InvalidRequest, or the adapter classified
-                an attempt's error as a rejection of the request; terminal for this item, without a retry.
-            ProviderDeclaredFinalError: the adapter classified an attempt's error as one the provider
-                declared final; terminal for this item, without a retry.
-            UnknownExceptionError: the adapter could not place an attempt's exception;
-                terminal for this item, without a retry.
-            RefusalError: the adapter reported a Refusal attempt (no structured output: the model
-                refused or a provider filter blocked the turn); terminal for this item, without a retry.
-            MaxCompletionTokensExceededError: the adapter reported a MaxCompletionTokensExceeded attempt (the structured
-                response hit the token cap); terminal for this item, without a retry.
-            EmptyTurnError: the adapter reported an EmptyTurn attempt (the model finished and produced
-                nothing); terminal for this item, without a retry.
-            SchemaViolationError: the adapter reported a SchemaViolation attempt (the model finished
-                and its text is not an instance of the bound response_format); terminal for this
-                item, without a retry.
-            ContextWindowExceededError: the adapter reported a ContextWindowExceeded attempt;
-                terminal for this item, without a retry.
-            UnfinishedTurnError: the adapter reported an UnfinishedTurn attempt (a 200 langchaint
-                cannot continue); terminal for this item, without a retry.
-            ProviderFailedTerminallyError: the adapter reported a ProviderFailedTerminally attempt
-                (the 200's body reports that generating the response failed, for a reason a resend
-                would hit again); terminal for this item, without a retry.
-            RetriesExhaustedError: every attempt failed transiently and the budget ran out.
-            TimedOutError: the deadline expired before the call produced a result.
-            ParserContractError: the adapter's parse violated its contract on an attempt's failure.
+            InvalidRequestError: The adapter rejects the request.
+            ProviderDeclaredFinalError: The provider declares a terminal failure.
+            UnknownExceptionError: The adapter cannot classify an exception.
+            RefusalError: The provider refuses structured output.
+            MaxCompletionTokensExceededError: Structured output reaches its token limit.
+            EmptyTurnError: The model produces no structured output or tool call.
+            SchemaViolationError: The output fails `response_format` validation.
+            ContextWindowExceededError: The request exceeds the context window.
+            UnfinishedTurnError: The provider returns an unfinished turn.
+            ProviderFailedTerminallyError: The response reports a terminal provider failure.
+            RetriesExhaustedError: Transient failures consume `max_attempts`.
+            TimedOutError: `deadline` expires.
+            ParserContractError: `Adapter.parse` violates its contract.
         """
         ledger.start_call()
         timeout_scope = deadline.scope
@@ -953,23 +835,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     async def _attempt_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _CallLedger, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
-        """Send the request until it succeeds, fails terminally, or the retry budget runs out.
+        """Send requests until success, a terminal failure, or `max_attempts`.
 
-        Runs inside the deadline opened by _generate_with_retries, its only caller.
-
-        Each attempt opens one adapter stream and drains it privately: no item reaches any caller,
-        which is what makes retrying a mid-stream failure safe, where stream_one, whose items do,
-        never retries an open stream. The drain runs inside the attempt's admitted() block, so a
-        mid-stream failure exits the block with its verdict exactly as an open failure does.
-        A failure that cuts the stream off has its billing_reported() and request_id() read before
-        the close drops them, into the _StreamObservations the failure handlers record from; the
-        billing is also noted on the ledger, where the deadline account finds it if this frame
-        unwinds instead.
+        Each attempt drains its stream before exposing output.
+        A failed stream records current billing and `request_id` before closing.
 
         Raises:
-            GenerationError: every failure _generate_with_retries names but TimedOutError, which its
-                scope raises.
-            ParserContractError: the adapter's parse violated its contract on an attempt's failure.
+            GenerationError: The call reaches a terminal failure.
+            ParserContractError: `Adapter.parse` violates its contract.
         """
         request = self._request_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
@@ -1119,29 +992,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     async def generate_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> GenerateResult[Any]:
-        """Generate one response under the retry loop.
+        """Generate one response with retries.
 
-        A structured tool-bound binding returns GenerateResult[OutputT], and a match on its kind
-        tells the final Response from the ToolCallTurn owing tool results.
-        Every other binding returns Response alone, its output never None, a text turn's being "".
-        Every non-success outcome propagates, all of them sharing the GenerationError base a caller
-        can catch at once: RetriesExhaustedError on transient exhaustion, InvalidRequestError on a
-        rejected request, ProviderDeclaredFinalError or UnknownExceptionError on an error the adapter
-        placed as final or could not place at all, and one of RefusalError,
-        MaxCompletionTokensExceededError, EmptyTurnError, SchemaViolationError,
-        ContextWindowExceededError, UnfinishedTurnError, or ProviderFailedTerminallyError on a 200
-        that produced no output; _generate_with_retries names the condition for each.
-        EscapedExceptionError joins them on an Exception that escaped langchaint's own machinery,
-        raised by the guard around that loop.
-
-        timeout_seconds bounds the whole call, admission waits and backoff sleeps included, and expiring
-        raises TimedOutError, which carries what the cut-off call spent. None is no deadline.
-        A cancellation from anywhere else (a caller's own asyncio.timeout, a TaskGroup sibling
-        failing, shutdown) cuts the call off and propagates, so this call's settled attempts are lost
-        with the frame. Use `timeout_seconds` to preserve settled attempts.
+        A structured tool-bound binding can return `ToolCallTurn`.
+        `timeout_seconds` bounds admission, requests, and backoff waits.
+        Generation failures raise a `GenerationError` subclass.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled this call.
+            asyncio.CancelledError: The caller cancels this call.
         """
         return await self._generate_one_any_binding(
             generation_input, deadline=WallClockDeadline(timeout_seconds)
@@ -1150,21 +1008,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     async def _generate_one_any_binding(
         self, generation_input: GenerationInput, *, deadline: Deadline
     ) -> GenerateResult[OutputT | None]:
-        """Run one call under a ledger of its own, reporting every Exception as its failure.
-
-        What generate_one does, at the widest output type, callable from a frame whose binding is not
-        statically concrete: generate_one's overloads are keyed on the binding, so they match no
-        generic self. The tracing wrapper reaches the request through here, and so does every batch
-        item, this being the GenerateItem generate_many passes.
-
-        The GenerationError clause re-raises the failures the retry loop already reported, which the
-        Exception clause below it would otherwise wrap a second time. TimedOutError is one of them,
-        so a deadline is never rewrapped as an escaped exception.
+        """Run one call at the widest output type and record escaped `Exception` values.
 
         Raises:
-            GenerationError: whatever _generate_with_retries failed the call with, or
-                EscapedExceptionError wrapping any other Exception that reached here.
-            BaseException: whatever cut the call off, propagating unobserved.
+            GenerationError: Generation fails or an escaped `Exception` becomes `EscapedExceptionError`.
+            BaseException: A non-`Exception` value interrupts the call.
         """
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
         try:
@@ -1185,9 +1033,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> CallResult[OutputT | None]:
         """One batch item: the success variant or the GenerationError.
 
-        Every terminal per-item outcome is a GenerationError, so nothing a request produces escapes
-        into run_many and reaches a sibling. An expired deadline is one of them, so one item's
-        deadline never cuts a sibling.
+        Every terminal item failure becomes `GenerationError` before reaching `run_many`.
+        One item's expired deadline therefore cannot cancel a sibling.
 
         Raises:
             BaseException: whatever cut the item off, propagating unobserved.
@@ -1230,47 +1077,16 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         # list is invariant, so no single element union is assignable from all three overloads;
         # a union of list types would restate the overloads without replacing this Any.
     ) -> list[Any]:
-        """Run an order-aligned batch: result i belongs to generation_inputs[i].
+        """Generate an input-aligned batch.
 
-        Each success uses generate_one's result type for this binding.
-        A GenerationError is returned in place of that item's result and never cancels a sibling.
-        It names retries exhausted, a rejected request, an error langchaint does not retry, a 200
-        that produced no output, or a defect in langchaint itself.
-        to_tables renders each GenerationError as one failure row, so the batch stays table-ready.
-        The returned list is therefore always complete.
-
-        SharedBackoff.max_concurrent_requests sets the batch's throughput, gating every request
-        start across everything sharing that instance.
-        The batch separately bounds how many items are pending, meaning started and not settled,
-        so a batch of a million inputs does not hold a million tasks.
-
-        warm_cache runs generation_inputs[0] to completion before starting the rest, because a
-        provider cache entry is readable only once the response that writes it begins.
-        Without warming, a batch sharing a cached prefix pays one cold cache write per pending item.
-        Warming costs one item of serial latency, and it runs whether or not the binding places a
-        cache marker.
-        A first item ending in a GenerationError still admits the rest: a 200 that produced no
-        output (a refusal, a truncation) wrote the prefix on the provider side, and after a
-        transport failure the rest simply run against a cold cache.
-        There is no second warmer.
-
-        max_working_seconds_per_item is how long one item may spend able to work, its clock stopped
-        for as long as that item waits to be admitted. An item waits behind the batch's other items
-        for a permit and then for its turn in the admission queue, and it waits out a shared pause
-        without being free to send anything, so charging any of that to the item would expire items
-        that never ran. What spends it is the request and the sleeps between attempts.
-        Use generate_one's timeout_seconds when what you need bounded is wall clock.
-        An item that expires is returned as a TimedOutError while its siblings run on.
-        Bound the batch this way rather than with a scope of your own: a cancellation from outside
-        discards the returned list, settled results and all, because the list is this frame's and the
-        frame is what unwinds.
-        Neither an outer cancellation nor an item's BaseException starts an item that had not
-        started.
+        Each `GenerationError` becomes that input's result and does not cancel sibling calls.
+        `SharedBackoff.max_concurrent_requests` limits request starts and pending items.
+        `warm_cache` completes the first input before starting the rest.
+        `max_working_seconds_per_item` excludes admission and shared-pause waits.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled the batch.
-            BaseException: an item raised a BaseException that is not an Exception, which langchaint
-                does not catch; the started items are cancelled and awaited, and it propagates.
+            asyncio.CancelledError: The caller cancels the batch.
+            BaseException: An item raises a non-`Exception` value.
         """
         return await self._generate_many_any_binding(
             generation_inputs,
@@ -1287,16 +1103,13 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         generate_item: "GenerateItem[OutputT]",
         max_working_seconds_per_item: float | None,
     ) -> list[CallResult[OutputT | None]]:
-        """Run the batch at the widest output type; _generate_one_any_binding says why this exists.
+        """Run a batch at the widest output type.
 
-        generate_item runs one item, so a caller that wraps each call wraps every item of a batch
-        alike, whichever branch below started it.
-        Every item gets a WorkingTimeDeadline of its own, built where that item starts.
+        Each item receives its own `WorkingTimeDeadline` when it starts.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled the batch.
-            BaseException: an item raised a BaseException that is not an Exception; the started
-                items are cancelled and awaited, and it propagates.
+            asyncio.CancelledError: The caller cancels the batch.
+            BaseException: An item raises a non-`Exception` value.
         """
         # The slices also convert the SequenceNotStr protocol to the Sequence _run_items takes.
         if warm_cache and generation_inputs:
@@ -1331,8 +1144,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             asyncio.CancelledError: an outer scope cancelled generate_many.
-            BaseException: an item raised a BaseException that is not an Exception; run_many cancels
-                and awaits the started items, and it propagates.
+            BaseException: An item raised a `BaseException` outside `Exception`.
+                `run_many` cancels and awaits started items before propagation.
         """
 
         async def run_one(
@@ -1379,15 +1192,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     def stream_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> StreamHandle[Any, Any]:
-        """Build the stream handle; entering it with `async with` opens the request.
+        """Build a `StreamHandle` that opens on context-manager entry.
 
-        The handle's final() result is typed the way generate_one types it, per binding.
-        Sync because nothing suspends until the handle is entered;
-        see StreamHandle for the retry, close, deadline, and abandoned contracts.
-        timeout_seconds bounds the block from entry until the call concludes, so it covers the open,
-        the item pulls, and whatever the block does between them. Its clock starts at entry, not
-        here, so a handle held before entering loses none of it. Work the block does after the call
-        concludes is the caller's own time.
+        `timeout_seconds` starts on entry and covers request opening, iteration, and caller work before conclusion.
         """
         return self._stream_one_any_binding(generation_input, timeout_seconds=timeout_seconds)
 

@@ -1,16 +1,8 @@
-"""Assert the claims task_stream.py's docstrings make, rather than trusting them.
+"""Verify task_stream.py behavior.
 
-Two of these are the reason the module has its shape.
-
-The first is the accounting claim: a call its own deadline cut off is on its run's turn_log and the
-run carries on from it, because langchaint owns that deadline and hands the loop a TimedOutError
-while the loop is still there to catch it.
-
-The second is the reach claim: a tool function reports into the on_event of whichever run dispatched
-it through the ambient GuiEmitter, with no emitter parameter on any tool.
-
-Async tests run through asyncio.run in a sync test function, the convention the rest of this repo's
-suite uses, so no pytest-asyncio plugin is needed.
+Timed-out calls remain in turn_log, and their runs continue.
+GuiEmitter routes tool progress to the dispatching run's on_event.
+Sync tests use asyncio.run for async behavior.
 """
 
 import asyncio
@@ -52,15 +44,11 @@ from langchaint.tracing import TracedLLM
 
 
 def _discard(event: Event) -> None:
-    """Drop the event; a test using this reads the runs and the totals instead."""
+    """Discard one event."""
 
 
 def _timed_out_count(app: App) -> int:
-    """Count the calls their deadline cut off, across every run's turn_log, folded after the run.
-
-    Such a call lands as the LlmFailure holding a TimedOutError, which is the record that carries
-    what that call had billed.
-    """
+    """Count TimedOutError records across each run's turn_log."""
     return sum(
         isinstance(record, LlmFailure) and isinstance(record.error, TimedOutError)
         for run in app.runs.values()
@@ -69,7 +57,7 @@ def _timed_out_count(app: App) -> int:
 
 
 def _total_cost(app: App) -> float:
-    """Fold the tree's whole cost from every run's turn_log, after the run."""
+    """Sum each run's own cost."""
     return sum(run.own_usage.cost_in_usd for run in app.runs.values())
 
 
@@ -99,7 +87,7 @@ def _build_app(
 
 
 def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableSpan | None:
-    """Return the span that is the given span's parent, or None when it is a root."""
+    """Return span's parent or None for a root span."""
     if span.parent is None:
         return None
     parent_id = span.parent.span_id
@@ -114,24 +102,20 @@ def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableS
 
 
 def _named(spans: tuple[ReadableSpan, ...], name: str) -> ReadableSpan:
-    """Return the one finished span with the given name, asserting it is unique."""
+    """Return the unique finished span named name."""
     matches = [span for span in spans if span.name == name]
     assert len(matches) == 1, f"expected exactly one {name!r} span, got {len(matches)}"
     return matches[0]
 
 
 def _attribute(span: ReadableSpan, key: str) -> object:
-    """Read one attribute off a finished span, asserting the span carries attributes at all."""
+    """Return one finished span attribute."""
     assert span.attributes is not None
     return span.attributes.get(key)
 
 
 def test_one_on_event_receives_the_whole_tree() -> None:
-    """Every run's events reach the one on_event, the specialist's through no forwarding at all.
-
-    delegate constructs its sub-run with the same on_event, so three levels report to one consumer,
-    and the parent's total is the prefix fold over the registry: its own log plus the specialist's.
-    """
+    """One on_event receives every run's events."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
     asyncio.run(app.run())
@@ -150,13 +134,7 @@ def test_one_on_event_receives_the_whole_tree() -> None:
 
 
 def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() -> None:
-    """ToolProgress from search carries the dispatching run's path, the specialist's included.
-
-    One search function, no emitter parameter: each run's final() installed its own GuiEmitter, and
-    the dispatch task copied the context holding it, so the same function reports to whichever run
-    called it, and the specialist's progress is stamped with the specialist's path rather than its
-    parent's.
-    """
+    """ToolProgress carries the dispatching run's agent_path."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
     asyncio.run(app.run())
@@ -166,22 +144,13 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
 
 
 def test_reading_the_emitter_outside_a_run_raises_naming_what_to_install() -> None:
-    """current_gui_emitter outside a run's loop raises a LookupError that names the fix.
-
-    The compile-time guarantee threading gives is lost on an ambient value, so the accessor owes the
-    reader a message better than the default "no value", which names only a variable.
-    """
+    """current_gui_emitter outside a run raises a descriptive LookupError."""
     with pytest.raises(LookupError, match="inside a run's loop"):
         _ = current_gui_emitter()
 
 
 def test_sub_agent_span_nests_under_the_delegate_tool_span() -> None:
-    """The specialist's span parents to the delegate execute_tool span with no context plumbing.
-
-    The sub-run's final() runs in the frame delegate awaits in, which is the one the tool span is
-    current in, so the nesting is ordinary frame nesting; it is asserted rather than assumed because
-    moving final() behind a task created elsewhere would silently break it.
-    """
+    """The specialist span has the delegate tool span as its parent."""
     exporter = InMemorySpanExporter()
     app = _build_app("happy", exporter=exporter)
     asyncio.run(app.run())
@@ -194,7 +163,7 @@ def test_sub_agent_span_nests_under_the_delegate_tool_span() -> None:
 
 
 def test_the_agent_span_parents_its_own_generate_spans() -> None:
-    """A run's generate spans sit under its agent span, with the span opened the ordinary way."""
+    """A run's generate spans have its agent span as parent."""
     exporter = InMemorySpanExporter()
     app = _build_app("happy", exporter=exporter)
     asyncio.run(app.run())
@@ -206,12 +175,12 @@ def test_the_agent_span_parents_its_own_generate_spans() -> None:
         if _attribute(span, "gen_ai.operation.name") == "chat"
         and _parent_of(span, spans) is energy
     ]
-    # research_energy's script is two turns, so two generate calls belong to it.
+    # research_energy has two scripted turns.
     assert len(generate_spans) == 2
 
 
 def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
-    """generate_one_timeout_seconds ends one call; the run keeps its next turn."""
+    """A timed-out call is recorded before the next turn."""
     app = _build_app("call_timeout")
     asyncio.run(app.run())
     climate = app.runs["root/research_climate"]
@@ -221,13 +190,7 @@ def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -
 
 
 def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> None:
-    """Both researchers are mid-request when the app deadline fires; the turns before it survive.
-
-    The TaskGroup in App.run awaits every child's unwind before the cancellation propagates, and a
-    turn appends its record when it happens, so nothing stands between the except and the settled
-    totals. The two in-flight calls add nothing: a cancellation destroys the frame holding the
-    account, which differs from config.generate_one_timeout_seconds.
-    """
+    """The app deadline preserves settled turns and excludes in-flight calls."""
     app = _build_app("app_timeout")
     at_except: list[tuple[int, float]] = []
 
@@ -239,12 +202,12 @@ def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> 
             at_except.append((_timed_out_count(app), _total_cost(app)))
 
     asyncio.run(drive())
-    # Climate's first turn ($0.01 plus two searches at $0.002) and energy's ($0.01 plus one search).
+    # Climate spends $0.014, and energy spends $0.012.
     assert at_except == [(0, pytest.approx(0.026))]
 
 
 def test_a_cost_limit_rejects_unknown_cost() -> None:
-    """A NaN cost cannot pass a configured max_cost_in_usd."""
+    """max_cost_in_usd rejects NaN cost."""
     unknown_cost = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": math.nan})
     with pytest.raises(RuntimeError, match="cost_in_usd is NaN"):
         _check_cost_limit(unknown_cost, 1.0)
@@ -277,7 +240,7 @@ def test_tool_call_budget_uses_call_positions() -> None:
 
 
 def test_duplicate_tool_call_ids_are_rejected() -> None:
-    """Repeated ToolCall.id values cannot enter positional budget handling."""
+    """Positional budget handling rejects duplicate ToolCall.id values."""
     tool_calls = (
         ToolCall(id="duplicate", name="search", args_json='{"query":"one"}'),
         ToolCall(id="duplicate", name="search", args_json='{"query":"two"}'),
@@ -290,7 +253,7 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
     """Delegate propagates DispatchExceptionGroup from a sub-agent tool."""
 
     class BrokenSearchArgs(BaseModel):
-        """Arguments for the failing replacement search tool."""
+        """Define broken_search arguments."""
 
         query: str
 
@@ -335,7 +298,7 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
     """_settle_node propagates DispatchExceptionGroup."""
 
     class DefectRun(AgentRun):
-        """A run whose tool layer reports a defect."""
+        """Raise a tool function defect from run."""
 
         @override
         async def run(self) -> str:
@@ -407,11 +370,7 @@ def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
-    """A sub-agent failure is data for the parent model, and its spend stands.
-
-    The specialist's final() emits AgentFailed before re-raising, delegate catches the raise and
-    returns an is_error tool message, and the records written as the sub-run spent survive the unwind.
-    """
+    """A failed sub-agent returns an error ToolMessage and preserves its spend."""
     events: list[Event] = []
     app = _build_app("subagent_error", on_event=events.append)
     asyncio.run(app.run())
@@ -422,21 +381,16 @@ def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers(
         and isinstance(event, AgentFinished | AgentFailed)
     ]
     assert specialist_terminals == [AgentFailed]
-    # One turn at $0.01 and one search at $0.002 before the second turn raised; both records stand.
+    # One turn and one search cost $0.012 before the failure.
     assert app.runs["root/research_climate/specialist#0"].usage.cost_in_usd == pytest.approx(0.012)
     assert "root/research_climate" in app.answers
 
 
 def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
-    """Two delegate calls register two runs, at spawn indices #0 and #1.
-
-    An agent's name is not unique within a parent, so identity is per spawn: without the index the
-    second run would collide with the first in the registry, and a registry row is the run object
-    itself, which two spawns cannot share.
-    """
+    """Each delegate call registers a distinct spawn-indexed run."""
     tracer = TracerProvider().get_tracer("full_app.test")
     registry: dict[str, AgentRun] = {}
-    # Two text turns: the shared script serves both spawns, one send each.
+    # The shared script provides one turn to each spawn.
     llm = TracedLLM(
         build_llm({"specialist": [Turn(text="first"), Turn(text="second")]}),
         capture_message_content=False,
@@ -464,19 +418,14 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
 
 
 def test_a_second_run_under_one_agent_path_is_rejected() -> None:
-    """Registering a run under an already-registered path raises instead of replacing the row.
-
-    A registry row is one run held by reference, so a silent replacement would drop the first run's
-    turn_log records from every fold; the raise forces a spawner that reuses a name to disambiguate
-    the path, as delegate does with its spawn index.
-    """
+    """Registering a duplicate agent_path raises ValueError."""
 
     class NoOpRun(AgentRun):
-        """The smallest concrete run: registration is the behavior under test, so run() never runs."""
+        """Provide a concrete AgentRun for registration."""
 
         @override
         async def run(self) -> str:
-            """Return a constant; nothing in this test drives the run."""
+            """Return an unused constant."""
             return "unused"
 
     registry: dict[str, AgentRun] = {}

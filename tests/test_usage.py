@@ -1,9 +1,7 @@
-"""Usage: the input partition, the non-negativity guard, the cost total, and folding.
+"""Test Usage validation, totals, and sum_of.
 
-The three input counters are a disjoint partition, so input_tokens_total is their sum.
-Every counter is non-negative by validation.
-The cost fields carry no such constraint, because an unpriceable category stores NaN there.
-Usage.sum_of folds counters and per-category costs, and ZERO_USAGE totals an empty batch.
+Token counters are nonnegative.
+Cost fields accept NaN for unknown prices.
 """
 
 import math
@@ -67,11 +65,7 @@ def test_negative_counter_is_rejected() -> None:
 
 
 def test_nan_cost_is_stored() -> None:
-    """The cost fields carry no constraint, so an unpriceable response's NaN survives construction.
-
-    A non-negative constraint rejects NaN, which would fail the whole Usage
-    and take the paid response's output down with it.
-    """
+    """An unpriceable response's NaN survives construction."""
     usage = _usage(output=40, output_cost=float("nan"))
     assert math.isnan(usage.output_tokens_cost_in_usd)
     assert math.isnan(usage.cost_in_usd)

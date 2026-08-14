@@ -5,7 +5,7 @@ from langchaint.openai import OpenAI, OpenAIPricingTable, OpenAIRates
 
 
 async def price_at_negotiated_rates() -> Response[str]:
-    """Price a model id outside the catalog at contract rates, and read both billing scopes.
+    """Price an uncataloged model at contract rates.
 
     Raises:
         OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.

@@ -351,8 +351,7 @@ def test_deepseek_without_a_client_requires_the_deepseek_key(
 ) -> None:
     """Building without a client reads DEEPSEEK_API_KEY, raising when it is unset rather than falling back.
 
-    The SDK's own fallback reads OPENAI_API_KEY, which would silently send the OpenAI key to
-    api.deepseek.com.
+    The SDK fallback would send OPENAI_API_KEY to api.deepseek.com.
     """
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
@@ -420,12 +419,7 @@ def test_openai_bedrock_model_forwards_prompt_cache_options_support(*, supported
 def test_a_base_client_takes_the_stated_provider_name(
     build: Callable[[], Adapter], provider_name: str
 ) -> None:
-    """A base client carries no provider of its own, so the caller's value stands unchallenged.
-
-    This is how an OpenAI-compatible endpoint is labeled with the provider it actually reaches.
-    Mapping a base client class to its own provider would pass every other test here while
-    turning this construction into a ValueError, so the acceptance needs its own assertion.
-    """
+    """A base OpenAI client accepts the caller's provider_name."""
     assert build().provider_name == provider_name
 
 
@@ -747,9 +741,8 @@ def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
 def test_a_subclass_of_a_platform_client_raises_like_its_base() -> None:
     """Subclassing a platform client to add headers or auth is ordinary application code.
 
-    provider_name_by_client_class holds no base client class, which is what lets the lookup use
-    isinstance: matching by exact type instead would let this subclass through with "openai" and
-    file every Bedrock-served span under openai.
+    provider_name_by_client_class excludes base client classes.
+    isinstance identifies platform client subclasses.
     """
 
     class SigV4BedrockOpenAI(AsyncBedrockOpenAI):

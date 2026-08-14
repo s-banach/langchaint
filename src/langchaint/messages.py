@@ -1,10 +1,7 @@
 """Provider-neutral messages and content parts.
 
-Messages carry no provider knowledge;
-adapters convert a whole Sequence[Message] to wire shapes because conversion depends on the full sequence,
-not on one message at a time.
-The system prompt is a generate-method parameter, not a message type,
-because providers place it in different request locations.
+Adapters convert each complete `Sequence[Message]` to provider values.
+The system prompt remains a binding parameter because providers place it outside messages.
 """
 
 from collections.abc import Mapping, Sequence
@@ -16,14 +13,9 @@ from langchaint.checked_copy import CheckedCopyModel
 
 
 class TextPart(CheckedCopyModel):
-    """One text span of a message's content.
+    """One text span.
 
-    cache_breakpoint True marks the exact end of a reusable prompt prefix:
-    everything from the start of the request through this part is the span the provider may cache.
-    The adapters map it to anthropic's block-level cache_control and openai's part-level prompt_cache_breakpoint.
-    Only the latest marks become cache writes, so a Sequence[Message] that accrues one mark per turn
-    keeps working as it grows: each adapter's docstring states the per-request write limit and
-    whether the adapter or the API is what applies it.
+    `cache_breakpoint=True` ends a reusable prompt prefix after this part.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -89,30 +81,17 @@ class AudioPart(CheckedCopyModel):
 type ContentPart = Annotated[
     TextPart | ImagePart | ImageUrlPart | AudioPart, Field(discriminator="kind")
 ]
-"""One model-facing value inside message content.
-
-Convert a document before sending it, into one form picked by its content.
-Extract the text layer to TextPart where words carry the meaning; rasterize the pages to ImagePart where layout does.
-The application owns that conversion,
-so it picks the resolution, which pages to send, and the text extractor, and can measure what each choice costs.
-"""
+"""One model-facing text, image, image URL, or audio value."""
 
 type MessageContent = str | Sequence[ContentPart]
-"""A model-facing message body the model reads.
-This is the constructor-facing form a caller or tool provides;
-the pydantic message models store it as str | tuple[ContentPart, ...], coercing the sequence to a frozen tuple,
-so their fields spell that tuple form out rather than aliasing it.
-It is not the possibly-structured generation Response.output,
-which can be a parsed BaseModel that is not a ContentPart and never round-trips back into a message body.
-"""
+"""A model-facing string or sequence of `ContentPart` values."""
 
 
 class ToolCall(CheckedCopyModel):
     """One tool call requested by the model.
 
-    args_json is the raw argument JSON text before validation;
-    adapters whose provider delivers decoded arguments serialize them back to JSON
-    so every provider yields the same shape.
+    `args_json` holds argument JSON text before validation.
+    Adapters serialize decoded provider arguments to this shared form.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -124,19 +103,10 @@ class ToolCall(CheckedCopyModel):
 
 
 class UserMessage(CheckedCopyModel):
-    """One user turn; content is plain text or a tuple of parts.
-
-    kind discriminates the Message union,
-    so a persisted Sequence[Message] re-validates to the same message types by construction
-    instead of by variant order.
-
-    content is keyword-only, as on every model here; CheckedCopyModel's module docstring says why a
-    positional UserMessage("Hello") is rejected. A Sequence[Message] that is one user turn goes to
-    BoundLLM.generate_one as a bare string, which wraps it in a UserMessage.
+    """One user turn containing text or ordered `ContentPart` values.
 
     Raises:
-        pydantic.ValidationError: content is neither str nor a sequence of ContentPart values,
-            or a key that is not a field was passed.
+        pydantic.ValidationError: `content` is invalid or an unknown key is passed.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -146,33 +116,12 @@ class UserMessage(CheckedCopyModel):
 
 
 class ReasoningPart(CheckedCopyModel):
-    """One ReasoningPart the model produced, round-tripped verbatim.
+    """A provider reasoning value preserved for replay.
 
-    The core never inspects raw: raw is the producing SDK item's model_dump(exclude_none=True),
-    and the consuming adapter re-feeds it
-    to the wire unchanged so the provider reads it byte-identical (Anthropic rejects a modified
-    thinking block; OpenAI re-reads encrypted_content; Gemini requires thought signatures resent
-    exactly as received).
-    No provider reads another provider's ReasoningPart.raw.
-    Switching providers requires rebuilding turns without foreign ReasoningPart values.
-    each adapter's docstring states what its wire does with a foreign one.
-    Full reasoning history is the default; editing the Sequence[Message] is the only way to change it.
-    Trimming is the application's job.
-    Trimming for length removes whole turns.
-    A kept turn keeps its ReasoningPart values.
-    The anthropic API 400s a tool-use continuation missing the latest assistant turn's thinking.
-    Beyond replay correctness, keeping ReasoningPart values matters for quality
-    (a reasoning model that cannot see its prior reasoning across a tool loop re-derives or contradicts itself)
-    and for prompt caching:
-    reasoning sits inside the growing cached prefix, so cache hits need it present and byte-identical every turn.
-    The dict field makes this model unhashable; messages are never hashed.
-
-    text is the provider's readable text, assembled from text already inside raw
-    and adding nothing raw does not hold;
-    raw alone is what the adapter replays, so editing text changes what telemetry and an
-    application display and never changes the request.
-    None means no readable text came back.
-    No adapter stores the empty string, so text-free is the single condition text is None.
+    The producing adapter stores an SDK dump in `raw`; the same adapter replays it unchanged.
+    Rebuild turns before switching providers.
+    `text` contains readable reasoning for display and does not affect replay.
+    `text=None` means the provider returned no readable reasoning.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -220,22 +169,13 @@ def _text_only_turn(turn: object) -> object:
 
 
 class AssistantMessage(CheckedCopyModel):
-    """One assistant turn, stored as the ordered part sequence the provider emitted.
+    """One assistant turn stored in provider emission order.
 
-    Both providers emit and require the order (Anthropic cannot rearrange thinking blocks;
-    OpenAI replays output items in their original order under store=False),
-    so the one stored sequence is turn and text/tool_calls are filtered views of it.
-    A bare string turn is one TextPart, for hand-written turns such as few-shot examples.
-
-    turn is keyword-only, as on every model here.
+    `text` and `tool_calls` are filtered views of `turn`.
+    A bare string becomes one `TextPart`.
 
     Raises:
-        pydantic.ValidationError: a key that is not a field was passed,
-            or turn is neither str nor a sequence of TurnPart values,
-            or a TextPart in the turn sets cache_breakpoint
-            (openai has no breakpoint on assistant replay text,
-            so a marked assistant part would be a provider-divergent runtime failure;
-            mark the following user or tool message instead).
+        pydantic.ValidationError: `turn` has an invalid value or a `TextPart` sets `cache_breakpoint`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -303,18 +243,13 @@ _MESSAGES_JSON: TypeAdapter[list[Message]] = TypeAdapter(list[Message])
 
 
 def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) -> str:
-    """Serialize messages as JSON text that messages_from_json restores.
+    """Serialize messages for `messages_from_json`.
 
-    A release that breaks loading says so in its release notes.
-
-    The output is compact; pass indent (pydantic's dump_json indent) for text a human reads or diffs.
-    Each ReasoningPart.raw and each RawPart.raw is embedded as the mapping the adapter replays,
-    so a restored conversation builds the same wire request as the original;
-    the conformance suite asserts that per adapter.
+    `indent` formats the JSON for human readers.
+    `ReasoningPart.raw` and `RawPart.raw` remain embedded for replay.
 
     Raises:
-        pydantic_core.PydanticSerializationError: a ReasoningPart.raw or RawPart.raw value is
-            an object JSON cannot represent.
+        pydantic_core.PydanticSerializationError: A raw value cannot be serialized as JSON.
     """
     return _MESSAGES_JSON.dump_json(list(messages), indent=indent).decode()
 

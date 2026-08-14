@@ -1,21 +1,8 @@
-"""The invariants every adapter holds to, as a test class an adapter author inherits.
+"""The conformance test class for adapter implementations.
 
-Subclass AdapterConformance once per adapter and implement its fixture methods; pytest collects
-langchaint's own test methods against that adapter. The audience is adapter authors, so this module
-sits off the top-level __all__, on the same tier as langchaint.adapter.
-
-The inversion is forced: a test must supply an input, the input to an adapter is an SDK response
-object, and there is no neutral response every adapter accepts. langchaint supplies the assertions
-and the author supplies the fixtures.
-The assertions are plain assert statements, and the ones needing an event loop run through
-asyncio.run, so inheriting this suite pulls in nothing beyond the runner already collecting it.
-
-Every invariant here is public API: changing one changes what every third-party suite asserts.
-
-An adapter lacking a capability supplies a degenerate fixture rather than skipping. A provider with
-no prompt caching returns zero cache-write tokens from response_with_cache_writes, and the cache
-invariants run and pass, because zero counters cost zero at any rate. Skipping is what would let a
-divergence report green while covering less.
+Subclass `AdapterConformance` and implement its fixture methods.
+The inherited tests validate each neutral adapter invariant against SDK response objects.
+Return degenerate fixtures for unsupported capabilities so each invariant still runs.
 """
 
 import asyncio
@@ -94,8 +81,7 @@ def _costs_agree(actual: float, expected: float) -> bool:
 def _row_number(row: Mapping[str, RowValue], column: str) -> float:
     """Read one numeric cell of an attempts row.
 
-    Every column this suite reads is filled, because the rows come from a Billing rather than from
-    an attempt the provider reported nothing for.
+    This suite reads only rows backed by `Billing`, so each selected column is filled.
     """
     value = row[column]
     assert isinstance(value, int | float), f"{column} is {value!r}, not a number"
@@ -105,17 +91,16 @@ def _row_number(row: Mapping[str, RowValue], column: str) -> float:
 class AdapterConformance(ABC):
     """Subclass once per adapter; langchaint supplies every test method.
 
-    Name the subclass so pytest collects it (TestAnthropicMessagesConformance), put it in the
-    adapter's own test module, and implement the fixture methods below. Each returns a freshly built
-    value, so one test cannot see what another did to it.
+    Use a pytest-compatible name such as `TestAnthropicMessagesConformance`.
+    Put the subclass in the adapter test module and implement the fixture methods below.
+    Return a fresh value so tests cannot share mutations.
     """
 
     @abstractmethod
     def make_adapter(self) -> Adapter:
         """Build the adapter under test.
 
-        It holds a rate table for every tier the fixtures report except the one
-        response_at_an_unpriced_tier reports.
+        Include a rate table for every fixture tier except `response_at_an_unpriced_tier`.
         """
         ...
 
@@ -123,8 +108,7 @@ class AdapterConformance(ABC):
     def response_with_cache_writes(self) -> BaseModel:
         """Return an SDK response reporting nonzero counters in every category the provider bills.
 
-        A provider without prompt caching reports zero cache writes here; the cache invariants pass
-        on zero counters at any rate.
+        Report zero cache writes when the provider lacks prompt caching.
         """
         ...
 
@@ -137,8 +121,7 @@ class AdapterConformance(ABC):
     def response_at_an_unpriced_tier(self) -> BaseModel:
         """Return an SDK response reporting nonzero counters at a tier no table of make_adapter prices.
 
-        The counters must be nonzero, since a category billing nothing costs zero at any rate and
-        would say nothing about an unpriced one.
+        Use nonzero counters because zero tokens cost zero at every rate.
         """
         ...
 
@@ -146,8 +129,7 @@ class AdapterConformance(ABC):
     def response_with_impossible_counters(self) -> BaseModel:
         """Return an SDK response whose counters cannot be partitioned, leaving one negative.
 
-        Whatever shape that takes for the provider: a count below zero, or a cache count above the
-        input total it is a share of.
+        Use a negative count or a cache count above its input total.
         """
         ...
 
@@ -180,8 +162,8 @@ class AdapterConformance(ABC):
 
         The one fixture that is not an input: what an adapter puts on the wire has no neutral shape,
         so the author supplies the reader and langchaint supplies the comparison.
-        The request comes from a Sequence[Message] of one UserMessage followed by the assistant turn
-        under test, so everything the user message put on the wire is what to skip past.
+        The request contains one `UserMessage` before the tested assistant turn.
+        Skip the wire content produced by that `UserMessage`.
         """
         ...
 
@@ -189,8 +171,7 @@ class AdapterConformance(ABC):
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
         """Return one turn twice: as the type the SDK's stream assembles into, and whole.
 
-        The same turn in both shapes, so a difference between the two readings is the adapter's and
-        not the fixture's.
+        Both responses must represent the same turn.
         """
         ...
 
@@ -208,8 +189,8 @@ class AdapterConformance(ABC):
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
         """Every failure this adapter's parse maps, against the exact verdict it returns.
 
-        Cover at least one exception per verdict kind this adapter's parse can return, one carrying
-        a server-stated retry_after, and one status the provider's table does not list.
+        Cover each verdict kind that `parse` can return.
+        Include a server-stated `retry_after` and an unlisted status.
         """
         ...
 
@@ -243,9 +224,9 @@ class AdapterConformance(ABC):
     def test_each_cost_is_its_counter_times_the_price_stored_beside_it(self) -> None:
         """A Billing's costs and the prices stored beside them reproduce each other.
 
-        The price beside a cost is the price that produced it, blended where the provider wrote at
-        more than one cache TTL, so a stored row reproduces its own arithmetic without the rate
-        table that made it.
+        Each cost stores its source price.
+        Multiple cache TTL prices are blended.
+        A stored row reproduces its arithmetic without the original rate table.
         """
         for billing in self._billings():
             usage = billing.usage
@@ -275,8 +256,7 @@ class AdapterConformance(ABC):
     def test_counters_that_cannot_be_partitioned_raise_at_arrival(self) -> None:
         """A response whose counters leave one category negative fails where it arrives.
 
-        Usage's counters are non-negative by validation, so a defective response fails at arrival
-        rather than producing a wrong cost that reaches a caller as a number.
+        `Usage` rejects negative counters before a wrong cost reaches the caller.
         """
         raw = self.response_with_impossible_counters()
         bound_adapter = self._bound_adapter()
@@ -298,8 +278,7 @@ class AdapterConformance(ABC):
     def test_a_served_tier_the_adapter_holds_no_table_for_prices_nan(self) -> None:
         """Every price and the total cost are NaN at a tier no table prices.
 
-        Not zero and not a raise: the response was paid for, so an unknown cost must not read as a
-        free request and must not destroy the output.
+        NaN preserves paid output without reporting a free request.
         """
         billing = self._bound_adapter().billing_from_raw(self.response_at_an_unpriced_tier())
         assert math.isnan(billing.input_cache_none_usd_per_million_tokens)
@@ -311,8 +290,8 @@ class AdapterConformance(ABC):
     def test_reasoning_round_trips_verbatim_in_position(self) -> None:
         """The reasoning an adapter read off a turn goes back on the wire unchanged, where it sat.
 
-        A provider rejects a turn whose reasoning it cannot verify, and langchaint models nothing
-        inside that payload, so the only sound thing to send back is the bytes that arrived.
+        Providers can verify reasoning payloads.
+        langchaint therefore sends the received payload unchanged.
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
@@ -354,9 +333,8 @@ class AdapterConformance(ABC):
     def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
         """A restored turn puts the original parts on the wire.
 
-        This is what makes the round trip a persistence format: serialization must not lose or
-        reshape a raw payload the provider verifies, and every value this adapter puts in
-        ReasoningPart.raw must serialize, which is where a non-JSON-representable value fails.
+        Serialization must preserve provider-verified raw payloads.
+        Every `ReasoningPart.raw` value must be JSON-representable.
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
@@ -403,10 +381,9 @@ class AdapterConformance(ABC):
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.
 
-        A listed exception must take the classification the author states. Totality over the SDK's
-        own exception tree is not something an author-supplied mapping establishes, so the second
-        half asserts only that a bare Exception comes back as some classification rather than as a
-        raise: an adapter that cannot place an exception says unknown_exception.
+        Each listed exception must use its stated classification.
+        A bare `Exception` must return a classification without raising.
+        An adapter returns `unknown_exception` when it cannot classify an exception.
         """
         adapter = self.make_adapter()
         for error, classification in self.sdk_errors_and_classifications().items():
@@ -418,9 +395,8 @@ class AdapterConformance(ABC):
     def test_every_listed_failure_parses_and_an_unknown_one_still_does(self) -> None:
         """Every listed failure takes its stated verdict, and an unlisted one still gets one.
 
-        parse must return a verdict for every input without raising, statuses and error types the
-        provider adds later included: SharedBackoff turns a raise into ParserContractError, which
-        fails the request with no verdict at all.
+        `parse` must return a verdict for every input without raising.
+        `SharedBackoff` converts a raise into `ParserContractError`.
         """
         adapter = self.make_adapter()
         for failure, verdict in self.sdk_errors_and_verdicts().items():
@@ -433,9 +409,8 @@ class AdapterConformance(ABC):
     ) -> None:
         """failure_types entries are strict Exception subclasses, and TransientError is one.
 
-        TransientError is required because the retry loop raises it inside the admitted()
-        block for a billable response reporting a transient failure; an adapter without it would
-        leave those failures unrecorded.
+        The retry loop raises `TransientError` inside `admitted()` for a billable transient failure.
+        Including `TransientError` ensures those failures are recorded.
         """
         adapter = self.make_adapter()
         for failure_type in adapter.failure_types:
@@ -446,8 +421,7 @@ class AdapterConformance(ABC):
     def test_the_stream_assembled_type_reads_the_same_as_the_whole_response(self) -> None:
         """One turn read off the type a stream assembles into and off a whole response agree.
 
-        Both request paths go through interpret, so the two readings are the same turn or the
-        adapter reads one of the two shapes wrongly.
+        Both request paths use `interpret`, which must read both response shapes identically.
         """
         streamed, whole = self.streamed_and_whole()
         bound_adapter = self._bound_adapter()
@@ -459,8 +433,8 @@ class AdapterConformance(ABC):
     def test_a_stream_missing_its_terminal_event_raises(self) -> None:
         """Draining a stream whose turn never closed is a protocol violation, not an empty answer.
 
-        The events that arrived are not the turn, and presenting them as one would hand a caller a
-        truncated answer as if the model had finished.
+        Received events do not form a completed turn.
+        Returning them would present truncated output as complete.
         """
         stream = self.stream_without_its_terminal_event()
 
@@ -478,9 +452,8 @@ class AdapterConformance(ABC):
     def test_each_attempt_row_reproduces_its_cost_from_its_own_prices(self) -> None:
         """The archive's arithmetic closes without reaching back into any object.
 
-        The same claim as test_each_cost_is_its_counter_times_the_price_stored_beside_it, read at
-        the table boundary, because a row that dropped a price or paired it with the wrong counter
-        would satisfy the first and fail here.
+        This checks stored arithmetic at the table boundary.
+        It detects a missing price or a price paired with the wrong counter.
         """
         adapter = self.make_adapter()
         for billing in self._billings():

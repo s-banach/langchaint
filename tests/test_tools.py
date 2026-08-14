@@ -1,10 +1,4 @@
-"""PydanticTool.validate_and_run and ToolManager routing.
-
-The typed validate-then-call pair lives on PydanticTool; these tests pin the error contract:
-an invalid args_json becomes an is_error ToolMessage and a function returning a
-ToolOutputExplicit(is_error=True) carries that failure with its app_data,
-while every function exception (including a function-internal ValidationError) propagates as a user-code defect.
-"""
+"""Test tool validation, dispatch, app_data, and function errors."""
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
@@ -198,13 +192,7 @@ def test_validate_and_run_returns_the_function_result() -> None:
 
 
 def test_invalid_tool_args_holds_the_validation_error() -> None:
-    """The raised InvalidToolArgsError carries the live ValidationError, not just a string.
-
-    validation_error is a pydantic ValidationError whose errors() name the failing field,
-    so a caller can read the structured detail.
-    str(the error) is non-empty and names the field too,
-    which a dropped __str__ override (leaving super().__init__()'s empty message) would fail.
-    """
+    """InvalidToolArgsError preserves ValidationError and readable text."""
     with pytest.raises(InvalidToolArgsError) as caught:
         _ = asyncio.run(_echo_tool().validate_and_run('{"wrong": "key"}'))
     error = caught.value
@@ -214,12 +202,7 @@ def test_invalid_tool_args_holds_the_validation_error() -> None:
 
 
 def test_details_from_pydantic_and_renderer_format_per_field() -> None:
-    """The pydantic conversion keeps loc and msg, and the renderer emits a header then one path:msg line each.
-
-    A nested-object path renders dot-joined (to.0.email), a list-index path stringifies the int segment (to.1),
-    proving the str(segment) join rather than a bare ".".join(path) that would TypeError on the int.
-    type codes, documentation URLs, and echoed input never appear.
-    """
+    """Pydantic errors render neutral paths and messages."""
 
     class _Recipient(BaseModel):
         """One recipient with a required email."""
@@ -257,12 +240,7 @@ def test_details_from_pydantic_and_renderer_format_per_field() -> None:
 
 
 def test_render_invalid_tool_args_formats_neutral_details() -> None:
-    """One header line, then one dot-joined path: message line per detail, in input order.
-
-    The details are constructed literally in jsonschema's shapes rather than produced by a validator,
-    so this pins the renderer alone: the empty path is that library's shape for a missing required property
-    (the message names the field), and the message carries the offending value verbatim, rendered untouched.
-    """
+    """render_invalid_tool_args preserves detail order and paths."""
     details = [
         InvalidToolArgsDetail(path=(), message="'name' is a required property"),
         InvalidToolArgsDetail(path=("items", 0, "id"), message="'x' is not of type 'integer'"),
@@ -322,16 +300,7 @@ def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
 
 
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
-    """The PydanticTool path's content and details are exactly the conversion and rendering of the pydantic error.
-
-    Catching the InvalidToolArgsError from the same validate_and_run, converting its validation_error
-    through _details_from_pydantic, and rendering reproduces both fields, pinning that dispatch passes
-    the tool name and the converted details through to the renderer rather than formatting the string itself,
-    and that the stored details are the same conversion the content was rendered from.
-
-    The match reads result.details with no assert, cast, or type ignore, which pyrefly checks and
-    which is the point of giving invalid args their own variant.
-    """
+    """PydanticTool renders and stores converted validation details."""
     args_json = '{"wrong": "key"}'
     with pytest.raises(InvalidToolArgsError) as caught:
         _ = asyncio.run(_echo_tool().validate_and_run(args_json))
@@ -349,12 +318,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
 
 
 def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
-    """A name the manager does not hold is model-correctable data: a DispatchUnknownTool, no raise.
-
-    The variant carries called_name and a default is_error ToolMessage naming held_names,
-    so the loop survives a hallucinated name or a tool_call stranded by a rebind and the model can retry.
-    Matching the variant narrows called_name, read with no assert.
-    """
+    """An unknown tool name returns DispatchUnknownTool."""
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     assert isinstance(result, DispatchUnknownTool)
@@ -498,13 +462,7 @@ def test_dispatch_carries_app_data_on_the_error_outcome() -> None:
 
 
 def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> None:
-    """PydanticTool.dispatch returns DispatchHandled[AppDataT], so the read narrows to the concrete type.
-
-    Dispatching a known single tool keeps its own app_data type, so the local annotation cites:
-    _Cites | None typechecks (it would be a pyrefly error if app_data were the
-    heterogeneous BaseModel | Mapping[str, object] | None the manager surfaces),
-    and .citations reads with no isinstance narrowing the discriminator already guarantees.
-    """
+    """PydanticTool.dispatch preserves its app_data type."""
 
     async def _cited_function(args: _EchoArgs) -> ToolOutputExplicit[_Cites]:
         """Return content plus a pydantic app_data."""
@@ -527,11 +485,7 @@ def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> N
 
 
 def test_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
-    """PydanticTool.dispatch is the same validate-then-wrap as the manager: bad args are a DispatchInvalidToolArgs.
-
-    The manager delegates to PydanticTool.dispatch, so the argument-validation rendering must live here;
-    a bad payload comes back as the invalid-args variant holding the neutral details, not a raise.
-    """
+    """PydanticTool.dispatch returns DispatchInvalidToolArgs for bad arguments."""
     call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
     result = asyncio.run(_echo_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
@@ -563,12 +517,7 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
 
 
 def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
-    """A function that raises InvalidToolArgsError is a defect, not this call's argument failure.
-
-    The error is about a payload the function validated itself, so rendering it for the model would
-    report these arguments as invalid at paths naming no field of args_model, after the function had
-    already run and charged.
-    """
+    """A function-raised InvalidToolArgsError propagates as a defect."""
 
     async def _nested_validation_function(args: _EchoArgs) -> str:
         """Validate a payload of the function's own and fail on it.
@@ -602,10 +551,7 @@ def test_duplicate_tool_names_are_rejected() -> None:
 
 
 async def _weather_function(args: dict[str, object]) -> str:
-    """Read the parsed city argument and report it, with no pydantic model in sight.
-
-    Annotated dict[str, object], the declared parameter type of JSONSchemaTool.function and the typical user form.
-    """
+    """Return weather from parsed JSONSchemaTool arguments."""
     return f"sunny in {args['city']}"
 
 
@@ -620,11 +566,7 @@ def _weather_tool() -> JSONSchemaTool:
 
 
 def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> None:
-    """JSONSchemaTool.schema carries the args_schema by identity, not a model_json_schema derivation.
-
-    A pydantic tool derives its schema; a JSONSchemaTool already holds the JSON schema the provider wants, so the wire
-    schema must be the exact object passed in (an MCP inputSchema), byte-for-byte, with no reshaping.
-    """
+    """JSONSchemaTool.schema preserves args_schema by identity."""
     schema = _weather_tool().schema()
     assert schema.name == "weather"
     assert schema.description == "Report the weather."
@@ -632,14 +574,7 @@ def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> No
 
 
 def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> None:
-    """An out-of-schema argument object becomes a DispatchInvalidToolArgs built from jsonschema's own errors.
-
-    The payload violates the schema twice (city missing, town unexpected); details is exactly the
-    absolute_path/message mapping of iter_errors and the content is render_invalid_tool_args of it,
-    so the JSONSchemaTool failure lands in the same variant through the same formatter as a PydanticTool failure.
-    Draft202012Validator pins the default draft: _WEATHER_SCHEMA carries no $schema key,
-    so dispatch must validate under Draft 2020-12.
-    """
+    """Schema violations return converted jsonschema errors."""
     call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo"}')
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
@@ -692,13 +627,7 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     ids=["schema_violation", "non_object_json", "malformed_json"],
 )
 def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_json: str) -> None:
-    """Each args_json a JSONSchemaTool rejects becomes the invalid-args variant, and the function never runs.
-
-    A scalar payload cannot be a tool's arguments and a truncated one cannot be decoded, so neither
-    reaches jsonschema; a decoded object that violates the schema is what jsonschema itself rejects.
-    All three come back holding the neutral details, symmetric with the pydantic tool, so the loop
-    and the model can recover rather than meeting a propagating exception.
-    """
+    """Bad JSONSchemaTool arguments return DispatchInvalidToolArgs without execution."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
     result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json=args_json)))
@@ -711,12 +640,7 @@ def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_
 
 
 def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None:
-    """An args_schema jsonschema cannot interpret raises jsonschema's own exception from dispatch, no variant.
-
-    "strng" is not a JSON Schema type, so validation can never mean anything; the raise propagates as a
-    user-code defect like a function exception, rather than becoming a DispatchInvalidToolArgs that would
-    blame the model for arguments it got right.
-    """
+    """An invalid args_schema raises jsonschema's exception."""
     tool = JSONSchemaTool(
         name="bad",
         description="Malformed schema.",
@@ -728,11 +652,7 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
-    """A JSONSchemaTool function returning a ToolOutputExplicit rides its app_data through, the MCP result channel.
-
-    dispatch returns DispatchHandled[AppDataT], so the local annotation on the read typechecks with
-    no isinstance: dispatching the tool directly, rather than through a manager, keeps its own app_data type.
-    """
+    """JSONSchemaTool.dispatch preserves ToolOutputExplicit app_data type."""
     raw_result = {"forecast": ["sunny"], "source": "mcp"}
 
     async def _mcp_function(
@@ -762,8 +682,7 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
 def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
     """One ToolManager routes to a PydanticTool and a JSONSchemaTool side by side.
 
-    schemas() emits both wire schemas and dispatch reaches each tool, proving Tool lets the manager hold
-    the two forms together without either being a special case.
+    ToolManager emits and dispatches both tool forms uniformly.
     """
     manager = ToolManager([_echo_tool(), _weather_tool()])
     names = {schema.name for schema in manager.schemas()}
@@ -801,12 +720,7 @@ def _raiser_tool() -> PydanticTool[_EchoArgs]:
 
 
 def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
-    """dispatch_many starts every call before any finishes, and orders outcomes by call position.
-
-    The first call's function blocks on an event only the second call's function sets:
-    sequential dispatch would never set it, so finishing inside the wait_for timeout proves concurrency,
-    and the first outcome still belongs to the first call although it completed last.
-    """
+    """dispatch_many runs calls concurrently and preserves call order."""
 
     async def _run() -> tuple[DispatchManyOutcome, ...]:
         gate = asyncio.Event()
@@ -881,11 +795,7 @@ def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
 
 
 def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None:
-    """A call precomputed answers is not dispatched: its ToolMessage rides a DispatchPrecomputed at the call's index.
-
-    The middle call is answered, its neighbors dispatch normally (precomputed returned None for them),
-    and the supplied ToolMessage arrives by reference, so the application appends exactly what it wrote.
-    """
+    """Precomputed preserves ToolMessage identity and call order without dispatch."""
     supplied_message = ToolMessage(
         tool_call_id="c2", content="skipped: duplicate call", is_error=True
     )
@@ -913,11 +823,7 @@ def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None
 
 
 def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> None:
-    """A supplied ToolMessage whose tool_call_id is not its call's id is a defect: ValueError, no tool ran.
-
-    The first call is left to dispatch and the mismatch sits on the second,
-    so the ValueError fires from a batch that mixes both precomputed answers.
-    """
+    """Precomputed rejects a mismatched tool_call_id before dispatch."""
     tool_calls = [
         ToolCall(id="c1", name="echo", args_json='{"text": "a"}'),
         ToolCall(id="c2", name="echo", args_json='{"text": "b"}'),
@@ -983,14 +889,7 @@ def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
 
 
 def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
-    """A raising function does not interrupt a sibling: the settled sibling's outcome and app_data survive.
-
-    The raiser fails immediately while the sibling yields to the event loop twice before returning,
-    so an implementation that raised on the first failure (or cancelled siblings, as a TaskGroup would)
-    would leave completed_outcomes without the sibling.
-    The sibling's app_data is the user story: a record of money the completed call spent
-    must reach the application although the batch raised.
-    """
+    """DispatchExceptionGroup preserves settled sibling outcomes and app_data."""
     receipt = _Receipt(record_id="rec-7")
 
     async def _spender_function(args: _EchoArgs) -> ToolOutputExplicit[_Receipt]:
@@ -1040,8 +939,7 @@ def test_dispatch_many_collects_every_defect_in_call_order() -> None:
 def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes() -> None:
     """except* catches the group, and the derived subgroup still carries completed_outcomes.
 
-    except* builds the caught subgroup through derive; a derive that fell back to the base ExceptionGroup
-    would drop completed_outcomes, so the subgroup's field is asserted against the settled call.
+    derive preserves completed_outcomes on an except* subgroup.
     """
     tool_calls = [
         ToolCall(id="c1", name="raiser", args_json='{"text": "a"}'),
@@ -1060,12 +958,7 @@ def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes(
 
 
 def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
-    """A CancelledError a sibling function produces on its own re-raises bare, never grouped.
-
-    ExceptionGroup rejects a BaseException that is not an Exception, so an implementation that fed
-    the gathered results to DispatchExceptionGroup unchecked would raise TypeError here instead,
-    and grouping the CancelledError would swallow cancellation.
-    """
+    """A tool-raised CancelledError propagates without grouping."""
 
     async def _self_cancelling_function(args: _EchoArgs) -> str:
         """Produce a CancelledError without anyone cancelling the enclosing task.
@@ -1095,8 +988,7 @@ def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
 def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
     """Defects co-occurring with a sibling's CancelledError chain as its __cause__, not vanish.
 
-    Cancellation wins the raise, but the sibling defect and the settled sibling's outcome
-    ride on the chained DispatchExceptionGroup, so neither is lost to the winning re-raise.
+    Cancellation chains sibling defects and settled outcomes in DispatchExceptionGroup.
     """
 
     async def _self_cancelling_function(args: _EchoArgs) -> str:
@@ -1131,13 +1023,7 @@ def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
 
 
 def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
-    """Cancelling the enclosing task cancels the in-flight dispatches and re-raises only after they unwind.
-
-    Both functions hang on never-set events with a finally recording the unwind;
-    when the awaited dispatch_many task re-raises CancelledError, both finally blocks must already have run,
-    which a bare gather (which cancels its children without awaiting them) would fail.
-    Nothing lands in a DispatchExceptionGroup: cancellation propagates bare.
-    """
+    """dispatch_many waits for sibling cancellation before propagating CancelledError."""
     unwound: list[str] = []
 
     async def _hanging_function(args: _EchoArgs) -> str:
@@ -1210,12 +1096,7 @@ def test_capture_tool_schema_converts_name_description_and_args_schema() -> None
 def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
     build_tool: Callable[[], CaptureTool[_CapturedAnswer]], expected_acknowledgement: str
 ) -> None:
-    """A valid call returns DispatchCaptured: the acknowledgement tool_message plus the typed instance.
-
-    Matching the variant reads captured.answer directly, with no None guard and no isinstance beyond the variant match;
-    pyrefly checks that this typechecks, which is the point of the required field.
-    A CaptureTool built without an acknowledgement answers "Acknowledged".
-    """
+    """A valid CaptureTool call returns typed output and acknowledgement."""
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
     outcome = asyncio.run(build_tool().capture(call))
     assert isinstance(outcome, DispatchCaptured)
@@ -1261,13 +1142,7 @@ def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant()
 
 
 def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
-    """A manager-routed call is answered like any tool's: DispatchHandled with the capture as app_data.
-
-    A CaptureTool sits in a ToolManager beside a function-bearing form, the mix that motivates dispatch existing,
-    so bind sends its schema with the rest;
-    a call routed there instead of through capture still validates and acknowledges,
-    with the instance on the erased app_data channel.
-    """
+    """ToolManager dispatches CaptureTool to DispatchHandled with captured app_data."""
     manager = ToolManager([_echo_tool(), _answer_capture_tool()])
     assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')

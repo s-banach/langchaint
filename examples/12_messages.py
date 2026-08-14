@@ -13,7 +13,7 @@ from langchaint import (
 
 
 def serialize_messages() -> str:
-    """Serialize messages and verify their restored values."""
+    """Serialize messages and verify the round trip."""
     messages: list[Message] = [
         UserMessage(
             content=[

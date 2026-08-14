@@ -1,8 +1,7 @@
-"""The deepseek backend provides `DeepSeek`, its model catalog, and pricing.
+"""Construct DeepSeek `LLM` values with cataloged pricing.
 
 Importing this subpackage requires `openai`.
 DeepSeek serves Chat Completions at https://api.deepseek.com.
-`DeepSeek` configures `AsyncOpenAI` for that endpoint.
 
 Prices use USD per one million tokens.
 Source: https://api-docs.deepseek.com/quick_start/pricing, read 2026-08-03.
@@ -66,15 +65,11 @@ _API_KEY_ENVIRONMENT_VARIABLE = "DEEPSEEK_API_KEY"
 
 
 def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
-    """Return DeepSeek's `prompt_cache_hit_tokens` value, or zero when absent.
+    """Return `prompt_cache_hit_tokens` from `CompletionUsage.model_extra`, or zero when absent.
 
-    DeepSeek documents cache-hit and cache-miss counters.
-    Their sum equals `prompt_tokens`.
+    DeepSeek documents that cache-hit and cache-miss counters sum to `prompt_tokens`.
     Source: https://api-docs.deepseek.com/guides/kv_cache, read 2026-08-03.
-    `CompletionUsage` models neither counter in openai 2.53.0.
-    The SDK therefore stores both counters in `model_extra`.
-    `DeepSeek.model` passes this as `cache_read_tokens_from_usage`.
-    Missing this reader prices cache hits as cache misses.
+    `CompletionUsage` omits both counters in openai 2.53.0.
     """
     extra = usage.model_extra
     if extra is None:

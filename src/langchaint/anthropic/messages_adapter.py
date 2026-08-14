@@ -1,74 +1,53 @@
-"""Adapter for the Anthropic Messages API over the official SDK.
+"""Implement the Anthropic Messages API through the official anthropic SDK.
 
-Verified against anthropic 0.120.0:
-- A structured binding sends `output_config.format` built as
-  `{"schema": transform_schema(TypeAdapter(Model).json_schema()), "type": "json_schema"}`,
-  the same `output_config` `messages.parse(output_format=Model)` builds, and validates the response
-  text itself. The SDK validates inside `parse` and inside the stream's `content_block_stop`
-  handling, one event before the final `output_tokens` and the cache counters arrive, so a rejection
-  raised there reaches langchaint with neither the message nor its billing attached.
-- `messages.stream(...)` returns a manager whose entered stream assembles deltas into a message
-  snapshot; `get_final_message()` returns it.
-- `Usage.cache_creation` splits cache writes into `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`,
-  which bill at different rates.
+The following SDK facts were verified against anthropic 0.120.0.
+A structured binding sends the same `output_config.format` as `messages.parse(output_format=Model)`.
+Its schema uses `transform_schema(TypeAdapter(Model).json_schema())` and type `"json_schema"`.
+The adapter validates response text after the SDK exposes the complete message and billing.
+SDK parsing may reject text before final output and cache counters arrive.
+`messages.stream` assembles deltas, and `get_final_message()` returns the message.
+The SDK reports no all-inclusive input total.
 
-`Usage.input_tokens` excludes cache reads and writes, so the three langchaint counters map directly
-and no all-inclusive provider total exists to cross-check. That one is verified by docs rather than
-by introspection: the SDK documents no relationship among the input counters,
-so `_billing_from_sdk_usage` carries the page that does.
+The API requires an unchanged replay of the latest assistant turn's thinking during tool use.
+The API filters earlier thinking blocks.
+The API rejects consecutive thinking blocks outside their original order.
+The adapter replays every `ReasoningPart` in turn order.
 
-Reasoning replay, verified by docs and live runs because it is request-time behavior SDK introspection cannot show:
-the API 400s a tool-use continuation unless the latest assistant turn's thinking blocks are re-sent unmodified.
-It filters prior thinking blocks itself.
-Therefore, re-emitting every ReasoningPart value is safe.
-It rejects consecutive thinking blocks re-sent out of their emission order, which turn order preserves.
+`automatic_cache_breakpoints=True` marks the frozen prefix and the last message block.
+The frozen prefix ends at the system prompt or at the last tool when no system prompt exists.
+`automatic_cache_breakpoints=False` adds no automatic marker.
+The adapter never sends top-level automatic `cache_control` because Bedrock does not support it.
+A marked user part adds `cache_control` to its text or image block.
+A marked final `ToolMessage` part adds `cache_control` to its enclosing `tool_result` block.
+A marked non-final `ToolMessage` part returns `InvalidRequest` because the boundary would move.
+A parts `system_prompt` produces one system block per part and preserves marked boundaries.
 
-`automatic_cache_breakpoints`: with `automatic_cache_breakpoints=True`,
-the bound adapter puts one `cache_control` marker at the end of the frozen prefix (the system prompt,
-or the last tool when no system prompt is bound) at bind time, and one on the last block of each request's messages,
-so the cached span grows with the Sequence[Message].
-With `automatic_cache_breakpoints=False`, the adapter writes no marker of its own.
-The adapter never sends the API's top-level automatic cache_control request parameter:
-it is unavailable on Bedrock, which this adapter also serves.
-A part with cache_breakpoint True adds a marker under either binding: on the part's own text or image block
-in a user message, and on the enclosing tool_result block for the last part of a ToolMessage
-(the API documents cache_control on the tool_result block itself; a marked part that is not
-the message's last would silently move the boundary to the block's end, so it is rejected instead).
-A system_prompt bound as parts renders one system block per part, marked parts carrying cache_control,
-so a breakpoint can sit inside the frozen prefix (stable instructions marked, semi-stable context after).
-The API allows at most 4 cache_control markers per request.
-The SDK documents no such limit, so the source is the provider's prompt-caching page, read 2026-07-25:
-https://platform.claude.com/docs/en/build-with-claude/prompt-caching
-message_mark_budget is what the limit leaves after the binding's own markers.
-Those are the system parts with cache_breakpoint set, plus whichever markers automatic_cache_breakpoints adds.
-A binding whose own markers exceed the limit fails at bind with ValueError.
-Where more message parts carry cache_breakpoint than that budget allows, the latest ones get markers.
-Older ones go unmarked, mirroring openai's documented latest-N rule.
-A Sequence[Message] accruing one cache_breakpoint per turn therefore keeps working.
-Every marker carries the adapter's cache_ttl ("5m" by default, omitting the ttl key since it is the API default;
-"1h" writes ttl "1h", whose writes bill at each table's cache_write_1h_usd_per_million_tokens).
+The API accepts at most four `cache_control` markers per request.
+Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-07-25.
+System marks and automatic marks reduce `message_mark_budget`.
+Binding fails with `ValueError` when its marks exceed the limit.
+The adapter marks only the latest message parts that fit `message_mark_budget`.
+Each marker uses `cache_ttl`.
+The default `"5m"` omits the API-default `ttl` key.
+`"1h"` sends `ttl="1h"` and uses `cache_write_1h_usd_per_million_tokens`.
 
-ContentPart mappings verified against anthropic 0.121.0:
+Content mappings were verified against anthropic 0.121.0.
 - `ImagePart` becomes `Base64ImageSourceParam`.
 - `ImageUrlPart` becomes `URLImageSourceParam`.
-- `AudioPart` returns `InvalidRequest` for `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `InvalidRequest` inside `UserMessage` and `ToolMessage`.
+- `Usage.server_tool_use` reports web-search invocation counts.
 
-Server-tool counters were verified against anthropic 0.121.0.
-Web-search invocation counts appear in `Usage.server_tool_use`.
-
-Mapping decisions:
-- ToolMessage becomes a `tool_result` block inside a user message;
-  consecutive tool results group into one user message because the API requires alternating roles.
-- `stop_reason` maps end_turn/tool_use/max_tokens/refusal to themselves and every other value to "other".
-- `reasoning_effort` maps to `output_config.effort` plus `thinking={"type": "adaptive"}`:
-  effort steers reasoning depth only under adaptive thinking (request-time behavior SDK introspection cannot show),
-  so the adapter sends the pair together and never one alone.
-  The value passes through as given, wider than the SDK's effort literal
-  (ReasoningEffort is the union of both providers' vocabularies, and openai's "none"/"minimal" are outside it),
-  and a model or value the API rejects surfaces as the provider's own error.
-  `thinking.display` is never sent: it takes `"summarized"` or `"omitted"` and chooses whether thinking
-  text is returned or redacted, and the SDK documents the default as `"summarized"`, which returns it,
-  so the adapter leaves the default in place rather than opting into redaction.
+Request and response mappings:
+- `ToolMessage` becomes `tool_result` inside a user message.
+- Consecutive `ToolMessage` values share one user message because the API requires alternating roles.
+- `end_turn`, `tool_use`, `max_tokens`, and `refusal` preserve their `stop_reason` values.
+- Other `stop_reason` values map to `"other"`.
+- `reasoning_effort` sends `output_config.effort` with `thinking={"type": "adaptive"}`.
+- The adapter sends neither field alone because effort applies only to adaptive thinking.
+- `ReasoningEffort` accepts values wider than the SDK literal and sends each value unchanged.
+- The provider reports unsupported values through its own error.
+- The adapter never sends `thinking.display`.
+- The SDK default `"summarized"` returns thinking text, while `"omitted"` redacts it.
 """
 
 import base64
@@ -274,11 +253,10 @@ class AnthropicRates:
     ) -> Billing:
         """Price one response's counters, the two cache-write TTLs each at their own rate.
 
-        The two write counts arrive apart and leave together: Usage.input_tokens_cache_write is
-        their sum, and input_tokens_cache_write_cost_in_usd is the sum of what each cost.
-        The Billing reports one cache-write price, the blend the two TTLs actually billed at, so
-        the write counter times that price reproduces the write cost. Where nothing was written it
-        is the 5-minute rate, Anthropic's own default TTL for a cache_control marker.
+        `Usage.input_tokens_cache_write` sums both write counters.
+        `input_tokens_cache_write_cost_in_usd` sums both write costs.
+        The reported cache-write price blends the rates to reproduce that cost.
+        Zero writes use Anthropic's default five-minute rate.
 
         Raises:
             pydantic.ValidationError: a counter is negative.
@@ -546,10 +524,8 @@ class _AnthropicRequestParams(RequestParams):
 class _NotSendableError(Exception):
     """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
 
-    Never leaves this module: _request_messages turns it into the InvalidRequest that build_request
-    returns. It exists because a Sequence[Message] is found unsendable several frames below
-    build_request, in per-part converters whose callers would each have to thread a union outward
-    otherwise.
+    `_request_messages` converts it to the `InvalidRequest` returned by `build_request`.
+    Per-part converters raise it when a `Sequence[Message]` is unsendable.
     """
 
     def __init__(self, reason: str) -> None:
@@ -638,21 +614,13 @@ def _tool_result_content(
 
 
 def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
-    """Copy one stored SDK dump into the wire block it came from, unread and unchanged.
+    """Copy a stored SDK block without reading or changing its fields.
 
-    The dict is the producing SDK block's model_dump; when this adapter produced it, its shape is
-    the wire param's by construction, so the cast holds. A dump another provider produced is not
-    this shape; where it names a type key it is passed through unchanged, never dropped or
-    neutralized here (trimming is the app's job), and left to the API. Reconstructing it field by
-    field would risk the exact byte-level change replay cannot tolerate.
-    The shallow copy keeps the wire path (which mutates blocks to place cache breakpoints) from
-    ever writing into the frozen message's stored payload.
+    The copy prevents cache-marker writes from changing the stored block.
+    A block from another provider passes through when it has a `type` key.
 
     Raises:
-        _NotSendableError: raw names no type key. Every content block param is discriminated by that
-            key (anthropic 0.120.2), so a dump without one is no block, and the wire path reads it
-            to place `automatic_cache_breakpoints`. build_request reports the whole
-            request unsendable and the item fails on its own.
+        _NotSendableError: `raw` lacks the `type` key required by anthropic 0.120.2 block parameters.
     """
     if "type" not in raw:
         raise _NotSendableError(
@@ -666,17 +634,13 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
     """Convert one AssistantMessage to wire blocks in turn order.
 
-    ReasoningPart.raw and RawPart.raw go to the wire unchanged, routed by their own
-    type key: langchaint models nothing inside either dump, and the API rejects a tool-use
-    continuation whose latest thinking block was modified.
-    A dump another provider produced goes to the wire the same way and the API rejects its
-    unknown type key, so a Sequence[Message] replayed through the wrong provider fails loudly;
-    one naming no type key at all does not reach the wire (from _replayed_block).
-    An empty TextPart is skipped because the API rejects empty text blocks.
+    `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
+    The API rejects modified thinking blocks and unknown `type` values.
+    Empty `TextPart` values are omitted because the API rejects them.
 
     Raises:
-        json.JSONDecodeError: a tool_call.args_json is not valid JSON.
-        _NotSendableError: a stored payload names no type key (from _replayed_block).
+        json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
+        _NotSendableError: A stored block lacks a `type` key.
     """
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.turn:
@@ -698,16 +662,10 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
 
 
 def _tool_message_is_marked(tool_message: ToolMessage) -> bool:
-    """Whether the tool message's last part sets cache_breakpoint, marking the enclosing tool_result block.
-
-    The marker goes on the tool_result block itself, the placement the API documents;
-    for the message's last part that is equivalent, because the block's span ends where that part ends.
+    """Return whether the last part marks the enclosing `tool_result` block.
 
     Raises:
-        _NotSendableError: a part other than the message's last sets cache_breakpoint.
-            The API accepts such a request, and the enclosing block's marker silently moves the
-            boundary to the block's end, so the wire form would not mean what the message says;
-            build_request returns InvalidRequest and the item fails on its own.
+        _NotSendableError: A non-final part sets `cache_breakpoint` because the API marks the block end.
     """
     if isinstance(tool_message.content, str):
         return False
@@ -731,25 +689,15 @@ def _wire_messages(
     cache_ttl: CacheTTL,
     message_mark_budget: int,
 ) -> list[MessageParam]:
-    """Convert messages to wire messages.
+    """Convert messages and apply the permitted cache markers.
 
-    With automatic_cache_breakpoints, places the per-request cache breakpoint on the last content block,
-    so the cached span grows with messages.
-    A thinking or redacted_thinking last block gets no breakpoint (its wire param has no cache_control key),
-    so that request writes none.
-    Every other block param names cache_control (anthropic 0.120.2), the ones langchaint models
-    nothing inside among them.
-    A part with cache_breakpoint marks its own block in a user message
-    and the enclosing tool_result block in a tool message;
-    the latest marks up to message_mark_budget are written and older ones left unwritten.
-    message_mark_budget is what the binding's markers leave of the request limit,
-    computed once in _precompute_fields; at 0, every mark goes unwritten.
+    `automatic_cache_breakpoints` marks the last block unless it is a thinking block.
+    A user part marks its own block, while a tool part marks its enclosing `tool_result`.
+    The latest marks up to `message_mark_budget` are sent.
 
     Raises:
-        _NotSendableError: A ContentPart lacks a wire form.
-            A ContentPart inside ToolMessage may set cache_breakpoint before the final index.
-            ReasoningPart.raw or RawPart.raw may omit type.
-        json.JSONDecodeError: a tool_call.args_json is not valid JSON (from _assistant_content_blocks).
+        _NotSendableError: A `ContentPart` lacks a wire form, a non-final tool part is marked, or raw lacks `type`.
+        json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
     """
     wire: list[tuple[Literal["user", "assistant"], list[_ContentBlockParam]]] = []
     pending_tool_results: list[_ContentBlockParam] = []
@@ -873,15 +821,7 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
 def _unfinished_turn_or_none(
     message: anthropic.types.Message, *, assistant_message: AssistantMessage
 ) -> UnfinishedTurn | None:
-    """Report a 200 that is not a finished turn, or None when the turn finished.
-
-    Continuing an unfinished turn means sending its content back for the provider to resume, which
-    this adapter does not do, so returning that content as the result would be silently wrong data.
-    Two known cases reach this. "pause_turn" pauses a turn for the caller to continue, which the API
-    emits for server-side tool execution this adapter never requests. A null stop reason is the
-    in-progress state of a message that is not finished. A stop reason outside the SDK's literal
-    lands here too, because a value this adapter cannot place is one it cannot call finished.
-    """
+    """Return `UnfinishedTurn` for `pause_turn`, a null stop reason, or an unknown stop reason."""
     stop_reason = message.stop_reason
     if stop_reason in (
         "end_turn",
@@ -901,12 +841,11 @@ def _unfinished_turn_or_none(
 def _as_message(raw: BaseModel) -> anthropic.types.Message:
     """Narrow a raw response to the SDK message this adapter produces.
 
-    The BoundAdapter methods that read a response take BaseModel, because BoundLLM holds them and
-    the neutral core imports no SDK. Every value reaching them came from this adapter's own stream,
-    so another type is a defect in langchaint and not a provider behavior.
+    `BoundAdapter` accepts `BaseModel` because the neutral core imports no SDK.
+    This adapter's stream produces every valid value.
 
     Raises:
-        TypeError: raw is not an anthropic Message.
+        TypeError: `raw` is not an anthropic `Message`.
     """
     if not isinstance(raw, anthropic.types.Message):
         raise TypeError(f"expected an anthropic Message, got {type(raw).__name__}")
@@ -916,9 +855,8 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
 def _first_text_block_text(message: anthropic.types.Message) -> str | None:
     """Return the text of the turn's first text block, None when the turn holds none.
 
-    The block a structured turn's instance is validated from. Reading the first block matches what
-    the SDK's own parse yields for every message it does not raise on: it validates every text block
-    and returns the first instance, so a message whose first block is not the instance raises there.
+    Structured output validation uses this block.
+    SDK parsing validates every text block and returns the first instance.
     """
     for block in message.content:
         if block.type == "text":
@@ -927,15 +865,11 @@ def _first_text_block_text(message: anthropic.types.Message) -> str | None:
 
 
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
-    """Build the langchaint assistant turn from the SDK message, block order preserved.
+    """Build `AssistantMessage` from SDK blocks in order.
 
-    A thinking or redacted_thinking block becomes a ReasoningPart carrying the block's own
-    model_dump for verbatim replay.
-    The two reasoning block types get a branch each because only thinking carries readable text:
-    a redacted_thinking block holds an opaque string under data and nothing a reader can display,
-    so ReasoningPart.text is None.
-    Every other block, a server tool call and its result among them, becomes a RawPart
-    holding its own model_dump, so the turn carries what the response was billed for.
+    Thinking blocks become replayable `ReasoningPart` values.
+    Redacted thinking has `text=None`.
+    Unmodeled blocks become replayable `RawPart` values.
     """
     turn: list[TurnPart] = []
     for block in message.content:
@@ -962,8 +896,7 @@ def _priced_tier(
 ) -> _AnthropicReportedServiceTier:
     """Normalize a missing reported tier to `standard`.
 
-    A response reporting no tier prices at the standard rates, which is what a Bedrock response
-    needs: the field is unlikely to be populated there and Anthropic's service tiers do not apply.
+    Bedrock responses need this default because Anthropic service tiers do not apply.
     """
     return service_tier if service_tier is not None else _STANDARD_TIER
 
@@ -975,21 +908,17 @@ def _billing_from_sdk_usage(
     provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
     billing_complete: bool = True,
 ) -> Billing:
-    """Price counters using reported response metadata.
+    """Price SDK counters by the reported service tier.
 
-    `usage.input_tokens` excludes cache reads and writes, so it is exactly the uncached-input counter.
-    The SDK documents no relationship among the input counters, so the source is the provider's
-    prompt-caching page, which gives the total as
-    cache_read_input_tokens + cache_creation_input_tokens + input_tokens, read 2026-07-25:
-    https://platform.claude.com/docs/en/build-with-claude/prompt-caching
-    output_tokens_details is optional on the SDK Usage.
-
-    usage.cache_creation splits the writes into 5-minute and 1-hour tokens, and one response can
-    report both nonzero; when it is absent, cache_creation_input_tokens is read as 5-minute writes.
+    `usage.input_tokens` excludes cache reads and writes.
+    Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-07-25.
+    `usage.cache_creation` separates five-minute and one-hour writes.
+    Missing `usage.cache_creation` makes `cache_creation_input_tokens` five-minute writes.
+    `usage.output_tokens_details` is optional.
 
     Raises:
-        pydantic.ValidationError: a reported counter is negative, so the priced Usage rejects it.
-        ValueError: a provider-executed request counter is boolean or negative.
+        pydantic.ValidationError: A reported token counter is negative.
+        ValueError: A provider-executed request counter is boolean or negative.
     """
     output_tokens_details = usage.output_tokens_details
     input_tokens_cache_write_5m = usage.cache_creation_input_tokens or 0
@@ -1055,8 +984,7 @@ def parse_anthropic(failure: Exception) -> Verdict:
     _verdict_from_anthropic_tables reads the status and the error type.
     On every status but 200 the provider's own x-should-retry directive then overrides that verdict,
     through verdict_under_retry_directive, which states the rule.
-    A status 200 is a mid-stream error event raised on a response the provider accepted, so its
-    headers say nothing about this failure and the tables' verdict stands.
+    Status 200 identifies a mid-stream error, so its headers do not override the table verdict.
     A retry-after header only fills a verdict's retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
     Never raises: an Exception outside failure_types is DoNotRetry, counted as a fallthrough.
@@ -1083,19 +1011,12 @@ def parse_anthropic(failure: Exception) -> Verdict:
 def _verdict_from_anthropic_tables(
     failure: anthropic.APIStatusError, retry_after: float | None
 ) -> Verdict:
-    """Return the verdict the status and the error type alone give one failure.
+    """Classify one `APIStatusError` by status and error type.
 
-    The listed rows come from anthropic's errors page,
-    https://platform.claude.com/docs/en/api/errors (read 2026-08-01):
-    _PAUSE_STATUSES are PauseAll, _RETRY_THIS_ONE_STATUSES are RetryThisOne,
-    and _DO_NOT_RETRY_STATUSES are DoNotRetry.
-    Some rows come from the SDK rather than the page; each table's docstring names which and why.
-    Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
-    a _PAUSE_ERROR_TYPES type pauses and a _RETRY_THIS_ONE_ERROR_TYPES type retries at any
-    status, because a mid-stream error event raises carrying the live response's 200 status
-    (anthropic 0.120.2 MessageStream), leaving the type as the failure's one signal; an unlisted
-    5xx is RetryThisOne, one attempt's server-side failure; any other unlisted status is
-    DoNotRetry, matching the page's rule that 400 covers otherwise-unlisted 4xx errors.
+    Source: https://platform.claude.com/docs/en/api/errors, read 2026-08-01.
+    Error types override status because stream errors may carry the live response's 200 status.
+    Unlisted 5xx statuses return `RetryThisOne`.
+    Other unlisted statuses return `DoNotRetry`.
     """
     for error_types, statuses, verdict_class in (
         (_PAUSE_ERROR_TYPES, _PAUSE_STATUSES, PauseAll),
@@ -1126,10 +1047,8 @@ def _verdict_from_anthropic_tables(
 class AnthropicMessagesAdapter(Adapter):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
-    The three clients expose the same messages.stream method and with_options,
-    so the adapter logic is identical across the first-party API and both Bedrock APIs.
-    default_max_completion_tokens fills the API-required max_tokens
-    when the binding's inference_params leave max_completion_tokens None.
+    All three clients expose `messages.stream` and `with_options`.
+    `default_max_completion_tokens` supplies required `max_tokens` when the binding omits it.
     """
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = {
@@ -1154,38 +1073,20 @@ class AnthropicMessagesAdapter(Adapter):
         service_tier: AnthropicServiceTier | None = None,
         inference_geo: str | None = None,
     ) -> None:
-        """Store the SDK client, which owns credentials and endpoints.
+        """Store request, caching, and pricing configuration without sending a request.
 
-        provider_name says which provider the client reaches: "anthropic" for AsyncAnthropic,
-        "aws.bedrock" for either Bedrock client class.
-        Both Bedrock classes are in provider_name_by_client_class, so a value contradicting either
-        makes Adapter.__init__ raise; an AsyncAnthropic takes the value its caller states, since
-        its base_url decides what it reaches.
-
-        The stored client disables SDK retries.
-        langchaint's retry loop owns retrying and counts every request.
-        Anthropic 0.120.0 Bedrock copies otherwise drop custom transports.
-        `client_without_retries` passes the SDK client's transport back into its copy.
-        cache_ttl applies uniformly to every cache_control marker this adapter writes,
-        automatic and cache_breakpoint alike; "5m" is the API default and writes bill 1.25x base input,
-        "1h" holds entries across longer gaps and writes bill 2x
-        (priced by each table's cache_write_1h_usd_per_million_tokens).
-        A uniform TTL per adapter also sidesteps the API's rules for mixing TTLs within one request:
-        mixing is allowed but requires the 1h markers before the 5m markers.
-        That ordering rule is docs-only, not SDK-introspectable, stated under "Mixing different TTLs" at
-        https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
-        cache_ttl is taken here, not by LLM.bind, whose parameters are provider-neutral.
-        The openai Responses adapter has no TTL to configure, so no neutral parameter fits.
-        A different TTL is therefore a different adapter.
-
-        `pricing` holds this model's rates and modifiers.
-        `inference_geo` requests one inference geography.
-        service_tier is what the request asks for, None sending nothing. It cannot decide the price:
-        the request and response vocabularies are disjoint, and the tier the response reports is
-        what selects token rates.
+        `provider_name` is `"anthropic"` for `AsyncAnthropic` and `"aws.bedrock"` for Bedrock clients.
+        The stored client disables SDK retries and preserves custom Bedrock transports.
+        `cache_ttl` applies to every automatic and explicit cache marker.
+        `"5m"` writes bill 1.25 times base input, and `"1h"` writes bill twice base input.
+        Mixed TTLs require one-hour markers before five-minute markers.
+        Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
+        `pricing` supplies rates and modifiers.
+        `inference_geo` requests an inference geography.
+        `service_tier` requests a tier, while the reported tier selects pricing.
 
         Raises:
-            ValueError: `provider_name` contradicts the client's class.
+            ValueError: `provider_name` contradicts a Bedrock client class.
         """
         super().__init__(
             client=client,
@@ -1201,25 +1102,17 @@ class AnthropicMessagesAdapter(Adapter):
         self.inference_geo: str | None = inference_geo
 
     def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
-        """Precompute the typed request fields the binding determines.
+        """Precompute request fields and the remaining `message_mark_budget`.
 
-        A str system_prompt is one system block; a parts system_prompt is one block per part,
-        each marked part carrying cache_control.
-        automatic_cache_breakpoints marks the last system block (idempotent when it is already marked)
-        or, with no system prompt, the last tool.
-        The binding's markers spend the API's 4-marker request limit first;
-        message_mark_budget carries the remainder to _wire_messages.
+        A string `system_prompt` becomes one system block.
+        A parts `system_prompt` becomes one block per part and preserves marks.
+        `automatic_cache_breakpoints` marks the last system block or the last tool.
+        Binding marks use the four-marker limit before message marks.
 
         Raises:
-            ValueError: the binding's markers alone (marked system parts plus the automatic markers)
-                exceed the API's 4-marker request limit; unmark some system parts.
-                Also raised on an extra_body key in _ADAPTER_POPULATED_WIRE_KEYS,
-                and on an empty tuple system_prompt,
-                which bind rejects and only a directly constructed Binding can carry.
-                Also raised for unsupported provider-executed tool `type` values.
-                Code execution requires a qualifying web tool.
-                Provider-executed tools require `provider_name="anthropic"`.
-                Configured web-search rates must be finite and nonnegative.
+            ValueError: Binding marks exceed four, `extra_body` conflicts, or `system_prompt` is empty.
+            ValueError: A provider-executed tool type is unsupported or code execution lacks a qualifying web tool.
+            ValueError: Provider-executed tools use another provider or web-search rates are invalid.
         """
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
@@ -1283,8 +1176,7 @@ class AnthropicMessagesAdapter(Adapter):
         output_config: OutputConfigParam | Omit = omit
         thinking: ThinkingConfigParam | Omit = omit
         if binding.inference_params.reasoning_effort is not None:
-            # cast: deliberate pass-through of the union ReasoningEffort vocabulary, wider than the
-            # SDK's effort literal; a value the API rejects surfaces as the provider's own error.
+            # cast: `ReasoningEffort` deliberately exceeds the SDK effort literal.
             output_config = cast(
                 "OutputConfigParam", {"effort": binding.inference_params.reasoning_effort}
             )
@@ -1358,12 +1250,10 @@ class AnthropicMessagesAdapter(Adapter):
     def classify(self, error: Exception) -> ErrorClassification:
         """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
-        APIConnectionError, which APITimeoutError subclasses, and RetryableError, the marker the
-        SDK's own retry policy honors from middleware, are the transport failures that produced
-        nothing parseable: transient.
-        An APIStatusError only arrives here after parse verdicted DoNotRetry, since every one is
-        in failure_types; terminal_classification_from_response names what it becomes.
-        Anything else the SDK raises is unknown_exception, which fails this item without a retry.
+        `APIConnectionError` and `RetryableError` are transient transport failures.
+        `APITimeoutError` is an `APIConnectionError` subclass.
+        `APIStatusError` reaches this function only after `parse` returns `DoNotRetry`.
+        Other exceptions return `unknown_exception`.
         """
         if isinstance(error, (anthropic.APIConnectionError, anthropic.RetryableError)):
             return "transient"
@@ -1378,8 +1268,7 @@ class AnthropicMessagesAdapter(Adapter):
     def request_id_from_error(self, error: Exception) -> str | None:
         """Read the request-id header off the SDK exception.
 
-        APIStatusError is the only anthropic exception carrying request_id, which it reads off the
-        error response's headers, None where that response carried none (anthropic 0.120.0).
+        `APIStatusError` alone carries `request_id` from response headers in anthropic 0.120.0.
         """
         if isinstance(error, anthropic.APIStatusError):
             return error.request_id
@@ -1405,29 +1294,19 @@ class _AnthropicStream(AdapterStream):
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
-        """Translate the SDK stream into StreamItem values.
+        """Translate SDK events into `StreamItem` values.
 
-        An input_json_delta yields a ToolCallDelta only when the block it grows is a tool_use
-        block, whose id and name are read off the SDK's message snapshot; the SDK appended the
-        block there at content_block_start, before any of its deltas. A server_tool_use block
-        grows by the same delta type and streams nothing; it reaches the caller in the turn final()
-        assembles, as a RawPart.
-
-        A turn's reasoning arrives as one or more thinking blocks, and the break between two of them
-        is a block boundary, never text. That boundary reaches the caller as a
-        REASONING_PART_SEPARATOR delta before the next block's first delta, so a caller
-        concatenating ReasoningDelta text gets those breaks as characters.
-        A block holding no text is not a block: a delta carrying no characters is dropped, and a
-        separator falls only between two blocks that streamed text, so the reasoning never opens or
-        ends on a blank line and never doubles one.
-        A redacted_thinking block streams no delta, so it contributes no reasoning text and does not
-        change the separation of the blocks around it.
+        `input_json_delta` yields `ToolCallDelta` only for `tool_use` blocks.
+        The adapter reads the id and name from the SDK message snapshot.
+        `server_tool_use` streams no delta and becomes `RawPart` in `final()`.
+        `REASONING_PART_SEPARATOR` separates thinking blocks that emitted text.
+        Empty deltas and redacted thinking emit no reasoning text or separator.
 
         Yields:
-            Stream items; SDK events langchaint does not model are dropped.
+            Stream items for SDK events langchaint models.
 
         Raises:
-            StreamProtocolError: the stream ended without a stop reason.
+            StreamProtocolError: The stream ends without a stop reason.
         """
         reasoning_delta_yielded = False
         separator_pending = False
@@ -1470,14 +1349,10 @@ class _AnthropicStream(AdapterStream):
 
     @override
     def billing_reported(self) -> Billing | None:
-        """Return what the running message snapshot billed, or None before the first event is accumulated.
+        """Return snapshot billing after the first event, or `None` before it.
 
-        The SDK builds the snapshot from message_start and updates it as later events arrive, so
-        Message.usage carries input_tokens from the turn's first event onward (both are required
-        fields on anthropic 0.120.0). The cache counters are optional and the SDK copies them on at
-        message_delta, so a snapshot read mid-stream can be missing them.
-        Reading the snapshot before any event has been accumulated is an error in the SDK, so the
-        first pull through items() is what makes this readable.
+        Anthropic 0.120.0 provides required input tokens from `message_start`.
+        Optional cache counters arrive with `message_delta`.
         """
         if not self._snapshot_started:
             return None
@@ -1492,8 +1367,7 @@ class _AnthropicStream(AdapterStream):
     def request_id(self) -> str | None:
         """Read the request-id header off the response the SDK stream is reading.
 
-        AsyncMessageStream.request_id is a public property over those headers, readable from the
-        moment the stream opens (anthropic 0.120.0).
+        `AsyncMessageStream.request_id` is readable when the stream opens in anthropic 0.120.0.
         """
         return self._sdk_stream.request_id
 
@@ -1594,11 +1468,10 @@ class _BoundAnthropicText(_BoundAnthropic[str]):
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
         """Read the turn, whose concatenated text is this binding's output.
 
-        Every message a text binding receives is a result: a stop reason langchaint cannot continue
-        still carries the text the model wrote, and no schema stands between that text and the output.
+        Every message supplies its text despite an unhandled stop reason.
 
         Raises:
-            TypeError: raw is not an anthropic Message.
+            TypeError: `raw` is not an anthropic `Message`.
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
@@ -1617,11 +1490,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
     ) -> None:
         """Precompute the request's output_config, the JSON-schema format merged into the binding's.
 
-        The format is built from the same transform_schema(TypeAdapter(...).json_schema()) call
-        messages.parse makes, so the request carries what passing output_format would have sent.
+        The format matches `messages.parse(output_format=...)`.
         The merge is what keeps a reasoning effort the binding set: output_config carries both keys.
-        The merged value replaces the binding's, so every request this binding builds carries it and
-        the two bindings send the same fields.
+        The merged value replaces the binding value in every request.
         """
         self._adapter = adapter
         self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
@@ -1639,25 +1510,11 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
     def _parsed_outcome(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage
     ) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
+        """Validate text, return `None` for a tool-call turn, or return a failure variant.
 
-        Validating here rather than in the SDK is what puts the message and its text in scope when
-        the text is rejected: the variant returned for a rejection is one the retry loop can place
-        against the attempt it already recorded, where a raise from inside the SDK is not.
-
-        None is the tool-call turn and nothing else: the turn is the tool calls, which the assistant
-        message carries, so a turn whose text is not the instance yields no instance without anything
-        having gone wrong.
-
-        Every other stop reason has a named variant, and none of them is retried, because no stop reason
-        states an error: the model finished on the terms it reports, so a resend is a fresh sample.
-        The stop reason is read before the rejection, so text the token cap cut mid-object is
-        reported as the truncation and not as a violation of the schema it was closing.
-
-        Each variant carries assistant_message, so the turn a rejected 200 did produce reaches the
-        caller on the failure.
-        The stop reason chooses the variant and is not carried on it: what such a 200 reports is fixed
-        by its GenerationError subclass.
+        Validation occurs after the attempt records its message and billing.
+        Stop reasons take precedence over schema validation.
+        Every failure variant carries `assistant_message`.
         """
         validation_error: ValidationError | None = None
         text = _first_text_block_text(message)

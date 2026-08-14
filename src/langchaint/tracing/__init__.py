@@ -1,75 +1,48 @@
-"""OTel span tracing for langchaint, as a thin wrapper that never fakes an event boundary it traces.
+"""Trace langchaint calls with OTel spans.
 
-TracedLLM wraps an LLM and mirrors bind / rebind so every binding stays traced;
-TracedBoundLLM wraps a BoundLLM and opens one CLIENT span per outbound call, which is one span for
-generate_one and one per item of a generate_many batch;
-TracedStreamHandle wraps a StreamHandle and opens one CLIENT span across the stream's life.
+Importing this subpackage requires `opentelemetry-api`.
+Applications configure the OTel SDK.
+
+`TracedBoundLLM` opens one CLIENT span for each generation call.
+`generate_many` opens one span per started input.
+`TracedStreamHandle` keeps one CLIENT span open for the stream.
 `TracedToolManager.dispatch` opens one INTERNAL `execute_tool` span.
-`TracedToolManager` passes through `LLM.bind(tools=TracedToolManager(...))` unchanged.
-`ToolManager.dispatch_many` gains per-call spans through `self.dispatch`.
-`precomputed` calls open no span because no tool executes.
-`TracedLLM.bind(tools=[...])` constructs it with `tracer`, `extra_attributes`, and `capture_message_content`.
-Every Traced class accepts extra_attributes, a constant mapping set on each span it opens at span start
-(an agent name for cross-trace aggregation, a deployment tag);
-an attribute set at completion (a mapper's, an outcome's) wins a key collision.
-Every Traced class also requires capture_message_content, which decides whether the spans carry
-the GenerationInput itself; it has no default, because recording prompts is a privacy choice langchaint never makes.
+`ToolManager.dispatch_many` uses `dispatch` and gets one span per tool call.
+`precomputed` opens no span because it executes no tool.
+`agent_span` opens one INTERNAL `invoke_agent` span around an application agent loop.
 
-Every span the convention defines a kind for carries gen_ai.operation.name, which it marks required:
-"chat" on the chat and stream spans, "execute_tool" on a dispatch span.
-It is set at span start, after extra_attributes, so an application constant cannot displace it.
+Each traced class requires `capture_message_content` because prompt recording is a privacy choice.
+`extra_attributes` sets constant attributes when each span starts.
+Completion attributes replace matching `extra_attributes` keys.
+Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
 
-The further attributes each span kind carries, capture_message_content True included:
+Chat and stream spans use `gen_ai.operation.name="chat"`.
+They report provider, request model, response model, finish reasons, token usage, attempts, and cost.
+With capture enabled, they report system instructions, tool definitions, input messages, and output messages.
+Stream spans also report `gen_ai.response.time_to_first_chunk`.
+Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
+With capture enabled, tool spans report arguments and results.
+Agent spans use `gen_ai.operation.name="invoke_agent"` and report agent name and `langchaint.agent_path`.
+Agent spans sum the run's usage partition and cost.
+Agent exit `extra_attributes` add application results.
 
-the chat span (CLIENT) and the stream span (CLIENT): gen_ai.provider.name, gen_ai.request.model,
-gen_ai.response.model, gen_ai.usage.input_tokens, gen_ai.usage.output_tokens,
-gen_ai.usage.reasoning.output_tokens, gen_ai.usage.cache_read.input_tokens,
-gen_ai.usage.cache_creation.input_tokens,
-gen_ai.response.finish_reasons, langchaint.attempts, langchaint.cost_in_usd,
-and under capture gen_ai.system_instructions, gen_ai.tool.definitions, gen_ai.input.messages,
-and gen_ai.output.messages.
-The stream span adds gen_ai.response.time_to_first_chunk.
-execute_tool (INTERNAL): gen_ai.tool.name, gen_ai.tool.call.id, error.type on a failure,
-and under capture gen_ai.tool.call.arguments and gen_ai.tool.call.result.
-invoke_agent (INTERNAL) is the one span the application opens itself, through agent_span, around its
-own agent loop: gen_ai.agent.name, langchaint.agent_path, the usage partition summed over the run,
-langchaint.cost_in_usd, and whatever the application's exit-time extra_attributes adds.
-Every span kind carries error.type when it ends on an exception.
-langchaint.* is the prefix for the attributes the GenAI convention defines no counterpart for, which is
-exactly langchaint.attempts, langchaint.cost_in_usd, and langchaint.agent_path.
-The langchaint.attempt_failed span event carries error_text and elapsed_seconds per failed attempt.
+`langchaint.*` names only attempts, cost, and agent path because the convention has no matching keys.
+Each failed attempt adds `langchaint.attempt_failed` with `error_text` and `elapsed_seconds`.
 
-The wrapper owns the span lifecycle
-(start at the traced operation, exactly-once end, error status on every exception path)
-and never fakes an event boundary a span is supposed to measure:
-TracedStreamHandle iterates so it can record gen_ai.response.time_to_first_chunk
-and close the span on a failing or abandoned stream, rather than delegating the iteration it needs to witness.
-The mapper owns only attribute names and values, the part that varies by convention;
-a mapper cannot change the span name, kind, or status, and a raising mapper is caught and logged, never propagated.
+Each traced operation starts and ends its span exactly once.
+`TracedStreamHandle` closes failed or abandoned streams.
+A mapper may set only attribute names and values.
+A mapper cannot change the span name, kind, or status.
+Mapper failures are logged and never propagate.
 
-Importing this subpackage requires opentelemetry-api;
-the import below raises a ModuleNotFoundError naming the package to install.
-The wrapper imports only opentelemetry-api, so a production app installs the api and wires its own SDK.
-
-Two sources at two revisions verify what this module emits, and neither is asserted from memory.
-Attribute key names are verified against opentelemetry-semantic-conventions 0.64b0,
-which opentelemetry-sdk requires exactly, so the test suite (which needs the sdk anyway)
-asserts every gen_ai.* literal below against that revision's constants.
-The chat-completion operation value is "chat" (GenAiOperationNameValues.CHAT);
-the tool-execution operation value is "execute_tool" (GenAiOperationNameValues.EXECUTE_TOOL),
-and the tool span's identity keys are gen_ai.tool.name and gen_ai.tool.call.id.
-The agent-invocation operation value is "invoke_agent" (GenAiOperationNameValues.INVOKE_AGENT),
-with gen_ai.agent.name as its identity key.
-Reasoning reaches a span as the counter gen_ai.usage.reasoning.output_tokens and, where the provider
-returned readable text, as the payload schemas' ReasoningPart; _turn_parts documents when it appears.
-Content payload shapes are verified against the JSON schemas the convention attaches to the attributes
-whose semconv type is any. GenAI moved out of open-telemetry/semantic-conventions and publishes no
-package-registry artifact, so those schemas are not in the tree the pinned package ships and cannot be
-pinned in pyproject.toml; they are vendored under tests/semconv_genai at a recorded commit, refreshed by
-scripts/refresh_semconv_genai.py, and every payload the test suite produces is validated against them,
-except gen_ai.tool.call.arguments where it carries something other than an object, the one
-disagreement, listed with its reason in that suite's _UNVALIDATED_PAYLOAD_ATTRIBUTES.
-A convention change is a deliberate edit to this module.
+Attribute names match opentelemetry-semantic-conventions 0.64b0.
+`GenAiOperationNameValues.CHAT`, `.EXECUTE_TOOL`, and `.INVOKE_AGENT` define the operation values.
+Tool identity uses `gen_ai.tool.name` and `gen_ai.tool.call.id`.
+Agent identity uses `gen_ai.agent.name`.
+Reasoning usage uses `gen_ai.usage.reasoning.output_tokens`.
+Readable reasoning uses `ReasoningPart` in content payloads.
+Content payloads follow the convention's JSON schemas.
+`gen_ai.tool.call.arguments` may carry a JSON value other than an object.
 """
 
 import importlib.metadata
@@ -167,13 +140,8 @@ _logger = logging.getLogger("langchaint.tracing")
 def _guarding_telemetry_failures(what: str) -> Generator[None]:
     """Log whatever the block raises instead of letting it out.
 
-    Every call that hands OTel something to record (an attribute, a status, an event, the end) is
-    caught and logged rather than propagated, because the caller's result is worth more than its
-    telemetry: a span implementation or a SpanProcessor's on_end that raises would otherwise turn a
-    paid Response into that exception, with the CallRecord and the usage gone. Several of those calls
-    also run while an exception unwinds, where a raise would replace the error the caller came for.
-    This is the shared form; the helpers that first invoke an application callable catch with their
-    own try/except so the log can name which callable failed.
+    OTel Exception values are logged because they must not replace a result or active exception.
+    Application callables use guards that name the callable.
     Only Exception is caught, so a cancellation still reaches the caller.
     """
     try:
@@ -185,9 +153,7 @@ def _guarding_telemetry_failures(what: str) -> Generator[None]:
 def _is_recording(span: Span) -> bool:
     """Read whether the span records, treating an Exception as not recording.
 
-    Every site that skips building attributes for a non-recording span asks through here, several of
-    them while an exception unwinds, where a raise would replace the error the caller came for.
-    Reading False on an Exception skips the attributes rather than the caller's result.
+    An Exception returns False so telemetry cannot replace a result or active exception.
     """
     try:
         return span.is_recording()
@@ -201,9 +167,7 @@ def _is_recording(span: Span) -> bool:
 def _start_span(tracer: Tracer, name: str, *, kind: SpanKind) -> Span:
     """Start one span, returning a non-recording span when the tracer itself raises.
 
-    Every later call on the returned span is guarded too, so the fallback needs only to be a Span;
-    a non-recording one makes each of them a no-op and the traced call runs untraced rather than
-    failing.
+    INVALID_SPAN lets the traced call continue without telemetry.
     """
     try:
         return tracer.start_span(name, kind=kind)
@@ -217,11 +181,8 @@ def _start_span(tracer: Tracer, name: str, *, kind: SpanKind) -> Span:
 def _end_span(span: Span) -> None:
     """End one span, without letting the end reach the caller.
 
-    Span.end calls the processor's on_end with no guard of its own (opentelemetry-sdk 1.43.0), so a
-    SpanProcessor that raises there raises here: on the success path, where the exception would
-    displace the Response, and on the failure paths, where it would displace the error the caller
-    came for. The bundled SimpleSpanProcessor catches its exporter's failure itself, so the raise
-    this guards against comes from a processor an application installed.
+    opentelemetry-sdk 1.43.0 Span.end does not guard SpanProcessor.on_end.
+    This guard preserves the result or active exception.
     """
     with _guarding_telemetry_failures("ending the span"):
         span.end()
@@ -298,9 +259,7 @@ top-level attribute; the per-message field is required, so a turn recorded from 
 def _finish_reason(stop_reason: StopReason) -> str:
     """Map a StopReason onto the convention's finish-reason vocabulary, passing unmapped values through.
 
-    One function for both places a finish reason is emitted, gen_ai.response.finish_reasons
-    and the per-message finish_reason inside gen_ai.output.messages,
-    so one span cannot carry two spellings of one concept.
+    gen_ai.response.finish_reasons and gen_ai.output.messages use this mapping.
     """
     return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
 
@@ -308,30 +267,19 @@ def _finish_reason(stop_reason: StopReason) -> str:
 def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
-    It is the default attribute_mapper, and public so a custom AttributeMapper extends it
-    instead of restating its keys, for a value derived from the result that the keys below do not carry:
-    {**gen_ai_attributes(result), "app.request_seconds": sum(a.elapsed_seconds for a in result.attempt_records)}.
-    An extending key belongs in the application's own namespace, not under langchaint.*, which is reserved
-    for the keys listed in the module docstring and can grow.
+    This is the default attribute_mapper.
+    A custom AttributeMapper can extend its result.
+    Extension keys must use the application's namespace because langchaint.* is reserved.
     A constant needs no mapper; extra_attributes sets one on every span.
     Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
     Reads only the fields every CallResult variant shares, so it cannot leak a prompt and cannot meaningfully fail.
     A key stays under the langchaint.* prefix only where the GenAI convention defines no counterpart,
     which is langchaint.attempts and langchaint.cost_in_usd here.
-    The cache counters are the convention's own: gen_ai.usage.input_tokens includes cached tokens
-    ("This value SHOULD include all types of input tokens, including cached tokens"),
-    which is exactly Usage.input_tokens_total, and each of gen_ai.usage.cache_read.input_tokens
-    and gen_ai.usage.cache_creation.input_tokens is a part of it ("The value SHOULD be included in
-    gen_ai.usage.input_tokens").
-    No cache_none counter is emitted: it is the total minus the other two, a subtraction any consumer can do,
-    and Usage derives it by subtraction on the openai path, so emitting it would re-export a derived value
-    in a shape implying it was measured.
-    gen_ai.response.finish_reasons is the plural array the convention defines, carrying the mapped
-    finish reason rather than the raw StopReason so it agrees with gen_ai.output.messages;
-    it is omitted when stop_reason is None (no completed turn).
-    gen_ai.response.model is the last attempt's model_served: on a success that is the attempt whose
-    answer the result carries. It is omitted where that attempt received no response and where the
-    call recorded no attempt, which the convention allows by conditioning it on being available.
+    gen_ai.usage.input_tokens is Usage.input_tokens_total.
+    The cache-read and cache-creation attributes are parts of that total.
+    No cache_none counter is emitted because it is derived.
+    gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
+    gen_ai.response.model is the last attempt's model_served and is omitted when unavailable.
     The usage and cost attributes are the call's paid totals across every attempt (result.usage is that scope),
     not one request's counts; per-attempt detail stays visible as the langchaint.attempt_failed span events.
     """
@@ -367,46 +315,30 @@ def agent_span(
 ) -> Generator[Span]:
     """Open one INTERNAL invoke_agent span around an application's own agent loop.
 
-    langchaint traces the calls an agent makes (generate, execute_tool), never the loop that makes them,
-    because it ships no loop. An application that runs its own loop owns the invoke_agent span the GenAI
-    convention defines for an agent invocation; this opens that span with the convention's identity
-    attributes and, on every exit path, sets the run's paid usage and cost.
+    langchaint ships no agent loop.
+    This context manager records an application's loop with identity, paid usage, and cost.
 
     The usage keys are the same ones gen_ai_attributes emits for a single call, here summed over the run:
-    gen_ai.usage.input_tokens is Usage.input_tokens_total (cached tokens included), with
-    cache_read.input_tokens and cache_creation.input_tokens as its parts, reasoning.output_tokens as the
-    reasoning share of output_tokens, and langchaint.cost_in_usd as the run's estimated cost.
+    gen_ai.usage.input_tokens is Usage.input_tokens_total.
+    reasoning.output_tokens is the reasoning share.
+    langchaint.cost_in_usd is estimated cost.
 
-    usage is called once, at exit rather than at entry, so a run cancelled in flight still records what it
-    spent up to the cancellation. extra_attributes, when given, is called at exit too, for the counters
-    only the finished loop knows (a turn count); its pairs are set before the identity and usage
-    attributes, so an application value cannot displace an attribute this helper owns, the same
-    collision rule every Traced class applies to its extra_attributes.
-    For a usage key the overwrite happens only when usage() returns: a raising usage() leaves the
-    usage attributes unset, so an extra claiming a gen_ai.usage.* key survives on that path.
+    usage and extra_attributes run once at exit.
+    Identity and usage attributes overwrite extra_attributes.
+    A usage key is overwritten only when usage returns.
 
-    An Exception from usage() or extra_attributes() is caught and logged at warning level and never
-    propagated, the same guard the attribute mapper gets: the exit runs in a finally, where a raise
-    would displace the exception already unwinding the loop, a CancelledError included.
+    An Exception from usage or extra_attributes is logged and does not propagate.
 
-    The span is started and ended through this module's guarded helpers, and made current by
-    trace.use_span with its exception recording and status setting off, rather than by
-    tracer.start_as_current_span: that helper ends the span in a bare finally, so a SpanProcessor
-    whose on_end raised would come out of the application's `with agent_span(...)` block and take
-    the loop's result with it.
-    Recording the body's exception is this module's too, so an invoke_agent span carries the
-    error.type every other span here carries.
-    The end sits in its own finally outside the one that sets the exit attributes, so nothing the
-    attribute pass can raise, a BaseException out of usage() included, leaves the span unended.
+    Guarded helpers start and end the span.
+    trace.use_span disables its exception and status handling.
+    This module records body exceptions and always ends the span.
 
     Yields:
-        The started invoke_agent span, already the current span. A body that sets no attributes of its
-        own can ignore it; the usage and extras are set from the callables at exit, not through it.
+        The current invoke_agent span.
 
-    Raises: nothing of its own. An Exception from the wrapped body propagates, with error.type and
-    error status recorded on the span first. A BaseException propagates with neither recorded,
-    whether it came from the body or from usage() or extra_attributes();
-    the span is ended on every path.
+    Raises:
+        Exception: the wrapped body raised. error.type and error status are recorded first.
+        BaseException: the body, usage, or extra_attributes raised a non-Exception BaseException.
     """
     identity: dict[str, str] = {
         "gen_ai.operation.name": "invoke_agent",
@@ -442,17 +374,9 @@ def _apply_agent_exit_attributes(
 ) -> None:
     """Set an ending invoke_agent span's extras, then re-set its identity, then set its usage.
 
-    The order is what enforces agent_span's collision rule: the extras go first, and the identity keys
-    (set at span start so the span is searchable while the run is live) are set again after them, so an
-    extra cannot displace gen_ai.operation.name or gen_ai.agent.name any more than it can a usage key.
-    The usage-key half of that rule holds only when usage() returns, since a raising usage() leaves
-    nothing to overwrite an extra with; agent_span's docstring states the same limit.
-    Each callable runs under its own guard, so a raising usage() still leaves the extras set and a
-    raising extra_attributes() still leaves the usage set; either is logged, never propagated, because
-    this runs in agent_span's finally where a raise would displace the loop's own exception.
+    Identity overwrites extras. Usage overwrites extras only when usage returns. Each callable has an independent guard.
     The set_attributes calls are guarded for the same reason.
-    Skipped when the span is not recording, the OTel guard for not computing attributes a
-    non-recording span discards.
+    A non-recording span skips attribute construction.
     """
     if not _is_recording(span):
         return
@@ -544,27 +468,17 @@ def _reject_non_json_constant(token: str) -> NoReturn:
 def _tool_call_arguments(args_json: str) -> object:
     """Deserialize a tool call's argument JSON, falling back to the raw text when it does not parse.
 
-    The convention asks for an object here ("in case a serialized string is available to the
-    instrumentation, the instrumentation SHOULD do the best effort to deserialize it to an object"),
-    so a well-formed args_json reaches a backend as nested JSON rather than as a string a consumer
-    decodes a second time.
-    Best effort covers any JSON value, an object or not, and text that does not parse is returned
-    unchanged, to be emitted as a JSON string by the caller.
-    That fallback is why a parse failure is neither raised nor logged here: a malformed or non-object
-    args_json is what the DispatchInvalidToolArgs variant reports, and the span should show the text that
-    produced it.
+    The convention requests best-effort deserialization of serialized arguments.
+    Any JSON value is returned.
+    Unparseable text is returned unchanged so DispatchInvalidToolArgs remains visible.
 
     The two parse hooks narrow json.loads to what json.dumps can write back as JSON.
-    Python's json accepts and emits Infinity and NaN, which RFC 8259 has no syntax for, and reaches them
-    from ordinary input as well: 1e400 parses to inf, so a returned value would re-serialize to a token
-    a strict consumer rejects.
-    Inside gen_ai.input.messages the cost is not one field, since the value is nested into a structure
-    serialized as a whole, so one such number would make the entire attribute unparseable.
+    RFC 8259 excludes Infinity and NaN.
+    The hooks route them to raw text so nested attributes remain valid JSON.
     Routing these to the raw-text fallback keeps every emitted payload standard JSON.
 
     Only ValueError is caught, the parse failure this fallback is for.
-    json.loads can also exhaust the stack on deeply nested input, and that RecursionError propagates to
-    the caller's own telemetry guard rather than being silently reported as unparseable text.
+    RecursionError propagates to the telemetry guard.
     """
     try:
         parsed: object = json.loads(
@@ -578,14 +492,9 @@ def _tool_call_arguments(args_json: str) -> object:
 def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
     """Render an assistant turn as the convention's parts array, in emission order.
 
-    A ReasoningPart renders as the convention's ReasoningPart and a TextPart as the convention's
-    TextPart, each carrying its text. A part without text renders as nothing,
-    since both parts require a content string and an empty one carries nothing;
-    the two adapters drop empty text on the wire side likewise.
-    The reasoning payload itself is never emitted: it is the
-    producing SDK item's model_dump, opaque by construction (an anthropic signature that may be
-    redacted, an openai encrypted_content), so it provides no readable content, and ReasoningPart
-    takes a content string rather than an opaque object.
+    ReasoningPart and TextPart emit their text.
+    Text-free parts emit nothing.
+    ReasoningPart.raw is opaque and is never emitted.
     A RawPart renders as nothing because it has no text.
     A turn holding only text-free parts therefore renders as an empty parts array,
     not as a missing message.
@@ -656,9 +565,7 @@ def _system_instructions(system_prompt: str | tuple[TextPart, ...]) -> list[dict
 def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, object]]:
     """Render the bound tool schemas as the convention's tool-definition array.
 
-    description and parameters are populated although the schema marks both NOT RECOMMENDED by default
-    on size grounds: a tool list without its argument schemas does not record what the model was offered,
-    which is the question the attribute exists to answer.
+    description and parameters record what the model received despite the schema's size warning.
     This is a deliberate departure from that recommendation.
     """
     return [
@@ -677,12 +584,11 @@ def _input_content_attributes(
 ) -> dict[str, SpanAttributeValue]:
     """Build the input-side content attributes for one call, each a JSON string.
 
-    OTel attribute values cannot nest, and the schemas say a span MAY record these as a JSON string
-    when structured form is unsupported.
+    OTel attribute values cannot nest, so structured values use the permitted JSON string form.
     A key whose source is empty or absent is omitted rather than emitted as [] or null,
-    so a bound system_prompt of None omits gen_ai.system_instructions and no bound tools omits
-    gen_ai.tool.definitions; a backend consequently cannot tell "no tools bound" from "capture off"
-    by the attribute alone.
+    system_prompt None omits gen_ai.system_instructions.
+    No bound tools omits gen_ai.tool.definitions.
+    These omissions are indistinguishable from disabled capture.
     """
     attributes: dict[str, SpanAttributeValue] = {}
     if binding.system_prompt is not None:
@@ -703,10 +609,7 @@ def _output_content_attributes(
     """Build gen_ai.output.messages from one assistant turn.
 
     One function for the success and the failure paths, so one turn renders the same whichever reported it.
-    One key holding one message, because several assistant messages under a key the convention uses
-    for one turn would render as a multi-message answer.
-    A result with no stop_reason (no completed turn) reports finish_reason "error", a member of the
-    convention's own enum, because the schema requires the field on every element.
+    One key contains one message for one turn. A missing stop_reason uses the required "error" enum member.
     """
     return {
         "gen_ai.output.messages": json.dumps([
@@ -728,8 +631,7 @@ def _apply_output_content(
 ) -> None:
     """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
 
-    A GenerationError reports the turn of the last attempt that produced one, so a failure the provider
-    generated content for carries it; the key is omitted entirely when no attempt produced a turn.
+    GenerationError carries the last produced turn. The key is omitted when no attempt produced a turn.
     Per-attempt detail stays on the langchaint.attempt_failed events, which carry no content.
     """
     if not span_config.capture_message_content:
@@ -797,9 +699,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
     The content keys are JSON strings, and some of what they serialize is arbitrary application data:
     a JSONSchemaTool args_schema is Mapping[str, object] the application supplies verbatim,
     so a value json.dumps cannot serialize reaches this module and raises.
-    The build is caught and logged at warning level and never propagated, the same way a raising
-    AttributeMapper is, so a telemetry defect never breaks a paid call or discards its result;
-    the span keeps whatever attributes were already set.
+    A build Exception is logged and does not propagate. Existing span attributes remain.
     Building inside the is_recording guard is why the GenerationInput is serialized here rather than earlier:
     an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
     """
@@ -819,10 +719,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
 def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> None:
     """Set the constant extra_attributes on a just-started span, when recording and non-empty.
 
-    Applied first, so the attributes are present however the span later ends, and so every attribute
-    this module sets itself wins a key collision against them: gen_ai.operation.name and the dispatch
-    identity keys, set immediately after at span start, and a mapper's or a dispatch outcome's,
-    set at completion.
+    These attributes apply first. Module-owned attributes win later key collisions.
     """
     _set_span_attributes(span, extra_attributes)
 
@@ -830,8 +727,7 @@ def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> Non
 def _apply_operation_name(span: Span, operation_name: str) -> None:
     """Set gen_ai.operation.name on a just-started span.
 
-    The convention marks this attribute required on the span kinds it defines, which is every span
-    this module opens.
+    The convention requires this attribute on every span kind this module opens.
     Applied at span start, so it is present however the span ends, and after extra_attributes,
     so an application constant cannot displace a required attribute.
     """
@@ -841,9 +737,7 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
 
-    error.type is the exception's class name, so the GenerationError subclasses (RetriesExhaustedError,
-    RefusalError, MaxCompletionTokensExceededError, InvalidRequestError, UnknownExceptionError) are
-    groupable by kind rather than only by the error_text message string.
+    error.type is the GenerationError subclass name, which groups errors independently of error_text.
     """
     _set_span_attribute(span, "error.type", type(error).__name__)
     with _guarding_telemetry_failures("setting the error status"):
@@ -853,9 +747,7 @@ def _set_generation_error_status(span: Span, error: GenerationError) -> None:
 def _record_other_exception(span: Span, exc: Exception) -> None:
     """Record the exception as a span event, set error.type from its class, and set error status.
 
-    error.type is the exception's class name, the convention's low-cardinality classification of how an operation
-    ended, which gives every span kind here a groupable failure signal (StreamProtocolError, a tool
-    function's own exception) beside the message string record_exception carries.
+    error.type uses the exception class name for low-cardinality grouping.
     Sets no shared-field attributes: this records the exception itself, not a call's result.
     """
     with _guarding_telemetry_failures("recording the exception"):
@@ -870,8 +762,7 @@ def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConf
 
     A GenerationError is that call's result, so the span takes the same result attributes, content,
     and status a success variant would give it; anything else is an exception the span only records.
-    One recorder for every method that can conclude a stream, so the same class produces the same
-    span whether the failure surfaced from the open, an item pull, or final().
+    The open, item pull, and final() use the same recording rule.
     """
     if isinstance(exc, GenerationError):
         _apply_result_attributes(span, exc, span_config.attribute_mapper)
@@ -904,15 +795,15 @@ class TracedLLM:
         and the assistant turn on every span this LLM's bindings open.
         It is required and has no default.
         Recording prompts is a privacy choice langchaint never makes.
-        The convention takes the same position, that instrumentations SHOULD NOT capture content by default
-        but SHOULD provide an opt-in; requiring the keyword is stricter, in the safe direction.
+        The convention says instrumentations SHOULD NOT capture content by default.
+        It says they SHOULD provide an opt-in.
+        This required keyword supplies the opt-in.
         The value propagates to every binding and every stream handle, and rebind carries it unchanged,
         so a rebound object cannot silently gain or lose capture.
         tracer None resolves trace.get_tracer("langchaint.tracing", <package version>) now, not at import.
         attribute_mapper is passed down unchanged to every binding; it defaults to gen_ai_attributes,
         the OTel GenAI semantic convention at the revision the module docstring pins.
-        extra_attributes is a constant mapping set at span start on every span every binding opens
-        (an agent name for cross-trace aggregation, a deployment tag); None means no such attributes.
+        extra_attributes applies at span start to every span. None supplies no extra attributes.
         A key the mapper also emits resolves to the mapper's value, set at completion.
         """
         self._llm = llm
@@ -1042,8 +933,7 @@ class TracedLLM:
 class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """Wraps a BoundLLM so every generate call opens a span.
 
-    Every call opens one CLIENT span, one outbound call each: generate_one's own, and one per item
-    of a generate_many batch, which is why the traces do not say which method was called.
+    Each outbound call opens one CLIENT span. generate_many opens one per item.
     The span name is the GenAI convention {operation} {model}, wrapper-owned,
     so a custom mapper changes attributes only, never the name, kind, or status.
     There is no langchaint.elapsed_seconds attribute:
@@ -1315,18 +1205,9 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         The overloads mirror BoundLLM.generate_one's, so output is typed per binding.
 
-        The span brackets the same interval as elapsed_seconds (permit waits and backoff included).
-        Under capture_message_content the input attributes are set at span start, so they are present on the
-        failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
-        a GenerationError's last recorded one included.
-
         Raises:
-            GenerationError: the wrapped generate_one raised a terminal per-item result (retries exhausted,
-                a refusal, a truncation, a rejected request, a provider error langchaint does not
-                retry, or an Exception that escaped langchaint's own machinery); the span is
-                attributed and closed first.
-            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
-                status set.
+            GenerationError: generate_one produced a terminal per-item error. The span is attributed and closed first.
+            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
         """
         return await self._generate_one_any_binding(
             generation_input, deadline=WallClockDeadline(timeout_seconds)
@@ -1337,18 +1218,13 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> GenerateResult[Any]:
         """Run one call under a chat span of its own.
 
-        The un-overloaded entry point, because a generic binding matches none of generate_one's
-        overloads, which are keyed on a concrete one. Same request, widest type.
-        It is also the GenerateItem passed to the wrapped BoundLLM, so a batch of n generation_inputs
-        traces as n chat spans, exactly as n generate_one calls do. deadline passes through unread,
-        so a traced call gets the deadline an untraced one gets, of whichever kind its caller built.
+        This unoverloaded entry point supports generic bindings.
+        generate_many uses it for one span per item.
+        deadline passes through unchanged.
 
         Raises:
-            GenerationError: the call failed; the span is attributed and closed first, and a batch
-                turns the error into that item's result. TimedOutError is one of them, so a call that
-                ran out of time closes its span like any other failure.
-            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
-                status set.
+            GenerationError: the call failed. The span is attributed and closed first.
+            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
         """
         return await self._under_chat_span(
             generation_input,
@@ -1363,15 +1239,12 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Await one call inside a CLIENT chat span, attributing the span from however it ends.
 
         The span brackets the same interval as elapsed_seconds (permit waits and backoff included).
-        Under capture_message_content the input attributes are set at span start, so they are present on the
-        failing paths too, and gen_ai.output.messages is set from whichever turn the result carries,
-        a GenerationError's last recorded one included.
+        capture_message_content records input at span start and records the result's turn at completion.
 
         Raises:
             GenerationError: whatever the call failed with, the span attributed and closed first.
             Exception: anything else the call raised, recorded on the span before it re-raises.
-            asyncio.CancelledError: an outer scope cancelled the call and the span ends with no
-                status set.
+            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         try:
@@ -1425,26 +1298,22 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         warm_cache: bool = False,
         max_working_seconds_per_item: float | None = None,
-        # list is invariant, so no single element union is assignable from all three overloads;
-        # a union of list types would restate the overloads without replacing this Any.
+        # `list` invariance requires `Any` to share one implementation across these overloads.
     ) -> list[Any]:
         """Order-aligned batch, traced as one chat span per started item and nothing else.
 
         The overloads mirror BoundLLM.generate_many's, so each result's output is typed per binding.
 
-        warm_cache and max_working_seconds_per_item pass through to BoundLLM.generate_many, which
-        documents them.
+        warm_cache and max_working_seconds_per_item pass through to BoundLLM.generate_many.
 
-        A batch large enough for one span per item to be too many spans is what an OTel sampler is
-        for, configured on the SDK where every other tracing volume decision is made.
+        Configure the OTel SDK sampler to limit span volume.
 
         Raises:
-            asyncio.CancelledError: an outer scope cancelled the batch; each started item's span
-                ended.
-            BaseException: an item raised a BaseException that is not an Exception, which langchaint
-                does not catch; the started items are cancelled and awaited, and it propagates.
+            asyncio.CancelledError: an outer scope cancelled the batch. Each started span ended.
+            BaseException: an item raised a non-Exception BaseException.
+                Started items are cancelled and awaited before it propagates.
         """
-        # The un-overloaded entry point; _generate_one_any_binding says why.
+        # `_generate_one_any_binding` accepts each overloaded `response_format`.
         return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
             generation_inputs,
             warm_cache=warm_cache,
@@ -1480,16 +1349,14 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         The overloads mirror BoundLLM.stream_one's, so final()'s result is typed per binding.
 
-        The span opens when the handle is entered, matching StreamHandle's own contract that
-        the request opens there.
+        The span and request open when the handle is entered.
         The binding and the generation_input are passed down rather than rendered here:
         the handle needs them to build its input attributes when the span starts,
-        and rendering them here would serialize the generation_input unconditionally, including for the
-        non-recording spans an application with no configured TracerProvider gets.
+        Rendering here would serialize generation_input for non-recording spans.
         The cost is that the handle holds the generation_input for the stream's whole life.
         """
         return TracedStreamHandle(
-            # The un-overloaded entry point; _generate_one_any_binding says why.
+            # `_generate_one_any_binding` accepts each overloaded `response_format`.
             stream_handle=self._bound_llm._stream_one_any_binding(  # noqa: SLF001
                 generation_input, timeout_seconds=timeout_seconds
             ),
@@ -1511,8 +1378,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     takes error status when the stream raises or its consuming block leaves with an exception,
     and ends exactly once.
     Under capture_message_content the input content attributes are set when the span starts,
-    and gen_ai.output.messages when the call concludes carrying a turn, whether final() returned
-    a success variant or any of the three methods raised a GenerationError.
+    gen_ai.output.messages records any terminal result that carries a turn.
     """
 
     def __init__(
@@ -1552,9 +1418,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
 
         Called by __aenter__ alone, which raises on a second entry, so this runs at most once per handle.
-        The input content attributes are built here rather than in stream_one: stream_one opens no span and
-        does no I/O by contract, so rendering there would serialize the generation_input even for the
-        non-recording spans an unconfigured application gets, which _apply_content_attributes skips.
+        stream_one opens no span and does no I/O. Building here lets _apply_content_attributes skip non-recording spans.
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         self._span = span
@@ -1577,10 +1441,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         The value is the monotonic seconds from the span's start (__aenter__) to the first item.
         The convention defines this key as measured from request issuance;
-        the span starts one step earlier, so the value here also covers the admission wait
-        and any backoff before the request went out.
-        That is the interval a caller waited for its first chunk, and the wider origin is stated
-        so a reader comparing this against another instrumentation's value knows which way it leans.
+        This value also includes admission waits and backoff because the span starts before request issuance.
         Set only when a first item passes through this iterator,
         so a stream drained by final() without iteration carries no such attribute.
         """
@@ -1603,16 +1464,14 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         StopAsyncIteration passes through without ending the span,
         so a following final() can still set attributes and end it.
-        A cancellation passes through the same way, because __aexit__ is what can tell this handle's
-        own expired timeout_seconds from an outer cancellation, and leaving the block always runs it.
+        Cancellation passes through so __aexit__ can distinguish timeout_seconds from outer cancellation.
 
         Raises:
             StopAsyncIteration: the inner stream is exhausted; the span is left open for final().
             Exception: the inner stream raised after open_stream() returned.
         """
         if self._span is None or self._span_ended:
-            # Never entered, or the span already closed: the inner handle raises, and recording that
-            # raise on an ended span only makes the OTel SDK log "Tried calling ... on an ended span".
+            # The inner handle reports calls before entry or after span closure.
             return await self._stream_handle.__anext__()
         span = self._span
         try:
@@ -1635,8 +1494,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         Raises:
             RuntimeError: This handle was already entered.
-            Exception: the inner handle failed to open; the span is attributed by what the exception
-                is, takes error status, and ends.
+            Exception: the inner handle failed to open. The span records the exception and ends.
         """
         if self._span is not None:
             raise RuntimeError("stream already entered: call stream_one again for a new one")
@@ -1661,14 +1519,11 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Close the inner handle, then end the span if it is still open.
 
         A span already ended by a mid-iteration failure or by final() is left alone.
-        An open span abandoned with an in-flight exception (a consuming loop body that raised) records that exception
-        and takes error status before ending.
+        An active Exception is recorded before the span ends.
 
-        A cancellation leaves __anext__ and final() without ending the span, because only here is it
-        known whether it was this handle's own timeout_seconds: the inner __aexit__ turns that one
-        into a GenerationError, which is the call's result and takes the same attributes any other
-        terminal result does. An outer cancellation ends the span with no status, the run having no
-        outcome to report.
+        __aexit__ distinguishes timeout_seconds from outer cancellation.
+        A timeout becomes GenerationError with terminal result attributes.
+        Outer cancellation ends the span without status.
         """
         try:
             await self._stream_handle.__aexit__(exc_type, exc, traceback)
@@ -1689,9 +1544,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
         """Drain the inner stream, attribute the span from the result, and end the span.
 
-        The span ends exactly once: if a prior final(), a mid-iteration failure, or __aexit__ already ended it,
-        this delegates to the inner final() (which re-raises or returns its cached result)
-        without touching the span again.
+        The span ends once. After it ends, this delegates to the cached inner final() result.
 
         Raises:
             GenerationError: inner final() raised a terminal per-item result.
@@ -1699,7 +1552,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 the span records it and closes.
         """
         if self._span is None or self._span_ended:
-            # Never entered, or a prior final()/failure/__aexit__ already closed the span.
+            # Calls before entry and calls after closure do not change the span.
             return await self._stream_handle.final()
         span = self._span
         try:
@@ -1720,9 +1573,7 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
 
     The three values are the documented error list the convention asks instrumentations to publish:
     tool_error (the tool ran and authored a failure), invalid_tool_args, and unknown_tool.
-    The latter two are exactly the outcomes where the tool function never ran,
-    so error.type IN ("invalid_tool_args", "unknown_tool") separates a model producing calls the tool layer
-    rejects from a defect in application tool code, as a closed set rather than a disjunction.
+    error.type values "invalid_tool_args" and "unknown_tool" mean the tool function never ran.
     A raising tool function is classified by _record_other_exception with its exception class name instead.
     """
     if isinstance(outcome, DispatchHandled):
@@ -1738,9 +1589,7 @@ class TracedToolManager(ToolManager):
     `TracedToolManager` subclasses `ToolManager` for `LLM.bind(tools=TracedToolManager(...))`.
     `ToolManager.dispatch_many` calls `self.dispatch`.
     Overriding `dispatch` adds spans without duplicating `ToolManager.dispatch_many`.
-    The span name is "execute_tool {call.name}", the GenAI convention's {operation} {target} pattern;
-    kind is INTERNAL because dispatch runs an in-process function
-    (a CLIENT span would register as an outbound call langchaint cannot see being made).
+    The span name is "execute_tool {call.name}". SpanKind.INTERNAL represents in-process dispatch.
     dispatch makes its span current while the tool function runs (trace.use_span).
     Spans the function starts (an instrumented HTTP request, a nested agent loop) nest under the execute_tool span.
     dispatch_many stays safe: asyncio.gather runs each dispatch in its own task with a copied context.
@@ -1757,46 +1606,31 @@ class TracedToolManager(ToolManager):
     | the tool function raised            | ERROR  | the exception class name|
 
     invalid_tool_args and unknown_tool are the two values meaning the tool function never ran.
-    A tool returning is_error True is designed control flow here, not a malfunction: the model reads the failure
-    and corrects, and the same holds for the other two failure variants.
+    A tool returning is_error True lets the model correct the call.
+    The other failure variants serve the same control flow.
     So a healthy agent doing one argument-validation retry emits ERROR spans as a matter of routine,
     and a dashboard reading span status as a health signal will show that.
     That is accepted rather than worked around: error.type is the field an operator filters on,
-    and OTel's position is that status describes the operation's outcome rather than the system's health
-    (an HTTP client span for a 404 takes ERROR status though the request itself worked).
+    OTel status describes the operation outcome, so these failures use ERROR status.
 
-    Under capture_message_content the span also carries gen_ai.tool.call.arguments at span start and
-    gen_ai.tool.call.result at completion.
-    gen_ai.tool.call.result carries the tool_message as a tool_call_response part, the same shape
-    gen_ai.input.messages carries it in on a generate span, so one tool result reaches a backend under one
-    shape from both spans that report it.
+    capture_message_content records gen_ai.tool.call.arguments at span start and gen_ai.tool.call.result at completion.
+    gen_ai.tool.call.result and gen_ai.input.messages use the same tool_call_response shape.
     That shape is an object, which is what the key's note asks for ("It's expected to be an object");
-    the key's JSON schema requires an object and no property of one, so the choice among objects is
-    this module's.
-    Its response field is the parts array every other content key uses, so a str content and a
-    Sequence[ContentPart] content reaches a backend in one shape.
+    The key's JSON schema requires an object without required properties.
+    This module uses a response parts array for both str and Sequence[ContentPart].
     gen_ai.tool.call.arguments is the model's own argument JSON, deserialized on a best effort:
-    the convention expects an object and asks an instrumentation holding a serialized string to try to
-    deserialize it.
-    A span attribute cannot hold a nested object, so the deserialized value is re-serialized to the
-    JSON string the convention permits when structured form is unsupported.
+    The convention requests best-effort deserialization to an object.
+    The nested value is reserialized because span attributes cannot nest.
     On this key the effect is therefore normalization; the nesting matters on the generate span,
     whose gen_ai.input.messages embeds the same arguments in a structure serialized as a whole.
-    Text that does not parse is preserved, so the value that produced the DispatchInvalidToolArgs variant
-    is still readable, and it goes out through that same re-serialization:
-    it reaches the span as a JSON string, quoted and escaped, and a consumer decoding the attribute
-    gets the model's text back.
+    Unparseable text is preserved as a quoted JSON string.
 
     gen_ai.tool.call.result is recorded on every variant, including the two where the tool function never ran.
     The convention defines that key as the result "if any and if execution was successful",
-    so this is a deliberate departure: on those variants the value is the langchaint-rendered correction the model
-    reads and adapts to, which is the payload a reader debugging a tool loop wants, and error.type on the
-    same span already says no tool produced it, so a consumer reading both is not misled.
+    This module also records langchaint's correction for failure variants. error.type states that no tool produced it.
     gen_ai.tool.call.result is what dispatch returned, which is not necessarily what the model read:
-    the application owns the loop, so on any variant it may rewrite, replace, or drop the tool_message it
-    received before appending it to the Sequence[Message].
-    The generate span's gen_ai.input.messages then carries different text for that call, and both spans are
-    correct, each reporting its own boundary; the difference is the application's edit made visible.
+    The application may change or drop tool_message before appending it to Sequence[Message].
+    gen_ai.input.messages records the resulting value.
     The two join on the tool call id, which is gen_ai.tool.call.id here and the tool_call_response part's id there.
 
     There is no attribute_mapper parameter: the attributes are the fixed keys above,

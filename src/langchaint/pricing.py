@@ -1,15 +1,7 @@
-"""The arithmetic that spends a rate, and the Billing one attempt carries.
+"""Pricing arithmetic and per-attempt `Billing`.
 
-category_cost prices token counters.
-Billing carries priced Usage, its service tier, raw usage, and applied token prices.
-Counter times price reproduces the stored token cost.
-Records retain token arithmetic without the originating rate table.
-
-Each backend subpackage defines the rate table its adapter spends.
-This module names no rate-table type.
-
-This module imports no SDK or error class.
-Missing category rates produce NaN instead of exceptions.
+Provider subpackages define rate tables.
+A nonzero category with no configured rate costs NaN.
 """
 
 from collections.abc import Mapping
@@ -24,9 +16,8 @@ from langchaint.usage import Usage
 def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, model: str) -> None:
     """Require the pricing key every response reporting no tier of its own prices at.
 
-    An adapter constructor calls this with the key its provider's tierless responses select
-    ("default", "ON_DEMAND"), so a missing key raises before the first request instead of pricing
-    every such response as NaN, with nothing said until the cost comes back unknown.
+    An adapter constructor passes the key selected by tierless responses, such as `"default"` or `"ON_DEMAND"`.
+    A missing key then raises before the first request.
 
     Raises:
         ValueError: key is not in pricing.
@@ -41,8 +32,8 @@ def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, mode
 def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
     """Price one token category, preserving zero when the rate is unknown.
 
-    The zero case is explicit because 0 * NaN is NaN, and an attempt that billed nothing in a
-    category must not make a total unknown when that category has no rate.
+    `0 * NaN` is NaN.
+    A zero-token category must therefore preserve a known zero cost.
     """
     if not tokens:
         return 0.0
@@ -76,21 +67,11 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
 
 @dataclass(frozen=True, kw_only=True)
 class Billing:
-    """What one attempt billed: the priced counters, what priced them, and the prices that applied.
+    """One attempt's priced usage, service tier, raw usage, and applied rates.
 
-    The four token prices are what this attempt's tokens priced at.
-    A stored row reproduces its token arithmetic without the originating rate table.
-    Later rate changes cannot reprice held history.
-    A provider that bills cache writes at more than one rate in one response reports the blend of
-    what those writes cost, since the counters behind the split do not survive into Usage.
-    A price is NaN where no rate stood behind that category, which leaves the response's own
-    counters intact and says the cost is unknown.
-
-    service_tier is the tier whose rates priced this attempt, at the provider's own spelling. Where
-    a response reports a value that names no tier of its own ("auto", or nothing at all), it is the
-    concrete tier that value resolved to, so the tier and the prices beside it always agree.
-    usage_raw is the provider's usage object, held by reference: a live, mutable pydantic object
-    despite the frozen dataclass around it, so treat it read-only.
+    Stored rates reproduce token costs without the original rate table.
+    A missing category rate is NaN.
+    `usage_raw` holds the mutable provider object by reference; copy it before mutation.
     """
 
     usage: Usage
@@ -105,9 +86,10 @@ class Billing:
     def cache_savings_in_usd(self) -> float:
         """What prompt caching saved this attempt against billing every input token uncached.
 
-        The counterfactual prices the whole input at the uncached rate; output cost is identical
-        under both and cancels. Negative where write premiums exceeded read discounts, NaN where a
-        nonzero input counter has no rate behind it, and 0.0 where no input was billed.
+        The counterfactual prices every input token at the uncached rate.
+        Output cost cancels because it is identical in both totals.
+        The result is negative when write premiums exceed read discounts.
+        It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input was billed.
         """
         uncached = category_cost(
             self.usage.input_tokens_total, self.input_cache_none_usd_per_million_tokens

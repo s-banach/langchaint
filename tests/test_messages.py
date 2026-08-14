@@ -1,9 +1,4 @@
-"""The kind discriminator on Message, ContentPart, and TurnPart.
-
-Persist/resume serializes a Sequence[Message] with a TypeAdapter and re-validates it,
-so a payload that re-validates to the wrong variant silently corrupts replay.
-Every variant carries a kind tag, and a payload without one is rejected rather than matched by shape.
-"""
+"""Test kind validation and JSON round trips for Message, ContentPart, and TurnPart."""
 
 import json
 from collections.abc import Callable
@@ -34,8 +29,7 @@ _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Mes
 def test_turn_parts_validate_to_the_variant_their_tag_names() -> None:
     """A persisted turn validates each part from its kind.
 
-    Selecting the wrong variant would corrupt replay, and a ReasoningPart
-    whose raw came back changed is a request the producing provider rejects.
+    kind preserves each variant and ReasoningPart.raw during replay.
     """
     raw = {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc-1"}
     message = AssistantMessage.model_validate({
@@ -145,8 +139,7 @@ def test_tool_message_error_accepts_part_content() -> None:
 def test_binary_image_bytes_round_trip_through_json() -> None:
     """A UserMessage and a ToolMessage holding non-UTF-8 image bytes survive the JSON round trip.
 
-    Real image bytes are rarely valid UTF-8, so a persisted conversation holding an image
-    depends on data having a JSON representation of its own.
+    Binary image data has a JSON representation independent of UTF-8.
     """
     image = ImagePart(data=b"\x89PNG\x00\xff", media_type="image/png")
     messages: tuple[Message, ...] = (
@@ -336,8 +329,7 @@ def test_messages_from_json_rejects_text_that_is_not_a_message_list() -> None:
 def test_messages_to_json_raises_on_a_raw_value_json_cannot_represent() -> None:
     """A ReasoningPart.raw holding a non-JSON-representable object raises, never silently reshapes.
 
-    This pins the failure mode for a hand-built ReasoningPart: a raise, not a lossy fallback the replay
-    would send.
+    A hand-built unserializable ReasoningPart raises without a lossy fallback.
     """
     message = AssistantMessage(turn=(ReasoningPart(raw={"payload": object()}),))
     with pytest.raises(PydanticSerializationError):

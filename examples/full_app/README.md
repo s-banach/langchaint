@@ -5,9 +5,8 @@ langchaint supplies generation, tools, accounting, deadlines, and tracing.
 The application supplies the loop and progress events.
 
 `task_stream.py` contains the application.
-Its callback is `on_event: Callable[[Event], None]`.
-The callback reports progress synchronously.
-It is not `BoundLLM.stream_one`.
+Its synchronous `on_event: Callable[[Event], None]` callback reports progress.
+The callback is not `BoundLLM.stream_one`.
 
 ## Run offline
 
@@ -57,20 +56,16 @@ For example, the first specialist uses `root/research_climate/specialist#0`.
 
 ## Required configuration
 
-`AgentConfig.automatic_cache_breakpoints` has no default.
-Each binding receives that exact value.
-`App.capture_message_content` has no default.
-Each tracing wrapper receives that exact value.
+`AgentConfig.automatic_cache_breakpoints` has no default and passes unchanged to each binding.
+`App.capture_message_content` has no default and passes unchanged to each tracing wrapper.
 
 `AgentConfig.generate_one_timeout_seconds` becomes `generate_one(timeout_seconds=...)`.
 That deadline includes admission, retries, and provider work.
 `max_turns` bounds repeated `TimedOutError` outcomes.
 
 `AgentConfig.max_cost_in_usd` is optional.
-The loop checks it before each turn.
-The loop stops when `cost_in_usd` reaches the configured value.
-A NaN `cost_in_usd` cannot satisfy a configured limit.
-The loop raises instead of continuing with unknown cost.
+The loop checks `cost_in_usd` before each turn and stops at the configured value.
+The loop raises on a NaN `cost_in_usd` instead of continuing with unknown cost.
 
 ## Progress events
 
@@ -95,8 +90,7 @@ The remaining accounting fields are exact:
 `usage_so_far` covers the emitting run and its descendants.
 `reported_usage` covers spend returned through `ToolOutputExplicit.app_data`.
 
-`ToolProgress` cannot read the current `AgentRun.usage`.
-It therefore carries no accounting field.
+`ToolProgress` carries no accounting field because it cannot read the current `AgentRun.usage`.
 
 ## Deadlines and cancellation
 
@@ -124,15 +118,13 @@ Those partial outcomes correlate through validated `tool_call_id` values.
 The loop records settled `app_data` before re-raising the defect.
 
 `DispatchExceptionGroup` always propagates from `delegate` and `_settle_node`.
-Other sub-agent failures become parent-readable tool errors.
-The parent can then finish without the failed sub-agent answer.
+Other sub-agent failures become parent-readable tool errors, so the parent can finish without the failed answer.
 
 ## Tracing
 
 `AgentRun.final` opens one `agent_span` around the loop.
 Its `generate_one` spans become children of that span.
-A delegated run starts inside the `delegate` tool span.
-Its `agent_span` therefore becomes that tool span's child.
+A delegated run's `agent_span` becomes a child of its `delegate` tool span.
 
 `capture_message_content` controls message content on generated spans.
 OpenTelemetry configuration controls recording and export.

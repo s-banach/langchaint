@@ -4,61 +4,143 @@ A provider-neutral LLM client library. Alpha: the API is unstable and may change
 
 ## Docstrings and comments
 
-Never cite internal dev documents, decision logs, spec files, or dead alternatives to the live code.
-Never refer to the repo's own prior state. Diff-relative prose is a sentence that only makes sense to a reader who saw the change that introduced it: wording like "as before", "no longer", or "now", a reference to a state that exists nowhere in the current tree, or a justification for a question no reader of the file would ask. The test: a sound sentence reads the same whether the code was born in its current shape or arrived there by refactor.
+Never cite internal dev documents, decision logs, spec files, dead alternatives, or the repo's prior state.
+Delete prose that depends on a reader knowing an earlier version.
+A sound sentence is independent of history.
 
-Module docstrings are the spec of record for mechanics; CLAUDE.md is the spec of record for principles. Write in CLAUDE.md only a cross-module rule, its criterion, and at most one edge-case example per rule; keep how a behavior works in the docstring of the code that implements it, and when such a behavior changes, update that docstring, not CLAUDE.md. The durability test: a CLAUDE.md sentence reads the same after any refactor that preserves the design tenets, so a sentence naming a symbol belongs in that symbol's docstring, except where the rule is about that name (`input_tokens`).
-A design rule earns its place here only if it is universally beneficial, so that a reader who had never seen langchaint would still call it correct. A choice that is merely the one langchaint made, including a feature deliberately not built, is not a design rule: it belongs in the docstring of the code a reader would reach for it in.
-Never record a design deliberation anywhere in the repo: no sentence of the form "X is rejected", "X was considered", or "we chose this over X". State what the code does and why. Where a feature langchaint does not have has a user-facing answer, write that answer as what the reader should do instead, and write nothing when there is none.
+Module docstrings specify mechanics.
+CLAUDE.md states cross-module principles.
+Write only a cross-module rule, its criterion, and at most one edge-case example in CLAUDE.md.
+Put behavior in the implementing code's docstring.
+Update that docstring when behavior changes.
+A CLAUDE.md rule must survive any refactor that preserves the design tenets.
+Put a rule that names a symbol in that symbol's docstring unless the rule defines the name itself, such as `input_tokens`.
 
-Document what a function raises. In every function whose body can raise (directly, by re-raising, or by propagating a documented raise from a helper), name the exception types a caller may see and the condition for each, in a `Raises:` section when the raise is direct or in prose when it is not. Enforce this in review, not lint: the de-selected ruff docstring rules cannot catch a missing or stale raise (see the note in `pyproject.toml`).
+Keep only universally beneficial design rules in CLAUDE.md.
+Put langchaint-specific choices in the relevant code docstring.
+
+Never record design deliberation in the repo.
+State current behavior and its reason.
+For an absent feature with a user-facing answer, state what the reader should do.
+Write nothing when no user-facing answer exists.
+
+Document every exception a function can raise or propagate and its condition.
+Use `Raises:` for direct raises and prose for propagated raises.
+Enforce this in review because Ruff cannot detect missing or stale raises.
 
 ## Provider facts
 
-Never assert provider behavior (wire parameters, usage-field semantics, exception taxonomies, cache rules) from memory; verify it against the installed `anthropic`/`openai` packages by introspection before writing or reviewing code that depends on it.
+Never assert provider behavior from memory.
+Verify it by introspecting the installed `anthropic` and `openai` packages before writing or reviewing dependent code.
 
-Put a verified fact in a docstring only where the caller acts on it, naming the outcome the caller handles and not the SDK mechanism reaching it, with the SDK version when it could drift.
+Put a verified provider fact in a docstring only where the caller acts on the outcome.
+Name the outcome and omit the SDK mechanism.
+Include the SDK version when the fact can drift.
 
 ## Naming rules
 
 - Give the keyword and the variable passed to it one name: `tool_manager=tool_manager`.
-- Call the project "langchaint", never "the package" or "the library"; use "package" only for its Python meanings.
-- Say "adapter" for an implementation of the class `Adapter`, including in compounds, and "provider" for anthropic and openai themselves and for a platform serving their models; a concrete name composes the two (`AnthropicMessagesAdapter`). "Provider" is wider than the company because the serving platform counts: one adapter reports a different `provider_name` over a direct client than over a Bedrock one.
-- Prefer neutral over provider vocabulary: when providers disagree, take the majority wire name or a neutral one (`ToolCall` not `ToolUse`).
+- Call the project "langchaint", never "the package" or "the library".
+- Use "package" only for its Python meanings.
+- Call an `Adapter` implementation an "adapter".
+- Call anthropic, openai, and model-serving platforms "providers".
+- Compose each concrete adapter name from its provider and adapter, as in `AnthropicMessagesAdapter`.
+- One adapter may report different `provider_name` values for direct and Bedrock clients.
+- Use neutral vocabulary when providers disagree: choose the majority wire name or a neutral name (`ToolCall`, not `ToolUse`).
 - Never write bare `input_tokens`: anthropic's field of that name excludes cache reads while openai's equivalent includes them. Use the partition `input_tokens_cache_read`/`_cache_write`/`_cache_none` and the derived `input_tokens_total`.
 - Put units and encodings in names (`cost_in_usd`, `elapsed_seconds`); mark unparsed JSON text with the `_json` suffix.
-- Use family prefixes to keep related fields adjacent in sorts and completions: `input_tokens_*`, `generate_one`/`generate_many` (arity in the suffix).
-- Never stutter with the holder (`tool.name`, not `tool.tool_name`); carry the full name on cross-object references (`tool_call_id` on `ToolMessage`).
-- Give the plain noun to the interface, because the protocol name is read far more often than any concrete name is written; name concrete forms by the technology their argument spec is written in, except a form distinguished by its fixed behavior, which is named for that behavior.
+- Prefix related fields so sorts and completions group them: `input_tokens_*`, `generate_one`, and `generate_many`.
+- Do not repeat the holder in an attribute name (`tool.name`, not `tool.tool_name`).
+- Use the full name for cross-object references (`tool_call_id` on `ToolMessage`).
+- Give the interface the plain noun.
+- Name each concrete form for its argument-spec technology or fixed behavior.
 - Use `cache_breakpoint` as the neutral name for a user-placed prompt-cache boundary: True on a part means the reusable prompt prefix ends there.
 - Count `max_attempts` as requests sent, including the first. Configure SDK clients with no internal retries.
-- Keep `content`, `output`, and `raw` three concepts, never one word: a model-facing message body, the generation result payload, and provider data langchaint models nothing inside and hands back unchanged. `reasoning` names what the model produced, never a fourth name for one of those three.
+- Keep `content`, `output`, and `raw` distinct: model-facing message body, generation result payload, and provider data langchaint passes through unchanged.
+- Use `reasoning` only for reasoning the model produced.
 
 ## Design rules
 
-- Leave the tool loop to the application: ship no agent loop, and make a tool function return data, never a control-flow signal.
+- Leave the tool loop to the application.
+- Ship no agent loop.
+- Make tool functions return data, never control-flow signals.
 - Create one `SharedBackoff` per rate-limit quota. Its `admitted()` block gates every request-start path.
-- Wrap official SDK clients and delegate stream assembly to the SDK. Write no wire TypedDicts by hand. Validate a structured response against the caller's model where the response is in scope, because an SDK that validates inside the call returning the response raises where neither the response nor its billing is reachable.
-- Give the error taxonomy one axis, retry: retry a transient error and propagate the rest. Every non-transient error is one item's own failure, so a batch returns one outcome per `GenerationInput` and no item's failure cancels a sibling. A defect langchaint can detect in a binding raises before any request is sent. Never report a parse that returned no output as data.
-- Put the provider's own error text in the error langchaint raises, unabridged: a prefix naming what failed, then the provider string. Never summarize, truncate, or replace it, because the provider's wording is the only description of a condition langchaint does not model. Keep generated content out of `error_text` and `__str__`: the tracing layer writes both into spans unconditionally, so content placed there escapes whatever `capture_message_content` the caller chose. Content a caller recovers from a failure goes on its own field.
-- Admit a field to `Usage` only if it is a provider-invariant counter or one of the priced categories partitioning what a request cost; keep provider-specific detail on the raw SDK usage beside it, and never let `usage` be `None` on a carrier. A cost that is not one category's spend has no field: a total is derived from the categories, and an application's own fee is the application's to carry.
+- Wrap official SDK clients.
+- Let the SDK assemble streams.
+- Do not define wire TypedDicts.
+- Validate a structured response against the caller's model while the response and its billing remain available.
+- Classify errors only by retry behavior.
+- Retry transient errors and propagate others.
+- Return one outcome per `GenerationInput` without letting one non-transient failure cancel a sibling.
+- Raise detectable binding defects before requests.
+- Never return a parse with no output as data.
+- Preserve provider error text verbatim after a prefix naming the failure.
+- The provider text describes an unmodeled condition.
+- Keep generated content out of `error_text` and `__str__` because tracing records both regardless of `capture_message_content`.
+- Put recoverable content in its own field.
+- Add a field to `Usage` only for a provider-invariant counter or priced category that partitions request cost.
+- Keep provider-specific details on the raw SDK usage.
+- Require `usage` on every carrier.
+- Derive totals from categories.
+- Let applications carry their own fees.
 - Scope `usage` as the paid total across every attempt, on success and on failure.
-- Price a category the rate table cannot price as NaN, never as an exception and never as zero: the response was paid for, so reporting an unknown cost must not destroy the output.
-- Never fabricate a price or a model catalog: default pricing only from a carried rate table, require it where no table maps to the model id, and call a first-party list price on a rate-setting platform an estimate.
-- Never take data out of an SDK object only to reconstruct it in a langchaint object of the same shape; pass provider values through by reference, constructing a langchaint model only where the shape genuinely changes.
-- Discriminate outcomes by type, not a nullable flag: return a union of frozen dataclasses, one variant per outcome, extra data as required non-optional fields, so matching narrows and no consumer writes `cast` or `assert x is not None`. Every variant carries a `Literal` `kind` field defaulting to its own snake-cased name, dropping any word every variant shares, so a caller selects a variant without importing it and a match on `kind` is checked for exhaustiveness. A variant that is a builtin cannot hold a tag, so `isinstance` selects it; where more than one class variant remains, each still carries its own tag. Split only where fields genuinely differ; the rule governs a value a caller branches on, not an element type consumed by folding.
-- Preserve reasoning verbatim across turns: re-emit every trace in place, unconditionally. Trimming is the application's job.
-- Honor user inputs faithfully, even invalid ones, and make no promise about how a provider will respond: never probe an endpoint to learn its errors, never add client-side guards guessing at provider-side rules, and do not restate this per case. Reserve client-side raises for documented provider facts and for defects that would otherwise produce a silently wrong result.
-- Use pydantic only where serde plus validation pay for themselves; everything else is a frozen dataclass or NamedTuple, and each qualifying model's docstring states what its validation buys. Derive every pydantic model from the checked-copy base, on which a key that is not a field is an error.
-- Keep the SDKs optional dependencies the application pins directly; declare no extras. The import path is the boundary: the neutral core imports no SDK; each backend subpackage imports its SDK at module top, guarded so a missing package raises a `ModuleNotFoundError` naming what to install.
-- Name each backend class for its provider. Compose Bedrock class names with the model provider. Send each model id verbatim. Require `pricing` where no carried table maps the model id. Document every parameter and cross-provider difference. Each subpackage docstring carries the pricing source URL.
-- Tier the public surface by audience: applications import from top-level `langchaint` and the backend subpackages; adapter authors import from `langchaint.adapter` and `langchaint.conformance`. Top-level `__all__` re-exports only the SDK-free application surface.
-- Check only what a type checker cannot. Applications are expected to run a strict one, so a runtime check that an argument has its annotated type duplicates it; check what a correctly-typed argument can still get wrong, such as a value out of range. `bool` is the case worth stating: it subclasses `int`, so a checker admits `True` wherever an `int` is annotated. A test that suppresses the type checker to reach a runtime check is a test of the type checker, so delete it rather than the suppression.
-- Ship OTel tracing in-tree as a thin, guarded-import subpackage off the top-level `__all__`. Premises: never fake an event boundary a span measures; the mapper gets attribute names and values, never the `GenerationInput`; catch and log telemetry failures, never propagate; wrap unconditionally, and leave enable/disable/routing to OTel SDK configuration. Record message content only through `capture_message_content`, a required keyword with no default. Use a convention key wherever one exists; reserve `langchaint.*` for what the convention lacks.
+- Set an unpriceable category to NaN.
+- Never raise or use zero for an unknown cost.
+- An exception would discard paid output, and zero would hide unknown cost.
+- Never fabricate prices or model catalogs.
+- Use default pricing only from a carried rate table.
+- Require `pricing` when no rate table maps the model id.
+- Label a first-party list price from a rate-setting platform an estimate.
+- Pass provider values through by reference.
+- Construct a langchaint model only when its shape differs from the SDK object.
+- Represent branchable outcomes as a union of frozen dataclasses with one variant per outcome.
+- Split variants only where their fields differ.
+- Require all extra data as non-optional fields.
+- Give each class variant a `Literal` `kind` defaulting to its snake-cased name after dropping words shared by every variant.
+- Use `kind` for exhaustive matching without imports.
+- Select builtin variants with `isinstance`.
+- This shape narrows types without `cast` or nullable assertions.
+- Do not split an element type consumed by folding.
+- Re-emit every reasoning trace verbatim and in place across turns.
+- Let applications trim reasoning.
+- Send user inputs verbatim, including invalid inputs.
+- Do not predict provider responses, probe endpoints, or add guards based on guessed provider rules.
+- Do not restate this rule for individual cases.
+- Raise client-side only for documented provider facts and detectable defects that would produce a silently wrong result.
+- Use pydantic only when serde and validation justify it.
+- Use a frozen dataclass or NamedTuple otherwise.
+- State the validation benefit in each pydantic model docstring.
+- Derive every pydantic model from the checked-copy base, which rejects keys that are not fields.
+- Keep SDKs as optional dependencies that the application pins directly.
+- Declare no extras.
+- Keep SDK imports out of the neutral core.
+- Import each SDK at the backend subpackage module top under a guard that raises `ModuleNotFoundError` with installation instructions.
+- Name each backend class for its provider.
+- Compose Bedrock class names with the model provider.
+- Send each model id verbatim.
+- Document every parameter and cross-provider difference.
+- Put the pricing source URL in each subpackage docstring.
+- Applications import from top-level `langchaint` and backend subpackages.
+- Adapter authors import from `langchaint.adapter` and `langchaint.conformance`.
+- Top-level `__all__` re-exports only the SDK-free application surface.
+- Use runtime checks only for errors a correctly typed argument can contain, such as an out-of-range value.
+- A strict type checker handles argument types.
+- A strict type checker accepts `True` as `int` because `bool` subclasses `int`.
+- Delete tests that suppress the type checker only to reach a runtime type check.
+- Ship thin OTel tracing in-tree as a guarded-import subpackage outside top-level `__all__`.
+- Never make a span measure a fake event boundary.
+- Give the mapper attribute names and values, never the `GenerationInput`.
+- Catch and log telemetry failures.
+- Never propagate telemetry failures.
+- Always wrap and use OTel SDK configuration for enabling, disabling, and routing.
+- Record message content only through `capture_message_content`, which is required and has no default.
+- Use convention keys where available and `langchaint.*` otherwise.
 
 ## Module map
 
-One line per module saying what it is for; the module docstring is the spec of what it holds. No symbol lists: an inventory goes stale on every added name.
+Use one line per module to state its purpose.
+Use the module docstring to specify its contents.
+Do not list symbols because inventories become stale.
 
 - `llm.py`: the client `LLM` and the `BoundLLM` its `bind` returns.
 - `adapter.py`: the neutral base contract, dual-audience; imports no SDK.
@@ -74,7 +156,7 @@ One line per module saying what it is for; the module docstring is the spec of w
 - `messages.py`: the provider-neutral message tree and content parts, and their JSON round trip.
 - `usage.py`: token accounting and the per-category costs that travel with it.
 - `checked_copy.py`: the base of langchaint's pydantic models.
-- `pricing.py`: the arithmetic that spends a rate and the `Billing` an attempt carries; imports no SDK and no error class. A rate table is provider-shaped and lives in the backend subpackage whose adapter spends it.
+- `pricing.py`: rate arithmetic and the `Billing` an attempt carries. It imports no SDK or error class. Each provider-shaped rate table lives in the backend subpackage whose adapter spends it.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: the backend subpackages; importing one requires its SDK.
 - `inference_params.py`: the inference parameters.
 - `run_many.py`: runs zero-argument async callables under a pending bound. It imports nothing from langchaint and models nothing about LLMs.
@@ -83,16 +165,27 @@ One line per module saying what it is for; the module docstring is the spec of w
 
 ## Checks
 
-Trigger: before committing. Run `scripts/CI.sh`; fix every error it reports and rerun until it reports zero.
+Trigger: before committing.
+Run `scripts/CI.sh` until it reports zero errors.
 
-It runs `pyrefly check`, `ruff check`, `ruff format --check`, and `pytest` through `uv run`, so the tools resolve from the locked dev group. The de-selected docstring rules and their reasons are in `pyproject.toml`. Keep the tests offline (constructed SDK objects, stub adapters, no API keys).
+`scripts/CI.sh` runs `pyrefly check`, `ruff check`, `ruff format --check`, and `pytest` through `uv run`.
+`pyproject.toml` explains the de-selected docstring rules.
+Keep tests offline with constructed SDK objects, stub adapters, and no API keys.
 
 ## Releasing
 
-Trigger: releasing a version. Bump `version` in `pyproject.toml` and push to `main`. Never create a `v*` tag by hand: `.github/workflows/publish.yml` publishes to PyPI and cuts the tag, and its gate publishes only a version strictly above every existing `v*` tag, so a hand-made tag stops the release it was meant to mark.
+Trigger: releasing a version.
+Bump `version` in `pyproject.toml` and push to `main`.
+Never create a `v*` tag by hand.
+`.github/workflows/publish.yml` publishes to PyPI and creates a tag only when `version` exceeds every existing `v*` tag.
+A manual tag for the release version blocks the release.
 
-Pushing the bump to `main` is therefore the release act, and PyPI does not accept a re-upload of a version that already exists. Confirm with the user before pushing a commit that changes `version`.
+Confirm with the user before pushing a commit that changes `version`.
+PyPI does not accept a re-uploaded version.
 
 # Casts
 
-`cast` is on the global code-smell list, and here its keep-with-a-comment escape does not apply: redesign every `cast` away except at two boundaries. First, a deliberately-opaque value re-enters a typed API whose own serialization produced it, and the alternative is worse (for example a revalidation that silently reshapes the payload). Second, a langchaint vocabulary is deliberately wider than the SDK literal it is sent as, under "Honor user inputs faithfully". Keep a surviving `cast` to one line, its comment naming which boundary.
+Redesign every `cast` away except at two boundaries.
+Keep a `cast` when a deliberately opaque value re-enters the typed API that serialized it and redesign would reshape the payload.
+Keep a `cast` when langchaint vocabulary is deliberately wider than the SDK literal under "Honor user inputs faithfully".
+Keep each surviving `cast` on one line with a comment naming its boundary.

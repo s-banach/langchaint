@@ -1,8 +1,8 @@
-"""OpenAI embedding requests over the official asynchronous SDK.
+"""OpenAI embeddings use the official asynchronous SDK.
 
 OpenAI 2.53.0 returns indexed float embeddings in `CreateEmbeddingResponse`.
 OpenAI accepts at most 2048 inputs and 300,000 tokens per request.
-This adapter counts tokens with `cl100k_base` through tiktoken 0.13.0.
+The adapter counts tokens with `cl100k_base` through tiktoken 0.13.0.
 """
 
 from functools import partial

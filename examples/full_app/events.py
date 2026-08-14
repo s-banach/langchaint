@@ -1,24 +1,8 @@
-"""The UI event vocabulary, and the ambient emitter that lets a tool function join it.
+"""Define UI events and route tool progress to the current run.
 
-One frozen dataclass per event, matched by type; agent_path names the run that emitted it
-("root", "root/research_climate", "root/research_climate/specialist#0"),
-which is what lets a UI nest a sub-agent's events under the tool call that started it.
-A tool-spawned run carries a spawn index after "#", because an agent's name is not unique within a
-parent and agent_path is the one identity an event carries: without it, two spawns of one name would
-interleave indistinguishably in a UI.
-
-Progress events carry usage_so_far when the run knows its total.
-Terminal events carry usage.
-usage_so_far includes the run's sub-agent spend.
-Terminal usage includes the run's sub-agent spend.
-LlmResponse.usage covers its `generate_one` call only.
-ToolProgress carries neither field.
-
-GuiEmitter and current_gui_emitter live here, in the lowest shared module, so a tool function reaches
-its run's on_event without importing the run machinery, which itself imports the tools.
-
-describe_error and content_text live here rather than in the run machinery, because they render the
-strings two of these events carry: AgentFailed.error and ToolResponse.content.
+agent_path identifies the emitting run and includes a spawn index for tool-spawned runs.
+usage_so_far and terminal usage include sub-agent spend.
+LlmResponse.usage covers one generate_one call.
 """
 
 from collections.abc import Callable
@@ -29,10 +13,7 @@ from langchaint import TextPart, ToolMessage, Usage
 
 
 def describe_error(error: BaseException) -> str:
-    """Render an exception for a UI, keeping the type when the message is empty.
-
-    TimeoutError carries no message, so str() alone would show a failure with no stated cause.
-    """
+    """Render an exception with its type and optional message."""
     text = str(error)
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
@@ -47,18 +28,14 @@ def content_text(message: ToolMessage) -> str:
 
 @dataclass(frozen=True)
 class AgentStarted:
-    """A run began; agent_path's last segment is the run's own name plus any spawn index."""
+    """Report that a run began."""
 
     agent_path: str
 
 
 @dataclass(frozen=True)
 class TurnStarted:
-    """A run is about to send its next generate call.
-
-    turn_number counts from 1 and is the same number max_turns bounds,
-    so a UI showing "turn 3/10" reads both from here.
-    """
+    """Report the start of a numbered turn."""
 
     agent_path: str
     turn_number: int
@@ -67,11 +44,10 @@ class TurnStarted:
 
 @dataclass(frozen=True)
 class LlmResponse:
-    """One generate call returned, which is where a UI refreshes the run's token counts.
+    """Report one generate response and updated usage.
 
-    text is the assistant text, empty on a pure tool-call turn.
-    usage is that one call's billing; usage_so_far is the run's total with this call already folded in,
-    which is the number a per-agent token counter redraws to.
+    text is empty for a response containing only tool calls.
+    usage covers this call, and usage_so_far covers the run.
     """
 
     agent_path: str
@@ -83,11 +59,10 @@ class LlmResponse:
 
 @dataclass(frozen=True)
 class ToolCalled:
-    """The model requested a tool, emitted before dispatch so a UI shows the call while it runs.
+    """Report a tool request before dispatch.
 
-    args_json is the model's raw argument text, unvalidated: it is what the model actually sent,
-    including the malformed text behind a DispatchInvalidToolArgs.
-    tool_call_id ties this event to the ToolResponse that settles it.
+    args_json preserves the model's unvalidated argument text.
+    tool_call_id links the request to its ToolResponse.
     """
 
     agent_path: str
@@ -100,13 +75,12 @@ class ToolCalled:
 
 @dataclass(frozen=True)
 class ToolResponse:
-    """One tool dispatch settled, which is where a UI marks the call done and shows its result.
+    """Report one settled tool request.
 
-    tool_call_id matches the ToolCalled that opened it.
-    content is what the model will read; is_error marks a failed, declined, or misrouted call.
-    reported_usage is spend the tool itself reported through app_data, ZERO_USAGE when it reported none;
-    it is already folded into usage_so_far. A sub-agent call reports none, because a sub-run records its
-    own spend as it goes, so its cost shows up as a jump in usage_so_far and not here.
+    tool_call_id links this event to ToolCalled.
+    content is the model-facing result.
+    is_error marks failed, declined, and misrouted calls.
+    reported_usage is the Usage from DispatchHandled.app_data, or ZERO_USAGE otherwise, and is included in usage_so_far.
     """
 
     agent_path: str
@@ -121,12 +95,7 @@ class ToolResponse:
 
 @dataclass(frozen=True)
 class ToolProgress:
-    """A tool function reported progress mid-call, through the run's ambient GuiEmitter.
-
-    Emitted between a ToolCalled and its ToolResponse, so a UI shows a long call moving rather than a
-    spinner. agent_path is the run whose dispatch is executing the tool, stamped by
-    GuiEmitter.emit_tool_progress, so the same tool function reports to whichever run called it.
-    """
+    """Report tool progress through the current run's GuiEmitter."""
 
     agent_path: str
     tool_name: str
@@ -135,13 +104,10 @@ class ToolProgress:
 
 @dataclass(frozen=True)
 class LlmCallAbandoned:
-    """One call outran config.generate_one_timeout_seconds; the run continues.
+    """Report a call that exceeded config.generate_one_timeout_seconds.
 
-    The request may have completed and billed server-side beyond what the provider had reported
-    when the deadline hit, and that remainder is unobservable client-side. The TimedOutError
-    on the run's turn_log records the drop, and usage_so_far gains what it accounts for.
-    turn_number is the turn whose call was dropped; the next turn resends from the same messages,
-    which the dropped call left untouched.
+    usage_so_far includes billing reported before the timeout.
+    The next turn reuses the unchanged messages.
     """
 
     agent_path: str
@@ -151,7 +117,7 @@ class LlmCallAbandoned:
 
 @dataclass(frozen=True)
 class AgentFinished:
-    """A run produced its answer; usage is that run's whole spend, sub-runs included."""
+    """Report a run's answer and total usage."""
 
     agent_path: str
     answer: str
@@ -160,7 +126,7 @@ class AgentFinished:
 
 @dataclass(frozen=True)
 class AgentFailed:
-    """A run failed; usage is its settled spend."""
+    """Report a run's failure and settled usage."""
 
     agent_path: str
     error: str
@@ -169,7 +135,7 @@ class AgentFailed:
 
 @dataclass(frozen=True)
 class AgentCancelled:
-    """An outer scope cancelled a run; usage is its settled spend."""
+    """Report a run's cancellation and settled usage."""
 
     agent_path: str
     usage: Usage
@@ -191,44 +157,27 @@ type Event = (
 
 @dataclass(frozen=True)
 class GuiEmitter:
-    """The identity and on_event of the run that is executing right now, held without a reference to the run.
-
-    One emitter per run, installed in a contextvar by that run's final() for its duration, so code
-    reached from anywhere inside the run's loop sends to the right on_event by asking rather than by
-    being handed one. A tool function is the case that needs it: the function holds no handle on the
-    run that dispatched it, and no amount of threading gets one in without a parameter on every tool.
-    """
+    """Route progress to the current run's on_event callback."""
 
     agent_path: str
     on_event: Callable[[Event], None]
 
     def emit_tool_progress(self, *, tool_name: str, message: str) -> None:
-        """Emit a ToolProgress stamped with this run's agent_path; on_event runs in this frame.
-
-        The stamp lives here so a tool function cannot misfile its progress under another run's path.
-        """
+        """Emit ToolProgress with this run's agent_path."""
         self.on_event(
             ToolProgress(agent_path=self.agent_path, tool_name=tool_name, message=message)
         )
 
 
 gui_emitter_var: ContextVar[GuiEmitter] = ContextVar("full_app_gui_emitter")
-"""Set by each run's final() and reset on its way out, so nesting restores the parent's emitter.
-
-asyncio copies the context at task creation, so a task created inside the run (a tool dispatch)
-inherits the run's emitter, for the same reason OTel spans nest across tasks; a sub-run started
-inside such a task installs its own without disturbing the parent's.
-"""
+"""Store the current run's GuiEmitter."""
 
 
 def current_gui_emitter() -> GuiEmitter:
-    """Return the emitter of the run this call is running inside.
+    """Return the current run's GuiEmitter.
 
     Raises:
-        LookupError: no run is current, which means this code is not reached from inside a run's loop.
-            Emitting from outside a run has no on_event to go to, so it is an error rather than a
-            silent drop, and the default LookupError names only a variable, so it is replaced with one
-            naming what to install and where.
+        LookupError: no run is current.
     """
     try:
         return gui_emitter_var.get()

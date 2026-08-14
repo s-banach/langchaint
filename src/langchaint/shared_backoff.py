@@ -1,23 +1,8 @@
 """Paced request admission for one rate-limit quota.
 
-One `SharedBackoff` coordinates requests sharing one rate-limit quota.
-Its `admitted()` block spans one request attempt.
-Entry acquires a permit when `max_concurrent_requests` is set.
-Provider pushback pauses every request using the same `SharedBackoff`.
-Waiting requests remain ordered by arrival.
-`max_request_starts_per_second` spaces request starts.
-Exit records provider pushback before returning the permit.
-`SharedBackoff` retries no requests and counts no tokens.
-It does not bound pending work.
-
-`PauseAll` and `PauseAllDoNotRetry` change shared state.
-`RetryThisOne` and `DoNotRetry` change no shared state.
-Status, error type, and provider retry directives determine each `Verdict`.
-`retry-after` states wait duration only.
-
-Deadlines use `time.monotonic`.
-Timestamp-formatted `retry-after` values require wall-clock comparison.
-This module supports many asyncio tasks within one event loop.
+`SharedBackoff.admitted` applies concurrency, request-rate, queue-order, and shared-pause constraints.
+`PauseAll` and `PauseAllDoNotRetry` pause the quota.
+`RetryThisOne` and `DoNotRetry` leave shared state unchanged.
 """
 
 import asyncio
@@ -75,13 +60,9 @@ class DoNotRetry:
 
 @dataclass(frozen=True, kw_only=True)
 class PauseAllDoNotRetry:
-    """The provider told us to stop sending for a while, and told this request not to come back.
+    """Pause shared requests and stop retrying this request.
 
-    retry_after is the wait the provider named in seconds, None where it named none.
-    It serves the shared pause rather than this request, which is why this variant carries one and
-    DoNotRetry does not.
-    Recording this verdict starts the shared pause, or extends a running one, exactly as PauseAll
-    does; the caller stops retrying this request, exactly as on DoNotRetry.
+    `retry_after` supplies the shared pause duration when present.
     """
 
     retry_after: float | None
@@ -99,8 +80,7 @@ Callers stop retrying this request for either verdict.
 def _random_up_to(ceiling: float) -> float:
     """Draw a wait greater than zero and no larger than ceiling.
 
-    1 - random.random() lies in (0, 1], so the draw is never the zero-length pause
-    random.uniform permits.
+    `1 - random.random()` lies in `(0, 1]`, so the pause is never zero.
     """
     return ceiling * (1.0 - random.random())
 
@@ -111,8 +91,7 @@ def _validated_positive_float(name: str, value: float) -> float:
     bool is rejected explicitly because it subclasses int, so a type checker admits True here.
 
     Raises:
-        ValueError: value is a bool, is not finite, is not greater than zero, or is an int too
-            large to convert to float.
+        ValueError: `value` is boolean, non-finite, non-positive, or too large to convert to float.
     """
     if isinstance(value, int):
         try:
@@ -178,19 +157,13 @@ class Admission:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> Literal[False]:
-        """Parse a failure_types exception into a verdict, record it, then return the permit.
+        """Parse and record a provider failure before releasing the permit.
 
-        The order matters: recording after releasing would let a waiter take the permit and be
-        admitted into the refusal already observed, so no await sits between recording and release.
-        The release sits in a finally covering all exit processing, so a raise anywhere in it still
-        returns the permit and cannot starve waiting requests.
-        Any exception outside failure_types is a fault in the attempt, not a provider failure: the
-        permit returns and it propagates unparsed and unrecorded.
-        On success nothing is recorded and verdict stays None.
+        Exceptions outside `failure_types` propagate without changing shared state.
+        The permit returns even when parsing raises.
 
         Raises:
-            ParserContractError: parse violated its contract and on_parse_error is "raise";
-                nothing was recorded and verdict stays None.
+            ParserContractError: `parse` violates its contract and `on_parse_error="raise"`.
         """
         try:
             if isinstance(exc_value, self._shared_backoff.failure_types):
@@ -205,20 +178,9 @@ class Admission:
 class SharedBackoff:
     """Coordinate request starts for one rate-limit quota.
 
-    Route every request sharing the rate-limit quota through one instance.
-    Each generated wait is positive and no greater than the wait ceiling.
-    A generated wait may fall below `minimum_wait_ceiling_seconds`.
-    `SharedBackoff` does not bound pending work.
-
-    Raise `failure_types` exceptions inside `admitted()`.
-    Consume provider streams inside `admitted()`.
-    Catching `failure_types` inside `admitted()` hides provider pushback.
-    Begin the request immediately after admission.
-    Keep unparseable transport failures outside `failure_types`.
-    Check replay safety before every retry.
-    Run `PrivateBackoff` between attempts for `RetryThisOne`.
-    Add no private wait for `PauseAll`.
-    Disable SDK and transport retries.
+    Run each complete provider request inside `admitted`.
+    Raise `failure_types` inside that block so provider pushback updates shared state.
+    Use `PrivateBackoff` between `RetryThisOne` attempts.
     """
 
     def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests, on_parse_error)
@@ -234,28 +196,20 @@ class SharedBackoff:
         max_request_starts_per_second: float = 50.0,
         on_parse_error: Literal["raise", "retry_this_one"] = "raise",
     ) -> None:
-        """Validate the configuration and initialize an unpaused `SharedBackoff`.
+        """Validate configuration and initialize an unpaused `SharedBackoff`.
 
-        `parse` synchronously maps each provider failure to a `Verdict`.
-        `failure_types` identifies the exceptions passed to `parse`.
-        `max_concurrent_requests=None` delegates concurrency limits to the caller.
-        `minimum_wait_ceiling_seconds` is the initial and minimum wait ceiling.
-        `longest_wait_seconds` caps the wait ceiling and `retry_after`.
-        `wait_multiplier` changes the wait ceiling by one step.
-        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
-        `max_request_starts_per_second` limits request starts during queued demand.
-        `on_parse_error="raise"` raises `ParserContractError`.
-        `on_parse_error="retry_this_one"` produces `RetryThisOne` without `retry_after`.
+        `parse` maps each `failure_types` exception to `Verdict`.
+        `max_concurrent_requests=None` applies no concurrency limit.
+        `longest_wait_seconds` caps generated waits and `retry_after`.
 
         Raises:
             ValueError: A numeric setting is boolean, non-finite, or non-positive.
-                Also raised when the request-rate reciprocal is non-finite.
-                Also raised when `wait_multiplier` is at most one.
-                Also raised when `longest_wait_seconds` is below `minimum_wait_ceiling_seconds`.
-                Also raised when their ratio is non-finite.
-                Also raised when `max_concurrent_requests` is boolean or below one.
-                Also raised when `failure_types` is empty.
-                Also raised when a failure type equals `Exception`.
+            ValueError: `1 / max_request_starts_per_second` is non-finite.
+            ValueError: `longest_wait_seconds / minimum_wait_ceiling_seconds` is non-finite.
+            ValueError: `wait_multiplier` is at most one.
+            ValueError: `longest_wait_seconds` is below `minimum_wait_ceiling_seconds`.
+            ValueError: `max_concurrent_requests` is boolean or below one.
+            ValueError: `failure_types` is empty or contains `Exception`.
         """
         self.minimum_wait_ceiling_seconds: float = _validated_positive_float(
             "minimum_wait_ceiling_seconds", minimum_wait_ceiling_seconds
@@ -356,23 +310,19 @@ class SharedBackoff:
     def max_concurrent_requests(self) -> int | None:
         """The number of requests allowed inside admitted() blocks at once, or None for no bound.
 
-        Read-only: the permits are sized once in __init__, so assigning this would move what
-        callers read while leaving the permit count they contend for unchanged.
+        `__init__` fixes both this value and the permit count.
+        The property is read-only to keep them consistent.
         """
         return self._max_concurrent_requests
 
     def admitted(self, *, budget: float | None = None) -> Admission:
-        """Return the block spanning one attempt; enter it to wait, exit it to report.
+        """Return an `Admission` block for one attempt.
 
-        budget bounds entry alone: the permit acquisition plus the wait for admission, and nothing
-        after, so what bounds the attempt itself is the SDK's own timeout.
-        None means entry may wait indefinitely.
-        The budget is per attempt; nothing bounds the total across attempts unless the caller
-        subtracts what each attempt spent and passes the remainder to the next call.
+        `budget` limits permit acquisition and admission waits.
+        `budget=None` permits an indefinite wait.
 
         Raises:
-            ValueError: budget is not None and fails the acceptance rule (not a bool, finite,
-                greater than zero); nothing was acquired.
+            ValueError: `budget` is boolean, non-finite, or non-positive.
         """
         budget_seconds = None if budget is None else _validated_positive_float("budget", budget)
         return Admission(self, budget_seconds)
@@ -417,7 +367,7 @@ class SharedBackoff:
             raise
 
     def _admit_waiting(self) -> None:
-        """Admit the front of the queue while nothing blocks it, else arm the timer for when it will.
+        """Admit the front of the queue or schedule _admit_waiting for its earliest admission.
 
         Admission requires no active pause and one elapsed request-start interval.
         Granting records the moment in _last_admission_at.
@@ -442,7 +392,7 @@ class SharedBackoff:
             granted.set_result(None)
 
     def _arm_admit_timer(self, delay_seconds: float) -> None:
-        """Schedule _admit_waiting for when the front becomes admissible, replacing any armed timer."""
+        """Schedule _admit_waiting for the front's admission time, replacing any scheduled timer."""
         if self._admit_timer is not None:
             self._admit_timer.cancel()
         self._admit_timer = asyncio.get_running_loop().call_later(
@@ -456,9 +406,10 @@ class SharedBackoff:
     def _log_pause_end(self) -> None:
         """Log the ended pause's length and the queue depth, on the first admission after its end.
 
-        Queue depth here cannot exceed max_concurrent_requests, or the worker pool's size when it
-        is None, so a full queue means every permit or worker is idle; it says nothing about work
-        waiting further upstream, which whatever bounds that work has to report.
+        Queue depth cannot exceed `max_concurrent_requests` when configured.
+        Otherwise it cannot exceed the worker pool size.
+        A full queue means every permit or worker is idle.
+        Upstream bounds must report additional waiting work.
         """
         if self._pause_until == _NEVER or self._last_admission_at > self._pause_until:
             return
@@ -498,11 +449,10 @@ class SharedBackoff:
     def _normalized(self, verdict: Verdict) -> Verdict:
         """Return the verdict with retry_after validated and capped at longest_wait_seconds.
 
-        Runs before either _record or Admission.verdict sees the verdict, so both sides work from
-        the same number whatever parse returned.
-        An invalid retry_after can corrupt state that outlives the verdict: a negative one plants a
-        pause end in the past that a later report reads as history, and a NaN passes a greater-than
-        cap into the quiet-step arithmetic.
+        Runs before `_record` or `Admission.verdict` reads the verdict.
+        Both therefore use the same normalized value.
+        A negative `retry_after` creates a past pause end.
+        A NaN bypasses the cap and corrupts quiet-step arithmetic.
         """
         if isinstance(verdict, DoNotRetry):
             return verdict
@@ -513,11 +463,9 @@ class SharedBackoff:
     def _normalized_retry_after(self, stated: float) -> float | None:
         """Return a valid retry_after capped at longest_wait_seconds, or None.
 
-        The type must be exactly int or float, which excludes bool; anything else becomes None,
-        counted, because a much larger or malformed value is more likely a bug or something hostile
-        than a real instruction.
-        Separate int and float branches: math.isfinite converts an int to float first and raises
-        OverflowError on a large enough one, while comparison does not, so a huge int caps cleanly.
+        Accept exactly `int` or `float`, excluding `bool`.
+        Count other values and return `None`.
+        Check integers before `math.isfinite` so huge integers cap without `OverflowError`.
         """
         if type(stated) is int:
             if stated <= 0:
@@ -587,8 +535,7 @@ class SharedBackoff:
     def _chosen_wait(self, verdict: PauseAll | PauseAllDoNotRetry) -> float:
         """Return how long this report proposes to pause.
 
-        `is None`, not truthiness: the wrapper guarantees a present retry_after is finite and
-        greater than zero, and this test stays correct even if that changes.
+        Test `is None` because `retry_after` presence determines the branch.
         """
         if verdict.retry_after is not None:
             return verdict.retry_after
@@ -626,15 +573,10 @@ class SharedBackoff:
 
 
 class PrivateBackoff:
-    """One logical request's waits between admitted() blocks, private to that request.
+    """Generate private waits between one request's `RetryThisOne` attempts.
 
-    The caller-side companion of RetryThisOne: recording that verdict changes no shared state,
-    so the failing request spaces its own retries with this.
-    Draw next_wait once per RetryThisOne and sleep it between blocks, never inside one.
-    A PauseAll costs no draw, because the next entry already waits out the shared pause.
-    A wait here overlaps a running pause rather than stacking on it, for the same reason.
-    Keep one instance across every attempt for one logical request.
-    Discard it when that logical request ends.
+    Keep one instance for the request's complete retry loop.
+    Sleep returned waits outside `admitted` blocks.
     """
 
     def __init__(self, shared_backoff: SharedBackoff) -> None:

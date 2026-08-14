@@ -1,8 +1,6 @@
-"""Refresh vendored GenAI data from one OpenTelemetry commit.
+"""Refresh vendored GenAI validation data from OpenTelemetry.
 
-Payload schemas validate tracing values.
-`provider-name-values.json` validates built-in `provider_name` values.
-Run `uv run python -m scripts.refresh_semconv_genai` without arguments.
+Run `uv run python -m scripts.refresh_semconv_genai`.
 """
 
 import json
@@ -26,16 +24,11 @@ ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.tool.call.arguments": "gen-ai-tool-call-arguments.json",
     "gen_ai.tool.call.result": "gen-ai-tool-call-result.json",
 }
-"""Map each emitted payload attribute to its schema.
-
-The refresh fetches these schemas.
-SOURCE_DOC lists this mapping.
-tests/test_tracing.py compares it against vendored files, tracing keys, and upstream filenames.
-"""
+"""Map each traced payload attribute to its validation schema."""
 
 
 def fetch(url: str) -> bytes:
-    """Read one URL, raising on any non-success status.
+    """Read one URL.
 
     Raises:
         urllib.error.HTTPError: the server answered with an error status.
@@ -47,7 +40,7 @@ def fetch(url: str) -> bytes:
 
 
 def resolve_head_sha() -> str:
-    """Return the full commit sha at the head of BRANCH in the upstream repository.
+    """Resolve BRANCH to an upstream revision.
 
     Raises:
         urllib.error.HTTPError: the commits endpoint answered with an error status.
@@ -61,7 +54,7 @@ def resolve_head_sha() -> str:
 
 
 def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
-    """Extract sorted `gen_ai.provider.name` values.
+    """Extract and sort gen_ai.provider.name values.
 
     Raises:
         ValueError: The registry attribute is missing, duplicated, empty, or malformed.

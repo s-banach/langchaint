@@ -5,7 +5,7 @@ from langchaint.openai import OpenAI
 
 
 async def search_the_web() -> Response[str]:
-    """Run provider web search and inspect its output and cost.
+    """Run provider web search and print its output and cost.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

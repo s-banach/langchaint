@@ -385,7 +385,7 @@ def test_the_categories_are_priced_apart() -> None:
 
 
 def test_the_reported_tier_selects_the_table() -> None:
-    """Priority rates price a priority response; "auto" and no tier both price at default."""
+    """Use the response's `service_tier` because it may differ from the request's (openai 3.0.0)."""
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
     at_priority = _billing_from_response(
         _response(usage=_usage_with_cache(), service_tier="priority"), pricing

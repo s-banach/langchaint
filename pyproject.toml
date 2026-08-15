@@ -160,7 +160,6 @@ lint.select = [
     "missing-trailing-period",
     "non-imperative-mood",
     "signature-in-docstring",
-    "first-word-uncapitalized",
     "docstring-starts-with-this",
     "missing-terminal-punctuation",
     "undocumented-param",

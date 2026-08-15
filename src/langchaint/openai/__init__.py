@@ -51,6 +51,7 @@ from langchaint.openai.shared import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
     OpenAIRates,
+    OpenAIResponsesServiceTier,
     OpenAIServiceTier,
     client_without_retries,
     parse_openai,
@@ -141,7 +142,7 @@ class OpenAI:
         pricing: OpenAIPricingTable | None = ...,
         supports_prompt_cache_options: bool | None = ...,
         reasoning_summary: ReasoningSummary | None = ...,
-        service_tier: OpenAIServiceTier | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
     ) -> LLM: ...
 
     @overload
@@ -153,7 +154,7 @@ class OpenAI:
         pricing: OpenAIPricingTable,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = ...,
-        service_tier: OpenAIServiceTier | None = ...,
+        service_tier: OpenAIResponsesServiceTier | None = ...,
     ) -> LLM: ...
 
     def model(
@@ -164,7 +165,7 @@ class OpenAI:
         pricing: OpenAIPricingTable | None = None,
         supports_prompt_cache_options: bool | None = None,
         reasoning_summary: ReasoningSummary | None = None,
-        service_tier: OpenAIServiceTier | None = None,
+        service_tier: OpenAIResponsesServiceTier | None = None,
     ) -> LLM:
         """Build an `LLM` for one Responses API model.
 
@@ -385,6 +386,7 @@ __all__ = [
     "OpenAIPricingTable",
     "OpenAIRates",
     "OpenAIResponsesAdapter",
+    "OpenAIResponsesServiceTier",
     "OpenAIServiceTier",
     "ReasoningSummary",
     "parse_openai",

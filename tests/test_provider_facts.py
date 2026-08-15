@@ -1,8 +1,8 @@
 """Pin SDK facts used by langchaint arithmetic and request mapping.
 
 These tests inspect declared fields, method signatures, and Bedrock service models.
-Current facts target anthropic 0.121.0 and openai 3.0.0.
-They also target google-genai 2.17.0 and botocore 1.43.69.
+Current facts target anthropic 0.122.0 and openai 3.1.0.
+They also target google-genai 2.18.1 and botocore 1.43.72.
 """
 
 import inspect

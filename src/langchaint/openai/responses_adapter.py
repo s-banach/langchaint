@@ -142,6 +142,7 @@ from langchaint.openai.shared import (
     OPENAI_FAILURE_TYPES,
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     OpenAIPricingTable,
+    OpenAIResponsesServiceTier,
     OpenAIServiceTier,
     _image_data_uri,
     _priced_tier,
@@ -220,7 +221,7 @@ class _OpenAIPrecomputedFields:
     tool_choice: _WireToolChoice | Omit
     parallel_tool_calls: bool | Omit
     prompt_cache_options: PromptCacheOptions | Omit
-    service_tier: OpenAIServiceTier | Omit
+    service_tier: OpenAIResponsesServiceTier | Omit
     include: list[ResponseIncludable]
     text: ResponseTextConfigParam | Omit
     """The structured binding's JSON-schema format, omitted by the text binding, which asks for none."""
@@ -719,7 +720,7 @@ class OpenAIResponsesAdapter(Adapter):
         regional_processing: bool = False,
         supports_prompt_cache_options: bool,
         reasoning_summary: ReasoningSummary | None = None,
-        service_tier: OpenAIServiceTier | None = None,
+        service_tier: OpenAIResponsesServiceTier | None = None,
     ) -> None:
         """Store request and pricing configuration without sending a request.
 
@@ -753,7 +754,7 @@ class OpenAIResponsesAdapter(Adapter):
         self.regional_processing: bool = regional_processing
         self.supports_prompt_cache_options: bool = supports_prompt_cache_options
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
-        self.service_tier: OpenAIServiceTier | None = service_tier
+        self.service_tier: OpenAIResponsesServiceTier | None = service_tier
 
     def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:
         """Precompute the typed request fields the binding determines.
@@ -1124,7 +1125,8 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
             tool_choice=precomputed.tool_choice,
             parallel_tool_calls=precomputed.parallel_tool_calls,
             prompt_cache_options=precomputed.prompt_cache_options,
-            service_tier=precomputed.service_tier,
+            # The Responses service-tier vocabulary is wider than the openai 3.0.0 SDK literal.
+            service_tier=cast("OpenAIServiceTier | Omit", precomputed.service_tier),
             include=precomputed.include,
             text=precomputed.text,
             store=False,

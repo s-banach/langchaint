@@ -61,13 +61,17 @@ tables above should learn.
 """
 
 type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
-"""What a request may ask for, and what a response reports (openai 2.45.0 types both with this literal).
+"""What a Chat Completions request may ask for (openai 3.1.0)."""
 
-The API documents the response value as the processing mode actually used and says it may differ
-from the value the request set, so the tier is read off each response rather than assumed.
+type OpenAIResponsesServiceTier = OpenAIServiceTier | Literal["ultrafast"]
+"""What a Responses request may ask for and what a Response may report (openai 3.1.0).
+
+The reported value selects pricing because it may differ from the requested value.
 """
 
-type _OpenAINormalizedServiceTier = Literal["default", "flex", "scale", "priority", "fast"]
+type _OpenAINormalizedServiceTier = Literal[
+    "default", "flex", "scale", "priority", "fast", "ultrafast"
+]
 """Normalized OpenAI response service tiers."""
 
 _DEFAULT_TIER: _OpenAINormalizedServiceTier = "default"
@@ -120,7 +124,9 @@ def _image_data_uri(image_part: ImagePart) -> str:
     return f"data:{image_part.media_type};base64,{encoded_data}"
 
 
-def _priced_tier(service_tier: OpenAIServiceTier | None) -> _OpenAINormalizedServiceTier:
+def _priced_tier(
+    service_tier: OpenAIResponsesServiceTier | None,
+) -> _OpenAINormalizedServiceTier:
     """Normalize one response's `service_tier`."""
     if service_tier is None or service_tier == "auto":
         return _DEFAULT_TIER
@@ -245,6 +251,7 @@ class OpenAIPricingTable:
     default: OpenAIRates
     flex: OpenAIRates | None = None
     fast: OpenAIRates | None = None
+    ultrafast: OpenAIRates | None = None
     scale: OpenAIRates | None = None
     long_context: OpenAILongContextPricing | None = None
     regional_processing_multiplier: float | None = None
@@ -266,7 +273,7 @@ class OpenAIPricingTable:
     def rates_for(
         self,
         *,
-        service_tier: OpenAIServiceTier | None,
+        service_tier: OpenAIResponsesServiceTier | None,
         input_tokens_total: int,
         regional_processing: bool,
     ) -> OpenAIRates:
@@ -278,8 +285,10 @@ class OpenAIPricingTable:
             rates = self.flex
         elif priced_tier in ("fast", "priority"):
             rates = self.fast
-        else:
+        elif priced_tier == "scale":
             rates = self.scale
+        else:
+            rates = self.ultrafast
         if rates is None:
             return _UNPRICED_RATES
         long_context = self.long_context

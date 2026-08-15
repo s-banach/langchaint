@@ -16,6 +16,7 @@ from langchaint.openai.shared import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
     OpenAIRates,
+    OpenAIResponsesServiceTier,
 )
 from scripts.update_pricing_metadata import (
     ANTHROPIC_OUTPUT_PATH,
@@ -87,14 +88,32 @@ def test_openai_modifiers_compose_after_service_tier_selection() -> None:
     assert rates.output_usd_per_million_tokens == 66.0
 
 
-def test_openai_missing_optional_rates_produce_nan() -> None:
-    """Missing scale and regional rates produce NaN."""
+def test_openai_ultrafast_rates_are_selected() -> None:
+    """Keep pricing coverage independent of the installed openai SDK types."""
+    ultrafast = _openai_rates().multiplied(input_multiplier=3.0, output_multiplier=3.0)
+    rates = OpenAIPricingTable(default=_openai_rates(), ultrafast=ultrafast).rates_for(
+        service_tier="ultrafast",
+        input_tokens_total=1,
+        regional_processing=False,
+    )
+    assert rates is ultrafast
+
+
+@pytest.mark.parametrize("service_tier", ["scale", "ultrafast"])
+def test_openai_missing_optional_tier_rates_produce_nan(
+    service_tier: OpenAIResponsesServiceTier,
+) -> None:
+    """Missing optional tier rates produce NaN."""
     rates = OpenAIPricingTable(default=_openai_rates()).rates_for(
-        service_tier="scale",
+        service_tier=service_tier,
         input_tokens_total=1,
         regional_processing=False,
     )
     assert math.isnan(rates.input_cache_none_usd_per_million_tokens)
+
+
+def test_openai_missing_regional_rates_produce_nan() -> None:
+    """Missing regional rates produce NaN."""
     regional = OpenAIPricingTable(default=_openai_rates()).rates_for(
         service_tier="default",
         input_tokens_total=1,

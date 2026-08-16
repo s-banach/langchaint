@@ -29,7 +29,7 @@ def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, mode
         )
 
 
-def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
+def category_cost(tokens: int, *, usd_per_million_tokens: float) -> float:
     """Price one token category, preserving zero when the rate is unknown.
 
     `0 * NaN` is NaN.
@@ -40,7 +40,7 @@ def category_cost(tokens: int, usd_per_million_tokens: float) -> float:
     return tokens * usd_per_million_tokens / 1_000_000
 
 
-def invocation_cost_in_usd(invocations: int, usd_per_invocation: float | None) -> float:
+def invocation_cost_in_usd(invocations: int, *, usd_per_invocation: float | None) -> float:
     """Price provider invocations, preserving zero when the rate is unavailable.
 
     Raises:
@@ -92,7 +92,8 @@ class Billing:
         It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input was billed.
         """
         uncached = category_cost(
-            self.usage.input_tokens_total, self.input_cache_none_usd_per_million_tokens
+            self.usage.input_tokens_total,
+            usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
         )
         billed = (
             self.usage.input_tokens_cache_read_cost_in_usd

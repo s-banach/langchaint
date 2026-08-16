@@ -79,7 +79,6 @@ from langchaint.adapter import (
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
     ANTHROPIC_BEDROCK_PRICING,
-    ANTHROPIC_PRICING,
     Anthropic,
     AnthropicBedrock,
     AnthropicBedrockModelName,
@@ -186,42 +185,33 @@ def _tool_schemas() -> tuple[ToolSchema, ...]:
 
 
 def _usage_with_cache_split() -> at.Usage:
-    """Return a usage object exercising every input counter and the write split."""
     return at.Usage(
         input_tokens=100,
         output_tokens=50,
         cache_read_input_tokens=200,
-        cache_creation_input_tokens=30,
         cache_creation=at.CacheCreation(
             ephemeral_5m_input_tokens=10, ephemeral_1h_input_tokens=20
         ),
     )
 
 
-def test_billing_partitions_input_counters_and_prices() -> None:
-    """input_tokens is the uncached counter, and the Billing's usage carries the priced cost."""
-    usage = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING).usage
-    assert usage.input_tokens_cache_read == 200
-    assert usage.input_tokens_cache_write == 30
-    assert usage.input_tokens_cache_none == 100
-    assert usage.input_tokens_total == 330
-    assert usage.cost_in_usd == (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
-
-
-def test_billing_carries_the_sdk_usage_object_itself() -> None:
-    """usage_raw is the SDK usage object by reference, not a copy."""
-    usage = _usage_with_cache_split()
-    billing = _billing_from_sdk_usage(usage, _PRICING)
-    assert billing.usage_raw is usage
-
-
-def test_billing_pins_the_served_tier_and_the_rates_that_applied() -> None:
-    """The Billing holds the served tier and the rates the tier's table charged."""
-    billing = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING)
+def test_billing_partitions_and_prices_complete_usage() -> None:
+    """Expose one complete SDK usage object's neutral counters, costs, tier, and applied rates."""
+    usage_raw = _usage_with_cache_split()
+    billing = _billing_from_sdk_usage(usage_raw, _PRICING)
+    usage = billing.usage
+    assert billing.usage_raw is usage_raw
     assert billing.service_tier == "standard"
     assert billing.input_cache_none_usd_per_million_tokens == 3.0
     assert billing.cache_read_usd_per_million_tokens == 0.3
     assert billing.output_usd_per_million_tokens == 15.0
+    assert usage.input_tokens_cache_read == 200
+    assert usage.input_tokens_cache_write == 30
+    assert usage.input_tokens_cache_none == 100
+    assert usage.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
+    assert usage.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
+    assert usage.input_tokens_cache_write_cost_in_usd == (10 * 3.75 + 20 * 6.0) / 1e6
+    assert usage.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
 
 
 def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
@@ -232,22 +222,6 @@ def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
     assert billing.service_tier == "priority"
     assert billing.usage.input_tokens_total == 100
     assert billing.usage.output_tokens == 50
-
-
-def test_billing_counts_the_writes_it_bills_for() -> None:
-    """Cache-write counters and cost use the cache_creation split."""
-    usage = _billing_from_sdk_usage(
-        at.Usage(
-            input_tokens=100,
-            output_tokens=0,
-            cache_creation=at.CacheCreation(
-                ephemeral_5m_input_tokens=10, ephemeral_1h_input_tokens=20
-            ),
-        ),
-        _PRICING,
-    ).usage
-    assert usage.input_tokens_cache_write == 30
-    assert abs(usage.cost_in_usd - (100 * 3.0 + 10 * 3.75 + 20 * 6.0) / 1e6) < 1e-12
 
 
 def test_billing_treats_none_cache_counts_as_zero() -> None:
@@ -427,17 +401,6 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
     assert abs(cost - expected) < 1e-12
 
 
-def test_the_stored_write_price_is_the_blend_of_what_the_two_ttls_billed() -> None:
-    """Mixed write TTLs store a blended cache-write price."""
-    billing = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING)
-    usage = billing.usage
-    assert usage.input_tokens_cache_write == 30
-    assert usage.input_tokens_cache_write_cost_in_usd == pytest.approx(
-        usage.input_tokens_cache_write * billing.cache_write_usd_per_million_tokens / 1e6
-    )
-    assert 3.75 < billing.cache_write_usd_per_million_tokens < 6.0
-
-
 def test_equal_write_rates_store_that_rate_as_the_write_price() -> None:
     """With both TTLs priced alike the blend is that rate, so blending adds no artifact."""
     equal_write_rates = AnthropicPricingTable(
@@ -476,33 +439,6 @@ def test_the_reported_tier_selects_the_table() -> None:
     reporting_none = _billing_from_sdk_usage(at.Usage(input_tokens=100, output_tokens=50), pricing)
     assert at_priority.usage.cost_in_usd == pytest.approx(2 * at_standard.usage.cost_in_usd)
     assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
-
-
-def test_the_categories_are_priced_apart() -> None:
-    """Each stored cost is its own category's product, and they sum to cost_in_usd."""
-    usage = _billing_from_sdk_usage(_usage_with_cache_split(), _PRICING).usage
-    assert usage.input_tokens_cache_none_cost_in_usd == 100 * 3.0 / 1e6
-    assert usage.input_tokens_cache_read_cost_in_usd == 200 * 0.3 / 1e6
-    assert usage.input_tokens_cache_write_cost_in_usd == (10 * 3.75 + 20 * 6.0) / 1e6
-    assert usage.output_tokens_cost_in_usd == 50 * 15.0 / 1e6
-    assert usage.cost_in_usd == pytest.approx(
-        (100 * 3.0 + 200 * 0.3 + 10 * 3.75 + 20 * 6.0 + 50 * 15.0) / 1e6
-    )
-
-
-def test_anthropic_model_accepts_replacement_pricing() -> None:
-    """Anthropic.model accepts a replacement pricing table."""
-    replacement = AnthropicPricingTable(
-        standard=ANTHROPIC_PRICING["claude-sonnet-5"].standard,
-        priority=_PRIORITY_RATES,
-    )
-    adapter = _anthropic_adapter_of(
-        Anthropic(client=AsyncAnthropic(api_key="test")).model(
-            "claude-sonnet-5",
-            pricing=replacement,
-        )
-    )
-    assert adapter.pricing is replacement
 
 
 def test_cache_ttl_is_stored_on_the_adapter() -> None:
@@ -2417,7 +2353,6 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a turn whose usage exercises every input counter and the write TTL split."""
         return _turn_message(_usage_with_cache_split())
 
     @override

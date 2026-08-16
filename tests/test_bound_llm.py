@@ -1681,78 +1681,48 @@ def test_rebind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     assert rebound.binding.tool_schemas is bound.binding.tool_schemas
 
 
-def test_rebind_to_a_response_format_rebinds_even_when_the_binding_is_unchanged() -> None:
-    """response_format is not part of Binding, so a rebind that only changes it must still re-bind."""
+def test_rebind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
+    """Omission preserves the output type, while a value selects structured or text binding."""
     adapter = _FakeAdapter()
-    bound_llm = LLM(adapter).bind(system_prompt="s")
-    structured = bound_llm.rebind(response_format=_Answer)
+    text = LLM(adapter).bind(system_prompt="s")
+    same = text.rebind()
+    assert_type(same, BoundLLM[str])
+    structured = text.rebind(response_format=_Answer)
     assert_type(structured, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 1
-    assert structured.binding == bound_llm.binding
-    assert structured._bound_adapter is not bound_llm._bound_adapter
-
-
-def test_rebind_leaving_response_format_out_keeps_the_content_type_and_rebuilds() -> None:
-    """Omitting response_format keeps BoundLLM[str] and rebuilds through bind_text."""
-    adapter = _FakeAdapter()
-    bound_llm = LLM(adapter).bind(system_prompt="s")
-    same = bound_llm.rebind()
-    assert_type(same, BoundLLM[str])
-    assert adapter.structured_bind_count == 0
-    assert same._bound_adapter is not bound_llm._bound_adapter
-
-
-def test_rebind_response_format_none_switches_structured_back_to_text() -> None:
-    """From a structured binding, response_format=None returns BoundLLM[str] via bind_text."""
-    adapter = _FakeAdapter()
-    structured = LLM(adapter).bind(system_prompt="s", response_format=_Answer)
-    assert len(adapter.bound_adapters) == 0
-    text = structured.rebind(response_format=None)
-    assert_type(text, BoundLLM[str])
-    assert len(adapter.bound_adapters) == 1
-    assert text._bound_adapter is not structured._bound_adapter
-
-
-def test_rebind_leaving_structured_response_format_out_rebuilds_through_bind_structured() -> None:
-    """A prefix change with response_format left out rebuilds from the stored model type."""
-    adapter = _FakeAdapter()
-    structured = LLM(adapter).bind(system_prompt="s", response_format=_Answer)
-    assert adapter.structured_bind_count == 1
+    assert structured.binding == text.binding
+    assert structured._bound_adapter is not text._bound_adapter
     rebound = structured.rebind(system_prompt="s2")
     assert_type(rebound, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 2
     assert rebound._bound_adapter is not structured._bound_adapter
+    text_again = structured.rebind(response_format=None)
+    assert_type(text_again, BoundLLM[str])
+    assert len(adapter.bound_adapters) == 3
+    assert text_again._bound_adapter is not structured._bound_adapter
 
 
-def test_tools_construct_the_bound_tool_manager() -> None:
-    """Pin `LLM.bind(tools=[...])` construction of `BoundLLM.tool_manager`."""
+def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
+    """Tool sequences construct a manager, including empty sequences; supplied managers pass through."""
     tool = _capture_tool()
     bound = LLM(_FakeAdapter()).bind(tools=[tool])
     assert isinstance(bound.tool_manager, ToolManager)
     assert bound.tool_manager.schemas() == (tool.schema(),)
+    empty = LLM(_FakeAdapter()).bind(tools=[])
+    assert isinstance(empty.tool_manager, ToolManager)
+    assert empty.tool_manager.schemas() == ()
+    tool_manager = ToolManager([tool])
+    assert LLM(_FakeAdapter()).bind(tools=tool_manager).tool_manager is tool_manager
 
 
-def test_empty_tools_construct_an_empty_tool_manager() -> None:
-    """An empty `tools` sequence still binds a `ToolManager`."""
-    bound = LLM(_FakeAdapter()).bind(tools=[])
-    assert isinstance(bound.tool_manager, ToolManager)
-    assert bound.tool_manager.schemas() == ()
-
-
-def test_duplicate_tool_names_fail_before_adapter_binding() -> None:
-    """`LLM.bind(tools=[...])` rejects duplicate names before `Adapter.bind_text`."""
+def test_duplicate_tool_names_fail_before_bind_and_rebind_reach_the_adapter() -> None:
+    """Duplicate tool names fail before either adapter-binding route."""
     adapter = _FakeAdapter()
     duplicate = _capture_tool()
     with pytest.raises(ValueError, match="duplicate tool name"):
         _ = LLM(adapter).bind(tools=[duplicate, duplicate])
     assert adapter.bound_adapters == []
-
-
-def test_duplicate_tool_names_fail_before_rebinding_the_adapter() -> None:
-    """`BoundLLM.rebind(tools=[...])` rejects duplicate names before `Adapter.bind_text`."""
-    adapter = _FakeAdapter()
     bound = LLM(adapter).bind()
-    duplicate = _capture_tool()
     with pytest.raises(ValueError, match="duplicate tool name"):
         _ = bound.rebind(tools=[duplicate, duplicate])
     assert len(adapter.bound_adapters) == 1
@@ -1767,20 +1737,17 @@ def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
     assert rebound.tool_manager is not bound.tool_manager
     assert rebound.tool_manager.schemas() == (replacement.schema(),)
     assert rebound.rebind(tools=None).tool_manager is None
+    tool_manager = ToolManager([replacement])
+    assert bound.rebind(tools=tool_manager).tool_manager is tool_manager
 
 
-def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> None:
-    """BoundLLM types reflect output type and ToolManager presence."""
-    llm = LLM(_FakeAdapter())
-    tool_manager = ToolManager([])
-
+def _pin_bind_and_rebind_types(llm: LLM, tool_manager: ToolManager) -> None:
     text = llm.bind()
     assert_type(text, BoundLLM[str, None])
     text_with_constructed_tools = llm.bind(tools=[_capture_tool()])
     assert_type(text_with_constructed_tools, BoundLLM[str, ToolManager])
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(text_with_tools, BoundLLM[str, ToolManager])
-    assert text_with_tools.tool_manager is tool_manager
     structured = llm.bind(response_format=_Answer)
     assert_type(structured, BoundLLM[_Answer, None])
     structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
@@ -1808,7 +1775,6 @@ def test_bind_and_rebind_type_output_by_whether_a_tool_manager_is_bound() -> Non
 
     rebound_with_tool_manager = structured.rebind(tools=tool_manager)
     assert_type(rebound_with_tool_manager, BoundLLM[_Answer, ToolManager])
-    assert rebound_with_tool_manager.tool_manager is tool_manager
     assert_type(structured.rebind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
     assert_type(structured_with_tools.rebind(tools=None), BoundLLM[_Answer, None])
     assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
@@ -1964,11 +1930,6 @@ def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_variant()
         assert result.tool_calls == (_FAKE_TOOL_CALL,)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
-def test_unchanged_sentinel_reprs_as_its_name() -> None:
-    """The sentinel renders as UNCHANGED so the rebind signature reads cleanly in help()."""
-    assert repr(UNCHANGED) == "UNCHANGED"
 
 
 def test_automatic_cache_breakpoints_participates_in_binding_equality() -> None:

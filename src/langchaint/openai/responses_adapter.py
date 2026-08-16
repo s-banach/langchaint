@@ -652,10 +652,10 @@ def _billing_from_response(
     file_search_invocations = sum(1 for item in response.output if item.type == "file_search_call")
     provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
         web_search_invocations,
-        pricing.web_search_usd_per_invocation,
+        usd_per_invocation=pricing.web_search_usd_per_invocation,
     ) + invocation_cost_in_usd(
         file_search_invocations,
-        pricing.file_search_usd_per_invocation,
+        usd_per_invocation=pricing.file_search_usd_per_invocation,
     )
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
         provider_executed_tool_cost_in_usd = nan

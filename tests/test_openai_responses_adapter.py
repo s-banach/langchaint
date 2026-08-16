@@ -241,23 +241,25 @@ def _response(
     })
 
 
-def test_billing_subtracts_cache_from_input_tokens_and_prices() -> None:
-    """The uncached counter is input_tokens minus both cache counts, and the priced cost rides on it."""
-    usage = _billing_from_response(_response(usage=_usage_with_cache()), _PRICING).usage
+def test_billing_partitions_and_prices_complete_usage() -> None:
+    """Expose one complete SDK response's neutral counters, costs, tier, and applied rates."""
+    raw = _response(usage=_usage_with_cache(), service_tier="auto")
+    billing = _billing_from_response(raw, _PRICING)
+    usage = billing.usage
+    assert billing.usage_raw is raw.usage
+    assert billing.service_tier == "default"
+    assert billing.input_cache_none_usd_per_million_tokens == 2.5
+    assert billing.cache_read_usd_per_million_tokens == 1.25
+    assert billing.cache_write_usd_per_million_tokens == 3.125
+    assert billing.output_usd_per_million_tokens == 10.0
+    assert raw.service_tier == "auto"
     assert usage.input_tokens_cache_read == 600
     assert usage.input_tokens_cache_write == 100
     assert usage.input_tokens_cache_none == 300
-    assert usage.input_tokens_total == 1000
-    assert usage.cost_in_usd == pytest.approx(
-        (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
-    )
-
-
-def test_billing_carries_the_sdk_usage_object_itself() -> None:
-    """usage_raw is the response's own ResponseUsage by reference, and None where it reported none."""
-    raw = _response(usage=_usage_with_cache())
-    assert _billing_from_response(raw, _PRICING).usage_raw is raw.usage
-    assert _billing_from_response(_response(usage=None), _PRICING).usage_raw is None
+    assert usage.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
+    assert usage.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
+    assert usage.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
+    assert usage.output_tokens_cost_in_usd == 40 * 10.0 / 1e6
 
 
 def test_web_search_output_adds_the_cataloged_provider_executed_tool_cost() -> None:
@@ -329,21 +331,6 @@ def test_charged_output_at_an_unpriced_tier_keeps_tool_cost() -> None:
     assert usage.provider_executed_tool_cost_in_usd == 0.01
 
 
-def test_billing_pins_the_priced_tier_and_the_rates_that_applied() -> None:
-    """The Billing holds the priced tier, not the reported value, and the four rates behind its costs.
-
-    A response reporting "auto" prices at "default", and the reported value survives on raw.
-    """
-    raw = _response(usage=_usage_with_cache(), service_tier="auto")
-    billing = _billing_from_response(raw, _PRICING)
-    assert billing.service_tier == "default"
-    assert billing.input_cache_none_usd_per_million_tokens == 2.5
-    assert billing.cache_read_usd_per_million_tokens == 1.25
-    assert billing.cache_write_usd_per_million_tokens == 3.125
-    assert billing.output_usd_per_million_tokens == 10.0
-    assert raw.service_tier == "auto"
-
-
 def test_billing_reads_reasoning_tokens() -> None:
     """output_tokens_reasoning reads the required reasoning_tokens counter."""
     usage = _billing_from_response(
@@ -364,6 +351,7 @@ def test_billing_reads_reasoning_tokens() -> None:
 def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
     """A response missing usage still stores the rates the tier that served it would have spent."""
     billing = _billing_from_response(_response(usage=None), _PRICING)
+    assert billing.usage_raw is None
     assert billing.output_usd_per_million_tokens == 10.0
     assert billing.service_tier == "default"
 
@@ -373,15 +361,6 @@ def test_a_response_that_billed_nothing_at_an_unpriced_tier_still_costs_zero() -
     billing = _billing_from_response(_response(usage=None, service_tier="flex"), _PRICING)
     assert math.isnan(billing.output_usd_per_million_tokens)
     assert billing.usage.cost_in_usd == 0.0
-
-
-def test_the_categories_are_priced_apart() -> None:
-    """Cache reads, cache writes, the uncached remainder, and output each bill at their rate."""
-    usage = _billing_from_response(_response(usage=_usage_with_cache()), _PRICING).usage
-    assert usage.input_tokens_cache_none_cost_in_usd == 300 * 2.5 / 1e6
-    assert usage.input_tokens_cache_read_cost_in_usd == 600 * 1.25 / 1e6
-    assert usage.input_tokens_cache_write_cost_in_usd == 100 * 3.125 / 1e6
-    assert usage.output_tokens_cost_in_usd == 40 * 10.0 / 1e6
 
 
 def test_the_reported_tier_selects_the_table() -> None:

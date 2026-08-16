@@ -204,8 +204,8 @@ def test_success_variant_is_tool_call_turn_only_where_a_split_bindings_turn_call
     assert result.output is output
 
 
-def test_retries_exhausted_error_derives_from_its_records() -> None:
-    """errors_from_attempts, attempts, and error_text are folds over the records, not stored copies."""
+def test_to_tables_failure_writes_complete_call_and_attempt_rows() -> None:
+    """A failed call retains its request, summary, attempt errors, and record-derived fields."""
     failure = _failure(
         attempt_records=(
             attempt_record(error=TransientError("e1")),
@@ -215,19 +215,26 @@ def test_retries_exhausted_error_derives_from_its_records() -> None:
     assert failure.attempts == 2
     assert [str(error) for error in failure.errors_from_attempts] == ["e1", "e2"]
     assert failure.error_text == "attempt 1: e1; attempt 2: e2"
+    assert failure.request == _REQUEST
+    assert "the-prompt-text" not in failure.error_text
+    assert "the-prompt-text" not in str(failure)
 
-
-def test_usage_successful_attempt_is_the_last_record() -> None:
-    """usage_successful_attempt reads the single kept answer's own usage."""
-    response = _response(
-        output="ok",
-        attempt_records=(
-            attempt_record(error=TransientError("e"), usage=ZERO_USAGE),
-            attempt_record(error=None, usage=_USAGE),
-        ),
-    )
-    assert response.usage_successful_attempt is response.attempt_records[-1].usage
-    assert response.usage_successful_attempt == _USAGE
+    calls, attempts = to_tables(failure)
+    assert calls == [
+        {
+            "call_id": 0,
+            "model": "fake-model",
+            "provider_name": "fake",
+            "elapsed_seconds": 2.5,
+            "attempts": 2,
+            "stop_reason": None,
+            "error_summary": "2 attempts failed; last: e2",
+            "request_json": json.dumps({"prompt": "the-prompt-text"}),
+            "output": None,
+        }
+    ]
+    assert [row["error_text"] for row in attempts] == ["e1", "e2"]
+    assert [row["kept"] for row in attempts] == [False, False]
 
 
 @pytest.mark.parametrize(
@@ -254,15 +261,37 @@ def test_usage_is_the_paid_total_across_attempts(
     assert response.usage_successful_attempt.cost_in_usd == pytest.approx(0.5)
 
 
-def test_to_tables_success_writes_one_call_row_and_one_attempt_row() -> None:
-    """A success names its output and reason on the call row and its billing on the attempt row.
-
-    usage_raw_json records the provider usage object independently of Billing.
-    """
+def test_to_tables_success_writes_complete_call_and_attempt_rows() -> None:
+    """A retried success retains output, billing, rates, provider usage, timing, and identifiers."""
     turn = AssistantMessage(turn=(TextPart(text="hello"),))
     calls, attempts = to_tables(
         _response(
-            output="hello", attempt_records=(attempt_record(error=None, usage=_USAGE, turn=turn),)
+            output=_USAGE,
+            attempt_records=(
+                attempt_record(
+                    error=TransientError("empty parse"),
+                    usage=_USAGE,
+                    started_after_seconds=3.0,
+                    elapsed_seconds=0.5,
+                    request_id="req_1",
+                ),
+                attempt_record(
+                    error=None,
+                    usage=_USAGE,
+                    input_cache_none_usd_per_million_tokens=20.0,
+                    usage_raw=_ProviderUsage(
+                        cache_creation_5m_input_tokens=3,
+                        server_tool_use_requests=1,
+                    ),
+                    started_after_seconds=9.0,
+                    elapsed_seconds=2.0,
+                    seconds_to_first_item=0.75,
+                    turn=turn,
+                    model_served="fake-model-2026-01-01",
+                    response_id="msg_9",
+                    request_id="req_2",
+                ),
+            ),
         )
     )
     (call_row,) = calls
@@ -271,45 +300,39 @@ def test_to_tables_success_writes_one_call_row_and_one_attempt_row() -> None:
         "model": "fake-model",
         "provider_name": "fake",
         "elapsed_seconds": 1.5,
-        "attempts": 1,
+        "attempts": 2,
         "stop_reason": "end_turn",
         "error_summary": None,
         "request_json": None,
-        "output": "hello",
+        "output": _USAGE.model_dump_json(),
     }
-    (attempt_row,) = attempts
-    assert attempt_row["call_id"] == 0
-    assert attempt_row["attempt_index"] == 0
-    assert attempt_row["kept"] is True
-    assert attempt_row["service_tier"] == "stub"
-    assert attempt_row["error_text"] is None
-    assert attempt_row["assistant_message_json"] == turn.model_dump_json()
-    assert attempt_row["usage_raw_json"] is None
-    assert attempt_row["cost_in_usd"] == pytest.approx(0.5)
-    assert attempt_row["input_tokens_cache_none"] == 5
-    assert attempt_row["input_tokens_cache_none_cost_in_usd"] == 0.1
-    assert attempt_row["input_tokens_total"] == 10
-    assert attempt_row["output_tokens"] == 7
-    assert attempt_row["output_tokens_cost_in_usd"] == 0.2
-    assert attempt_row["output_tokens_reasoning"] == 2
-
-
-def test_to_tables_bills_each_attempt_in_its_own_row() -> None:
-    """Attempt rows separate paid Usage from kept output Usage."""
-    _, attempts = to_tables(
-        _response(
-            output="ok",
-            attempt_records=(
-                attempt_record(error=TransientError("empty parse"), usage=_USAGE),
-                attempt_record(error=None, usage=_USAGE),
-            ),
-        )
-    )
     assert [row["attempt_index"] for row in attempts] == [0, 1]
     assert [row["kept"] for row in attempts] == [False, True]
     assert [row["error_text"] for row in attempts] == ["empty parse", None]
     assert [row["cost_in_usd"] for row in attempts] == [pytest.approx(0.5), pytest.approx(0.5)]
     assert [row["output_tokens"] for row in attempts] == [7, 7]
+    assert [row["started_after_seconds"] for row in attempts] == [3.0, 9.0]
+    assert [row["elapsed_seconds"] for row in attempts] == [0.5, 2.0]
+    assert [row["seconds_to_first_item"] for row in attempts] == [None, 0.75]
+    assert [row["model_served"] for row in attempts] == [None, "fake-model-2026-01-01"]
+    assert [row["response_id"] for row in attempts] == [None, "msg_9"]
+    assert [row["request_id"] for row in attempts] == ["req_1", "req_2"]
+    assert attempts[0]["usage_raw_json"] is None
+    kept = attempts[1]
+    assert kept["service_tier"] == "stub"
+    assert kept["assistant_message_json"] == turn.model_dump_json()
+    assert json.loads(str(kept["usage_raw_json"])) == {
+        "cache_creation_5m_input_tokens": 3,
+        "server_tool_use_requests": 1,
+    }
+    assert kept["input_tokens_cache_none"] == 5
+    assert kept["input_tokens_cache_none_cost_in_usd"] == 0.1
+    assert kept["input_tokens_total"] == 10
+    assert kept["output_tokens_cost_in_usd"] == 0.2
+    assert kept["output_tokens_reasoning"] == 2
+    assert kept["input_cache_none_usd_per_million_tokens"] == 20.0
+    assert isinstance(kept["output_usd_per_million_tokens"], float)
+    assert math.isnan(kept["output_usd_per_million_tokens"])
 
 
 def test_to_tables_carries_an_unpriced_cost_as_nan() -> None:
@@ -358,123 +381,6 @@ def test_to_tables_nulls_every_billing_column_where_the_provider_reported_nothin
     assert attempt_row["error_text"] == "no response"
 
 
-def test_to_tables_pins_the_prices_that_applied_beside_the_counters() -> None:
-    """The attempt row carries its own rates, so counter times rate reproduces the stored cost."""
-    _, attempts = to_tables(
-        _response(
-            output="ok",
-            attempt_records=(
-                attempt_record(
-                    error=None,
-                    usage=_USAGE,
-                    input_cache_none_usd_per_million_tokens=20.0,
-                ),
-            ),
-        )
-    )
-    assert attempts[0]["input_cache_none_usd_per_million_tokens"] == 20.0
-    assert isinstance(attempts[0]["output_usd_per_million_tokens"], float)
-    assert math.isnan(attempts[0]["output_usd_per_million_tokens"])
-
-
-def test_to_tables_dumps_the_provider_usage_object_the_neutral_counters_cannot_hold() -> None:
-    """usage_raw_json carries what Usage merges or drops, so the archive keeps it past the process.
-
-    usage_raw_json preserves provider-specific usage fields for JSON queries.
-    """
-    _, attempts = to_tables(
-        _response(
-            output="ok",
-            attempt_records=(
-                attempt_record(
-                    error=None,
-                    usage=_USAGE,
-                    usage_raw=_ProviderUsage(
-                        cache_creation_5m_input_tokens=3, server_tool_use_requests=1
-                    ),
-                ),
-            ),
-        )
-    )
-    assert json.loads(str(attempts[0]["usage_raw_json"])) == {
-        "cache_creation_5m_input_tokens": 3,
-        "server_tool_use_requests": 1,
-    }
-
-
-def test_to_tables_places_each_attempt_on_the_calls_timeline() -> None:
-    """started_after_seconds is measured from the call's start, so the first wait is visible.
-
-    started_after_seconds exposes waits between attempts.
-    """
-    _, attempts = to_tables(
-        _failure(
-            attempt_records=(
-                attempt_record(
-                    error=TransientError("e1"), started_after_seconds=3.0, elapsed_seconds=0.5
-                ),
-                attempt_record(
-                    error=TransientError("e2"), started_after_seconds=9.0, elapsed_seconds=0.25
-                ),
-            )
-        )
-    )
-    assert [row["started_after_seconds"] for row in attempts] == [3.0, 9.0]
-    assert [row["elapsed_seconds"] for row in attempts] == [0.5, 0.25]
-
-
-def test_to_tables_measures_time_to_first_item_from_the_attempts_own_start() -> None:
-    """The column is the gap from this attempt's start, not from the call's, and null with no stamp.
-
-    The attempt's own start excludes earlier attempts and their waits.
-    """
-    _, attempts = to_tables(
-        _failure(
-            attempt_records=(
-                attempt_record(
-                    error=TransientError("e1"), started_after_seconds=3.0, elapsed_seconds=0.5
-                ),
-                attempt_record(
-                    error=TransientError("e2"),
-                    started_after_seconds=9.0,
-                    elapsed_seconds=2.0,
-                    seconds_to_first_item=0.75,
-                ),
-            )
-        )
-    )
-    assert [row["seconds_to_first_item"] for row in attempts] == [None, 0.75]
-
-
-def test_to_tables_writes_the_ids_and_served_model_each_attempt_carries() -> None:
-    """Every column is the record's own value.
-
-    A response-less attempt may still carry request_id from its error.
-    """
-    _, attempts = to_tables(
-        _failure(
-            attempt_records=(
-                attempt_record(error=TransientError("e1"), request_id="req_1"),
-                attempt_record(
-                    error=TransientError("e2"),
-                    model_served="fake-model-2026-01-01",
-                    response_id="msg_9",
-                    request_id="req_2",
-                ),
-            )
-        )
-    )
-    assert [row["model_served"] for row in attempts] == [None, "fake-model-2026-01-01"]
-    assert [row["response_id"] for row in attempts] == [None, "msg_9"]
-    assert [row["request_id"] for row in attempts] == ["req_1", "req_2"]
-
-
-def test_to_tables_structured_output_becomes_json() -> None:
-    """A pydantic output instance is flattened to its JSON, not its repr."""
-    calls, _ = to_tables(_response(output=_USAGE, attempt_records=(attempt_record(error=None),)))
-    assert calls[0]["output"] == _USAGE.model_dump_json()
-
-
 def test_to_tables_writes_a_tool_call_turn_as_a_null_output_with_no_error_summary() -> None:
     """A ToolCallTurn that parsed no instance is a success whose output cell is None.
 
@@ -488,41 +394,6 @@ def test_to_tables_writes_a_tool_call_turn_as_a_null_output_with_no_error_summar
     assert calls[0]["stop_reason"] == "tool_use"
 
 
-def test_to_tables_failure_summarizes_the_call_and_rows_each_attempts_own_error() -> None:
-    """error_summary states how the call ended; each attempt's own error is its row's error_text.
-
-    error_summary states the call outcome.
-    Attempt rows preserve each error_text.
-    """
-    calls, attempts = to_tables(
-        _failure(
-            attempt_records=(
-                attempt_record(error=TransientError("e1")),
-                attempt_record(error=TransientError("e2")),
-            )
-        )
-    )
-    assert calls[0]["output"] is None
-    assert calls[0]["stop_reason"] is None
-    assert calls[0]["attempts"] == 2
-    assert calls[0]["error_summary"] == "2 attempts failed; last: e2"
-    assert [row["error_text"] for row in attempts] == ["e1", "e2"]
-    assert all(row["kept"] is False for row in attempts)
-
-
-def test_to_tables_writes_the_request_a_failed_call_sent_and_nothing_else() -> None:
-    """A failure's row carries what every attempt of the call sent, rendered by the adapter.
-
-    The prompt reaches the table through this column alone: error_summary is the failure's own text,
-    so a caller who drops request_json is left with no message content in the calls table.
-    """
-    calls, _attempts = to_tables(
-        _failure(attempt_records=(attempt_record(error=TransientError("e1")),))
-    )
-    assert calls[0]["request_json"] == json.dumps({"prompt": "the-prompt-text"})
-    assert "the-prompt-text" not in str(calls[0]["error_summary"])
-
-
 def test_to_tables_writes_no_request_where_the_call_built_none() -> None:
     """A failure the adapter declared before building a request writes a null cell, not an empty one."""
     calls, _attempts = to_tables(
@@ -532,17 +403,6 @@ def test_to_tables_writes_no_request_where_the_call_built_none() -> None:
         )
     )
     assert calls[0]["request_json"] is None
-
-
-def test_a_failures_text_carries_no_part_of_the_request() -> None:
-    """error_text and __str__ stay free of the prompt, which the tracing layer writes unconditionally.
-
-    Error text excludes GenerationInput content.
-    """
-    failure = _failure(attempt_records=(attempt_record(error=TransientError("e1")),))
-    assert failure.request == _REQUEST
-    assert "the-prompt-text" not in failure.error_text
-    assert "the-prompt-text" not in str(failure)
 
 
 @pytest.mark.parametrize(

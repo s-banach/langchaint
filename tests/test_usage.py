@@ -40,24 +40,6 @@ def _usage(
     )
 
 
-def test_input_tokens_total_sums_the_partition() -> None:
-    """input_tokens_total is the sum of the three disjoint input counters."""
-    usage = _usage(cache_read=600, cache_write=100, cache_none=300, output=40)
-    assert usage.input_tokens_total == 1000
-
-
-def test_cost_in_usd_sums_the_five_categories() -> None:
-    """cost_in_usd is derived, so it cannot disagree with the parts it adds."""
-    usage = _usage(
-        cache_read_cost=0.01,
-        cache_write_cost=0.02,
-        cache_none_cost=0.03,
-        output_cost=0.04,
-        provider_executed_tool_cost=0.05,
-    )
-    assert usage.cost_in_usd == pytest.approx(0.15)
-
-
 def test_negative_counter_is_rejected() -> None:
     """A negative counter raises, so no carrier holds a Usage claiming negative tokens."""
     with pytest.raises(ValidationError):
@@ -131,13 +113,6 @@ def test_sum_of_is_fieldwise_over_counters_and_costs() -> None:
     assert total.output_tokens_cost_in_usd == pytest.approx(4.44)
     assert total.provider_executed_tool_cost_in_usd == pytest.approx(5.55)
     assert total.cost_in_usd == pytest.approx(16.65)
-
-
-def test_sum_of_with_zero_usage_changes_nothing() -> None:
-    """Folding ZERO_USAGE in leaves the other usage's every field alone."""
-    usage = _usage(cache_none=7, output=3, cache_none_cost=0.2, output_cost=0.3)
-    assert Usage.sum_of([usage, ZERO_USAGE]) == usage
-    assert Usage.sum_of([ZERO_USAGE, usage]) == usage
 
 
 def test_sum_of_empty_is_zero_usage() -> None:

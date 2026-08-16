@@ -885,55 +885,50 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
     asyncio.run(scenario())
 
 
-def test_traced_bind_and_rebind_carry_extra_body_by_reference() -> None:
-    """TracedLLM.bind forwards extra_body to LLM.bind; TracedBoundLLM.rebind keeps, replaces, or clears it."""
+def test_traced_bind_and_rebind_forward_binding_options() -> None:
+    """Forward binding options through initial, omitted, replacement, and clearing values."""
     extra_body = {"safety_identifier": "user-7"}
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    bound = traced.bind(extra_body=extra_body)
-    assert bound.binding.extra_body is extra_body
-    assert bound.rebind(system_prompt="s").binding.extra_body is extra_body
-    replacement = {"safety_identifier": "user-8"}
-    assert bound.rebind(extra_body=replacement).binding.extra_body is replacement
-    assert bound.rebind(extra_body=None).binding.extra_body is None
-
-
-def test_traced_bind_and_rebind_forward_provider_executed_tools() -> None:
-    """Traced bindings keep, replace, or clear provider_executed_tools."""
     provider_tool = {"type": "web_search"}
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    bound = traced.bind(provider_executed_tools=[provider_tool])
+    traced = TracedLLM(
+        LLM(_FakeAdapter(automatic_cache_breakpoints_default=False)),
+        capture_message_content=False,
+    )
+    assert traced.bind().max_attempts == 3
+    bound = traced.bind(
+        extra_body=extra_body,
+        provider_executed_tools=[provider_tool],
+        automatic_cache_breakpoints=True,
+        max_attempts=2,
+    )
+    assert bound.binding.extra_body is extra_body
     assert bound.binding.provider_executed_tools == (provider_tool,)
     assert bound.binding.provider_executed_tools[0] is provider_tool
-    assert bound.rebind(system_prompt="s").binding.provider_executed_tools[0] is provider_tool
-
-    replacement = {"type": "file_search"}
-    replaced = bound.rebind(provider_executed_tools=[replacement])
-    assert replaced.binding.provider_executed_tools == (replacement,)
-    assert replaced.binding.provider_executed_tools[0] is replacement
-    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
-
-
-def test_traced_bind_and_rebind_forward_automatic_cache_breakpoints() -> None:
-    """`automatic_cache_breakpoints=True` makes omitted `TracedLLM.bind` forwarding fail.
-
-    `automatic_cache_breakpoints=None` makes omitted `TracedBoundLLM.rebind` forwarding fail.
-    """
-    adapter = _FakeAdapter(automatic_cache_breakpoints_default=False)
-    traced = TracedLLM(LLM(adapter), capture_message_content=False)
-    bound = traced.bind(automatic_cache_breakpoints=True)
     assert bound.binding.automatic_cache_breakpoints is True
-    reset = bound.rebind(automatic_cache_breakpoints=None)
-    assert reset.binding.automatic_cache_breakpoints is False
-
-
-def test_traced_bind_and_rebind_forward_max_attempts() -> None:
-    """TracedLLM.bind and TracedBoundLLM.rebind forward max_attempts."""
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
-    assert traced.bind().max_attempts == 3
-    bound = traced.bind(max_attempts=2)
     assert bound.max_attempts == 2
-    assert bound.rebind().max_attempts == 2
-    assert bound.rebind(max_attempts=4).max_attempts == 4
+
+    kept = bound.rebind()
+    assert kept.binding.extra_body is extra_body
+    assert kept.binding.provider_executed_tools[0] is provider_tool
+    assert kept.binding.automatic_cache_breakpoints is True
+    assert kept.max_attempts == 2
+
+    replacement = {"safety_identifier": "user-8"}
+    replacement_tool = {"type": "file_search"}
+    replaced = bound.rebind(
+        extra_body=replacement,
+        provider_executed_tools=[replacement_tool],
+        automatic_cache_breakpoints=None,
+        max_attempts=4,
+    )
+    assert replaced.binding.extra_body is replacement
+    assert replaced.binding.provider_executed_tools == (replacement_tool,)
+    assert replaced.binding.provider_executed_tools[0] is replacement_tool
+    assert replaced.binding.automatic_cache_breakpoints is False
+    assert replaced.max_attempts == 4
+
+    cleared = bound.rebind(extra_body=None, provider_executed_tools=())
+    assert cleared.binding.extra_body is None
+    assert cleared.binding.provider_executed_tools == ()
 
 
 def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:

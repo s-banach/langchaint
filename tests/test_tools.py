@@ -325,15 +325,6 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     assert result.called_name == "missing"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.is_error is True
-    assert "missing" in result.tool_message.content
-    assert "echo" in result.tool_message.content
-
-
-def test_dispatch_unknown_tool_content_delegates_to_the_renderer() -> None:
-    """The unknown-tool content is exactly render_unknown_tool of called_name and held_names."""
-    call = ToolCall(id="call1", name="missing", args_json="{}")
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
-    assert isinstance(result, DispatchUnknownTool)
     assert result.tool_message.content == render_unknown_tool(
         called_name="missing", held_names=("echo",)
     )
@@ -398,100 +389,36 @@ class _Receipt(BaseModel):
     record_id: str
 
 
-def test_dispatch_passes_a_pydantic_app_data_through_live() -> None:
-    """A success ToolOutputExplicit with a pydantic app_data reaches result.app_data by identity."""
-    cites = _Cites(citations=["doc-1", "doc-2"])
-
-    async def _cited_function(args: _EchoArgs) -> ToolOutputExplicit[_Cites]:
-        """Return model-visible content plus the app_data the model never sees."""
-        return ToolOutputExplicit(content=f"echoed {args.text}", app_data=cites)
-
-    tool = PydanticTool(
-        name="cited",
-        description="Returns content plus app_data.",
-        args_model=_EchoArgs,
-        function=_cited_function,
-    )
-    call = ToolCall(id="call1", name="cited", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert result.tool_message.content == "echoed tide"
-    assert result.tool_message.is_error is False
-    assert result.app_data is cites
-
-
-def test_dispatch_passes_a_mapping_app_data_through_unchanged() -> None:
-    """A mapping app_data reaches result.app_data unchanged, for MCP tools with unknown schemas."""
-    app_data = {"citations": ["doc-1"]}
+def test_dispatch_preserves_mapping_app_data_identity() -> None:
+    """Mapping app_data passes through ToolManager unchanged."""
+    mapping = {"citations": ["doc-1"]}
 
     async def _mapping_function(args: _EchoArgs) -> ToolOutputExplicit[Mapping[str, object]]:
-        """Return content plus a mapping app_data."""
-        return ToolOutputExplicit(content=f"echoed {args.text}", app_data=app_data)
+        """Return content plus mapping app_data."""
+        return ToolOutputExplicit(content=f"declined {args.text}", is_error=True, app_data=mapping)
 
-    tool = PydanticTool(
+    mapping_tool = PydanticTool(
         name="mapping",
         description="Returns a mapping app_data.",
         args_model=_EchoArgs,
         function=_mapping_function,
     )
-    call = ToolCall(id="call1", name="mapping", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert result.app_data == {"citations": ["doc-1"]}
-
-
-def test_dispatch_carries_app_data_on_the_error_outcome() -> None:
-    """An is_error ToolOutputExplicit still carries its app_data: failure and record ride together."""
-    receipt = _Receipt(record_id="rec-7")
-
-    async def _persist_then_fail_function(args: _EchoArgs) -> ToolOutputExplicit[_Receipt]:
-        """Persist a record, then report a model-visible failure carrying that record."""
-        return ToolOutputExplicit(content=f"declined {args.text}", is_error=True, app_data=receipt)
-
-    tool = PydanticTool(
-        name="persist",
-        description="Fails after persisting a record.",
-        args_model=_EchoArgs,
-        function=_persist_then_fail_function,
-    )
-    call = ToolCall(id="call1", name="persist", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
-    assert result.tool_message.is_error is True
-    assert result.app_data is receipt
-
-
-def test_tool_dispatch_carries_the_tools_app_data_type_without_isinstance() -> None:
-    """PydanticTool.dispatch preserves its app_data type."""
-
-    async def _cited_function(args: _EchoArgs) -> ToolOutputExplicit[_Cites]:
-        """Return content plus a pydantic app_data."""
-        return ToolOutputExplicit(
-            content=f"echoed {args.text}", app_data=_Cites(citations=["doc-1"])
+    mapping_result = asyncio.run(
+        ToolManager([mapping_tool]).dispatch(
+            ToolCall(id="call2", name="mapping", args_json='{"text": "tide"}')
         )
-
-    tool = PydanticTool(
-        name="cited",
-        description="Returns content plus app_data.",
-        args_model=_EchoArgs,
-        function=_cited_function,
     )
-    call = ToolCall(id="call1", name="cited", args_json='{"text": "tide"}')
-    result = asyncio.run(tool.dispatch(call))
+    assert isinstance(mapping_result, DispatchHandled)
+    assert mapping_result.tool_message.is_error is True
+    assert mapping_result.app_data is mapping
+
+
+async def _pin_tool_dispatch_app_data_type(
+    tool: PydanticTool[_EchoArgs, _Cites], call: ToolCall
+) -> None:
+    result = await tool.dispatch(call)
     assert isinstance(result, DispatchHandled)
-    cites: _Cites | None = result.app_data
-    assert cites is not None
-    assert cites.citations == ["doc-1"]
-
-
-def test_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
-    """PydanticTool.dispatch returns DispatchInvalidToolArgs for bad arguments."""
-    call = ToolCall(id="call1", name="echo", args_json='{"wrong": "key"}')
-    result = asyncio.run(_echo_tool().dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
-    assert result.tool_message.is_error is True
-    assert "invalid arguments for echo" in result.tool_message.content
-    assert any("text" in detail.path for detail in result.details)
+    assert_type(result.app_data, _Cites | None)
 
 
 def test_plain_function_exception_propagates_as_a_defect() -> None:

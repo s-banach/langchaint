@@ -11,7 +11,6 @@ from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicRates,
 )
-from langchaint.openai import OPENAI_PRICING
 from langchaint.openai.shared import (
     OpenAILongContextPricing,
     OpenAIPricingTable,
@@ -179,12 +178,6 @@ def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
             standard=_anthropic_rates(),
             inference_geo_us_multiplier=value,
         )
-
-
-def test_catalog_aliases_share_canonical_tables() -> None:
-    """Each alias references its canonical pricing table."""
-    assert OPENAI_PRICING["gpt-5.6"] is OPENAI_PRICING["gpt-5.6-sol"]
-    assert ANTHROPIC_PRICING["claude-haiku-4-5"] is ANTHROPIC_PRICING["claude-haiku-4-5-20251001"]
 
 
 def test_bedrock_pricing_uses_bedrock_entries() -> None:

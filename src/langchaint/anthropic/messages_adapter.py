@@ -263,10 +263,12 @@ class AnthropicRates:
             pydantic.ValidationError: a counter is negative.
         """
         cache_write_5m_cost_in_usd = category_cost(
-            input_tokens_cache_write_5m, self.cache_write_5m_usd_per_million_tokens
+            input_tokens_cache_write_5m,
+            usd_per_million_tokens=self.cache_write_5m_usd_per_million_tokens,
         )
         cache_write_1h_cost_in_usd = category_cost(
-            input_tokens_cache_write_1h, self.cache_write_1h_usd_per_million_tokens
+            input_tokens_cache_write_1h,
+            usd_per_million_tokens=self.cache_write_1h_usd_per_million_tokens,
         )
         input_tokens_cache_write = input_tokens_cache_write_5m + input_tokens_cache_write_1h
         input_tokens_cache_write_cost_in_usd = (
@@ -280,14 +282,17 @@ class AnthropicRates:
                 output_tokens=output_tokens,
                 output_tokens_reasoning=output_tokens_reasoning,
                 input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+                    input_tokens_cache_read,
+                    usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
                 ),
                 input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
                 input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+                    input_tokens_cache_none,
+                    usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
                 ),
                 output_tokens_cost_in_usd=category_cost(
-                    output_tokens, self.output_usd_per_million_tokens
+                    output_tokens,
+                    usd_per_million_tokens=self.output_usd_per_million_tokens,
                 ),
                 provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),
@@ -942,7 +947,7 @@ def _billing_from_sdk_usage(
     web_search_requests = 0 if server_tool_use is None else server_tool_use.web_search_requests
     provider_executed_tool_cost_in_usd = invocation_cost_in_usd(
         web_search_requests,
-        pricing.web_search_usd_per_invocation,
+        usd_per_invocation=pricing.web_search_usd_per_invocation,
     )
     if provider_tools.web_search and not billing_complete:
         provider_executed_tool_cost_in_usd = nan

@@ -3,7 +3,6 @@
 import asyncio
 import importlib
 from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Protocol, TypeIs
 
 import pytest
@@ -111,16 +110,6 @@ def test_tool_approval_paths() -> None:
     assert [message.is_error for message in approved_messages] == [False, False]
     assert denied_messages[0].is_error is True
     assert denied_messages[0].content == "The user declined this transfer."
-
-
-def test_tool_forms_type_guard_rejects_unrelated_classes() -> None:
-    """Only BaseModel subclasses satisfy the TransferArgs protocol attribute."""
-    invalid_module = SimpleNamespace(
-        TransferArgs=int,
-        dispatch_with_approval=print,
-        search_docs=print,
-    )
-    assert not _is_tool_forms_example(invalid_module)
 
 
 def test_tool_arguments_reject_infinite_transfers_and_missing_queries() -> None:

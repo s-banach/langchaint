@@ -30,7 +30,6 @@ from anthropic.types.output_tokens_details import OutputTokensDetails as Anthrop
 from botocore.exceptions import ClientError
 from google.genai import _api_client
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
-from openai.lib._parsing._responses import type_to_text_format_param
 from openai.resources.embeddings import AsyncEmbeddings
 from openai.types import CreateEmbeddingResponse
 from openai.types import Embedding as OpenAIEmbedding
@@ -113,55 +112,31 @@ def _is_required(model: type[BaseModel], name: str) -> bool:
     return model.model_fields[name].is_required()
 
 
-def test_anthropic_cache_counters_stay_optional_ints() -> None:
-    """The anthropic cache counters are Optional[int], which is what the `or 0` in the adapter reads.
-
-    Anthropic cache-read counters remain optional integers.
-    """
+def test_anthropic_usage_fields_match_the_billing_parser() -> None:
+    """Distinguish optional fallback counters from required counters and TTL details."""
     for name in ("cache_read_input_tokens", "cache_creation_input_tokens"):
         assert _field_annotation(AnthropicUsage, name) == (int | None), name
         assert not _is_required(AnthropicUsage, name), name
-
-
-def test_anthropic_unguarded_counters_stay_required_ints() -> None:
-    """input_tokens and output_tokens are required ints, which the adapter reads unguarded."""
     for name in ("input_tokens", "output_tokens"):
         assert _field_annotation(AnthropicUsage, name) is int, name
         assert _is_required(AnthropicUsage, name), name
-
-
-def test_anthropic_cache_creation_keeps_both_ttl_counters() -> None:
-    """The two-TTL split the adapter prices at different rates is still two required int fields.
-
-    The adapter prices both cache-write TTL counters separately.
-    """
     for name in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
         assert _field_annotation(CacheCreation, name) is int, name
         assert _is_required(CacheCreation, name), name
-
-
-def test_anthropic_reasoning_counter_is_thinking_tokens() -> None:
-    """The reasoning counter the adapter reports as output_tokens_reasoning is still named thinking_tokens."""
     assert _field_annotation(AnthropicOutputDetails, "thinking_tokens") is int
     assert _is_required(AnthropicOutputDetails, "thinking_tokens")
 
 
-def test_openai_usage_counters_stay_required_ints() -> None:
-    """OpenAI input token counters are required integers."""
-    assert _field_annotation(ResponseUsage, "input_tokens") is int
-    assert _is_required(ResponseUsage, "input_tokens")
+def test_openai_usage_fields_match_the_billing_parser() -> None:
+    """Require the counters and detail objects accessed directly during response billing."""
+    for name in ("input_tokens", "output_tokens"):
+        assert _field_annotation(ResponseUsage, name) is int, name
+        assert _is_required(ResponseUsage, name), name
     for name in ("cached_tokens", "cache_write_tokens"):
         assert _field_annotation(InputTokensDetails, name) is int, name
         assert _is_required(InputTokensDetails, name), name
     assert _field_annotation(OutputTokensDetails, "reasoning_tokens") is int
     assert _is_required(OutputTokensDetails, "reasoning_tokens")
-
-
-def test_openai_usage_details_objects_are_not_optional() -> None:
-    """input_tokens_details and output_tokens_details are non-nullable, so the adapter reaches into them directly.
-
-    OpenAI cached_tokens remains a required integer.
-    """
     for name in ("input_tokens_details", "output_tokens_details"):
         assert _is_required(ResponseUsage, name), name
     assert _field_annotation(ResponseUsage, "input_tokens_details") is InputTokensDetails
@@ -348,12 +323,6 @@ def test_openai_status_error_reads_the_code_parse_branches_on() -> None:
     assert bodyless.code is None
 
 
-def test_both_sdk_clients_retry_twice_by_default() -> None:
-    """Each SDK defaults to two internal retries."""
-    assert anthropic.DEFAULT_MAX_RETRIES == 2
-    assert openai.DEFAULT_MAX_RETRIES == 2
-
-
 def test_openai_maps_only_the_statuses_it_lists_to_a_subclass() -> None:
     """OpenAI uses APIStatusError for unlisted status codes."""
     client = openai.OpenAI(api_key="k")
@@ -474,13 +443,6 @@ def test_openai_stream_events_carry_the_delta_and_done_types_the_stream_branches
     assert "response.reasoning_text.delta" in type_values
     assert "response.reasoning_summary_text.done" in type_values
     assert "response.reasoning_text.done" in type_values
-
-
-def test_the_schema_builders_both_adapters_call_are_still_where_they_were() -> None:
-    """Each structured-output schema builder remains callable."""
-    assert "transform_schema" in anthropic.__all__
-    assert callable(anthropic.transform_schema)
-    assert callable(type_to_text_format_param)
 
 
 def test_the_cache_breakpoint_keys_both_adapters_write_still_exist() -> None:

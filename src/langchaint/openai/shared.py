@@ -175,16 +175,20 @@ class OpenAIRates:
                 output_tokens=output_tokens,
                 output_tokens_reasoning=output_tokens_reasoning,
                 input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read, self.cache_read_usd_per_million_tokens
+                    input_tokens_cache_read,
+                    usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
                 ),
                 input_tokens_cache_write_cost_in_usd=category_cost(
-                    input_tokens_cache_write, self.cache_write_usd_per_million_tokens
+                    input_tokens_cache_write,
+                    usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
                 ),
                 input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none, self.input_cache_none_usd_per_million_tokens
+                    input_tokens_cache_none,
+                    usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
                 ),
                 output_tokens_cost_in_usd=category_cost(
-                    output_tokens, self.output_usd_per_million_tokens
+                    output_tokens,
+                    usd_per_million_tokens=self.output_usd_per_million_tokens,
                 ),
                 provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),

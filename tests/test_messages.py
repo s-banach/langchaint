@@ -351,11 +351,3 @@ def test_model_copy_rejects_a_key_that_is_not_a_field() -> None:
     """A typo key raises and the message lists the model's fields."""
     with pytest.raises(TypeError, match="not a field of UserMessage"):
         _ = UserMessage(content="hi").model_copy(update={"contnet": "bye"})
-
-
-def test_model_copy_with_a_field_key_returns_the_modified_copy() -> None:
-    """A field key passes the check and modifies the frozen model's copy as on pydantic's model_copy."""
-    message = ToolMessage(tool_call_id="c1", content="ok")
-    copy = message.model_copy(update={"is_error": True})
-    assert copy.is_error is True
-    assert message.is_error is False

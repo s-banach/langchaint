@@ -233,24 +233,30 @@ class AdapterConformance(ABC):
             assert _costs_agree(
                 usage.input_tokens_cache_read_cost_in_usd,
                 category_cost(
-                    usage.input_tokens_cache_read, billing.cache_read_usd_per_million_tokens
+                    usage.input_tokens_cache_read,
+                    usd_per_million_tokens=billing.cache_read_usd_per_million_tokens,
                 ),
             )
             assert _costs_agree(
                 usage.input_tokens_cache_write_cost_in_usd,
                 category_cost(
-                    usage.input_tokens_cache_write, billing.cache_write_usd_per_million_tokens
+                    usage.input_tokens_cache_write,
+                    usd_per_million_tokens=billing.cache_write_usd_per_million_tokens,
                 ),
             )
             assert _costs_agree(
                 usage.input_tokens_cache_none_cost_in_usd,
                 category_cost(
-                    usage.input_tokens_cache_none, billing.input_cache_none_usd_per_million_tokens
+                    usage.input_tokens_cache_none,
+                    usd_per_million_tokens=billing.input_cache_none_usd_per_million_tokens,
                 ),
             )
             assert _costs_agree(
                 usage.output_tokens_cost_in_usd,
-                category_cost(usage.output_tokens, billing.output_usd_per_million_tokens),
+                category_cost(
+                    usage.output_tokens,
+                    usd_per_million_tokens=billing.output_usd_per_million_tokens,
+                ),
             )
 
     def test_counters_that_cannot_be_partitioned_raise_at_arrival(self) -> None:
@@ -483,7 +489,8 @@ class AdapterConformance(ABC):
                 assert _costs_agree(
                     _row_number(row, cost_column),
                     category_cost(
-                        int(_row_number(row, counter_column)), _row_number(row, price_column)
+                        int(_row_number(row, counter_column)),
+                        usd_per_million_tokens=_row_number(row, price_column),
                     ),
                 )
 

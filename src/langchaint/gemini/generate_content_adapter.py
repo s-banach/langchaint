@@ -260,8 +260,8 @@ class GeminiRates:
 _NO_CACHE_WRITE_RATE = float("nan")
 """The cache-write price every Gemini Billing reports.
 
-Gemini bills no cache writes, so no rate exists to state; the write counter is always zero, and
-category_cost(0, NaN) is 0.0, so nothing NaN-poisons.
+Gemini bills no cache writes, so no rate exists to state.
+The write counter is always zero, and `category_cost(0, usd_per_million_tokens=float("nan"))` is `0.0`.
 """
 
 
@@ -326,14 +326,17 @@ class GeminiPricingTable:
                 output_tokens=output_tokens,
                 output_tokens_reasoning=output_tokens_reasoning,
                 input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read, rates.cache_read_usd_per_million_tokens
+                    input_tokens_cache_read,
+                    usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
                 ),
                 input_tokens_cache_write_cost_in_usd=0.0,
                 input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none, rates.input_cache_none_usd_per_million_tokens
+                    input_tokens_cache_none,
+                    usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
                 ),
                 output_tokens_cost_in_usd=category_cost(
-                    output_tokens, rates.output_usd_per_million_tokens
+                    output_tokens,
+                    usd_per_million_tokens=rates.output_usd_per_million_tokens,
                 ),
                 provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
             ),
@@ -535,10 +538,10 @@ def _provider_executed_tool_cost_in_usd(
     google_maps_rate = table.google_maps_usd_per_query
     return invocation_cost_in_usd(
         len(search_queries),
-        google_search_rate,
+        usd_per_invocation=google_search_rate,
     ) + invocation_cost_in_usd(
         maps_query_count,
-        google_maps_rate,
+        usd_per_invocation=google_maps_rate,
     )
 
 

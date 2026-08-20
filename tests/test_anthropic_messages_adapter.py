@@ -917,7 +917,7 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
         )
     )
     tools = _block_list(precomputed.tools)
-    assert tools[0]["name"] == "get_weather"
+    assert tools[0].get("name") == "get_weather"
     assert tools[1].get("type") == "web_search_20250305"
     assert tools[1].get("cache_control") == {"type": "ephemeral"}
     assert "cache_control" not in provider_tool

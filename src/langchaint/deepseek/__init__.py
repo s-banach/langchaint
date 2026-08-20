@@ -22,7 +22,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "openai":
         raise
     raise ModuleNotFoundError(
-        "langchaint's deepseek backend requires the openai package; install openai."
+        "langchaint's deepseek backend requires the openai package; install langchaint[deepseek]."
     ) from exc
 
 from openai.types.completion_usage import CompletionUsage

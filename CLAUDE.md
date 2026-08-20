@@ -111,8 +111,9 @@ Include the SDK version when the fact can drift.
 - Use a frozen dataclass or NamedTuple otherwise.
 - State the validation benefit in each pydantic model docstring.
 - Derive every pydantic model from the checked-copy base, which rejects keys that are not fields.
-- Keep SDKs as optional dependencies that the application pins directly.
-- Declare no extras.
+- Keep SDKs as optional dependencies.
+- Declare each backend dependency set as an extra with the same lower bounds used by the dev group.
+- Let applications add tighter SDK pins.
 - Keep SDK imports out of the neutral core.
 - Import each SDK at the backend subpackage module top under a guard that raises `ModuleNotFoundError` with installation instructions.
 - Name each backend class for its provider.

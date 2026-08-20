@@ -28,15 +28,15 @@ One-hour cache writes cost twice base input.
 from dataclasses import dataclass
 from typing import Literal, overload
 
-import httpx
-
 try:
+    import httpx2
     from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 except ModuleNotFoundError as exc:
-    if exc.name != "anthropic":
+    if exc.name not in ("anthropic", "httpx2"):
         raise
     raise ModuleNotFoundError(
-        "langchaint's anthropic backend requires the anthropic package; install anthropic."
+        "langchaint's anthropic backend requires its dependencies; install "
+        "langchaint[anthropic] or langchaint[anthropic-bedrock]."
     ) from exc
 
 from langchaint.anthropic._generated_pricing import (
@@ -287,7 +287,7 @@ class AnthropicBedrock:
         *,
         aws_region: str | None = None,
         client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
-        http_client: httpx.AsyncClient | None = None,
+        http_client: httpx2.AsyncClient | None = None,
         max_concurrent_requests: int | None = 8,
         max_request_starts_per_second: float = 50.0,
         minimum_wait_ceiling_seconds: float = 1.0,
@@ -325,7 +325,7 @@ class AnthropicBedrock:
             quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         )
         self.aws_region: str | None = aws_region
-        self.http_client: httpx.AsyncClient | None = http_client
+        self.http_client: httpx2.AsyncClient | None = http_client
         self._passed_client = client_without_retries(client) if client is not None else None
         self._clients_by_api: dict[
             Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle

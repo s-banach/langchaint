@@ -149,12 +149,12 @@ def test_embedding_model_performs_no_tokenizer_loading(
 
 
 def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Name tiktoken when the optional tokenizer dependency is unavailable."""
+    """Name the OpenAI embedding extra when tiktoken is unavailable."""
     client = _client(lambda _request: _response([[1.0]]))
     openai = OpenAI(client=client)
     monkeypatch.delitem(sys.modules, "langchaint.openai.embedding_adapter")
     monkeypatch.setitem(sys.modules, "tiktoken", None)
-    with pytest.raises(ModuleNotFoundError, match="require the tiktoken package"):
+    with pytest.raises(ModuleNotFoundError, match=r"langchaint\[openai-embedding\]"):
         _ = openai.embedding_model("text-embedding-3-small")
     asyncio.run(client.close())
 

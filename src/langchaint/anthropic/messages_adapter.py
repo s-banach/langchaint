@@ -1,6 +1,6 @@
 """Implement the Anthropic Messages API through the official anthropic SDK.
 
-The following SDK facts were verified against anthropic 0.120.0.
+The following SDK facts were verified against anthropic 1.0.0.
 A structured binding sends the same `output_config.format` as `messages.parse(output_format=Model)`.
 Its schema uses `transform_schema(TypeAdapter(Model).json_schema())` and type `"json_schema"`.
 The adapter validates response text after the SDK exposes the complete message and billing.
@@ -54,7 +54,7 @@ import base64
 import json
 from abc import ABC
 from collections import Counter
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite, nan
 from typing import Any, ClassVar, Literal, cast, override
@@ -496,6 +496,45 @@ class _AnthropicPrecomputedFields:
     provider_tools: _AnthropicProviderTools
 
 
+@dataclass(frozen=True)
+class _TemperatureExtraBody(Mapping[str, object]):
+    """Expose temperature with caller fields while retaining caller_fields by reference."""
+
+    temperature: float
+    caller_fields: Mapping[str, object]
+
+    @override
+    def __getitem__(self, key: str) -> object:
+        if key == "temperature":
+            return self.temperature
+        return self.caller_fields[key]
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        yield "temperature"
+        yield from (key for key in self.caller_fields if key != "temperature")
+
+    @override
+    def __len__(self) -> int:
+        caller_field_count = len(self.caller_fields)
+        if "temperature" in self.caller_fields:
+            return caller_field_count
+        return caller_field_count + 1
+
+
+def _extra_body_with_temperature(
+    precomputed: _AnthropicPrecomputedFields,
+) -> Mapping[str, object] | None:
+    if isinstance(precomputed.temperature, Omit):
+        return precomputed.extra_body
+    if precomputed.extra_body is None:
+        return {"temperature": precomputed.temperature}
+    return _TemperatureExtraBody(
+        temperature=precomputed.temperature,
+        caller_fields=precomputed.extra_body,
+    )
+
+
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "model",
     "max_tokens",
@@ -510,8 +549,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "messages",
     "stream",
 })
-"""The wire keys an extra_body must not hold: every keyword open_stream passes,
-plus stream, which the SDK's stream method sets and its event parsing depends on."""
+"""The wire keys an extra_body must not hold because the adapter owns their values."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1450,7 +1488,6 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         manager = self._adapter.client.messages.stream(
             model=precomputed.model,
             max_tokens=precomputed.max_tokens,
-            temperature=precomputed.temperature,
             system=precomputed.system,
             tools=precomputed.tools,
             tool_choice=precomputed.tool_choice,
@@ -1459,7 +1496,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             service_tier=precomputed.service_tier,
             inference_geo=precomputed.inference_geo,
             messages=params.messages,
-            extra_body=precomputed.extra_body,
+            extra_body=_extra_body_with_temperature(precomputed),
         )
         return _AnthropicStream(
             sdk_stream=await manager.__aenter__(),

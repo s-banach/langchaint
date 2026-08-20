@@ -13,20 +13,24 @@ Applications should use a strict type checker because langchaint leaves argument
 ## Install and authenticate
 
 langchaint requires Python 3.13 or newer.
-Applications install and pin each provider SDK.
-langchaint declares no dependency extras.
+Install one or more backend extras, such as `pip install "langchaint[openai]"`.
+Each extra declares langchaint's tested dependency lower bounds.
+Applications may add tighter dependency pins.
 Top-level `import langchaint` requires no provider SDK or `numpy`.
 Backend imports report missing dependencies through `ModuleNotFoundError`.
 
-| Provider | Class | Creates | Depends | Default credentials |
+| Backend | Class | Creates | Install | Default credentials |
 | --- | --- | --- | --- | --- |
-| Anthropic | `Anthropic` | `LLM` | `anthropic` | `ANTHROPIC_API_KEY` |
-| Amazon Bedrock | `AnthropicBedrock` | `LLM` | `anthropic[bedrock]` | AWS credential provider chain |
-| Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `boto3` and `numpy` | AWS credential provider chain |
-| DeepSeek | `DeepSeek` | `LLM` | `openai` | `DEEPSEEK_API_KEY` |
-| Gemini | `Gemini` | `LLM` | `google-genai` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| OpenAI | `OpenAI` | `LLM`, `EmbeddingModel` | `openai` (`numpy` and `tiktoken` for embeddings) | `OPENAI_API_KEY` |
-| Amazon Bedrock | `OpenAIBedrock` | `LLM` | `openai[bedrock]` | AWS credential provider chain |
+| Anthropic | `Anthropic` | `LLM` | `langchaint[anthropic]` | `ANTHROPIC_API_KEY` |
+| Anthropic on Amazon Bedrock | `AnthropicBedrock` | `LLM` | `langchaint[anthropic-bedrock]` | AWS credential provider chain |
+| Cohere on Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `langchaint[cohere-bedrock]` | AWS credential provider chain |
+| DeepSeek | `DeepSeek` | `LLM` | `langchaint[deepseek]` | `DEEPSEEK_API_KEY` |
+| Gemini | `Gemini` | `LLM` | `langchaint[gemini]` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| OpenAI | `OpenAI` | `LLM` | `langchaint[openai]` | `OPENAI_API_KEY` |
+| OpenAI embeddings | `OpenAI` | `EmbeddingModel` | `langchaint[openai-embedding]` | `OPENAI_API_KEY` |
+| OpenAI on Amazon Bedrock | `OpenAIBedrock` | `LLM` | `langchaint[openai-bedrock]` | AWS credential provider chain |
+
+Install `langchaint[tracing]` to use the OTel tracing subpackage.
 
 Every listed class accepts `client=`.
 Amazon Bedrock classes use the AWS credential provider chain.

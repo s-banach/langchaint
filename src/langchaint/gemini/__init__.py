@@ -32,7 +32,7 @@ except ModuleNotFoundError as exc:
     if exc.name not in ("google", "google.genai"):
         raise
     raise ModuleNotFoundError(
-        "langchaint's gemini backend requires the google-genai package; install google-genai."
+        "langchaint's gemini backend requires google-genai; install langchaint[gemini]."
     ) from exc
 
 from langchaint.gemini.generate_content_adapter import (

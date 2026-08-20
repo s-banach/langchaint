@@ -65,7 +65,7 @@ except ModuleNotFoundError as exc:
     if exc.name is not None and not exc.name.startswith("opentelemetry"):
         raise
     raise ModuleNotFoundError(
-        "langchaint's tracing subpackage requires opentelemetry-api; install opentelemetry-api."
+        "langchaint's tracing subpackage requires opentelemetry-api; install langchaint[tracing]."
     ) from exc
 
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice

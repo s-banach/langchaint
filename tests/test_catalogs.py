@@ -8,7 +8,7 @@ import json
 import pathlib
 from collections.abc import Callable
 
-import httpx
+import httpx2
 import pytest
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from google import genai
@@ -457,7 +457,7 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
     model: AnthropicBedrockModelName,
 ) -> None:
     """Preserve a passed Bedrock client's custom transport while disabling retries."""
-    http_client = httpx.AsyncClient()
+    http_client = httpx2.AsyncClient()
     if model == "anthropic.claude-opus-4-8":
         client = AsyncAnthropicBedrockMantle(
             aws_region="us-east-1",
@@ -484,7 +484,7 @@ def test_bedrock_rejects_client_and_http_client_together() -> None:
     with pytest.raises(ValueError, match="http_client="):
         _ = AnthropicBedrock(
             client=client,
-            http_client=httpx.AsyncClient(),
+            http_client=httpx2.AsyncClient(),
         )
 
 

@@ -18,6 +18,17 @@ dependencies = [
     "pydantic>=2.13.4",
 ]
 
+[project.optional-dependencies]
+anthropic = ["anthropic>=1.0.0"]
+anthropic-bedrock = ["anthropic[bedrock]>=1.0.0"]
+cohere-bedrock = ["boto3>=1.42", "numpy>=2.5.0"]
+deepseek = ["openai>=3.0.0"]
+gemini = ["google-genai>=2.18.0"]
+openai = ["openai>=3.0.0"]
+openai-embedding = ["numpy>=2.5.0", "openai>=3.0.0", "tiktoken>=0.13.0"]
+openai-bedrock = ["openai[bedrock]>=3.0.0"]
+tracing = ["opentelemetry-api>=1.30.0"]
+
 [project.urls]
 Homepage = "https://github.com/s-banach/langchaint"
 Repository = "https://github.com/s-banach/langchaint"
@@ -29,7 +40,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "anthropic>=0.120.0",
+    "anthropic>=1.0.0",
     "coverage>=7.10.0",
     "numpy>=2.5.0",
     "openai>=3.0.0",

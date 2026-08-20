@@ -36,7 +36,8 @@ except ModuleNotFoundError as exc:
     if exc.name != "openai":
         raise
     raise ModuleNotFoundError(
-        "langchaint's openai backend requires the openai package; install openai."
+        "langchaint's openai backend requires its dependencies; install "
+        "langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
     ) from exc
 
 import langchaint  # noqa: TC001 (required for runtime type introspection)
@@ -271,17 +272,20 @@ class OpenAI:
                     f"dimension for {model!r} must be an int from 1 through "
                     f"{maximum_dimension}, got {validated_dimension!r}"
                 )
-        from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
-
         try:
+            from langchaint.embedding import EmbeddingModel  # noqa: PLC0415 (defer numpy)
             from langchaint.openai.embedding_adapter import (  # noqa: PLC0415 (keep tiktoken outside ordinary imports)
                 _OpenAIEmbeddingAdapter,
             )
         except ModuleNotFoundError as exc:
-            if exc.name != "tiktoken":
+            cause = exc.__cause__
+            if exc.name not in ("numpy", "tiktoken") and (
+                not isinstance(cause, ModuleNotFoundError) or cause.name != "numpy"
+            ):
                 raise
             raise ModuleNotFoundError(
-                "OpenAI embeddings require the tiktoken package; install tiktoken."
+                "OpenAI embeddings require numpy and tiktoken; install "
+                "langchaint[openai-embedding]."
             ) from exc
         adapter = _OpenAIEmbeddingAdapter(
             client=self.client,

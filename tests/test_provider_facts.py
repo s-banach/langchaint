@@ -1,7 +1,7 @@
 """Pin SDK facts used by langchaint arithmetic and request mapping.
 
 These tests inspect declared fields, method signatures, and Bedrock service models.
-Current facts target anthropic 0.122.0 and openai 3.1.0.
+Current facts target anthropic 1.0.0 and openai 3.1.0.
 They also target google-genai 2.18.1 and botocore 1.43.72.
 """
 
@@ -11,7 +11,6 @@ import typing
 import anthropic
 import boto3
 import botocore.session
-import httpx
 import httpx2
 import openai
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
@@ -267,12 +266,12 @@ def test_anthropic_reported_service_tier_values_match_the_sdk() -> None:
     assert reported == ("standard", "priority", "batch")
 
 
-def _anthropic_response_with(status_code: int, headers: dict[str, str]) -> httpx.Response:
-    """Build the httpx.Response read by anthropic error constructors."""
-    return httpx.Response(
+def _anthropic_response_with(status_code: int, headers: dict[str, str]) -> httpx2.Response:
+    """Build the httpx2.Response read by anthropic error constructors."""
+    return httpx2.Response(
         status_code=status_code,
         headers=headers,
-        request=httpx.Request("POST", "https://example.invalid/v1"),
+        request=httpx2.Request("POST", "https://example.invalid/v1"),
     )
 
 

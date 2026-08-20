@@ -26,7 +26,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "boto3":
         raise
     raise ModuleNotFoundError(
-        "langchaint's cohere backend requires the boto3 package; install boto3."
+        "langchaint's cohere backend requires boto3; install langchaint[cohere-bedrock]."
     ) from exc
 
 from botocore.config import Config

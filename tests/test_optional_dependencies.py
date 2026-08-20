@@ -29,18 +29,19 @@ def test_generation_imports_without_numpy() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_embedding_apis_name_missing_numpy() -> None:
-    """Name `numpy` when top-level and OpenAI embedding APIs request it."""
+def test_embedding_apis_name_the_install_for_missing_numpy() -> None:
+    """Name each supported install when an embedding API lacks `numpy`."""
     completed = _run_without_numpy(
         "import asyncio\n"
         "import langchaint\n"
         "from openai import AsyncOpenAI\n"
         "from langchaint.openai import OpenAI\n"
-        'expected = "langchaint embeddings require the numpy package; install numpy."\n'
+        'neutral_expected = "langchaint embeddings require the numpy package; install numpy."\n'
+        'openai_expected = "OpenAI embeddings require numpy and tiktoken; install langchaint[openai-embedding]."\n'
         "try:\n"
         "    _ = langchaint.EmbeddingModel\n"
         "except ModuleNotFoundError as error:\n"
-        "    assert str(error) == expected\n"
+        "    assert str(error) == neutral_expected\n"
         "else:\n"
         '    raise AssertionError("EmbeddingModel did not require numpy")\n'
         'client = AsyncOpenAI(api_key="offline")\n'
@@ -48,7 +49,7 @@ def test_embedding_apis_name_missing_numpy() -> None:
         "try:\n"
         '    _ = openai.embedding_model("text-embedding-3-small")\n'
         "except ModuleNotFoundError as error:\n"
-        "    assert str(error) == expected\n"
+        "    assert str(error) == openai_expected\n"
         "else:\n"
         '    raise AssertionError("embedding_model did not require numpy")\n'
         "finally:\n"

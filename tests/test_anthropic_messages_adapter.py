@@ -16,7 +16,7 @@ from typing import TypeIs, get_args, override
 
 import anthropic
 import anthropic.types as at
-import httpx
+import httpx2
 import pytest
 from anthropic import (
     AsyncAnthropic,
@@ -862,6 +862,7 @@ def _binding(
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     tool_choice: ToolChoice = "required",
     extra_body: Mapping[str, object] | None = None,
+    temperature: float | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
     return Binding(
@@ -870,7 +871,7 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=False,
-        inference_params=InferenceParams(reasoning_effort="high"),
+        inference_params=InferenceParams(reasoning_effort="high", temperature=temperature),
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
@@ -1141,22 +1142,26 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
     assert isinstance(precomputed_fields.thinking, anthropic.Omit)
 
 
-def test_request_maps_temperature_and_omits_it_when_unset() -> None:
-    """A bound temperature lands on the request; None leaves the omit sentinel."""
-    unset = _adapter()._precompute_fields(
+def test_request_maps_temperature_and_omits_it_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound temperature enters extra_body; None leaves the omit sentinel."""
+    adapter = _adapter()
+    unset = adapter._precompute_fields(
         _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert isinstance(unset.temperature, anthropic.Omit)
-    binding = Binding(
-        system_prompt=None,
-        tool_schemas=(),
-        provider_executed_tools=(),
-        tool_choice="auto",
-        parallel_tool_calls=True,
-        inference_params=InferenceParams(temperature=0.2),
-        automatic_cache_breakpoints=False,
+    precomputed_fields = adapter._precompute_fields(
+        _binding(
+            system_prompt=None,
+            tool_schemas=(),
+            automatic_cache_breakpoints=False,
+            temperature=0.2,
+        )
     )
-    assert _adapter()._precompute_fields(binding).temperature == 0.2
+    assert precomputed_fields.temperature == 0.2
+    text_bound = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
+    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") == {"temperature": 0.2}
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
@@ -1219,15 +1224,15 @@ class _FakeSDKMessageStream(AsyncMessageStream[None]):
     ) -> None:
         self._replay_events = list(replay_events)
         self._message_snapshot = message_snapshot
-        self._http_response = httpx.Response(
+        self._http_response = httpx2.Response(
             200,
             headers=headers,
-            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
         )
 
     @property
     @override
-    def response(self) -> httpx.Response:
+    def response(self) -> httpx2.Response:
         return self._http_response
 
     @override
@@ -1647,6 +1652,33 @@ def test_the_request_sends_extra_body_by_reference(
     assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
 
 
+def test_temperature_keeps_caller_extra_body_fields_by_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temperature combines with caller fields and retains their mapping by reference."""
+    adapter = _adapter()
+    caller_fields: dict[str, object] = {"top_k": 5}
+    text_bound = _BoundAnthropicText(
+        adapter=adapter,
+        precomputed_fields=adapter._precompute_fields(
+            _binding(
+                system_prompt=None,
+                tool_schemas=(),
+                automatic_cache_breakpoints=True,
+                extra_body=caller_fields,
+                temperature=0.2,
+            )
+        ),
+    )
+    sent_extra_body = _kwarg_sent(monkeypatch, text_bound, "extra_body")
+    assert isinstance(sent_extra_body, Mapping)
+    assert dict(sent_extra_body) == {"temperature": 0.2, "top_k": 5}
+    caller_fields["top_k"] = 6
+    assert sent_extra_body["top_k"] == 6
+    caller_fields["temperature"] = 0.7
+    assert dict(sent_extra_body) == {"temperature": 0.2, "top_k": 6}
+
+
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's text block into the response_format."""
     outcome = _structured_parse(_structured_message(_REPORT_JSON))
@@ -1749,11 +1781,11 @@ def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation(
 
 
 def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
-    """Build the SDK's 429 exception around a constructed httpx response."""
-    response = httpx.Response(
+    """Build the SDK's 429 exception around a constructed httpx2 response."""
+    response = httpx2.Response(
         429,
         headers=headers,
-        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
     )
     return anthropic.RateLimitError("rate limited", response=response, body=None)
 
@@ -1857,14 +1889,14 @@ def _status_error[ErrorT: anthropic.APIStatusError](
     headers: dict[str, str] | None = None,
     error_type: str | None = None,
 ) -> ErrorT:
-    """Build one of the SDK's status exceptions around a constructed httpx response.
+    """Build one of the SDK's status exceptions around a constructed httpx2 response.
 
     error_type fills the SDK exception's error.type.
     None represents a non-JSON body.
     """
-    response = httpx.Response(
+    response = httpx2.Response(
         status_code,
-        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
         headers=headers,
     )
     body = None if error_type is None else {"error": {"type": error_type, "message": "boom"}}
@@ -1874,7 +1906,7 @@ def _status_error[ErrorT: anthropic.APIStatusError](
 def _connection_error() -> anthropic.APIConnectionError:
     """Build the SDK's transport-failure exception, which carries a request and no response."""
     return anthropic.APIConnectionError(
-        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
     )
 
 
@@ -2411,7 +2443,7 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         return {
             _connection_error(): "transient",
             anthropic.APITimeoutError(
-                httpx.Request("POST", "https://api.anthropic.com")
+                httpx2.Request("POST", "https://api.anthropic.com")
             ): "transient",
             anthropic.RetryableError("middleware said retry"): "transient",
             _status_error(anthropic.RateLimitError, 429): "invalid_request",

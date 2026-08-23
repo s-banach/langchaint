@@ -17,22 +17,22 @@ type OpenAIModelName = Literal[
 
 _GPT_5_6_SOL = OpenAIPricingTable(
     default=OpenAIRates(
-        input_cache_none_usd_per_million_tokens=5,
-        output_usd_per_million_tokens=30,
-        cache_read_usd_per_million_tokens=0.5,
-        cache_write_usd_per_million_tokens=6.25,
+        input_cache_none_usd_per_million_tokens=4,
+        output_usd_per_million_tokens=20,
+        cache_read_usd_per_million_tokens=0.4,
+        cache_write_usd_per_million_tokens=5,
     ),
     flex=OpenAIRates(
-        input_cache_none_usd_per_million_tokens=2.5,
-        output_usd_per_million_tokens=15,
-        cache_read_usd_per_million_tokens=0.25,
-        cache_write_usd_per_million_tokens=3.125,
+        input_cache_none_usd_per_million_tokens=2,
+        output_usd_per_million_tokens=10,
+        cache_read_usd_per_million_tokens=0.2,
+        cache_write_usd_per_million_tokens=2.5,
     ),
     fast=OpenAIRates(
-        input_cache_none_usd_per_million_tokens=10,
-        output_usd_per_million_tokens=60,
-        cache_read_usd_per_million_tokens=1,
-        cache_write_usd_per_million_tokens=12.5,
+        input_cache_none_usd_per_million_tokens=8,
+        output_usd_per_million_tokens=40,
+        cache_read_usd_per_million_tokens=0.8,
+        cache_write_usd_per_million_tokens=10,
     ),
     long_context=OpenAILongContextPricing(
         input_tokens_above=272000,

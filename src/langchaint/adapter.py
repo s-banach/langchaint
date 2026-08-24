@@ -1,10 +1,4 @@
-"""The adapter contract.
-
-An `Adapter` converts a `Binding`, sends requests, translates events, reports billing, and classifies failures.
-`AdapterStream.final` returns the SDK response so the retry loop records billing before `BoundAdapter.interpret` runs.
-`Adapter.bind_text` and `Adapter.bind_structured` precompute provider fields.
-`BoundAdapter.build_request` adds per-call `messages` and rejects unsendable input before a request starts.
-"""
+"""The provider-neutral adapter contract."""
 
 import email.utils
 import json
@@ -50,6 +44,9 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
     `retry-after-ms` contains milliseconds.
     `retry-after` contains seconds or a GMT HTTP date.
     Return `None` when neither header contains a positive delay.
+
+    Args:
+        headers: The provider response headers.
     """
     retry_after_ms_header = headers.get("retry-after-ms")
     if retry_after_ms_header is not None:
@@ -73,10 +70,6 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
 
 
 def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None:
-    """Convert a GMT-suffixed HTTP-date retry-after into seconds from now, or None.
-
-    None for a date that does not parse, one not ending in "GMT", and one at or before the current time.
-    """
     if not retry_after_header.endswith("GMT"):
         return None
     parsed = email.utils.parsedate_tz(retry_after_header)
@@ -91,7 +84,12 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
 def terminal_classification_from_response(
     *, status_code: int, headers: Mapping[str, str]
 ) -> Literal["invalid_request", "declared_final", "unknown_exception"]:
-    """Name one terminal error using its status and retry directive."""
+    """Name one terminal error using its status and retry directive.
+
+    Args:
+        status_code: The response status code.
+        headers: The provider response headers.
+    """
     if status_code == 200:
         return "declared_final"
     if 400 <= status_code < 500:
@@ -104,8 +102,10 @@ def terminal_classification_from_response(
 def should_retry_from_headers(headers: Mapping[str, str]) -> bool | None:
     """Read the provider's own retry directive from response headers.
 
-    x-should-retry is non-standard and both SDK clients obey it ahead of every status rule.
-    None means the provider stated nothing and the status decides.
+    `None` defers the decision to the status.
+
+    Args:
+        headers: The provider response headers.
     """
     should_retry_header = headers.get("x-should-retry")
     if should_retry_header == "true":
@@ -125,6 +125,11 @@ def verdict_under_retry_directive(
     The directive decides whether this request retries.
     The status decides whether `SharedBackoff` pauses the rate-limit quota.
     Callers exclude status-200 mid-stream error events.
+
+    Args:
+        verdict: The status-based verdict.
+        headers: The provider response headers.
+        retry_after: The normalized retry delay for a forced retry.
     """
     directive = should_retry_from_headers(headers)
     if directive is False:
@@ -139,8 +144,8 @@ def verdict_under_retry_directive(
 def verdict_from_transient_error(error: TransientError) -> PauseAll | RetryThisOne:
     """Map one `TransientError` to its `Verdict`.
 
-    Retry loops create `TransientError` for transient failures in billable responses.
-    They raise it inside `SharedBackoff.admitted()`.
+    Args:
+        error: The transient failure to map.
     """
     if error.is_rate_limit:
         return PauseAll(retry_after=error.retry_after_seconds)
@@ -154,7 +159,12 @@ def record_parse_fallthrough(
 
     A provider parse function calls this when no listed row matched the failure.
     The count and the warning make a new provider status or error type visible.
-    Without them the default would absorb it silently.
+
+    Args:
+        fallthrough_counts: The counter to increment by failure description.
+        parse_name: The provider parse function name used in the warning.
+        status_code: The status code used in the failure description.
+        error_type: The provider error type used in the failure description.
     """
     tag = f"status={status_code} type={error_type}"
     fallthrough_counts[tag] += 1
@@ -162,21 +172,14 @@ def record_parse_fallthrough(
 
 
 REASONING_PART_SEPARATOR = "\n\n"
-"""What an adapter puts between two reasoning parts a provider breaks structurally.
-
-Providers delimit the parts of a turn's reasoning by structure, not by text: neither the boundary
-nor any whitespace for it arrives on the wire. One constant keeps the two adapters from separating
-parts differently.
-"""
+"""Text inserted between provider-delimited reasoning parts."""
 
 
 @dataclass(frozen=True, kw_only=True)
 class ReasoningDelta:
     """A chunk of the model's readable reasoning.
 
-    text is literal characters to append: a consumer concatenates the deltas and renders the result.
-    An adapter supplies REASONING_PART_SEPARATOR as its own delta at each part boundary,
-    so the concatenation reads as prose rather than running two parts together.
+    Append `text` to the preceding reasoning text.
     """
 
     text: str
@@ -187,9 +190,8 @@ class ReasoningDelta:
 class ToolCallDelta:
     """A chunk of one forming tool call's argument JSON.
 
-    id and name are the values the completed ToolCall carries,
-    so a consumer keys a buffer by id and labels it by name from the first delta.
-    partial_args_json is literal characters to append to that buffer.
+    `id` and `name` match the completed `ToolCall`.
+    Append `partial_args_json` values by `id`.
     """
 
     id: str
@@ -202,16 +204,14 @@ type StreamItem = str | ReasoningDelta | ToolCallDelta | ToolCall
 """What a stream yields: answer text chunks, reasoning text deltas, tool-call argument deltas, and completed tool calls.
 
 Answer text chunks are the provider SDK's own strings, passed through without a wrapper class or copy.
-Reasoning is wrapped because it is the turn's second kind of text and a bare string could not be told from the answer;
-a consumer routes the two to different places.
+`ReasoningDelta` distinguishes reasoning text from answer text.
 Each tool call is yielded once, complete, when its block closes.
-A call's ToolCallDelta items all precede its completed ToolCall.
+A call's `ToolCallDelta` values all precede its completed `ToolCall`.
 Two forming calls' deltas may interleave, so a consumer accumulates per id.
-Where the completed call's args_json is valid JSON, its concatenated deltas parse to the same JSON value;
-text equality is not promised, because an adapter may re-serialize the arguments it accumulated.
-Zero deltas for a call is allowed:
-an adapter whose provider delivers calls whole yields none, and empty arguments stream no fragments anywhere.
-Usage, cost, and stop reason are not streamed; they live on the Response from final().
+When the completed call's `args_json` is valid JSON, its concatenated deltas parse to the same JSON value.
+An adapter may re-serialize the arguments it accumulated, so text equality is not promised.
+Providers that deliver complete calls or empty arguments can produce no deltas.
+Usage, cost, and stop reason are available on the `Response` from `final()` instead of the stream.
 """
 
 
@@ -227,8 +227,8 @@ class SpecificToolChoice:
 class AllowedToolsChoice:
     """Tool choice restricted to named application tools.
 
-    `tool_names` names entries in `Binding.tool_schemas` and permits no calls to
-    `Binding.provider_executed_tools`.
+    `tool_names` names entries in `Binding.tool_schemas`.
+    `tool_names` permits no calls to `Binding.provider_executed_tools`.
     `mode="auto"` permits text or a named tool call.
     `mode="required"` requires a named tool call.
 
@@ -253,10 +253,10 @@ class AllowedToolsChoice:
 type ToolChoice = Literal["auto", "required", "none"] | SpecificToolChoice | AllowedToolsChoice
 """Provider-neutral tool choice.
 
-"auto" lets the model decide, "required" forces some tool call (Anthropic's "any"), and "none" forbids tool calls.
-SpecificToolChoice forces one named tool.
-AllowedToolsChoice restricts calls without changing the bound tool definitions, preserving their cacheable prefix.
-Adapters without `AllowedToolsChoice` support reject `AllowedToolsChoice` at bind time.
+`"auto"` lets the model decide, `"required"` requires a tool call, and `"none"` forbids tool calls.
+`SpecificToolChoice` forces one named tool.
+`AllowedToolsChoice` restricts calls without changing the bound tool definitions.
+Adapters that do not support `AllowedToolsChoice` reject it at bind time.
 """
 
 
@@ -268,8 +268,13 @@ def validated_provider_executed_tool_types(
 ) -> frozenset[str]:
     """Validate each `type` discriminator and return its distinct values.
 
+    Args:
+        provider_executed_tools: The provider-shaped tool definitions.
+        supported_types: The supported `type` values.
+        adapter_name: The adapter name used in the error message.
+
     Raises:
-        ValueError: a mapping lacks a supported string `type` value.
+        ValueError: A mapping lacks a supported string `type` value.
     """
     tool_types: set[str] = set()
     for provider_executed_tool in provider_executed_tools:
@@ -286,19 +291,16 @@ def validated_provider_executed_tool_types(
 class Binding:
     """The frozen prefix of one BoundLLM, in langchaint terms only.
 
-    Every field here determines the provider's cacheable prompt prefix or is fixed per binding by design;
-    per-request data is the messages argument of the BoundAdapter methods, nothing else.
+    Every field determines the provider's cacheable prompt prefix or stays fixed for one binding.
+    The `messages` argument of each `BoundAdapter` method contains the per-request data.
     """
 
     system_prompt: str | tuple[TextPart, ...] | None
-    """The bound system prompt; None binds none.
+    """The bound system prompt.
 
-    The parts form exists to carry cache_breakpoint marks inside the system prompt:
-    the anthropic adapter renders one system text block per part,
-    and the openai Responses adapter sends the parts as a developer-role input message ahead of the Sequence[Message]
-    (the SDK documents `instructions` as "a system (or developer) message inserted into the model's context",
-    and only input message parts carry prompt_cache_breakpoint).
-    A plain str renders as one anthropic system block and as the Responses adapter's instructions parameter.
+    A parts value carries `cache_breakpoint` values inside the system prompt.
+    `AnthropicMessagesAdapter` renders one system text block per part.
+    `OpenAIResponsesAdapter` sends the parts as a developer-role input message before the `Sequence[Message]`.
     """
 
     tool_schemas: tuple[ToolSchema, ...]
@@ -319,12 +321,10 @@ class Binding:
     """
 
     extra_body: Mapping[str, object] | None = None
-    """Provider wire-body fields sent verbatim on every request; None binds none.
+    """Provider wire-body fields sent verbatim on every request.
 
-    Keys are the provider's own wire names, and values pass through by reference.
-    Each SDK merges extra_body over the named request parameters, extra_body winning on a
-    duplicate key, so each adapter raises at bind time for a
-    key it populates itself instead of letting the merge silently override the binding.
+    Provider wire names map to values passed through by reference.
+    Each adapter rejects keys that it populates.
     """
 
     def __post_init__(self) -> None:
@@ -358,6 +358,11 @@ def reject_extra_body_keys_the_adapter_populates(
 
     `normalized_key` maps caller keys to the form used by `populated_keys`.
 
+    Args:
+        extra_body: The provider wire-body fields, or `None`.
+        populated_keys: The request field names that the adapter populates.
+        normalized_key: The function that normalizes a caller key before comparison.
+
     Raises:
         ValueError: An `extra_body` key normalizes into `populated_keys`.
     """
@@ -366,8 +371,8 @@ def reject_extra_body_keys_the_adapter_populates(
     colliding = sorted(key for key in extra_body if normalized_key(key) in populated_keys)
     if colliding:
         raise ValueError(
-            f"extra_body keys {colliding} collide with request fields the adapter populates; "
-            "the SDK merge would silently override the binding, so they are refused"
+            f"extra_body keys {colliding} collide with request fields the adapter populates. "
+            "The adapter refuses these keys to prevent the SDK merge from silently overriding the binding"
         )
 
 
@@ -401,11 +406,7 @@ class Refusal(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class MaxCompletionTokensExceeded(NoOutput):
-    """A completed 200 that reached the token cap before its JSON closed.
-
-    The retry loop records the attempt and fails the item with a MaxCompletionTokensExceededError,
-    without retrying.
-    """
+    """A completed 200 that reached the token cap before its JSON closed."""
 
     kind: Literal["max_completion_tokens_exceeded"] = "max_completion_tokens_exceeded"
 
@@ -415,7 +416,6 @@ class SchemaViolation(NoOutput):
     """A completed turn whose text fails `response_format` validation.
 
     `validation_error_json` preserves pydantic's error details and rejected values without documentation URLs.
-    It stays outside the exception message because validator text can contain generated content.
     """
 
     validation_error_json: str
@@ -485,7 +485,7 @@ class UnfinishedTurn(NoOutput):
 
 @dataclass(frozen=True, kw_only=True)
 class InvalidRequest:
-    """A Sequence[Message] the adapter will not put on the wire; nothing was sent.
+    """A `Sequence[Message]` the adapter will not put on the wire.
 
     The retry loop records no attempt and raises `InvalidRequestError` with `reason`.
     Nothing was sent or billed.
@@ -506,17 +506,21 @@ class RequestParams(ABC):
 
     @abstractmethod
     def as_json(self) -> str:
-        """Render the request as a JSON object, for an archive to hold as one cell. No I/O."""
+        """Render the request as a JSON object for an archive to hold as one cell."""
         ...
 
 
 def narrowed_request[RequestT: RequestParams](
     request: RequestParams, request_class: type[RequestT]
 ) -> RequestT:
-    """Narrow the neutral request to the subclass one adapter builds, for its open_stream.
+    """Narrow the neutral request to the subclass one adapter builds for `open_stream`.
+
+    Args:
+        request: The neutral request to narrow.
+        request_class: The required adapter-specific request class.
 
     Raises:
-        TypeError: request was built by another adapter, which is a defect in langchaint.
+        TypeError: `request` is not an instance of `request_class`.
     """
     if not isinstance(request, request_class):
         raise TypeError(f"expected a request this adapter built, got {type(request).__name__}")
@@ -527,12 +531,15 @@ def request_json(request: RequestParams, *, omitted_class: type) -> str:
     """Render a request as JSON after removing `omitted_class` values.
 
     Convert unsupported JSON values to text.
+
+    Args:
+        request: The request to render.
+        omitted_class: The omit sentinel class whose values to remove.
     """
     return json.dumps(_without_omitted(asdict(request), omitted_class), default=_json_default)
 
 
 def _without_omitted(value: object, omitted_class: type) -> object:
-    """Return value with every mapping key whose value is an omit sentinel dropped, recursively."""
     if isinstance(value, dict):
         without_omitted: dict[object, object] = {}
         for key, item in value.items():
@@ -551,7 +558,6 @@ def _without_omitted(value: object, omitted_class: type) -> object:
 
 
 def _json_default(value: object) -> object:
-    """Render one value the json module rejects: an SDK model as its fields, anything else as text."""
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     return str(value)
@@ -569,33 +575,20 @@ type NoOutputOutcome = (
 )
 """Every outcome of a billable 200 that produced no output.
 
-Spelled as the concrete variants rather than as NoOutput so that a match on
-kind over it, or over ResponseOutcome, is provably exhaustive: a variant added here without a match
-case in each retry loop is a type error rather than a silent fall-through.
-The variants differ in what the retry loop does with them, which is why they are separate types rather
-than one type carrying a reason: see each class.
+The concrete variants make a `kind` match over `NoOutputOutcome` or `ResponseOutcome` exhaustive.
+Each variant has distinct retry-loop behavior.
 """
 
 type ResponseOutcome[OutputT] = AdapterResult[OutputT] | NoOutputOutcome
-"""What one completed 200 produced: the turn, or the reason it yielded no output.
-
-Also what one attempt produced, because build_request decides whether a request can be sent, so
-every attempt sends one.
-"""
+"""What one completed 200 produced: the turn or the reason it yielded no output."""
 
 
 class AdapterStream(ABC):
-    """One open stream, backed by the SDK's stream manager.
-
-    The adapter translates SDK events into StreamItem values as they pass through;
-    assembly stays in the SDK.
-    The stream yields items and returns the assembled response.
-    `BoundAdapter.interpret` produces the output.
-    """
+    """One open stream, backed by the SDK's stream manager."""
 
     @abstractmethod
     def items(self) -> AsyncIterator[StreamItem]:
-        """Yield StreamItem values in arrival order; StreamItem's docstring enumerates them.
+        """Yield `StreamItem` values in arrival order.
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.
@@ -628,16 +621,12 @@ class AdapterStream(ABC):
 
     @abstractmethod
     async def close(self) -> None:
-        """Close the underlying connection; idempotent."""
+        """Close the underlying connection idempotently."""
         ...
 
 
 class BoundAdapter[OutputT](ABC):
-    """One adapter bound to a frozen prefix.
-
-    Constructed by Adapter.bind_text or Adapter.bind_structured, which precompute the SDK keyword arguments once;
-    build_request adds the per-request messages, and open_stream takes what it built.
-    """
+    """One adapter bound to a frozen prefix."""
 
     @abstractmethod
     def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
@@ -646,12 +635,18 @@ class BoundAdapter[OutputT](ABC):
         Called once before the first attempt.
         Returns `InvalidRequest` before any request or retry budget use.
         Performs no I/O.
+
+        Args:
+            messages: The per-request messages.
         """
         ...
 
     @abstractmethod
     def billing_from_raw(self, raw: BaseModel) -> Billing:
         """Price one response's reported counters before `interpret`.
+
+        Args:
+            raw: The provider SDK response.
 
         Raises:
             TypeError: `raw` has the wrong SDK response type.
@@ -663,7 +658,9 @@ class BoundAdapter[OutputT](ABC):
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Build `ResponseIdentity`.
 
-        Use `raw` and the stream's `request_id`.
+        Args:
+            raw: The provider SDK response.
+            request_id: The request id from the response headers, or `None`.
 
         Raises:
             TypeError: `raw` has the wrong SDK response type.
@@ -674,6 +671,9 @@ class BoundAdapter[OutputT](ABC):
     def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
         """Return a normalized turn or a `NoOutputOutcome`.
 
+        Args:
+            raw: The provider SDK response.
+
         Raises:
             TypeError: `raw` has the wrong SDK response type.
         """
@@ -682,6 +682,9 @@ class BoundAdapter[OutputT](ABC):
     @abstractmethod
     async def open_stream(self, request: RequestParams) -> AdapterStream:
         """Open a streaming request.
+
+        Args:
+            request: The adapter-specific request.
 
         Raises:
             TypeError: `request` has the wrong `RequestParams` subclass.
@@ -741,6 +744,12 @@ class Adapter(ABC):
     ) -> None:
         """Validate `provider_name` and store adapter-wide values.
 
+        Args:
+            client: The provider SDK client.
+            model: The model id to send verbatim.
+            provider_name: The serving provider recorded on results and errors.
+            automatic_cache_breakpoints_default: The default for automatic prompt-cache boundaries.
+
         Raises:
             ValueError: `client` fixes a provider that differs from `provider_name`.
         """
@@ -759,9 +768,11 @@ class Adapter(ABC):
 
         Pure conversion of the binding to SDK keyword arguments; no I/O.
 
+        Args:
+            binding: The provider-neutral binding.
+
         Raises:
-            ValueError: the binding asks for something this adapter cannot send,
-                which is a defect to report before any request rather than a request to spend.
+            ValueError: `binding` asks for something this adapter cannot send.
         """
         ...
 
@@ -773,28 +784,35 @@ class Adapter(ABC):
 
         A successful tool-call turn returns `None` because it contains no structured instance.
 
+        Args:
+            binding: The provider-neutral binding.
+            response_format: The pydantic model used to validate structured output.
+
         Raises:
             ValueError: `binding` contains unsupported values.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
+            pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         ...
 
     failure_types: ClassVar[tuple[type[Exception], ...]]
-    """The exception types parse maps to a verdict, for SharedBackoff's failure_types.
+    """The exception types `parse` maps to a `Verdict` for `SharedBackoff.failure_types`.
 
-    Each concrete adapter states its own: its SDK's status-error class, whose response carries the
-    status and error type parse reads, plus TransientError, which the retry loop raises for a 200
-    whose body reports a transient failure. Transport failures that produced nothing parseable (a
-    connection drop, a timeout) stay out, propagating unparsed for classify to sort.
-    Every entry must be a strict subclass of Exception.
+    `parse` handles SDK status errors and `TransientError`.
+    `classify` handles other transport failures.
+    Every entry must be a strict subclass of `Exception`.
     """
 
     @abstractmethod
     def parse(self, failure: Exception) -> Verdict:
-        """Map one failure_types exception to its verdict, for SharedBackoff's parse.
+        """Map one `failure_types` exception to its `Verdict` for `SharedBackoff.parse`.
 
-        A retry-after header never sets the verdict, only its retry_after.
+        A retry-after header sets only `retry_after`.
         Return a verdict for every input without raising.
         Each provider's `parse` documents defaults for unknown statuses and error types.
+
+        Args:
+            failure: The exception to parse.
         """
         ...
 
@@ -803,15 +821,19 @@ class Adapter(ABC):
         """Classify an unparsed exception or name a terminal `DoNotRetry` error.
 
         Return `unknown_exception` for an unrecognized exception.
+
+        Args:
+            error: The exception to classify.
         """
         ...
 
     def request_id_from_error(self, error: Exception) -> str | None:  # noqa: ARG002
         """Return the request-id header carried by error, when the SDK exposes one.
 
-        Provider support uses this id for failed attempts.
-        `identity_from_raw` handles responses.
         The base implementation returns `None` because it knows no SDK types.
         Adapters override it to read the SDK exception attribute.
+
+        Args:
+            error: The provider SDK exception.
         """
         return None

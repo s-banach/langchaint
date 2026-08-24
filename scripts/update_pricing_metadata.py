@@ -65,7 +65,7 @@ def _download_json(url: str) -> object:
 
     Raises:
         OSError: The download fails.
-        ValueError: The response is invalid JSON.
+        ValueError: The response is not JSON.
     """
     request = Request(url, headers={"User-Agent": "langchaint-pricing-refresh"})
     with urlopen(request) as response:
@@ -109,7 +109,7 @@ def _positive_number(entry: dict[str, object], field: str) -> float:
     """Read one positive numeric field.
 
     Raises:
-        ValueError: The field is missing or invalid.
+        ValueError: The field is missing, invalid, or zero.
     """
     value = _nonnegative_number(entry, field)
     if value == 0:
@@ -121,8 +121,8 @@ def _metadata_items(value: object, name: str) -> dict[str, _MetadataValue]:
     """Validate one provider's documentation metadata.
 
     Raises:
-        TypeError: A metadata value has the wrong type.
-        ValueError: A metadata object key is invalid.
+        TypeError: A metadata entry is not an object or a metadata field has the wrong type.
+        ValueError: A metadata object key is not a string.
     """
     raw_items = _required_dict(value, name)
     items: dict[str, _MetadataValue] = {}
@@ -186,7 +186,7 @@ def _metadata_rate(
 
     Raises:
         KeyError: The requested metadata is missing.
-        ValueError: The requested metadata is invalid.
+        ValueError: The requested metadata is invalid or the rate is negative.
     """
     value = _validated_metadata_value(metadata, provider, field)
     if value < 0:
@@ -203,7 +203,7 @@ def _metadata_multiplier(
 
     Raises:
         KeyError: The requested metadata is missing.
-        ValueError: The requested metadata is invalid.
+        ValueError: The requested metadata is invalid or the multiplier is not positive.
     """
     value = _validated_metadata_value(metadata, provider, field)
     if value <= 0:
@@ -246,7 +246,7 @@ def _long_context(entry: dict[str, object], *, indent: str) -> list[str]:
     """Render OpenAI long-context pricing.
 
     Raises:
-        ValueError: Long-context fields are missing or invalid.
+        ValueError: Long-context fields are missing, invalid, or ambiguous.
     """
     pattern = re.compile(r"input_cost_per_token_above_(\d+)k_tokens$")
     threshold_fields = [field for field in entry if pattern.fullmatch(field)]
@@ -402,7 +402,7 @@ def _openai_module(entries: dict[str, dict[str, object]], metadata: _ProviderMet
     """Render the generated OpenAI module.
 
     Raises:
-        KeyError: A required entry or metadata value is missing.
+        KeyError: A required model or metadata value is missing.
         ValueError: Pricing data or provider metadata is invalid.
     """
     model_names = [*OPENAI_ALIASES, *OPENAI_LITELLM_KEYS]
@@ -448,7 +448,7 @@ def _anthropic_module(entries: dict[str, dict[str, object]], metadata: _Provider
     """Render the generated Anthropic module.
 
     Raises:
-        KeyError: A required entry or metadata value is missing.
+        KeyError: A required model or metadata value is missing.
         ValueError: Pricing data or provider metadata is invalid.
     """
     model_names = [*ANTHROPIC_LITELLM_KEYS, *ANTHROPIC_ALIASES]
@@ -538,6 +538,7 @@ def main() -> None:
     Raises:
         OSError: A download or file operation fails.
         TypeError: Upstream data has the wrong shape.
+        KeyError: A required model or metadata value is missing.
         ValueError: Upstream data or metadata is invalid.
         SyntaxError: Generated Python is invalid.
     """

@@ -29,8 +29,8 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: A `generate_one` call failed.
-        DispatchExceptionGroup: A tool function raised.
+        GenerationError: Generation fails.
+        DispatchExceptionGroup: A tool function raises.
         RuntimeError: The model exceeded `max_turns`.
     """
     openai = OpenAI()

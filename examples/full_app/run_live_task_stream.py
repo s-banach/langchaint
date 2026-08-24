@@ -24,9 +24,9 @@ async def main() -> None:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        TimeoutError: APP_TIMEOUT_SECONDS expires.
-        ExceptionGroup: a concurrent tool function raises.
-        asyncio.CancelledError: the caller cancels the app.
+        TimeoutError: `APP_TIMEOUT_SECONDS` expires.
+        ExceptionGroup: A concurrent tool function raises.
+        asyncio.CancelledError: The caller cancels the app.
     """
     openai = OpenAI()
     app = App(

@@ -16,6 +16,9 @@ def max_pending_for_requests(max_concurrent_requests: int | None) -> int:
 
     Extra tasks keep request permits supplied during retry waits.
 
+    Args:
+        max_concurrent_requests: The request concurrency bound, or `None` when unbounded.
+
     Raises:
         ValueError: `max_concurrent_requests` is boolean or below one.
     """
@@ -40,13 +43,17 @@ async def run_many[OutputT](
     A failure cancels and settles pending tasks before propagating.
     Concurrent failures propagate by the lowest input index.
 
+    Args:
+        run_ones: The zero-argument async callables to run.
+        max_pending: The pending-task bound, or `None` to start every callable concurrently.
+
     Raises:
         ValueError: `max_pending` is boolean or below one.
         TypeError: A `run_one` returns a non-coroutine.
         asyncio.CancelledError: The caller cancels this function.
         BaseException: A `run_one` raises it.
     """
-    # bool is rejected explicitly because it subclasses int, so a type checker admits True here.
+    # Reject `bool` explicitly because it subclasses `int`.
     if max_pending is not None and (isinstance(max_pending, bool) or max_pending < 1):
         raise ValueError(f"max_pending must be None or a positive int, got {max_pending!r}")
     run_one_snapshot = tuple(run_ones)

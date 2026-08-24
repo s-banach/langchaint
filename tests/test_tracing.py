@@ -130,8 +130,7 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
     Exact-equality assertions test fields that the schemas leave optional.
 
     Raises:
-        AssertionError: a payload does not conform, is not a JSON string, or does not parse,
-            naming the span and the attribute in each case.
+        AssertionError: A payload does not conform, is not a JSON string, or does not parse.
     """
     for key, value in (span.attributes or {}).items():
         file = _PAYLOAD_SCHEMA_FILES.get(key)
@@ -149,8 +148,8 @@ def _validate_payload_attributes(span: ReadableSpan) -> None:
             jsonschema.Draft202012Validator(_payload_schema(file)).validate(payload)
         except jsonschema.ValidationError as error:
             raise AssertionError(
-                f"{span.name}: {key} violates {file} at "
-                f"{list(error.absolute_path)}: {error.message}"
+                f"{span.name}: {key} violates {file}. "
+                f"Path {list(error.absolute_path)}: {error.message}"
             ) from error
 
 
@@ -481,7 +480,7 @@ def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> 
         handle = traced.bind().stream_one("hi")
 
         async def enter_and_leave() -> None:
-            """Enter the handle whose open never returns; the wait_for below cancels this."""
+            """Enter the handle whose open never returns. The wait_for below cancels this."""
             async with handle:
                 pass
 
@@ -680,7 +679,7 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
 def test_stream_entered_but_never_iterated_emits_a_span() -> None:
     """Entering opens a request, so an entered handle emits a span even with no item pulled.
 
-    The request is billed whether or not the caller reads it; a silent span would hide it.
+    The request is billed whether or not the caller reads it. A silent span would hide it.
     """
 
     async def scenario() -> None:
@@ -702,8 +701,8 @@ def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
 ) -> None:
     """Iterating after the block raises from the inner handle without writing to the closed span.
 
-    Recording that RuntimeError on the ended span would make the OTel SDK log a warning of its own,
-    so langchaint's instrumentation would be the source of noise for an ordinary caller mistake.
+    Recording RuntimeError on the ended span would make the OTel SDK log a warning.
+    The test rejects that warning for an ordinary caller mistake.
     """
 
     async def scenario() -> None:
@@ -1020,11 +1019,7 @@ def test_raising_mapper_is_caught_and_the_result_survives(
 
 
 def test_generate_many_invokes_the_mapper_once_per_item() -> None:
-    """Each item's span is mapped from that item's own result, the mapper firing once per item.
-
-    A counting mapper is what distinguishes this from a mapper called once for the whole batch,
-    which has no single result to map.
-    """
+    """Map each item's span from that item's result once."""
 
     async def scenario() -> None:
         """Run a two-item batch under a counting mapper and read what each item's span carries."""
@@ -1128,14 +1123,13 @@ def _bind_overload_pin() -> None:
 def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:
     """Pin the mapper covariance: a Response[_Answer] must satisfy the Response[object] parameter.
 
-    pyrefly type-checks this module,
-    Response OutputT covariance is checked statically by the call below.
+    pyrefly checks Response OutputT covariance at the call below.
     """
     return mapper(response)
 
 
 def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
-    """The adapter and shared_backoff pass through TracedLLM; the BoundLLM fields through TracedBoundLLM."""
+    """The adapter and shared_backoff pass through TracedLLM. BoundLLM fields pass through TracedBoundLLM."""
     adapter = _FakeAdapter()
     shared_backoff = _fast_shared_backoff()
     traced = TracedLLM(LLM(adapter, shared_backoff=shared_backoff), capture_message_content=False)
@@ -1150,7 +1144,7 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
 
 
 def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() -> None:
-    """extra_attributes land at span start on generate spans; a mapper key of the same name wins."""
+    """extra_attributes land at span start on generate spans. A mapper key of the same name wins."""
 
     async def scenario() -> None:
         """Generate under extra_attributes plus a colliding mapper key and inspect the span."""
@@ -1180,7 +1174,7 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
     """extra_attributes pass through rebind and land on the stream span and each batch item's span."""
 
     async def scenario() -> None:
-        """Rebind, then stream and batch under one extra_attributes mapping; every span carries it."""
+        """Rebind, then stream and batch under one extra_attributes mapping. Every span carries it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(
@@ -1250,7 +1244,7 @@ async def _echo_tool_function(args: _EchoToolArgs) -> str:
 
 
 async def _unserializable_schema_tool_function(_args: Mapping[str, object]) -> str:
-    """Stand in for the tool function; the capture tests never dispatch a call to it."""
+    """Stand in for the tool function. The capture tests never dispatch a call to it."""
     return ""
 
 
@@ -1635,8 +1629,9 @@ def test_agent_span_carries_the_run_identity_and_summed_usage() -> None:
     (finished,) = exporter.get_finished_spans()
     assert finished.name == "invoke_agent research_climate"
     assert finished.kind == SpanKind.INTERNAL
-    # agent_span leaves the status UNSET on success, which OTel reads as success; it sets ERROR only
-    # when the wrapped body raises. It does not claim OK, matching start_as_current_span's own default.
+    # agent_span leaves status UNSET on success.
+    # agent_span sets status ERROR when the wrapped body raises.
+    # start_as_current_span uses the same UNSET default.
     assert finished.status.status_code == StatusCode.UNSET
     assert finished.attributes is not None
     assert dict(finished.attributes) == {
@@ -2148,7 +2143,7 @@ def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
 
 
 def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data() -> None:
-    """ImagePart and AudioPart omit data; ImageUrlPart records URL metadata."""
+    """ImagePart and AudioPart omit data. ImageUrlPart records URL metadata."""
 
     async def scenario() -> None:
         """Generate over Sequence[Message] containing ImagePart, ImageUrlPart, and AudioPart."""
@@ -2220,8 +2215,8 @@ def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_
 def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
     """ReasoningPart.text emits as the convention's reasoning part.
 
-    ReasoningPart.raw stays off the span whether ReasoningPart.text is present,
-    so the part carries the readable copy and never the signature beside it.
+    ReasoningPart.raw stays off the span when ReasoningPart.text is present.
+    The span receives the readable copy without the signature.
     """
 
     async def scenario() -> None:
@@ -2249,7 +2244,7 @@ def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
 
 
 def test_an_absent_system_prompt_omits_its_key_while_capture_stays_on() -> None:
-    """No bound system prompt omits gen_ai.system_instructions; the GenerationInput is still captured.
+    """No bound system prompt omits gen_ai.system_instructions. The GenerationInput is still captured.
 
     The captured input messages are what separates this from the capture-off case.
     """
@@ -2473,9 +2468,9 @@ def test_tool_span_captures_arguments_and_result_under_capture() -> None:
         )
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
-        # The attribute's own string, not its decoded value: the effect on this key is normalization,
-        # and the spacing here differs from args_json, so a decoded comparison would also pass
-        # against an implementation that set the attribute to args_json untouched.
+        # The expected value checks the attribute string after normalization.
+        # Its spacing differs from args_json.
+        # Decoding the attribute would hide a missing normalization step.
         assert span.attributes["gen_ai.tool.call.arguments"] == '{"text": "hi", "n": 1}'
         assert _captured(exporter, "gen_ai.tool.call.result") == {
             "type": "tool_call_response",

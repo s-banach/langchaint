@@ -9,7 +9,7 @@ async def search_the_web() -> Response[str]:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: The generation failed.
+        GenerationError: Generation fails.
     """
     openai = OpenAI()
     # Catalog pricing supplies the required web-search invocation rate.

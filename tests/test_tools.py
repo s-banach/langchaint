@@ -449,7 +449,7 @@ def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> N
         """Validate a payload of the function's own and fail on it.
 
         Raises:
-            InvalidToolArgsError: always; the nested payload lacks the required text field.
+            InvalidToolArgsError: always. The nested payload lacks the required text field.
         """
         try:
             _ = _EchoArgs.model_validate({"wrong": args.text})
@@ -505,8 +505,8 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
-    # The Validator protocol types iter_errors as yielding ValidationError, where the concrete
-    # Draft202012Validator's own stub yields Incomplete.
+    # Validator.iter_errors is typed as yielding ValidationError.
+    # Draft202012Validator.iter_errors is typed as yielding Incomplete.
     validator: Validator = Draft202012Validator(_WEATHER_SCHEMA)
     expected_details = tuple(
         InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
@@ -586,8 +586,8 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
     ) -> ToolOutputExplicit[Mapping[str, object]]:
         """Return model-visible content plus the raw MCP result the model never sees.
 
-        Annotated Mapping[str, object]: accepted against the dict[str, object] parameter by contravariance,
-        pinning that the wider annotation keeps typechecking.
+        Contravariance lets Mapping[str, object] satisfy the dict[str, object] parameter.
+        The annotation keeps that wider type checked.
         """
         return ToolOutputExplicit(content=f"weather for {args['city']}", app_data=raw_result)
 
@@ -1035,8 +1035,8 @@ def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
 def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     """An invalid call returns the same DispatchInvalidToolArgs any tool form produces.
 
-    The content and details are exactly the pydantic conversion and rendering,
-    so the model reads identical field-level corrections whether it miscalled a CaptureTool or a PydanticTool.
+    The content and details use the shared Pydantic conversion and rendering.
+    CaptureTool and PydanticTool return identical field-level corrections.
     """
     args_json = '{"wrong": "key"}'
     with pytest.raises(ValidationError) as caught:
@@ -1053,11 +1053,7 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
 
 
 def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant() -> None:
-    """Malformed JSON and a non-object JSON value land in the same DispatchInvalidToolArgs variant, no raise.
-
-    args_model.model_validate_json raises ValidationError for both shapes,
-    so capture returns rendered corrections exactly as it does for a well-formed object with wrong fields.
-    """
+    """Malformed and non-object JSON return DispatchInvalidToolArgs."""
     for args_json in ("not json", '"scalar"'):
         call = ToolCall(id="call1", name="final_response", args_json=args_json)
         outcome = asyncio.run(_answer_capture_tool().capture(call))

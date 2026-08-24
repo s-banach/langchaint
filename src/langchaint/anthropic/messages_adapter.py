@@ -185,31 +185,22 @@ _RETRY_THIS_ONE_ERROR_TYPES = frozenset({"api_error", "timeout_error"})
 """The 500 and 504 error types, which retry at any status carrying them."""
 
 _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 402, 403, 404, 413, 422})
-"""The statuses that reject this request; a resend fails again.
-
-Every one but 422 is on anthropic's errors page.
-422 is not: every client the adapter supports raises UnprocessableEntityError for it
-(anthropic 0.120.2).
-"""
+"""The statuses that reject this request. A resend fails again."""
 
 PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""How often parse_anthropic fell to a status-family default, keyed by status and error type.
-
-A diagnostic surface, read by no decision: a growing key names a status or error type the
-tables above should learn.
-"""
+"""`record_parse_fallthrough` increments this counter for each status-family default."""
 
 _CACHE_MARKER_REQUEST_LIMIT = 4
 """The API allows at most 4 cache_control markers per request, the binding's own included."""
 
 type CacheTTL = Literal["5m", "1h"]
-"""A cache entry's time to live, the two tiers the API offers; writes bill 1.25x ("5m") or 2x ("1h") base input."""
+"""Cache TTLs with write rates of 1.25x ("5m") or 2x ("1h") base input."""
 
 type AnthropicServiceTier = Literal["auto", "standard_only"]
 """What a request may ask for (anthropic 0.120.0).
 
-"auto" is a ceiling, not a selector: the SDK documents the parameter as whether to use priority
-capacity if available or standard capacity, so no request value names priority.
+"auto" permits priority capacity when available or standard capacity otherwise.
+No request value selects priority capacity.
 "standard_only" is the one value that pins a tier.
 """
 
@@ -383,10 +374,12 @@ class AnthropicPricingTable:
 
 
 def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
-    """Build one cache_control marker; "5m" omits the ttl key because it is the API default.
+    """Build one cache_control marker.
 
-    The "5m" wire form must stay byte-stable across releases,
-    so that upgrading langchaint alone cannot invalidate a caller's live cache entry.
+    "5m" omits the ttl key because it is the API default.
+
+    The "5m" wire form must stay byte-stable across releases.
+    A changed wire form would invalidate a caller's live cache entry.
     """
     if cache_ttl == "5m":
         return {"type": "ephemeral"}
@@ -472,8 +465,8 @@ def _provider_tools(
 class _AnthropicPrecomputedFields:
     """The typed request fields one binding precomputes.
 
-    Fields set to the SDK's omit sentinel leave the provider default in place;
-    passing them as explicit keywords (never **kwargs) keeps the SDK's overload resolution intact.
+    Fields set to the SDK's omit sentinel leave the provider default in place.
+    Passing them as explicit keywords keeps the SDK's overload resolution intact.
     """
 
     model: str
@@ -489,8 +482,10 @@ class _AnthropicPrecomputedFields:
     automatic_cache_breakpoints: bool
     cache_ttl: CacheTTL
     message_mark_budget: int
-    """What the binding's own markers (system marks, the frozen-prefix and last-message markers) leave
-    of the API's 4-marker request limit for per-request marked parts."""
+    """The remaining per-request part markers under the API's four-marker request limit.
+
+    System marks, the frozen-prefix marker, and the last-message marker reduce this value.
+    """
 
     extra_body: Mapping[str, object] | None
     provider_tools: _AnthropicProviderTools
@@ -573,7 +568,6 @@ class _NotSendableError(Exception):
     """
 
     def __init__(self, reason: str) -> None:
-        """Store what cannot be sent; it becomes the InvalidRequest reason."""
         super().__init__(reason)
         self.reason = reason
 
@@ -622,8 +616,8 @@ def _user_content_blocks(
 ) -> tuple[list[_ContentBlockParam], list[TextBlockParam | ImageBlockParam]]:
     """Convert one UserMessage.content value to wire blocks.
 
-    The second element holds the blocks whose part sets cache_breakpoint, in content order;
-    the caller applies the request-wide marker budget, so no marker is written here.
+    The second element holds the blocks whose part sets cache_breakpoint in content order.
+    The caller applies the request-wide marker budget, so this function writes no marker.
 
     Raises:
         _NotSendableError: _part_block rejects one ContentPart.
@@ -790,8 +784,8 @@ def _request_messages(
     """Convert messages under the binding's caching parameters, or report them unsendable.
 
     The one place a Sequence[Message] this adapter will not put on the wire becomes an InvalidRequest.
-    An unparseable tool_call.args_json is one of those: the wire block holds the parsed arguments,
-    so text that is not JSON has no block to go in.
+    The wire block holds parsed `tool_call.args_json`.
+    Text that is not JSON has no wire block.
     """
     try:
         return _wire_messages(
@@ -807,7 +801,9 @@ def _request_messages(
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
-    """Convert the neutral tool choice; neutral "required" is Anthropic "any".
+    """Convert the neutral tool choice.
+
+    Neutral "required" is Anthropic "any".
 
     Raises:
         TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
@@ -837,8 +833,8 @@ def _wire_tools(
 ) -> list[ToolUnionParam]:
     """Convert every bound tool to one ordered wire list.
 
-    cache_breakpoint_on_last_tool puts the frozen-prefix cache breakpoint on the last tool,
-    used when no system prompt follows the tools to carry it.
+    `cache_breakpoint_on_last_tool` puts the frozen-prefix cache breakpoint on the last tool.
+    The last tool carries the marker when no system prompt follows the tools.
     """
     tools: list[ToolUnionParam] = [
         {
@@ -852,7 +848,7 @@ def _wire_tools(
     # The adapter validated each mapping's type discriminator.
     tools.extend(cast("ToolUnionParam", tool) for tool in provider_executed_tools)
     if cache_breakpoint_on_last_tool and tools and "cache_control" not in tools[-1]:
-        # Copying preserves caller state; mutating it would alter the binding's mapping.
+        # Copying preserves the caller's mapping.
         last_tool = dict(tools[-1])
         last_tool["cache_control"] = _cache_control_param(cache_ttl)
         # cast: the copied mapping remains wider than the SDK TypedDict union.
@@ -1032,8 +1028,8 @@ def parse_anthropic(failure: Exception) -> Verdict:
     """Map one AnthropicMessagesAdapter.failure_types exception to its verdict.
 
     _verdict_from_anthropic_tables reads the status and the error type.
-    On every status but 200 the provider's own x-should-retry directive then overrides that verdict,
-    through verdict_under_retry_directive, which states the rule.
+    On every status except 200, x-should-retry overrides that verdict.
+    `verdict_under_retry_directive` defines the override.
     Status 200 identifies a mid-stream error, so its headers do not override the table verdict.
     A retry-after header only fills a verdict's retry_after.
     A TransientError takes verdict_from_transient_error's shared mapping.
@@ -1107,8 +1103,8 @@ class AnthropicMessagesAdapter(Adapter):
     }
     """AsyncAnthropic is deliberately absent: it reaches whatever its base_url points at.
 
-    Both classes here speak Bedrock's auth and URL scheme, so the class fixes the provider,
-    and the caller's stated value stands for anything else.
+    Both classes here use Bedrock authentication and URLs.
+    The caller states `provider_name` for other clients.
     """
 
     def __init__(  # noqa: PLR0913 (each request and billing parameter remains explicit)
@@ -1258,9 +1254,11 @@ class AnthropicMessagesAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O.
+        """Bind for plain-text output without I/O.
 
-        Propagates _precompute_fields' ValueError and TypeError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
+            TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
         """
         return _BoundAnthropicText(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
@@ -1270,9 +1268,13 @@ class AnthropicMessagesAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O.
+        """Bind for structured output validated into response_format without I/O.
 
-        Propagates _precompute_fields' ValueError and TypeError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
+            TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
+            pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         return _BoundAnthropicStructured(
             adapter=self,
@@ -1286,10 +1288,7 @@ class AnthropicMessagesAdapter(Adapter):
     )
     """The exceptions parse_anthropic maps to a verdict.
 
-    APIStatusError catches every error status, not only the ones with their own subclass:
-    _make_status_error returns a specific subclass only for the statuses it lists and the bare
-    APIStatusError for every other one (anthropic 0.120.2, Bedrock clients included), so a
-    subclass list would silently drop whatever status the provider adds next.
+    APIStatusError catches every error status.
     """
 
     @override
@@ -1424,7 +1423,6 @@ class _AnthropicStream(AdapterStream):
 
     @override
     async def close(self) -> None:
-        """Close the underlying connection; idempotent."""
         await self._sdk_stream.close()
 
 
@@ -1477,11 +1475,11 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open one messages.stream and return the live stream; connection failures raise here.
+        """Open one messages.stream and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+            Exception: The SDK fails to open the stream.
         """
         params = narrowed_request(request, _AnthropicRequestParams)
         precomputed = params.precomputed

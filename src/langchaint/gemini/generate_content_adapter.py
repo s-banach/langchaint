@@ -136,18 +136,15 @@ _RETRY_THIS_ONE_STATUSES = frozenset({408, 500, 502, 504})
 """One request's failure, retried without pausing siblings.
 
 500 INTERNAL and 504 DEADLINE_EXCEEDED come from the troubleshooting page.
-408 and 502 are unlisted there; the evidence is the SDK's own default retryable set,
-`_RETRY_HTTP_STATUS_CODES == (408, 429, 500, 502, 503, 504)` (google-genai 2.16.0).
+408 and 502 are unlisted there.
+The google-genai 2.19.0 retryable set is `(408, 429, 500, 502, 503, 504)`.
 """
 
 _DO_NOT_RETRY_STATUSES = frozenset({400, 403, 404})
-"""The statuses the troubleshooting page lists as this request's rejection; a resend fails again."""
+"""The request-rejection statuses from the troubleshooting page. A resend fails again."""
 
 PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""How often parse_gemini fell to a status-family default, keyed by status and error status word.
-
-A diagnostic surface, read by no decision: a growing key names a status the tables above should learn.
-"""
+"""`record_parse_fallthrough` increments this counter for each status-family default."""
 
 type GeminiServiceTier = Literal["flex", "standard", "priority"]
 """What a request may ask for: the SDK ServiceTier wire values (google-genai 2.16.0)."""
@@ -157,11 +154,9 @@ type GeminiPricedServiceTier = Literal[
 ]
 """What a response's usage_metadata.traffic_type reports having been served at (google-genai 2.16.0).
 
-The pricing mapping's keys are these words, but its key type is str: the SDK types traffic_type as
-an open enum that constructs unknown values, so the tier read off a response is a str and the
-mapping's docstrings name this vocabulary instead of its type narrowing to it.
-Disjoint from GeminiServiceTier: the request and response vocabularies share no word, so the tier
-is read off each response.
+The pricing mapping uses these values as keys.
+Its key type is `str` because the SDK's open enum constructs unknown values.
+The request and response tier vocabularies share no value.
 """
 
 _ON_DEMAND_TIER: GeminiPricedServiceTier = "ON_DEMAND"
@@ -185,9 +180,7 @@ _FINISHED_FINISH_REASONS = (
 )
 """The finish reasons langchaint can read a completed turn from.
 
-Everything else (LANGUAGE, OTHER, MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, the remaining
-image members, UNSPECIFIED, and any value the provider adds later) is a turn langchaint cannot
-call finished, reported as UnfinishedTurn by the structured binding.
+All other values produce `UnfinishedTurn` for a structured binding.
 """
 
 _NO_CACHE_BREAKPOINT_WIRE_FORM = (
@@ -283,8 +276,7 @@ class GeminiPricingTable:
         """Require the two long-prompt fields together.
 
         Raises:
-            ValueError: exactly one of long_prompt_threshold_tokens and long_prompt_rates is set;
-                a threshold without rates prices nothing, and rates without a threshold never apply.
+            ValueError: Exactly one of long_prompt_threshold_tokens and long_prompt_rates is set.
         """
         if (self.long_prompt_threshold_tokens is None) != (self.long_prompt_rates is None):
             raise ValueError(
@@ -360,8 +352,8 @@ _UNPRICED = GeminiPricingTable(
 )
 """What prices a response reporting a traffic_type the adapter holds no table for.
 
-Every nonzero counter costs NaN and every zero counter costs zero, so the paid response survives
-carrying a cost that says it is unknown.
+Every nonzero counter costs NaN.
+Every zero counter costs zero.
 """
 
 
@@ -594,7 +586,6 @@ class _NotSendableError(Exception):
     """
 
     def __init__(self, reason: str) -> None:
-        """Store what cannot be sent; it becomes the InvalidRequest reason."""
         super().__init__(reason)
         self.reason = reason
 
@@ -665,9 +656,8 @@ def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
 def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> types.Part:
     """Restore one stored raw dump to the Part that produced it, byte-identical.
 
-    model_validate_json is the inverse of the JSON-mode dump _assistant_message_from stored,
-    restoring the signature bytes from base64.
-    part_description names the ReasoningPart or RawPart.
+    `model_validate_json` reverses the JSON-mode dump stored by `_assistant_message_from`.
+    `part_description` names the `ReasoningPart` or `RawPart`.
 
     Raises:
         _NotSendableError: raw does not restore to a Part.
@@ -866,7 +856,7 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     Assistant turns supply ToolCall names for later FunctionResponse values.
 
     Raises:
-        _NotSendableError: a message is unsendable; each per-part converter names its condition.
+        _NotSendableError: A message is unsendable.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
     contents: list[types.Content] = []
@@ -938,7 +928,10 @@ class _GeminiRequestParams(RequestParams):
 
 
 def _wire_tool_config(tool_choice: ToolChoice) -> types.ToolConfig:
-    """Convert the neutral tool choice; neutral "required" is Gemini mode ANY."""
+    """Convert the neutral tool choice.
+
+    Neutral "required" is Gemini mode ANY.
+    """
     if isinstance(tool_choice, SpecificToolChoice):
         function_calling_config = types.FunctionCallingConfig(
             mode=types.FunctionCallingConfigMode.ANY,
@@ -1137,7 +1130,8 @@ class GeminiGenerateContentAdapter(Adapter):
     ) -> None:
         """Store the SDK client and request pricing without sending a request.
 
-        `provider_name` records the provider reached by `client`; a Vertex AI client requires `"gcp.vertex_ai"`.
+        `provider_name` records the provider reached by `client`.
+        A Vertex AI client requires `"gcp.vertex_ai"`.
         Per-request options disable retries without copying the client.
         `pricing` maps each `GeminiPricedServiceTier` to rates.
         Missing reported tiers cost NaN.
@@ -1282,9 +1276,11 @@ class GeminiGenerateContentAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O.
+        """Bind for plain-text output without I/O.
 
-        Propagates _bound_config's ValueError.
+        Raises:
+            pydantic.ValidationError: A provider-executed tool is invalid.
+            ValueError: `binding` contains unsupported values.
         """
         config, provider_tool_fields = self._bound_config(binding, response_json_schema=None)
         return _BoundGeminiText(
@@ -1295,9 +1291,13 @@ class GeminiGenerateContentAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O.
+        """Bind for structured output validated into response_format without I/O.
 
-        Propagates _bound_config's ValueError.
+        Raises:
+            pydantic.ValidationError: A provider-executed tool is invalid.
+            ValueError: `binding` contains unsupported values.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
+            pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
         config, provider_tool_fields = self._bound_config(
@@ -1313,8 +1313,8 @@ class GeminiGenerateContentAdapter(Adapter):
     failure_types: ClassVar[tuple[type[Exception], ...]] = (errors.APIError, TransientError)
     """The exceptions parse_gemini maps to a verdict.
 
-    APIError is the SDK's one status-error class (ClientError and ServerError subclass it), and a
-    mid-stream error chunk raises it too, so every provider-stated failure lands in parse.
+    `ClientError` and `ServerError` subclass `APIError`.
+    A mid-stream error chunk also raises `APIError`.
     """
 
     @override
@@ -1340,7 +1340,9 @@ class GeminiGenerateContentAdapter(Adapter):
 
 
 class _ResponseAccumulator:
-    """Assembles streamed chunks into one GenerateContentResponse; assembled_response's engine.
+    """Assemble streamed chunks into one GenerateContentResponse.
+
+    `assembled_response` uses this class.
 
     _GeminiStream reads the public accumulated values before response() is built.
     """
@@ -1403,7 +1405,7 @@ class _ResponseAccumulator:
         return self.prompt_feedback is not None and self.prompt_feedback.block_reason is not None
 
     def response(self) -> types.GenerateContentResponse:
-        """Build the assembled response; no candidate is emitted when nothing candidate-borne arrived."""
+        """Build the assembled response."""
         candidates: list[types.Candidate] | None = None
         if self.parts or self.finish_reason is not None:
             candidates = [
@@ -1570,7 +1572,9 @@ class _GeminiStream(AdapterStream):
 
     @override
     async def close(self) -> None:
-        """Close the SDK's chunk iterator; an async generator's aclose is idempotent.
+        """Close the SDK's chunk iterator.
+
+        An async generator's aclose is idempotent.
 
         A test iterator without aclose has no connection to close.
         """
@@ -1634,7 +1638,10 @@ def _finished_turn_or_no_output(
 
 
 def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
-    """Map the finish reason to the neutral vocabulary; the module docstring states each row."""
+    """Map the finish reason to the neutral vocabulary.
+
+    The module docstring states each mapping.
+    """
     finish_reason = finished_turn.finish_reason
     if finish_reason == types.FinishReason.MAX_TOKENS:
         return "max_tokens"
@@ -1683,8 +1690,9 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Combine the response's id and model with request_id.
 
-        Both fields are optional on the SDK response; an absent one reports as the empty string,
-        which states the response named none without inventing a value.
+        Both fields are optional on the SDK response.
+        An absent field reports as the empty string.
+
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
@@ -1707,7 +1715,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open one generate_content_stream and return the live stream; connection failures raise here.
+        """Open one generate_content_stream and return the live stream.
 
         In google-genai 2.16.0, awaiting generate_content_stream returns an unstarted async generator.
         Pulling first_chunk performs connection I/O before any event is yielded.
@@ -1715,7 +1723,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
 
         Raises:
             TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+            Exception: The SDK fails to open the stream.
         """
         params = narrowed_request(request, _GeminiRequestParams)
         chunks = await self._adapter.client.aio.models.generate_content_stream(

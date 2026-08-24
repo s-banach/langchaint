@@ -42,8 +42,8 @@ async def stream_tool_call() -> Response[str]:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: The stream ended with a generation failure.
-        StreamProtocolError: The stream ended without a terminal event.
+        GenerationError: Generation fails.
+        StreamProtocolError: The stream has no terminal event.
     """
     openai = OpenAI()
     bound = openai.model("gpt-5.6-terra", reasoning_summary="auto").bind(

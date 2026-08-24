@@ -31,8 +31,8 @@ def fetch(url: str) -> bytes:
     """Read one URL.
 
     Raises:
-        urllib.error.HTTPError: the server answered with an error status.
-        urllib.error.URLError: the host could not be reached.
+        urllib.error.HTTPError: The server returns an error status.
+        urllib.error.URLError: The host cannot be reached.
     """
     with urllib.request.urlopen(url) as response:
         content: bytes = response.read()
@@ -43,10 +43,10 @@ def resolve_head_sha() -> str:
     """Resolve BRANCH to an upstream revision.
 
     Raises:
-        urllib.error.HTTPError: the commits endpoint answered with an error status.
-        urllib.error.URLError: the host could not be reached.
-        json.JSONDecodeError: the response body was not JSON.
-        KeyError: the response carried no sha, meaning the API shape changed.
+        urllib.error.HTTPError: The commits endpoint returns an error status.
+        urllib.error.URLError: The host cannot be reached.
+        json.JSONDecodeError: The response body is not JSON.
+        KeyError: The response contains no sha.
     """
     payload = json.loads(fetch(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
     sha: str = payload["sha"]
@@ -76,7 +76,7 @@ def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
     if attribute_lines.count("    type:") != 1:
         raise ValueError("gen_ai.provider.name must define one type mapping")
     if attribute_lines.count("      members:") != 1:
-        raise ValueError("gen_ai.provider.name type must define one members list")
+        raise ValueError("gen_ai.provider.name type must define one `members` list")
     members_start = attribute_lines.index("      members:") + 1
     members_end = next(
         (
@@ -93,7 +93,7 @@ def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
         if attribute_lines[index].startswith("        - ")
     ]
     if not member_starts:
-        raise ValueError("gen_ai.provider.name members must not be empty")
+        raise ValueError("gen_ai.provider.name `members` must not be empty")
     values: list[str] = []
     for position, member_start in enumerate(member_starts):
         member_end = (
@@ -105,7 +105,7 @@ def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
             if line.startswith("          value: ")
         ]
         if len(value_lines) != 1:
-            raise ValueError("each gen_ai.provider.name member must define one value")
+            raise ValueError("each entry in gen_ai.provider.name `members` must define one value")
         try:
             value: object = json.loads(value_lines[0])
         except json.JSONDecodeError as error:
@@ -146,12 +146,12 @@ def main() -> None:
     """Fetch every vendored file from one upstream commit.
 
     Raises:
-        urllib.error.HTTPError: an upstream request answered with an error status.
-        urllib.error.URLError: the host could not be reached.
-        json.JSONDecodeError: the commits endpoint returned a body that was not JSON.
-        KeyError: the commits endpoint returned no sha, meaning the API shape changed.
-        ValueError: registry.yaml is missing or malformed.
-        OSError: a vendored file could not be written.
+        urllib.error.HTTPError: An upstream request returns an error status.
+        urllib.error.URLError: An upstream host cannot be reached.
+        json.JSONDecodeError: The commits endpoint response is not JSON.
+        KeyError: The commits endpoint response contains no sha.
+        ValueError: `registry.yaml` is invalid.
+        OSError: A vendored path cannot be created or written.
     """
     sha = resolve_head_sha()
     schema_contents = {

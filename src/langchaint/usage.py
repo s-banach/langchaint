@@ -54,7 +54,13 @@ class Usage(CheckedCopyModel):
 
     @staticmethod
     def sum_of(usages: Iterable["Usage"]) -> "Usage":
-        """Sum counters and costs; an empty iterable returns `ZERO_USAGE`."""
+        """Sum counters and costs.
+
+        An empty iterable returns `ZERO_USAGE`.
+
+        Args:
+            usages: The usage values to sum.
+        """
         input_tokens_cache_read = 0
         input_tokens_cache_write = 0
         input_tokens_cache_none = 0

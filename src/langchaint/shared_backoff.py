@@ -28,8 +28,9 @@ _NEVER = float("-inf")
 class PauseAll:
     """The provider told us to stop sending for a while.
 
-    retry_after is the wait the provider named in seconds, None where it named none.
-    Recording this verdict starts the shared pause, or extends a running one.
+    `retry_after` is the provider-specified wait in seconds.
+    `retry_after` is `None` when the provider specified no wait.
+    Recording this verdict starts or extends the shared pause.
     """
 
     retry_after: float | None
@@ -40,8 +41,9 @@ class PauseAll:
 class RetryThisOne:
     """Worth retrying, with no sign the provider wants less traffic overall.
 
-    retry_after is a wait floor for this one request's next attempt, None where the provider named none.
-    Recording this verdict changes no shared state; it exists so the caller reads one vocabulary off Admission.verdict.
+    `retry_after` is a wait floor for this request's next attempt.
+    `retry_after` is `None` when the provider specified no wait.
+    Recording this verdict changes no shared state.
     """
 
     retry_after: float | None
@@ -50,10 +52,7 @@ class RetryThisOne:
 
 @dataclass(frozen=True, kw_only=True)
 class DoNotRetry:
-    """Waiting will not help; the caller stops retrying this request.
-
-    No retry_after field: a stray `retry-after` header on a failure that can never succeed names no wait worth serving.
-    """
+    """Tell the caller to stop retrying this request."""
 
     kind: Literal["do_not_retry"] = "do_not_retry"
 
@@ -88,7 +87,7 @@ def _random_up_to(ceiling: float) -> float:
 def _validated_positive_float(name: str, value: float) -> float:
     """Return value as a positive finite float.
 
-    bool is rejected explicitly because it subclasses int, so a type checker admits True here.
+    `bool` is rejected explicitly because it subclasses `int`.
 
     Raises:
         ValueError: `value` is boolean, non-finite, non-positive, or too large to convert to float.
@@ -110,11 +109,11 @@ def _validated_positive_float(name: str, value: float) -> float:
 
 
 class Admission:
-    """One `admitted()` block: entry waits until the request may start, exit reports how it ended.
+    """Represent one `admitted()` block. Entry waits until the request may start. Exit reports how the request ended.
 
-    verdict is None until a failure_types exception exits the block, then holds the normalized parse result.
-    It is the same object _record received, so both sides work from the same capped retry_after.
-    Build one only through SharedBackoff.admitted, which validates the budget first.
+    `verdict` is `None` until a `failure_types` exception exits the block.
+    `verdict` then holds the normalized `parse` result.
+    Build `Admission` only through `SharedBackoff.admitted`, which validates `budget` first.
     """
 
     def __init__(self, shared_backoff: "SharedBackoff", budget_seconds: float | None) -> None:
@@ -124,13 +123,13 @@ class Admission:
         self.verdict: Verdict | None = None
 
     async def __aenter__(self) -> "Admission":
-        """Acquire a permit when max_concurrent_requests is set, then admission; normally both are immediate.
+        """Acquire a permit when `max_concurrent_requests` is set.
 
-        Once this returns, the request is admitted, and a pause starting afterwards does not revoke that admission.
-        Cancellation during entry leaves nothing held: the request leaves the queue and any acquired permit returns.
+        Once this returns, the request is admitted. A later pause does not revoke that admission.
+        Cancellation during entry removes the request from the queue. Cancellation returns any acquired permit.
 
         Raises:
-            GaveUpWaiting: the budget expired first; nothing is held and nothing was recorded.
+            GaveUpWaiting: `budget` expired before admission.
         """
         shared_backoff = self._shared_backoff
         try:
@@ -159,11 +158,11 @@ class Admission:
     ) -> Literal[False]:
         """Parse and record a provider failure before releasing the permit.
 
-        Exceptions outside `failure_types` propagate without changing shared state.
         The permit returns even when parsing raises.
 
         Raises:
             ParserContractError: `parse` violates its contract and `on_parse_error="raise"`.
+            BaseException: The admitted block raises it.
         """
         try:
             if isinstance(exc_value, self._shared_backoff.failure_types):
@@ -196,11 +195,22 @@ class SharedBackoff:
         max_request_starts_per_second: float = 50.0,
         on_parse_error: Literal["raise", "retry_this_one"] = "raise",
     ) -> None:
-        """Validate configuration and initialize an unpaused `SharedBackoff`.
+        """Validate configuration. Initialize an unpaused `SharedBackoff`.
 
         `parse` maps each `failure_types` exception to `Verdict`.
         `max_concurrent_requests=None` applies no concurrency limit.
         `longest_wait_seconds` caps generated waits and `retry_after`.
+
+        Args:
+            parse: The provider failure parser.
+            failure_types: The exception types that `parse` accepts.
+            max_concurrent_requests: The request concurrency limit, or `None`.
+            minimum_wait_ceiling_seconds: The minimum private wait ceiling in seconds.
+            longest_wait_seconds: The maximum generated or provider-specified wait in seconds.
+            wait_multiplier: The factor that grows or shrinks the wait ceiling.
+            quiet_seconds_per_decay_step: The quiet interval that shrinks the wait ceiling once.
+            max_request_starts_per_second: The request-start rate limit.
+            on_parse_error: The action when `parse` raises.
 
         Raises:
             ValueError: A numeric setting is boolean, non-finite, or non-positive.
@@ -270,9 +280,7 @@ class SharedBackoff:
         For fewer steps, wait_multiplier ** steps cannot exceed the checked ceiling ratio.
         """
         self._pause_until = _NEVER
-        """When the current pause ends; once it is over, still the end of the previous pause."""
         self._pause_started_at = _NEVER
-        """When the current pause began; a metric for logging, read by no decision."""
         self._wait_ceiling = self.minimum_wait_ceiling_seconds
         """Longest pause this object will currently choose for itself."""
         self._last_admission_at = _NEVER
@@ -286,12 +294,6 @@ class SharedBackoff:
         self._permits = (
             None if max_concurrent_requests is None else asyncio.Semaphore(max_concurrent_requests)
         )
-        """The permits; None when max_concurrent_requests is None.
-
-        asyncio.Semaphore grants waiters in the order they joined and keeps the permit count whole
-        under cancellation: acquire's CancelledError branch passes a granted-but-unclaimed permit
-        on to the next waiter (CPython 3.14 asyncio.locks.Semaphore).
-        """
         self._admit_timer: asyncio.TimerHandle | None = None
         """Wakes _admit_waiting when the front of the queue becomes admissible."""
         self._clock: Callable[[], float] = time.monotonic
@@ -299,11 +301,9 @@ class SharedBackoff:
         self.event_counts: Counter[str] = Counter()
         """How often each noteworthy entry or exit event occurred, by tag.
 
-        The correction tags: "retry_after_invalid", "retry_after_over_cap", and under
-        on_parse_error="retry_this_one" also "parse_raised".
-        The failure tags: "gave_up_waiting" for a budget that expired before admission, and
-        "parser_contract_error" for a parse contract violation under on_parse_error="raise".
-        A metric, read by no decision.
+        The correction tags are `"retry_after_invalid"` and `"retry_after_over_cap"`.
+        `on_parse_error="retry_this_one"` also permits the `"parse_raised"` correction tag.
+        The failure tags are `"gave_up_waiting"` and `"parser_contract_error"`.
         """
 
     @property
@@ -321,6 +321,9 @@ class SharedBackoff:
         `budget` limits permit acquisition and admission waits.
         `budget=None` permits an indefinite wait.
 
+        Args:
+            budget: The admission wait budget in seconds, or `None`.
+
         Raises:
             ValueError: `budget` is boolean, non-finite, or non-positive.
         """
@@ -328,7 +331,9 @@ class SharedBackoff:
         return Admission(self, budget_seconds)
 
     async def _acquire_permit(self) -> None:
-        """Hold one permit, waiting behind earlier waiters; no-op when there is no bound.
+        """Hold one permit after earlier waiters.
+
+        Do nothing when there is no concurrency bound.
 
         Raises:
             asyncio.CancelledError: the wait was cancelled; no permit is held.
@@ -338,7 +343,10 @@ class SharedBackoff:
         _ = await self._permits.acquire()
 
     def _release_permit(self) -> None:
-        """Return one permit, waking the longest-waiting live waiter; no-op when there is no bound."""
+        """Return one permit and wake the longest-waiting live waiter.
+
+        Do nothing when there is no concurrency bound.
+        """
         if self._permits is None:
             return
         self._permits.release()
@@ -588,11 +596,9 @@ class PrivateBackoff:
     def next_wait(self, retry_after: float | None) -> float:
         """Return one failure's wait in seconds, then grow the ceiling one step.
 
-        The wait is a positive random draw bounded by _ceiling.
-        retry_after raises that wait when present.
-        Admission.verdict provides a normalized retry_after.
-        The normalized retry_after is capped at longest_wait_seconds.
-        _ceiling grows by wait_multiplier under the same cap.
+        The wait is a positive random draw bounded by `_ceiling`.
+        `retry_after` raises that wait when present.
+        The normalized `retry_after` is capped at `longest_wait_seconds`.
         """
         wait = _random_up_to(self._ceiling)
         if retry_after is not None:

@@ -8,8 +8,8 @@ async def price_at_negotiated_rates() -> Response[str]:
     """Price an uncataloged model at contract rates.
 
     Raises:
-        OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.
-        GenerationError: any terminal outcome of the generate call.
+        openai.OpenAIError: OpenAI credentials are unavailable.
+        GenerationError: Generation fails.
     """
     negotiated_default_rates = OpenAIRates(
         input_cache_none_usd_per_million_tokens=1.00,

@@ -54,7 +54,7 @@ DEEPSEEK_PRICING: dict[DeepSeekModelName, OpenAIRates] = {
         cache_write_usd_per_million_tokens=0.0,
     ),
 }
-"""Public off-peak prices per deepseek model; the default pricing lookup."""
+"""Public off-peak prices that `DeepSeek.model` uses by default."""
 
 _PRICING_BY_MODEL_ID = dict[str, OpenAIRates](DEEPSEEK_PRICING.items())
 """`DEEPSEEK_PRICING` with `str` keys for runtime model lookup."""

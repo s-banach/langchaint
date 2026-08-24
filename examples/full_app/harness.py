@@ -186,7 +186,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         """Build the scripted response identity.
 
         Raises:
-            TypeError: raw is not a FakeRaw.
+            TypeError: `raw` is not a `FakeRaw`.
         """
         return ResponseIdentity(
             model_served="scripted-model",
@@ -199,7 +199,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         """Build the result for the scripted turn.
 
         Raises:
-            TypeError: raw is not a FakeRaw.
+            TypeError: `raw` is not a `FakeRaw`.
         """
         turn = self._adapter.scripts[self._tag].turns[_turn_index(raw)]
         if turn.tool_calls:

@@ -151,9 +151,9 @@ def _completion(
     choices: list[object] | None = None,
     model: str = "m",
 ) -> ChatCompletion:
-    """Build a completion whose id is fixed at "r1"; every field a test varies is a parameter.
+    """Build a completion whose id is fixed at "r1". Every field a test varies is a parameter.
 
-    message holds the assistant message's fields minus role; None gives content "hey".
+    message holds the assistant message's fields minus role. None gives content "hey".
     choices overrides the single built choice, [] being the no-choices response.
     """
     if choices is None:
@@ -292,7 +292,7 @@ def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
 
 
 def test_the_reported_tier_selects_the_table() -> None:
-    """Priority rates price a priority response; "auto" and no tier both price at default."""
+    """Priority rates price a priority response. "auto" and no tier both price at default."""
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
     at_priority = _billing(
         _completion(usage=_usage_with_cache(), service_tier="priority"), pricing
@@ -389,7 +389,7 @@ def _finished(completion: ChatCompletion) -> _FinishedTurn:
 def test_stop_reason_mapping(
     build_completion: Callable[[], ChatCompletion], expected: StopReason
 ) -> None:
-    """Each finish_reason row maps as the module docstring states.
+    """Map each finish_reason row to its neutral StopReason.
 
     The refusal field is tested ahead of the rows, which the refusal-beside-stop row pins.
     """
@@ -540,7 +540,7 @@ def test_wire_messages_converts_each_message_kind() -> None:
 
 
 def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
-    """A marked part carries prompt_cache_breakpoint on its wire part; unmarked siblings carry none."""
+    """A marked part carries prompt_cache_breakpoint on its wire part. Unmarked siblings carry none."""
     wire = _wire_messages([
         UserMessage(
             content=(
@@ -642,7 +642,7 @@ def test_build_request_rejects_audio_part_media_type_without_input_audio_format(
 
 
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
-    """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
+    """The neutral strings pass through unchanged. SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"
     assert _wire_tool_choice("required") == "required"
     assert _wire_tool_choice("none") == "none"
@@ -802,7 +802,7 @@ def test_build_request_reports_a_raw_part_in_a_turn_as_invalid_request() -> None
 
 
 def test_request_maps_the_inference_params_and_omits_the_unset() -> None:
-    """Each set parameter lands on its wire field; unset ones leave the omit sentinel."""
+    """Each set parameter lands on its wire field. Unset ones leave the omit sentinel."""
     fields_set = _adapter()._precompute_fields(
         _binding(
             inference_params=InferenceParams(
@@ -820,7 +820,7 @@ def test_request_maps_the_inference_params_and_omits_the_unset() -> None:
 
 
 def test_request_omits_tool_fields_without_tools_and_sends_all_three_with_them() -> None:
-    """Tools bring tool_choice and parallel_tool_calls with them; toolless bindings send none of the three."""
+    """Tools bring tool_choice and parallel_tool_calls with them. Toolless bindings send none."""
     toolless = _adapter()._precompute_fields(_binding())
     assert isinstance(toolless.tools, openai.Omit)
     assert isinstance(toolless.tool_choice, openai.Omit)
@@ -915,7 +915,7 @@ def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises(
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
-    """A stated service_tier lands on the request; None leaves the omit sentinel."""
+    """A stated service_tier lands on the request. None leaves the omit sentinel."""
     assert isinstance(_adapter()._precompute_fields(_binding()).service_tier, openai.Omit)
     stated = OpenAIChatCompletionsAdapter(
         client=AsyncOpenAI(api_key="test"),
@@ -945,7 +945,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
 
 
 def _text_bound() -> _BoundChatCompletionsText:
-    """Build a text-bound adapter over a keyless client; no request is sent."""
+    """Build a text-bound adapter over a keyless client. No request is sent."""
     adapter = _adapter()
     return _BoundChatCompletionsText(
         adapter=adapter, precomputed_fields=adapter._precompute_fields(_binding())
@@ -960,7 +960,7 @@ class _StructuredReport(BaseModel):
 
 
 def _structured_bound() -> _BoundChatCompletionsStructured[_StructuredReport]:
-    """Build a structured-bound adapter over a keyless client; no request is sent."""
+    """Build a structured-bound adapter over a keyless client. No request is sent."""
     adapter = _adapter()
     return _BoundChatCompletionsStructured(
         adapter=adapter,
@@ -1202,7 +1202,7 @@ def _chunk(
     usage: CompletionUsage | None = None,
     choices: list[object] | None = None,
 ) -> ChatCompletionChunk:
-    """Build one chunk with a single choice; choices=[] is the usage-only trailing chunk."""
+    """Build one chunk with a single choice. choices=[] is the usage-only trailing chunk."""
     if choices is None:
         choices = [{"index": 0, "delta": dict(delta or {}), "finish_reason": finish_reason}]
     return ChatCompletionChunk.model_validate({
@@ -1343,7 +1343,7 @@ def test_billing_reported_is_none_until_the_usage_chunk_arrives() -> None:
 
 
 def test_final_patches_the_tracked_usage_over_a_trailing_chunks_reset() -> None:
-    """A usage-less chunk after the usage chunk resets the snapshot's usage; final() restores it."""
+    """A usage-less chunk after the usage chunk resets the snapshot's usage. final() restores it."""
     stream = _stream([*_text_stream_chunks(), _chunk(choices=[])])
 
     async def scenario() -> ChatCompletion:
@@ -1406,7 +1406,7 @@ def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_respo
     ids=["connection_error", "response_validation_error"],
 )
 def test_an_api_error_subclass_raised_mid_stream_propagates_untouched(error: Exception) -> None:
-    """Only the bare APIError is the SSE error payload; every subclass keeps its own meaning."""
+    """Only the bare APIError is the SSE error payload. Every subclass keeps its own meaning."""
     with pytest.raises(type(error)) as raised:
         _ = _collected_items([_chunk(delta={"role": "assistant"}), error])
     assert raised.value is error
@@ -1431,11 +1431,7 @@ def _kwarg_sent[OutputT](
 
 
 def test_the_request_sends_extra_body_by_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """open_stream passes the binding's extra_body to the SDK's extra_body parameter.
-
-    A request that dropped it would silently go out without the caller's wire fields,
-    which no offline round-trip test can catch.
-    """
+    """open_stream passes the binding's extra_body to the SDK's extra_body parameter."""
     adapter = _adapter()
     extra_body = {"safety_identifier": "user-7"}
     text_bound = _BoundChatCompletionsText(
@@ -1581,10 +1577,10 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the table both openai adapters share; its builder's docstring states each row."""
+        """Return the shared OpenAI classification table."""
         return openai_sdk_errors_and_classifications()
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the parse rows both openai adapters share; the builder's docstring names their sources."""
+        """Return the shared OpenAI verdict table."""
         return openai_sdk_errors_and_verdicts()

@@ -40,7 +40,8 @@ class AttemptRecord:
     `first_item_at_monotonic_seconds` records the first streamed item exposed to the caller.
     `error` contains only a retriable `TransientError`.
     `billing` is `None` when no response or stream reported billing.
-    `raw` holds the mutable SDK response by reference; copy it before mutation.
+    `raw` holds the mutable SDK response by reference.
+    Copy `raw` before mutation.
     Response identifiers and `assistant_message` are `None` when no response supplied them.
     """
 
@@ -62,9 +63,9 @@ class AttemptRecord:
 
     @property
     def usage(self) -> Usage:
-        """The billed counters and costs in the neutral summary, ZERO_USAGE where none were reported.
+        """Return the billed counters and costs in the neutral summary.
 
-        Never None, so a fold over attempts adds a shape rather than testing for one.
+        Return `ZERO_USAGE` when no billing was reported.
         """
         return ZERO_USAGE if self.billing is None else self.billing.usage
 
@@ -110,18 +111,19 @@ class _CallCarrier:
 
     @property
     def started_at_monotonic_seconds(self) -> float:
-        """The call's start, the origin its attempt records' stamps are read against."""
+        """Return the call's start timestamp.
+
+        Attempt record timestamps use this timestamp as their origin.
+        """
         return self.call.started_at_monotonic_seconds
 
     @property
     def elapsed_seconds(self) -> float:
-        """The call's wall time, permit waits and backoff sleeps included."""
+        """Return the call's wall time including permit waits and backoff sleeps."""
         return self.call.elapsed_seconds
 
 
 class _StagedResponse(NamedTuple):
-    """One arrived response, what it billed, and its ids, held until the attempt around it closes."""
-
     raw: BaseModel
     billing: Billing
     identity: ResponseIdentity
@@ -135,7 +137,7 @@ class _CallLedger:
     """
 
     def __init__(self, *, model: str, provider_name: str) -> None:
-        """Open a ledger against what will serve the call, stamping its start as now."""
+        """Stamp the call start with the current monotonic time."""
         self._model = model
         self._provider_name = provider_name
         self._attempt_records: list[AttemptRecord] = []
@@ -168,9 +170,9 @@ class _CallLedger:
         self._started_at_monotonic_seconds = time.monotonic()
 
     def start_attempt(self) -> None:
-        """Stamp the attempt's start as now; the next record closes the bracket it opens.
+        """Stamp the attempt start with the current monotonic time.
 
-        Clears the first-item stamp, request id, and in-flight billing.
+        The next record closes the interval.
         """
         self._attempt_started_at_monotonic_seconds = time.monotonic()
         self._attempt_in_flight = True
@@ -203,7 +205,10 @@ class _CallLedger:
 
     @property
     def billing_in_flight(self) -> Billing | None:
-        """The noted in-flight billing, None once a record settles the attempt it belonged to."""
+        """Return the noted in-flight billing.
+
+        Return `None` after a record settles the corresponding attempt.
+        """
         return self._billing_in_flight
 
     @property
@@ -218,7 +223,7 @@ class _CallLedger:
 
     @property
     def in_flight_attempt_started_at_monotonic_seconds(self) -> float | None:
-        """When the open attempt started, None between attempts and before the first.
+        """Return when the open attempt started.
 
         An attempt remains open from `start_attempt` until a record closes it.
         An interrupted open attempt reports when its request started.
@@ -233,7 +238,7 @@ class _CallLedger:
         assistant_message: AssistantMessage | None,
         billing: Billing | None = None,
     ) -> None:
-        """Close the attempt started by the last start_attempt(), ending it now."""
+        """Close the attempt started by the last `start_attempt` call at the current time."""
         self.record_ending_at(
             time.monotonic(), error=error, assistant_message=assistant_message, billing=billing
         )
@@ -273,7 +278,7 @@ class _CallLedger:
         )
 
     def freeze(self) -> CallRecord:
-        """Return the call's history as of now, for a result to carry."""
+        """Return the call history as of the current time for a result to carry."""
         return self.freeze_ending_at(time.monotonic())
 
     def freeze_ending_at(self, ended_at_monotonic_seconds: float) -> CallRecord:

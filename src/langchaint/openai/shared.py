@@ -47,18 +47,13 @@ _RETRY_THIS_ONE_STATUSES = frozenset({500, 408, 409})
 """One request's server-side failure or collision, retried without pausing siblings."""
 
 _DO_NOT_RETRY_STATUSES = frozenset({400, 401, 403, 404, 422})
-"""The statuses that reject this request; a resend fails the same way.
+"""The statuses that reject this request.
 
-404 and 422 are not in the error-code guide: AsyncOpenAI raises NotFoundError and
-UnprocessableEntityError for them (openai 2.51.0).
+A resend fails the same way.
 """
 
 PARSE_FALLTHROUGH_COUNTS: Counter[str] = Counter()
-"""How often parse_openai fell to a status-family default, keyed by status and error type.
-
-A diagnostic surface, read by no decision: a growing key names a status or error type the
-tables above should learn.
-"""
+"""`record_parse_fallthrough` increments this counter for each status-family default."""
 
 type OpenAIServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 """What a Chat Completions request may ask for (openai 3.1.0)."""
@@ -110,12 +105,13 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
 }
 """Whether a resend may get past the failure each ResponseError.code names (openai 2.48.0).
 
-Every value of the SDK's code literal is a key, which tests/test_provider_facts.py pins, so the
-unknown-code path below is reached only by a code newer than the installed SDK.
-The three transient codes are read off their names: the SDK documents none of the codes, and these
-three name a condition of the moment while every other names a property of the request.
-failed_to_download_image is terminal for that reason: a URL the caller got wrong fails identically
-on every resend.
+Every value of the SDK's code literal is a key.
+`tests/test_provider_facts.py` checks that mapping.
+The unknown-code path handles codes added after the installed SDK.
+The SDK does not document the codes.
+The three transient codes name temporary conditions.
+Each other code names a request property.
+failed_to_download_image is terminal for that reason: a URL the caller got wrong fails identically on every resend.
 """
 
 
@@ -156,10 +152,9 @@ class OpenAIRates:
     ) -> Billing:
         """Price one response's counters at these rates.
 
-        The counters arrive as arguments rather than in a counts object,
-        which would exist only to be unpacked again one call later.
-        output_tokens_reasoning is the reasoning share of output_tokens, billed at the output rate;
-        it is a parameter because the returned Usage carries it.
+        output_tokens_reasoning is the reasoning share of output_tokens.
+        The output rate applies to output_tokens_reasoning.
+        The returned Usage carries output_tokens_reasoning.
 
         Token cost is the sum of four token category costs.
         provider_executed_tool_cost_in_usd adds the provider-executed tool charge.
@@ -364,13 +359,14 @@ def _verdict_from_openai_status(
 ) -> Verdict:
     """Return the verdict the status and the error code alone give one error-status failure.
 
-    The listed rows come from openai's error-code guide,
-    https://developers.openai.com/api/docs/guides/error-codes (read 2026-08-01):
+    Source: https://developers.openai.com/api/docs/guides/error-codes.
+    Read 2026-08-01.
     `_PAUSE_STATUSES` return `PauseAll` unless `_SPEND_LIMIT_CODES` requires `DoNotRetry`.
     Retrying spend-limit errors cannot restore access.
     `_RETRY_THIS_ONE_STATUSES` return `RetryThisOne`.
     `_DO_NOT_RETRY_STATUSES` return `DoNotRetry`.
-    Some rows come from the SDK rather than the guide; each table's docstring names which and why.
+    Some rows come from the SDK.
+    Each table's docstring names the source and reason.
     `error.code` separates spend-limit 429 errors because `error.type` may still be `insufficient_quota`.
     Failures outside the rows take a default, counted in PARSE_FALLTHROUGH_COUNTS and logged:
     unlisted 5xx statuses return `RetryThisOne`, and other unlisted statuses return `DoNotRetry`.
@@ -420,12 +416,11 @@ def _verdict_from_openai_error_code(
 
 
 OPENAI_FAILURE_TYPES: tuple[type[Exception], ...] = (openai.APIStatusError, TransientError)
-"""The exceptions parse_openai maps to a verdict; both adapters' failure_types.
+"""The exceptions parse_openai maps to a verdict.
 
-APIStatusError catches every error status, not only the ones with their own subclass:
-_make_status_error returns a specific subclass only for the statuses it lists and the bare
-APIStatusError for every other one (openai 2.51.0), so a subclass list would silently drop
-413, which openai maps to no class, and whatever status the provider adds next.
+Both adapters use these exceptions as `failure_types`.
+
+APIStatusError catches every error status.
 """
 
 
@@ -461,12 +456,8 @@ PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS: Mapping[type, str] = {
     AsyncBedrockOpenAI: "aws.bedrock",
     AsyncAzureOpenAI: "azure.ai.openai",
 }
-"""Both adapters' provider_name_by_client_class. AsyncOpenAI is deliberately absent: it reaches
-whatever its base_url points at.
+"""The client-class provider map shared by both OpenAI adapters.
 
-The two classes here each speak one platform's auth and URL scheme, so the class fixes the
-provider. A plain AsyncOpenAI does not: pointing its base_url at another vendor's
-OpenAI-compatible endpoint is how Groq, DeepSeek, and xAI are reached, all of them
-gen_ai.provider.name values.
-Mapping AsyncOpenAI to "openai" would make Adapter.__init__ raise for every one of them.
+`AsyncAzureOpenAI` and `AsyncBedrockOpenAI` determine their providers.
+`AsyncOpenAI` is absent so a caller can state the provider for an OpenAI-compatible endpoint.
 """

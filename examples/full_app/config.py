@@ -35,13 +35,14 @@ class AgentConfig:
 
         Raises:
             ValueError: system_prompt does not start with "[name] ".
-                Also raised when max_cost_in_usd is not positive and finite.
+                The same exception applies when max_cost_in_usd is not positive and finite.
         """
         tag = f"[{self.name}] "
         if not self.system_prompt.startswith(tag):
             raise ValueError(
-                f"system_prompt must start with {tag!r} so the scripted adapter selects "
-                f"{self.name}'s script; got {self.system_prompt!r}"
+                f"system_prompt must start with {tag!r}. "
+                f"ScriptedAdapter uses the tag to select {self.name!r}. "
+                f"Got {self.system_prompt!r}."
             )
         if self.max_cost_in_usd is not None and (
             not math.isfinite(self.max_cost_in_usd) or self.max_cost_in_usd <= 0

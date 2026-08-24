@@ -216,7 +216,7 @@ def test_bedrock_modeled_exceptions_remain_client_errors() -> None:
 
 
 def test_anthropic_stop_reasons_are_the_set_the_adapter_maps() -> None:
-    """A value the provider adds fails here; _normalized_stop_reason would map it to "other" unnoticed."""
+    """A value the provider adds fails here. _normalized_stop_reason would map it to "other" unnoticed."""
     annotation = _field_annotation(AnthropicMessage, "stop_reason")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "end_turn",
@@ -243,7 +243,7 @@ def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
 
 
 def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
-    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not; a third value would fall through."""
+    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not. A third value would fall through."""
     annotation = _field_annotation(IncompleteDetails, "reason")
     assert typing.get_args(typing.get_args(annotation)[0]) == (
         "max_output_tokens",
@@ -428,7 +428,7 @@ def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
 
 
 def test_anthropic_content_block_deltas_carry_the_two_kinds_of_text_the_stream_yields() -> None:
-    """The stream branches on these two delta types; a rename drops that text from the stream unnoticed."""
+    """The stream branches on these two delta types. A rename drops that text from the stream unnoticed."""
     type_values = _type_literals_of_union(_field_annotation(RawContentBlockDeltaEvent, "delta"))
     assert "text_delta" in type_values
     assert "thinking_delta" in type_values

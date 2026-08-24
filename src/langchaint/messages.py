@@ -13,7 +13,7 @@ from langchaint.checked_copy import CheckedCopyModel
 
 
 class TextPart(CheckedCopyModel):
-    """One text span.
+    """Pydantic rejects unknown keys in one text part.
 
     `cache_breakpoint=True` ends a reusable prompt prefix after this part.
     """
@@ -26,11 +26,12 @@ class TextPart(CheckedCopyModel):
 
 
 class ImagePart(CheckedCopyModel):
-    """media_type is an IANA media type such as "image/png".
+    """Pydantic rejects unknown keys in one inline image part.
 
-    cache_breakpoint has the same meaning as on TextPart: the reusable prompt prefix ends at this part.
+    `media_type` is an IANA media type such as `"image/png"`.
+    `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
 
-    In JSON, data is URL-safe base64 text.
+    In JSON, `data` is URL-safe base64 text.
     Pydantic's default UTF-8 byte encoding fails on ordinary image bytes.
     """
 
@@ -45,12 +46,14 @@ class ImagePart(CheckedCopyModel):
 
 
 class ImageUrlPart(CheckedCopyModel):
-    """langchaint sends url unchanged and never fetches it.
+    """Pydantic rejects unknown keys in one image URL part.
 
-    media_type is an optional IANA media type.
-    Gemini receives media_type when present.
-    Other adapters receive url without media_type.
-    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
+    langchaint sends `url` unchanged.
+    langchaint never fetches `url`.
+    `media_type` is an optional IANA media type.
+    Gemini receives `media_type` when present.
+    Other adapters receive `url` without `media_type`.
+    `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -62,10 +65,11 @@ class ImageUrlPart(CheckedCopyModel):
 
 
 class AudioPart(CheckedCopyModel):
-    """media_type is an IANA media type, such as "audio/wav".
+    """Pydantic rejects unknown keys in one inline audio part.
 
-    JSON stores data as URL-safe base64 text.
-    cache_breakpoint has the same meaning as TextPart.cache_breakpoint.
+    `media_type` is an IANA media type, such as `"audio/wav"`.
+    JSON stores `data` as URL-safe base64 text.
+    `cache_breakpoint` has the same meaning as `TextPart.cache_breakpoint`.
     """
 
     model_config = ConfigDict(
@@ -81,14 +85,12 @@ class AudioPart(CheckedCopyModel):
 type ContentPart = Annotated[
     TextPart | ImagePart | ImageUrlPart | AudioPart, Field(discriminator="kind")
 ]
-"""One model-facing text, image, image URL, or audio value."""
 
 type MessageContent = str | Sequence[ContentPart]
-"""A model-facing string or sequence of `ContentPart` values."""
 
 
 class ToolCall(CheckedCopyModel):
-    """One tool call requested by the model.
+    """Pydantic rejects unknown keys in one model-requested tool call.
 
     `args_json` holds argument JSON text before validation.
     Adapters serialize decoded provider arguments to this shared form.
@@ -103,7 +105,7 @@ class ToolCall(CheckedCopyModel):
 
 
 class UserMessage(CheckedCopyModel):
-    """One user turn containing text or ordered `ContentPart` values.
+    """Pydantic selects each `ContentPart` variant by `kind` in one user turn.
 
     Raises:
         pydantic.ValidationError: `content` is invalid or an unknown key is passed.
@@ -116,9 +118,10 @@ class UserMessage(CheckedCopyModel):
 
 
 class ReasoningPart(CheckedCopyModel):
-    """A provider reasoning value preserved for replay.
+    """Pydantic rejects unknown keys in one provider reasoning value preserved for replay.
 
-    The producing adapter stores an SDK dump in `raw`; the same adapter replays it unchanged.
+    The producing adapter stores an SDK dump in `raw`.
+    The same adapter replays `raw` unchanged.
     Rebuild turns before switching providers.
     `text` contains readable reasoning for display and does not affect replay.
     `text=None` means the provider returned no readable reasoning.
@@ -132,14 +135,13 @@ class ReasoningPart(CheckedCopyModel):
 
 
 class RawPart(CheckedCopyModel):
-    """One replayable provider fragment without another TurnPart variant.
+    """Pydantic rejects unknown keys in one replayable provider fragment.
 
-    An adapter emits RawPart for replayable response values lacking another TurnPart variant.
-    The turn preserves their response order.
-    raw is the producing SDK model_dump fragment required for replay.
-    The consuming adapter sends raw unchanged in its original wire position.
-    Another adapter returns InvalidRequest or leaves validation to its provider.
-    Applications inspect Response.raw for the complete SDK response.
+    `AssistantMessage.turn` preserves `RawPart` response order.
+    `raw` is the producing SDK `model_dump` fragment required for replay.
+    The consuming adapter sends `raw` unchanged in its original wire position.
+    Another adapter returns `InvalidRequest` or leaves validation to its provider.
+    Applications inspect `Response.raw` for the complete SDK response.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -151,27 +153,21 @@ class RawPart(CheckedCopyModel):
 type TurnPart = Annotated[
     ReasoningPart | TextPart | ToolCall | RawPart, Field(discriminator="kind")
 ]
-"""One ordered value inside AssistantMessage.turn.
+"""One ordered value inside `AssistantMessage.turn`.
 
-An image a provider returns arrives as RawPart.
+An image a provider returns arrives as `RawPart`.
 """
 
 
 def _text_only_turn(turn: object) -> object:
-    """Coerce a bare string to a one-TextPart turn, so AssistantMessage(turn="hey") works.
-
-    Runs before validation on every construction path (the constructor and model_validate alike),
-    so the stored turn is always the tuple form and readers never branch on a string.
-    """
     if isinstance(turn, str):
         return (TextPart(text=turn),)
     return turn
 
 
 class AssistantMessage(CheckedCopyModel):
-    """One assistant turn stored in provider emission order.
+    """Pydantic selects each `TurnPart` variant by `kind` in one assistant turn.
 
-    `text` and `tool_calls` are filtered views of `turn`.
     A bare string becomes one `TextPart`.
 
     Raises:
@@ -185,35 +181,38 @@ class AssistantMessage(CheckedCopyModel):
 
     @model_validator(mode="after")
     def _reject_cache_breakpoint(self) -> "AssistantMessage":
-        """Reject a turn whose TextPart sets cache_breakpoint; the class docstring states why.
+        """Reject a turn whose `TextPart` sets `cache_breakpoint`.
 
         Raises:
-            ValueError: a TextPart in the turn sets cache_breakpoint; pydantic surfaces it as a ValidationError.
+            ValueError: A `TextPart` in `turn` sets `cache_breakpoint`.
         """
         if any(isinstance(part, TextPart) and part.cache_breakpoint for part in self.turn):
             raise ValueError(
-                "cache_breakpoint is not supported on assistant turn text: "
-                "openai has no breakpoint on assistant replay text; "
-                "mark the following user or tool message instead"
+                "cache_breakpoint is not supported on assistant turn text. "
+                "openai has no breakpoint on assistant replay text. "
+                "Mark the following user or tool message instead"
             )
         return self
 
     @property
     def text(self) -> str:
-        """The concatenated TextPart texts of the turn; empty when the turn held no text."""
+        """Return the concatenated `TextPart.text` values from `turn`.
+
+        Return an empty string when `turn` contains no `TextPart`.
+        """
         return "".join(part.text for part in self.turn if isinstance(part, TextPart))
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """The ToolCall parts of the turn, in emission order."""
+        """Return the `ToolCall` values from `turn` in emission order."""
         return tuple(part for part in self.turn if isinstance(part, ToolCall))
 
 
 class ToolMessage(CheckedCopyModel):
-    """One tool result sent back to the model.
+    """Pydantic selects each `ContentPart` variant by `kind` in one tool result.
 
-    tool_call_id must match the id of the ToolCall it answers.
-    is_error True tells the model the tool failed; content then holds the error text.
+    `tool_call_id` must match the `ToolCall.id` it answers.
+    `is_error=True` tells the model the tool failed.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -225,28 +224,32 @@ class ToolMessage(CheckedCopyModel):
 
     @classmethod
     def error(cls, tool_call: ToolCall, content: str | tuple[ContentPart, ...]) -> "ToolMessage":
-        """Build an is_error ToolMessage answering tool_call.
+        """Build a `ToolMessage` with `is_error=True` that answers `tool_call`.
 
-        tool_call_id is bound from tool_call.id, so the message answers that call by construction.
+        Args:
+            tool_call: The tool call that the message answers.
+            content: The model-facing error content.
         """
         return cls(tool_call_id=tool_call.id, content=content, is_error=True)
 
 
 type Message = Annotated[UserMessage | AssistantMessage | ToolMessage, Field(discriminator="kind")]
-"""Discriminated on kind: pydantic validation selects the variant from the tag,
-never from which variant's fields happen to match,
-so messages_to_json and messages_from_json restore each message to its exact type.
+"""Pydantic validation selects the message variant from `kind`.
+
+`messages_to_json` and `messages_from_json` restore each message to its exact type.
 """
 
 _MESSAGES_JSON: TypeAdapter[list[Message]] = TypeAdapter(list[Message])
-"""Module-level so TypeAdapter construction compiles the schema once, not on every call."""
 
 
 def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) -> str:
     """Serialize messages for `messages_from_json`.
 
-    `indent` formats the JSON for human readers.
     `ReasoningPart.raw` and `RawPart.raw` remain embedded for replay.
+
+    Args:
+        messages: The messages to serialize.
+        indent: The JSON indentation width, or `None` for compact JSON.
 
     Raises:
         pydantic_core.PydanticSerializationError: A raw value cannot be serialized as JSON.
@@ -255,10 +258,13 @@ def messages_to_json(messages: Sequence[Message], *, indent: int | None = None) 
 
 
 def messages_from_json(messages_json: str) -> list[Message]:
-    """Restore the message list messages_to_json serialized.
+    """Restore the message list that `messages_to_json` serialized.
+
+    Args:
+        messages_json: The serialized message list.
 
     Raises:
-        pydantic.ValidationError: messages_json does not hold a serialized message list.
+        pydantic.ValidationError: `messages_json` does not hold a serialized message list.
     """
     return _MESSAGES_JSON.validate_json(messages_json)
 
@@ -266,9 +272,8 @@ def messages_from_json(messages_json: str) -> list[Message]:
 type StopReason = Literal[
     "end_turn", "tool_use", "max_tokens", "refusal", "context_window_exceeded", "other"
 ]
-"""Provider stop reasons normalized to one vocabulary;
-adapters map unrecognized provider values to "other" so a new provider value cannot break callers.
-context_window_exceeded carries no provider prefix because this vocabulary is langchaint's own;
-it earns a value rather than "other" because it names a terminal condition a caller acts on,
-by shortening the GenerationInput or moving to a model with a larger window.
+"""Provider stop reasons normalized to one vocabulary.
+
+Adapters map unrecognized provider values to `"other"`.
+A caller can shorten the `GenerationInput` or choose a model with a larger context window.
 """

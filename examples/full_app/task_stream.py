@@ -138,10 +138,9 @@ class AgentRun(ABC):
         """
         if agent_path in registry:
             raise ValueError(
-                f"agent_path {agent_path!r} is already registered: a registry row is one run held "
-                "by reference, so a second run under the same path would replace the first and "
-                "drop its turn_log records from every fold. Disambiguate the path, as delegate "
-                "does with its spawn index."
+                f"agent_path {agent_path!r} is already registered. "
+                "A second run at the same agent_path would replace the first run. "
+                "Use a distinct agent_path, as delegate does with its spawn index."
             )
         self.agent_path: str = agent_path
         self.config: AgentConfig = config
@@ -181,8 +180,8 @@ class AgentRun(ABC):
         """Run the agent with its GuiEmitter and span.
 
         Raises:
-            Exception: whatever run() failed with; AgentFailed is emitted before the re-raise.
-            asyncio.CancelledError: An outer scope cancelled the run.
+            Exception: `run()` or `on_event` raises.
+            asyncio.CancelledError: An outer scope cancels the run.
         """
         token = gui_emitter_var.set(GuiEmitter(self.agent_path, self.on_event))
         try:
@@ -260,10 +259,11 @@ class ReActAgent(AgentRun):
         Each settled outcome is appended to turn_log.
 
         Raises:
-            GenerationError: a generate call fails after its retries, except TimedOutError.
-            RuntimeError: `max_turns` elapsed, or configured cost cannot permit another turn.
-            DispatchExceptionGroup: a tool function raised; the settled siblings are folded first.
-            asyncio.CancelledError: an outer deadline cancelled the run.
+            GenerationError: Generation fails after its retries, except for `TimedOutError`.
+            RuntimeError: `max_turns` elapses or the configured cost prevents another turn.
+            DispatchExceptionGroup: A tool function raises after settled sibling outcomes enter `turn_log`.
+            asyncio.CancelledError: An outer deadline cancels the run.
+            Exception: `on_event` raises.
         """
         self.messages.append(UserMessage(content=self.prompt))
         for _ in range(self.config.max_turns):
@@ -332,9 +332,9 @@ class ReActAgent(AgentRun):
         Calls above config.max_tool_calls are declined through precomputed.
 
         Raises:
-            DispatchExceptionGroup: one or more tool functions raise after completed_outcomes settle.
-            RuntimeError: ToolCall.id repeats.
-            asyncio.CancelledError: an outer deadline cancelled the run mid-dispatch.
+            DispatchExceptionGroup: A tool function raises after `completed_outcomes` settle.
+            RuntimeError: A `ToolCall.id` repeats.
+            asyncio.CancelledError: An outer deadline cancels the dispatch.
         """
         usage_so_far = self.usage
         for tool_call in tool_calls:
@@ -462,7 +462,7 @@ def build_delegate_tool(
         """Run the specialist and return its answer.
 
         Raises:
-            DispatchExceptionGroup: A specialist tool function raised.
+            DispatchExceptionGroup: A specialist tool function raises.
         """
         sub_run = ReActAgent(
             agent_path=f"{parent_path}/{sub_config.name}#{next(spawn_counter)}",
@@ -565,8 +565,8 @@ class App:
         """Await one node and record its answer or failure.
 
         Raises:
-            DispatchExceptionGroup: A tool function raised.
-            asyncio.CancelledError: An outer scope cancelled the graph.
+            DispatchExceptionGroup: A tool function raises.
+            asyncio.CancelledError: An outer scope cancels the graph.
         """
         try:
             self.answers[run.agent_path] = await run.final()
@@ -578,12 +578,14 @@ class App:
     async def run(self) -> None:
         """Run each graph node and report its events through on_event.
 
-        TaskGroup waits for researcher cancellation before propagating it.
-
         Raises:
-            asyncio.CancelledError: an outer deadline cancelled the graph mid-run.
-            DispatchExceptionGroup: A synthesize tool function raised.
-            ExceptionGroup: A concurrent researcher tool function raised.
+            KeyError: A required configuration is missing.
+            ValueError: An `agent_path` is already registered.
+            ValueError: `max_attempts` is boolean or below one.
+            ValueError: `automatic_cache_breakpoints` is unsupported.
+            asyncio.CancelledError: An outer deadline cancels the graph after researcher tasks settle.
+            DispatchExceptionGroup: A synthesize tool function raises.
+            ExceptionGroup: A concurrent researcher tool function raises.
         """
         # Use climate_name for the run and the delegate's parent_path.
         climate_name = "research_climate"

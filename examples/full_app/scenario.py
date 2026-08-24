@@ -52,10 +52,10 @@ class DelegateArgs(BaseModel):
 async def search_tool(args: SearchArgs) -> ToolOutputExplicit[Usage]:
     """Return a canned result and its Usage through app_data.
 
-    current_gui_emitter routes progress to the dispatching run's stream.
+    current_gui_emitter() routes progress to the dispatching run's stream.
 
     Raises:
-        LookupError: dispatched outside a run's loop, where no emitter is installed.
+        LookupError: No run installed a `GuiEmitter`.
     """
     current_gui_emitter().emit_tool_progress(
         tool_name="search", message=f"searching the corpus for {args.query!r}"

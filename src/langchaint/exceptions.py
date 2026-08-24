@@ -50,11 +50,7 @@ class EmbeddingOutputError(RuntimeError):
 def _extract_transient_errors(
     attempt_records: Sequence[AttemptRecord],
 ) -> tuple[TransientError, ...]:
-    """Return the errors of the failed attempts, in order.
-
-    The fold RetriesExhaustedError consumes;
-    on a failure this is every record's error, on a success all but the last.
-    """
+    """Return the errors of the failed attempts, in order."""
     return tuple(record.error for record in attempt_records if record.error is not None)
 
 
@@ -70,7 +66,8 @@ class GenerationError(_CallCarrier, Exception):
     `call` preserves attempt timing, billing, turns, and raw responses.
     `request` preserves the sent request when one exists and stays outside `error_text`.
     `usage` sums paid usage across recorded attempts.
-    `generate_one` raises subclasses; `generate_many` returns them at their input positions.
+    `generate_one` raises subclasses.
+    `generate_many` returns subclasses at their input positions.
     """
 
     call: CallRecord
@@ -86,11 +83,10 @@ class GenerationError(_CallCarrier, Exception):
 
     @property
     def stop_reason(self) -> StopReason | None:
-        """Return `None`; subclasses with completed turns override this value."""
+        """Return `None`."""
         return None
 
     def _summary(self) -> str:
-        """Return the exception message; each subclass overrides this with its own reason."""
         return "generation failed"
 
     @override
@@ -121,13 +117,7 @@ class GenerationError(_CallCarrier, Exception):
 
 
 class RetriesExhaustedError(GenerationError):
-    """Every attempt failed with a transient error, and the budget ran out.
-
-    generate_one raises it;
-    generate_many returns it at the index of the item that exhausted its retries,
-    so the same object is both the raised failure and the failure result of a batch.
-    errors_from_attempts is derived from attempt_records.
-    """
+    """Every attempt failed with a transient error, and the budget ran out."""
 
     @override
     def _summary(self) -> str:
@@ -164,8 +154,8 @@ class RetryUnavailableError(GenerationError):
 class RefusalError(GenerationError):
     """No structured output: the model refused, or a provider content filter blocked the turn.
 
-    Fires only on the structured path, where neither leaves an instance to return;
-    the text path surfaces a refusal as a Response with stop_reason "refusal".
+    This error occurs only on the structured path because no validated instance exists.
+    The text path returns a `Response` with `stop_reason="refusal"`.
     langchaint does not retry refusals.
     Retrying resamples and spends nonzero input tokens, including cache reads when warm.
     """
@@ -182,13 +172,12 @@ class RefusalError(GenerationError):
 
 
 class MaxCompletionTokensExceededError(GenerationError):
-    """The structured response reached max_completion_tokens before its JSON parsed.
+    """The structured response reached `max_completion_tokens` before its JSON parsed.
 
-    Fires only on the structured path; the text path surfaces the cap as a Response with stop_reason "max_tokens".
-    Not retried, unconditionally:
-    the attempt already generated the full token cap,
-    the most expensive possible response, and a resample under the same cap truncates again.
-    The fix is a larger max_completion_tokens via rebind.
+    This error occurs only on the structured path.
+    The text path returns a `Response` with `stop_reason="max_tokens"`.
+    langchaint does not retry this error.
+    Use `rebind` with a larger `max_completion_tokens`.
     """
 
     @property
@@ -208,7 +197,7 @@ class EmptyTurnError(GenerationError):
     @property
     @override
     def stop_reason(self) -> Literal["end_turn"]:
-        """The provider completed the turn; it was empty of anything the binding could return."""
+        """Return the stop reason for a turn with no value the binding could return."""
         return "end_turn"
 
     @override
@@ -235,7 +224,7 @@ class SchemaViolationError(GenerationError):
     @property
     @override
     def stop_reason(self) -> Literal["end_turn"]:
-        """The provider completed the turn; what it wrote is not the bound model."""
+        """Return the stop reason for text that does not validate as the bound model."""
         return "end_turn"
 
     @override
@@ -246,8 +235,8 @@ class SchemaViolationError(GenerationError):
 class ContextWindowExceededError(GenerationError):
     """The request overflowed the model's context window.
 
-    Not retried: the same request overflows identically on every attempt.
-    The fix is a shorter GenerationInput or a model with a larger window.
+    langchaint does not retry this error because the same request overflows on every attempt.
+    Use a shorter `GenerationInput` or a model with a larger context window.
     """
 
     @property
@@ -432,16 +421,19 @@ class TimedOutError(AbandonedCallError):
 
 
 class InvalidToolArgsError(Exception):
-    """A tool call's args_json failed validation against the tool's args_model.
+    """A tool call's `args_json` failed validation against the tool's `args_model`.
 
-    Raised only by PydanticTool._validated_args, never by langchaint from the function,
-    so catching it cannot swallow a function defect.
+    `PydanticTool._validated_args` is the only langchaint function that raises this error.
+    A tool function does not cause langchaint to raise this error.
     `ToolManager.dispatch` catches it and returns `DispatchInvalidToolArgs`.
-    That outcome holds `InvalidToolArgsDetail` and an error `ToolMessage`.
     """
 
     def __init__(self, validation_error: ValidationError) -> None:
-        """Hold the ValidationError by reference; __str__ derives the message from it."""
+        """Hold `validation_error` by reference.
+
+        Args:
+            validation_error: The tool argument validation failure.
+        """
         super().__init__()
         self.validation_error: ValidationError = validation_error
 
@@ -468,7 +460,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         *,
         completed_outcomes: "tuple[DispatchManyOutcome, ...]",
     ) -> Self:
-        """Pass message and exceptions to the base __new__, which takes nothing else; __init__ stores the keyword."""
+        """Pass `message` and `exceptions` to the base `__new__`."""
         group = super().__new__(cls, message, exceptions)
         group.completed_outcomes = completed_outcomes
         return group
@@ -489,14 +481,13 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         self.completed_outcomes = completed_outcomes
 
     @override
-    # pyrefly: ignore[bad-override]  # typeshed types derive as generic per call
-    # ([_ExceptionT](Sequence[_ExceptionT], /) -> ExceptionGroup[_ExceptionT]), which no concrete
-    # subclass override can satisfy; this is the override pattern PEP 654 itself documents.
+    # pyrefly: ignore[bad-override]  # Typeshed makes `derive` generic for each call.
+    # No concrete subclass override can satisfy the generic signature.
     def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
         """Rebuild a subgroup carrying the same completed_outcomes.
 
-        `except*` and `split` call this method.
-        The override preserves `completed_outcomes` on each subgroup.
+        Args:
+            excs: The subgroup exceptions.
         """
         return DispatchExceptionGroup(
             self.message, excs, completed_outcomes=self.completed_outcomes

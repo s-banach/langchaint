@@ -14,13 +14,15 @@ from langchaint.usage import Usage
 
 
 def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, model: str) -> None:
-    """Require the pricing key every response reporting no tier of its own prices at.
+    """Require the pricing key used for a response that reports no service tier.
 
-    An adapter constructor passes the key selected by tierless responses, such as `"default"` or `"ON_DEMAND"`.
-    A missing key then raises before the first request.
+    Args:
+        pricing: The rate table to check.
+        key: The key used for a response with no service tier.
+        model: The model id used in the error message.
 
     Raises:
-        ValueError: key is not in pricing.
+        ValueError: `key` is absent from `pricing`.
     """
     if key not in pricing:
         raise ValueError(
@@ -34,6 +36,10 @@ def category_cost(tokens: int, *, usd_per_million_tokens: float) -> float:
 
     `0 * NaN` is NaN.
     A zero-token category must therefore preserve a known zero cost.
+
+    Args:
+        tokens: The token count to price.
+        usd_per_million_tokens: The rate in USD per million tokens.
     """
     if not tokens:
         return 0.0
@@ -42,6 +48,10 @@ def category_cost(tokens: int, *, usd_per_million_tokens: float) -> float:
 
 def invocation_cost_in_usd(invocations: int, *, usd_per_invocation: float | None) -> float:
     """Price provider invocations, preserving zero when the rate is unavailable.
+
+    Args:
+        invocations: The invocation count to price.
+        usd_per_invocation: The rate in USD per invocation, or `None` when unavailable.
 
     Raises:
         ValueError: `invocations` is boolean or negative.
@@ -57,6 +67,10 @@ def invocation_cost_in_usd(invocations: int, *, usd_per_invocation: float | None
 
 def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> None:
     """Reject a configured charged rate that cannot produce a finite nonnegative cost.
+
+    Args:
+        rate_name: The rate name used in the error message.
+        rate: The configured rate.
 
     Raises:
         ValueError: `rate` is unavailable, boolean, negative, infinite, or NaN.

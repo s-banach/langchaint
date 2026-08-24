@@ -27,7 +27,7 @@ class ProviderFailure(Exception):  # noqa: N818 (named for what it is, a raised 
 
 
 def _retry_verdict(_failure: Exception) -> Verdict:
-    """Map every failure to RetryThisOne with no retry_after; the parse most tests bind."""
+    """Map every failure to RetryThisOne with no retry_after. The parse most tests bind."""
     return RetryThisOne(retry_after=None)
 
 
@@ -201,7 +201,7 @@ def test_constructor_rejects_an_unrepresentable_ceiling_ratio() -> None:
 
 
 def test_constructor_accepts_longest_wait_seconds_equal_to_the_floor() -> None:
-    """A one-value ceiling range is legal; the ceiling then never moves."""
+    """A one-value ceiling range is legal. The ceiling then never moves."""
     shared_backoff = _shared_backoff(
         minimum_wait_ceiling_seconds=2.0,
         longest_wait_seconds=2.0,

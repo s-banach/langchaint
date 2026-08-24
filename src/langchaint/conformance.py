@@ -68,11 +68,7 @@ _CONTENT_PART_CASES: tuple[ContentPart, ...] = (
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
-    """Whether two costs are the same number, counting NaN as the same as NaN.
-
-    NaN is a cost the rate table could not price, and it compares equal to nothing including itself,
-    so an invariant reading a cost off an unpriced category needs this rather than ==.
-    """
+    """Whether two costs are the same number, counting NaN as the same as NaN."""
     if math.isnan(actual) and math.isnan(expected):
         return True
     return math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-12)
@@ -89,8 +85,9 @@ def _row_number(row: Mapping[str, RowValue], column: str) -> float:
 
 
 class AdapterConformance(ABC):
-    """Subclass once per adapter; langchaint supplies every test method.
+    """Subclass once per adapter.
 
+    langchaint supplies every test method.
     Use a pytest-compatible name such as `TestAnthropicMessagesConformance`.
     Put the subclass in the adapter test module and implement the fixture methods below.
     Return a fresh value so tests cannot share mutations.
@@ -160,10 +157,11 @@ class AdapterConformance(ABC):
     def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
         """Read the assistant turn's parts from a request, in wire order.
 
-        The one fixture that is not an input: what an adapter puts on the wire has no neutral shape,
-        so the author supplies the reader and langchaint supplies the comparison.
         The request contains one `UserMessage` before the tested assistant turn.
         Skip the wire content produced by that `UserMessage`.
+
+        Args:
+            request: The adapter-specific request to inspect.
         """
         ...
 

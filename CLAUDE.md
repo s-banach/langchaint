@@ -9,8 +9,8 @@ Keep CLAUDE.md to cross-module principles and architecture required to edit lang
 Put symbol behavior in the implementing code's docstring.
 Never cite internal documents, design deliberation, dead alternatives, or prior code.
 State current behavior and its reason without requiring historical context.
-Document every exception a function raises or propagates and its condition.
-Use `Raises:` for direct raises and prose for propagated raises.
+Document each exception relevant to the public interface and its condition in `Raises:`, regardless of where it originates.
+Omit incidental exceptions and source details that do not affect caller handling.
 Verify an SDK fact from the installed SDK before writing dependent code.
 Put a verified SDK fact only in a docstring where the caller acts on the outcome.
 Include the SDK version when an SDK fact can drift.

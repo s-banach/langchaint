@@ -17,10 +17,11 @@ from langchaint.pricing import Billing
 from langchaint.usage import Usage
 
 type GenerateResult[OutputT] = Response[OutputT] | ToolCallTurn[OutputT]
-"""One successful generate result; a match on kind selects the variant without importing the classes.
+"""One successful generate result.
 
+A match on `kind` selects the variant without importing the classes.
 Only a structured tool-bound binding returns both variants.
-Every other binding returns Response alone, and its generate and stream overloads say so.
+Every other binding returns `Response` alone.
 """
 
 type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
@@ -31,7 +32,7 @@ type RowValue = str | int | float | bool | None
 
 
 class _SuccessCarrier(_CallCarrier):
-    """The invariants and folds the success variants share; the fields stay on each variant.
+    """Provide the invariants and folds shared by the success variants.
 
     `_SuccessCarrier` is not a dataclass, so each frozen subclass declares its fields.
     """
@@ -39,10 +40,12 @@ class _SuccessCarrier(_CallCarrier):
     assistant_message: AssistantMessage
 
     def __post_init__(self) -> None:
-        """Enforce that the records describe a success: retries before, one success last.
+        """Require retries before one final successful attempt record.
 
         Raises:
-            ValueError: attempt_records is empty, a non-final record has no error, or the final record carries an error.
+            ValueError: `attempt_records` is empty.
+            ValueError: A non-final record has no error.
+            ValueError: The final record carries an error.
         """
         if not self.attempt_records:
             raise ValueError("attempt_records must hold at least one record")
@@ -53,13 +56,14 @@ class _SuccessCarrier(_CallCarrier):
 
     @property
     def attempts(self) -> int:
-        """Requests langchaint observed going out: one attempt record each."""
+        """Count requests that langchaint observed going out."""
         return len(self.attempt_records)
 
     @property
     def usage(self) -> Usage:
-        """The paid total across every attempt of the call, carrying cost_in_usd, the number to bill on.
+        """Return the paid total across every attempt of the call.
 
+        `cost_in_usd` is the amount to bill.
         Every billed retry contributes usage.
         This total can exceed the final output's `usage_successful_attempt`.
         `GenerationError.usage` uses the same paid-total scope.
@@ -68,10 +72,10 @@ class _SuccessCarrier(_CallCarrier):
 
     @property
     def usage_successful_attempt(self) -> Usage:
-        """The single kept answer's own usage, the one matching output, assistant_message, and raw.usage.
+        """Return usage for the single kept answer.
 
-        The last attempt record is the success (__post_init__ enforces it), so this reads it directly.
-        It equals usage where no failed attempt billed, and is smaller where one did.
+        This usage matches `output`, `assistant_message`, and `raw.usage`.
+        This value equals `usage` when no failed attempt was billed.
         """
         return self.attempt_records[-1].usage
 
@@ -87,16 +91,18 @@ class Response[OutputT](_SuccessCarrier):
 
     `output` contains assistant text or a validated `response_format` instance.
     `assistant_message` preserves the complete ordered turn for reuse.
-    `raw` holds the mutable SDK response by reference; copy it before mutation.
-    `usage` covers every attempt; `usage_successful_attempt` covers the final attempt.
+    `raw` holds the mutable SDK response by reference.
+    Copy `raw` before mutation.
+    `usage` covers every attempt.
+    `usage_successful_attempt` covers the final attempt.
     """
 
     output: OutputT
-    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    # pyrefly: ignore[bad-override]  # _CallCarrier.call is writable. This frozen field is read-only.
     call: CallRecord
     raw: BaseModel
     stop_reason: StopReason
-    # pyrefly: ignore[bad-override]  # read-only here, read-write on _SuccessCarrier; same split as call
+    # pyrefly: ignore[bad-override]  # _SuccessCarrier.assistant_message is writable. This frozen field is read-only.
     assistant_message: AssistantMessage
     kind: Literal["response"] = "response"
 
@@ -110,19 +116,20 @@ class ToolCallTurn[OutputT](_SuccessCarrier):
     """
 
     output: OutputT | None
-    # pyrefly: ignore[bad-override]  # read-only here, read-write on _CallCarrier; see its docstring
+    # pyrefly: ignore[bad-override]  # _CallCarrier.call is writable. This frozen field is read-only.
     call: CallRecord
     raw: BaseModel
     stop_reason: StopReason
-    # pyrefly: ignore[bad-override]  # read-only here, read-write on _SuccessCarrier; same split as call
+    # pyrefly: ignore[bad-override]  # _SuccessCarrier.assistant_message is writable. This frozen field is read-only.
     assistant_message: AssistantMessage
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     def __post_init__(self) -> None:
-        """Enforce the shared success invariants, then this variant's own: the turn holds a tool call.
+        """Enforce the shared success invariants. Require the turn to hold a tool call.
 
         Raises:
-            ValueError: A check in `_SuccessCarrier.__post_init__` failed, or the turn has no tool call.
+            ValueError: A check in `_SuccessCarrier.__post_init__` failed.
+            ValueError: The turn has no tool call.
         """
         super().__post_init__()
         if not self.assistant_message.tool_calls:
@@ -178,21 +185,13 @@ def _abandoned_call_error[ErrorT: AbandonedCallError](
 
 
 class Tables(NamedTuple):
-    """The two tables to_tables builds, joined on call_id.
-
-    `NamedTuple` supports positional unpacking and named access.
-    The field names distinguish the two identically typed lists.
-    """
+    """The two tables that `to_tables` builds, joined on `call_id`."""
 
     calls: list[dict[str, RowValue]]
     attempts: list[dict[str, RowValue]]
 
 
 def _output_cell(output: object) -> str | None:
-    """Flatten one output to its cell: a pydantic instance as its JSON, anything else as its str.
-
-    `None` stays `None` so the output column contains no false text.
-    """
     if output is None:
         return None
     if isinstance(output, BaseModel):
@@ -201,7 +200,6 @@ def _output_cell(output: object) -> str | None:
 
 
 def _request_cell(result: CallResult[object]) -> str | None:
-    """Render what a failed call sent, None on a success and None where no request was built."""
     if not isinstance(result, GenerationError) or result.request is None:
         return None
     return result.request.as_json()
@@ -348,6 +346,9 @@ def to_tables[OutputT](results: CallResult[OutputT] | Iterable[CallResult[Output
     `kept` marks the final attempt of a successful call.
     An interrupted in-flight request gets an extra attempts row.
     A single result is accepted in place of an iterable.
+
+    Args:
+        results: One result or the results to flatten.
     """
     call_results = list(results) if isinstance(results, Iterable) else [results]
     calls: list[dict[str, RowValue]] = []

@@ -288,7 +288,7 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
 
 
 def test_gemini_shares_backoff_and_bind_owns_max_attempts() -> None:
-    """`Gemini` shares `SharedBackoff`; `LLM.bind()` sets `max_attempts`."""
+    """`Gemini` shares `SharedBackoff`. `LLM.bind()` sets `max_attempts`."""
     gemini = Gemini(
         client=genai.Client(api_key="offline", vertexai=False),
         max_concurrent_requests=16,
@@ -364,7 +364,7 @@ def test_deepseek_without_a_client_requires_the_deepseek_key(
 
 
 def test_deepseek_shares_backoff_and_bind_owns_max_attempts() -> None:
-    """`DeepSeek` shares `SharedBackoff`; `LLM.bind()` sets `max_attempts`."""
+    """`DeepSeek` shares `SharedBackoff`. `LLM.bind()` sets `max_attempts`."""
     deepseek = DeepSeek(
         client=_deepseek_client(),
         max_concurrent_requests=16,
@@ -616,7 +616,7 @@ def test_backend_classes_expose_no_lifecycle_methods(backend_class: type[object]
 
 
 def test_reasoning_summary_lands_on_the_adapter() -> None:
-    """A caller-supplied reasoning_summary reaches the adapter; the default is None."""
+    """A caller-supplied reasoning_summary reaches the adapter. The default is None."""
     openai = OpenAI(client=AsyncOpenAI(api_key="offline"))
     llm = openai.model("gpt-5.6-terra", regional_processing=False, reasoning_summary="detailed")
     adapter = llm.adapter
@@ -628,7 +628,7 @@ def test_reasoning_summary_lands_on_the_adapter() -> None:
 
 
 def test_cache_ttl_lands_on_the_adapter() -> None:
-    """A caller-supplied cache_ttl reaches the adapter; the default is "5m"."""
+    """A caller-supplied cache_ttl reaches the adapter. The default is "5m"."""
     anthropic = Anthropic(client=AsyncAnthropic(api_key="offline"))
     llm = anthropic.model("claude-sonnet-5", cache_ttl="1h")
     adapter = llm.adapter
@@ -724,11 +724,7 @@ def test_deepseek_model_rejects_a_bedrock_client() -> None:
 def test_the_adapter_raises_on_anthropic_over_a_bedrock_client(
     client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
 ) -> None:
-    """Both Bedrock client classes contradict provider_name="anthropic".
-
-    `Anthropic.model()` annotations already stop this path.
-    This test covers direct adapter construction.
-    """
+    """Reject both Bedrock client classes with provider_name="anthropic"."""
     with pytest.raises(ValueError, match="contradicts the client"):
         _ = AnthropicMessagesAdapter(
             client=client,

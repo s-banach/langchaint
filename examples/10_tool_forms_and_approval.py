@@ -97,7 +97,7 @@ async def dispatch_with_approval(
     """Dispatch approved calls and record settled outcomes.
 
     Raises:
-        DispatchExceptionGroup: At least one tool function raised.
+        DispatchExceptionGroup: At least one tool function raises.
     """
     tool_manager = ToolManager([transfer_funds, search_docs_tool])
     try:

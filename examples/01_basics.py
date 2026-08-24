@@ -20,7 +20,7 @@ async def basics() -> None:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: A `generate_one` call failed.
+        GenerationError: Generation fails.
     """
     openai = OpenAI()
     llm = openai.model("gpt-5.6-terra")

@@ -68,6 +68,10 @@ class CheckedCopyModel(BaseModel):
 
         Field values retain pydantic's unvalidated `model_copy` behavior.
 
+        Args:
+            update: Field values to replace, or `None` to retain every field.
+            deep: Whether pydantic deep-copies field values.
+
         Raises:
             TypeError: An update key does not name a field.
         """

@@ -19,7 +19,7 @@ def _usage(
     input_tokens_cache_write_cost_in_usd: float = 0.0,
     input_tokens_cache_none_cost_in_usd: float = 0.0,
 ) -> Usage:
-    """One response's input side; output cancels out of the cache-savings counterfactual."""
+    """One response's input side. Output cancels out of the cache-savings counterfactual."""
     return Usage(
         input_tokens_cache_read=input_tokens_cache_read,
         input_tokens_cache_write=input_tokens_cache_write,

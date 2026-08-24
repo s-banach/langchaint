@@ -201,7 +201,7 @@ class _FakeStream(AdapterStream):
     """Provide fixed stream items and an assembled response."""
 
     def __init__(self) -> None:
-        """Start unclosed; close records that it ran."""
+        """Start unclosed. `close` records that it ran."""
         self.closed = False
         self.raw = _FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
@@ -384,7 +384,7 @@ class _ProtocolErrorStream(_FakeStream):
         """Raise StreamProtocolError before yielding anything.
 
         Yields:
-            Nothing; the raise precedes the first yield.
+            Nothing. The raise precedes the first yield.
 
         Raises:
             StreamProtocolError: always, before the first yield.
@@ -401,7 +401,7 @@ class _UnnamedItemErrorStream(_FakeStream):
         """Raise a plain exception before yielding anything.
 
         Yields:
-            Nothing; the raise precedes the first yield.
+            Nothing. The raise precedes the first yield.
 
         Raises:
             ValueError: always, before the first yield.
@@ -486,7 +486,7 @@ class _HangingStream(_FakeStream):
         """Suspend on an event that never fires, before yielding anything.
 
         Yields:
-            Nothing; the wait never returns.
+            Nothing. The wait never returns.
         """
         await asyncio.Event().wait()
         yield "unreachable"
@@ -690,10 +690,10 @@ class _FakeBoundAdapter(BoundAdapter[str]):
 
 
 class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
-    """A structured bound adapter for response_format rebind tests; it never generates.
+    """A structured bound adapter for response_format rebind tests. It never generates.
 
-    Those tests check binding identity and the switched content type, not structured output,
-    so open_stream stays unreachable.
+    The rebind tests check binding identity and the switched content type.
+    open_stream stays unreachable.
     """
 
     @override
@@ -759,8 +759,8 @@ class _FakeAdapter(Adapter):
         automatic_cache_breakpoints_default: bool = False,
     ) -> None:
         """Store how each freshly bound adapter behaves and the classify verdict."""
-        # This adapter reaches no SDK, so it passes client=None, which matches no entry in the
-        # base's empty provider_name_by_client_class, leaving the stated "fake" to stand.
+        # This adapter reaches no SDK, so it passes client=None.
+        # The empty provider_name_by_client_class preserves the stated "fake" provider_name.
         super().__init__(
             client=None,
             model="fake-model",
@@ -1033,7 +1033,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
 def test_attempt_record_bracket_excludes_the_backoff_sleep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The failed record's own span stays small; the backoff shows up as the gap between records.
+    """The failed record's own span stays small. The backoff shows up as the gap between records.
 
     The random draw is pinned so each drawn wait is its ceiling, making the backoff gap deterministic.
     """
@@ -1604,7 +1604,7 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
 def test_rebind_builds_a_new_bound_adapter_whether_or_not_the_binding_changed(
     new_system_prompt: str | Unchanged, expected_system_prompt: str, *, binding_is_equal: bool
 ) -> None:
-    """A rebind always binds again; the Binding is what tracks whether a field actually changed."""
+    """A rebind always binds again. The Binding is what tracks whether a field actually changed."""
     adapter = _FakeAdapter()
     bound_llm = LLM(adapter).bind(system_prompt="s")
     rebound = bound_llm.rebind(system_prompt=new_system_prompt)
@@ -1703,7 +1703,7 @@ def test_rebind_response_format_selects_and_rebuilds_the_adapter_route() -> None
 
 
 def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
-    """Tool sequences construct a manager, including empty sequences; supplied managers pass through."""
+    """Tool sequences construct a manager, including empty sequences. Supplied managers pass through."""
     tool = _capture_tool()
     bound = LLM(_FakeAdapter()).bind(tools=[tool])
     assert isinstance(bound.tool_manager, ToolManager)
@@ -1729,7 +1729,7 @@ def test_duplicate_tool_names_fail_before_bind_and_rebind_reach_the_adapter() ->
 
 
 def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
-    """`BoundLLM.rebind(tools=[...])` replaces `ToolManager`; `tools=None` removes it."""
+    """`BoundLLM.rebind(tools=[...])` replaces `ToolManager`. `tools=None` removes it."""
     original = _capture_tool("original")
     replacement = _capture_tool("replacement")
     bound = LLM(_FakeAdapter()).bind(tools=[original])
@@ -1844,7 +1844,7 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Report a fixed identity; no split test reads it."""
+        """Report a fixed identity. No split test reads it."""
         return ResponseIdentity(
             model_served="fake-model-served",
             response_id="structured-response",
@@ -1863,7 +1863,7 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Hand back the stored fake stream; interpret ignores the raw it assembles."""
+        """Hand back the stored fake stream. interpret ignores the raw it assembles."""
         return self.stream
 
 
@@ -1960,7 +1960,7 @@ def test_bind_resolves_automatic_cache_breakpoints_default(*, default_value: boo
 def test_rebind_omission_preserves_and_none_resets_automatic_cache_breakpoints(
     *, default_value: bool
 ) -> None:
-    """Omission preserves the value; None resolves `automatic_cache_breakpoints_default`."""
+    """Omission preserves the value. None resolves `automatic_cache_breakpoints_default`."""
     override_value = not default_value
     bound = LLM(_FakeAdapter(automatic_cache_breakpoints_default=default_value)).bind(
         automatic_cache_breakpoints=override_value
@@ -1973,7 +1973,7 @@ def test_rebind_omission_preserves_and_none_resets_automatic_cache_breakpoints(
 
 
 def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
-    """LLM.bind puts extra_body on the Binding unchanged; rebind keeps, replaces, or clears it."""
+    """LLM.bind puts extra_body on the Binding unchanged. rebind keeps, replaces, or clears it."""
     adapter = _FakeAdapter()
     extra_body = {"safety_identifier": "user-7"}
     bound_llm = LLM(adapter).bind(extra_body=extra_body)
@@ -2022,9 +2022,9 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
     async def scenario() -> None:
         """Serialize a three-item batch at one concurrent request, failing the first under a one-attempt budget.
 
-        One permit runs the items in submission order,
-        so the single scripted failure lands on the first item and the other two succeed,
-        which is exactly the mixed-outcome alignment under test.
+        One permit runs the items in submission order.
+        The scripted failure lands on the first item.
+        The remaining items succeed at their input indexes.
         """
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
@@ -2072,7 +2072,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
 
 
 def test_invalid_request_fails_only_its_item() -> None:
-    """A rejected item comes back as its InvalidRequestError at its index; the sibling still succeeds.
+    """A rejected item comes back as its InvalidRequestError at its index. The sibling still succeeds.
 
     Nothing a single item does reaches a sibling, so the batch returns one outcome per generation_input.
     """
@@ -2098,7 +2098,7 @@ def test_invalid_request_fails_only_its_item() -> None:
 
 
 def test_generate_many_warm_cache_runs_the_first_item_alone_then_the_rest_together() -> None:
-    """warm_cache completes generation_inputs[0] before any sibling starts; the rest run at normal concurrency."""
+    """warm_cache completes generation_inputs[0] before any sibling starts. The rest run at normal concurrency."""
 
     async def scenario() -> None:
         """Run controlled three-item batches and compare peak_in_flight.
@@ -2144,7 +2144,7 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
     """A first item ending in a GenerationError stays at its index and the siblings still run."""
 
     async def scenario() -> None:
-        """Fail the deterministic first attempt under a one-attempt budget; the other two succeed."""
+        """Fail the deterministic first attempt under a one-attempt budget. The other two succeed."""
         adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=1,
@@ -2238,8 +2238,8 @@ def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provide
 ):
     """generate_one raises EscapedExceptionError whose error is the ParserContractError.
 
-    A parse contract violation must not take the transport-failure path,
-    where classify would report it as an UnknownExceptionError, a provider outcome.
+    A parse contract violation must bypass the transport-failure path.
+    classify would report that path as an UnknownExceptionError.
     """
 
     async def scenario() -> None:
@@ -2254,7 +2254,7 @@ def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provide
 
 
 def test_a_parse_contract_violation_on_a_stream_open_reaches_the_caller() -> None:
-    """Entering stream_one raises the ParserContractError itself; no stream-path frame wraps it."""
+    """Entering stream_one raises the ParserContractError itself. No stream-path frame wraps it."""
 
     async def scenario() -> None:
         """Fail the one open with a TransientError whose parse raises."""
@@ -2296,8 +2296,8 @@ def test_bare_str_is_shorthand_for_one_user_message() -> None:
     async def scenario() -> None:
         """Drive each generate method with a bare str against the echo fake.
 
-        The echo fake returns the first turn's content only when that turn is a UserMessage with str content,
-        so an echoed value proves the coercion built a real UserMessage.
+        The echo fake returns content from a UserMessage with str content.
+        An echoed value proves that coercion built a UserMessage.
         """
         adapter = _FakeAdapter(echo=True)
         bound_llm = LLM(adapter).bind()
@@ -2356,7 +2356,7 @@ def test_stream_cancelled_during_the_open_returns_the_permit() -> None:
         bound_llm = LLM(_FakeAdapter(hang_from_open=1), shared_backoff=shared_backoff).bind()
 
         async def enter_and_leave() -> None:
-            """Enter the handle whose open never returns; the wait_for below cancels this."""
+            """Enter the handle whose open never returns. The wait_for below cancels this."""
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
 
@@ -2378,7 +2378,7 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def drain() -> None:
-            """Enter and iterate into the hang; the wait_for below cancels this."""
+            """Enter and iterate into the hang. The wait_for below cancels this."""
             async with handle:
                 async for _item in handle:
                     pass
@@ -2406,7 +2406,7 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def drain() -> None:
-            """Enter and iterate into the hang; the wait_for below cancels this."""
+            """Enter and iterate into the hang. The wait_for below cancels this."""
             async with handle:
                 async for _item in handle:
                     pass
@@ -2433,8 +2433,8 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
         bound_llm = LLM(
             _FakeAdapter(stream=_FailingCloseStream()), shared_backoff=shared_backoff
         ).bind()
-        # Leaving after one item keeps the admission held into __aexit__, so the close is the only
-        # path that can return it; exhausting the iterator exits it before the close is reached.
+        # Leaving after one item keeps admission held until __aexit__.
+        # close must return that admission.
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 break
@@ -2458,7 +2458,7 @@ def test_a_stream_cancelled_during_the_open_sets_its_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def enter_and_leave() -> None:
-            """Enter the handle whose open never returns; the wait_for below cancels this."""
+            """Enter the handle whose open never returns. The wait_for below cancels this."""
             async with handle:
                 pass
 
@@ -2505,7 +2505,7 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Let final() report Refusal, then sleep; the wait_for below cancels this inside the block."""
+            """Let final() report Refusal, then sleep. The wait_for below cancels this inside the block."""
             async with handle:
                 with pytest.raises(RefusalError):
                     await handle.final()
@@ -2521,8 +2521,8 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
 def test_a_stream_cancelled_after_a_protocol_error_sets_its_abandoned() -> None:
     """A StreamProtocolError accounts for nothing, so a cancellation after one still records the call.
 
-    The record is the only account of the stream that was opened: the error carries no model,
-    no attempt records, and no usage.
+    The record accounts for the opened stream.
+    StreamProtocolError carries no model, attempt records, or usage.
     """
 
     async def scenario() -> None:
@@ -2533,7 +2533,7 @@ def test_a_stream_cancelled_after_a_protocol_error_sets_its_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Let final() hit the protocol error, then sleep; the wait_for below cancels this."""
+            """Let final() hit the protocol error, then sleep. The wait_for below cancels this."""
             async with handle:
                 with pytest.raises(StreamProtocolError):
                     await handle.final()
@@ -2658,7 +2658,7 @@ def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Hang inside the block; the wait_for cancels this."""
+            """Hang inside the block. The wait_for cancels this."""
             async with handle:
                 await asyncio.sleep(60)
 
@@ -2712,7 +2712,7 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Let the iteration fail after one item, then sleep; the wait_for cancels this."""
+            """Let the iteration fail after one item, then sleep. The wait_for cancels this."""
             async with handle:
                 with pytest.raises(RetryUnavailableError) as raised:
                     async for _item in handle:
@@ -2744,7 +2744,7 @@ def test_a_stream_cancelled_after_a_drain_failure_sets_no_abandoned() -> None:
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Let final() hit the unplaceable failure, then sleep; the wait_for cancels this."""
+            """Let final() hit the unplaceable failure, then sleep. The wait_for cancels this."""
             async with handle:
                 with pytest.raises(UnknownExceptionError):
                     await handle.final()
@@ -2988,7 +2988,7 @@ def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
         async def consume() -> None:
-            """Let final() report the failure, then sleep; the wait_for below cancels in the block."""
+            """Let final() report the failure, then sleep. The wait_for below cancels in the block."""
             async with handle:
                 with pytest.raises(RetryUnavailableError):
                     await handle.final()
@@ -3409,8 +3409,7 @@ def test_stream_final_replays_every_error_that_concluded_the_call(
 def test_stream_final_replays_a_raise_from_the_adapter_stream() -> None:
     """A raise from the adapter stream's final() concludes the call, so a second call replays it.
 
-    Without the store, a second call asks the adapter stream again,
-    re-running an assembly whose one request is already paid for.
+    The stored exception prevents a second adapter-stream assembly.
     """
 
     async def scenario() -> None:
@@ -3479,7 +3478,7 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
         assert response.output == "ok"
         assert response.attempts == 2
         assert elapsed_seconds >= retry_after_seconds
-        # Only a PauseAll record moves _pause_until off the sentinel; a RetryThisOne must not.
+        # Only a PauseAll record moves _pause_until off the sentinel. A RetryThisOne must not.
         assert shared_backoff._pause_until == _NEVER
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -3594,7 +3593,7 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
 
 
 def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
-    """A list of system parts freezes to a tuple on the binding; a str passes through."""
+    """A list of system parts freezes to a tuple on the binding. A str passes through."""
     parts = [TextPart(text="stable", cache_breakpoint=True), TextPart(text="context")]
     bound_llm = LLM(_FakeAdapter()).bind(system_prompt=parts)
     assert bound_llm.binding.system_prompt == tuple(parts)
@@ -3602,7 +3601,7 @@ def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
 
 
 def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
-    """Empty parts are a configuration error; None is the way to bind no system prompt."""
+    """Empty parts are a configuration error. None is the way to bind no system prompt."""
     with pytest.raises(ValueError, match="empty"):
         _ = LLM(_FakeAdapter()).bind(system_prompt=[])
 
@@ -3845,8 +3844,8 @@ def test_a_stream_deadline_expiring_mid_items_raises() -> None:
         async def drain() -> None:
             """Consume the stream, recording each item as it arrives.
 
-            The deadline expires mid-iteration, so each item has to reach seen on its own;
-            a comprehension would build a list the expiry discards.
+            The deadline expires mid-iteration, so each item has to reach seen on its own.
+            A comprehension would build a list the expiry discards.
             """
             async with handle:
                 async for item in handle:
@@ -3907,7 +3906,7 @@ def test_a_failed_stream_entry_leaves_no_armed_deadline() -> None:
         with pytest.raises(InvalidRequestError):
             async with handle:
                 pass
-        # Outlast the deadline the failed entry opened; a leaked timer cancels this sleep.
+        # Outlast the deadline the failed entry opened. A leaked timer cancels this sleep.
         await asyncio.sleep(0.1)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))

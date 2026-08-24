@@ -38,9 +38,9 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
     The last turn forces final_response.
 
     Raises:
-        OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.
-        RuntimeError: no turn produced a valid capture.
-        GenerationError: a generate_one call failed.
+        openai.OpenAIError: OpenAI credentials are unavailable.
+        GenerationError: Generation fails.
+        RuntimeError: No turn produced a valid capture.
     """
     openai = OpenAI()
     final_response_tool = CaptureTool(

@@ -1,9 +1,4 @@
-"""Anthropic Messages adapter helpers over constructed SDK objects.
-
-These pin behavior the type checker cannot: usage partition arithmetic, the 5-minute/1-hour cache-write cost split,
-stop-reason mapping, tool_use extraction, cache-breakpoint placement, tool-choice translation,
-and the request fields the binding precomputes.
-"""
+"""Test Anthropic Messages adapters with constructed SDK objects."""
 
 import asyncio
 import base64
@@ -172,7 +167,7 @@ def _tool_schemas() -> tuple[ToolSchema, ...]:
     """Return the schemas of one tool named get_weather."""
 
     async def function(args: _EchoArgs) -> str:
-        """Return the city unchanged; never called in these tests."""
+        """Return the city unchanged. Never called in these tests."""
         return args.city
 
     tool = PydanticTool(
@@ -579,7 +574,7 @@ def test_empty_thinking_text_normalizes_to_none() -> None:
 
 
 def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
-    """A redacted_thinking block round-trips as its own dump; the type key routes it on the wire.
+    """A redacted_thinking block round-trips as its own dump. The type key routes it on the wire.
 
     ReasoningPart.text is None because the block has no readable text.
     """
@@ -1145,7 +1140,7 @@ def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> 
 def test_request_maps_temperature_and_omits_it_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bound temperature enters extra_body; None leaves the omit sentinel."""
+    """A bound temperature enters extra_body. None leaves the omit sentinel."""
     adapter = _adapter()
     unset = adapter._precompute_fields(
         _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
@@ -1165,7 +1160,7 @@ def test_request_maps_temperature_and_omits_it_when_unset(
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
-    """A stated service_tier lands on the request; None leaves the omit sentinel.
+    """A stated service_tier lands on the request. None leaves the omit sentinel.
 
     The sentinel omits an unstated tier from the request.
     """
@@ -1328,7 +1323,7 @@ def _collected_items(
     replay_events: Sequence[ParsedMessageStreamEvent],
     message_snapshot: ParsedMessage[None] | None = None,
 ) -> list[StreamItem]:
-    """Drain the translated items into a list; None means a bare end_turn snapshot."""
+    """Drain the translated items into a list. None means a bare end_turn snapshot."""
     snapshot = message_snapshot if message_snapshot is not None else _message_snapshot("end_turn")
 
     async def scenario() -> list[StreamItem]:
@@ -1514,7 +1509,7 @@ class _StructuredReport(BaseModel):
 
 
 def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
-    """Build a structured-bound adapter over a keyless client; no request is sent."""
+    """Build a structured-bound adapter over a keyless client. No request is sent."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
@@ -1581,7 +1576,7 @@ def _structured_message(
     text: str | None,
     stop_reason: at.StopReason | None = "end_turn",
 ) -> at.Message:
-    """Build a message whose first text block carries the given text; None gives no text block."""
+    """Build a message whose first text block carries the given text. None gives no text block."""
     return at.Message(
         id="msg_1",
         content=[at.TextBlock(type="text", text=text)] if text is not None else [],
@@ -1614,8 +1609,7 @@ def test_the_structured_request_sends_the_output_config(
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
     """An extra_body key that open_stream passes as its own keyword raises at bind time.
 
-    The SDK merges extra_body over the named request parameters with extra_body winning,
-    so admitting the key would silently override the binding.
+    Rejecting the duplicate key prevents extra_body from overriding the binding.
     """
     with pytest.raises(ValueError, match="max_tokens"):
         _ = _adapter()._precompute_fields(
@@ -1631,11 +1625,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
 def test_the_request_sends_extra_body_by_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_stream passes the binding's extra_body to the SDK's extra_body parameter.
-
-    A request that dropped it would silently go out without the caller's wire fields,
-    which no offline round-trip test can catch.
-    """
+    """open_stream passes the binding's extra_body to the SDK's extra_body parameter."""
     adapter = _adapter()
     extra_body = {"top_k": 5}
     text_bound = _BoundAnthropicText(
@@ -1801,7 +1791,7 @@ def test_parse_anthropic_reads_retry_after_from_the_headers_without_letting_it_p
 
 
 def test_parse_anthropic_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:
-    """An unlisted status lands one tagged count; a listed status leaves the counter alone."""
+    """An unlisted status lands one tagged count. A listed status leaves the counter alone."""
     before = dict(PARSE_FALLTHROUGH_COUNTS)
     assert parse_anthropic(_status_error(anthropic.RateLimitError, 429)) == PauseAll(
         retry_after=None
@@ -2006,7 +1996,7 @@ def test_bedrock_preferred_model_names_equal_anthropic_bedrock_keys() -> None:
 
 
 def test_wire_messages_marks_a_marked_user_part() -> None:
-    """A user part with cache_breakpoint carries the marker on its own block; unmarked siblings carry none."""
+    """A user part with cache_breakpoint carries the marker on its own block. Unmarked siblings carry none."""
     messages = [
         UserMessage(
             content=(
@@ -2127,7 +2117,7 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
 def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cache_breakpoints() -> (
     None
 ):
-    """Five marks spend the 4-marker request budget on the latest four; the oldest goes unwritten."""
+    """Five marks spend the 4-marker request budget on the latest four. The oldest goes unwritten."""
     messages = [
         UserMessage(
             content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(5))
@@ -2163,7 +2153,7 @@ def test_wire_messages_reserves_markers_for_automatic_cache_breakpoints() -> Non
 
 
 def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
-    """A parts system_prompt is one block per part; marked parts and the automatic last block carry markers."""
+    """A parts system_prompt is one block per part. Marked parts and the automatic last block carry markers."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             system_prompt=(

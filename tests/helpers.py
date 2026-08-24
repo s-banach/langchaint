@@ -1,6 +1,6 @@
 """Helpers shared by more than one test module.
 
-A helper lands here when a second module needs it; one used by a single module stays in that module.
+A helper lands here when a second module needs it. One used by a single module stays in that module.
 """
 
 import importlib
@@ -73,7 +73,7 @@ def attempt_record(
     response_id: str | None = None,
     request_id: str | None = None,
 ) -> AttemptRecord:
-    """Build one record on the fixed origin; reported_billing False is an attempt the provider never billed."""
+    """Build one record on the fixed origin. reported_billing False is an attempt the provider never billed."""
     started_at_monotonic_seconds = CALL_STARTED_AT + started_after_seconds
     return AttemptRecord(
         started_at_monotonic_seconds=started_at_monotonic_seconds,
@@ -104,7 +104,7 @@ def attempt_record(
 def call_record(
     attempt_records: tuple[AttemptRecord, ...], *, elapsed_seconds: float
 ) -> CallRecord:
-    """Build a CallRecord over the records under test; the identity fields are fixed filler."""
+    """Build a CallRecord over the records under test. The identity fields are fixed filler."""
     return CallRecord(
         model="fake-model",
         provider_name="fake",

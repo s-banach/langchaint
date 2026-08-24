@@ -75,7 +75,7 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     ),
-    # the pricing page lists no cache-read price for gemini-3.5-flash-lite, so it is NaN
+    # The pricing page lists no cache-read price for gemini-3.5-flash-lite, so the rate is NaN.
     "gemini-3.5-flash-lite": GeminiPricingTable(
         rates=GeminiRates(
             input_cache_none_usd_per_million_tokens=0.30,
@@ -110,7 +110,7 @@ GEMINI_PRICING: dict[GeminiModelName, GeminiPricingTable] = {
         google_maps_usd_per_query=0.014,
     ),
 }
-"""Public on-demand prices per gemini model; the default pricing lookup."""
+"""Public on-demand prices that `Gemini.model` uses by default."""
 
 _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 """`GEMINI_PRICING` with `str` keys for runtime model lookup."""

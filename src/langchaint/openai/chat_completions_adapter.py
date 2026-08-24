@@ -173,15 +173,18 @@ _AUDIO_FORMAT_BY_MEDIA_TYPE: Mapping[str, Literal["wav", "mp3"]] = {
 class _ChatCompletionsPrecomputedFields:
     """The typed request fields one binding precomputes.
 
-    Fields set to the SDK's omit sentinel leave the provider default in place;
-    passing them as explicit keywords (never **kwargs) keeps the SDK's overload resolution intact.
+    Fields set to the SDK's omit sentinel leave the provider default in place.
+    Passing them as explicit keywords keeps the SDK's overload resolution intact.
     tool_choice and parallel_tool_calls are omitted without tools because the API rejects them otherwise.
     """
 
     model: str
     messages_prefix: list[ChatCompletionMessageParam]
-    """Messages sent ahead of the Sequence[Message] every request:
-    a bound system_prompt becomes one system-role message here, and an absent one leaves it empty."""
+    """Messages sent before each request's `Sequence[Message]`.
+
+    A bound `system_prompt` becomes one system-role message.
+    An absent `system_prompt` leaves this list empty.
+    """
 
     max_completion_tokens: int | Omit
     temperature: float | Omit
@@ -212,8 +215,6 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "stream",
     "stream_options",
 })
-"""The wire keys an extra_body must not hold: every keyword open_stream passes,
-including stream and stream_options, which the stream path depends on."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -238,7 +239,6 @@ class _NotSendableError(Exception):
     """
 
     def __init__(self, reason: str) -> None:
-        """Store what cannot be sent; it becomes the InvalidRequest reason."""
         super().__init__(reason)
         self.reason = reason
 
@@ -454,8 +454,8 @@ def _wire_tool_choice(tool_choice: ToolChoice) -> _WireToolChoice:
 def _wire_tools(tool_schemas: tuple[ToolSchema, ...]) -> list[ChatCompletionFunctionToolParam]:
     """Convert tool schemas to function tools.
 
-    strict is left unset, leaving the provider's non-strict default in place,
-    matching the schemas the ToolManager generates, which are not written to strict mode's restrictions.
+    strict is left unset, which uses the provider's non-strict default.
+    The non-strict default accepts the schemas that `ToolManager` generates.
     """
     return [
         {
@@ -563,7 +563,9 @@ def _finished_turn_or_unfinished(completion: ChatCompletion) -> _FinishedTurn | 
 
 
 def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
-    """Map the finish reason to the neutral vocabulary; the module docstring states each row.
+    """Map the finish reason to the neutral vocabulary.
+
+    The module docstring states each mapping.
 
     The refusal field is tested ahead of the rows, as the module docstring states.
     """
@@ -684,8 +686,8 @@ class OpenAIChatCompletionsAdapter(Adapter):
 
     All three expose `chat.completions.create` and `with_options`.
     `AsyncOpenAI.base_url` also supports OpenAI-compatible providers.
-    The client parameter is annotated AsyncOpenAI because the other two subclass it;
-    provider_name_by_client_class is what tells them apart.
+    The client parameter is annotated AsyncOpenAI because the other two classes subclass it (openai 3.3.1).
+    provider_name_by_client_class distinguishes the client classes.
     """
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
@@ -810,9 +812,10 @@ class OpenAIChatCompletionsAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O.
+        """Bind for plain-text output without I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
         """
         return _BoundChatCompletionsText(
             adapter=self, precomputed_fields=self._precompute_fields(binding)
@@ -822,9 +825,12 @@ class OpenAIChatCompletionsAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O.
+        """Bind for structured output validated into response_format without I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
+            pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         return _BoundChatCompletionsStructured(
             adapter=self,
@@ -888,7 +894,7 @@ class _ChatCompletionsStream(AdapterStream):
         Raises:
             openai.APIStatusError: An SSE payload contains an error object.
                 The error carries status 200, request headers, and the SDK error body.
-                `APIError` subclasses propagate unchanged.
+            openai.APIError: The SDK raises a specific `APIError` subclass.
         """
         chunk_iterator = aiter(self._sdk_stream)
         while True:
@@ -915,7 +921,7 @@ class _ChatCompletionsStream(AdapterStream):
         The stream tracks the last non-`None` usage because SDK accumulation may reset it.
 
         Yields:
-            Stream items; SDK events langchaint does not model are dropped.
+            Stream items. SDK events that langchaint does not model are dropped.
 
         Raises:
             openai.APIStatusError: _chunks rewrapped the SDK's mid-stream error raise.
@@ -1011,7 +1017,6 @@ class _ChatCompletionsStream(AdapterStream):
 
     @override
     async def close(self) -> None:
-        """Close the underlying connection; idempotent."""
         await self._sdk_stream.close()
 
 
@@ -1042,8 +1047,6 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
         """Combine the response's id and model with request_id.
 
-        id and model are both required str fields on the SDK's ChatCompletion (openai 2.51.0),
-        so neither is absent and neither needs converting.
         request_id comes from AdapterStream.request_id().
 
         Raises:
@@ -1070,11 +1073,11 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open one streaming create call and return the live stream; connection failures raise here.
+        """Open one streaming create call and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+            Exception: The SDK fails to open the stream.
         """
         params = narrowed_request(request, _ChatCompletionsRequestParams)
         precomputed = params.precomputed

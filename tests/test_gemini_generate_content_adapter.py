@@ -166,7 +166,7 @@ def _usage_metadata(
     thoughts_token_count: int | None = 10,
     traffic_type: types.TrafficType | None = None,
 ) -> types.GenerateContentResponseUsageMetadata:
-    """Build usage metadata; the defaults exercise every counter the partition reads."""
+    """Build usage metadata. The defaults exercise every counter the partition reads."""
     return types.GenerateContentResponseUsageMetadata(
         prompt_token_count=prompt_token_count,
         cached_content_token_count=cached_content_token_count,
@@ -185,7 +185,7 @@ def _response(
     grounding_metadata: types.GroundingMetadata | None = None,
     block_reason: types.BlockedReason | None = None,
 ) -> types.GenerateContentResponse:
-    """Build a response; parts None with finish_reason None builds one without candidates."""
+    """Build a response. parts None with finish_reason None builds one without candidates."""
     candidates: list[types.Candidate] | None = None
     if parts is not None or finish_reason is not None:
         candidates = [
@@ -298,7 +298,7 @@ def test_every_request_suppresses_sdk_retries() -> None:
 
 
 def test_system_prompt_forms() -> None:
-    """A str binds as-is; a parts tuple binds as one Content of text parts; None binds none."""
+    """A str binds as-is. A parts tuple binds as one Content of text parts. None binds none."""
     assert _bound_config(_binding()).system_instruction is None
     assert _bound_config(_binding(system_prompt="be terse")).system_instruction == "be terse"
     parts_config = _bound_config(_binding(system_prompt=(TextPart(text="a"), TextPart(text="b"))))
@@ -397,7 +397,7 @@ def test_tool_schemas_become_function_declarations() -> None:
 def test_tool_choice_mapping(
     tool_choice: ToolChoice, expected: types.FunctionCallingConfig
 ) -> None:
-    """Neutral "required" is mode ANY; a specific choice is ANY narrowed to the one name."""
+    """Neutral "required" is mode ANY. A specific choice is ANY narrowed to the one name."""
     config = _bound_config(_binding(tool_schemas=(_echo_schema(),), tool_choice=tool_choice))
     assert config.tool_config == types.ToolConfig(function_calling_config=expected)
 
@@ -607,7 +607,7 @@ def test_provider_executed_tools_reject_allowed_tools_choice() -> None:
 
 
 def test_inference_params_map_to_generation_fields() -> None:
-    """The InferenceParams fields land as temperature and max_output_tokens; None omits either."""
+    """The InferenceParams fields land as temperature and max_output_tokens. None omits either."""
     config = _bound_config(
         _binding(inference_params=InferenceParams(max_completion_tokens=64, temperature=0.5))
     )
@@ -633,7 +633,7 @@ def test_reasoning_effort_maps_to_thinking_level() -> None:
 
 
 def test_reasoning_effort_outside_the_sdk_enum_passes_through() -> None:
-    """Effort "xhigh" reaches the wire as "XHIGH": the SDK constructs the synthetic member with a warning."""
+    """Effort "xhigh" reaches the wire as "XHIGH"."""
     with pytest.warns(UserWarning, match="XHIGH"):
         config = _bound_config(
             _binding(inference_params=InferenceParams(reasoning_effort="xhigh"))
@@ -645,7 +645,7 @@ def test_reasoning_effort_outside_the_sdk_enum_passes_through() -> None:
 
 
 def test_structured_bind_sends_the_response_schema() -> None:
-    """The structured binding sends response_json_schema with the JSON mime type; text sends neither."""
+    """The structured binding sends response_json_schema with the JSON mime type. text sends neither."""
     structured = _adapter().bind_structured(_binding(), _Answer)
     request = structured.build_request([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
@@ -657,7 +657,7 @@ def test_structured_bind_sends_the_response_schema() -> None:
 
 
 def test_service_tier_lands_on_the_config() -> None:
-    """The adapter's service_tier is sent on every request; None sends nothing."""
+    """The adapter's service_tier is sent on every request. None sends nothing."""
     adapter = GeminiGenerateContentAdapter(
         client=genai.Client(api_key="offline", vertexai=False),
         model="gemini-3.5-flash",
@@ -1002,7 +1002,7 @@ def test_thought_text_is_reasoning_part_text_and_not_output() -> None:
 
 
 def test_as_json_holds_the_request_without_transport_config() -> None:
-    """The archive cell carries model, contents, config, and extra_body; http_options stays out."""
+    """The archive cell carries model, contents, config, and extra_body. http_options stays out."""
     request = _built_request(
         [UserMessage(content="hi")],
         _binding(
@@ -1022,7 +1022,7 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 
 
 def test_text_binding_reads_stop_reasons() -> None:
-    """STOP is end_turn or tool_use by the turn's calls; MAX_TOKENS and SAFETY name themselves."""
+    """STOP is end_turn or tool_use by the turn's calls. MAX_TOKENS and SAFETY name themselves."""
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
     assert isinstance(ended, AdapterResult)
@@ -1058,7 +1058,7 @@ def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
 
 
 def test_no_candidates_reads_the_block_reason() -> None:
-    """A blocked prompt is a Refusal with an empty turn; no candidates and no block is unfinished."""
+    """A blocked prompt is a Refusal with an empty turn. No candidates and no block is unfinished."""
     bound = _adapter().bind_text(_binding())
     blocked = bound.interpret(
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
@@ -1375,7 +1375,7 @@ def test_truncated_gemini_search_billing_produces_nan() -> None:
 
 
 def test_the_long_prompt_threshold_reprices_every_category() -> None:
-    """Above the threshold the long rates price; at or below it the base rates do."""
+    """Above the threshold the long rates price. At or below it the base rates do."""
     short = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
         usage_raw=None,
@@ -1432,7 +1432,7 @@ def test_the_long_prompt_fields_are_required_together() -> None:
 
 
 def test_traffic_type_selects_the_table() -> None:
-    """A reported tier prices at its own table; UNSPECIFIED and None price at ON_DEMAND."""
+    """A reported tier prices at its own table. UNSPECIFIED and None price at ON_DEMAND."""
     flex_rates = GeminiRates(
         input_cache_none_usd_per_million_tokens=0.5,
         cache_read_usd_per_million_tokens=0.05,
@@ -1466,7 +1466,7 @@ def test_traffic_type_selects_the_table() -> None:
 
 
 def test_items_translate_parts_with_reasoning_separators() -> None:
-    """Thought text streams as deltas, a separator at each part boundary; answer text streams bare."""
+    """Thought text streams as deltas. Each part boundary emits a separator. Answer text streams bare."""
     items = _drained(
         _gemini_stream([
             _response([types.Part(thought=True, text="think a")], finish_reason=None),
@@ -1564,7 +1564,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
 
 
 def test_billing_reported_follows_usage_arrival() -> None:
-    """None before usage_metadata arrives; the last-seen usage's Billing after."""
+    """Return Billing only after usage_metadata arrives."""
 
     async def scenario() -> tuple[Billing | None, Billing | None]:
         stream = _gemini_stream([
@@ -1710,7 +1710,7 @@ def test_open_stream_performs_the_connection_io(monkeypatch: pytest.MonkeyPatch)
 
         async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
             raise httpx.ConnectError("no route")
-            yield _response([])  # unreachable; the yield makes chunks an async generator
+            yield _response([])  # Unreachable. The yield makes chunks an async generator.
 
         return chunks()
 
@@ -1774,7 +1774,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a turn whose usage fills every counter Gemini bills; writes are always zero."""
+        """Return a turn whose usage fills every counter Gemini bills. Writes are always zero."""
         return _reasoning_turn_response(_usage_metadata())
 
     @override
@@ -1798,7 +1798,7 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return the reasoning turn; its docstring names the signature bytes as the payload."""
+        """Return the reasoning turn with signature bytes as the payload."""
         return _reasoning_turn_response(_usage_metadata())
 
     @override

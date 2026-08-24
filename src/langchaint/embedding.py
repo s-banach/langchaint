@@ -4,7 +4,8 @@
 `EmbeddingModel` retries each embedding batch independently.
 All attempts use its `SharedBackoff`.
 The adapter owns provider batching and response decoding.
-The returned matrix preserves input order and owns writable `float32` storage.
+The returned matrix preserves input order.
+The returned matrix owns writable `float32` storage.
 Every returned row has L2 norm one.
 """
 
@@ -141,6 +142,11 @@ class EmbeddingModel:
     ) -> None:
         """Store one adapter, `SharedBackoff`, and `max_attempts`.
 
+        Args:
+            adapter: The provider-specific embedding operations.
+            shared_backoff: The request admission state.
+            max_attempts: The maximum provider requests for one batch.
+
         Raises:
             ValueError: `max_attempts` is boolean or below one.
         """
@@ -196,6 +202,10 @@ class EmbeddingModel:
         """Return one normalized row per input in input order.
 
         Empty input returns a writable `(0, dimension)` matrix without provider work.
+
+        Args:
+            inputs: The input texts.
+            task: The embedding purpose to send to the provider.
 
         Raises:
             TypeError: `inputs` is a bare `str`.

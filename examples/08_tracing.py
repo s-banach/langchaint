@@ -26,8 +26,8 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: A `generate_one` call failed.
-        DispatchExceptionGroup: A tool function raised.
+        GenerationError: Generation fails.
+        DispatchExceptionGroup: A tool function raises.
         RuntimeError: The model exceeded `max_turns`.
     """
     tracer_provider = TracerProvider()

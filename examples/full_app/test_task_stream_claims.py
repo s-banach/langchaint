@@ -143,9 +143,9 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
     assert "root/research_energy" in progress_paths
 
 
-def test_reading_the_emitter_outside_a_run_raises_naming_what_to_install() -> None:
-    """current_gui_emitter outside a run raises a descriptive LookupError."""
-    with pytest.raises(LookupError, match="inside a run's loop"):
+def test_reading_without_an_active_emitter_raises() -> None:
+    """`current_gui_emitter` raises when no `GuiEmitter` is active."""
+    with pytest.raises(LookupError, match="No GuiEmitter is active"):
         _ = current_gui_emitter()
 
 

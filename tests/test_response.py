@@ -187,7 +187,7 @@ def test_success_variant_is_tool_call_turn_only_where_a_split_bindings_turn_call
     output: str | None,
     expected_class: type[Response[object] | ToolCallTurn[object]],
 ) -> None:
-    """The split needs both: the binding splits and the turn called tools; either alone is a Response.
+    """The split needs both: the binding splits and the turn called tools. Either alone is a Response.
 
     output rides whichever variant results, so a turn carrying both an instance and tool calls keeps it.
     """
@@ -245,7 +245,7 @@ def test_to_tables_failure_writes_complete_call_and_attempt_rows() -> None:
 def test_usage_is_the_paid_total_across_attempts(
     failed_attempt_usage: Usage, expected_cost_in_usd: float, expected_output_tokens: int
 ) -> None:
-    """Usage folds every attempt's billing; usage_successful_attempt stays the kept answer's own.
+    """Usage folds every attempt's billing. usage_successful_attempt stays the kept answer's own.
 
     A retried billed response separates total Usage from successful-attempt Usage.
     """

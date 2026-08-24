@@ -17,8 +17,8 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     """Run a batch and send failed items to a second provider.
 
     Raises:
-        OpenAIError: OpenAI credentials are unavailable during `OpenAI` construction.
-        GenerationError: a fallback call failed too.
+        openai.OpenAIError: OpenAI credentials are unavailable.
+        GenerationError: Fallback generation fails.
     """
     anthropic = Anthropic(
         max_concurrent_requests=16,

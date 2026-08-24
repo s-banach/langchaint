@@ -247,8 +247,6 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
     "input",
     "stream",
 })
-"""The wire keys an extra_body must not hold: every keyword open_stream passes,
-plus stream, which the SDK's stream method sets and its event parsing depends on."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -337,11 +335,12 @@ def _function_call_output(
 
     The output field accepts str or ResponseFunctionCallOutputItemListParam.
     ResponseFunctionCallOutputItemListParam accepts text and image content.
-    A bare string passes through; a sequence of parts becomes that structured content list.
-    The image content param is a distinct wire type from the user-message input_image param,
-    so this builds its own dict rather than reusing _user_item's list, sharing only the data: URI encoding.
-    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part,
-    under the same latest-N server rule _user_item's docstring states.
+    A bare string passes through.
+    A sequence of parts becomes that structured content list.
+    The image content param differs from the user-message input_image param.
+    This function builds the output image dict and shares only the data URI encoding.
+    A part with cache_breakpoint carries prompt_cache_breakpoint on its wire part.
+    The latest-N server rule in `_user_item` also applies here.
 
     Raises:
         _NotSendableError: content holds AudioPart.
@@ -426,7 +425,9 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
 
 
 def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
-    """Convert messages to input items; the system prompt is separate.
+    """Convert messages to input items.
+
+    The system prompt is separate.
 
     Raises:
         _NotSendableError: A ContentPart has no Responses wire form.
@@ -468,8 +469,9 @@ def _wire_tools(
 ) -> list[ToolParam]:
     """Convert every bound tool to one ordered wire list.
 
-    strict is a required key of FunctionToolParam; None leaves the provider's non-strict default in place,
-    matching the schemas the ToolManager generates, which are not written to strict mode's restrictions.
+    strict is a required key of FunctionToolParam.
+    None leaves the provider's non-strict default in place.
+    The ToolManager schemas do not satisfy strict mode's restrictions.
     """
     tools: list[ToolParam] = [
         {
@@ -550,7 +552,9 @@ def _first_output_text(response: OpenAIResponse) -> str | None:
 
 
 def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
-    """Derive the stop reason; the API reports no finish reason field.
+    """Derive the stop reason.
+
+    The API reports no finish reason field.
 
     An incomplete `content_filter` result maps to `refusal` without retry.
     """
@@ -699,10 +703,10 @@ def _adapter_result[OutputT](
 class OpenAIResponsesAdapter(Adapter):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
-    All three expose the same responses.stream method and with_options,
-    so the adapter logic is identical across the first-party API, Bedrock, and Azure.
-    The client parameter is annotated AsyncOpenAI because the other two subclass it;
-    provider_name_by_client_class is what tells them apart.
+    All three expose the same responses.stream method and with_options.
+    The adapter logic is shared across the first-party API, Bedrock, and Azure.
+    The client parameter is annotated AsyncOpenAI because the other two classes subclass it (openai 3.3.1).
+    provider_name_by_client_class distinguishes the client classes.
     """
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
@@ -845,9 +849,10 @@ class OpenAIResponsesAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind for plain-text output; pure conversion, no I/O.
+        """Bind for plain-text output without I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
         """
         return _BoundOpenAIText(adapter=self, precomputed_fields=self._precompute_fields(binding))
 
@@ -855,9 +860,12 @@ class OpenAIResponsesAdapter(Adapter):
     def bind_structured[ModelT: BaseModel](
         self, binding: Binding, response_format: type[ModelT]
     ) -> BoundAdapter[ModelT | None]:
-        """Bind for structured output validated into response_format; pure conversion, no I/O.
+        """Bind for structured output validated into response_format without I/O.
 
-        Propagates _precompute_fields' ValueError.
+        Raises:
+            ValueError: `binding` contains unsupported values.
+            pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
+            pydantic.PydanticUserError: `response_format` is not fully defined.
         """
         return _BoundOpenAIStructured(
             adapter=self,
@@ -912,8 +920,7 @@ class _OpenAIStream(AdapterStream):
         The SDK emits the added event before its deltas.
 
         Reasoning arrives on two independent event types and both are forwarded:
-        summary deltas, which the constructor's reasoning_summary asks for,
-        and reasoning text deltas from a model that fills the reasoning item's content.
+        summary deltas requested by reasoning_summary, and text deltas from a reasoning item's content.
         A stream yielding no ReasoningDelta is a model returning no readable reasoning.
 
         Done events delimit reasoning parts without text.
@@ -1052,7 +1059,6 @@ class _OpenAIStream(AdapterStream):
 
     @override
     async def close(self) -> None:
-        """Close the underlying connection; idempotent."""
         await self._sdk_stream.close()
 
 
@@ -1107,11 +1113,11 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Open one responses.stream and return the live stream; connection failures raise here.
+        """Open one responses.stream and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
-            Exception: the SDK's own exceptions propagate unchanged; Adapter.classify sorts them.
+            Exception: The SDK fails to open the stream.
         """
         params = narrowed_request(request, _OpenAIRequestParams)
         precomputed = params.precomputed

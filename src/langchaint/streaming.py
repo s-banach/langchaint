@@ -82,7 +82,9 @@ async def _close_stream_quietly(
     The request has already ended.
     A close exception would displace its result or error, so this function logs the exception.
     `failure_log_message` names the preserved result.
-    A `BaseException` propagates.
+
+    Raises:
+        BaseException: `adapter_stream.close()` raises a value outside `Exception`.
     """
     try:
         await adapter_stream.close()
@@ -93,7 +95,7 @@ async def _close_stream_quietly(
 class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     """An async context manager and iterator for one streamed call.
 
-    Entry opens the request; `final` drains items and returns `Response` or `ToolTurnT`.
+    Entry opens the request. `final` drains items. `final` returns `Response` or `ToolTurnT`.
     `max_attempts` applies only before the stream opens.
     An open-stream transient failure raises `RetryUnavailableError`.
     """
@@ -109,11 +111,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         timeout_seconds: float | None,
         splits_tool_call_turns: bool,
     ) -> None:
-        """Store the request; called by BoundLLM.stream_one only.
-
-        `splits_tool_call_turns` identifies a structured tool-bound binding.
-        `_success_variant` uses it to return `ToolCallTurn`.
-        """
+        """Store the request."""
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages
@@ -123,25 +121,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._timeout_seconds = timeout_seconds
         self._splits_tool_call_turns = splits_tool_call_turns
         self._deadline: asyncio.Timeout | None = None
-        """The deadline scope while the call is in progress, None once it is not.
-
-        Opened in __aenter__, so it bounds everything the block does until the call concludes: the
-        open, the item pulls, and the caller's own work between them. Closed the moment a conclusion
-        is stored, so a caller's own work after the call has a result is not charged to the call and
-        cannot raise a second account of it; __aexit__ closes whatever is left. It is built at entry
-        rather than here because asyncio.timeout fixes its instant when it is built, and stream_one
-        hands the handle over before the block starts.
-        """
         self.abandoned: AbandonedCallError | None = None
-        """The account of this call where a cancellation cut it off, None otherwise.
+        """The interrupted call account, or `None`.
 
-        Set on the way out of the block, before the BaseException that cut the call off resumes
-        propagating, so the caller reads it in its own except or finally. stream_one hands the
-        handle back before anything suspends, so the caller holds it whenever a request is in
-        flight, which is why this needs no log.
-        None where a success variant or a GenerationError already gave the caller an account of the call,
-        and None where timeout_seconds expired, which raises TimedOutError instead: both account for
-        the same call, so reporting both would double what the archive says the call spent.
+        Cancellation sets this value before the caller receives `asyncio.CancelledError`.
+        A success or `GenerationError` leaves this value as `None`.
+        An expired `timeout_seconds` raises `TimedOutError` and leaves this value as `None`.
         """
         self._adapter_stream: AdapterStream | None = None
         self._items: AsyncIterator[StreamItem] | None = None
@@ -149,15 +134,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._admission: Admission | None = None
         self._ended_at_monotonic_seconds: float | None = None
         self._conclusion: GenerateResult[OutputT] | Exception | None = None
-        """What concluded the call: the success variant, or the error that ended it; None until it ends."""
         self._conclusion_carried_the_call = False
-        """Whether that conclusion gave the caller an account of this call; see _set_abandoned."""
         self._state: _State = "unopened"
         self._request: RequestParams | None = None
-        """What every attempt of this call sends: None before entry and where none was built.
-
-        The value a GenerationError this handle raises carries, so its None cases are that field's.
-        """
 
     def _request_for_this_call(self) -> RequestParams:
         """Return the request every attempt of this call sends, building it on the first ask.
@@ -195,13 +174,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         try:
             await self._open_stream_with_retries()
         except BaseException as exc:
-            # __aexit__ does not run when __aenter__ raises, so finish, exit the admission, and
-            # close the deadline here. Leaving the deadline open would leave a live timer that
-            # cancels this task at an arbitrary later point, outside any block this handle governs.
-            # _open_stream_with_retries exits the admission on every path that raises, so this exit
-            # covers only the case where it never entered one; it is idempotent either way.
-            # The abandonment is recorded here because no other frame sees a cancellation that lands
-            # during the open.
+            # `__aexit__` does not run when `__aenter__` raises.
+            # Finish the call, exit admission, and close the deadline here.
+            # An open deadline would retain a timer that could cancel this task after this operation.
+            # Record abandonment here because no other frame sees cancellation during the open.
             self._state = "finished"
             await self._exit_admission(None)
             billing_in_flight = self._billing_reported()
@@ -236,8 +212,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         try:
             await self._close_adapter_stream()
         finally:
-            # The set runs after the close whatever the close does, so the account is there
-            # even when a BaseException comes out of it, which _close_adapter_stream does not catch.
             if isinstance(exc, asyncio.CancelledError) and not timed_out:
                 self._set_abandoned(billing_in_flight)
         if timed_out:
@@ -327,8 +301,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         Return an existing `TransientError` unchanged.
         This preserves its `retry_after_seconds`, `is_rate_limit`, and message.
-        The wrapper takes the verdict's capped retry_after and calls a PauseAll a rate limit;
-        a failure outside failure_types has no verdict and carries neither.
         """
         if isinstance(exc, TransientError):
             return exc
@@ -402,8 +374,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             else self._adapter.classify(exc)
         )
         if classification == "invalid_request":
-            # Adapter.classify returns invalid_request only for a request the provider rejected,
-            # so it went out and gets a record.
+            # `Adapter.classify` returns `invalid_request` only for a provider rejection.
+            # The provider received this request, so the ledger records the attempt.
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
             return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
         if classification == "declared_final":
@@ -413,10 +385,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 error=exc, call=self._ledger.freeze(), request=self._request
             )
         if self._adapter_stream is not None:
-            # The stream was open, so langchaint can say the attempt reached the provider and
-            # what that provider reported for it; the class records nothing where it cannot.
-            # The open test is the stream itself, not its billing, which is None on an open
-            # stream that has reported nothing yet.
+            # An open stream proves that the attempt reached the provider.
+            # Test the stream itself because an open stream can have `billing=None`.
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
         return UnknownExceptionError(error=exc, call=self._ledger.freeze(), request=self._request)
 
@@ -432,7 +402,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return invalid_request
 
     def __aiter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
-        """Return self; the handle is its own iterator."""
+        """Return `self` because the handle is its own iterator."""
         return self
 
     async def _open_stream_with_retries(self) -> None:
@@ -463,9 +433,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 await self._backoff_or_exhaust(exc, verdict)
                 continue
             except BaseException:
-                # CancelledError is a BaseException the clause above does not catch. Exiting here
-                # returns the permit at the same point on every failing path, so no caller's
-                # unwind is what the shared budget depends on.
+                # `CancelledError` is a `BaseException` that the clause above does not catch.
+                # Exit here to return the permit at the same point on each failing path.
                 _ = await self._exit_admission(None)
                 raise
             self._adapter_stream = opened
@@ -495,8 +464,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         except BaseException as exc:
             self._state = "finished"
             if self._conclusion is None and isinstance(exc, Exception):
-                # A cancellation is not a conclusion: it destroys the frames that could have
-                # observed the call, which is what abandoned records instead.
+                # Cancellation destroys the frames that could observe the call.
+                # `abandoned` records that condition.
                 self._conclusion = exc
                 self._conclusion_carried_the_call = isinstance(exc, GenerationError)
                 await self._close_deadline(exc)
@@ -583,8 +552,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             try:
                 raw = await adapter_stream.final()
-                # Staged before interpret reads the response, so what the attempt billed and what
-                # the response says about itself are on the ledger from the moment they are known.
                 self._ledger.stage_response(
                     raw=raw,
                     billing=self._bound_adapter.billing_from_raw(raw),
@@ -598,16 +565,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                 )
             except BaseException as exc:
-                # A cancellation is not a conclusion, the same rule __anext__ applies:
-                # it destroys the frames that could have observed the call rather than ending it.
-                # The interpretation is inside the try because _conclude records the attempt before
-                # it returns, so a raise past that record would let a second call record it again.
+                # Keep interpretation inside the `try` because `_conclude` records before returning.
+                # A raise after that record could let a second call record the attempt again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
                     await self._close_deadline(exc)
                 raise
-            # _conclude builds every result off the frozen CallRecord, so the caller has an
-            # account of the call whichever one it was.
             self._conclusion_carried_the_call = True
             await self._close_deadline(None)
         if isinstance(self._conclusion, (Response, ToolCallTurn)):
@@ -621,7 +584,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         raw: BaseModel,
         ended_at_monotonic_seconds: float,
     ) -> CallResult[OutputT]:
-        """Build what this outcome concludes the call with: the success variant, or the error to raise.
+        """Build the call result for this outcome.
 
         Returns the error rather than raising it, so no case can conclude the call without being stored.
         Every outcome records the staged response before building the result.
@@ -641,8 +604,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             retry_unavailable.__cause__ = failure
             return retry_unavailable
-        # error is None on every variant reaching here: the request succeeded, and what the adapter
-        # made of the response is the item's outcome, not this attempt's failure.
         self._ledger.record_ending_at(
             ended_at_monotonic_seconds,
             error=None,

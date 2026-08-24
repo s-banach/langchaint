@@ -107,7 +107,7 @@ def test_string_turn_coercion() -> None:
 
 
 def test_tool_message_content_accepts_parts_and_coerces_a_list_to_a_tuple() -> None:
-    """A ToolMessage can carry text and image parts; a list of parts coerces to a tuple like UserMessage."""
+    """A ToolMessage can carry text and image parts. A list of parts coerces to a tuple like UserMessage."""
     parts = [TextPart(text="saw"), ImagePart(data=b"png", media_type="image/png")]
     message = ToolMessage(tool_call_id="c1", content=parts)
     assert message.content == tuple(parts)
@@ -195,7 +195,7 @@ def test_audio_part_json_is_pinned_exactly() -> None:
 
 
 def test_cache_breakpoint_round_trips_and_defaults_false() -> None:
-    """A marked part survives the JSON round trip; an unmarked part re-validates with the default."""
+    """A marked part survives the JSON round trip. An unmarked part re-validates with the default."""
     messages: tuple[Message, ...] = (
         UserMessage(
             content=(
@@ -230,7 +230,7 @@ def test_assistant_turn_rejects_a_marked_text_part() -> None:
 
 
 def test_assistant_turn_still_accepts_unmarked_text() -> None:
-    """The validator rejects only marked parts; the plain turn is untouched."""
+    """The validator rejects only marked parts. The plain turn is untouched."""
     assert AssistantMessage(turn="hey").text == "hey"
 
 
@@ -309,7 +309,7 @@ def test_a_pinned_serialization_still_loads() -> None:
 
 
 def test_messages_to_json_is_compact_and_indent_passes_through() -> None:
-    """The default output holds no newlines; indent produces the same messages pretty-printed."""
+    """The default output holds no newlines. indent produces the same messages pretty-printed."""
     messages = _one_of_each_message()
     compact = messages_to_json(messages)
     pretty = messages_to_json(messages, indent=2)
@@ -339,8 +339,9 @@ def test_messages_to_json_raises_on_a_raw_value_json_cannot_represent() -> None:
 def test_model_copy_rejects_a_derived_property_key() -> None:
     """model_copy(update={"tool_calls": ...}) raises instead of silently dropping the key.
 
-    pydantic's unvalidated copy would leave turn unchanged while the property shadows the dead key,
-    so an app filtering an assistant turn's tool calls this way would re-send the unfiltered turn.
+    pydantic's unvalidated copy would leave turn unchanged.
+    The property would shadow the unused key.
+    An app could then resend the unfiltered assistant turn.
     """
     message = AssistantMessage(turn=(ToolCall(id="c1", name="probe", args_json="{}"),))
     with pytest.raises(TypeError, match="derived property of AssistantMessage"):

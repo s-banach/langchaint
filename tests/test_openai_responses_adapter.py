@@ -223,7 +223,7 @@ def _response(
     error: ResponseError | None = None,
     model: str = "m",
 ) -> OpenAIResponse:
-    """Build a response whose id is fixed at "r1"; every field a test varies is a parameter."""
+    """Build a response whose id is fixed at "r1". Every field a test varies is a parameter."""
     return OpenAIResponse.model_validate({
         "id": "r1",
         "created_at": 0,
@@ -620,12 +620,7 @@ def test_wire_input_converts_each_message_kind() -> None:
 
 
 def test_wire_input_converts_tool_result_parts_to_structured_output_content() -> None:
-    """A ToolMessage carrying parts becomes a function_call_output whose output is the content list.
-
-    The installed openai SDK's output field accepts input_text and input_image content params,
-    so an image reaches the provider as a data: URI.
-    A dropped part or mis-encoded image changes this list.
-    """
+    """A ToolMessage carrying parts becomes a function_call_output with structured content."""
     wire = _wire_input([
         ToolMessage(
             tool_call_id="call1",
@@ -692,7 +687,7 @@ def test_build_request_reports_audio_as_invalid_request(message: Message) -> Non
 
 
 def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
-    """The neutral strings pass through unchanged; SpecificToolChoice becomes the function form."""
+    """The neutral strings pass through unchanged. SpecificToolChoice becomes the function form."""
     assert _wire_tool_choice("auto") == "auto"
     assert _wire_tool_choice("required") == "required"
     assert _wire_tool_choice("none") == "none"
@@ -833,7 +828,7 @@ def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
 
 
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
-    """A stated service_tier lands on the request; None leaves the omit sentinel.
+    """A stated service_tier lands on the request. None leaves the omit sentinel.
 
     The sentinel omits an unstated tier from the request.
     """
@@ -852,7 +847,7 @@ def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
 
 
 def test_request_maps_temperature_and_omits_it_when_unset() -> None:
-    """A bound temperature lands on the request; None leaves the omit sentinel."""
+    """A bound temperature lands on the request. None leaves the omit sentinel."""
     unset = _adapter()._precompute_fields(_binding(automatic_cache_breakpoints=True))
     assert isinstance(unset.temperature, openai.Omit)
     binding = Binding(
@@ -1059,8 +1054,7 @@ def test_allowed_tools_choice_keeps_complete_responses_tool_definitions() -> Non
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
     """An extra_body key that open_stream passes as its own keyword raises at bind time.
 
-    The SDK merges extra_body over the named request parameters with extra_body winning,
-    so admitting the key would silently override the binding.
+    Rejecting the duplicate key prevents extra_body from overriding the binding.
     """
     with pytest.raises(ValueError, match="temperature"):
         _ = _adapter()._precompute_fields(
@@ -1071,11 +1065,7 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
 def test_the_request_sends_extra_body_by_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """open_stream passes the binding's extra_body to the SDK's extra_body parameter.
-
-    A request that dropped it would silently go out without the caller's wire fields,
-    which no offline round-trip test can catch.
-    """
+    """open_stream passes the binding's extra_body to the SDK's extra_body parameter."""
     adapter = _adapter()
     extra_body = {"safety_identifier": "user-7"}
     text_bound = _BoundOpenAIText(
@@ -1269,7 +1259,7 @@ def _streamed_reasoning(translated: Sequence[StreamItem]) -> str:
 
 
 def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
-    """Text deltas pass through in order as the SDK's own strings; nothing follows them."""
+    """Text deltas pass through in order as the SDK's own strings. Nothing follows them."""
     translated = _collected_items([
         _text_delta_event("he", 1),
         _text_delta_event("y", 2),
@@ -1279,7 +1269,7 @@ def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
 
 
 def test_stream_yields_both_reasoning_channels_as_reasoning_deltas() -> None:
-    """Summary deltas and reasoning-text deltas both become ReasoningDelta; answer text stays a bare string.
+    """Summary deltas and reasoning-text deltas both become ReasoningDelta. Answer text stays a bare string.
 
     Which channel a model fills is request-time behavior, so the adapter forwards whichever arrives.
     """
@@ -1471,11 +1461,7 @@ def test_stream_yields_argument_fragments_then_one_complete_tool_call() -> None:
 
 
 def test_stream_incomplete_terminal_still_assembles_final() -> None:
-    """An incomplete terminal yields no item, and final() must not raise.
-
-    The SDK's get_final_response() raises RuntimeError unless the terminal event is response.completed,
-    so final() assembles from the captured terminal response instead.
-    """
+    """final() returns the captured incomplete terminal response."""
 
     async def scenario() -> None:
         incomplete_response = _response(
@@ -1499,7 +1485,7 @@ def test_stream_incomplete_terminal_still_assembles_final() -> None:
 
 
 def test_final_after_completed_terminal_assembles_from_the_parsed_response() -> None:
-    """The completed terminal already carries a ParsedResponse; final() assembles from it."""
+    """The completed terminal already carries a ParsedResponse. final() assembles from it."""
 
     async def scenario() -> None:
         adapter_stream = _stream([
@@ -1647,7 +1633,7 @@ class _StructuredReport(BaseModel):
 
 
 def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
-    """Build a structured-bound adapter over a keyless client; no request is sent."""
+    """Build a structured-bound adapter over a keyless client. No request is sent."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(
         _binding(automatic_cache_breakpoints=False, system_prompt="sys")
@@ -1777,7 +1763,7 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
 
 
 def _text_bound() -> _BoundOpenAIText:
-    """Build a text-bound adapter over a keyless client; no request is sent."""
+    """Build a text-bound adapter over a keyless client. No request is sent."""
     adapter = _adapter()
     return _BoundOpenAIText(
         adapter=adapter,
@@ -1930,12 +1916,7 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
 def test_every_request_carries_the_reasoning_include(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both bindings send include=["reasoning.encrypted_content"] on the request.
-
-    The offline round-trip tests cannot catch a dropped include:
-    the SDK documents include as what populates encrypted_content,
-    so without this parameter every replayed reasoning item could be silently empty.
-    """
+    """Both bindings send include=["reasoning.encrypted_content"] on the request."""
     adapter = _adapter()
     precomputed_fields = adapter._precompute_fields(_binding(automatic_cache_breakpoints=True))
     text_bound = _BoundOpenAIText(adapter=adapter, precomputed_fields=precomputed_fields)
@@ -1991,11 +1972,7 @@ def _rate_limit_error(headers: dict[str, str]) -> openai.RateLimitError:
 
 
 def test_parse_openai_reads_retry_after_from_the_headers_without_letting_it_pick() -> None:
-    """A retry-after header fills the verdict's retry_after and never changes which verdict.
-
-    `httpx2.Headers` provides case-insensitive lookup.
-    The assertion covers mixed-case `Retry-After-MS`.
-    """
+    """Read mixed-case Retry-After-MS without changing the verdict."""
     assert parse_openai(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(retry_after=1.5)
     assert parse_openai(_rate_limit_error({})) == PauseAll(retry_after=None)
     bad_request = status_error(openai.BadRequestError, 400, {"retry-after": "7"})
@@ -2059,7 +2036,7 @@ def test_parse_openai_ignores_a_retry_directive_on_the_streams_200_status() -> N
 
 
 def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:
-    """An unlisted status lands one tagged count; a listed status leaves the counter alone."""
+    """An unlisted status lands one tagged count. A listed status leaves the counter alone."""
     before = dict(PARSE_FALLTHROUGH_COUNTS)
     assert parse_openai(status_error(openai.InternalServerError, 500)) == RetryThisOne(
         retry_after=None
@@ -2118,7 +2095,7 @@ def test_adapter_pins_sdk_retries_off() -> None:
 
 
 def test_wire_input_marks_marked_user_and_tool_parts() -> None:
-    """A marked part carries prompt_cache_breakpoint on its wire part; unmarked siblings carry none."""
+    """A marked part carries prompt_cache_breakpoint on its wire part. Unmarked siblings carry none."""
     wire = _wire_input([
         UserMessage(
             content=(
@@ -2185,7 +2162,7 @@ def test_wire_input_sends_every_mark_without_a_client_side_cap() -> None:
 
 
 def test_request_system_parts_become_a_developer_input_message() -> None:
-    """A parts system_prompt travels as a developer-role input message; instructions stays unset."""
+    """A parts system_prompt travels as a developer-role input message. instructions stays unset."""
     precomputed_fields = _adapter()._precompute_fields(
         _binding(
             automatic_cache_breakpoints=True,
@@ -2303,10 +2280,10 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_classifications(self) -> Mapping[Exception, ErrorClassification]:
-        """Return the table both openai adapters share; its builder's docstring states each row."""
+        """Return the shared OpenAI classification table."""
         return openai_sdk_errors_and_classifications()
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return the parse rows both openai adapters share; the builder's docstring names their sources."""
+        """Return the shared OpenAI verdict table."""
         return openai_sdk_errors_and_verdicts()

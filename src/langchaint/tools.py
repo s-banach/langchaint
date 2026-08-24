@@ -141,10 +141,10 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
         )
 
     def _validated_args(self, args_json: str) -> ArgsT:
-        """Validate args_json against args_model.
+        """Validate `args_json` against `args_model`.
 
         Raises:
-            InvalidToolArgsError: args_json failed validation; model data the model can correct.
+            InvalidToolArgsError: `args_json` fails validation.
         """
         try:
             return self.args_model.model_validate_json(args_json)
@@ -154,10 +154,12 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     async def validate_and_run(self, args_json: str) -> ToolOutput[AppDataT]:
         """Validate `args_json` with `args_model`, then run `function`.
 
-        Function exceptions propagate unchanged.
+        Args:
+            args_json: The model-generated argument JSON.
 
         Raises:
             InvalidToolArgsError: `args_json` fails validation.
+            BaseException: `function` raises it.
         """
         return await self.function(self._validated_args(args_json))
 
@@ -166,8 +168,13 @@ class PydanticTool[ArgsT: BaseModel, AppDataT = None]:
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
         """Return a handled call or its argument-validation failure.
 
-        Function exceptions propagate unchanged.
         The caller must match `call.name` before calling this method.
+
+        Args:
+            call: The tool call to dispatch.
+
+        Raises:
+            BaseException: `function` raises it.
         """
         try:
             args = self._validated_args(call.args_json)
@@ -180,14 +187,11 @@ def _is_matching_args_model[ArgsT: BaseModel, AppDataT](
     annotation: object,
     _function: Callable[[ArgsT], Awaitable[ToolOutput[AppDataT]]],
 ) -> TypeIs[type[ArgsT]]:
-    """Check whether annotation reifies function's statically inferred ArgsT."""
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
 @dataclass(frozen=True, kw_only=True)
 class _ToolDecorator:
-    """Build a PydanticTool from one function and explicit provider-facing metadata."""
-
     description: str
     name: str | None
 
@@ -253,10 +257,10 @@ class DispatchCaptured[CapturedT: BaseModel]:
 
 @dataclass(frozen=True, kw_only=True)
 class CaptureTool[CapturedT: BaseModel]:
-    """Validate model-generated arguments and return them without calling a function.
+    """Validate model-generated arguments. Return them without calling a function.
 
     `acknowledgement` becomes the model-facing tool result.
-    `capture` preserves `CapturedT`; `dispatch` returns the capture as `DispatchHandled.app_data`.
+    `capture` preserves `CapturedT`.
     """
 
     name: str
@@ -278,6 +282,9 @@ class CaptureTool[CapturedT: BaseModel]:
         """Validate `call.args_json` and return its capture or failure.
 
         The caller must match `call.name` before calling this method.
+
+        Args:
+            call: The tool call to validate.
         """
         try:
             captured = self.args_model.model_validate_json(call.args_json)
@@ -291,7 +298,11 @@ class CaptureTool[CapturedT: BaseModel]:
     async def dispatch(
         self, call: ToolCall
     ) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
-        """Return `capture` as `DispatchHandled.app_data` after validation."""
+        """Return `capture` as `DispatchHandled.app_data` after validation.
+
+        Args:
+            call: The tool call to dispatch.
+        """
         outcome = await self.capture(call)
         match outcome.kind:
             case "captured":
@@ -303,7 +314,6 @@ class CaptureTool[CapturedT: BaseModel]:
 
 
 _ARGS_OBJECT = TypeAdapter(dict[str, object])
-"""Parse `args_json` as a JSON object without coercing its values."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -311,8 +321,6 @@ class JSONSchemaTool[AppDataT = None]:
     """A function whose raw JSON schema validates its model-generated arguments.
 
     `args_schema` passes to the provider unchanged.
-    `dispatch` requires a JSON object and applies the schema selected by `$schema`.
-    A malformed schema or function exception propagates unchanged.
     """
 
     name: str
@@ -322,11 +330,10 @@ class JSONSchemaTool[AppDataT = None]:
 
     @cached_property
     def _validator(self) -> jsonschema.protocols.Validator:
-        """Build and cache the `args_schema` validator on first access."""
         return jsonschema.validators.validator_for(self.args_schema)(self.args_schema)
 
     def schema(self) -> ToolSchema:
-        """Convert to the provider-neutral schema, passing args_schema through unchanged."""
+        """Convert to the provider-neutral schema."""
         return ToolSchema(
             name=self.name, description=self.description, args_schema=self.args_schema
         )
@@ -337,13 +344,19 @@ class JSONSchemaTool[AppDataT = None]:
         """Validate `call.args_json`, then run `function`.
 
         Validation failures skip `function`.
-        Function and `jsonschema` exceptions propagate unchanged.
+
+        Args:
+            call: The tool call to dispatch.
+
+        Raises:
+            BaseException: `function` raises it.
         """
         try:
             args = _ARGS_OBJECT.validate_json(call.args_json)
         except ValidationError as error:
             return _invalid_args_outcome(call, _details_from_pydantic(error))
-        # Parsing preserves the JSON types required by `iter_errors`; `object` cannot prove that to the checker.
+        # Parsing preserves the JSON types required by `iter_errors`.
+        # `object` cannot prove those types to the checker.
         # pyrefly: ignore[bad-argument-type]
         details = _details_from_jsonschema(self._validator.iter_errors(args))
         if details:
@@ -357,7 +370,7 @@ class Tool[AppDataT](Protocol):
 
     @property
     def name(self) -> str:
-        """Return the tool's dispatch name, matched against a ToolCall.name."""
+        """Return the tool's dispatch name matched against `ToolCall.name`."""
         ...
 
     def schema(self) -> ToolSchema:
@@ -367,12 +380,23 @@ class Tool[AppDataT](Protocol):
     async def dispatch(
         self, call: ToolCall
     ) -> DispatchHandled[AppDataT] | DispatchInvalidToolArgs:
-        """Run this tool on call and wrap the outcome."""
+        """Run this tool on `call` and wrap the outcome.
+
+        Args:
+            call: The tool call to dispatch.
+
+        Raises:
+            BaseException: The tool implementation raises it.
+        """
         ...
 
 
 def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDetail]) -> str:
     """Build the model-facing content for an argument-validation failure.
+
+    Args:
+        tool_name: The tool name to include in the content.
+        details: The argument-validation failures.
 
     Raises:
         ValueError: `details` is empty.
@@ -389,13 +413,17 @@ def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDe
 
 
 def render_unknown_tool(called_name: str, held_names: SequenceNotStr[str]) -> str:
-    """Name an unknown tool and list the available tool names."""
+    """Name an unknown tool and list the available tool names.
+
+    Args:
+        called_name: The unknown tool name.
+        held_names: The available tool names.
+    """
     held = ", ".join(held_names) if held_names else "(none)"
     return f"unknown tool {called_name!r}; available tools: {held}"
 
 
 def _details_from_pydantic(validation_error: ValidationError) -> tuple[InvalidToolArgsDetail, ...]:
-    """Copy `loc` and `msg` from a pydantic `ValidationError`."""
     return tuple(
         InvalidToolArgsDetail(path=tuple(error["loc"]), message=error["msg"])
         for error in validation_error.errors(
@@ -407,7 +435,6 @@ def _details_from_pydantic(validation_error: ValidationError) -> tuple[InvalidTo
 def _details_from_jsonschema(
     errors: Iterable[jsonschema.exceptions.ValidationError],
 ) -> tuple[InvalidToolArgsDetail, ...]:
-    """Copy `absolute_path` and `message` from each `jsonschema` validation error."""
     return tuple(
         InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
         for error in errors
@@ -417,7 +444,6 @@ def _details_from_jsonschema(
 def _invalid_args_outcome(
     call: ToolCall, details: tuple[InvalidToolArgsDetail, ...]
 ) -> DispatchInvalidToolArgs:
-    """Build the shared invalid-arguments outcome from nonempty `details`."""
     tool_message = ToolMessage.error(
         call, render_invalid_tool_args(tool_name=call.name, details=details)
     )
@@ -452,7 +478,6 @@ def _split_precomputed(
 def _handled_outcome[AppDataT](
     call: ToolCall, result: ToolOutput[AppDataT]
 ) -> DispatchHandled[AppDataT]:
-    """Convert a tool function result to `DispatchHandled`."""
     if isinstance(result, ToolOutputExplicit):
         tool_message = ToolMessage(
             tool_call_id=call.id, content=result.content, is_error=result.is_error
@@ -468,6 +493,9 @@ class ToolManager:
     def __init__(self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]) -> None:
         """Index the tools by name.
 
+        Args:
+            tools: The tools to index.
+
         Raises:
             ValueError: Two tools share a name.
         """
@@ -478,13 +506,17 @@ class ToolManager:
             self._tools[tool.name] = tool
 
     def schemas(self) -> tuple[ToolSchema, ...]:
-        """Convert every held tool to its provider-neutral schema."""
+        """Convert every indexed tool to its provider-neutral schema."""
         return tuple(tool.schema() for tool in self._tools.values())
 
     async def dispatch(self, call: ToolCall) -> DispatchOutcome:
         """Dispatch `call` or return `DispatchUnknownTool`.
 
-        Function exceptions propagate unchanged.
+        Args:
+            call: The tool call to dispatch.
+
+        Raises:
+            BaseException: The matched tool raises it.
         """
         tool = self._tools.get(call.name)
         if tool is None:
@@ -500,20 +532,21 @@ class ToolManager:
         *,
         precomputed: Callable[[ToolCall], ToolMessage | None] | None = None,
     ) -> tuple[DispatchManyOutcome, ...]:
-        """Dispatch calls concurrently and preserve `tool_calls` order.
+        """Dispatch calls concurrently. Preserve `tool_calls` order.
 
         `precomputed` runs for every call before any tool function starts.
         A returned `ToolMessage` skips that call's dispatch.
-        Function exceptions settle sibling calls before `DispatchExceptionGroup` propagates.
-        Cancellation also settles sibling calls before propagating.
+
+        Args:
+            tool_calls: The tool calls to dispatch.
+            precomputed: The optional function that supplies a result without dispatch.
 
         Raises:
-            DispatchExceptionGroup: Tool functions raise `Exception` values.
-                `completed_outcomes` preserves settled outcomes in input order.
-            asyncio.CancelledError: The caller cancels this function.
-            BaseException: A tool function raises a non-`Exception` value.
-                The first value in input order propagates after every call settles.
-                Concurrent `Exception` values become its `DispatchExceptionGroup` cause.
+            ValueError: `precomputed` returns a `ToolMessage` for another `tool_call_id`.
+            DispatchExceptionGroup: Tool functions raise `Exception` values after sibling calls settle.
+            asyncio.CancelledError: The caller cancels this function after sibling calls settle.
+            BaseException: `precomputed` raises it before any tool function starts.
+            BaseException: A tool function raises a non-`Exception` value after every call settles.
         """
         answered, to_dispatch = _split_precomputed(tool_calls, precomputed)
         settled: dict[int, DispatchManyOutcome | BaseException] = dict(answered)

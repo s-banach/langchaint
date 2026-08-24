@@ -10,8 +10,9 @@ async def retrieve_and_summarize() -> Response[str]:
     """Embed documents, select one, and summarize it.
 
     Raises:
-        openai.OpenAIError: OpenAI credentials are unavailable.
-        Exception: Embedding or generation failed.
+        openai.OpenAIError: OpenAI credentials are unavailable or an embedding request fails.
+        EmbeddingOutputError: An embedding response contains invalid vectors.
+        GenerationError: Summary generation fails.
     """
     openai = OpenAI()
     embedding_model = openai.embedding_model("text-embedding-3-small", dimension=256)

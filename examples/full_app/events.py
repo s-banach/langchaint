@@ -177,12 +177,9 @@ def current_gui_emitter() -> GuiEmitter:
     """Return the current run's GuiEmitter.
 
     Raises:
-        LookupError: no run is current.
+        LookupError: No `GuiEmitter` is active.
     """
     try:
         return gui_emitter_var.get()
     except LookupError:
-        raise LookupError(
-            "no GuiEmitter in context: emit is only meaningful inside a run's loop, where "
-            "AgentRun.final installs one for that run."
-        ) from None
+        raise LookupError("No GuiEmitter is active.") from None

@@ -315,7 +315,7 @@ def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_variant_c
 
 
 def test_a_generate_result_kind_narrows_the_output_type_the_variants_share_a_name_for() -> None:
-    """The response case returns the non-optional output; the tool_call_turn case reads tool_calls."""
+    """The response case returns the non-optional output. The tool_call_turn case reads tool_calls."""
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
     tool_call_turn: ToolCallTurn[int] = ToolCallTurn(
         output=None,

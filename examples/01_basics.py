@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import InferenceParams, Response, to_tables
+from langchaint import GenerationError, InferenceParams, to_tables
 from langchaint.openai import OpenAI
 
 
@@ -44,7 +44,7 @@ async def basics() -> None:
     print(bridge.output)
 
     results = await assistant.generate_many(["Define entropy.", "Define enthalpy."])
-    successful_count = sum(isinstance(result, Response) for result in results)
+    generation_error_count = sum(isinstance(result, GenerationError) for result in results)
     calls, attempts = to_tables(results)
-    print(f"{successful_count} successful results")
+    print(f"{generation_error_count} generation errors")
     print(f"{len(calls)} calls over {len(attempts)} attempts")

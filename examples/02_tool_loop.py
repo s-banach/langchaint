@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from langchaint import Message, Response, ToolCallTurn, UserMessage, tool
+from langchaint import Message, UserMessage, tool
 from langchaint.openai import OpenAI
 
 
@@ -44,11 +44,11 @@ async def run_tool_loop(prompt: str, max_turns: int = 10) -> FinalAnswer:
     messages: list[Message] = [UserMessage(content=prompt)]
     for _ in range(max_turns):
         result = await bound.generate_one(messages)
-        match result:
-            case ToolCallTurn():
+        match result.kind:
+            case "tool_call_turn":
                 messages.append(result.assistant_message)
                 outcomes = await bound.tool_manager.dispatch_many(result.tool_calls)
                 messages.extend(outcome.tool_message for outcome in outcomes)
-            case Response():
+            case "response":
                 return result.output
     raise RuntimeError(f"model did not finish within {max_turns} turns")

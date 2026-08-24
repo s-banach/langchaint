@@ -3,12 +3,9 @@
 from pydantic import BaseModel
 
 from langchaint import (
-    ReasoningDelta,
     Response,
     SpecificToolChoice,
     StreamItem,
-    ToolCall,
-    ToolCallDelta,
     tool,
 )
 from langchaint.openai import OpenAI
@@ -28,14 +25,15 @@ async def get_weather(args: WeatherArgs) -> str:
 
 def print_stream_item(item: StreamItem) -> None:
     """Print one StreamItem."""
-    match item:
-        case str():
-            print(item, end="", flush=True)
-        case ReasoningDelta():
+    if isinstance(item, str):
+        print(item, end="", flush=True)
+        return
+    match item.kind:
+        case "reasoning_delta":
             print(f"reasoning: {item.text}")
-        case ToolCallDelta():
+        case "tool_call_delta":
             print(f"{item.name}[{item.id}] arguments: {item.partial_args_json}")
-        case ToolCall():
+        case "tool_call":
             print(f"completed call: {item.name}({item.args_json})")
 
 

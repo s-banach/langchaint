@@ -41,7 +41,6 @@ from langchaint import (
     LLM,
     ZERO_USAGE,
     DispatchExceptionGroup,
-    DispatchHandled,
     DispatchManyOutcome,
     GenerationError,
     Message,
@@ -382,7 +381,7 @@ class ReActAgent(AgentRun):
         """Record each outcome and emit ToolResponse.
 
         tool_call_id matches partial outcomes to their calls.
-        DispatchHandled may carry reported Usage or CritiqueVerdict through app_data.
+        An outcome with `kind == "handled"` may carry reported Usage or CritiqueVerdict through app_data.
 
         Raises:
             RuntimeError: An outcome repeats or names an unknown tool_call_id.
@@ -400,14 +399,13 @@ class ReActAgent(AgentRun):
                 raise RuntimeError(
                     f"dispatch_many returned unknown tool_call_id {tool_call_id!r}"
                 ) from None
-            match outcome:
-                case DispatchHandled(app_data=Usage() as reported_usage):
-                    pass
-                case DispatchHandled(app_data=CritiqueVerdict(approved=True)):
+            reported_usage = ZERO_USAGE
+            if outcome.kind == "handled":
+                app_data = outcome.app_data
+                if isinstance(app_data, Usage):
+                    reported_usage = app_data
+                elif isinstance(app_data, CritiqueVerdict) and app_data.approved:
                     self.critique_approved = True
-                    reported_usage = ZERO_USAGE
-                case _:
-                    reported_usage = ZERO_USAGE
             self.turn_log.append(
                 ToolTurn(
                     turn_number=self.turn_number,

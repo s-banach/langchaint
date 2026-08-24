@@ -143,8 +143,6 @@ Text bindings expose tool calls through `Response.tool_calls`.
 ```python
 from pydantic import BaseModel
 
-from langchaint import Response, ToolCallTurn
-
 
 class Answer(BaseModel):
     text: str
@@ -155,10 +153,10 @@ result = await llm.bind(
     tools=tools,
 ).generate_one("Answer the question")
 
-match result:
-    case ToolCallTurn():
+match result.kind:
+    case "tool_call_turn":
         print(result.tool_calls)
-    case Response():
+    case "response":
         print(result.output.text)
 ```
 

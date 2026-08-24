@@ -1,151 +1,164 @@
 # langchaint
 
-langchaint provides typed generation and embeddings with raw provider responses and per-attempt billing.
+langchaint is an opinionated, provider-neutral Python client for LLM applications.
+It provides fully typed, asynchronous APIs for generation, streaming, embeddings, tools, retries, and billing.
+The application owns the agent loop.
+
 Alpha: the API is unstable and may change without notice.
 
-## Purpose
+## Why langchaint
 
-langchaint provides provider-neutral async `BoundLLM` and `EmbeddingModel` interfaces.
-langchaint provides no agent class or agent loop.
-langchaint uses pyrefly's strict `all` preset.
-Applications should use a strict type checker because langchaint leaves argument-type checks to static checking.
+- **One consistent API.** Set `system_prompt`, `tools`, `inference_params`, and `response_format` once with `LLM.bind()`. Use the resulting `BoundLLM` with `generate_one()`, `generate_many()`, or `stream_one()`.
+- **Types that follow your configuration.** Passing `response_format=Answer` makes `response.output` an `Answer`. Passing `tools` also determines the `tool_manager` type and whether `generate_one()` can return `ToolCallTurn`.
+- **Easy-to-discover result variants.** Every `GenerateResult`, `DispatchOutcome`, and `DispatchManyOutcome` variant has a literal `.kind` value. Every `StreamItem` variant except `str` does too. Editors can autocomplete the values, so a match statement needs no class imports.
+- **Names that explain themselves.** Public names state their meaning, units, and scope through names such as `timeout_seconds`, `max_attempts`, `cost_in_usd`, and `input_tokens_cache_read`.
+- **Retries that cooperate.** One `SharedBackoff` coordinates concurrency, request-start pacing, and provider-directed pauses across models that share a rate-limit quota.
+- **Complete billing.** Successful results and `GenerationError` values retain provider-reported usage from every recorded attempt, including billed retries.
+- **Streaming with clear ownership.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed result with its usage and attempt history.
+- **Agent loops in plain Python.** Provider-neutral messages, typed tools, concurrent dispatch, and explicit result variants support ordinary async control flow.
 
-## Install and authenticate
+langchaint ships `py.typed`.
+Static type information preserves structured output types through generation, batching, and streaming.
+
+## Install
 
 langchaint requires Python 3.13 or newer.
-Install one or more backend extras, such as `pip install "langchaint[openai]"`.
-Each extra declares langchaint's tested dependency lower bounds.
-Applications may add tighter dependency pins.
-Top-level `import langchaint` requires no provider SDK or `numpy`.
-Backend imports report missing dependencies through `ModuleNotFoundError`.
 
-| Backend | Class | Creates | Install | Default credentials |
-| --- | --- | --- | --- | --- |
-| Anthropic | `Anthropic` | `LLM` | `langchaint[anthropic]` | `ANTHROPIC_API_KEY` |
-| Anthropic on Amazon Bedrock | `AnthropicBedrock` | `LLM` | `langchaint[anthropic-bedrock]` | AWS credential provider chain |
-| Cohere on Amazon Bedrock | `CohereBedrock` | `EmbeddingModel` | `langchaint[cohere-bedrock]` | AWS credential provider chain |
-| DeepSeek | `DeepSeek` | `LLM` | `langchaint[deepseek]` | `DEEPSEEK_API_KEY` |
-| Gemini | `Gemini` | `LLM` | `langchaint[gemini]` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| OpenAI | `OpenAI` | `LLM` | `langchaint[openai]` | `OPENAI_API_KEY` |
-| OpenAI embeddings | `OpenAI` | `EmbeddingModel` | `langchaint[openai-embedding]` | `OPENAI_API_KEY` |
-| OpenAI on Amazon Bedrock | `OpenAIBedrock` | `LLM` | `langchaint[openai-bedrock]` | AWS credential provider chain |
+Install the extra for each backend you use:
 
-Install `langchaint[tracing]` to use the OTel tracing subpackage.
+```bash
+pip install "langchaint[openai]"
+```
 
-Every listed class accepts `client=`.
-Amazon Bedrock classes use the AWS credential provider chain.
-It includes environment credentials, profiles, SSO, containers, and instance roles.
-Pass `aws_region=` to select a Bedrock region explicitly.
+| Backend | Class | Install |
+| --- | --- | --- |
+| Anthropic | `Anthropic` | `langchaint[anthropic]` |
+| Anthropic on Amazon Bedrock | `AnthropicBedrock` | `langchaint[anthropic-bedrock]` |
+| Cohere embeddings on Amazon Bedrock | `CohereBedrock` | `langchaint[cohere-bedrock]` |
+| DeepSeek | `DeepSeek` | `langchaint[deepseek]` |
+| Gemini | `Gemini` | `langchaint[gemini]` |
+| OpenAI | `OpenAI` | `langchaint[openai]` |
+| OpenAI embeddings | `OpenAI` | `langchaint[openai-embedding]` |
+| OpenAI on Amazon Bedrock | `OpenAIBedrock` | `langchaint[openai-bedrock]` |
 
-## Generation quickstart
+Install `langchaint[tracing]` for OTel tracing.
+
+## Generate a typed response
 
 ```python
 import asyncio
 
+from pydantic import BaseModel
+
 from langchaint.openai import OpenAI
 
 
+class Answer(BaseModel):
+    answer: str
+    confidence: float
+
+
 async def main() -> None:
-    openai = OpenAI()
-    bound_llm = openai.model("gpt-5.6-terra").bind(system_prompt="Answer clearly and concisely.")
-    response = await bound_llm.generate_one("Why is the sky blue?")
-    print(response.output, response.usage.cost_in_usd)
+    assistant = (
+        OpenAI()
+        .model("gpt-5.6-terra")
+        .bind(
+            system_prompt="Answer clearly and concisely.",
+            response_format=Answer,
+        )
+    )
+    response = await assistant.generate_one("Why is the sky blue?")
+
+    print(response.output.answer)
+    print(response.usage.cost_in_usd)
 
 
 asyncio.run(main())
 ```
 
-`response.output` is assistant text.
-`regional_processing=False` uses the standard `1.0` token-price multiplier.
-Use `regional_processing=True` for an endpoint with regional processing.
-Pass a Pydantic model to `LLM.bind(response_format=...)` for validated structured output.
+The Pydantic model determines the output type and validates the provider response.
+The response retains the complete assistant turn, raw SDK response, stop reason, per-attempt history, and billing.
 
-## Embedding quickstart
+`generate_many()` returns one result per input in input order.
+A terminal failure becomes that input's `GenerationError`, so sibling results remain available.
 
-```python
-import asyncio
+## Coordinate retries across a rate-limit quota
 
-from langchaint.openai import OpenAI
-
-
-async def main() -> None:
-    openai = OpenAI()
-    embedding_model = openai.embedding_model(
-        "text-embedding-3-small",
-        dimension=1024,
-    )
-    documents = await embedding_model.embed(
-        ["The Moon orbits Earth.", "Mars has two small moons."],
-        task="retrieval_document",
-    )
-    query = await embedding_model.embed(
-        ["Which object circles Earth?"],
-        task="retrieval_query",
-    )
-    print(documents.shape, query.shape)
-
-
-asyncio.run(main())
-```
-
-`EmbeddingModel.embed()` requires `task` for every adapter.
-The OpenAI adapter sends no `task` request field.
-`EmbeddingModel.embed()` returns normalized `Float2D` values with `numpy.float32` elements.
-Each input produces one row.
-
-Use `CohereBedrock` for Cohere embeddings through Amazon Bedrock.
-
-## Share one rate-limit quota
-
-Create one `OpenAI` per rate-limit quota.
+Create one `OpenAI` for each rate-limit quota:
 
 ```python
 openai = OpenAI(
     max_concurrent_requests=8,
     max_request_starts_per_second=50.0,
 )
-terra = openai.model("gpt-5.6-terra")
-sol = openai.model("gpt-5.6-sol")
+
+fast_model = openai.model("gpt-5.6-luna")
+strong_model = openai.model("gpt-5.6-sol")
 ```
 
-`terra` and `sol` share `openai.client` and one `SharedBackoff`.
-`max_concurrent_requests` and `max_request_starts_per_second` apply across both `LLM` values.
-An `EmbeddingModel` from `openai.embedding_model()` uses the same client and `SharedBackoff`.
+Both `LLM` values share one `SharedBackoff`.
+A rate-limit response pauses request starts across the shared quota.
+A transient failure local to one request waits and retries that request.
+Each binding keeps its own `max_attempts` limit.
 
-Pass an SDK client to close it directly.
+Unlike independent retry loops, `SharedBackoff` can slow the whole quota as soon as one request receives a rate-limit response.
+
+## Stream with an explicit lifetime
 
 ```python
-from openai import AsyncOpenAI
+text_assistant = OpenAI().model("gpt-5.6-terra").bind()
 
-client = AsyncOpenAI()
-openai = OpenAI(client=client)
-terra = openai.model("gpt-5.6-terra")
+async with text_assistant.stream_one("Explain photosynthesis.") as stream:
+    async for item in stream:
+        if isinstance(item, str):
+            print(item, end="", flush=True)
 
-# Use terra.
-
-await client.close()
+    response = await stream.final()
 ```
 
-## Binding and results
+The context manager owns the provider stream and the shared request permit.
+Iteration exposes text, reasoning, and tool-call `StreamItem` values.
+`final()` drains unread `StreamItem` values and returns the assembled `Response` or `ToolCallTurn`.
 
-Call `LLM.bind()` before `generate_one`, `generate_many`, or `stream_one`.
-Use `BoundLLM.rebind()` to replace selected binding fields.
-Pass `tools=[tool]` to `LLM.bind()` and dispatch through `BoundLLM.tool_manager`.
-`LLM.bind(max_attempts=...)` limits requests for one `GenerationInput`, including the first.
-`embedding_model(max_attempts=...)` limits requests for one batch of inputs sent together, including the first.
-`LLM.bind()` uses `Adapter.automatic_cache_breakpoints_default` unless `automatic_cache_breakpoints` overrides it.
-`cache_breakpoint=True` requests an explicit breakpoint at that `ContentPart`.
-`GenerateResult` and `GenerationError` include paid `Usage` across attempts.
+## Build agent loops with ordinary async Python
+
+langchaint provides the messages, typed tools, argument validation, concurrent dispatch, and result variants needed for an agent loop.
+The application controls turn limits, state, approvals, model changes, and persistence.
+
+```python
+messages: list[Message] = [UserMessage(content=prompt)]
+
+for _ in range(max_turns):
+    result = await bound.generate_one(messages)
+
+    match result.kind:
+        case "tool_call_turn":
+            messages.append(result.assistant_message)
+            outcomes = await bound.tool_manager.dispatch_many(result.tool_calls)
+            messages.extend(outcome.tool_message for outcome in outcomes)
+        case "response":
+            return result.output
+
+raise RuntimeError("model did not finish within max_turns")
+```
+
+`ToolManager.dispatch_many()` runs parallel tool calls concurrently and preserves their order.
+
+See [`examples/02_tool_loop.py`](examples/02_tool_loop.py) for a complete typed tool loop.
+
+## Account for the complete call
+
+`response.usage.cost_in_usd` includes every billed retry recorded for the call.
+`response.usage_successful_attempt.cost_in_usd` reports the kept answer.
+`GenerationError.usage` preserves the recorded cost of failed calls.
+
+`Usage` separates uncached input, cache reads, cache writes, output, reasoning output, and provider-executed tool charges.
+Each `Billing` records the service tier and token rates applied to one attempt.
+When a used category has no known rate, its cost is `NaN` instead of zero.
 
 ## More examples
 
-[`examples/README.md`](examples/README.md) indexes migration guidance and examples.
-The examples cover structured output, batches, streaming, tools, tracing, pricing, failures, prompt caching, reasoning, embeddings, and application structure.
-
-## Development
-
-Run `scripts/CI.sh` before committing.
-The tests are offline and require no API keys.
+[`examples/README.md`](examples/README.md) covers structured output, batches, streaming, tools, tracing, pricing, failures, prompt caching, reasoning, embeddings, and application structure.
 
 ## License
 

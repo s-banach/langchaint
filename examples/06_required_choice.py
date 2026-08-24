@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from langchaint import (
     AllowedToolsChoice,
     CaptureTool,
-    DispatchCaptured,
     Message,
     SpecificToolChoice,
     UserMessage,
@@ -73,6 +72,9 @@ async def run_required_choice_agent(prompt: str, max_turns: int = 10) -> FinalRe
                 continue
             outcome = await final_response_tool.capture(call)
             messages.append(outcome.tool_message)
-            if isinstance(outcome, DispatchCaptured):
-                return outcome.captured
+            match outcome.kind:
+                case "captured":
+                    return outcome.captured
+                case "invalid_tool_args":
+                    continue
     raise RuntimeError(f"agent did not submit final_response within {max_turns} turns")

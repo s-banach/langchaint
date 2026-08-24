@@ -248,6 +248,7 @@ class DispatchCaptured[CapturedT: BaseModel]:
 
     tool_message: ToolMessage
     captured: CapturedT
+    kind: Literal["captured"] = "captured"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -292,9 +293,13 @@ class CaptureTool[CapturedT: BaseModel]:
     ) -> DispatchHandled[CapturedT] | DispatchInvalidToolArgs:
         """Return `capture` as `DispatchHandled.app_data` after validation."""
         outcome = await self.capture(call)
-        if isinstance(outcome, DispatchInvalidToolArgs):
-            return outcome
-        return DispatchHandled(tool_message=outcome.tool_message, app_data=outcome.captured)
+        match outcome.kind:
+            case "captured":
+                return DispatchHandled(
+                    tool_message=outcome.tool_message, app_data=outcome.captured
+                )
+            case "invalid_tool_args":
+                return outcome
 
 
 _ARGS_OBJECT = TypeAdapter(dict[str, object])

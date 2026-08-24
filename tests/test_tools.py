@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field, ValidationError
 from langchaint import (
     CaptureTool,
     ContentPart,
-    DispatchCaptured,
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
@@ -1026,7 +1025,7 @@ def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
     """A valid CaptureTool call returns typed output and acknowledgement."""
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
     outcome = asyncio.run(build_tool().capture(call))
-    assert isinstance(outcome, DispatchCaptured)
+    assert outcome.kind == "captured"
     assert outcome.captured.answer == "tide"
     assert outcome.tool_message.tool_call_id == "call1"
     assert outcome.tool_message.content == expected_acknowledgement
@@ -1046,7 +1045,7 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     expected_content = render_invalid_tool_args("final_response", expected_details)
     call = ToolCall(id="call1", name="final_response", args_json=args_json)
     outcome = asyncio.run(_answer_capture_tool().capture(call))
-    assert isinstance(outcome, DispatchInvalidToolArgs)
+    assert outcome.kind == "invalid_tool_args"
     assert outcome.tool_message.is_error is True
     assert outcome.tool_message.tool_call_id == "call1"
     assert outcome.tool_message.content == expected_content
@@ -1062,7 +1061,7 @@ def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant()
     for args_json in ("not json", '"scalar"'):
         call = ToolCall(id="call1", name="final_response", args_json=args_json)
         outcome = asyncio.run(_answer_capture_tool().capture(call))
-        assert isinstance(outcome, DispatchInvalidToolArgs)
+        assert outcome.kind == "invalid_tool_args"
         assert outcome.tool_message.is_error is True
         assert "invalid arguments for final_response" in outcome.tool_message.content
         assert len(outcome.details) >= 1

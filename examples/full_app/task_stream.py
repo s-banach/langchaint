@@ -35,7 +35,7 @@ from events import (
 )
 from opentelemetry.trace import Tracer
 from pydantic import BaseModel
-from scenario import CritiqueVerdict, DelegateArgs, build_critique_tool, search_tool
+from tools import CritiqueVerdict, DelegateArgs, build_critique_tool, search_tool
 
 from langchaint import (
     LLM,

@@ -1,6 +1,6 @@
-"""Provide a scripted offline adapter for the example.
+"""Provide a deterministic adapter for full-app tests.
 
-Each binding's system prompt selects a list of turns by tag.
+Each binding's complete system prompt selects a list of turns.
 Text ends a loop, and tool calls continue it.
 delay_seconds suspends open_stream to exercise timeouts.
 """
@@ -101,7 +101,7 @@ class Turn:
 
 @dataclass
 class Script:
-    """Track one agent tag's turns and opens."""
+    """Track one system prompt's turns and opens."""
 
     turns: list[Turn]
     opens: int = 0
@@ -111,7 +111,7 @@ class ScriptedAdapter(Adapter):
     """Serve every agent from scripts selected by system prompt."""
 
     def __init__(self, scripts: dict[str, list[Turn]]) -> None:
-        """Store one Script per agent tag."""
+        """Store one Script per system prompt."""
         super().__init__(
             client=None,
             model="fake-model",
@@ -119,7 +119,7 @@ class ScriptedAdapter(Adapter):
             automatic_cache_breakpoints_default=False,
         )
         self.scripts: dict[str, Script] = {
-            tag: Script(turns=list(turns)) for tag, turns in scripts.items()
+            system_prompt: Script(turns=list(turns)) for system_prompt, turns in scripts.items()
         }
 
     @override
@@ -129,8 +129,15 @@ class ScriptedAdapter(Adapter):
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        """Bind to the script named by the system prompt."""
-        return _ScriptedBoundAdapter(self, _tag_of(binding))
+        """Bind to the script named by the system prompt.
+
+        Raises:
+            TypeError: The binding does not contain a string system prompt.
+        """
+        system_prompt = binding.system_prompt
+        if not isinstance(system_prompt, str):
+            raise TypeError("ScriptedAdapter requires a string system prompt")
+        return _ScriptedBoundAdapter(self, system_prompt)
 
     @override
     def bind_structured[ModelT: BaseModel](
@@ -154,14 +161,6 @@ class ScriptedAdapter(Adapter):
         return "unknown_exception"
 
 
-def _tag_of(binding: Binding) -> str:
-    """Read the agent tag from the system prompt."""
-    system_prompt = binding.system_prompt
-    if isinstance(system_prompt, str) and system_prompt.startswith("["):
-        return system_prompt[1 : system_prompt.index("]")]
-    return "default"
-
-
 @dataclass(frozen=True, kw_only=True)
 class _ScriptedRequest(RequestParams):
     """Store the messages for one scripted attempt."""
@@ -177,9 +176,9 @@ class _ScriptedRequest(RequestParams):
 class _ScriptedBoundAdapter(BoundAdapter[str]):
     """Play one agent's scripted turns in order."""
 
-    def __init__(self, adapter: ScriptedAdapter, tag: str) -> None:
+    def __init__(self, adapter: ScriptedAdapter, system_prompt: str) -> None:
         self._adapter = adapter
-        self._tag = tag
+        self._system_prompt = system_prompt
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -206,7 +205,7 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         Raises:
             TypeError: `raw` is not a `FakeRaw`.
         """
-        turn = self._adapter.scripts[self._tag].turns[_turn_index(raw)]
+        turn = self._adapter.scripts[self._system_prompt].turns[_turn_index(raw)]
         if turn.tool_calls:
             return AdapterResult(
                 output="",
@@ -231,11 +230,13 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
 
         Raises:
             Exception: the turn's scripted error, whatever type it carries.
-            RuntimeError: the script for this tag ran out of turns.
+            RuntimeError: the script for this system prompt ran out of turns.
         """
-        script = self._adapter.scripts[self._tag]
+        script = self._adapter.scripts[self._system_prompt]
         if script.opens >= len(script.turns):
-            raise RuntimeError(f"script {self._tag!r} exhausted after {script.opens} turns")
+            raise RuntimeError(
+                f"script for {self._system_prompt!r} exhausted after {script.opens} turns"
+            )
         turn_index = script.opens
         turn = script.turns[turn_index]
         script.opens += 1

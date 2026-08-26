@@ -19,6 +19,6 @@ Most examples construct backend classes directly to show request code.
 | [`11_provider_executed_tools.py`](11_provider_executed_tools.py) | OpenAI web search, `RawPart`, and `Usage.provider_executed_tool_cost_in_usd` |
 | [`12_messages.py`](12_messages.py) | Multimodal content and message JSON serialization |
 | [`MIGRATING_FROM_LANGCHAIN.md`](MIGRATING_FROM_LANGCHAIN.md) | LangChain migration by API concept |
-| [`full_app/`](full_app/README.md) | Offline progress-event application architecture |
+| [`full_app/`](full_app/README.md) | Progress-event application architecture |
 
 Read `MIGRATING_FROM_LANGCHAIN.md`, `01_basics.py`, then `02_tool_loop.py`.

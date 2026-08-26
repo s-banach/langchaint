@@ -13,7 +13,7 @@ from dataclasses import dataclass
 class AgentConfig:
     """Configure one agent.
 
-    name matches the system_prompt tag and the last segment of agent_path before any spawn index.
+    name matches the last segment of agent_path before any spawn index.
     max_tool_calls bounds the whole run and declines excess calls with an error ToolMessage.
     max_attempts includes the first request of each generate_one call.
     max_cost_in_usd stops new turns after settled spend reaches the limit.
@@ -31,19 +31,11 @@ class AgentConfig:
     self_correction_enabled: bool = False
 
     def __post_init__(self) -> None:
-        """Validate the system_prompt tag and max_cost_in_usd.
+        """Validate max_cost_in_usd.
 
         Raises:
-            ValueError: system_prompt does not start with "[name] ".
-                The same exception applies when max_cost_in_usd is not positive and finite.
+            ValueError: max_cost_in_usd is set to a nonpositive or nonfinite value.
         """
-        tag = f"[{self.name}] "
-        if not self.system_prompt.startswith(tag):
-            raise ValueError(
-                f"system_prompt must start with {tag!r}. "
-                f"ScriptedAdapter uses the tag to select {self.name!r}. "
-                f"Got {self.system_prompt!r}."
-            )
         if self.max_cost_in_usd is not None and (
             not math.isfinite(self.max_cost_in_usd) or self.max_cost_in_usd <= 0
         ):
@@ -55,14 +47,14 @@ def build_configs() -> dict[str, AgentConfig]:
     configs = (
         AgentConfig(
             name="research_climate",
-            system_prompt="[research_climate] Research the climate outlook.",
+            system_prompt="Research the climate outlook.",
             automatic_cache_breakpoints=False,
             max_turns=6,
             generate_one_timeout_seconds=1.5,
         ),
         AgentConfig(
             name="research_energy",
-            system_prompt="[research_energy] Research the energy outlook.",
+            system_prompt="Research the energy outlook.",
             automatic_cache_breakpoints=False,
             max_turns=6,
             max_tool_calls=6,
@@ -70,7 +62,7 @@ def build_configs() -> dict[str, AgentConfig]:
         ),
         AgentConfig(
             name="specialist",
-            system_prompt="[specialist] Answer the question with one search.",
+            system_prompt="Answer the question with one search.",
             automatic_cache_breakpoints=False,
             max_turns=3,
             max_tool_calls=2,
@@ -78,7 +70,7 @@ def build_configs() -> dict[str, AgentConfig]:
         ),
         AgentConfig(
             name="synthesize",
-            system_prompt="[synthesize] Reconcile the findings.",
+            system_prompt="Reconcile the findings.",
             automatic_cache_breakpoints=False,
             max_turns=6,
             max_tool_calls=4,

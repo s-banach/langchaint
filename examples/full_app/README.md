@@ -8,36 +8,10 @@ The application supplies the loop and progress events.
 Its synchronous `on_event: Callable[[Event], None]` callback reports progress.
 The callback is not `BoundLLM.stream_one`.
 
-## Run offline
-
-`harness.py` provides a scripted adapter.
-It sends no network requests.
-
-```console
-uv run python examples/full_app/run_task_stream.py
-```
-
-`run_task_stream.py` executes the committed `SCENARIOS` table.
-
-| scenario | behavior |
-| --- | --- |
-| `happy` | Every run completes. |
-| `subagent_error` | A provider failure becomes a parent-readable tool error. |
-| `call_timeout` | One call times out, then the run continues. |
-| `app_timeout` | The whole-app deadline cancels active runs. |
-| `tool_budget` | `max_tool_calls` declines later calls. |
-| `unapproved_answer` | `synthesize` requests critique before accepting an answer. |
-
-## Run live
+## Provider construction
 
 `run_live_task_stream.py` uses one `OpenAI` throughout the application lifetime.
 It uses `gpt-5.6-terra` for every run.
-
-```console
-OPENAI_API_KEY=... uv run python examples/full_app/run_live_task_stream.py
-```
-
-The live run uses canned application tools.
 Model responses still determine the loop path.
 
 ## Graph
@@ -129,9 +103,3 @@ A delegated run's `agent_span` becomes a child of its `delegate` tool span.
 
 `capture_message_content` controls message content on generated spans.
 OpenTelemetry configuration controls recording and export.
-
-## Tests
-
-`test_task_stream_claims.py` runs offline.
-It verifies accounting, cancellation, deadlines, event routing, and span nesting.
-It also verifies NaN cost rejection and tool-defect propagation.

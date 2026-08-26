@@ -68,16 +68,13 @@ dev = [
 
 [tool.pyrefly]
 preset = "all"
-# project-includes bounds type checking to exactly these trees; search-path is the separate
-# import-resolution setting, "src" being the langchaint import root. scripts is in because
-# tests/test_tracing.py imports scripts.refresh_semconv_genai for the one map naming which
-# schema validates which attribute, so a shape change there breaks the gate.
+# project-includes bounds type checking to these paths.
+# search-path separately configures import resolution.
+# src is the langchaint import root.
+# tests/test_tracing.py imports scripts.refresh_semconv_genai to verify the map from each attribute to its schema.
 project-includes = ["src", "tests", "examples", "scripts"]
-# src is the langchaint import root; the repo root is added so cross-module test
-# imports (tests.test_bound_llm reused by tests.test_tracing) resolve the same way
-# pytest resolves them at runtime. examples/full_app is added because its modules import
-# each other by bare name (from events import Event), the way they resolve when run
-# by path with that directory on sys.path.
+# The repository root resolves cross-module test imports as pytest resolves them at runtime.
+# examples/full_app resolves bare imports from example modules and tests/test_full_app.py.
 search-path = ["src", ".", "examples/full_app"]
 
 [tool.pyrefly.errors]
@@ -86,15 +83,15 @@ implicit-bool = false
 explicit-any = false
 
 [tool.pytest.ini_options]
-# examples/full_app is in because its claims suite asserts what the app's docstrings say,
-# the span nesting and the timeout layers; an unchecked claim is a claim that rots.
-testpaths = ["tests", "examples/full_app"]
-# examples/full_app's modules import each other by bare name, the way they resolve when run by path.
+# tests/test_full_app.py verifies the example app's documented behavior.
+testpaths = ["tests"]
+# Example modules import each other by bare name.
+# tests/test_full_app.py imports task_stream through the same path.
 pythonpath = ["examples/full_app"]
 
 [tool.coverage.run]
 branch = true
-omit = ["examples/full_app/test_task_stream_claims.py"]
+omit = ["tests/test_full_app.py"]
 relative_files = true
 source = ["src/langchaint", "examples/full_app"]
 

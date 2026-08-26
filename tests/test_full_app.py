@@ -22,12 +22,10 @@ from events import (
     ToolProgress,
     current_gui_emitter,
 )
-from harness import Turn, build_llm, call
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel
-from scenario import build_scripts
 from task_stream import (
     AgentRun,
     App,
@@ -41,6 +39,8 @@ from task_stream import (
 
 from langchaint import ZERO_USAGE, DispatchExceptionGroup, ToolCall, tool
 from langchaint.tracing import TracedLLM
+from tests.full_app_support.scenarios import build_scripts
+from tests.full_app_support.scripted_adapter import Turn, build_llm, call
 
 
 def _discard(event: Event) -> None:
@@ -77,7 +77,7 @@ def _build_app(
             configs["research_climate"], max_tool_calls=climate_max_tool_calls
         )
     return App(
-        llm=build_llm(build_scripts(scenario)),
+        llm=build_llm(build_scripts(scenario, configs)),
         configs=configs,
         tracer=tracer_provider.get_tracer("full_app.test"),
         on_event=on_event,
@@ -217,7 +217,7 @@ def test_agent_config_rejects_a_nan_cost_limit() -> None:
     with pytest.raises(ValueError, match="positive and finite"):
         _ = AgentConfig(
             name="limited",
-            system_prompt="[limited] answer",
+            system_prompt="Answer.",
             automatic_cache_breakpoints=False,
             max_cost_in_usd=math.nan,
         )
@@ -269,8 +269,9 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(task_stream, "search_tool", broken_search)
     tracer = TracerProvider().get_tracer("full_app.test")
     registry: dict[str, AgentRun] = {}
+    specialist_prompt = "Answer the question."
     llm = TracedLLM(
-        build_llm({"specialist": [Turn(tool_calls=(call("search", '{"query": "q"}'),))]}),
+        build_llm({specialist_prompt: [Turn(tool_calls=(call("search", '{"query": "q"}'),))]}),
         capture_message_content=False,
         tracer=tracer,
     )
@@ -279,7 +280,7 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
         parent_path="root/parent",
         sub_config=AgentConfig(
             name="specialist",
-            system_prompt="[specialist] answer",
+            system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,
         ),
         tracer=tracer,
@@ -318,7 +319,7 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
         agent_path="root/defect",
         config=AgentConfig(
             name="defect",
-            system_prompt="[defect] fail",
+            system_prompt="Fail.",
             automatic_cache_breakpoints=False,
         ),
         tracer=TracerProvider().get_tracer("full_app.test"),
@@ -326,7 +327,7 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
         on_event=_discard,
     )
     with pytest.raises(DispatchExceptionGroup):
-        asyncio.run(app._settle_node(run))  # noqa: SLF001 (test the propagation boundary)
+        asyncio.run(app._settle_node(run))
 
 
 def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
@@ -391,8 +392,9 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
     tracer = TracerProvider().get_tracer("full_app.test")
     registry: dict[str, AgentRun] = {}
     # The shared script provides one turn to each spawn.
+    specialist_prompt = "Answer the question."
     llm = TracedLLM(
-        build_llm({"specialist": [Turn(text="first"), Turn(text="second")]}),
+        build_llm({specialist_prompt: [Turn(text="first"), Turn(text="second")]}),
         capture_message_content=False,
         tracer=tracer,
     )
@@ -401,7 +403,7 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
         parent_path="root/parent",
         sub_config=AgentConfig(
             name="specialist",
-            system_prompt="[specialist] answer",
+            system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,
         ),
         tracer=tracer,
@@ -429,7 +431,7 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
             return "unused"
 
     registry: dict[str, AgentRun] = {}
-    config = AgentConfig(name="twin", system_prompt="[twin] p", automatic_cache_breakpoints=False)
+    config = AgentConfig(name="twin", system_prompt="Respond.", automatic_cache_breakpoints=False)
     tracer = TracerProvider().get_tracer("full_app.test")
     _ = NoOpRun(
         agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard

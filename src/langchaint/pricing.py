@@ -8,9 +8,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite, nan
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_serializer
 
-from langchaint.usage import Usage
+from langchaint.checked_copy import CheckedCopyModel
+from langchaint.usage import Usage, _serialize_nonfinite_float
 
 
 def require_pricing_key[KeyT](pricing: Mapping[KeyT, object], *, key: KeyT, model: str) -> None:
@@ -79,22 +80,31 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
         raise ValueError(f"{rate_name} must be finite and nonnegative")
 
 
-@dataclass(frozen=True, kw_only=True)
-class Billing:
-    """One attempt's priced usage, service tier, raw usage, and applied rates.
+class Billing(CheckedCopyModel):
+    """One attempt's normalized priced usage, service tier, and applied rates.
 
     Stored rates reproduce token costs without the original rate table.
     A missing category rate is NaN.
-    `usage_raw` holds the mutable provider object by reference; copy it before mutation.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
 
     usage: Usage
     service_tier: str
-    usage_raw: BaseModel | None
     input_cache_none_usd_per_million_tokens: float
     cache_read_usd_per_million_tokens: float
     cache_write_usd_per_million_tokens: float
     output_usd_per_million_tokens: float
+
+    @field_serializer(
+        "input_cache_none_usd_per_million_tokens",
+        "cache_read_usd_per_million_tokens",
+        "cache_write_usd_per_million_tokens",
+        "output_usd_per_million_tokens",
+        when_used="json",
+    )
+    def _serialize_rate(self, rate: float) -> float | str:
+        return _serialize_nonfinite_float(rate)
 
     @property
     def cache_savings_in_usd(self) -> float:
@@ -115,3 +125,11 @@ class Billing:
             + self.usage.input_tokens_cache_none_cost_in_usd
         )
         return uncached - billed
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProviderBilling:
+    """One attempt's normalized billing and live provider usage."""
+
+    billing: Billing
+    usage_raw: BaseModel | None

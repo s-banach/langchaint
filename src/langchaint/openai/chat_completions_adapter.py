@@ -151,7 +151,7 @@ from langchaint.openai.shared import (
     request_id_from_openai_error,
     require_prompt_cache_options_support,
 )
-from langchaint.pricing import Billing
+from langchaint.pricing import ProviderBilling
 from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
@@ -511,7 +511,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     if message.function_call is not None:
         turn.append(
             RawPart(
-                raw=message.model_dump(mode="python", include={"function_call"}, exclude_none=True)
+                raw=message.model_dump(mode="json", include={"function_call"}, exclude_none=True)
             )
         )
     for tool_call in message.tool_calls or ():
@@ -524,7 +524,7 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
                 )
             )
         else:
-            turn.append(RawPart(raw=tool_call.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -611,7 +611,7 @@ def _billing_from_chat_completion(
     *,
     pricing: OpenAIPricingTable,
     cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
-) -> Billing:
+) -> ProviderBilling:
     """Price response counters at the reported `service_tier`.
 
     `prompt_tokens` includes cached and cache-write tokens.
@@ -991,7 +991,7 @@ class _ChatCompletionsStream(AdapterStream):
         return self._snapshot_with_tracked_usage()
 
     @override
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Return what the tracked usage bills at the snapshot's tier, or None before one arrives.
 
         `stream_options` requests usage on the trailing chunk.
@@ -1030,7 +1030,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
     _precomputed_fields: _ChatCompletionsPrecomputedFields
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price counters using the reported `service_tier`.
 
         Raises:

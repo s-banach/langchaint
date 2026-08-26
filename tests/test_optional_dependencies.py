@@ -29,6 +29,30 @@ def test_generation_imports_without_numpy() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_normalized_error_validation_imports_no_provider_backend() -> None:
+    """Validating normalized error JSON imports no provider backend."""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "from pydantic import TypeAdapter\n"
+            "from langchaint import GenerationErrorRecord\n"
+            'payload = b\'{"call":{"model":"m","provider_name":"p","attempt_records":[],"elapsed_seconds":0.0},"reason":"bad","kind":"invalid_request_error"}\'\n'
+            "record = TypeAdapter(GenerationErrorRecord).validate_json(payload)\n"
+            'assert record.kind == "invalid_request_error"\n'
+            'provider_prefixes = ("langchaint.anthropic", "langchaint.cohere", "langchaint.deepseek", "langchaint.gemini", "langchaint.openai")\n'
+            "assert not any(name.startswith(provider_prefixes) for name in sys.modules)\n",
+        ],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_embedding_apis_name_the_install_for_missing_numpy() -> None:
     """Name each supported install when an embedding API lacks `numpy`."""
     completed = _run_without_numpy(

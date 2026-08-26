@@ -2,7 +2,7 @@
 
 AgentRun.final installs GuiEmitter, opens the agent span, emits terminal events, and drives run.
 on_event executes synchronously inside the run.
-TimedOutError lets the loop record a timed-out call and continue.
+`TimedOutErrorRecord` lets the loop record a timed-out call and continue.
 
 Each run registers at construction and appends settled TurnRecord values to turn_log.
 Usage is derived from the registered runs' turn_log values.
@@ -46,7 +46,6 @@ from langchaint import (
     Message,
     PydanticTool,
     Response,
-    TimedOutError,
     Tool,
     ToolCall,
     ToolManager,
@@ -259,7 +258,7 @@ class ReActAgent(AgentRun):
         Each settled outcome is appended to turn_log.
 
         Raises:
-            GenerationError: Generation fails after its retries, except for `TimedOutError`.
+            GenerationError: Generation fails after its retries, except for `TimedOutErrorRecord`.
             RuntimeError: `max_turns` elapses or the configured cost prevents another turn.
             DispatchExceptionGroup: A tool function raises after settled sibling outcomes enter `turn_log`.
             asyncio.CancelledError: An outer deadline cancels the run.
@@ -289,7 +288,7 @@ class ReActAgent(AgentRun):
                 )
             except GenerationError as error:
                 self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
-                if not isinstance(error, TimedOutError):
+                if error.record.kind != "timed_out_error":
                     raise
                 # The timed-out call leaves self.messages unchanged for the next turn.
                 self.on_event(

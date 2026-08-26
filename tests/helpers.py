@@ -20,10 +20,12 @@ from langchaint import (
     AttemptRecord,
     Billing,
     CallRecord,
+    SettledAttemptRecord,
     TransientError,
+    TransientErrorRecord,
     Usage,
 )
-from langchaint.adapter import ErrorClassification
+from langchaint.adapter import ErrorClassification, ProviderBilling
 from langchaint.shared_backoff import (
     DoNotRetry,
     PauseAll,
@@ -31,9 +33,6 @@ from langchaint.shared_backoff import (
     RetryThisOne,
     Verdict,
 )
-
-CALL_STARTED_AT = 1000.0
-"""The fixed time.monotonic() origin every record attempt_record and call_record build sits on."""
 
 
 class StubRaw(BaseModel):
@@ -44,13 +43,11 @@ def stated_billing(
     usage: Usage,
     *,
     input_cache_none_usd_per_million_tokens: float = math.nan,
-    usage_raw: BaseModel | None = None,
 ) -> Billing:
-    """Build Billing from test-stated Usage and optional cache rate."""
+    """Build normalized Billing from test-stated Usage and an optional cache rate."""
     return Billing(
         usage=usage,
         service_tier="stub",
-        usage_raw=usage_raw,
         input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
         cache_read_usd_per_million_tokens=math.nan,
         cache_write_usd_per_million_tokens=math.nan,
@@ -58,13 +55,28 @@ def stated_billing(
     )
 
 
+def stated_provider_billing(
+    usage: Usage,
+    *,
+    input_cache_none_usd_per_million_tokens: float = math.nan,
+    usage_raw: BaseModel | None = None,
+) -> ProviderBilling:
+    """Build provider billing from normalized Billing and optional raw usage."""
+    return ProviderBilling(
+        billing=stated_billing(
+            usage,
+            input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
+        ),
+        usage_raw=usage_raw,
+    )
+
+
 def attempt_record(
     *,
-    error: TransientError | None,
+    error: TransientError | TransientErrorRecord | None,
     usage: Usage = ZERO_USAGE,
     reported_billing: bool = True,
     input_cache_none_usd_per_million_tokens: float = math.nan,
-    usage_raw: BaseModel | None = None,
     started_after_seconds: float = 0.0,
     elapsed_seconds: float = 0.0,
     seconds_to_first_item: float | None = None,
@@ -72,29 +84,31 @@ def attempt_record(
     model_served: str | None = None,
     response_id: str | None = None,
     request_id: str | None = None,
-) -> AttemptRecord:
-    """Build one record on the fixed origin. reported_billing False is an attempt the provider never billed."""
-    started_at_monotonic_seconds = CALL_STARTED_AT + started_after_seconds
-    return AttemptRecord(
-        started_at_monotonic_seconds=started_at_monotonic_seconds,
-        ended_at_monotonic_seconds=started_at_monotonic_seconds + elapsed_seconds,
-        first_item_at_monotonic_seconds=(
-            None
-            if seconds_to_first_item is None
-            else started_at_monotonic_seconds + seconds_to_first_item
-        ),
-        error=error,
+) -> SettledAttemptRecord:
+    """Build one normalized settled attempt record."""
+    normalized_error = (
+        TransientErrorRecord(
+            message=str(error),
+            retry_after_seconds=error.retry_after_seconds,
+            is_rate_limit=error.is_rate_limit,
+        )
+        if isinstance(error, TransientError)
+        else error
+    )
+    return SettledAttemptRecord(
+        started_after_seconds=started_after_seconds,
+        elapsed_seconds=elapsed_seconds,
+        seconds_to_first_item=seconds_to_first_item,
+        error=normalized_error,
         billing=(
             stated_billing(
                 usage,
                 input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
-                usage_raw=usage_raw,
             )
             if reported_billing
             else None
         ),
         assistant_message=turn,
-        raw=None,
         model_served=model_served,
         response_id=response_id,
         request_id=request_id,
@@ -109,7 +123,6 @@ def call_record(
         model="fake-model",
         provider_name="fake",
         attempt_records=attempt_records,
-        started_at_monotonic_seconds=CALL_STARTED_AT,
         elapsed_seconds=elapsed_seconds,
     )
 

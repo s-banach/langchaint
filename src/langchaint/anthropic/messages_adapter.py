@@ -138,6 +138,7 @@ from langchaint.messages import (
 )
 from langchaint.pricing import (
     Billing,
+    ProviderBilling,
     category_cost,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
@@ -242,7 +243,7 @@ class AnthropicRates:
         output_tokens: int,
         output_tokens_reasoning: int,
         provider_executed_tool_cost_in_usd: float,
-    ) -> Billing:
+    ) -> ProviderBilling:
         """Price one response's counters, the two cache-write TTLs each at their own rate.
 
         `Usage.input_tokens_cache_write` sums both write counters.
@@ -265,38 +266,40 @@ class AnthropicRates:
         input_tokens_cache_write_cost_in_usd = (
             cache_write_5m_cost_in_usd + cache_write_1h_cost_in_usd
         )
-        return Billing(
-            usage=Usage(
-                input_tokens_cache_read=input_tokens_cache_read,
-                input_tokens_cache_write=input_tokens_cache_write,
-                input_tokens_cache_none=input_tokens_cache_none,
-                output_tokens=output_tokens,
-                output_tokens_reasoning=output_tokens_reasoning,
-                input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read,
-                    usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+        return ProviderBilling(
+            billing=Billing(
+                usage=Usage(
+                    input_tokens_cache_read=input_tokens_cache_read,
+                    input_tokens_cache_write=input_tokens_cache_write,
+                    input_tokens_cache_none=input_tokens_cache_none,
+                    output_tokens=output_tokens,
+                    output_tokens_reasoning=output_tokens_reasoning,
+                    input_tokens_cache_read_cost_in_usd=category_cost(
+                        input_tokens_cache_read,
+                        usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                    ),
+                    input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
+                    input_tokens_cache_none_cost_in_usd=category_cost(
+                        input_tokens_cache_none,
+                        usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                    ),
+                    output_tokens_cost_in_usd=category_cost(
+                        output_tokens,
+                        usd_per_million_tokens=self.output_usd_per_million_tokens,
+                    ),
+                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
-                input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
-                input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none,
-                    usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                service_tier=service_tier,
+                input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                cache_write_usd_per_million_tokens=(
+                    input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
+                    if input_tokens_cache_write
+                    else self.cache_write_5m_usd_per_million_tokens
                 ),
-                output_tokens_cost_in_usd=category_cost(
-                    output_tokens,
-                    usd_per_million_tokens=self.output_usd_per_million_tokens,
-                ),
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+                output_usd_per_million_tokens=self.output_usd_per_million_tokens,
             ),
-            service_tier=service_tier,
             usage_raw=usage_raw,
-            input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
-            cache_write_usd_per_million_tokens=(
-                input_tokens_cache_write_cost_in_usd * 1_000_000 / input_tokens_cache_write
-                if input_tokens_cache_write
-                else self.cache_write_5m_usd_per_million_tokens
-            ),
-            output_usd_per_million_tokens=self.output_usd_per_million_tokens,
         )
 
     def multiplied(self, multiplier: float) -> "AnthropicRates":
@@ -926,14 +929,14 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
         elif block.type == "thinking":
             turn.append(
                 ReasoningPart(
-                    raw=block.model_dump(mode="python", exclude_none=True),
+                    raw=block.model_dump(mode="json", exclude_none=True),
                     text=block.thinking or None,
                 )
             )
         elif block.type == "redacted_thinking":
-            turn.append(ReasoningPart(raw=block.model_dump(mode="python", exclude_none=True)))
+            turn.append(ReasoningPart(raw=block.model_dump(mode="json", exclude_none=True)))
         else:
-            turn.append(RawPart(raw=block.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=block.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -953,7 +956,7 @@ def _billing_from_sdk_usage(
     *,
     provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
     billing_complete: bool = True,
-) -> Billing:
+) -> ProviderBilling:
     """Price SDK counters by the reported service tier.
 
     `usage.input_tokens` excludes cache reads and writes.
@@ -1398,7 +1401,7 @@ class _AnthropicStream(AdapterStream):
         return await self._sdk_stream.get_final_message()
 
     @override
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Return snapshot billing after the first event, or `None` before it.
 
         Anthropic 0.120.0 provides required input tokens from `message_start`.
@@ -1436,7 +1439,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
     _precomputed_fields: _AnthropicPrecomputedFields
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price counters using reported response metadata.
 
         Raises:

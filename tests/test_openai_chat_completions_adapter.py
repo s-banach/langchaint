@@ -28,6 +28,7 @@ from langchaint import (
     ImagePart,
     ImageUrlPart,
     InferenceParams,
+    JsonValue,
     RawPart,
     ReasoningDelta,
     ReasoningPart,
@@ -81,7 +82,7 @@ from langchaint.openai.chat_completions_adapter import (
     _wire_tool_choice,
     cache_read_tokens_from_usage_openai,
 )
-from langchaint.pricing import Billing
+from langchaint.pricing import Billing, ProviderBilling
 from langchaint.shared_backoff import RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 from tests.helpers import openai_sdk_errors_and_classifications, openai_sdk_errors_and_verdicts
@@ -111,7 +112,7 @@ _TOOL_CALL_WIRE: dict[str, object] = {
 }
 """One function tool call as the API returns it on an assistant message."""
 
-_CUSTOM_TOOL_CALL_WIRE: dict[str, object] = {
+_CUSTOM_TOOL_CALL_WIRE: dict[str, JsonValue] = {
     "id": "c9",
     "type": "custom",
     "custom": {"name": "n", "input": "i"},
@@ -206,6 +207,13 @@ def _billing(
     pricing: OpenAIPricingTable = _PRICING,
 ) -> Billing:
     """Price one completion with the openai cache-read reader, the adapter's default."""
+    return _provider_billing(completion, pricing).billing
+
+
+def _provider_billing(
+    completion: ChatCompletion,
+    pricing: OpenAIPricingTable = _PRICING,
+) -> ProviderBilling:
     return _billing_from_chat_completion(
         completion,
         pricing=pricing,
@@ -228,8 +236,8 @@ def test_billing_subtracts_cache_from_prompt_tokens_and_prices() -> None:
 def test_billing_carries_the_sdk_usage_object_itself() -> None:
     """usage_raw is the completion's own CompletionUsage by reference, and None where it reported none."""
     raw = _completion(usage=_usage_with_cache())
-    assert _billing(raw).usage_raw is raw.usage
-    assert _billing(_completion(usage=None)).usage_raw is None
+    assert _provider_billing(raw).usage_raw is raw.usage
+    assert _provider_billing(_completion(usage=None)).usage_raw is None
 
 
 def test_search_annotations_produce_unknown_provider_executed_tool_cost() -> None:
@@ -329,7 +337,7 @@ def test_the_deepseek_reader_prices_cache_hits_as_cache_reads() -> None:
         _completion(usage=_deepseek_usage()),
         pricing=_PRICING,
         cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
-    )
+    ).billing
     assert billing.usage.input_tokens_cache_read == 600
     assert billing.usage.input_tokens_cache_write == 0
     assert billing.usage.input_tokens_cache_none == 400
@@ -511,7 +519,7 @@ def test_the_turn_replays_as_one_assistant_param_with_reasoning_merged_beside_co
 
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
-    raw: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
+    raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
     assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
@@ -1330,7 +1338,7 @@ def test_billing_reported_is_none_until_the_usage_chunk_arrives() -> None:
     """A stream cut off before the usage-bearing chunk reports None, and the full drain reports it."""
     stream = _stream(_text_stream_chunks())
 
-    async def scenario() -> tuple[Billing | None, Billing | None]:
+    async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
         before = stream.billing_reported()
         async for _item in stream.items():
             pass
@@ -1339,7 +1347,7 @@ def test_billing_reported_is_none_until_the_usage_chunk_arrives() -> None:
     before, after = asyncio.run(scenario())
     assert before is None
     assert after is not None
-    assert after.usage.input_tokens_total == 1000
+    assert after.billing.usage.input_tokens_total == 1000
 
 
 def test_final_patches_the_tracked_usage_over_a_trailing_chunks_reset() -> None:

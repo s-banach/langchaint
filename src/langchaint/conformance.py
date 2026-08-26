@@ -23,8 +23,8 @@ from langchaint.adapter import (
     InvalidRequest,
     RequestParams,
 )
-from langchaint.call import AttemptRecord, CallRecord
-from langchaint.exceptions import AbandonedCallError, StreamProtocolError, TransientError
+from langchaint.call import CallRecord, SettledAttemptRecord
+from langchaint.exceptions import AbandonedCallErrorRecord, StreamProtocolError, TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import (
     AssistantMessage,
@@ -211,7 +211,7 @@ class AdapterConformance(ABC):
         """Return the billing of each fixture response the cost invariants price."""
         bound_adapter = self._bound_adapter()
         return [
-            bound_adapter.billing_from_raw(raw)
+            bound_adapter.billing_from_raw(raw).billing
             for raw in (
                 self.response_with_cache_writes(),
                 self.response_without_usage(),
@@ -275,7 +275,7 @@ class AdapterConformance(ABC):
 
         A Billing exists whenever a response did, and it names the tier that would have priced it.
         """
-        billing = self._bound_adapter().billing_from_raw(self.response_without_usage())
+        billing = self._bound_adapter().billing_from_raw(self.response_without_usage()).billing
         assert billing.usage == ZERO_USAGE
         assert billing.service_tier
 
@@ -284,7 +284,9 @@ class AdapterConformance(ABC):
 
         NaN preserves paid output without reporting a free request.
         """
-        billing = self._bound_adapter().billing_from_raw(self.response_at_an_unpriced_tier())
+        billing = (
+            self._bound_adapter().billing_from_raw(self.response_at_an_unpriced_tier()).billing
+        )
         assert math.isnan(billing.input_cache_none_usd_per_million_tokens)
         assert math.isnan(billing.cache_read_usd_per_million_tokens)
         assert math.isnan(billing.cache_write_usd_per_million_tokens)
@@ -430,8 +432,8 @@ class AdapterConformance(ABC):
         streamed, whole = self.streamed_and_whole()
         bound_adapter = self._bound_adapter()
         assert bound_adapter.interpret(streamed) == bound_adapter.interpret(whole)
-        assert bound_adapter.billing_from_raw(streamed).usage == (
-            bound_adapter.billing_from_raw(whole).usage
+        assert bound_adapter.billing_from_raw(streamed).billing.usage == (
+            bound_adapter.billing_from_raw(whole).billing.usage
         )
 
     def test_a_stream_missing_its_terminal_event_raises(self) -> None:
@@ -493,29 +495,25 @@ class AdapterConformance(ABC):
                 )
 
 
-def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallError:
+def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallErrorRecord:
     """Wrap one Billing in a result carrier, to reach to_tables with a single attempts row."""
-    return AbandonedCallError(
+    return AbandonedCallErrorRecord(
         call=CallRecord(
             model=adapter.model,
             provider_name=adapter.provider_name,
             attempt_records=(
-                AttemptRecord(
-                    started_at_monotonic_seconds=0.0,
-                    ended_at_monotonic_seconds=1.0,
-                    first_item_at_monotonic_seconds=None,
+                SettledAttemptRecord(
+                    started_after_seconds=0.0,
+                    elapsed_seconds=1.0,
+                    seconds_to_first_item=None,
                     error=None,
                     billing=billing,
                     assistant_message=None,
-                    raw=None,
                     model_served=None,
                     response_id=None,
                     request_id=None,
                 ),
             ),
-            started_at_monotonic_seconds=0.0,
             elapsed_seconds=1.0,
         ),
-        billing_in_flight=None,
-        in_flight_attempt_started_at_monotonic_seconds=None,
     )

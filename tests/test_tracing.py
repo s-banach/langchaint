@@ -35,26 +35,21 @@ from langchaint import (
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
+    GenerationError,
     ImagePart,
     ImageUrlPart,
-    InvalidRequestError,
     JSONSchemaTool,
-    MaxCompletionTokensExceededError,
     PydanticTool,
     ReasoningPart,
-    RefusalError,
     Response,
-    RetriesExhaustedError,
-    RetryUnavailableError,
+    SettledAttemptRecord,
     StreamItem,
     TextPart,
-    TimedOutError,
     ToolCall,
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
     TransientError,
-    UnfinishedTurnError,
     UserMessage,
     to_tables,
 )
@@ -269,7 +264,7 @@ class _IsRecordingRaisesTracer(trace.NoOpTracer):
 
 
 def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -> None:
-    """A broken span cannot replace InvalidRequestError."""
+    """A broken span cannot replace GenerationError."""
 
     async def scenario() -> None:
         """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
@@ -279,7 +274,7 @@ def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -
             tracer=_IsRecordingRaisesTracer(),
             capture_message_content=True,
         )
-        with pytest.raises(InvalidRequestError):
+        with pytest.raises(GenerationError):
             await traced.bind().generate_one("hi")
 
     asyncio.run(scenario())
@@ -337,7 +332,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
 
 
 def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
-    """A RefusalError yields an error span carrying the 200's real token counts and cost."""
+    """A GenerationError yields an error span carrying the 200's real token counts and cost."""
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports Refusal, then inspect the error span."""
@@ -348,7 +343,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(RefusalError):
+        with pytest.raises(GenerationError):
             await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -361,7 +356,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
 
 def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None:
-    """A MaxCompletionTokensExceededError yields an error span with the 200's tokens and max_tokens finish."""
+    """A GenerationError yields an error span with the 200's tokens and max_tokens finish."""
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports MaxCompletionTokensExceeded, then inspect the error span."""
@@ -374,7 +369,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(MaxCompletionTokensExceededError):
+        with pytest.raises(GenerationError):
             await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -397,7 +392,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(RetriesExhaustedError):
+        with pytest.raises(GenerationError):
             await traced.bind(max_attempts=2).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -428,13 +423,13 @@ def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(InvalidRequestError):
+        with pytest.raises(GenerationError):
             await traced.bind().generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == "misconfigured"
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "InvalidRequestError"
+        assert span.attributes["error.type"] == "InvalidRequestErrorRecord"
         # Nothing was sent, so the usage attributes are the zeros of a call that never billed.
         assert span.attributes["langchaint.cost_in_usd"] == 0.0
         assert "gen_ai.response.finish_reasons" not in span.attributes
@@ -508,7 +503,7 @@ async def _drain_by_final(handle: TracedStreamHandle[str]) -> None:
 def test_a_traced_streams_expired_deadline_takes_error_status(
     drain: Callable[[TracedStreamHandle[str]], Awaitable[None]],
 ) -> None:
-    """Stream deadlines record TimedOutError for each drain method."""
+    """Stream deadlines record GenerationError for each drain method."""
 
     async def scenario() -> None:
         """Drain a stream that stalls after its first item, under a deadline it outlasts."""
@@ -523,14 +518,14 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         )
         handle = traced.bind().stream_one("hi", timeout_seconds=0.05)
 
-        with pytest.raises(TimedOutError):
+        with pytest.raises(GenerationError):
             async with handle:
                 await drain(handle)
         assert handle.abandoned is None
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
-        assert span.attributes[error_semconv.ERROR_TYPE] == "TimedOutError"
+        assert span.attributes[error_semconv.ERROR_TYPE] == "TimedOutErrorRecord"
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -605,7 +600,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
             [UserMessage(content="c")],
         ])
         first, *rest = results
-        assert isinstance(first, RefusalError)
+        assert isinstance(first, GenerationError)
         assert all(isinstance(result, Response) for result in rest)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
@@ -615,7 +610,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         # max_concurrent_requests=1 serializes the batch, so the refused item is the first span to end.
         refused, *succeeded = spans
         assert refused.status.status_code == StatusCode.ERROR
-        assert _attribute(refused, "error.type") == "RefusalError"
+        assert _attribute(refused, "error.type") == "RefusalErrorRecord"
         assert all(span.status.status_code == StatusCode.OK for span in succeeded)
 
     asyncio.run(scenario())
@@ -759,7 +754,7 @@ def test_stream_never_entered_emits_no_span() -> None:
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
-    """A stream failure records RetryUnavailableError and attempt_failed."""
+    """A stream failure records GenerationError and attempt_failed."""
 
     async def _drain(traced: TracedLLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
@@ -776,12 +771,12 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(RetryUnavailableError):
+        with pytest.raises(GenerationError):
             await _drain(traced)
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "RetryUnavailableError"
+        assert span.attributes["error.type"] == "RetryUnavailableErrorRecord"
         assert [event.name for event in span.events] == ["langchaint.attempt_failed"]
 
     asyncio.run(scenario())
@@ -802,13 +797,13 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
             tracer=tracer,
             capture_message_content=False,
         )
-        with pytest.raises(RetriesExhaustedError):
+        with pytest.raises(GenerationError):
             async with traced.bind(max_attempts=2).stream_one("hi"):
                 pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "RetriesExhaustedError"
+        assert span.attributes["error.type"] == "RetriesExhaustedErrorRecord"
         assert span.attributes["langchaint.attempts"] == 2
         assert [event.name for event in span.events] == ["langchaint.attempt_failed"] * 2
 
@@ -828,7 +823,7 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
             capture_message_content=False,
         )
         async with traced.bind().stream_one("hi") as stream:
-            with pytest.raises(RefusalError):
+            with pytest.raises(GenerationError):
                 await stream.final()
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
@@ -1210,7 +1205,11 @@ def test_gen_ai_attributes_is_public_and_composable() -> None:
             """Extend the built-in attributes with the call's total request time."""
             return {
                 **gen_ai_attributes(result),
-                "app.request_seconds": sum(a.elapsed_seconds for a in result.attempt_records),
+                "app.request_seconds": sum(
+                    attempt.elapsed_seconds
+                    for attempt in result.attempt_records
+                    if isinstance(attempt, SettledAttemptRecord)
+                ),
             }
 
         tracer, exporter = _in_memory_tracer()
@@ -2294,13 +2293,13 @@ def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> Non
             tracer=tracer,
             capture_message_content=True,
         )
-        with pytest.raises(RefusalError):
+        with pytest.raises(GenerationError):
             await traced.bind(system_prompt="be brief").generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
         assert "gen_ai.system_instructions" in span.attributes
-        assert span.attributes["error.type"] == "RefusalError"
+        assert span.attributes["error.type"] == "RefusalErrorRecord"
         (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
         assert message["role"] == "assistant"
         assert message["finish_reason"] == "refusal"
@@ -2320,7 +2319,7 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
             tracer=tracer,
             capture_message_content=True,
         )
-        with pytest.raises(RetriesExhaustedError):
+        with pytest.raises(GenerationError):
             await traced.bind(max_attempts=2).generate_one("hi")
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
@@ -2682,7 +2681,7 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
             tracer=tracer,
             capture_message_content=capture_message_content,
         )
-        with pytest.raises(RefusalError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await traced.bind(max_attempts=3).generate_one("hi")
 
         error = raised.value
@@ -2722,7 +2721,7 @@ def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reas
             tracer=tracer,
             capture_message_content=True,
         )
-        with pytest.raises(UnfinishedTurnError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await traced.bind().generate_one("hi")
         assert raised.value.stop_reason is None
         (span,) = exporter.get_finished_spans()

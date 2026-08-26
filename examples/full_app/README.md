@@ -61,7 +61,7 @@ For example, the first specialist uses `root/research_climate/specialist#0`.
 
 `AgentConfig.generate_one_timeout_seconds` becomes `generate_one(timeout_seconds=...)`.
 That deadline includes admission, retries, and provider work.
-`max_turns` bounds repeated `TimedOutError` outcomes.
+`max_turns` bounds repeated `TimedOutErrorRecord` outcomes.
 
 `AgentConfig.max_cost_in_usd` is optional.
 The loop checks `cost_in_usd` before each turn and stops at the configured value.
@@ -95,7 +95,7 @@ The remaining accounting fields are exact:
 ## Deadlines and cancellation
 
 `generate_one_timeout_seconds` belongs to one `generate_one` call.
-A `TimedOutError` carries settled attempt accounting.
+A `TimedOutErrorRecord` carries settled attempt accounting.
 The loop appends `LlmFailure` before continuing.
 `LlmCallAbandoned` reports that continuation.
 

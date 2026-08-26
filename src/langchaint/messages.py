@@ -4,12 +4,66 @@ Adapters convert each complete `Sequence[Message]` to provider values.
 The system prompt remains a binding parameter because providers place it outside messages.
 """
 
-from collections.abc import Mapping, Sequence
-from typing import Annotated, Literal
+import math
+from collections.abc import Sequence
+from typing import Annotated, Literal, TypeIs
 
-from pydantic import BeforeValidator, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter, model_validator
 
 from langchaint.checked_copy import CheckedCopyModel
+
+
+def _is_object_list(value: object) -> TypeIs[list[object]]:
+    return type(value) is list
+
+
+def _is_object_dict(value: object) -> TypeIs[dict[object, object]]:
+    return type(value) is dict
+
+
+def _require_json_runtime_shape(value: object) -> object:
+    active_container_ids: set[int] = set()
+
+    def require_value_shape(nested_value: object) -> None:
+        if nested_value is None or type(nested_value) in (bool, int, str):
+            return
+        if type(nested_value) is float:
+            if not math.isfinite(nested_value):
+                raise ValueError("a JSON number must be finite")
+            return
+        if _is_object_list(nested_value):
+            container_id = id(nested_value)
+            if container_id in active_container_ids:
+                raise ValueError("a JSON value must not contain a cycle")
+            active_container_ids.add(container_id)
+            try:
+                for item in nested_value:
+                    require_value_shape(item)
+            finally:
+                active_container_ids.remove(container_id)
+            return
+        if _is_object_dict(nested_value):
+            container_id = id(nested_value)
+            if container_id in active_container_ids:
+                raise ValueError("a JSON value must not contain a cycle")
+            active_container_ids.add(container_id)
+            try:
+                for key, item in nested_value.items():
+                    if type(key) is not str:
+                        raise ValueError("a JSON object key must be a string")
+                    require_value_shape(item)
+            finally:
+                active_container_ids.remove(container_id)
+            return
+        raise ValueError("value must use JSON runtime types")
+
+    require_value_shape(value)
+    return value
+
+
+type _JsonValue = None | bool | int | FiniteFloat | str | list[_JsonValue] | dict[str, _JsonValue]
+type JsonValue = Annotated[_JsonValue, BeforeValidator(_require_json_runtime_shape)]
+"""A JSON value whose floating-point values are finite."""
 
 
 class TextPart(CheckedCopyModel):
@@ -129,7 +183,7 @@ class ReasoningPart(CheckedCopyModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    raw: Mapping[str, object]
+    raw: dict[str, JsonValue]
     text: str | None = None
     kind: Literal["reasoning_part"] = "reasoning_part"
 
@@ -146,7 +200,7 @@ class RawPart(CheckedCopyModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    raw: Mapping[str, object]
+    raw: dict[str, JsonValue]
     kind: Literal["raw_part"] = "raw_part"
 
 

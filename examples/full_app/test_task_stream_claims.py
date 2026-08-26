@@ -39,7 +39,7 @@ from task_stream import (
     build_delegate_tool,
 )
 
-from langchaint import ZERO_USAGE, DispatchExceptionGroup, TimedOutError, ToolCall, tool
+from langchaint import ZERO_USAGE, DispatchExceptionGroup, ToolCall, tool
 from langchaint.tracing import TracedLLM
 
 
@@ -48,9 +48,8 @@ def _discard(event: Event) -> None:
 
 
 def _timed_out_count(app: App) -> int:
-    """Count TimedOutError records across each run's turn_log."""
     return sum(
-        isinstance(record, LlmFailure) and isinstance(record.error, TimedOutError)
+        isinstance(record, LlmFailure) and record.error.record.kind == "timed_out_error"
         for run in app.runs.values()
         for record in run.turn_log
     )

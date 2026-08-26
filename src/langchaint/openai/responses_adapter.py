@@ -153,7 +153,7 @@ from langchaint.openai.shared import (
     require_prompt_cache_options_support,
 )
 from langchaint.pricing import (
-    Billing,
+    ProviderBilling,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
 )
@@ -602,7 +602,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
         if item.type == "reasoning":
             turn.append(
                 ReasoningPart(
-                    raw=item.model_dump(mode="python", exclude_none=True),
+                    raw=item.model_dump(mode="json", exclude_none=True),
                     text=_reasoning_text(item),
                 )
             )
@@ -615,7 +615,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
                 elif content_part.type == "refusal":
                     turn.append(TextPart(text=content_part.refusal))
         else:
-            turn.append(RawPart(raw=item.model_dump(mode="python", exclude_none=True)))
+            turn.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
 
@@ -624,7 +624,7 @@ def _billing_from_response(
     pricing: OpenAIPricingTable,
     *,
     regional_processing: bool = False,
-) -> Billing:
+) -> ProviderBilling:
     """Price response counters at the reported `service_tier`.
 
     `input_tokens` includes cached and cache-write tokens.
@@ -1016,7 +1016,7 @@ class _OpenAIStream(AdapterStream):
         return self._terminal_response
 
     @override
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Return terminal billing or NaN for incomplete charged provider tools.
 
         OpenAI 2.45.0 stream state accumulates output items without counters.
@@ -1072,7 +1072,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
     _precomputed_fields: _OpenAIPrecomputedFields
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price counters using the reported `service_tier`.
 
         Raises:

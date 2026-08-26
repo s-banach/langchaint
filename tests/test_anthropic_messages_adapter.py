@@ -65,6 +65,7 @@ from langchaint.adapter import (
     MaxCompletionTokensExceeded,
     NoOutput,
     NoOutputOutcome,
+    ProviderBilling,
     Refusal,
     RequestParams,
     ResponseOutcome,
@@ -82,13 +83,14 @@ from langchaint.anthropic import (
     AnthropicRates,
 )
 from langchaint.anthropic.messages_adapter import (
+    _NO_ANTHROPIC_PROVIDER_TOOLS,
     PARSE_FALLTHROUGH_COUNTS,
     _adapter_result,
+    _AnthropicProviderTools,
     _AnthropicRequestParams,
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
-    _billing_from_sdk_usage,
     _BoundAnthropic,
     _BoundAnthropicStructured,
     _BoundAnthropicText,
@@ -98,6 +100,9 @@ from langchaint.anthropic.messages_adapter import (
     _wire_messages,
     _wire_tool_choice,
     parse_anthropic,
+)
+from langchaint.anthropic.messages_adapter import (
+    _billing_from_sdk_usage as _provider_billing_from_sdk_usage,
 )
 from langchaint.call import ResponseIdentity
 from langchaint.conformance import AdapterConformance
@@ -110,6 +115,22 @@ from langchaint.shared_backoff import (
     Verdict,
 )
 from langchaint.tools import ToolSchema
+
+
+def _billing_from_sdk_usage(
+    usage: at.Usage,
+    pricing: AnthropicPricingTable,
+    *,
+    provider_tools: _AnthropicProviderTools = _NO_ANTHROPIC_PROVIDER_TOOLS,
+    billing_complete: bool = True,
+) -> Billing:
+    return _provider_billing_from_sdk_usage(
+        usage,
+        pricing,
+        provider_tools=provider_tools,
+        billing_complete=billing_complete,
+    ).billing
+
 
 _STANDARD_RATES = AnthropicRates(
     input_cache_none_usd_per_million_tokens=3.0,
@@ -195,7 +216,7 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
     usage_raw = _usage_with_cache_split()
     billing = _billing_from_sdk_usage(usage_raw, _PRICING)
     usage = billing.usage
-    assert billing.usage_raw is usage_raw
+    assert _provider_billing_from_sdk_usage(usage_raw, _PRICING).usage_raw is usage_raw
     assert billing.service_tier == "standard"
     assert billing.input_cache_none_usd_per_million_tokens == 3.0
     assert billing.cache_read_usd_per_million_tokens == 0.3
@@ -2325,7 +2346,7 @@ def test_request_rejects_an_empty_tuple_system_prompt() -> None:
 def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot_after() -> None:
     """billing_reported returns None before the first event and Billing after it."""
 
-    async def scenario() -> tuple[Billing | None, Billing | None]:
+    async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
         """Read billing before and after one stream item."""
         adapter_stream = _anthropic_stream(
             [_text_delta_event("he", 0)], _message_snapshot("end_turn")
@@ -2337,7 +2358,9 @@ def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot
 
     before, after = asyncio.run(scenario())
     assert before is None
-    assert after == _billing_from_sdk_usage(at.Usage(input_tokens=1, output_tokens=1), _PRICING)
+    assert after == _provider_billing_from_sdk_usage(
+        at.Usage(input_tokens=1, output_tokens=1), _PRICING
+    )
 
 
 def _turn_content() -> list[at.ContentBlock]:

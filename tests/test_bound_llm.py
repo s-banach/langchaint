@@ -15,42 +15,36 @@ from langchaint import (
     ZERO_USAGE,
     AllowedToolsChoice,
     AssistantMessage,
-    Billing,
     BoundLLM,
     CallResult,
     CaptureTool,
-    ContextWindowExceededError,
+    CutOffAttemptRecord,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DoNotRetry,
-    EmptyTurnError,
-    EscapedExceptionError,
+    EscapedExceptionErrorRecord,
     GenerationError,
-    InvalidRequestError,
-    MaxCompletionTokensExceededError,
+    InvalidRequestErrorRecord,
     Message,
     ParserContractError,
     PauseAllDoNotRetry,
-    ProviderDeclaredFinalError,
-    ProviderFailedTerminallyError,
-    RefusalError,
+    ProviderDeclaredFinalErrorRecord,
     Response,
-    RetriesExhaustedError,
-    RetryUnavailableError,
-    SchemaViolationError,
+    RetriesExhaustedErrorRecord,
+    SchemaViolationErrorRecord,
+    SettledAttemptRecord,
     SharedBackoff,
     StopReason,
     StreamItem,
     StreamProtocolError,
     TextPart,
-    TimedOutError,
     ToolCall,
     ToolCallTurn,
     ToolManager,
     ToolSchema,
     TransientError,
-    UnfinishedTurnError,
-    UnknownExceptionError,
+    TransientErrorRecord,
+    UnknownExceptionErrorRecord,
     Usage,
     UserMessage,
     Verdict,
@@ -67,6 +61,7 @@ from langchaint.adapter import (
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
+    ProviderBilling,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     Refusal,
@@ -80,7 +75,16 @@ from langchaint.call import ResponseIdentity
 from langchaint.llm import UNCHANGED, Unchanged
 from langchaint.shared_backoff import _NEVER
 from langchaint.streaming import StreamHandle
-from tests.helpers import random_returns_zero, stated_billing
+from tests.helpers import random_returns_zero, stated_provider_billing
+
+
+def _settled_attempt_records(
+    records: tuple[SettledAttemptRecord | CutOffAttemptRecord, ...],
+) -> tuple[SettledAttemptRecord, ...]:
+    settled = tuple(record for record in records if isinstance(record, SettledAttemptRecord))
+    assert len(settled) == len(records)
+    return settled
+
 
 _USAGE = Usage(
     input_tokens_cache_read=0,
@@ -208,9 +212,11 @@ class _FakeStream(AdapterStream):
         """What billing_reported wraps; None stands for an adapter with no such channel."""
 
     @override
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Wrap whatever the test set, defaulting to the None an openai stream returns."""
-        return None if self._usage_reported is None else stated_billing(self._usage_reported)
+        return (
+            None if self._usage_reported is None else stated_provider_billing(self._usage_reported)
+        )
 
     @override
     def request_id(self) -> str | None:
@@ -611,9 +617,9 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         self.peak_in_flight = 0
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Return what the response under this raw was scripted to have billed."""
-        return stated_billing(self._scripted_by_raw_id[_as_fake_raw(raw).id].usage)
+        return stated_provider_billing(self._scripted_by_raw_id[_as_fake_raw(raw).id].usage)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
@@ -697,7 +703,7 @@ class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
     """
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Unreachable: response_format rebind tests do not generate."""
         raise NotImplementedError
 
@@ -865,10 +871,11 @@ def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_recor
     async def scenario() -> None:
         """Drive one generate_one whose interpret raises over the response its stream assembled."""
         bound_llm = LLM(_InterpretRaisesAdapter(), shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(UnknownExceptionError) as unplaceable:
+        with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = unplaceable.value.attempt_records
-        assert isinstance(record.raw, _FakeRawResponse)
+        (record,) = _settled_attempt_records(unplaceable.value.attempt_records)
+        (provider_attempt,) = unplaceable.value.provider_attempts
+        assert isinstance(provider_attempt.raw, _FakeRawResponse)
         assert record.usage == _USAGE
         assert record.assistant_message is None
         assert record.error is None
@@ -889,8 +896,9 @@ def test_stream_final_records_the_response_before_interpreting_it() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(RuntimeError, match="interpretation failed"):
                 await handle.final()
-            (record,) = handle._ledger.freeze().attempt_records
-        assert record.raw is stream.raw
+            (record,) = _settled_attempt_records(handle._ledger.freeze().attempt_records)
+            (provider_attempt,) = handle._ledger.provider_attempts
+        assert provider_attempt.raw is stream.raw
         assert record.usage == _USAGE_STREAM
         assert record.assistant_message is None
         assert record.error is None
@@ -922,13 +930,14 @@ def test_retry_recovers_after_a_transient_failure() -> None:
         assert succeeded.request_id == f"req-{_as_fake_raw(response.raw).id}"
         (succeeding_raw,) = adapter.bound_adapters[0].final_raws
         assert response.raw is succeeding_raw
-        assert (
-            failed.started_at_monotonic_seconds
-            <= failed.ended_at_monotonic_seconds
-            <= succeeded.started_at_monotonic_seconds
-            <= succeeded.ended_at_monotonic_seconds
+        assert failed.started_after_seconds + failed.elapsed_seconds <= (
+            succeeded.started_after_seconds
         )
-        records_span = succeeded.ended_at_monotonic_seconds - failed.started_at_monotonic_seconds
+        records_span = (
+            succeeded.started_after_seconds
+            + succeeded.elapsed_seconds
+            - failed.started_after_seconds
+        )
         assert response.elapsed_seconds >= records_span
 
     asyncio.run(scenario())
@@ -1009,7 +1018,7 @@ def test_an_adapter_raised_transient_error_still_names_its_request() -> None:
 
 
 def test_retry_exhaustion_raises_ordered_failure() -> None:
-    """Exhausting the budget raises RetriesExhaustedError carrying the ordered errors."""
+    """Exhausting the budget raises GenerationError carrying the ordered errors."""
 
     async def scenario() -> None:
         """Drive one generate_one to exhaustion under a two-attempt budget."""
@@ -1017,11 +1026,14 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=2,
         )
-        with pytest.raises(RetriesExhaustedError) as exhausted:
+        with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
         failure = exhausted.value
-        assert [str(error) for error in failure.errors_from_attempts] == ["e1", "e2"]
-        assert [str(record.error) for record in failure.attempt_records] == ["e1", "e2"]
+        assert isinstance(failure.record, RetriesExhaustedErrorRecord)
+        assert [str(error) for error in failure.record.errors_from_attempts] == ["e1", "e2"]
+        assert [
+            str(record.error) for record in _settled_attempt_records(failure.attempt_records)
+        ] == ["e1", "e2"]
         assert failure.error_text == "attempt 1: e1; attempt 2: e2"
         assert failure.attempts == 2
         assert failure.model == adapter.model
@@ -1054,7 +1066,9 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         failed, succeeded = response.attempt_records
         assert failed.elapsed_seconds < 0.05
-        backoff_gap = succeeded.started_at_monotonic_seconds - failed.ended_at_monotonic_seconds
+        backoff_gap = succeeded.started_after_seconds - (
+            failed.started_after_seconds + failed.elapsed_seconds
+        )
         assert backoff_gap >= 0.05
         assert response.elapsed_seconds >= 0.05
 
@@ -1070,11 +1084,12 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
             invalid_requests=[InvalidRequest(reason="nope")], classify_result="transient"
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(InvalidRequestError) as rejected:
+        with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
-        assert rejected.value.reason == "nope"
+        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.reason == "nope"
         assert rejected.value.error_text == "nope"
         assert rejected.value.model == adapter.model
         assert rejected.value.provider_name == adapter.provider_name
@@ -1085,7 +1100,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
 
 
 def test_rejection_after_transient_attempts_carries_their_records() -> None:
-    """InvalidRequestError preserves earlier attempt records and Usage."""
+    """GenerationError preserves earlier attempt records and Usage."""
 
     async def scenario() -> None:
         """Settle one billed transient attempt, then have classify call the next one a rejection."""
@@ -1097,13 +1112,13 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
             classify_result="invalid_request",
         )
         bound_llm = LLM(classified_adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(InvalidRequestError) as classified:
+        with pytest.raises(GenerationError) as classified:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        billed_record, rejected_record = classified.value.attempt_records
+        billed_record, rejected_record = _settled_attempt_records(classified.value.attempt_records)
         assert billed_record.usage.cost_in_usd == 0.25
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
-        assert rejected_record.raw is None
+        assert classified.value.provider_attempts[-1].raw is None
         assert isinstance(classified.value.__cause__, ValueError)
         assert classified.value.request == _FakeRequest(messages=(UserMessage(content="hi"),))
 
@@ -1111,7 +1126,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
 
 
 def test_refusal_outcome_raises_without_retry() -> None:
-    """A Refusal outcome becomes a RefusalError carrying the attempt record, never retried.
+    """A Refusal outcome becomes a GenerationError carrying the attempt record, never retried.
 
     The record carries the turn the refusal arrived on and the response it was read from.
     """
@@ -1120,7 +1135,7 @@ def test_refusal_outcome_raises_without_retry() -> None:
         """Drive one generate_one whose attempt reports the Refusal variant."""
         adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(RefusalError) as refusal:
+        with pytest.raises(GenerationError) as refusal:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = refusal.value
@@ -1128,11 +1143,11 @@ def test_refusal_outcome_raises_without_retry() -> None:
         assert failure.stop_reason == "refusal"
         assert failure.usage.cost_in_usd == 0.25
         assert failure.usage.output_tokens == _USAGE.output_tokens
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
         assert record.usage.cost_in_usd == 0.25
         assert record.assistant_message == _REJECTED_TURN
-        assert record.raw is not None
+        assert failure.provider_attempts[0].raw is not None
 
     asyncio.run(scenario())
 
@@ -1142,13 +1157,13 @@ def test_refusal_outcome_raises_without_retry() -> None:
     [
         (
             MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN),
-            MaxCompletionTokensExceededError,
+            GenerationError,
             "max_tokens",
         ),
-        (EmptyTurn(assistant_message=_REJECTED_TURN), EmptyTurnError, "end_turn"),
+        (EmptyTurn(assistant_message=_REJECTED_TURN), GenerationError, "end_turn"),
         (
             ContextWindowExceeded(assistant_message=_REJECTED_TURN),
-            ContextWindowExceededError,
+            GenerationError,
             "context_window_exceeded",
         ),
     ],
@@ -1192,13 +1207,14 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
             ]
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(SchemaViolationError) as schema_violation:
+        with pytest.raises(GenerationError) as schema_violation:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = schema_violation.value
         assert failure.attempts == 1
         assert failure.stop_reason == "end_turn"
-        assert failure.validation_error_json == _VALIDATION_ERROR_JSON
+        assert isinstance(failure.record, SchemaViolationErrorRecord)
+        assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
         assert "SENTINEL" not in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
 
@@ -1224,7 +1240,7 @@ def test_unfinished_turn_outcome_raises_carrying_the_adapter_s_reason() -> None:
             ]
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(UnfinishedTurnError) as unfinished_turn:
+        with pytest.raises(GenerationError) as unfinished_turn:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = unfinished_turn.value
@@ -1245,7 +1261,7 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
         assert adapter.bound_adapters[0].open_count == 2
         assert response.attempts == 2
         rejected, succeeded = response.attempt_records
-        assert isinstance(rejected.error, TransientError)
+        assert isinstance(rejected.error, TransientErrorRecord)
         assert str(rejected.error) == _PROVIDER_FAILURE_REASON
         assert rejected.usage.cost_in_usd == 0.25
         assert succeeded.error is None
@@ -1277,10 +1293,10 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
             max_attempts=1,
         )
-        with pytest.raises(RetriesExhaustedError) as exhausted:
+        with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = exhausted.value.attempt_records
-        assert isinstance(record.error, TransientError)
+        (record,) = _settled_attempt_records(exhausted.value.attempt_records)
+        assert isinstance(record.error, TransientErrorRecord)
         assert record.error.is_rate_limit
         # Only a PauseAll record moves _pause_until off the sentinel, so this is the flag arriving.
         assert shared_backoff._pause_until != _NEVER
@@ -1303,7 +1319,7 @@ def test_provider_failed_terminally_raises_without_retry() -> None:
             ]
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(ProviderFailedTerminallyError) as provider_failure:
+        with pytest.raises(GenerationError) as provider_failure:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = provider_failure.value
@@ -1332,40 +1348,41 @@ def test_a_plain_exception_classified_transient_is_retried() -> None:
 
 
 def test_exception_classified_invalid_request_fails_the_item_without_retry() -> None:
-    """A plain exception classified invalid_request raises InvalidRequestError on the first attempt.
+    """A plain exception classified invalid_request raises GenerationError on the first attempt.
 
-    InvalidRequestError fails one batch item and preserves __cause__.
+    GenerationError fails one batch item and preserves __cause__.
     """
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt raises a classify-invalid_request exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="invalid_request")
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(InvalidRequestError) as rejected:
+        with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
-        assert rejected.value.reason == "the provider rejected the request: boom"
+        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.reason == "the provider rejected the request: boom"
         assert isinstance(rejected.value.__cause__, ValueError)
 
     asyncio.run(scenario())
 
 
 def test_exception_classified_unknown_exception_fails_the_item_without_retry() -> None:
-    """A plain exception classified unknown_exception raises UnknownExceptionError on the first attempt.
+    """A plain exception classified unknown_exception raises GenerationError on the first attempt.
 
-    UnknownExceptionError fails one batch item without an AttemptRecord.
+    GenerationError fails one batch item without an AttemptRecord.
     """
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt raises a classify-unknown_exception exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unknown_exception")
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(UnknownExceptionError) as unplaceable:
+        with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = unplaceable.value
         assert isinstance(failure, GenerationError)
-        assert isinstance(failure.error, ValueError)
+        assert isinstance(failure.record, UnknownExceptionErrorRecord)
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "langchaint could not place this exception: boom"
         assert failure.stop_reason is None
@@ -1377,7 +1394,7 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
 
 
 def test_exception_classified_declared_final_fails_the_item_with_a_record() -> None:
-    """A plain exception classified declared_final raises ProviderDeclaredFinalError, unretried.
+    """A plain exception classified declared_final raises GenerationError, unretried.
 
     A provider response creates an AttemptRecord with ZERO_USAGE when it reports no Billing.
     """
@@ -1386,16 +1403,16 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
         """Drive one generate_one whose attempt raises a classify-declared_final exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="declared_final")
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(ProviderDeclaredFinalError) as declared_final:
+        with pytest.raises(GenerationError) as declared_final:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = declared_final.value
-        assert isinstance(failure.error, ValueError)
+        assert isinstance(failure.record, ProviderDeclaredFinalErrorRecord)
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "a final error from the provider: boom"
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
-        assert record.raw is None
+        assert failure.provider_attempts[0].raw is None
         assert record.usage == ZERO_USAGE
         assert failure.usage == ZERO_USAGE
 
@@ -1412,7 +1429,7 @@ def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_lim
             failures=[TransientError("throttled")], classify_result="invalid_request"
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
-        with pytest.raises(ProviderDeclaredFinalError):
+        with pytest.raises(GenerationError):
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         # Only a pausing record moves _pause_until off the sentinel, so this is the pause arriving.
@@ -1432,9 +1449,9 @@ def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=1,
         )
-        with pytest.raises(RetriesExhaustedError) as exhausted:
+        with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = exhausted.value.attempt_records
+        (record,) = _settled_attempt_records(exhausted.value.attempt_records)
         assert record.usage == _USAGE_STREAM
         assert record.request_id == "req-fake-stream"
         assert stream.closed
@@ -1443,19 +1460,20 @@ def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -
 
 
 def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -> None:
-    """TimedOutError preserves Billing reported before a mid-drain hang."""
+    """GenerationError preserves Billing reported before a mid-drain hang."""
 
     async def scenario() -> None:
         """Hang a stream after its first item and let a short deadline expire."""
         stream = _HangsAfterFirstItemStream()
         stream._usage_reported = _USAGE_STREAM
         bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(TimedOutError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.05)
         timed_out = raised.value
-        assert timed_out.attempt_records == ()
-        assert timed_out.billing_in_flight is not None
-        assert timed_out.billing_in_flight.usage == _USAGE_STREAM
+        (cut_off,) = timed_out.attempt_records
+        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.billing is not None
+        assert cut_off.billing.usage == _USAGE_STREAM
         assert timed_out.usage == _USAGE_STREAM
         assert stream.closed
 
@@ -1471,12 +1489,13 @@ def test_a_settled_attempts_billing_is_counted_once_after_a_later_deadline_cut()
         stream._usage_reported = _USAGE_STREAM
         adapter = _FakeAdapter(stream=stream, classify_result="transient", hang_from_open=2)
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(TimedOutError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.05)
         timed_out = raised.value
-        (record,) = timed_out.attempt_records
+        record, cut_off = timed_out.attempt_records
         assert record.usage == _USAGE_STREAM
-        assert timed_out.billing_in_flight is None
+        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.billing is None
         assert timed_out.usage == _USAGE_STREAM
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -1506,10 +1525,10 @@ def test_a_stream_protocol_error_is_retried_to_exhaustion() -> None:
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=2,
         )
-        with pytest.raises(RetriesExhaustedError) as exhausted:
+        with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 2
-        first, second = exhausted.value.attempt_records
+        first, second = _settled_attempt_records(exhausted.value.attempt_records)
         assert "stream ended without a stop event" in str(first.error)
         assert "stream ended without a stop event" in str(second.error)
 
@@ -1537,9 +1556,9 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_attempt() -> N
         """Fail the drain with an exception classify calls unknown_exception."""
         stream = _UnnamedItemErrorStream()
         bound_llm = LLM(_FakeAdapter(stream=stream), shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(UnknownExceptionError) as unplaceable:
+        with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = unplaceable.value.attempt_records
+        (record,) = _settled_attempt_records(unplaceable.value.attempt_records)
         assert record.usage == ZERO_USAGE
         assert record.request_id == "req-fake-stream"
         assert stream.closed
@@ -1548,7 +1567,7 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_attempt() -> N
 
 
 def test_an_unplaceable_exception_fails_only_its_item() -> None:
-    """A classify-unknown_exception item comes back as its UnknownExceptionError at its index.
+    """A classify-unknown_exception item comes back as its GenerationError at its index.
 
     The sibling succeeds.
     """
@@ -1565,7 +1584,7 @@ def test_an_unplaceable_exception_fails_only_its_item() -> None:
             [UserMessage(content="b")],
         ])
         first, second = results
-        assert isinstance(first, UnknownExceptionError)
+        assert isinstance(first, GenerationError)
         assert isinstance(second, Response)
         assert second.output == "b"
 
@@ -1838,9 +1857,9 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
         self.stream = _FakeStream()
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Bill every response the fixed _USAGE."""
-        return stated_billing(_USAGE)
+        return stated_provider_billing(_USAGE)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
@@ -2037,7 +2056,7 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
             [UserMessage(content="c")],
         ])
         first, second, third = results
-        assert isinstance(first, RetriesExhaustedError)
+        assert isinstance(first, GenerationError)
         assert isinstance(second, Response)
         assert second.output == "b"
         assert isinstance(third, Response)
@@ -2047,7 +2066,7 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
 
 
 def test_generate_many_returns_a_refusal_at_its_index() -> None:
-    """An item whose attempt reports Refusal comes back as the RefusalError at its index, siblings succeed."""
+    """An item whose attempt reports Refusal comes back as the GenerationError at its index, siblings succeed."""
 
     async def scenario() -> None:
         """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt reports Refusal."""
@@ -2062,7 +2081,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
             [UserMessage(content="b")],
         ])
         first, second = results
-        assert isinstance(first, RefusalError)
+        assert isinstance(first, GenerationError)
         assert first.stop_reason == "refusal"
         assert first.usage.cost_in_usd == 0.25
         assert isinstance(second, Response)
@@ -2072,7 +2091,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
 
 
 def test_invalid_request_fails_only_its_item() -> None:
-    """A rejected item comes back as its InvalidRequestError at its index. The sibling still succeeds.
+    """A rejected item comes back as its GenerationError at its index. The sibling still succeeds.
 
     Nothing a single item does reaches a sibling, so the batch returns one outcome per generation_input.
     """
@@ -2089,8 +2108,9 @@ def test_invalid_request_fails_only_its_item() -> None:
             [UserMessage(content="b")],
         ])
         first, second = results
-        assert isinstance(first, InvalidRequestError)
-        assert first.reason == "misconfigured"
+        assert isinstance(first, GenerationError)
+        assert isinstance(first.record, InvalidRequestErrorRecord)
+        assert first.record.reason == "misconfigured"
         assert isinstance(second, Response)
         assert second.output == "b"
 
@@ -2154,7 +2174,7 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
             warm_cache=True,
         )
         first, second, third = results
-        assert isinstance(first, RetriesExhaustedError)
+        assert isinstance(first, GenerationError)
         assert isinstance(second, Response)
         assert second.output == "b"
         assert isinstance(third, Response)
@@ -2201,13 +2221,13 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
             [UserMessage(content="a")],
             [UserMessage(content="b")],
         ])
-        failures = [result for result in results if isinstance(result, EscapedExceptionError)]
+        failures = [result for result in results if isinstance(result, GenerationError)]
         responses = [result for result in results if isinstance(result, Response)]
         assert len(failures) == 1
         assert len(responses) == 1
         failure = failures[0]
-        assert isinstance(failure.error, RuntimeError)
-        assert failure.__cause__ is failure.error
+        assert isinstance(failure.record, EscapedExceptionErrorRecord)
+        assert isinstance(failure.__cause__, RuntimeError)
         assert "classify defect" in failure.error_text
         assert failure.request is None
         # The attempt was in flight when the defect escaped, so no attempt is settled.
@@ -2217,16 +2237,13 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
 
 
 def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
-    """generate_one's caller sees the defect as an EscapedExceptionError, not the bare exception.
-
-    Defects propagate outside the GenerationError result channel.
-    """
+    """`generate_one` raises a defect as `GenerationError`."""
 
     async def scenario() -> None:
         """Fail the one attempt and let classify raise past the retry loop."""
         adapter = _ClassifyRaisesAdapter(failures=[ValueError("defect")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(EscapedExceptionError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
         assert str(raised.value) == "an exception escaped langchaint: classify defect"
 
@@ -2236,19 +2253,20 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
 def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provider_outcome() -> (
     None
 ):
-    """generate_one raises EscapedExceptionError whose error is the ParserContractError.
+    """generate_one raises GenerationError whose error is the ParserContractError.
 
     A parse contract violation must bypass the transport-failure path.
-    classify would report that path as an UnknownExceptionError.
+    `classify` would produce `UnknownExceptionErrorRecord` on that path.
     """
 
     async def scenario() -> None:
         """Fail the one attempt with a TransientError whose parse raises."""
         adapter = _FakeAdapter(failures=[TransientError("boom")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind()
-        with pytest.raises(EscapedExceptionError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
-        assert isinstance(raised.value.error, ParserContractError)
+        assert isinstance(raised.value.record, EscapedExceptionErrorRecord)
+        assert isinstance(raised.value.__cause__, ParserContractError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2280,9 +2298,9 @@ def test_a_defect_over_a_staged_response_keeps_the_attempt_and_its_billing() -> 
         """Stage the response, raise from interpret, then raise again from classify placing it."""
         adapter = _ClassifyRaisesOverStagedResponseAdapter()
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(EscapedExceptionError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
-        (record,) = raised.value.attempt_records
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert record.usage == _USAGE
         assert raised.value.usage == _USAGE
         assert raised.value.attempts == 1
@@ -2387,9 +2405,10 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
             await asyncio.wait_for(drain(), timeout=0.05)
         abandoned = handle.abandoned
         assert abandoned is not None
-        assert abandoned.attempt_records == ()
+        (cut_off,) = abandoned.attempt_records
+        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.billing is None
         assert abandoned.usage == ZERO_USAGE
-        assert abandoned.billing_in_flight is None
         assert abandoned.model == adapter.model
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -2415,7 +2434,9 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
             await asyncio.wait_for(drain(), timeout=0.05)
         abandoned = handle.abandoned
         assert abandoned is not None
-        assert abandoned.attempt_records == ()
+        (cut_off,) = abandoned.attempt_records
+        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.billing is not None
         assert abandoned.usage == _USAGE_STREAM
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -2472,7 +2493,7 @@ def test_a_stream_cancelled_during_the_open_sets_its_abandoned() -> None:
 def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
     """final() completing, or a consumer leaving the block voluntarily, leaves abandoned None.
 
-    Voluntary exit after Response creates no AbandonedCallError.
+    Voluntary exit after `Response` creates no `AbandonedCallErrorRecord`.
     """
 
     async def scenario() -> None:
@@ -2495,7 +2516,7 @@ def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
 def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
     """A cancellation after final() raised its GenerationError leaves abandoned None.
 
-    RefusalError concludes the call without AbandonedCallError.
+    `RefusalErrorRecord` concludes the call without `AbandonedCallErrorRecord`.
     """
 
     async def scenario() -> None:
@@ -2507,7 +2528,7 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
         async def consume() -> None:
             """Let final() report Refusal, then sleep. The wait_for below cancels this inside the block."""
             async with handle:
-                with pytest.raises(RefusalError):
+                with pytest.raises(GenerationError):
                     await handle.final()
                 await asyncio.sleep(60)
 
@@ -2566,7 +2587,7 @@ def test_a_mid_stream_rate_limit_pauses_the_rate_limit_quota() -> None:
         ).bind()
         before_monotonic_seconds = time.monotonic()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
                     pass
         cause = raised.value.__cause__
@@ -2622,7 +2643,7 @@ def test_an_adapter_stated_mid_stream_transient_error_becomes_the_cause_unwrappe
             shared_backoff=_fast_shared_backoff(),
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
                     pass
         assert raised.value.__cause__ is stream.error
@@ -2690,10 +2711,10 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
             shared_backoff=_fast_shared_backoff(),
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
                     pass
-        (record,) = raised.value.attempt_records
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert record.usage == expected_usage
         assert raised.value.usage == expected_usage
 
@@ -2701,7 +2722,7 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
 
 
 def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> None:
-    """Cancellation after RetryUnavailableError creates no abandoned error."""
+    """Cancellation after GenerationError creates no abandoned error."""
 
     async def scenario() -> None:
         """Absorb the mid-stream failure inside the block, then hang into the caller's deadline."""
@@ -2714,11 +2735,11 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
         async def consume() -> None:
             """Let the iteration fail after one item, then sleep. The wait_for cancels this."""
             async with handle:
-                with pytest.raises(RetryUnavailableError) as raised:
+                with pytest.raises(GenerationError) as raised:
                     async for _item in handle:
                         pass
-                (record,) = raised.value.attempt_records
-                assert isinstance(record.error, TransientError)
+                (record,) = _settled_attempt_records(raised.value.attempt_records)
+                assert isinstance(record.error, TransientErrorRecord)
                 assert "open stream failed during iteration" in str(record.error)
                 await asyncio.sleep(60)
 
@@ -2732,7 +2753,7 @@ def test_a_stream_cancelled_after_a_mid_stream_failure_sets_no_abandoned() -> No
 def test_a_stream_cancelled_after_a_drain_failure_sets_no_abandoned() -> None:
     """A GenerationError raised while draining carries the call, so a cancellation sets nothing.
 
-    A concluded stream failure creates no AbandonedCallError.
+    A concluded stream failure creates no `AbandonedCallErrorRecord`.
     """
 
     async def scenario() -> None:
@@ -2746,7 +2767,7 @@ def test_a_stream_cancelled_after_a_drain_failure_sets_no_abandoned() -> None:
         async def consume() -> None:
             """Let final() hit the unplaceable failure, then sleep. The wait_for cancels this."""
             async with handle:
-                with pytest.raises(UnknownExceptionError):
+                with pytest.raises(GenerationError):
                     await handle.final()
                 await asyncio.sleep(60)
 
@@ -2827,30 +2848,30 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
         assert response.attempts == 1
         (record,) = response.attempt_records
         assert record.error is None
-        assert record.started_at_monotonic_seconds <= record.ended_at_monotonic_seconds
+        assert record.elapsed_seconds >= 0.0
 
     asyncio.run(scenario())
 
 
 def test_stream_final_refusal_raises_without_retry() -> None:
-    """A structured refusal detected in the stream's final() surfaces as a RefusalError.
+    """A structured refusal detected in the stream's final() surfaces as a GenerationError.
 
-    final() records the one 200 that produced no output and raises the RefusalError carrying that record.
+    final() records the one 200 that produced no output and raises the GenerationError carrying that record.
     """
 
     async def scenario() -> None:
-        """Drain a stream whose final() reports Refusal, then read the raised RefusalError."""
+        """Drain a stream whose final() reports Refusal, then read the raised GenerationError."""
         adapter = _FakeAdapter(stream=_RefusingStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RefusalError) as refusal:
+            with pytest.raises(GenerationError) as refusal:
                 await handle.final()
         failure = refusal.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
         assert failure.usage.cost_in_usd == 0.25
         assert failure.usage.output_tokens == _USAGE.output_tokens
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
         assert record.usage.cost_in_usd == 0.25
 
@@ -2865,13 +2886,13 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
         adapter = _FakeAdapter(stream=_UnfinishedTurnStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(UnfinishedTurnError) as unfinished_turn:
+            with pytest.raises(GenerationError) as unfinished_turn:
                 await handle.final()
         failure = unfinished_turn.value
         assert failure.attempts == 1
         assert "pause_turn" in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
 
     asyncio.run(scenario())
@@ -2888,14 +2909,15 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
         adapter = _FakeAdapter(stream=_SchemaViolationStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(SchemaViolationError) as schema_violation:
+            with pytest.raises(GenerationError) as schema_violation:
                 await handle.final()
         failure = schema_violation.value
         assert failure.attempts == 1
-        assert failure.validation_error_json == _VALIDATION_ERROR_JSON
+        assert isinstance(failure.record, SchemaViolationErrorRecord)
+        assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
         assert "SENTINEL" not in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
 
     asyncio.run(scenario())
@@ -2904,9 +2926,9 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
 @pytest.mark.parametrize(
     ("stream", "expected_error"),
     [
-        (_MaxCompletionTokensExceededStream(), MaxCompletionTokensExceededError),
-        (_EmptyTurnStream(), EmptyTurnError),
-        (_ContextWindowExceededStream(), ContextWindowExceededError),
+        (_MaxCompletionTokensExceededStream(), GenerationError),
+        (_EmptyTurnStream(), GenerationError),
+        (_ContextWindowExceededStream(), GenerationError),
     ],
     ids=["max_completion_tokens_exceeded", "empty_turn", "context_window_exceeded"],
 )
@@ -2925,31 +2947,32 @@ def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
         failure = caught.value
         assert failure.attempts == 1
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
 
     asyncio.run(scenario())
 
 
 def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unavailable() -> None:
-    """A transient terminal outcome raises RetryUnavailableError without reopening."""
+    """A transient terminal outcome raises GenerationError without reopening."""
 
     async def scenario() -> None:
         """Drain a stream whose final() reports the failure, then read the raised error."""
         adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as retry_unavailable:
+            with pytest.raises(GenerationError) as retry_unavailable:
                 await handle.final()
         failure = retry_unavailable.value
         assert failure.attempts == 1
         assert _PROVIDER_FAILURE_REASON in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert str(record.error) == _PROVIDER_FAILURE_REASON
         assert record.assistant_message == _REJECTED_TURN
-        assert record.raw is not None
-        assert failure.__cause__ is record.error
+        assert failure.provider_attempts[0].raw is not None
+        assert isinstance(failure.__cause__, TransientError)
+        assert str(failure.__cause__) == str(record.error)
         assert adapter.bound_adapters[0].open_count == 1
 
     asyncio.run(scenario())
@@ -2963,22 +2986,22 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
         adapter = _FakeAdapter(stream=_ProviderFailedTerminallyStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(ProviderFailedTerminallyError) as provider_failure:
+            with pytest.raises(GenerationError) as provider_failure:
                 await handle.final()
         failure = provider_failure.value
         assert failure.attempts == 1
         assert _PROVIDER_FAILURE_REASON in failure.error_text
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = failure.attempt_records
+        (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
 
     asyncio.run(scenario())
 
 
 def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned() -> None:
-    """A cancellation after final() raised its RetryUnavailableError sets nothing.
+    """A cancellation after final() raised its GenerationError sets nothing.
 
-    UnfinishedTurnError concludes the call without AbandonedCallError.
+    `RetryUnavailableErrorRecord` concludes the call without `AbandonedCallErrorRecord`.
     """
 
     async def scenario() -> None:
@@ -2990,7 +3013,7 @@ def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned
         async def consume() -> None:
             """Let final() report the failure, then sleep. The wait_for below cancels in the block."""
             async with handle:
-                with pytest.raises(RetryUnavailableError):
+                with pytest.raises(GenerationError):
                     await handle.final()
                 await asyncio.sleep(60)
 
@@ -3012,9 +3035,9 @@ def test_a_stream_that_drops_mid_turn_records_the_id_its_open_response_carried()
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 await handle.final()
-        (record,) = raised.value.attempt_records
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert record.response_id is None
         assert record.request_id == "req-fake-stream"
 
@@ -3031,9 +3054,9 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 await anext(handle)
-        (record,) = raised.value.attempt_records
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert record.request_id == "req-from-items-error"
 
     asyncio.run(scenario())
@@ -3077,11 +3100,8 @@ def test_stream_retry_populates_attempt_records() -> None:
         assert succeeded.model_served == "fake-model-served"
         assert succeeded.response_id == "fake-response-2"
         assert succeeded.request_id == "req-fake-response-2"
-        assert (
-            failed.started_at_monotonic_seconds
-            <= failed.ended_at_monotonic_seconds
-            <= succeeded.started_at_monotonic_seconds
-            <= succeeded.ended_at_monotonic_seconds
+        assert failed.started_after_seconds + failed.elapsed_seconds <= (
+            succeeded.started_after_seconds
         )
 
     asyncio.run(scenario())
@@ -3099,10 +3119,8 @@ def test_a_stream_stamps_its_first_item_and_not_a_later_one() -> None:
             _ = [item async for item in handle]
             response = await handle.final()
         (record,) = response.attempt_records
-        assert record.first_item_at_monotonic_seconds is not None
-        seconds_to_first_item = (
-            record.first_item_at_monotonic_seconds - record.started_at_monotonic_seconds
-        )
+        assert record.seconds_to_first_item is not None
+        seconds_to_first_item = record.seconds_to_first_item
         assert 0.0 <= seconds_to_first_item < gap_seconds
         assert record.elapsed_seconds > gap_seconds
 
@@ -3117,13 +3135,13 @@ def test_a_non_stream_attempt_leaves_its_first_item_stamp_unset() -> None:
         bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind()
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         (record,) = response.attempt_records
-        assert record.first_item_at_monotonic_seconds is None
+        assert record.seconds_to_first_item is None
 
     asyncio.run(scenario())
 
 
 def test_stream_open_classified_invalid_request_carries_the_prior_attempts_records() -> None:
-    """A rejected open raises InvalidRequestError from the entry with the prior transient record."""
+    """A rejected open raises GenerationError from the entry with the prior transient record."""
 
     async def scenario() -> None:
         """Enter a handle whose first open fails transiently and whose second is rejected."""
@@ -3132,12 +3150,15 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
             classify_result="invalid_request",
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(InvalidRequestError) as rejected:
+        with pytest.raises(GenerationError) as rejected:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert isinstance(rejected.value.__cause__, ValueError)
-        assert rejected.value.reason == "the provider rejected the request: boom"
-        transient_record, rejected_record = rejected.value.attempt_records
+        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.reason == "the provider rejected the request: boom"
+        transient_record, rejected_record = _settled_attempt_records(
+            rejected.value.attempt_records
+        )
         assert str(transient_record.error) == "connection reset"
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
@@ -3148,19 +3169,20 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
 def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened() -> None:
     """build_request refusing the messages fails the item before any stream is opened.
 
-    InvalidRequestError carries model and attempt_records without a request.
+    GenerationError carries model and attempt_records without a request.
     """
 
     async def scenario() -> None:
         """Enter a handle whose build_request refuses."""
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="nope")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(InvalidRequestError) as rejected:
+        with pytest.raises(GenerationError) as rejected:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
-        assert rejected.value.reason == "nope"
+        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.reason == "nope"
         assert rejected.value.model == adapter.model
         assert rejected.value.attempt_records == ()
 
@@ -3168,17 +3190,18 @@ def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened
 
 
 def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> None:
-    """An open failure classified unknown_exception raises UnknownExceptionError from the entry, unretried."""
+    """An open failure classified unknown_exception raises GenerationError from the entry, unretried."""
 
     async def scenario() -> None:
         """Enter a handle whose open raises a classify-unknown_exception exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unknown_exception")
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(UnknownExceptionError) as unplaceable:
+        with pytest.raises(GenerationError) as unplaceable:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
-        assert isinstance(unplaceable.value.error, ValueError)
+        assert isinstance(unplaceable.value.record, UnknownExceptionErrorRecord)
+        assert isinstance(unplaceable.value.__cause__, ValueError)
         assert unplaceable.value.error_text == "langchaint could not place this exception: boom"
         assert unplaceable.value.attempt_records == ()
 
@@ -3186,7 +3209,7 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
 
 
 def test_stream_open_classified_declared_final_raises_the_items_failure() -> None:
-    """An open failure the provider declared final raises ProviderDeclaredFinalError, unretried.
+    """An open failure the provider declared final raises GenerationError, unretried.
 
     The open reached the provider, which answered, so that attempt has a record.
     """
@@ -3195,13 +3218,14 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
         """Enter a handle whose open raises a classify-declared_final exception."""
         adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="declared_final")
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(ProviderDeclaredFinalError) as declared_final:
+        with pytest.raises(GenerationError) as declared_final:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
-        assert isinstance(declared_final.value.error, ValueError)
+        assert isinstance(declared_final.value.record, ProviderDeclaredFinalErrorRecord)
+        assert isinstance(declared_final.value.__cause__, ValueError)
         assert declared_final.value.error_text == "a final error from the provider: boom"
-        (record,) = declared_final.value.attempt_records
+        (record,) = _settled_attempt_records(declared_final.value.attempt_records)
         assert record.error is None
         assert record.usage == ZERO_USAGE
 
@@ -3218,7 +3242,7 @@ def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
             failures=[TransientError("throttled")], classify_result="invalid_request"
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
-        with pytest.raises(ProviderDeclaredFinalError):
+        with pytest.raises(GenerationError):
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
@@ -3229,7 +3253,7 @@ def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
 
 
 def test_a_pause_all_do_not_retry_verdict_ends_an_open_stream_with_the_items_failure() -> None:
-    """A terminal mid-stream failure raises ProviderDeclaredFinalError."""
+    """A terminal mid-stream failure raises GenerationError."""
 
     async def scenario() -> None:
         """Read a first-item failure that parses to PauseAllDoNotRetry."""
@@ -3240,7 +3264,7 @@ def test_a_pause_all_do_not_retry_verdict_ends_an_open_stream_with_the_items_fai
             adapter, shared_backoff=_fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(ProviderDeclaredFinalError) as declared_final:
+            with pytest.raises(GenerationError) as declared_final:
                 _ = await anext(handle)
         assert declared_final.value.error_text == (
             "a final error from the provider: dropped before the first item"
@@ -3257,13 +3281,13 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
         adapter = _FakeAdapter(stream=_FailsBeforeFirstItemStream())
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RetryUnavailableError) as raised:
+            with pytest.raises(GenerationError) as raised:
                 await anext(handle)
         assert adapter.bound_adapters[0].open_count == 1
         assert raised.value.attempts == 1
-        (record,) = raised.value.attempt_records
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert str(record.error) == "dropped before the first item"
-        assert record.first_item_at_monotonic_seconds is None
+        assert record.seconds_to_first_item is None
 
     asyncio.run(scenario())
 
@@ -3271,9 +3295,9 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
 @pytest.mark.parametrize(
     ("classify_result", "expected_error"),
     [
-        ("invalid_request", InvalidRequestError),
-        ("declared_final", ProviderDeclaredFinalError),
-        ("unknown_exception", UnknownExceptionError),
+        ("invalid_request", GenerationError),
+        ("declared_final", GenerationError),
+        ("unknown_exception", GenerationError),
     ],
     ids=["invalid_request", "declared_final", "unknown_exception"],
 )
@@ -3294,7 +3318,7 @@ def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
             with pytest.raises(expected_error) as caught:
                 async for _item in handle:
                     pass
-        (record,) = caught.value.attempt_records
+        (record,) = _settled_attempt_records(caught.value.attempt_records)
         assert record.usage == _USAGE_STREAM
         assert caught.value.usage == _USAGE_STREAM
 
@@ -3311,10 +3335,10 @@ def test_an_unplaceable_mid_stream_error_records_the_attempt_with_nothing_report
             shared_backoff=_fast_shared_backoff(),
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(UnknownExceptionError) as caught:
+            with pytest.raises(GenerationError) as caught:
                 async for _item in handle:
                     pass
-        (record,) = caught.value.attempt_records
+        (record,) = _settled_attempt_records(caught.value.attempt_records)
         assert record.billing is None
         assert record.usage == ZERO_USAGE
 
@@ -3322,7 +3346,7 @@ def test_an_unplaceable_mid_stream_error_records_the_attempt_with_nothing_report
 
 
 def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
-    """Opens that keep failing past the budget raise RetriesExhaustedError with the table fields set."""
+    """Opens that keep failing past the budget raise GenerationError with the table fields set."""
 
     async def scenario() -> None:
         """Open a stream under a two-attempt budget whose every open_stream fails transiently."""
@@ -3330,12 +3354,13 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=2,
         )
-        with pytest.raises(RetriesExhaustedError) as exhausted:
+        with pytest.raises(GenerationError) as exhausted:
             async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
                 await handle.final()
         failure = exhausted.value
         assert failure.attempts == 2
-        assert [str(error) for error in failure.errors_from_attempts] == ["e1", "e2"]
+        assert isinstance(failure.record, RetriesExhaustedErrorRecord)
+        assert [str(error) for error in failure.record.errors_from_attempts] == ["e1", "e2"]
         assert failure.model == "fake-model"
         assert failure.provider_name == "fake"
         assert failure.elapsed_seconds >= 0.0
@@ -3353,11 +3378,8 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 pass
-            drained_at = time.monotonic()
             await asyncio.sleep(idle_seconds)
             response = await handle.final()
-        (record,) = response.attempt_records
-        assert record.ended_at_monotonic_seconds <= drained_at
         assert response.elapsed_seconds < idle_seconds
 
     asyncio.run(scenario())
@@ -3380,8 +3402,8 @@ def test_stream_final_is_idempotent() -> None:
 @pytest.mark.parametrize(
     ("stream", "expected_error"),
     [
-        (_RefusingStream(), RefusalError),
-        (_ProviderFailedTransientlyStream(), RetryUnavailableError),
+        (_RefusingStream(), GenerationError),
+        (_ProviderFailedTransientlyStream(), GenerationError),
         (_ProtocolErrorStream(), StreamProtocolError),
     ],
     ids=["refusal", "provider_failed_transiently", "protocol_error"],
@@ -3610,7 +3632,7 @@ def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
 def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
     settled_attempts: int,
 ) -> None:
-    """TimedOutError counts the in-flight request after settled attempts."""
+    """GenerationError counts the in-flight request after settled attempts."""
 
     async def scenario() -> None:
         """Fail settled_attempts requests transiently, then hang the next past a deadline."""
@@ -3620,14 +3642,13 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
             hang_from_open=settled_attempts + 1,
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(TimedOutError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.05)
         timed_out = raised.value
         assert timed_out.attempts == settled_attempts + 1
-        assert len(timed_out.attempt_records) == settled_attempts
-        assert timed_out.in_flight_attempt_started_at_monotonic_seconds is not None
-        # No response arrived on any attempt, so nothing the provider reported is in flight.
-        assert timed_out.billing_in_flight is None
+        assert len(timed_out.attempt_records) == settled_attempts + 1
+        assert isinstance(timed_out.attempt_records[-1], CutOffAttemptRecord)
+        assert timed_out.attempt_records[-1].billing is None
         assert timed_out.usage == ZERO_USAGE
         assert str(timed_out) == "the call timed out before it produced a result"
 
@@ -3645,11 +3666,11 @@ def test_a_deadline_expiring_before_admission_reports_no_attempts() -> None:
         ).bind()
         holder = asyncio.create_task(bound_llm.generate_one([UserMessage(content="held")]))
         await asyncio.sleep(0.02)
-        with pytest.raises(TimedOutError) as raised:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="queued")], timeout_seconds=0.05)
         timed_out = raised.value
         assert timed_out.attempts == 0
-        assert timed_out.in_flight_attempt_started_at_monotonic_seconds is None
+        assert timed_out.attempt_records == ()
         assert timed_out.usage == ZERO_USAGE
         _ = holder.cancel()
         await asyncio.gather(holder, return_exceptions=True)
@@ -3694,7 +3715,7 @@ def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
         first, second = results
         assert isinstance(first, Response)
         assert first.output == "fast"
-        assert isinstance(second, TimedOutError)
+        assert isinstance(second, GenerationError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -3731,7 +3752,7 @@ def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
         first, second = results
         assert isinstance(first, Response)
         assert first.output == "answered"
-        assert isinstance(second, TimedOutError)
+        assert isinstance(second, GenerationError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 
@@ -3804,7 +3825,7 @@ def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
         results = await bound_llm.generate_many(
             [[UserMessage(content="retries")]], max_working_seconds_per_item=0.20
         )
-        assert isinstance(results[0], TimedOutError)
+        assert isinstance(results[0], GenerationError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 
@@ -3821,7 +3842,7 @@ def test_a_stream_deadline_raises_and_leaves_abandoned_unset() -> None:
             _FakeAdapter(hang_from_open=1), shared_backoff=_fast_shared_backoff()
         ).bind()
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
-        with pytest.raises(TimedOutError):
+        with pytest.raises(GenerationError):
             async with handle:
                 pass
         assert handle.abandoned is None
@@ -3851,7 +3872,7 @@ def test_a_stream_deadline_expiring_mid_items_raises() -> None:
                 async for item in handle:
                     seen.append(item)  # noqa: PERF401
 
-        with pytest.raises(TimedOutError):
+        with pytest.raises(GenerationError):
             await drain()
         assert seen, "the items delivered before the deadline stay delivered"
         assert handle.abandoned is None
@@ -3879,14 +3900,14 @@ def test_a_stream_deadline_stops_at_a_conclusion_an_item_pull_raised() -> None:
     """A terminal item pull closes the call deadline."""
 
     async def scenario() -> None:
-        """Take the UnknownExceptionError mid-iteration, then outlive the deadline in the block."""
+        """Take the GenerationError mid-iteration, then outlive the deadline in the block."""
         bound_llm = LLM(
             _FakeAdapter(stream=_FailsAfterFirstItemStream()),
             shared_backoff=_fast_shared_backoff(),
         ).bind()
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.05)
         async with handle:
-            with pytest.raises(UnknownExceptionError):
+            with pytest.raises(GenerationError):
                 async for _ in handle:
                     pass
             await asyncio.sleep(0.1)
@@ -3903,7 +3924,7 @@ def test_a_failed_stream_entry_leaves_no_armed_deadline() -> None:
         adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="no")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         handle = bound_llm.stream_one([UserMessage(content="hi")], timeout_seconds=0.02)
-        with pytest.raises(InvalidRequestError):
+        with pytest.raises(GenerationError):
             async with handle:
                 pass
         # Outlast the deadline the failed entry opened. A leaked timer cancels this sleep.

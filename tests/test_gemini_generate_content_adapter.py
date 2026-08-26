@@ -47,6 +47,7 @@ from langchaint.adapter import (
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutput,
+    ProviderBilling,
     Refusal,
     RequestParams,
     SchemaViolation,
@@ -62,13 +63,46 @@ from langchaint.gemini import (
     assembled_response,
 )
 from langchaint.gemini.generate_content_adapter import (
-    _billing_from_response,
-    _billing_from_usage,
+    _billing_from_response as _provider_billing_from_response,
+)
+from langchaint.gemini.generate_content_adapter import (
+    _billing_from_usage as _provider_billing_from_usage,
+)
+from langchaint.gemini.generate_content_adapter import (
     _GeminiRequestParams,
     _GeminiStream,
 )
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
+
+
+def _billing_from_usage(
+    usage_metadata: types.GenerateContentResponseUsageMetadata | None,
+    pricing: Mapping[str, GeminiPricingTable],
+    *,
+    provider_executed_tool_cost_in_usd: float,
+) -> Billing:
+    return _provider_billing_from_usage(
+        usage_metadata,
+        pricing,
+        provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+    ).billing
+
+
+def _billing_from_response(
+    response: types.GenerateContentResponse,
+    pricing: Mapping[str, GeminiPricingTable],
+    *,
+    configured_fields: frozenset[str] = frozenset(),
+    billing_complete: bool = True,
+) -> Billing:
+    return _provider_billing_from_response(
+        response,
+        pricing,
+        configured_fields=configured_fields,
+        billing_complete=billing_complete,
+    ).billing
+
 
 _ON_DEMAND_RATES = GeminiRates(
     input_cache_none_usd_per_million_tokens=1.0,
@@ -1385,7 +1419,7 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         output_tokens=10,
         output_tokens_reasoning=0,
         provider_executed_tool_cost_in_usd=0.0,
-    )
+    ).billing
     assert short.input_cache_none_usd_per_million_tokens == 1.0
     long = _LONG_PROMPT_TABLE.price(
         service_tier="ON_DEMAND",
@@ -1396,7 +1430,7 @@ def test_the_long_prompt_threshold_reprices_every_category() -> None:
         output_tokens=10,
         output_tokens_reasoning=0,
         provider_executed_tool_cost_in_usd=0.0,
-    )
+    ).billing
     assert long.input_cache_none_usd_per_million_tokens == 2.0
     assert long.cache_read_usd_per_million_tokens == 0.2
     assert long.output_usd_per_million_tokens == 20.0
@@ -1566,7 +1600,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
 def test_billing_reported_follows_usage_arrival() -> None:
     """Return Billing only after usage_metadata arrives."""
 
-    async def scenario() -> tuple[Billing | None, Billing | None]:
+    async def scenario() -> tuple[ProviderBilling | None, ProviderBilling | None]:
         stream = _gemini_stream([
             _response([types.Part(text="he")], finish_reason=None),
             _response(
@@ -1588,8 +1622,8 @@ def test_billing_reported_follows_usage_arrival() -> None:
     )
     # Whole-Billing equality would fail on the NaN cache-write rate both sides carry.
     assert after is not None
-    assert after.usage == expected.usage
-    assert after.service_tier == expected.service_tier
+    assert after.billing.usage == expected.usage
+    assert after.billing.service_tier == expected.service_tier
 
 
 def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
@@ -1600,7 +1634,7 @@ def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
         for response in responses:
             yield response
 
-    async def scenario() -> Billing | None:
+    async def scenario() -> ProviderBilling | None:
         stream = _GeminiStream(
             chunks=chunks(),
             pricing=_PRICING,
@@ -1625,7 +1659,7 @@ def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
 
     billing = asyncio.run(scenario())
     assert billing is not None
-    assert math.isnan(billing.usage.provider_executed_tool_cost_in_usd)
+    assert math.isnan(billing.billing.usage.provider_executed_tool_cost_in_usd)
 
 
 def test_stream_billing_collects_every_candidate_provider_query() -> None:
@@ -1661,7 +1695,7 @@ def test_stream_billing_collects_every_candidate_provider_query() -> None:
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
         yield response
 
-    async def scenario() -> Billing | None:
+    async def scenario() -> ProviderBilling | None:
         stream = _GeminiStream(
             chunks=chunks(),
             pricing=_PRICING,
@@ -1672,7 +1706,7 @@ def test_stream_billing_collects_every_candidate_provider_query() -> None:
 
     billing = asyncio.run(scenario())
     assert billing is not None
-    assert billing.usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
+    assert billing.billing.usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
 
 
 def test_close_closes_the_sdk_iterator() -> None:

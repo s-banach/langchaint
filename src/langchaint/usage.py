@@ -3,9 +3,10 @@
 The three `input_tokens_*` counters partition all input tokens.
 """
 
+import math
 from collections.abc import Iterable
 
-from pydantic import ConfigDict, NonNegativeInt
+from pydantic import ConfigDict, NonNegativeInt, field_serializer
 
 from langchaint.checked_copy import CheckedCopyModel
 
@@ -19,7 +20,7 @@ class Usage(CheckedCopyModel):
     Cost fields accept NaN and negative caller-supplied rates.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
 
     input_tokens_cache_read: NonNegativeInt
     input_tokens_cache_write: NonNegativeInt
@@ -31,6 +32,17 @@ class Usage(CheckedCopyModel):
     input_tokens_cache_none_cost_in_usd: float
     output_tokens_cost_in_usd: float
     provider_executed_tool_cost_in_usd: float
+
+    @field_serializer(
+        "input_tokens_cache_read_cost_in_usd",
+        "input_tokens_cache_write_cost_in_usd",
+        "input_tokens_cache_none_cost_in_usd",
+        "output_tokens_cost_in_usd",
+        "provider_executed_tool_cost_in_usd",
+        when_used="json",
+    )
+    def _serialize_cost(self, cost_in_usd: float) -> float | str:
+        return _serialize_nonfinite_float(cost_in_usd)
 
     @property
     def input_tokens_total(self) -> int:
@@ -109,3 +121,13 @@ ZERO_USAGE: Usage = Usage(
     provider_executed_tool_cost_in_usd=0.0,
 )
 """Usage for an empty sum or an attempt with no reported billing."""
+
+
+def _serialize_nonfinite_float(value: float) -> float | str:
+    if math.isnan(value):
+        return "NaN"
+    if value == math.inf:
+        return "Infinity"
+    if value == -math.inf:
+        return "-Infinity"
+    return value

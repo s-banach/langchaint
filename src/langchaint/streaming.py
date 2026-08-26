@@ -13,8 +13,6 @@ from collections.abc import AsyncIterator, Sequence
 from types import TracebackType
 from typing import Literal, Never, overload
 
-from pydantic import BaseModel
-
 from langchaint.adapter import (
     Adapter,
     AdapterStream,
@@ -27,26 +25,26 @@ from langchaint.adapter import (
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
-    AbandonedCallError,
-    ContextWindowExceededError,
-    EmptyTurnError,
+    AbandonedCallErrorRecord,
+    ContextWindowExceededErrorRecord,
+    EmptyTurnErrorRecord,
     GenerationError,
-    InvalidRequestError,
-    MaxCompletionTokensExceededError,
-    ProviderDeclaredFinalError,
-    ProviderFailedTerminallyError,
-    RefusalError,
-    RetriesExhaustedError,
-    RetryUnavailableError,
-    SchemaViolationError,
+    InvalidRequestErrorRecord,
+    MaxCompletionTokensExceededErrorRecord,
+    ProviderDeclaredFinalErrorRecord,
+    ProviderFailedTerminallyErrorRecord,
+    RefusalErrorRecord,
+    RetriesExhaustedErrorRecord,
+    RetryUnavailableErrorRecord,
+    SchemaViolationErrorRecord,
     StreamProtocolError,
-    TimedOutError,
+    TimedOutErrorRecord,
     TransientError,
-    UnfinishedTurnError,
-    UnknownExceptionError,
+    UnfinishedTurnErrorRecord,
+    UnknownExceptionErrorRecord,
 )
 from langchaint.messages import Message
-from langchaint.pricing import Billing
+from langchaint.pricing import ProviderBilling
 from langchaint.response import (
     CallResult,
     GenerateResult,
@@ -92,12 +90,12 @@ async def _close_stream_quietly(
         _logger.warning(failure_log_message, exc_info=True)
 
 
-class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
+class StreamHandle[OutputT, ToolTurnT = Never]:
     """An async context manager and iterator for one streamed call.
 
     Entry opens the request. `final` drains items. `final` returns `Response` or `ToolTurnT`.
     `max_attempts` applies only before the stream opens.
-    An open-stream transient failure raises `RetryUnavailableError`.
+    An open-stream transient failure raises `GenerationError`.
     """
 
     def __init__(
@@ -121,12 +119,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._timeout_seconds = timeout_seconds
         self._splits_tool_call_turns = splits_tool_call_turns
         self._deadline: asyncio.Timeout | None = None
-        self.abandoned: AbandonedCallError | None = None
+        self.abandoned: AbandonedCallErrorRecord | None = None
         """The interrupted call account, or `None`.
 
         Cancellation sets this value before the caller receives `asyncio.CancelledError`.
         A success or `GenerationError` leaves this value as `None`.
-        An expired `timeout_seconds` raises `TimedOutError` and leaves this value as `None`.
+        An expired `timeout_seconds` raises `GenerationError` and leaves this value as `None`.
         """
         self._adapter_stream: AdapterStream | None = None
         self._items: AsyncIterator[StreamItem] | None = None
@@ -144,7 +142,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Every open attempt gets the same request.
 
         Raises:
-            InvalidRequestError: `build_request` returned `InvalidRequest`, so nothing can be sent.
+            GenerationError: `build_request` returned `InvalidRequest`, so nothing can be sent.
         """
         if self._request is None:
             built = self._bound_adapter.build_request(self._messages)
@@ -157,12 +155,13 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Open the request and return self.
 
         Raises:
-            InvalidRequestError: `build_request` returned `InvalidRequest`, or the provider rejected the request.
+            GenerationError: `build_request` returns `InvalidRequest`.
+                The provider rejects the request.
+                The provider declares the open failure final.
+                The adapter cannot classify the open failure.
+                The open attempts consume `max_attempts`.
+                `timeout_seconds` expires before the request opens.
             RuntimeError: This handle was already entered.
-            ProviderDeclaredFinalError: the provider declared the open failure final.
-            UnknownExceptionError: the adapter could not place the open failure.
-            RetriesExhaustedError: the opens spent the retry budget.
-            TimedOutError: timeout_seconds expired before the request opened.
             ParserContractError: the adapter's parse violated its contract on a failed open.
         """
         if self._state != "unopened":
@@ -197,10 +196,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Close the deadline, connection, and admission.
 
         Cancellation sets `abandoned` unless a result already records the call.
-        An expired `timeout_seconds` raises `TimedOutError` instead.
+        An expired `timeout_seconds` raises `GenerationError` instead.
 
         Raises:
-            TimedOutError: `timeout_seconds` expires before the block finishes.
+            GenerationError: `timeout_seconds` expires before the block finishes.
             BaseException: Closing the adapter stream raises a non-`Exception` value.
         """
         self._state = "finished"
@@ -235,11 +234,11 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             return True
         return False
 
-    def _timed_out_error(self, billing_in_flight: Billing | None) -> TimedOutError:
+    def _timed_out_error(self, billing_in_flight: ProviderBilling | None) -> GenerationError:
         """Freeze the ledger into this call's deadline account."""
-        return _abandoned_call_error(TimedOutError, self._ledger, billing_in_flight)
+        return _abandoned_call_error(TimedOutErrorRecord, self._ledger, billing_in_flight)
 
-    def _billing_reported(self) -> Billing | None:
+    def _billing_reported(self) -> ProviderBilling | None:
         """Ask the open stream what the provider has reported, or None where it reported nothing.
 
         Call before the connection closes, because closing drops the stream this asks.
@@ -248,14 +247,15 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             return None
         return self._adapter_stream.billing_reported()
 
-    def _set_abandoned(self, billing_in_flight: Billing | None) -> None:
+    def _set_abandoned(self, billing_in_flight: ProviderBilling | None) -> None:
         """Set `abandoned` when no conclusion already accounts for the call.
 
         Include billing reported by the interrupted attempt.
         """
         if self._conclusion_carried_the_call:
             return
-        self.abandoned = _abandoned_call_error(AbandonedCallError, self._ledger, billing_in_flight)
+        call, _ = self._ledger.freeze_with_cut_off(billing_in_flight)
+        self.abandoned = AbandonedCallErrorRecord(call=call)
 
     async def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
         """Exit the held admission and return its `Verdict`.
@@ -317,7 +317,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return wrapped
 
     def _record_transient_error(
-        self, wrapped: TransientError, billing: Billing | None = None
+        self, wrapped: TransientError, billing: ProviderBilling | None = None
     ) -> None:
         """Record one transient failure as an attempt.
 
@@ -336,10 +336,14 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         `RetryThisOne.retry_after` sets that wait's floor.
 
         Raises:
-            RetriesExhaustedError: the recorded failure spent the last attempt.
+            GenerationError: the recorded failure spent the last attempt.
         """
         if self._ledger.attempts >= self._max_attempts:
-            raise RetriesExhaustedError(call=self._ledger.freeze(), request=self._request) from exc
+            raise GenerationError(
+                record=RetriesExhaustedErrorRecord(call=self._ledger.freeze()),
+                request=self._request,
+                provider_attempts=self._ledger.provider_attempts,
+            ) from exc
         match verdict:
             case PauseAll():
                 return
@@ -349,7 +353,11 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 await asyncio.sleep(self._private_backoff.next_wait(None))
 
     def _terminal_error_or_none(
-        self, exc: Exception, *, verdict: Verdict | None, stream_billing: Billing | None
+        self,
+        exc: Exception,
+        *,
+        verdict: Verdict | None,
+        stream_billing: ProviderBilling | None,
     ) -> GenerationError | None:
         """Map one attempt failure to its terminal error.
 
@@ -366,7 +374,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             return None
         # `PauseAllDoNotRetry` becomes `declared_final` without `classify()`.
         # A provider directive states this request will not succeed.
-        # `ProviderDeclaredFinalError` names that outcome.
+        # `GenerationError` names that outcome.
         # `classify()` could otherwise return `invalid_request` for status 429.
         classification: ErrorClassification = (
             "declared_final"
@@ -381,22 +389,32 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         if classification == "declared_final":
             # The provider answered, so the attempt gets a record.
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-            return ProviderDeclaredFinalError(
-                error=exc, call=self._ledger.freeze(), request=self._request
+            return GenerationError(
+                record=ProviderDeclaredFinalErrorRecord(
+                    reason=str(exc), call=self._ledger.freeze()
+                ),
+                request=self._request,
+                provider_attempts=self._ledger.provider_attempts,
             )
         if self._adapter_stream is not None:
             # An open stream proves that the attempt reached the provider.
             # Test the stream itself because an open stream can have `billing=None`.
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-        return UnknownExceptionError(error=exc, call=self._ledger.freeze(), request=self._request)
+        return GenerationError(
+            record=UnknownExceptionErrorRecord(reason=str(exc), call=self._ledger.freeze()),
+            request=self._request,
+            provider_attempts=self._ledger.provider_attempts,
+        )
 
-    def _invalid_request_error(self, reason: str, cause: Exception | None) -> InvalidRequestError:
-        """Build this handle's InvalidRequestError, chained to cause when there is one.
+    def _invalid_request_error(self, reason: str, cause: Exception | None) -> GenerationError:
+        """Build this handle's GenerationError, chained to cause when there is one.
 
         `cause` is `None` when `build_request` returns `InvalidRequest` before sending anything.
         """
-        invalid_request = InvalidRequestError(
-            reason=reason, call=self._ledger.freeze(), request=self._request
+        invalid_request = GenerationError(
+            record=InvalidRequestErrorRecord(reason=reason, call=self._ledger.freeze()),
+            request=self._request,
+            provider_attempts=self._ledger.provider_attempts,
         )
         invalid_request.__cause__ = cause
         return invalid_request
@@ -412,10 +430,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         A successful stream holds admission until completion.
 
         Raises:
-            InvalidRequestError: The adapter or provider rejects the request.
-            ProviderDeclaredFinalError: The provider declares the open failure terminal.
-            UnknownExceptionError: The adapter cannot classify the open failure.
-            RetriesExhaustedError: Open failures consume `max_attempts`.
+            GenerationError: The adapter or provider rejects the request.
+                The provider declares the open failure terminal.
+                The adapter cannot classify the open failure.
+                Open failures consume `max_attempts`.
             ParserContractError: `Adapter.parse` violates its contract.
         """
         request = self._request_for_this_call()
@@ -444,10 +462,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         """Return the next item.
 
         Raises:
-            RetryUnavailableError: The open stream fails transiently.
-            InvalidRequestError: The adapter classifies an item error as an invalid request.
-            ProviderDeclaredFinalError: The provider declares an item error terminal.
-            UnknownExceptionError: The adapter cannot classify an item exception.
+            GenerationError: The open stream fails transiently.
+                The adapter classifies an item error as an invalid request.
+                The provider declares an item error terminal.
+                The adapter cannot classify an item exception.
             StreamProtocolError: The event stream ends without a terminal event.
             ParserContractError: `Adapter.parse` violates its contract.
             StopAsyncIteration: The stream is exhausted.
@@ -501,8 +519,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             self._record_transient_error(wrapped, stream_billing)
             await self._close_adapter_stream()
-            raise RetryUnavailableError(
-                call=self._ledger.freeze(), request=self._request
+            raise GenerationError(
+                record=RetryUnavailableErrorRecord(call=self._ledger.freeze()),
+                request=self._request,
+                provider_attempts=self._ledger.provider_attempts,
             ) from wrapped
         except BaseException:
             _ = await self._exit_admission(None)
@@ -513,8 +533,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     @overload
     async def final(self: "StreamHandle[OutputT, Never]") -> Response[OutputT]: ...
     @overload
-    async def final(self) -> "Response[OutputT] | ToolTurnT": ...
-    async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
+    async def final(self) -> "Response[OutputT] | ToolCallTurn[OutputT]": ...
+    async def final(self) -> Response[OutputT] | ToolCallTurn[OutputT]:
         """Drain remaining items and return the stored result.
 
         Repeated calls return or raise the same conclusion without reading the stream again.
@@ -522,17 +542,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
 
         Raises:
             StreamProtocolError: The event stream ends without a terminal event.
-            InvalidRequestError: The adapter classifies an item error as an invalid request.
-            ProviderDeclaredFinalError: The provider declares an item error terminal.
-            UnknownExceptionError: The adapter cannot classify an item exception.
-            RefusalError: The assembled response contains a refusal.
-            MaxCompletionTokensExceededError: Structured output reaches its token limit.
-            EmptyTurnError: The assembled response contains no output.
-            SchemaViolationError: Structured output fails validation.
-            ContextWindowExceededError: The request exceeds the context window.
-            UnfinishedTurnError: The assembled response contains an unfinished turn.
-            ProviderFailedTerminallyError: The assembled response reports a terminal provider failure.
-            RetryUnavailableError: The open stream fails transiently.
+            GenerationError: The adapter or provider reports a terminal failure.
+                The assembled response reports a terminal result.
+                The open stream fails transiently.
+                The adapter cannot classify an item exception.
             ParserContractError: `Adapter.parse` violates its contract.
             RuntimeError: The handle is unopened or finished without a stored conclusion.
         """
@@ -561,7 +574,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 )
                 self._conclusion = self._conclude(
                     self._bound_adapter.interpret(raw),
-                    raw=raw,
                     ended_at_monotonic_seconds=ended_at_monotonic_seconds,
                 )
             except BaseException as exc:
@@ -581,7 +593,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self,
         outcome: ResponseOutcome[OutputT],
         *,
-        raw: BaseModel,
         ended_at_monotonic_seconds: float,
     ) -> CallResult[OutputT]:
         """Build the call result for this outcome.
@@ -589,7 +600,6 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Returns the error rather than raising it, so no case can conclude the call without being stored.
         Every outcome records the staged response before building the result.
         The frozen call therefore includes the terminal response and billing.
-        raw is that response, which only a success carries onward.
         """
         if outcome.kind == "provider_failed_transiently":
             failure = TransientError(outcome.reason, is_rate_limit=outcome.is_rate_limit)
@@ -598,9 +608,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 error=failure,
                 assistant_message=outcome.assistant_message,
             )
-            retry_unavailable = RetryUnavailableError(
-                call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+            retry_unavailable = GenerationError(
+                record=RetryUnavailableErrorRecord(
+                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                ),
                 request=self._request,
+                provider_attempts=self._ledger.provider_attempts,
             )
             retry_unavailable.__cause__ = failure
             return retry_unavailable
@@ -615,45 +628,65 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                     splits_tool_call_turns=self._splits_tool_call_turns,
                     output=outcome.output,
                     call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    raw=raw,
+                    provider_attempts=self._ledger.provider_attempts,
                     stop_reason=outcome.stop_reason,
-                    assistant_message=outcome.assistant_message,
                 )
             case "refusal":
-                return RefusalError(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=RefusalErrorRecord(
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "max_completion_tokens_exceeded":
-                return MaxCompletionTokensExceededError(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=MaxCompletionTokensExceededErrorRecord(
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "empty_turn":
-                return EmptyTurnError(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=EmptyTurnErrorRecord(
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "schema_violation":
-                return SchemaViolationError(
-                    validation_error_json=outcome.validation_error_json,
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=SchemaViolationErrorRecord(
+                        validation_error_json=outcome.validation_error_json,
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "context_window_exceeded":
-                return ContextWindowExceededError(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=ContextWindowExceededErrorRecord(
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "unfinished_turn":
-                return UnfinishedTurnError(
-                    reason=outcome.reason,
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=UnfinishedTurnErrorRecord(
+                        reason=outcome.reason,
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )
             case "provider_failed_terminally":
-                return ProviderFailedTerminallyError(
-                    reason=outcome.reason,
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                return GenerationError(
+                    record=ProviderFailedTerminallyErrorRecord(
+                        reason=outcome.reason,
+                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+                    ),
                     request=self._request,
+                    provider_attempts=self._ledger.provider_attempts,
                 )

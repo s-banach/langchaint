@@ -25,7 +25,7 @@ from langchaint.adapter import (
 )
 from langchaint.exceptions import TransientError
 from langchaint.messages import ImagePart
-from langchaint.pricing import Billing, category_cost
+from langchaint.pricing import Billing, ProviderBilling, category_cost
 from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.usage import Usage
 
@@ -149,7 +149,7 @@ class OpenAIRates:
         output_tokens: int,
         output_tokens_reasoning: int,
         provider_executed_tool_cost_in_usd: float,
-    ) -> Billing:
+    ) -> ProviderBilling:
         """Price one response's counters at these rates.
 
         output_tokens_reasoning is the reasoning share of output_tokens.
@@ -162,37 +162,39 @@ class OpenAIRates:
         Raises:
             pydantic.ValidationError: a counter is negative.
         """
-        return Billing(
-            usage=Usage(
-                input_tokens_cache_read=input_tokens_cache_read,
-                input_tokens_cache_write=input_tokens_cache_write,
-                input_tokens_cache_none=input_tokens_cache_none,
-                output_tokens=output_tokens,
-                output_tokens_reasoning=output_tokens_reasoning,
-                input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read,
-                    usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+        return ProviderBilling(
+            billing=Billing(
+                usage=Usage(
+                    input_tokens_cache_read=input_tokens_cache_read,
+                    input_tokens_cache_write=input_tokens_cache_write,
+                    input_tokens_cache_none=input_tokens_cache_none,
+                    output_tokens=output_tokens,
+                    output_tokens_reasoning=output_tokens_reasoning,
+                    input_tokens_cache_read_cost_in_usd=category_cost(
+                        input_tokens_cache_read,
+                        usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                    ),
+                    input_tokens_cache_write_cost_in_usd=category_cost(
+                        input_tokens_cache_write,
+                        usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
+                    ),
+                    input_tokens_cache_none_cost_in_usd=category_cost(
+                        input_tokens_cache_none,
+                        usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                    ),
+                    output_tokens_cost_in_usd=category_cost(
+                        output_tokens,
+                        usd_per_million_tokens=self.output_usd_per_million_tokens,
+                    ),
+                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
-                input_tokens_cache_write_cost_in_usd=category_cost(
-                    input_tokens_cache_write,
-                    usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
-                ),
-                input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none,
-                    usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-                ),
-                output_tokens_cost_in_usd=category_cost(
-                    output_tokens,
-                    usd_per_million_tokens=self.output_usd_per_million_tokens,
-                ),
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+                service_tier=service_tier,
+                input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
+                cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
+                cache_write_usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
+                output_usd_per_million_tokens=self.output_usd_per_million_tokens,
             ),
-            service_tier=service_tier,
             usage_raw=usage_raw,
-            input_cache_none_usd_per_million_tokens=self.input_cache_none_usd_per_million_tokens,
-            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens,
-            cache_write_usd_per_million_tokens=self.cache_write_usd_per_million_tokens,
-            output_usd_per_million_tokens=self.output_usd_per_million_tokens,
         )
 
     def multiplied(self, *, input_multiplier: float, output_multiplier: float) -> "OpenAIRates":

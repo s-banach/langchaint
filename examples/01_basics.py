@@ -2,9 +2,9 @@
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
-from langchaint import GenerationError, InferenceParams, to_tables
+from langchaint import CallResultRecord, GenerationError, InferenceParams, to_tables
 from langchaint.openai import OpenAI
 
 
@@ -45,6 +45,9 @@ async def basics() -> None:
 
     results = await assistant.generate_many(["Define entropy.", "Define enthalpy."])
     generation_error_count = sum(isinstance(result, GenerationError) for result in results)
-    calls, attempts = to_tables(results)
+    result_record_adapter = TypeAdapter(list[CallResultRecord[str]])
+    result_records_json = result_record_adapter.dump_json([result.record for result in results])
+    restored_result_records = result_record_adapter.validate_json(result_records_json)
+    calls, attempts = to_tables(restored_result_records)
     print(f"{generation_error_count} generation errors")
     print(f"{len(calls)} calls over {len(attempts)} attempts")

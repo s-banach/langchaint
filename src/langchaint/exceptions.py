@@ -1,22 +1,24 @@
-"""Exception vocabulary.
-
-`TransientError` marks a retriable attempt.
-`GenerationError` carries one terminal call outcome without cancelling sibling calls.
-Adapters classify SDK exceptions; retry loops construct `GenerationError` values from call records.
-"""
+"""Provider-neutral exception and normalized generation error records."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal, Self, override
+from typing import TYPE_CHECKING, Annotated, Literal, Self, override
 
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
-from langchaint.call import AttemptRecord, CallRecord, _CallCarrier
+from langchaint.call import (
+    AttemptProviderData,
+    CallRecord,
+    CutOffAttemptRecord,
+    SettledAttemptRecord,
+    TransientErrorRecord,
+    _require_completed_model_turn,
+    _settled_attempts,
+)
+from langchaint.checked_copy import CheckedCopyModel
 from langchaint.messages import AssistantMessage, StopReason
-from langchaint.pricing import Billing
 from langchaint.usage import Usage
 
 if TYPE_CHECKING:
-    # Runtime imports of these types would create cycles through `tools.py` and `adapter.py`.
     from langchaint.adapter import RequestParams
     from langchaint.tools import DispatchManyOutcome
 
@@ -26,9 +28,12 @@ class TransientError(Exception):
 
     `__cause__` holds the original provider exception when one exists.
     Retry loops raise `TransientError` inside `SharedBackoff.admitted()`.
-    Attempt records store the capped wait on their `TransientError`.
-    Billing remains on the same `AttemptRecord`.
+    `SettledAttemptRecord.error` preserves normalized failure data.
+    `SettledAttemptRecord.billing` preserves billing from the same request.
     """
+
+    retry_after_seconds: float | None
+    is_rate_limit: bool
 
     def __init__(
         self,
@@ -37,409 +42,575 @@ class TransientError(Exception):
         retry_after_seconds: float | None = None,
         is_rate_limit: bool = False,
     ) -> None:
-        """Store the server-stated wait and the rate-limit classification."""
+        """Store the server-stated wait and rate-limit classification."""
         super().__init__(message)
-        self.retry_after_seconds: float | None = retry_after_seconds
-        self.is_rate_limit: bool = is_rate_limit
+        self.retry_after_seconds = retry_after_seconds
+        self.is_rate_limit = is_rate_limit
 
 
 class EmbeddingOutputError(RuntimeError):
     """A provider returned unusable embedding vectors."""
 
 
-def _extract_transient_errors(
-    attempt_records: Sequence[AttemptRecord],
-) -> tuple[TransientError, ...]:
-    """Return the errors of the failed attempts, in order."""
-    return tuple(record.error for record in attempt_records if record.error is not None)
+_RECORD_CONFIG = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
 
 
-def _join_error_text(attempt_records: Sequence[AttemptRecord]) -> str:
-    return "; ".join(
-        f"attempt {index + 1}: {record.error}" for index, record in enumerate(attempt_records)
-    )
+class _GenerationErrorRecordBase(CheckedCopyModel):
+    """Shared normalized data and properties for terminal generation errors.
 
-
-class GenerationError(_CallCarrier, Exception):
-    """A terminal per-item generation result.
-
-    `call` preserves attempt timing, billing, turns, and raw responses.
-    `request` preserves the sent request when one exists and stays outside `error_text`.
-    `usage` sums paid usage across recorded attempts.
-    `generate_one` raises subclasses.
-    `generate_many` returns subclasses at their input positions.
+    Validation rejects unknown fields.
     """
 
+    model_config = _RECORD_CONFIG
+
     call: CallRecord
-    usage: Usage
-    request: "RequestParams | None"
-
-    def __init__(self, *, call: CallRecord, request: "RequestParams | None") -> None:
-        """Store the call and what it sent, and fold the paid total from the records."""
-        super().__init__()
-        self.call = call
-        self.request = request
-        self.usage = Usage.sum_of(record.usage for record in call.attempt_records)
 
     @property
-    def stop_reason(self) -> StopReason | None:
-        """Return `None`."""
-        return None
-
-    def _summary(self) -> str:
-        return "generation failed"
-
-    @override
-    def __str__(self) -> str:
-        """Render the reason, computed on demand so it never depends on when the fields were set."""
-        return self._summary()
-
-    @property
-    def assistant_message(self) -> AssistantMessage | None:
-        """Return the last recorded `assistant_message`, or `None`."""
-        for record in reversed(self.attempt_records):
-            if record.assistant_message is not None:
-                return record.assistant_message
-        return None
+    def attempt_records(
+        self,
+    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
+        """Return the call's normalized attempt records."""
+        return self.call.attempt_records
 
     @property
     def attempts(self) -> int:
-        """Requests langchaint observed going out: one attempt record each."""
-        return len(self.attempt_records)
+        """Return requests that langchaint observed going out."""
+        return len(self.call.attempt_records)
+
+    @property
+    def usage(self) -> Usage:
+        """Return normalized usage across every recorded request."""
+        return Usage.sum_of(attempt.usage for attempt in self.call.attempt_records)
+
+    @property
+    def model(self) -> str:
+        """Return the requested model id."""
+        return self.call.model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider name."""
+        return self.call.provider_name
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Return the complete call duration."""
+        return self.call.elapsed_seconds
+
+    @property
+    def assistant_message(self) -> AssistantMessage | None:
+        """Return the last recorded assistant message."""
+        for attempt in reversed(self.call.attempt_records):
+            if isinstance(attempt, SettledAttemptRecord) and attempt.assistant_message is not None:
+                return attempt.assistant_message
+        return None
+
+    @property
+    def stop_reason(self) -> StopReason | None:
+        """Return the normalized stop reason when this variant defines one."""
+        return None
+
+    @property
+    def error_summary(self) -> str:
+        """Return the tracing-safe terminal failure summary."""
+        return "generation failed"
 
     @property
     def error_text(self) -> str:
-        """The whole failure as one string, which the tracing layer sets as the call span's status.
-
-        `RetriesExhaustedError` includes its complete transient-error chain.
-        """
-        return str(self)
-
-
-class RetriesExhaustedError(GenerationError):
-    """Every attempt failed with a transient error, and the budget ran out."""
+        """Return the tracing-safe complete failure text."""
+        return self.error_summary
 
     @override
-    def _summary(self) -> str:
-        errors = _extract_transient_errors(self.attempt_records)
-        last = str(errors[-1]) if errors else "no attempts recorded"
-        return f"{len(errors)} attempts failed; last: {last}"
+    def __str__(self) -> str:
+        """Return `error_summary`."""
+        return self.error_summary
+
+
+class _CompletedModelTurnErrorRecordBase(_GenerationErrorRecordBase):
+    """Shared validation for errors that require a completed model turn.
+
+    Validation rejects unknown fields.
+    """
+
+    @model_validator(mode="after")
+    def _validate_completed_model_turn(self) -> Self:
+        _require_completed_model_turn(self.call)
+        return self
+
+
+def _require_retry_failures(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
+    attempts = _settled_attempts(call)
+    if not attempts:
+        raise ValueError("call must contain at least one settled attempt")
+    if any(attempt.error is None for attempt in attempts):
+        raise ValueError("every attempt must contain a transient error")
+    return attempts
+
+
+def _require_terminal_provider_result(call: CallRecord, *, permit_empty: bool) -> None:
+    attempts = _settled_attempts(call)
+    if not attempts:
+        if permit_empty:
+            return
+        raise ValueError("call must contain a final provider result")
+    if any(attempt.error is None for attempt in attempts[:-1]):
+        raise ValueError("every attempt before the final attempt must contain an error")
+    final = attempts[-1]
+    if final.error is not None:
+        raise ValueError("the final attempt must be error-free")
+    if final.assistant_message is not None:
+        raise ValueError("the final provider result must not contain an assistant message")
+
+
+def _require_abandoned_shape(call: CallRecord) -> None:
+    settled = tuple(
+        attempt for attempt in call.attempt_records if isinstance(attempt, SettledAttemptRecord)
+    )
+    final_is_cut_off = bool(call.attempt_records) and isinstance(
+        call.attempt_records[-1], CutOffAttemptRecord
+    )
+    if final_is_cut_off:
+        settled_prefix = settled
+    elif settled and settled[-1].error is None:
+        final = settled[-1]
+        if final.assistant_message is not None:
+            raise ValueError("the final settled request must be a terminal provider result")
+        settled_prefix = settled[:-1]
+    else:
+        settled_prefix = settled
+    if any(attempt.error is None for attempt in settled_prefix):
+        raise ValueError("settled attempts before the terminal request must contain errors")
+
+
+class RetriesExhaustedErrorRecord(_GenerationErrorRecordBase):
+    """Every request failed transiently and the retry budget ended.
+
+    Validation rejects unknown fields.
+    """
+
+    kind: Literal["retries_exhausted_error"] = "retries_exhausted_error"
+
+    @model_validator(mode="after")
+    def _validate_retry_failures(self) -> Self:
+        _ = _require_retry_failures(self.call)
+        return self
 
     @property
-    def errors_from_attempts(self) -> tuple[TransientError, ...]:
-        """The failed attempts' errors, in order."""
-        return _extract_transient_errors(self.attempt_records)
+    def errors_from_attempts(self) -> tuple[TransientErrorRecord, ...]:
+        """Return each attempt's normalized transient error."""
+        return tuple(
+            attempt.error for attempt in _settled_attempts(self.call) if attempt.error is not None
+        )
+
+    @property
+    @override
+    def error_summary(self) -> str:
+        errors = self.errors_from_attempts
+        return f"{len(errors)} attempts failed; last: {errors[-1]}"
 
     @property
     @override
     def error_text(self) -> str:
-        """The folded failure chain, one entry per attempt."""
-        return _join_error_text(self.attempt_records)
+        """Return one transient error entry per request."""
+        return "; ".join(
+            f"attempt {index + 1}: {attempt.error}"
+            for index, attempt in enumerate(_settled_attempts(self.call))
+        )
 
 
-class RetryUnavailableError(GenerationError):
-    """A transient failure from an open stream that `stream_one` cannot retry.
+class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
+    """An open stream failed transiently after retry became unavailable.
 
-    Call `stream_one` again to retry.
-    The final attempt's `TransientError` is also `__cause__`.
+    Validation rejects unknown fields.
     """
 
+    kind: Literal["retry_unavailable_error"] = "retry_unavailable_error"
+
+    @model_validator(mode="after")
+    def _validate_retry_failures(self) -> Self:
+        _ = _require_retry_failures(self.call)
+        return self
+
+    @property
     @override
-    def _summary(self) -> str:
-        errors = _extract_transient_errors(self.attempt_records)
-        last = str(errors[-1]) if errors else "no attempts recorded"
-        return f"no retry was available for a transient failure: {last}"
+    def error_summary(self) -> str:
+        """Return the final transient error in the stable summary."""
+        error = _require_retry_failures(self.call)[-1].error
+        return f"no retry was available for a transient failure: {error}"
 
 
-class RefusalError(GenerationError):
-    """No structured output: the model refused, or a provider content filter blocked the turn.
+class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A structured response ended in a refusal.
 
-    This error occurs only on the structured path because no validated instance exists.
-    The text path returns a `Response` with `stop_reason="refusal"`.
-    langchaint does not retry refusals.
-    Retrying resamples and spends nonzero input tokens, including cache reads when warm.
+    Validation rejects unknown fields.
     """
+
+    kind: Literal["refusal_error"] = "refusal_error"
 
     @property
     @override
     def stop_reason(self) -> Literal["refusal"]:
-        """The turn the provider completed and the adapter rejected ended in a refusal."""
         return "refusal"
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return "no structured output: the model refused or a provider filter blocked the turn"
 
 
-class MaxCompletionTokensExceededError(GenerationError):
-    """The structured response reached `max_completion_tokens` before its JSON parsed.
+class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A structured response reached its token limit before parsing.
 
-    This error occurs only on the structured path.
-    The text path returns a `Response` with `stop_reason="max_tokens"`.
-    langchaint does not retry this error.
-    Use `rebind` with a larger `max_completion_tokens`.
+    Validation rejects unknown fields.
     """
+
+    kind: Literal["max_completion_tokens_exceeded_error"] = "max_completion_tokens_exceeded_error"
 
     @property
     @override
     def stop_reason(self) -> Literal["max_tokens"]:
-        """The turn the provider completed and the adapter rejected hit the token cap."""
         return "max_tokens"
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return "the structured response reached max_completion_tokens before its JSON parsed"
 
 
-class EmptyTurnError(GenerationError):
-    """A structured turn produces no instance or tool call."""
+class EmptyTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A structured response produced no output or tool call.
+
+    Validation rejects unknown fields.
+    """
+
+    kind: Literal["empty_turn_error"] = "empty_turn_error"
 
     @property
     @override
     def stop_reason(self) -> Literal["end_turn"]:
-        """Return the stop reason for a turn with no value the binding could return."""
         return "end_turn"
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return "the model completed its turn without producing output"
 
 
-class SchemaViolationError(GenerationError):
-    """The turn's text fails the bound `response_format` validation.
+class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A structured response failed the caller's model validation.
 
-    `validation_error_json` contains pydantic's errors and rejected values.
-    It stays outside the exception message because validator text can contain generated content.
+    Validation rejects unknown fields.
     """
 
     validation_error_json: str
-
-    def __init__(
-        self, *, validation_error_json: str, call: CallRecord, request: "RequestParams | None"
-    ) -> None:
-        """Store what the validation rejected, then the call."""
-        self.validation_error_json = validation_error_json
-        super().__init__(call=call, request=request)
+    kind: Literal["schema_violation_error"] = "schema_violation_error"
 
     @property
     @override
     def stop_reason(self) -> Literal["end_turn"]:
-        """Return the stop reason for text that does not validate as the bound model."""
         return "end_turn"
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return "the turn's text is not an instance of the bound response_format"
 
 
-class ContextWindowExceededError(GenerationError):
-    """The request overflowed the model's context window.
+class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A response reported that the request exceeded the context window.
 
-    langchaint does not retry this error because the same request overflows on every attempt.
-    Use a shorter `GenerationInput` or a model with a larger context window.
+    Validation rejects unknown fields.
     """
+
+    kind: Literal["context_window_exceeded_error"] = "context_window_exceeded_error"
 
     @property
     @override
     def stop_reason(self) -> Literal["context_window_exceeded"]:
-        """The provider reported the overflow as the turn's stop reason."""
         return "context_window_exceeded"
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return "the request exceeded the model's context window"
 
 
-class UnfinishedTurnError(GenerationError):
-    """The provider returns a partial turn that langchaint cannot continue.
+class UnfinishedTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A provider returned a partial turn that langchaint cannot continue.
 
-    `reason` preserves the provider's description and becomes the exception message.
+    Validation rejects unknown fields.
     """
 
     reason: str
+    kind: Literal["unfinished_turn_error"] = "unfinished_turn_error"
 
-    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
-        """Store what the provider reported, then the call."""
-        self.reason = reason
-        super().__init__(call=call, request=request)
-
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return self.reason
 
 
-class ProviderFailedTerminallyError(GenerationError):
-    """A billable response reports a terminal generation failure.
+class ProviderFailedTerminallyErrorRecord(_CompletedModelTurnErrorRecordBase):
+    """A billable response reported a terminal generation failure.
 
-    `reason` preserves the provider's description in the exception message.
+    Validation rejects unknown fields.
     """
 
     reason: str
+    kind: Literal["provider_failed_terminally_error"] = "provider_failed_terminally_error"
 
-    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
-        """Store what the provider reported, then the call."""
-        self.reason = reason
-        super().__init__(call=call, request=request)
-
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return f"the provider reported that generating the response failed: {self.reason}"
 
 
-class InvalidRequestError(GenerationError):
-    """The adapter or provider rejects one request.
+class InvalidRequestErrorRecord(_GenerationErrorRecordBase):
+    """An adapter or provider rejected one request.
 
-    `request` is `None` when `build_request` rejects messages before constructing a request.
-    Provider rejections preserve their SDK exception as `__cause__`.
-    `reason` is the exception message.
+    Validation rejects unknown fields.
     """
 
     reason: str
+    kind: Literal["invalid_request_error"] = "invalid_request_error"
 
-    def __init__(self, *, reason: str, call: CallRecord, request: "RequestParams | None") -> None:
-        """Store the rejection, then the call."""
-        self.reason = reason
-        super().__init__(call=call, request=request)
+    @model_validator(mode="after")
+    def _validate_terminal_provider_result(self) -> Self:
+        _require_terminal_provider_result(self.call, permit_empty=True)
+        return self
 
+    @property
     @override
-    def _summary(self) -> str:
+    def error_summary(self) -> str:
         return self.reason
 
 
-class ProviderDeclaredFinalError(GenerationError):
-    """The provider marks an error terminal.
+class ProviderDeclaredFinalErrorRecord(_GenerationErrorRecordBase):
+    """A provider marked one request error as terminal.
 
-    `error` preserves the provider's message and is also chained as `__cause__`.
+    Validation rejects unknown fields.
     """
 
-    error: Exception
+    reason: str
+    kind: Literal["provider_declared_final_error"] = "provider_declared_final_error"
 
-    def __init__(
-        self, *, error: Exception, call: CallRecord, request: "RequestParams | None"
-    ) -> None:
-        """Store the provider's exception, then the call."""
-        self.error = error
-        super().__init__(call=call, request=request)
+    @model_validator(mode="after")
+    def _validate_terminal_provider_result(self) -> Self:
+        _require_terminal_provider_result(self.call, permit_empty=False)
+        return self
 
+    @property
     @override
-    def _summary(self) -> str:
-        return f"a final error from the provider: {self.error}"
+    def error_summary(self) -> str:
+        return f"a final error from the provider: {self.reason}"
 
 
-class UnknownExceptionError(GenerationError):
-    """An exception `Adapter.classify` cannot place.
+class UnknownExceptionErrorRecord(_GenerationErrorRecordBase):
+    """An exception `Adapter.classify` could not place.
 
-    `error` is also chained as `__cause__`.
-    The attempt record contains billing only when a response or open stream reported it.
+    Validation rejects unknown fields.
     """
 
-    error: Exception
+    reason: str
+    kind: Literal["unknown_exception_error"] = "unknown_exception_error"
 
-    def __init__(
-        self, *, error: Exception, call: CallRecord, request: "RequestParams | None"
-    ) -> None:
-        """Store the unplaceable exception, then the call."""
-        self.error = error
-        super().__init__(call=call, request=request)
-
+    @property
     @override
-    def _summary(self) -> str:
-        return f"langchaint could not place this exception: {self.error}"
+    def error_summary(self) -> str:
+        return f"langchaint could not place this exception: {self.reason}"
 
 
-class EscapedExceptionError(GenerationError):
-    """An exception that escapes langchaint's generation handling.
+class EscapedExceptionErrorRecord(_GenerationErrorRecordBase):
+    """An exception escaped langchaint's generation handling.
 
-    `error` is also chained as `__cause__` and supplies `error_text`.
+    Validation rejects unknown fields.
     """
 
-    error: Exception
+    reason: str
+    kind: Literal["escaped_exception_error"] = "escaped_exception_error"
 
-    def __init__(self, *, error: Exception, call: CallRecord) -> None:
-        """Store the escaped exception, then the call."""
-        self.error = error
-        super().__init__(call=call, request=None)
-
+    @property
     @override
-    def _summary(self) -> str:
-        return f"an exception escaped langchaint: {self.error}"
+    def error_summary(self) -> str:
+        return f"an exception escaped langchaint: {self.reason}"
 
 
-class AbandonedCallError(GenerationError):
-    """A call whose result did not reach the caller.
+class AbandonedCallErrorRecord(_GenerationErrorRecordBase):
+    """A call ended before its result reached the caller.
 
-    `in_flight_attempt_started_at_monotonic_seconds` identifies an unfinished request.
-    `billing_in_flight` contains billing reported before interruption.
-    `usage` sums settled attempts and `billing_in_flight`.
+    Validation rejects unknown fields.
     """
 
-    billing_in_flight: Billing | None
-    in_flight_attempt_started_at_monotonic_seconds: float | None
+    kind: Literal["abandoned_call_error"] = "abandoned_call_error"
+
+    @model_validator(mode="after")
+    def _validate_abandoned_shape(self) -> Self:
+        _require_abandoned_shape(self.call)
+        return self
+
+    @property
+    @override
+    def error_summary(self) -> str:
+        return "the call was cut off before its result reached the caller"
+
+
+class TimedOutErrorRecord(_GenerationErrorRecordBase):
+    """A langchaint deadline expired before the call returned.
+
+    Validation rejects unknown fields.
+    """
+
+    kind: Literal["timed_out_error"] = "timed_out_error"
+
+    @model_validator(mode="after")
+    def _validate_abandoned_shape(self) -> Self:
+        _require_abandoned_shape(self.call)
+        return self
+
+    @property
+    @override
+    def error_summary(self) -> str:
+        return "the call timed out before it produced a result"
+
+
+type GenerationErrorRecord = Annotated[
+    RetriesExhaustedErrorRecord
+    | RetryUnavailableErrorRecord
+    | RefusalErrorRecord
+    | MaxCompletionTokensExceededErrorRecord
+    | EmptyTurnErrorRecord
+    | SchemaViolationErrorRecord
+    | ContextWindowExceededErrorRecord
+    | UnfinishedTurnErrorRecord
+    | ProviderFailedTerminallyErrorRecord
+    | InvalidRequestErrorRecord
+    | ProviderDeclaredFinalErrorRecord
+    | UnknownExceptionErrorRecord
+    | EscapedExceptionErrorRecord
+    | AbandonedCallErrorRecord
+    | TimedOutErrorRecord,
+    Field(discriminator="kind"),
+]
+
+_GENERATION_ERROR_RECORD_CLASSES = (
+    RetriesExhaustedErrorRecord,
+    RetryUnavailableErrorRecord,
+    RefusalErrorRecord,
+    MaxCompletionTokensExceededErrorRecord,
+    EmptyTurnErrorRecord,
+    SchemaViolationErrorRecord,
+    ContextWindowExceededErrorRecord,
+    UnfinishedTurnErrorRecord,
+    ProviderFailedTerminallyErrorRecord,
+    InvalidRequestErrorRecord,
+    ProviderDeclaredFinalErrorRecord,
+    UnknownExceptionErrorRecord,
+    EscapedExceptionErrorRecord,
+    AbandonedCallErrorRecord,
+    TimedOutErrorRecord,
+)
+
+
+class GenerationError(Exception):
+    """A live terminal generation failure with one normalized record."""
+
+    record: GenerationErrorRecord
+    request: "RequestParams | None"
+    provider_attempts: tuple[AttemptProviderData, ...]
 
     def __init__(
         self,
         *,
-        call: CallRecord,
-        billing_in_flight: Billing | None,
-        in_flight_attempt_started_at_monotonic_seconds: float | None,
+        record: GenerationErrorRecord,
+        request: "RequestParams | None",
+        provider_attempts: tuple[AttemptProviderData, ...],
     ) -> None:
-        """Store the cut-off attempt's account, then add what it billed to the settled total."""
-        super().__init__(call=call, request=None)
-        self.billing_in_flight = billing_in_flight
-        self.in_flight_attempt_started_at_monotonic_seconds = (
-            in_flight_attempt_started_at_monotonic_seconds
-        )
-        if billing_in_flight is not None:
-            self.usage = Usage.sum_of([self.usage, billing_in_flight.usage])
+        """Store normalized and live-only failure data."""
+        if type(record) not in _GENERATION_ERROR_RECORD_CLASSES:
+            raise TypeError(f"unsupported generation error record: {type(record).__name__}")
+        if len(provider_attempts) != len(record.call.attempt_records):
+            raise ValueError("provider_attempts must align with call.attempt_records")
+        super().__init__()
+        self.record = record
+        self.request = request
+        self.provider_attempts = provider_attempts
 
     @property
-    @override
+    def call(self) -> CallRecord:
+        """Return the normalized call record."""
+        return self.record.call
+
+    @property
+    def attempt_records(
+        self,
+    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
+        """Return normalized request records in order."""
+        return self.record.attempt_records
+
+    @property
     def attempts(self) -> int:
-        """Requests langchaint observed going out, counting the one cut off without a record.
+        """Return requests that langchaint observed going out."""
+        return self.record.attempts
 
-        Counting the request keeps the calls row consistent with the `to_tables` attempts rows.
-        """
-        if self.in_flight_attempt_started_at_monotonic_seconds is None:
-            return len(self.attempt_records)
-        return len(self.attempt_records) + 1
+    @property
+    def usage(self) -> Usage:
+        """Return normalized usage across every request."""
+        return self.record.usage
+
+    @property
+    def model(self) -> str:
+        """Return the requested model id."""
+        return self.record.model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider name."""
+        return self.record.provider_name
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Return the complete call duration."""
+        return self.record.elapsed_seconds
+
+    @property
+    def assistant_message(self) -> AssistantMessage | None:
+        """Return the last recorded assistant message."""
+        return self.record.assistant_message
+
+    @property
+    def stop_reason(self) -> StopReason | None:
+        """Return the normalized stop reason when present."""
+        return self.record.stop_reason
+
+    @property
+    def error_text(self) -> str:
+        """Return the tracing-safe complete failure text."""
+        return self.record.error_text
 
     @override
-    def _summary(self) -> str:
-        return "the call was cut off before its result reached the caller"
-
-
-class TimedOutError(AbandonedCallError):
-    """A langchaint deadline expires before the call returns.
-
-    `generate_one.timeout_seconds` includes admission waits.
-    `generate_many.max_working_seconds_per_item` excludes admission waits.
-    """
-
-    @override
-    def _summary(self) -> str:
-        return "the call timed out before it produced a result"
+    def __str__(self) -> str:
+        """Return `record.error_summary`."""
+        return self.record.error_summary
 
 
 class InvalidToolArgsError(Exception):
     """A tool call's `args_json` failed validation against the tool's `args_model`.
 
-    `PydanticTool._validated_args` is the only langchaint function that raises this error.
+    `PydanticTool._validated_args` raises this error.
     A tool function does not cause langchaint to raise this error.
-    `ToolManager.dispatch` catches it and returns `DispatchInvalidToolArgs`.
+    `ToolManager.dispatch` catches this error and returns `DispatchInvalidToolArgs`.
     """
 
-    def __init__(self, validation_error: ValidationError) -> None:
-        """Hold `validation_error` by reference.
+    validation_error: ValidationError
 
-        Args:
-            validation_error: The tool argument validation failure.
-        """
+    def __init__(self, validation_error: ValidationError) -> None:
+        """Hold `validation_error` by reference."""
         super().__init__()
-        self.validation_error: ValidationError = validation_error
+        self.validation_error = validation_error
 
     @override
     def __str__(self) -> str:
-        """Render the held ValidationError as its own multi-line string."""
+        """Render the held validation error."""
         return str(self.validation_error)
 
 
@@ -447,7 +618,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     """Tool function exceptions from `ToolManager.dispatch_many`.
 
     `completed_outcomes` preserves settled outcomes in input order.
-    The grouped exceptions also preserve input order and their tracebacks.
+    The grouped exceptions preserve input order and their tracebacks.
     Cancellation propagates separately with this group as its cause when both occur.
     """
 
@@ -460,7 +631,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         *,
         completed_outcomes: "tuple[DispatchManyOutcome, ...]",
     ) -> Self:
-        """Pass `message` and `exceptions` to the base `__new__`."""
+        """Build a group carrying the completed dispatch outcomes."""
         group = super().__new__(cls, message, exceptions)
         group.completed_outcomes = completed_outcomes
         return group
@@ -472,23 +643,14 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         *,
         completed_outcomes: "tuple[DispatchManyOutcome, ...]",
     ) -> None:
-        """Store completed_outcomes and set args on the base.
-
-        `BaseException.__init__` accepts only positional arguments.
-        This override stores the keyword-only `completed_outcomes`.
-        """
+        """Store grouped exceptions and completed dispatch outcomes."""
         super().__init__(message, exceptions)
         self.completed_outcomes = completed_outcomes
 
     @override
     # pyrefly: ignore[bad-override]  # Typeshed makes `derive` generic for each call.
-    # No concrete subclass override can satisfy the generic signature.
     def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
-        """Rebuild a subgroup carrying the same completed_outcomes.
-
-        Args:
-            excs: The subgroup exceptions.
-        """
+        """Return a subgroup with the same `completed_outcomes`."""
         return DispatchExceptionGroup(
             self.message, excs, completed_outcomes=self.completed_outcomes
         )
@@ -497,26 +659,26 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
 class StreamProtocolError(Exception):
     """A stream did not follow the event contract.
 
-    Raised when a stream ends without a terminal result.
-    This includes a missing Messages API stop reason or Responses API terminal response.
-    It also includes a `StreamHandle` that ends without an adapter stream.
-    `AdapterStream.final()` may raise it when called before `AdapterStream.items()` is exhausted.
+    A stream that ends without a terminal result raises this error.
+    A missing Messages API stop reason or Responses API terminal response raises this error.
+    A `StreamHandle` that ends without an adapter stream raises this error.
+    `AdapterStream.final()` may raise this error before `AdapterStream.items()` is exhausted.
     """
 
 
-class GaveUpWaiting(Exception):  # noqa: N818 (the interface names the outcome, not an error kind)
-    """The `budget` expired before SharedBackoff.admitted's entry admitted the request.
+class GaveUpWaiting(Exception):  # noqa: N818
+    """A budget expired before `SharedBackoff.admitted()` admitted the request.
 
-    Entry holds nothing: no permit, no queue place, and nothing recorded.
-    A fresh attempt joins the same queue behind the same pause, so do not resubmit at once.
+    The admission holds no permit or queue position and records no request.
+    A new attempt joins the same queue behind the same pause.
     """
 
 
 class ParserContractError(Exception):
-    """A SharedBackoff parse raised.
+    """A `SharedBackoff` parse function raised.
 
-    A defect in `parse`, not a provider classification: fix `parse` rather than retrying through it.
-    __cause__ holds what `parse` raised, where it raised.
-    Behind that as context sits the provider failure `parse` was given.
-    Nothing was recorded, and Admission.verdict is None.
+    This error identifies a defect in `parse` instead of a provider classification.
+    `__cause__` holds the exception from `parse`.
+    The provider failure passed to `parse` remains as exception context.
+    `SharedBackoff` records no request outcome for this error.
     """

@@ -56,6 +56,7 @@ from langchaint import (
     ImagePart,
     ImageUrlPart,
     InferenceParams,
+    JsonValue,
     Message,
     RawPart,
     ReasoningDelta,
@@ -101,7 +102,6 @@ from langchaint.openai import (
 from langchaint.openai.responses_adapter import (
     _assistant_items,
     _assistant_message_from,
-    _billing_from_response,
     _BoundOpenAI,
     _BoundOpenAIStructured,
     _BoundOpenAIText,
@@ -111,7 +111,11 @@ from langchaint.openai.responses_adapter import (
     _wire_input,
     _wire_tool_choice,
 )
+from langchaint.openai.responses_adapter import (
+    _billing_from_response as _provider_billing_from_response,
+)
 from langchaint.openai.shared import PARSE_FALLTHROUGH_COUNTS, parse_openai
+from langchaint.pricing import Billing
 from langchaint.shared_backoff import (
     DoNotRetry,
     PauseAll,
@@ -125,6 +129,18 @@ from tests.helpers import (
     openai_sdk_errors_and_verdicts,
     status_error,
 )
+
+
+def _billing_from_response(
+    response: OpenAIResponse,
+    pricing: OpenAIPricingTable,
+    *,
+    regional_processing: bool = False,
+) -> Billing:
+    return _provider_billing_from_response(
+        response, pricing, regional_processing=regional_processing
+    ).billing
+
 
 _DEFAULT_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -246,7 +262,7 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
     raw = _response(usage=_usage_with_cache(), service_tier="auto")
     billing = _billing_from_response(raw, _PRICING)
     usage = billing.usage
-    assert billing.usage_raw is raw.usage
+    assert _provider_billing_from_response(raw, _PRICING).usage_raw is raw.usage
     assert billing.service_tier == "default"
     assert billing.input_cache_none_usd_per_million_tokens == 2.5
     assert billing.cache_read_usd_per_million_tokens == 1.25
@@ -351,7 +367,7 @@ def test_billing_reads_reasoning_tokens() -> None:
 def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
     """A response missing usage still stores the rates the tier that served it would have spent."""
     billing = _billing_from_response(_response(usage=None), _PRICING)
-    assert billing.usage_raw is None
+    assert _provider_billing_from_response(_response(usage=None), _PRICING).usage_raw is None
     assert billing.output_usd_per_million_tokens == 10.0
     assert billing.service_tier == "default"
 
@@ -591,7 +607,7 @@ def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
-    raw: dict[str, object] = {"type": "thinking", "thinking": "t", "signature": "s"}
+    raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
     assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_items(assistant_message) == [
         raw,
@@ -1123,7 +1139,7 @@ def test_cutoff_openai_provider_tool_billing_is_nan() -> None:
     """A charged binding cannot report zero before terminal usage arrives."""
     billing = _stream([], charged_provider_tools=True).billing_reported()
     assert billing is not None
-    assert math.isnan(billing.usage.provider_executed_tool_cost_in_usd)
+    assert math.isnan(billing.billing.usage.provider_executed_tool_cost_in_usd)
     assert _stream([]).billing_reported() is None
 
 
@@ -1537,7 +1553,7 @@ def test_stream_failed_terminal_is_terminal_and_reports_the_provider_failure() -
         assert translated == []
         raw = await adapter_stream.final()
         assert isinstance(_text_bound().interpret(raw), ProviderFailedTransiently)
-        assert _text_bound().billing_from_raw(raw).usage.input_tokens_total == 1000
+        assert _text_bound().billing_from_raw(raw).billing.usage.input_tokens_total == 1000
 
     asyncio.run(scenario())
 

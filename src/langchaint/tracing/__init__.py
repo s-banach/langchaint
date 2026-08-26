@@ -69,7 +69,8 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
-from langchaint.exceptions import AbandonedCallError, GenerationError
+from langchaint.call import SettledAttemptRecord
+from langchaint.exceptions import AbandonedCallErrorRecord, GenerationError
 from langchaint.inference_params import InferenceParams
 from langchaint.llm import (
     LLM,
@@ -115,8 +116,7 @@ type SpanAttributes = Mapping[str, SpanAttributeValue]
 type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
 """Maps one generate result to its span attributes.
 
-The parameter is `CallResult[object]` because the mapper reads the fields shared by each `CallResult` variant.
-Frozen dataclasses make the success variants' `OutputT` covariant under PEP 695 inference.
+The mapper reads the fields shared by each `CallResult` variant.
 No mapper receives `GenerationInput`, so `gen_ai_attributes` cannot put a prompt on a span.
 A custom mapper can reach `CallResult.raw`, which holds the SDK response by reference.
 `capture_message_content` controls prompt capture because the wrapper receives `GenerationInput` as a method argument.
@@ -260,7 +260,7 @@ def _finish_reason(stop_reason: StopReason) -> str:
     return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
 
 
-def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
+def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
     `result` supplies the response identity, usage, stop reason, and attempt records.
@@ -283,7 +283,10 @@ def gen_ai_attributes(result: CallResult[object]) -> SpanAttributes:
     """
     usage = result.usage
     records = result.attempt_records
-    model_served = records[-1].model_served if records else None
+    final_record = records[-1] if records else None
+    model_served = (
+        final_record.model_served if isinstance(final_record, SettledAttemptRecord) else None
+    )
     attributes: dict[str, SpanAttributeValue] = {
         "gen_ai.provider.name": result.provider_name,
         "gen_ai.request.model": result.model,
@@ -628,8 +631,8 @@ def _output_content_attributes(
     }
 
 
-def _apply_output_content(
-    span: Span, result: CallResult[object], span_config: _SpanConfig
+def _apply_output_content[OutputT](
+    span: Span, result: CallResult[OutputT], span_config: _SpanConfig
 ) -> None:
     """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
 
@@ -647,7 +650,7 @@ def _apply_output_content(
     )
 
 
-def _record_attempt_failed_events(span: Span, result: CallResult[object]) -> None:
+def _record_attempt_failed_events[OutputT](span: Span, result: CallResult[OutputT]) -> None:
     """Add one langchaint.attempt_failed event per failed attempt in the result's records.
 
     Each event carries the attempt's error text and its own `elapsed_seconds`.
@@ -655,16 +658,16 @@ def _record_attempt_failed_events(span: Span, result: CallResult[object]) -> Non
     They answer the first question a slow traced call raises: was it the request or the retries.
     """
     for record in result.attempt_records:
-        if record.error is not None:
+        if isinstance(record, SettledAttemptRecord) and record.error is not None:
             span.add_event(
                 "langchaint.attempt_failed",
                 {"error_text": str(record.error), "elapsed_seconds": record.elapsed_seconds},
             )
 
 
-def _apply_result_attributes(
+def _apply_result_attributes[OutputT](
     span: Span,
-    result: CallResult[object],
+    result: CallResult[OutputT],
     attribute_mapper: AttributeMapper,
 ) -> None:
     """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
@@ -737,9 +740,9 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
     """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
 
-    error.type is the GenerationError subclass name, which groups errors independently of error_text.
+    error.type is the normalized error record class name, which groups errors independently of error_text.
     """
-    _set_span_attribute(span, "error.type", type(error).__name__)
+    _set_span_attribute(span, "error.type", type(error.record).__name__)
     with _guarding_telemetry_failures("setting the error status"):
         span.set_status(Status(StatusCode.ERROR, error.error_text))
 
@@ -1384,7 +1387,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         )
 
 
-class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
+class TracedStreamHandle[OutputT, ToolTurnT = Never]:
     """Wraps a StreamHandle, owning one span across the stream's life.
 
     Items pass through by reference.
@@ -1420,7 +1423,7 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         self._first_item_seen = False
 
     @property
-    def abandoned(self) -> AbandonedCallError | None:
+    def abandoned(self) -> AbandonedCallErrorRecord | None:
         """The wrapped handle's account of this call where a cancellation cut it off, None otherwise.
 
         StreamHandle.abandoned says when it is set.
@@ -1478,10 +1481,10 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Cancellation passes through so __aexit__ can distinguish timeout_seconds from outer cancellation.
 
         Raises:
-            RetryUnavailableError: The open stream fails transiently.
-            InvalidRequestError: The adapter classifies an item error as an invalid request.
-            ProviderDeclaredFinalError: The provider declares an item error terminal.
-            UnknownExceptionError: The adapter cannot classify an item exception.
+            GenerationError: The open stream fails transiently.
+                The adapter classifies an item error as an invalid request.
+                The provider declares an item error terminal.
+                The adapter cannot classify an item exception.
             StreamProtocolError: The event stream ends without a terminal event.
             ParserContractError: `Adapter.parse` violates its contract.
             StopAsyncIteration: The inner stream is exhausted.
@@ -1511,12 +1514,12 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         A second entry raises before the span is touched, so it cannot mark the first stream's span failed.
 
         Raises:
-            InvalidRequestError: The adapter rejects the request.
+            GenerationError: The adapter rejects the request.
+                The provider declares the open failure terminal.
+                The adapter cannot classify the open failure.
+                The open attempts consume the retry budget.
+                `timeout_seconds` expires before the request opens.
             RuntimeError: This handle was already entered.
-            ProviderDeclaredFinalError: The provider declares the open failure terminal.
-            UnknownExceptionError: The adapter cannot classify the open failure.
-            RetriesExhaustedError: Open attempts consume the retry budget.
-            TimedOutError: `timeout_seconds` expires before the request opens.
             ParserContractError: `Adapter.parse` violates its contract.
             asyncio.CancelledError: The caller cancels entry.
         """
@@ -1564,25 +1567,18 @@ class TracedStreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     @overload
     async def final(self: "TracedStreamHandle[OutputT, Never]") -> Response[OutputT]: ...
     @overload
-    async def final(self) -> "Response[OutputT] | ToolTurnT": ...
-    async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
+    async def final(self) -> "Response[OutputT] | ToolCallTurn[OutputT]": ...
+    async def final(self) -> Response[OutputT] | ToolCallTurn[OutputT]:
         """Drain the inner stream, attribute the span from the result, and end the span.
 
         The span ends once. After it ends, this delegates to the cached inner final() result.
 
         Raises:
             StreamProtocolError: The event stream ends without a terminal event.
-            InvalidRequestError: The adapter classifies an item error as an invalid request.
-            ProviderDeclaredFinalError: The provider declares an item error terminal.
-            UnknownExceptionError: The adapter cannot classify an item exception.
-            RefusalError: The assembled response contains a refusal.
-            MaxCompletionTokensExceededError: Structured output reaches its token limit.
-            EmptyTurnError: The assembled response contains no output.
-            SchemaViolationError: Structured output fails validation.
-            ContextWindowExceededError: The request exceeds the context window.
-            UnfinishedTurnError: The assembled response contains an unfinished turn.
-            ProviderFailedTerminallyError: The assembled response reports a terminal provider failure.
-            RetryUnavailableError: The open stream fails transiently.
+            GenerationError: The adapter or provider reports a terminal failure.
+                The assembled response reports a terminal result.
+                The open stream fails transiently.
+                The adapter cannot classify an item exception.
             ParserContractError: `Adapter.parse` violates its contract.
             RuntimeError: The handle is unopened or finished without a stored conclusion.
             asyncio.CancelledError: The caller cancels finalization.

@@ -35,6 +35,7 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
+    ProviderBilling,
     RequestParams,
     verdict_from_transient_error,
 )
@@ -76,7 +77,6 @@ _TURN_USAGE = Usage(
 _TURN_BILLING = Billing(
     usage=_TURN_USAGE,
     service_tier="scripted",
-    usage_raw=None,
     input_cache_none_usd_per_million_tokens=60.00,
     cache_read_usd_per_million_tokens=6.00,
     cache_write_usd_per_million_tokens=75.00,
@@ -177,9 +177,9 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         self._tag = tag
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Return the constant billing for one turn."""
-        return _TURN_BILLING
+        return ProviderBilling(billing=_TURN_BILLING, usage_raw=None)
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:

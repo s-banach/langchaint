@@ -24,27 +24,27 @@ from langchaint.adapter import (
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
-    ContextWindowExceededError,
-    EmptyTurnError,
-    EscapedExceptionError,
+    ContextWindowExceededErrorRecord,
+    EmptyTurnErrorRecord,
+    EscapedExceptionErrorRecord,
     GenerationError,
-    InvalidRequestError,
-    MaxCompletionTokensExceededError,
+    InvalidRequestErrorRecord,
+    MaxCompletionTokensExceededErrorRecord,
     ParserContractError,
-    ProviderDeclaredFinalError,
-    ProviderFailedTerminallyError,
-    RefusalError,
-    RetriesExhaustedError,
-    SchemaViolationError,
+    ProviderDeclaredFinalErrorRecord,
+    ProviderFailedTerminallyErrorRecord,
+    RefusalErrorRecord,
+    RetriesExhaustedErrorRecord,
+    SchemaViolationErrorRecord,
     StreamProtocolError,
-    TimedOutError,
+    TimedOutErrorRecord,
     TransientError,
-    UnfinishedTurnError,
-    UnknownExceptionError,
+    UnfinishedTurnErrorRecord,
+    UnknownExceptionErrorRecord,
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
-from langchaint.pricing import Billing
+from langchaint.pricing import ProviderBilling
 from langchaint.response import (
     CallResult,
     GenerateResult,
@@ -68,7 +68,7 @@ from langchaint.tools import Tool, ToolManager, ToolSchema
 
 
 class _StreamObservations(NamedTuple):
-    billing: Billing | None
+    billing: ProviderBilling | None
     request_id: str | None
     opened: bool
 
@@ -705,18 +705,29 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             # `Adapter.classify` returns `invalid_request` only for a provider rejection.
             # The provider received this request, so the ledger records the attempt.
             ledger.record(error=None, assistant_message=None, billing=observations.billing)
-            return InvalidRequestError(
-                reason=f"the provider rejected the request: {exc}",
-                call=ledger.freeze(),
+            return GenerationError(
+                record=InvalidRequestErrorRecord(
+                    reason=f"the provider rejected the request: {exc}",
+                    call=ledger.freeze(),
+                ),
                 request=request,
+                provider_attempts=ledger.provider_attempts,
             )
         if classification == "declared_final":
             # The provider answered, so the attempt gets a record.
             ledger.record(error=None, assistant_message=None, billing=observations.billing)
-            return ProviderDeclaredFinalError(error=exc, call=ledger.freeze(), request=request)
+            return GenerationError(
+                record=ProviderDeclaredFinalErrorRecord(reason=str(exc), call=ledger.freeze()),
+                request=request,
+                provider_attempts=ledger.provider_attempts,
+            )
         if observations.opened:
             ledger.record(error=None, assistant_message=None, billing=observations.billing)
-        return UnknownExceptionError(error=exc, call=ledger.freeze(), request=request)
+        return GenerationError(
+            record=UnknownExceptionErrorRecord(reason=str(exc), call=ledger.freeze()),
+            request=request,
+            provider_attempts=ledger.provider_attempts,
+        )
 
     def _request_id_for_failure(
         self, exc: Exception, observations: _StreamObservations
@@ -812,18 +823,12 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Run generation attempts under `deadline` and record each outcome.
 
         Raises:
-            InvalidRequestError: The adapter rejects the request.
-            ProviderDeclaredFinalError: The provider declares a terminal failure.
-            UnknownExceptionError: The adapter cannot classify an exception.
-            RefusalError: The provider refuses structured output.
-            MaxCompletionTokensExceededError: Structured output reaches its token limit.
-            EmptyTurnError: The model produces no structured output or tool call.
-            SchemaViolationError: The output fails `response_format` validation.
-            ContextWindowExceededError: The request exceeds the context window.
-            UnfinishedTurnError: The provider returns an unfinished turn.
-            ProviderFailedTerminallyError: The response reports a terminal provider failure.
-            RetriesExhaustedError: Transient failures consume `max_attempts`.
-            TimedOutError: `deadline` expires.
+            GenerationError: The adapter rejects the request.
+                The provider declares a terminal failure.
+                The adapter cannot classify an exception.
+                The completed response reports a terminal result.
+                Transient failures consume `max_attempts`.
+                `deadline` expires.
             ParserContractError: `Adapter.parse` violates its contract.
         """
         ledger.start_call()
@@ -838,7 +843,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 raise
             # The ledger retains billing that the interrupted stream reported.
             # A settled attempt record clears this value to `None`.
-            raise _abandoned_call_error(TimedOutError, ledger, ledger.billing_in_flight) from None
+            raise _abandoned_call_error(
+                TimedOutErrorRecord, ledger, ledger.billing_in_flight
+            ) from None
 
     async def _attempt_until_budget_runs_out(
         self, messages: Sequence[Message], *, ledger: _CallLedger, deadline: Deadline
@@ -924,35 +931,63 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                             splits_tool_call_turns=self._splits_tool_call_turns,
                             output=outcome.output,
                             call=ledger.freeze(),
-                            raw=raw,
+                            provider_attempts=ledger.provider_attempts,
                             stop_reason=outcome.stop_reason,
-                            assistant_message=outcome.assistant_message,
                         )
                     case "refusal":
-                        raise RefusalError(call=ledger.freeze(), request=request)
+                        raise GenerationError(
+                            record=RefusalErrorRecord(call=ledger.freeze()),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
+                        )
                     case "max_completion_tokens_exceeded":
-                        raise MaxCompletionTokensExceededError(
-                            call=ledger.freeze(), request=request
+                        raise GenerationError(
+                            record=MaxCompletionTokensExceededErrorRecord(call=ledger.freeze()),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
                         )
                     case "empty_turn":
-                        raise EmptyTurnError(call=ledger.freeze(), request=request)
-                    case "schema_violation":
-                        raise SchemaViolationError(
-                            validation_error_json=outcome.validation_error_json,
-                            call=ledger.freeze(),
+                        raise GenerationError(
+                            record=EmptyTurnErrorRecord(call=ledger.freeze()),
                             request=request,
+                            provider_attempts=ledger.provider_attempts,
+                        )
+                    case "schema_violation":
+                        raise GenerationError(
+                            record=SchemaViolationErrorRecord(
+                                validation_error_json=outcome.validation_error_json,
+                                call=ledger.freeze(),
+                            ),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
                         )
                     case "context_window_exceeded":
-                        raise ContextWindowExceededError(call=ledger.freeze(), request=request)
+                        raise GenerationError(
+                            record=ContextWindowExceededErrorRecord(call=ledger.freeze()),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
+                        )
                     case "unfinished_turn":
-                        raise UnfinishedTurnError(
-                            reason=outcome.reason, call=ledger.freeze(), request=request
+                        raise GenerationError(
+                            record=UnfinishedTurnErrorRecord(
+                                reason=outcome.reason, call=ledger.freeze()
+                            ),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
                         )
                     case "provider_failed_terminally":
-                        raise ProviderFailedTerminallyError(
-                            reason=outcome.reason, call=ledger.freeze(), request=request
+                        raise GenerationError(
+                            record=ProviderFailedTerminallyErrorRecord(
+                                reason=outcome.reason, call=ledger.freeze()
+                            ),
+                            request=request,
+                            provider_attempts=ledger.provider_attempts,
                         )
-        raise RetriesExhaustedError(call=ledger.freeze(), request=request)
+        raise GenerationError(
+            record=RetriesExhaustedErrorRecord(call=ledger.freeze()),
+            request=request,
+            provider_attempts=ledger.provider_attempts,
+        )
 
     def _request_for_messages(
         self, messages: Sequence[Message], *, ledger: _CallLedger
@@ -960,11 +995,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Build one provider request.
 
         Raises:
-            InvalidRequestError: The adapter rejects `messages` before any request.
+            GenerationError: The adapter rejects `messages` before any request.
         """
         built = self._bound_adapter.build_request(messages)
         if isinstance(built, InvalidRequest):
-            raise InvalidRequestError(reason=built.reason, call=ledger.freeze(), request=None)
+            raise GenerationError(
+                record=InvalidRequestErrorRecord(reason=built.reason, call=ledger.freeze()),
+                request=None,
+                provider_attempts=ledger.provider_attempts,
+            )
         return built
 
     @overload
@@ -1013,7 +1052,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Run one call at the widest output type and record escaped `Exception` values.
 
         Raises:
-            GenerationError: Generation fails or an escaped `Exception` becomes `EscapedExceptionError`.
+            GenerationError: Generation fails or an escaped `Exception` becomes `GenerationError`.
             BaseException: A non-`Exception` value interrupts the call.
         """
         ledger = _CallLedger(model=self.adapter.model, provider_name=self.adapter.provider_name)
@@ -1024,7 +1063,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         except GenerationError:
             raise
         except Exception as escaped:
-            raise EscapedExceptionError(error=escaped, call=ledger.freeze()) from escaped
+            raise GenerationError(
+                record=EscapedExceptionErrorRecord(reason=str(escaped), call=ledger.freeze()),
+                request=None,
+                provider_attempts=ledger.provider_attempts,
+            ) from escaped
 
     async def _generate_or_failure(
         self,

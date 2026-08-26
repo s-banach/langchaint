@@ -77,7 +77,6 @@ Document every public parameter and cross-provider difference.
 - Preserve provider error text verbatim after a prefix that names the failure.
 - Keep generated content out of `error_text` and `__str__` because tracing records both without regard to `capture_message_content`.
 - Put recoverable content in its own field.
-- Represent every non-exception class variant of a public outcome union as a frozen dataclass.
 - Create a separate variant only when an outcome has different fields or changes control flow.
 - Require variant-specific data as non-optional fields.
 - Give each variant a defaulted `Literal` `kind` named from the class after dropping words shared by every variant.

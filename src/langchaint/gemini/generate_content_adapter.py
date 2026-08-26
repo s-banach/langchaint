@@ -121,6 +121,7 @@ from langchaint.messages import (
 )
 from langchaint.pricing import (
     Billing,
+    ProviderBilling,
     category_cost,
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
@@ -294,7 +295,7 @@ class GeminiPricingTable:
         output_tokens: int,
         output_tokens_reasoning: int,
         provider_executed_tool_cost_in_usd: float,
-    ) -> Billing:
+    ) -> ProviderBilling:
         """Price one response's counters, at the long-prompt rates when the prompt crosses the threshold.
 
         prompt_token_count excludes the tool-execution input the categories include.
@@ -310,34 +311,36 @@ class GeminiPricingTable:
             and prompt_token_count > self.long_prompt_threshold_tokens
         ):
             rates = self.long_prompt_rates
-        return Billing(
-            usage=Usage(
-                input_tokens_cache_read=input_tokens_cache_read,
-                input_tokens_cache_write=0,
-                input_tokens_cache_none=input_tokens_cache_none,
-                output_tokens=output_tokens,
-                output_tokens_reasoning=output_tokens_reasoning,
-                input_tokens_cache_read_cost_in_usd=category_cost(
-                    input_tokens_cache_read,
-                    usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
+        return ProviderBilling(
+            billing=Billing(
+                usage=Usage(
+                    input_tokens_cache_read=input_tokens_cache_read,
+                    input_tokens_cache_write=0,
+                    input_tokens_cache_none=input_tokens_cache_none,
+                    output_tokens=output_tokens,
+                    output_tokens_reasoning=output_tokens_reasoning,
+                    input_tokens_cache_read_cost_in_usd=category_cost(
+                        input_tokens_cache_read,
+                        usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
+                    ),
+                    input_tokens_cache_write_cost_in_usd=0.0,
+                    input_tokens_cache_none_cost_in_usd=category_cost(
+                        input_tokens_cache_none,
+                        usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
+                    ),
+                    output_tokens_cost_in_usd=category_cost(
+                        output_tokens,
+                        usd_per_million_tokens=rates.output_usd_per_million_tokens,
+                    ),
+                    provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
                 ),
-                input_tokens_cache_write_cost_in_usd=0.0,
-                input_tokens_cache_none_cost_in_usd=category_cost(
-                    input_tokens_cache_none,
-                    usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
-                ),
-                output_tokens_cost_in_usd=category_cost(
-                    output_tokens,
-                    usd_per_million_tokens=rates.output_usd_per_million_tokens,
-                ),
-                provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+                service_tier=service_tier,
+                input_cache_none_usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
+                cache_read_usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
+                cache_write_usd_per_million_tokens=_NO_CACHE_WRITE_RATE,
+                output_usd_per_million_tokens=rates.output_usd_per_million_tokens,
             ),
-            service_tier=service_tier,
             usage_raw=usage_raw,
-            input_cache_none_usd_per_million_tokens=rates.input_cache_none_usd_per_million_tokens,
-            cache_read_usd_per_million_tokens=rates.cache_read_usd_per_million_tokens,
-            cache_write_usd_per_million_tokens=_NO_CACHE_WRITE_RATE,
-            output_usd_per_million_tokens=rates.output_usd_per_million_tokens,
         )
 
 
@@ -400,7 +403,7 @@ def _billing_from_usage(
     pricing: Mapping[str, GeminiPricingTable],
     *,
     provider_executed_tool_cost_in_usd: float,
-) -> Billing:
+) -> ProviderBilling:
     """Price the reported counters at the table the served tier selects.
 
     prompt_token_count includes cached_content_token_count (google-genai 2.16.0 field description).
@@ -544,7 +547,7 @@ def _billing_from_provider_evidence(
     *,
     configured_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
-) -> Billing:
+) -> ProviderBilling:
     """Price token counters and assembled provider-executed tool evidence."""
     service_tier = _ON_DEMAND_TIER
     if usage_metadata is not None:
@@ -568,7 +571,7 @@ def _billing_from_response(
     *,
     configured_fields: frozenset[str] = frozenset(),
     billing_complete: bool = True,
-) -> Billing:
+) -> ProviderBilling:
     """Price token counters and provider evidence from every candidate."""
     return _billing_from_provider_evidence(
         response.usage_metadata,
@@ -1548,7 +1551,7 @@ class _GeminiStream(AdapterStream):
         return self._accumulator.response()
 
     @override
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Return available billing from accumulated stream evidence.
 
         Missing usage returns None when no charged provider tool was configured.
@@ -1673,7 +1676,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
     _provider_tool_fields: frozenset[str]
 
     @override
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price the response's counters at the table its reported traffic_type selects.
 
         Raises:

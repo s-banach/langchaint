@@ -16,7 +16,7 @@ from langchaint.call import ResponseIdentity
 from langchaint.exceptions import TransientError
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
-from langchaint.pricing import Billing
+from langchaint.pricing import ProviderBilling as ProviderBilling  # noqa: PLC0414
 from langchaint.shared_backoff import (
     DoNotRetry,
     PauseAll,
@@ -430,7 +430,7 @@ class ProviderFailedTransiently(NoOutput):
     `reason` becomes the attempt's `TransientError` text.
     `is_rate_limit=True` produces `PauseAll` during generation.
     `PauseAll` pauses the rate-limit quota.
-    Streaming records the attempt and raises `RetryUnavailableError`.
+    Streaming records the attempt and raises `GenerationError`.
     Streaming cannot retry because the response stream already ended.
     """
 
@@ -454,7 +454,7 @@ class ProviderFailedTerminally(NoOutput):
 class EmptyTurn(NoOutput):
     """A completed turn that produced no instance and no ToolCall.
 
-    The retry loop records the attempt and raises `EmptyTurnError` without retrying.
+    The retry loop records the attempt and raises `GenerationError` without retrying.
     A retry would request a new sample.
     """
 
@@ -465,7 +465,7 @@ class EmptyTurn(NoOutput):
 class ContextWindowExceeded(NoOutput):
     """A 200 reporting that the request overflowed the model's context window.
 
-    The retry loop records the attempt and raises `ContextWindowExceededError` without retrying.
+    The retry loop records the attempt and raises `GenerationError` without retrying.
     The same request always overflows.
     """
 
@@ -487,7 +487,7 @@ class UnfinishedTurn(NoOutput):
 class InvalidRequest:
     """A `Sequence[Message]` the adapter will not put on the wire.
 
-    The retry loop records no attempt and raises `InvalidRequestError` with `reason`.
+    The retry loop records no attempt and raises `GenerationError` with `reason`.
     Nothing was sent or billed.
     """
 
@@ -605,7 +605,7 @@ class AdapterStream(ABC):
         ...
 
     @abstractmethod
-    def billing_reported(self) -> Billing | None:
+    def billing_reported(self) -> ProviderBilling | None:
         """Return currently reported billing, or `None` before the SDK reports any."""
         ...
 
@@ -642,7 +642,7 @@ class BoundAdapter[OutputT](ABC):
         ...
 
     @abstractmethod
-    def billing_from_raw(self, raw: BaseModel) -> Billing:
+    def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
         """Price one response's reported counters before `interpret`.
 
         Args:

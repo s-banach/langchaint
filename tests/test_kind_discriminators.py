@@ -8,9 +8,12 @@ Runtime tests exercise each branch of the match statements.
 from typing import assert_type
 
 from langchaint import (
+    AbandonedCallErrorRecord,
     AssistantMessage,
     AudioPart,
     ContentPart,
+    ContextWindowExceededErrorRecord,
+    CutOffAttemptRecord,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchManyOutcome,
@@ -18,25 +21,42 @@ from langchaint import (
     DispatchPrecomputed,
     DispatchUnknownTool,
     DoNotRetry,
+    EmptyTurnErrorRecord,
+    EscapedExceptionErrorRecord,
     GenerateResult,
+    GenerationErrorRecord,
     ImagePart,
     ImageUrlPart,
+    InvalidRequestErrorRecord,
     InvalidToolArgsDetail,
+    MaxCompletionTokensExceededErrorRecord,
     Message,
     PauseAll,
     PauseAllDoNotRetry,
+    ProviderDeclaredFinalErrorRecord,
+    ProviderFailedTerminallyErrorRecord,
     RawPart,
     ReasoningDelta,
     ReasoningPart,
+    RefusalErrorRecord,
     Response,
+    ResponseRecord,
+    RetriesExhaustedErrorRecord,
     RetryThisOne,
+    RetryUnavailableErrorRecord,
+    SchemaViolationErrorRecord,
     StreamItem,
     TextPart,
+    TimedOutErrorRecord,
     ToolCall,
     ToolCallDelta,
     ToolCallTurn,
+    ToolCallTurnRecord,
     ToolMessage,
+    TransientErrorRecord,
     TurnPart,
+    UnfinishedTurnErrorRecord,
+    UnknownExceptionErrorRecord,
     UserMessage,
     Verdict,
 )
@@ -52,6 +72,7 @@ from langchaint.adapter import (
     SchemaViolation,
     UnfinishedTurn,
 )
+from langchaint.call import AttemptProviderData
 from tests.helpers import StubRaw, attempt_record, call_record
 
 _TURN = AssistantMessage(turn="hi")
@@ -194,6 +215,58 @@ def _by_generate_result_kind_missing_a_variant(result: GenerateResult[int]) -> o
             return result.output
 
 
+def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requires one branch)
+    record: GenerationErrorRecord,
+) -> object:
+    """Verify that `kind` narrows every normalized generation error record."""
+    match record.kind:
+        case "retries_exhausted_error":
+            assert_type(record, RetriesExhaustedErrorRecord)
+            return record.errors_from_attempts
+        case "retry_unavailable_error":
+            assert_type(record, RetryUnavailableErrorRecord)
+            return record.error_summary
+        case "refusal_error":
+            assert_type(record, RefusalErrorRecord)
+            return record.stop_reason
+        case "max_completion_tokens_exceeded_error":
+            assert_type(record, MaxCompletionTokensExceededErrorRecord)
+            return record.stop_reason
+        case "empty_turn_error":
+            assert_type(record, EmptyTurnErrorRecord)
+            return record.stop_reason
+        case "schema_violation_error":
+            assert_type(record, SchemaViolationErrorRecord)
+            return record.validation_error_json
+        case "context_window_exceeded_error":
+            assert_type(record, ContextWindowExceededErrorRecord)
+            return record.stop_reason
+        case "unfinished_turn_error":
+            assert_type(record, UnfinishedTurnErrorRecord)
+            return record.reason
+        case "provider_failed_terminally_error":
+            assert_type(record, ProviderFailedTerminallyErrorRecord)
+            return record.reason
+        case "invalid_request_error":
+            assert_type(record, InvalidRequestErrorRecord)
+            return record.reason
+        case "provider_declared_final_error":
+            assert_type(record, ProviderDeclaredFinalErrorRecord)
+            return record.reason
+        case "unknown_exception_error":
+            assert_type(record, UnknownExceptionErrorRecord)
+            return record.reason
+        case "escaped_exception_error":
+            assert_type(record, EscapedExceptionErrorRecord)
+            return record.reason
+        case "abandoned_call_error":
+            assert_type(record, AbandonedCallErrorRecord)
+            return record.attempts
+        case "timed_out_error":
+            assert_type(record, TimedOutErrorRecord)
+            return record.attempts
+
+
 def _by_stream_item_kind(item: StreamItem) -> object:
     """Exercise an exhaustive match on StreamItem."""
     if isinstance(item, str):
@@ -317,19 +390,62 @@ def test_a_response_outcome_kind_reaches_a_case_that_reads_a_field_its_variant_c
 def test_a_generate_result_kind_narrows_the_output_type_the_variants_share_a_name_for() -> None:
     """The response case returns the non-optional output. The tool_call_turn case reads tool_calls."""
     tool_call = ToolCall(id="c1", name="probe", args_json="{}")
+    tool_call_message = AssistantMessage(turn=(tool_call,))
+    provider_attempts = (AttemptProviderData(raw=StubRaw(), usage_raw=None),)
     tool_call_turn: ToolCallTurn[int] = ToolCallTurn(
-        output=None,
-        call=_CALL,
-        raw=StubRaw(),
-        stop_reason="tool_use",
-        assistant_message=AssistantMessage(turn=(tool_call,)),
+        record=ToolCallTurnRecord(
+            output=None,
+            call=call_record(
+                (attempt_record(error=None, turn=tool_call_message),), elapsed_seconds=1.0
+            ),
+            stop_reason="tool_use",
+        ),
+        provider_attempts=provider_attempts,
     )
     response = Response(
-        output=7, call=_CALL, raw=StubRaw(), stop_reason="end_turn", assistant_message=_TURN
+        record=ResponseRecord(
+            output=7,
+            call=call_record((attempt_record(error=None, turn=_TURN),), elapsed_seconds=1.0),
+            stop_reason="end_turn",
+        ),
+        provider_attempts=provider_attempts,
     )
     assert _by_generate_result_kind(response) == 7
     assert _by_generate_result_kind(tool_call_turn) == (tool_call,)
     assert _by_generate_result_kind_missing_a_variant(tool_call_turn) is None
+
+
+def test_a_generation_error_record_kind_narrows_every_record_variant() -> None:
+    """Each `GenerationErrorRecord.kind` branch reads its narrowed record type."""
+    failed_call = call_record(
+        (attempt_record(error=TransientErrorRecord(message="retry"), turn=None),),
+        elapsed_seconds=1.0,
+    )
+    completed_call = call_record((attempt_record(error=None, turn=_TURN),), elapsed_seconds=1.0)
+    terminal_call = call_record((attempt_record(error=None, turn=None),), elapsed_seconds=1.0)
+    empty_call = call_record((), elapsed_seconds=0.0)
+    cut_off_call = call_record(
+        (CutOffAttemptRecord(started_after_seconds=0.0, billing=None),),
+        elapsed_seconds=1.0,
+    )
+    records: tuple[GenerationErrorRecord, ...] = (
+        RetriesExhaustedErrorRecord(call=failed_call),
+        RetryUnavailableErrorRecord(call=failed_call),
+        RefusalErrorRecord(call=completed_call),
+        MaxCompletionTokensExceededErrorRecord(call=completed_call),
+        EmptyTurnErrorRecord(call=completed_call),
+        SchemaViolationErrorRecord(call=completed_call, validation_error_json="[]"),
+        ContextWindowExceededErrorRecord(call=completed_call),
+        UnfinishedTurnErrorRecord(call=completed_call, reason="unfinished"),
+        ProviderFailedTerminallyErrorRecord(call=completed_call, reason="failed"),
+        InvalidRequestErrorRecord(call=empty_call, reason="invalid"),
+        ProviderDeclaredFinalErrorRecord(call=terminal_call, reason="terminal"),
+        UnknownExceptionErrorRecord(call=empty_call, reason="unknown"),
+        EscapedExceptionErrorRecord(call=empty_call, reason="escaped"),
+        AbandonedCallErrorRecord(call=cut_off_call),
+        TimedOutErrorRecord(call=cut_off_call),
+    )
+    assert all(_by_generation_error_record_kind(record) is not None for record in records)
 
 
 def test_a_verdict_kind_selects_the_variant_that_carries_the_field_read() -> None:

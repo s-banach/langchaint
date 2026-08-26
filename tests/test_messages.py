@@ -1,17 +1,18 @@
 """Test kind validation and JSON round trips for Message, ContentPart, and TurnPart."""
 
 import json
+import math
 from collections.abc import Callable
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
-from pydantic_core import PydanticSerializationError
 
 from langchaint import (
     AssistantMessage,
     AudioPart,
     ImagePart,
     ImageUrlPart,
+    JsonValue,
     Message,
     RawPart,
     ReasoningPart,
@@ -326,14 +327,57 @@ def test_messages_from_json_rejects_text_that_is_not_a_message_list() -> None:
         _ = messages_from_json('[{"content": "hi"}]')
 
 
-def test_messages_to_json_raises_on_a_raw_value_json_cannot_represent() -> None:
-    """A ReasoningPart.raw holding a non-JSON-representable object raises, never silently reshapes.
+def test_reasoning_part_rejects_a_raw_value_json_cannot_represent() -> None:
+    """A non-JSON value fails before its `ReasoningPart` enters a message."""
+    with pytest.raises(ValidationError):
+        _ = TypeAdapter(ReasoningPart).validate_python({"raw": {"payload": object()}})
 
-    A hand-built unserializable ReasoningPart raises without a lossy fallback.
-    """
-    message = AssistantMessage(turn=(ReasoningPart(raw={"payload": object()}),))
-    with pytest.raises(PydanticSerializationError):
-        _ = messages_to_json([message])
+
+@pytest.mark.parametrize("value", [(1, 2), {1, 2}])
+def test_reasoning_part_rejects_a_non_json_container(value: object) -> None:
+    """A tuple or set fails before its `ReasoningPart` enters a message."""
+    with pytest.raises(ValidationError):
+        _ = TypeAdapter(ReasoningPart).validate_python({"raw": {"payload": value}})
+
+
+@pytest.mark.parametrize("container_kind", ["list", "dict"])
+def test_reasoning_part_rejects_a_cyclic_container(container_kind: str) -> None:
+    """A cyclic list or dict fails before its `ReasoningPart` enters a message."""
+    if container_kind == "list":
+        list_value: list[object] = []
+        list_value.append(list_value)
+        value: object = list_value
+    else:
+        dict_value: dict[str, object] = {}
+        dict_value["self"] = dict_value
+        value = dict_value
+    with pytest.raises(ValidationError, match="cycle"):
+        _ = TypeAdapter(ReasoningPart).validate_python({"raw": {"payload": value}})
+
+
+def test_raw_parts_accept_finite_recursive_json() -> None:
+    """Finite recursive JSON reconstructs through both provider replay parts."""
+    raw: dict[str, JsonValue] = {
+        "none": None,
+        "flag": True,
+        "count": 3,
+        "ratio": 1.5,
+        "text": "value",
+        "nested": [1, {"next": False}],
+    }
+    for part in (ReasoningPart(raw=raw), RawPart(raw=raw)):
+        restored = TypeAdapter(type(part)).validate_json(TypeAdapter(type(part)).dump_json(part))
+        assert restored == part
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("part_type", [ReasoningPart, RawPart])
+def test_raw_parts_reject_nonfinite_recursive_json(
+    value: float, part_type: type[ReasoningPart] | type[RawPart]
+) -> None:
+    """A non-finite nested float fails before provider replay data enters a message."""
+    with pytest.raises(ValidationError):
+        _ = TypeAdapter(part_type).validate_python({"raw": {"nested": [value]}})
 
 
 def test_model_copy_rejects_a_derived_property_key() -> None:

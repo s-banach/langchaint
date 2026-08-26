@@ -1136,6 +1136,10 @@ def test_traced_passthroughs_reach_the_wrapped_objects() -> None:
     assert bound.response_format is _Answer
     assert bound.tool_manager is None
     assert bound.binding.system_prompt is None
+    assert (
+        bound.config_fingerprint()
+        == LLM(adapter).bind(response_format=_Answer).config_fingerprint()
+    )
 
 
 def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() -> None:

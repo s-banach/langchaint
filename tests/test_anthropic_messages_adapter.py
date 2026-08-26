@@ -870,6 +870,26 @@ def _adapter() -> AnthropicMessagesAdapter:
     )
 
 
+def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
+    """Fingerprint data includes constructor request settings and excludes billing settings."""
+    adapter = AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="anthropic",
+        default_max_completion_tokens=8192,
+        cache_ttl="1h",
+        service_tier="standard_only",
+        inference_geo="us",
+    )
+    assert adapter.config_fingerprint_data() == {
+        "cache_ttl": "1h",
+        "default_max_completion_tokens": 8192,
+        "inference_geo": "us",
+        "service_tier": "standard_only",
+    }
+
+
 def _binding(
     *,
     system_prompt: str | tuple[TextPart, ...] | None,

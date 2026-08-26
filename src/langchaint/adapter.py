@@ -763,6 +763,17 @@ class Adapter(ABC):
         self.automatic_cache_breakpoints_default: bool = automatic_cache_breakpoints_default
 
     @abstractmethod
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return a snapshot of stored adapter configuration that can form provider requests.
+
+        Exclude the SDK client, credentials, pricing, and response-accounting configuration.
+        `BoundLLM.config_fingerprint` adds the adapter class, model, and provider.
+        `BoundLLM.config_fingerprint` also adds the binding and response format.
+        An adapter may include a non-secret endpoint identity when its contract treats that identity as configuration.
+        """
+        ...
+
+    @abstractmethod
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         """Bind for plain-text output.
 

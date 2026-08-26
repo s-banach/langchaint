@@ -747,6 +747,25 @@ def _adapter(
     )
 
 
+def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
+    """Fingerprint data includes constructor request settings and excludes billing settings."""
+    adapter = OpenAIResponsesAdapter(
+        client=AsyncOpenAI(api_key="test"),
+        model="m",
+        pricing=_PRICING,
+        provider_name="openai",
+        regional_processing=True,
+        supports_prompt_cache_options=False,
+        reasoning_summary="detailed",
+        service_tier="ultrafast",
+    )
+    assert adapter.config_fingerprint_data() == {
+        "reasoning_summary": "detailed",
+        "service_tier": "ultrafast",
+        "supports_prompt_cache_options": False,
+    }
+
+
 def _binding(
     *,
     automatic_cache_breakpoints: bool,

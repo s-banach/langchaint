@@ -8,7 +8,7 @@ delay_seconds suspends open_stream to exercise timeouts.
 import asyncio
 import itertools
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, override
 
@@ -121,6 +121,11 @@ class ScriptedAdapter(Adapter):
         self.scripts: dict[str, Script] = {
             tag: Script(turns=list(turns)) for tag, turns in scripts.items()
         }
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return the scripted adapter's stored request configuration."""
+        return {}
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:

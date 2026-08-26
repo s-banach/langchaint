@@ -1160,6 +1160,11 @@ class GeminiGenerateContentAdapter(Adapter):
         self.pricing: Mapping[str, GeminiPricingTable] = pricing
         self.service_tier: GeminiServiceTier | None = service_tier
 
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return stored request configuration outside `Binding`."""
+        return {"service_tier": self.service_tier}
+
     def _bound_config(
         self, binding: Binding, *, response_json_schema: dict[str, object] | None
     ) -> tuple[types.GenerateContentConfig, frozenset[str]]:

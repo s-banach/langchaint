@@ -143,6 +143,18 @@ def _adapter() -> GeminiGenerateContentAdapter:
     )
 
 
+def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
+    """Fingerprint data includes constructor request settings and excludes billing settings."""
+    adapter = GeminiGenerateContentAdapter(
+        client=genai.Client(api_key="offline", vertexai=False),
+        model="gemini-3.5-flash",
+        pricing=_PRICING,
+        provider_name="gcp.gemini",
+        service_tier="priority",
+    )
+    assert adapter.config_fingerprint_data() == {"service_tier": "priority"}
+
+
 def _binding(
     *,
     system_prompt: str | tuple[TextPart, ...] | None = None,

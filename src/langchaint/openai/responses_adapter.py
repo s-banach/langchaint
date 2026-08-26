@@ -760,6 +760,15 @@ class OpenAIResponsesAdapter(Adapter):
         self.reasoning_summary: ReasoningSummary | None = reasoning_summary
         self.service_tier: OpenAIResponsesServiceTier | None = service_tier
 
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return stored request configuration outside `Binding`."""
+        return {
+            "reasoning_summary": self.reasoning_summary,
+            "service_tier": self.service_tier,
+            "supports_prompt_cache_options": self.supports_prompt_cache_options,
+        }
+
     def _precompute_fields(self, binding: Binding) -> _OpenAIPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 

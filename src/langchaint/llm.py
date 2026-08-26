@@ -12,6 +12,10 @@ from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
+from langchaint._config_fingerprint import (
+    bound_llm_config_fingerprint,
+    capture_response_format_fingerprint_data,
+)
 from langchaint.adapter import (
     Adapter,
     Binding,
@@ -434,11 +438,44 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self.max_attempts: int = max_attempts
         self._bound_adapter = bound_adapter
         self._tool_manager = tool_manager
+        self._adapter_class = type(adapter)
+        self._adapter_model = adapter.model
+        self._adapter_provider_name = adapter.provider_name
+        self._adapter_config_fingerprint_data = adapter.config_fingerprint_data()
+        self._response_format_fingerprint_data = capture_response_format_fingerprint_data(
+            response_format
+        )
 
     @property
     def tool_manager(self) -> ToolManagerT:
         """Return the bound `ToolManager` or `None`."""
         return self._tool_manager
+
+    def config_fingerprint(self) -> str:
+        """Return a versioned SHA-256 fingerprint of the current stored request configuration.
+
+        The fingerprint captures adapter and response-format configuration during binding.
+        The fingerprint includes the binding.
+        The fingerprint excludes per-call messages, retry configuration, and admission configuration.
+        The fingerprint excludes pricing, credentials, SDK client state, and tool functions.
+        It identifies stored configuration, not semantic or provider-wire equivalence.
+        Each call reads current values referenced by `Binding`.
+
+        Mapping insertion order does not affect the fingerprint. Sequence order and container types do.
+        Class identity uses `__module__` and `__qualname__`.
+        Dynamically created classes that reuse both values require distinct serialized configuration.
+
+        Raises:
+            TypeError: A configuration value has no deterministic encoding or contains a cycle.
+        """
+        return bound_llm_config_fingerprint(
+            adapter_class=self._adapter_class,
+            adapter_model=self._adapter_model,
+            adapter_provider_name=self._adapter_provider_name,
+            adapter_config_fingerprint_data=self._adapter_config_fingerprint_data,
+            binding=self.binding,
+            response_format_fingerprint_data=self._response_format_fingerprint_data,
+        )
 
     @property
     def _splits_tool_call_turns(self) -> bool:

@@ -1002,6 +1002,10 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """max_attempts counts requests sent including the first."""
         return self._bound_llm.max_attempts
 
+    def config_fingerprint(self) -> str:
+        """Return the wrapped `BoundLLM.config_fingerprint`."""
+        return self._bound_llm.config_fingerprint()
+
     @overload
     def rebind[NewModelT: BaseModel](
         self,

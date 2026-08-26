@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar, assert_type, override
 
@@ -29,6 +29,7 @@ from langchaint import (
     ParserContractError,
     PauseAllDoNotRetry,
     ProviderDeclaredFinalErrorRecord,
+    PydanticTool,
     Response,
     RetriesExhaustedErrorRecord,
     SchemaViolationErrorRecord,
@@ -784,6 +785,11 @@ class _FakeAdapter(Adapter):
         self._open_barrier_from_call = open_barrier_from_call
         self.bound_adapters: list[_FakeBoundAdapter] = []
         self.structured_bind_count = 0
+
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return the fake adapter's stored request configuration."""
+        return {"automatic_cache_breakpoints_default": self.automatic_cache_breakpoints_default}
 
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
@@ -1639,6 +1645,28 @@ class _Answer(BaseModel):
     value: int
 
 
+class _OtherAnswer(BaseModel):
+    """A distinct response format for configuration fingerprint tests."""
+
+    value: str
+
+
+class _UnschematizableAnswer(BaseModel):
+    """A response format whose callable field has no JSON Schema."""
+
+    callback: Callable[[], None]
+
+
+class _MutableSchemaAnswer(BaseModel):
+    """A response format whose field annotation changes in one test."""
+
+    value: int
+
+
+class _OtherFakeAdapter(_FakeAdapter):
+    """Give the same fake behavior a distinct adapter class identity."""
+
+
 def _capture_tool(name: str = "capture") -> CaptureTool[_Answer]:
     return CaptureTool(
         name=name,
@@ -2001,6 +2029,180 @@ def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
     replacement = {"safety_identifier": "user-8"}
     assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
     assert bound_llm.rebind(extra_body=None).binding.extra_body is None
+
+
+def test_config_fingerprint_has_a_fixed_versioned_digest() -> None:
+    """Pin the canonical format and SHA-256 result for the default fake binding."""
+    fingerprint = LLM(_FakeAdapter()).bind().config_fingerprint()
+    assert fingerprint == "sha256:ade90c6f8015578b706794b62ef0636d7241e4a08d2d2aeedfc22874a075890c"
+
+
+def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
+    """Mappings with equal entries produce one configuration fingerprint."""
+    first = LLM(_FakeAdapter()).bind(extra_body={"alpha": 1, "beta": 2})
+    second = LLM(_FakeAdapter()).bind(extra_body={"beta": 2, "alpha": 1})
+    assert first.config_fingerprint() == second.config_fingerprint()
+
+
+def test_config_fingerprint_preserves_sequence_order_and_container_types() -> None:
+    """Sequence order and stored container types distinguish configurations."""
+    ordered = LLM(_FakeAdapter()).bind(extra_body={"values": [1, 2]})
+    reversed_order = LLM(_FakeAdapter()).bind(extra_body={"values": [2, 1]})
+    tuple_value = LLM(_FakeAdapter()).bind(extra_body={"values": (1, 2)})
+    set_value = LLM(_FakeAdapter()).bind(extra_body={"values": {1, 2}})
+    frozen_set_value = LLM(_FakeAdapter()).bind(extra_body={"values": frozenset({1, 2})})
+    assert ordered.config_fingerprint() != reversed_order.config_fingerprint()
+    assert ordered.config_fingerprint() != tuple_value.config_fingerprint()
+    assert set_value.config_fingerprint() != frozen_set_value.config_fingerprint()
+
+
+def test_config_fingerprint_tracks_ignored_binding_values() -> None:
+    """A changed stored automatic-cache setting changes configuration identity."""
+    enabled = LLM(_FakeAdapter()).bind(automatic_cache_breakpoints=True)
+    disabled = LLM(_FakeAdapter()).bind(automatic_cache_breakpoints=False)
+    assert enabled.config_fingerprint() != disabled.config_fingerprint()
+
+
+def test_config_fingerprint_treats_an_omitted_resolved_default_as_its_explicit_value() -> None:
+    """Binding stores the resolved automatic-cache value instead of the bind call form."""
+    omitted = LLM(_FakeAdapter(automatic_cache_breakpoints_default=True)).bind()
+    explicit = LLM(_FakeAdapter(automatic_cache_breakpoints_default=True)).bind(
+        automatic_cache_breakpoints=True
+    )
+    assert omitted.config_fingerprint() == explicit.config_fingerprint()
+
+
+def test_config_fingerprint_tracks_adapter_model_provider_class_and_configuration() -> None:
+    """Each stored adapter identity category participates in configuration identity."""
+    baseline_adapter = _FakeAdapter()
+    baseline = LLM(baseline_adapter).bind()
+    changed_model_adapter = _FakeAdapter()
+    changed_model_adapter.model = "other-model"
+    changed_provider_adapter = _FakeAdapter()
+    changed_provider_adapter.provider_name = "other-provider"
+    changed_config_adapter = _FakeAdapter()
+    changed_config_adapter.automatic_cache_breakpoints_default = True
+    assert baseline.config_fingerprint() != LLM(changed_model_adapter).bind().config_fingerprint()
+    assert (
+        baseline.config_fingerprint() != LLM(changed_provider_adapter).bind().config_fingerprint()
+    )
+    assert baseline.config_fingerprint() != LLM(_OtherFakeAdapter()).bind().config_fingerprint()
+    assert baseline.config_fingerprint() != LLM(changed_config_adapter).bind().config_fingerprint()
+
+
+def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -> None:
+    """Binding references stay current, while adapter configuration is captured during binding."""
+    extra_body: dict[str, object] = {"value": 1}
+    adapter = _FakeAdapter()
+    bound = LLM(adapter).bind(extra_body=extra_body)
+    initial = bound.config_fingerprint()
+    extra_body["value"] = 2
+    after_binding_mutation = bound.config_fingerprint()
+    adapter.model = "changed-model"
+    adapter.provider_name = "changed-provider"
+    adapter.automatic_cache_breakpoints_default = True
+    assert initial != after_binding_mutation
+    assert after_binding_mutation == bound.config_fingerprint()
+    assert after_binding_mutation != bound.rebind().config_fingerprint()
+
+
+def test_config_fingerprint_tracks_response_format_and_rebind() -> None:
+    """Structured response configuration and rebound fields participate."""
+    text = LLM(_FakeAdapter()).bind()
+    answer = LLM(_FakeAdapter()).bind(response_format=_Answer)
+    other_answer = LLM(_FakeAdapter()).bind(response_format=_OtherAnswer)
+    rebound = answer.rebind(system_prompt="changed")
+    assert text.config_fingerprint() != answer.config_fingerprint()
+    assert answer.config_fingerprint() != other_answer.config_fingerprint()
+    assert answer.config_fingerprint() != rebound.config_fingerprint()
+
+
+def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> None:
+    """Execution policy and application functions do not enter configuration identity."""
+
+    async def first_function(_args: _Answer) -> str:
+        return "first"
+
+    async def second_function(_args: _Answer) -> str:
+        return "second"
+
+    first_tool = PydanticTool(
+        name="answer",
+        description="Answer.",
+        args_model=_Answer,
+        function=first_function,
+    )
+    second_tool = PydanticTool(
+        name="answer",
+        description="Answer.",
+        args_model=_Answer,
+        function=second_function,
+    )
+    first = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
+        tools=[first_tool], max_attempts=1
+    )
+    second = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind(
+        tools=[second_tool], max_attempts=9
+    )
+    assert first.config_fingerprint() == second.config_fingerprint()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (object(), "binding.extra_body['value'] has unsupported type builtins.object"),
+        (float("inf"), "binding.extra_body['value'] contains a non-finite float"),
+    ],
+)
+def test_config_fingerprint_rejects_values_without_a_deterministic_encoding(
+    value: object, message: str
+) -> None:
+    """The TypeError names the unsupported value's path."""
+    bound = LLM(_FakeAdapter()).bind(extra_body={"value": value})
+    with pytest.raises(TypeError) as raised:
+        _ = bound.config_fingerprint()
+    assert str(raised.value) == message
+
+
+def test_config_fingerprint_rejects_a_container_cycle() -> None:
+    """A cycle raises TypeError with the recursive value's path."""
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    bound = LLM(_FakeAdapter()).bind(extra_body=cyclic)
+    message = "binding.extra_body['self'] contains a cycle"
+    with pytest.raises(TypeError) as raised:
+        _ = bound.config_fingerprint()
+    assert str(raised.value) == message
+
+
+def test_config_fingerprint_encodes_an_unpaired_surrogate() -> None:
+    """ASCII JSON escaping gives every Python string a UTF-8 fingerprint input."""
+    fingerprint = LLM(_FakeAdapter()).bind(extra_body={"value": "\ud800"}).config_fingerprint()
+    assert fingerprint.startswith("sha256:")
+
+
+def test_config_fingerprint_normalizes_a_response_schema_failure() -> None:
+    """Pydantic schema failures become the documented TypeError at the response-format path."""
+    bound = LLM(_FakeAdapter()).bind(response_format=_UnschematizableAnswer)
+    with pytest.raises(TypeError) as raised:
+        _ = bound.config_fingerprint()
+    assert str(raised.value).startswith(
+        "response_format.model_json_schema() cannot be serialized deterministically:"
+    )
+
+
+def test_config_fingerprint_captures_the_response_schema_during_binding() -> None:
+    """A bound fingerprint retains the schema that existed during binding."""
+    first = LLM(_FakeAdapter()).bind(response_format=_MutableSchemaAnswer)
+    field = _MutableSchemaAnswer.model_fields["value"]
+    field.annotation = str
+    _ = _MutableSchemaAnswer.model_rebuild(force=True)
+    try:
+        second = LLM(_FakeAdapter()).bind(response_format=_MutableSchemaAnswer)
+        assert first.config_fingerprint() != second.config_fingerprint()
+    finally:
+        field.annotation = int
+        _ = _MutableSchemaAnswer.model_rebuild(force=True)
 
 
 def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:

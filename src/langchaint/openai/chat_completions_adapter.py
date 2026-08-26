@@ -738,6 +738,14 @@ class OpenAIChatCompletionsAdapter(Adapter):
         )
         self.service_tier: OpenAIServiceTier | None = service_tier
 
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return stored request configuration outside `Binding`."""
+        return {
+            "service_tier": self.service_tier,
+            "supports_prompt_cache_options": self.supports_prompt_cache_options,
+        }
+
     def _precompute_fields(self, binding: Binding) -> _ChatCompletionsPrecomputedFields:
         """Precompute the typed request fields the binding determines.
 

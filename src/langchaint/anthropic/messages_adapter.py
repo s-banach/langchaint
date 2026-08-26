@@ -1150,6 +1150,16 @@ class AnthropicMessagesAdapter(Adapter):
         self.service_tier: AnthropicServiceTier | None = service_tier
         self.inference_geo: str | None = inference_geo
 
+    @override
+    def config_fingerprint_data(self) -> Mapping[str, object]:
+        """Return stored request configuration outside `Binding`."""
+        return {
+            "cache_ttl": self.cache_ttl,
+            "default_max_completion_tokens": self.default_max_completion_tokens,
+            "inference_geo": self.inference_geo,
+            "service_tier": self.service_tier,
+        }
+
     def _precompute_fields(self, binding: Binding) -> _AnthropicPrecomputedFields:
         """Precompute request fields and the remaining `message_mark_budget`.
 

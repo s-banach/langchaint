@@ -22,19 +22,14 @@ from langchaint.exceptions import (
     AbandonedCallErrorRecord,
     ContextWindowExceededErrorRecord,
     EmptyTurnErrorRecord,
-    EscapedExceptionErrorRecord,
     GenerationError,
-    InvalidRequestErrorRecord,
+    GenerationErrorRecord,
     MaxCompletionTokensExceededErrorRecord,
-    ProviderDeclaredFinalErrorRecord,
     ProviderFailedTerminallyErrorRecord,
     RefusalErrorRecord,
-    RetriesExhaustedErrorRecord,
-    RetryUnavailableErrorRecord,
     SchemaViolationErrorRecord,
     TimedOutErrorRecord,
     UnfinishedTurnErrorRecord,
-    UnknownExceptionErrorRecord,
     _GenerationErrorRecordBase,
 )
 from langchaint.messages import AssistantMessage, StopReason, ToolCall
@@ -265,21 +260,7 @@ type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
 type CallResultRecord[OutputT] = Annotated[
     SerializeAsAny[ResponseRecord[OutputT]]
     | SerializeAsAny[ToolCallTurnRecord[OutputT]]
-    | RetriesExhaustedErrorRecord
-    | RetryUnavailableErrorRecord
-    | RefusalErrorRecord
-    | MaxCompletionTokensExceededErrorRecord
-    | EmptyTurnErrorRecord
-    | SchemaViolationErrorRecord
-    | ContextWindowExceededErrorRecord
-    | UnfinishedTurnErrorRecord
-    | ProviderFailedTerminallyErrorRecord
-    | InvalidRequestErrorRecord
-    | ProviderDeclaredFinalErrorRecord
-    | UnknownExceptionErrorRecord
-    | EscapedExceptionErrorRecord
-    | AbandonedCallErrorRecord
-    | TimedOutErrorRecord,
+    | GenerationErrorRecord,
     Field(discriminator="kind"),
 ]
 

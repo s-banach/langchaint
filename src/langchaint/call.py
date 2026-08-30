@@ -141,6 +141,42 @@ class CallRecord(CheckedCopyModel):
         return self
 
 
+class _CallResultRecordBase(CheckedCopyModel):
+    """Share call-derived properties across normalized result records.
+
+    Validation rejects unknown fields.
+    """
+
+    model_config = _RECORD_CONFIG
+
+    call: CallRecord
+
+    @property
+    def attempts(self) -> int:
+        """Return the observed request count."""
+        return len(self.call.attempt_records)
+
+    @property
+    def usage(self) -> Usage:
+        """Return normalized usage across every request."""
+        return Usage.sum_of(attempt.usage for attempt in self.call.attempt_records)
+
+    @property
+    def model(self) -> str:
+        """Return the requested model id."""
+        return self.call.model
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider name."""
+        return self.call.provider_name
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Return the complete call duration."""
+        return self.call.elapsed_seconds
+
+
 def _settled_attempts(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
     attempts = tuple(
         attempt for attempt in call.attempt_records if isinstance(attempt, SettledAttemptRecord)

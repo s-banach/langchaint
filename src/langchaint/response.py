@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Generic, Literal, NamedTuple, Self, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
+from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 
 from langchaint.adapter import RequestParams, ResponseOutcome
 from langchaint.call import (
@@ -13,10 +13,10 @@ from langchaint.call import (
     CutOffAttemptRecord,
     SettledAttemptRecord,
     _CallLedger,
+    _CallResultRecordBase,
     _require_completed_model_turn,
     _settled_attempts,
 )
-from langchaint.checked_copy import CheckedCopyModel
 from langchaint.exceptions import (
     _GENERATION_ERROR_RECORD_CLASSES,
     AbandonedCallErrorRecord,
@@ -36,19 +36,14 @@ from langchaint.messages import AssistantMessage, StopReason, ToolCall
 from langchaint.pricing import Billing, ProviderBilling
 from langchaint.usage import Usage
 
-_RECORD_CONFIG = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
 _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 
-class _SuccessRecordBase(CheckedCopyModel):
+class _SuccessRecordBase(_CallResultRecordBase):
     """Properties and invariants shared by normalized success records.
 
     Validation rejects unknown fields.
     """
-
-    model_config = _RECORD_CONFIG
-
-    call: CallRecord
 
     @model_validator(mode="after")
     def _validate_success(self) -> Self:
@@ -61,31 +56,6 @@ class _SuccessRecordBase(CheckedCopyModel):
     ) -> tuple[SettledAttemptRecord, ...]:
         """Return the call's normalized request records."""
         return _settled_attempts(self.call)
-
-    @property
-    def attempts(self) -> int:
-        """Return the observed request count."""
-        return len(self.call.attempt_records)
-
-    @property
-    def usage(self) -> Usage:
-        """Return normalized usage across every request."""
-        return Usage.sum_of(attempt.usage for attempt in self.call.attempt_records)
-
-    @property
-    def model(self) -> str:
-        """Return the requested model id."""
-        return self.call.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the provider name."""
-        return self.call.provider_name
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """Return the complete call duration."""
-        return self.call.elapsed_seconds
 
     @property
     def assistant_message(self) -> AssistantMessage:

@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Annotated, Literal, Self, override
 
-from pydantic import ConfigDict, Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, model_validator
 
 from langchaint.call import (
     AttemptProviderData,
@@ -11,10 +11,10 @@ from langchaint.call import (
     CutOffAttemptRecord,
     SettledAttemptRecord,
     TransientErrorRecord,
+    _CallResultRecordBase,
     _require_completed_model_turn,
     _settled_attempts,
 )
-from langchaint.checked_copy import CheckedCopyModel
 from langchaint.messages import AssistantMessage, StopReason
 from langchaint.usage import Usage
 
@@ -52,18 +52,11 @@ class EmbeddingOutputError(RuntimeError):
     """A provider returned unusable embedding vectors."""
 
 
-_RECORD_CONFIG = ConfigDict(frozen=True, extra="forbid", ser_json_inf_nan="strings")
-
-
-class _GenerationErrorRecordBase(CheckedCopyModel):
+class _GenerationErrorRecordBase(_CallResultRecordBase):
     """Shared normalized data and properties for terminal generation errors.
 
     Validation rejects unknown fields.
     """
-
-    model_config = _RECORD_CONFIG
-
-    call: CallRecord
 
     @property
     def attempt_records(
@@ -71,31 +64,6 @@ class _GenerationErrorRecordBase(CheckedCopyModel):
     ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
         """Return the call's normalized attempt records."""
         return self.call.attempt_records
-
-    @property
-    def attempts(self) -> int:
-        """Return requests that langchaint observed going out."""
-        return len(self.call.attempt_records)
-
-    @property
-    def usage(self) -> Usage:
-        """Return normalized usage across every recorded request."""
-        return Usage.sum_of(attempt.usage for attempt in self.call.attempt_records)
-
-    @property
-    def model(self) -> str:
-        """Return the requested model id."""
-        return self.call.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the provider name."""
-        return self.call.provider_name
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """Return the complete call duration."""
-        return self.call.elapsed_seconds
 
     @property
     def assistant_message(self) -> AssistantMessage | None:

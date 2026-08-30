@@ -17,7 +17,6 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     BoundAdapter,
-    ErrorClassification,
     InvalidRequest,
     RequestParams,
     ResponseOutcome,
@@ -28,13 +27,12 @@ from langchaint.exceptions import (
     AbandonedCallErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
-    ProviderDeclaredFinalErrorRecord,
     RetriesExhaustedErrorRecord,
     RetryUnavailableErrorRecord,
     StreamProtocolError,
     TimedOutErrorRecord,
     TransientError,
-    UnknownExceptionErrorRecord,
+    _terminal_error_record,
 )
 from langchaint.messages import Message
 from langchaint.pricing import ProviderBilling
@@ -369,32 +367,20 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         # A provider directive states this request will not succeed.
         # `GenerationError` names that outcome.
         # `classify()` could otherwise return `invalid_request` for status 429.
-        classification: ErrorClassification = (
+        classification = (
             "declared_final"
             if isinstance(verdict, PauseAllDoNotRetry)
             else self._adapter.classify(exc)
         )
-        if classification == "invalid_request":
-            # `Adapter.classify` returns `invalid_request` only for a provider rejection.
-            # The provider received this request, so the ledger records the attempt.
-            self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-            return self._invalid_request_error(f"the provider rejected the request: {exc}", exc)
-        if classification == "declared_final":
-            # The provider answered, so the attempt gets a record.
-            self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-            return GenerationError(
-                record=ProviderDeclaredFinalErrorRecord(
-                    reason=str(exc), call=self._ledger.freeze()
-                ),
-                request=self._request,
-                provider_attempts=self._ledger.provider_attempts,
-            )
-        if self._adapter_stream is not None:
-            # An open stream proves that the attempt reached the provider.
-            # Test the stream itself because an open stream can have `billing=None`.
+        if (
+            classification in ("invalid_request", "declared_final")
+            or self._adapter_stream is not None
+        ):
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
         return GenerationError(
-            record=UnknownExceptionErrorRecord(reason=str(exc), call=self._ledger.freeze()),
+            record=_terminal_error_record(
+                classification, reason=str(exc), call=self._ledger.freeze()
+            ),
             request=self._request,
             provider_attempts=self._ledger.provider_attempts,
         )

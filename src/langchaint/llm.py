@@ -27,7 +27,6 @@ from langchaint.adapter import (
     Adapter,
     Binding,
     BoundAdapter,
-    ErrorClassification,
     InvalidRequest,
     RequestParams,
     ResponseOutcome,
@@ -39,12 +38,11 @@ from langchaint.exceptions import (
     GenerationError,
     InvalidRequestErrorRecord,
     ParserContractError,
-    ProviderDeclaredFinalErrorRecord,
     RetriesExhaustedErrorRecord,
     StreamProtocolError,
     TimedOutErrorRecord,
     TransientError,
-    UnknownExceptionErrorRecord,
+    _terminal_error_record,
 )
 from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
@@ -739,35 +737,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         observations: _StreamObservations,
     ) -> GenerationError:
         """Convert a terminal verdict or `classify` result to `GenerationError`."""
-        classification: ErrorClassification = (
+        classification = (
             "declared_final"
             if isinstance(verdict, PauseAllDoNotRetry)
             else self.adapter.classify(exc)
         )
-        if classification == "invalid_request":
-            # `Adapter.classify` returns `invalid_request` only for a provider rejection.
-            # The provider received this request, so the ledger records the attempt.
-            ledger.record(error=None, assistant_message=None, billing=observations.billing)
-            return GenerationError(
-                record=InvalidRequestErrorRecord(
-                    reason=f"the provider rejected the request: {exc}",
-                    call=ledger.freeze(),
-                ),
-                request=request,
-                provider_attempts=ledger.provider_attempts,
-            )
-        if classification == "declared_final":
-            # The provider answered, so the attempt gets a record.
-            ledger.record(error=None, assistant_message=None, billing=observations.billing)
-            return GenerationError(
-                record=ProviderDeclaredFinalErrorRecord(reason=str(exc), call=ledger.freeze()),
-                request=request,
-                provider_attempts=ledger.provider_attempts,
-            )
-        if observations.opened:
+        if classification in ("invalid_request", "declared_final") or observations.opened:
             ledger.record(error=None, assistant_message=None, billing=observations.billing)
         return GenerationError(
-            record=UnknownExceptionErrorRecord(reason=str(exc), call=ledger.freeze()),
+            record=_terminal_error_record(classification, reason=str(exc), call=ledger.freeze()),
             request=request,
             provider_attempts=ledger.provider_attempts,
         )

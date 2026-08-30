@@ -19,7 +19,7 @@ from langchaint.messages import AssistantMessage, StopReason
 from langchaint.usage import Usage
 
 if TYPE_CHECKING:
-    from langchaint.adapter import RequestParams
+    from langchaint.adapter import ErrorClassification, RequestParams
     from langchaint.tools import DispatchManyOutcome
 
 
@@ -509,6 +509,18 @@ _GENERATION_ERROR_RECORD_CLASSES = (
     AbandonedCallErrorRecord,
     TimedOutErrorRecord,
 )
+
+
+def _terminal_error_record(
+    classification: "ErrorClassification", *, reason: str, call: CallRecord
+) -> GenerationErrorRecord:
+    if classification == "invalid_request":
+        return InvalidRequestErrorRecord(
+            reason=f"the provider rejected the request: {reason}", call=call
+        )
+    if classification == "declared_final":
+        return ProviderDeclaredFinalErrorRecord(reason=reason, call=call)
+    return UnknownExceptionErrorRecord(reason=reason, call=call)
 
 
 class GenerationError(Exception):

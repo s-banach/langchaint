@@ -74,19 +74,12 @@ async def run_many[OutputT](
             settled_tasks, _ = await asyncio.wait(
                 pending_run_one_index_by_task, return_when=asyncio.FIRST_COMPLETED
             )
-            failure_to_raise: BaseException | None = None
             settled_tasks_in_run_one_order = sorted(
                 settled_tasks, key=pending_run_one_index_by_task.__getitem__
             )
             for task in settled_tasks_in_run_one_order:
                 run_one_index = pending_run_one_index_by_task.pop(task)
-                try:
-                    result_by_run_one_index[run_one_index] = task.result()
-                except BaseException as failure:  # noqa: BLE001 (observe every BaseException)
-                    if failure_to_raise is None:
-                        failure_to_raise = failure
-            if failure_to_raise is not None:
-                raise failure_to_raise  # noqa: TRY301 (handler below settles the pending tasks)
+                result_by_run_one_index[run_one_index] = task.result()
     except BaseException:
         # Settle every task before propagating.
         for task in pending_run_one_index_by_task:

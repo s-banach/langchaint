@@ -56,7 +56,7 @@ from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import nan
-from typing import Any, ClassVar, Literal, cast, override
+from typing import Any, Literal, cast, override
 
 import openai
 from openai import AsyncOpenAI, Omit, omit
@@ -92,14 +92,12 @@ from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
-    Adapter,
     AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
     EmptyTurn,
-    ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutputOutcome,
@@ -140,17 +138,13 @@ from langchaint.messages import (
 from langchaint.openai.shared import (
     _DEFAULT_TIER,
     _DISPOSITION_BY_ERROR_CODE,
-    OPENAI_FAILURE_TYPES,
-    PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     OpenAIPricingTable,
     OpenAIResponsesServiceTier,
     OpenAIServiceTier,
     _image_data_uri,
+    _OpenAIGenerationAdapterBase,
     _priced_tier,
-    classify_openai,
     client_without_retries,
-    parse_openai,
-    request_id_from_openai_error,
     require_prompt_cache_options_support,
 )
 from langchaint.pricing import (
@@ -158,7 +152,6 @@ from langchaint.pricing import (
     invocation_cost_in_usd,
     require_finite_nonnegative_rate,
 )
-from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
 type _WireToolChoice = (
@@ -692,7 +685,7 @@ def _adapter_result[OutputT](
     )
 
 
-class OpenAIResponsesAdapter(Adapter):
+class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
     All three expose the same responses.stream method and with_options.
@@ -700,11 +693,6 @@ class OpenAIResponsesAdapter(Adapter):
     The client parameter is annotated AsyncOpenAI because the other two classes subclass it (openai 3.3.1).
     provider_name_by_client_class distinguishes the client classes.
     """
-
-    provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
-        PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
-    )
-    """The shared openai-SDK map, whose docstring states why AsyncOpenAI is absent from it."""
 
     def __init__(  # noqa: PLR0913 (each request and billing parameter remains explicit)
         self,
@@ -873,24 +861,6 @@ class OpenAIResponsesAdapter(Adapter):
             precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
         )
-
-    failure_types: ClassVar[tuple[type[Exception], ...]] = OPENAI_FAILURE_TYPES
-    """The shared tuple, whose docstring states why the bare APIStatusError covers every status."""
-
-    @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate to parse_openai, whose docstring names the table and the defaults."""
-        return parse_openai(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Delegate to classify_openai, whose docstring names each row."""
-        return classify_openai(error)
-
-    @override
-    def request_id_from_error(self, error: Exception) -> str | None:
-        """Delegate to request_id_from_openai_error, which reads the SDK exception's header."""
-        return request_id_from_openai_error(error)
 
 
 class _OpenAIStream(AdapterStream):

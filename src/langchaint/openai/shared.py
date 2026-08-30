@@ -5,17 +5,19 @@ This module imports neither adapter nor private SDK modules.
 """
 
 import base64
+from abc import ABC
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
-from typing import Literal
+from typing import ClassVar, Literal, override
 
 import openai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI
 from pydantic import BaseModel
 
 from langchaint.adapter import (
+    Adapter,
     ErrorClassification,
     record_parse_fallthrough,
     retry_after_seconds_from_headers,
@@ -463,3 +465,25 @@ PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS: Mapping[type, str] = {
 `AsyncAzureOpenAI` and `AsyncBedrockOpenAI` determine their providers.
 `AsyncOpenAI` is absent so a caller can state the provider for an OpenAI-compatible endpoint.
 """
+
+
+class _OpenAIGenerationAdapterBase(Adapter, ABC):
+    """Share OpenAI provider validation and failure handling."""
+
+    provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
+        PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
+    )
+
+    failure_types: ClassVar[tuple[type[Exception], ...]] = OPENAI_FAILURE_TYPES
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        return parse_openai(failure)
+
+    @override
+    def classify(self, error: Exception) -> ErrorClassification:
+        return classify_openai(error)
+
+    @override
+    def request_id_from_error(self, error: Exception) -> str | None:
+        return request_id_from_openai_error(error)

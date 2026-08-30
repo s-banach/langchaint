@@ -67,7 +67,7 @@ from abc import ABC
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import nan
-from typing import ClassVar, Literal, cast, override
+from typing import Literal, cast, override
 
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
@@ -97,14 +97,12 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
-    Adapter,
     AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
     EmptyTurn,
-    ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
     NoOutput,
@@ -140,20 +138,15 @@ from langchaint.messages import (
     UserMessage,
 )
 from langchaint.openai.shared import (
-    OPENAI_FAILURE_TYPES,
-    PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     OpenAIPricingTable,
     OpenAIServiceTier,
     _image_data_uri,
+    _OpenAIGenerationAdapterBase,
     _priced_tier,
-    classify_openai,
     client_without_retries,
-    parse_openai,
-    request_id_from_openai_error,
     require_prompt_cache_options_support,
 )
 from langchaint.pricing import ProviderBilling
-from langchaint.shared_backoff import Verdict
 from langchaint.tools import ToolSchema
 
 type _WireToolChoice = (
@@ -670,7 +663,7 @@ def _wire_response_format(response_format: type[BaseModel]) -> ResponseFormatJSO
     return {"type": "json_schema", "json_schema": json_schema}
 
 
-class OpenAIChatCompletionsAdapter(Adapter):
+class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
     """Adapter over an AsyncOpenAI, AsyncBedrockOpenAI, or AsyncAzureOpenAI client.
 
     All three expose `chat.completions.create` and `with_options`.
@@ -678,11 +671,6 @@ class OpenAIChatCompletionsAdapter(Adapter):
     The client parameter is annotated AsyncOpenAI because the other two classes subclass it (openai 3.3.1).
     provider_name_by_client_class distinguishes the client classes.
     """
-
-    provider_name_by_client_class: ClassVar[Mapping[type, str]] = (
-        PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS
-    )
-    """The shared openai-SDK map, whose docstring states why AsyncOpenAI is absent from it."""
 
     def __init__(
         self,
@@ -834,24 +822,6 @@ class OpenAIChatCompletionsAdapter(Adapter):
             precomputed_fields=self._precompute_fields(binding),
             response_format=response_format,
         )
-
-    failure_types: ClassVar[tuple[type[Exception], ...]] = OPENAI_FAILURE_TYPES
-    """The shared tuple, whose docstring states why the bare APIStatusError covers every status."""
-
-    @override
-    def parse(self, failure: Exception) -> Verdict:
-        """Delegate to parse_openai, whose docstring names the table and the defaults."""
-        return parse_openai(failure)
-
-    @override
-    def classify(self, error: Exception) -> ErrorClassification:
-        """Delegate to classify_openai, whose docstring names each row."""
-        return classify_openai(error)
-
-    @override
-    def request_id_from_error(self, error: Exception) -> str | None:
-        """Delegate to request_id_from_openai_error, which reads the SDK exception's header."""
-        return request_id_from_openai_error(error)
 
 
 def _snapshot_tool_call_id(state: ChatCompletionStreamState, index: int) -> str:

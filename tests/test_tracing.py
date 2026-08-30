@@ -31,6 +31,7 @@ from langchaint import (
     AssistantMessage,
     AudioPart,
     CallResult,
+    CallResultRecord,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
@@ -42,6 +43,7 @@ from langchaint import (
     PydanticTool,
     ReasoningPart,
     Response,
+    ResponseRecord,
     SettledAttemptRecord,
     StreamItem,
     TextPart,
@@ -616,6 +618,44 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
     asyncio.run(scenario())
 
 
+def test_generate_many_records_traces_generated_items_and_skips_reused_items(
+    tmp_path: pathlib.Path,
+) -> None:
+    """generate_many_records opens chat spans only for items that send requests."""
+
+    async def scenario() -> None:
+        """Persist two samples, reorder them around one new sample, and inspect the span count."""
+        adapter = _FakeAdapter(echo=True)
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(adapter),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        bound = traced.bind()
+        resume_path = tmp_path / "records.json"
+        first = await bound.generate_many_records(
+            ["a", "b"],
+            resume_path=resume_path,
+            sample_ids=["sample-a", "sample-b"],
+        )
+        assert all(isinstance(record, ResponseRecord) for record in first)
+        assert len(exporter.get_finished_spans()) == 2
+
+        resumed = await bound.generate_many_records(
+            ["b", "c", "a"],
+            resume_path=resume_path,
+            sample_ids=["sample-b", "sample-c", "sample-a"],
+        )
+        assert all(isinstance(record, ResponseRecord) for record in resumed)
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 3
+        assert all(span.kind == SpanKind.CLIENT for span in spans)
+        assert adapter.bound_adapters[0].open_count == 3
+
+    asyncio.run(scenario())
+
+
 def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -> None:
     """A stream iterated to exhaustion then final() ends exactly one span carrying time_to_first_chunk."""
 
@@ -1113,6 +1153,19 @@ def _bind_overload_pin() -> None:
     )
     assert_type(structured.rebind(tools=tool_manager), TracedBoundLLM[_Answer, ToolManager])
     assert_type(structured_with_tools.rebind(tools=None), TracedBoundLLM[_Answer])
+
+
+async def _generate_many_records_overload_pin() -> None:
+    """Pin `TracedBoundLLM.generate_many_records` output types for text and structured bindings."""
+    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    text_records = await traced.bind().generate_many_records(
+        ["hi"], resume_path=pathlib.Path("records.json")
+    )
+    structured_records = await traced.bind(response_format=_Answer).generate_many_records(
+        ["hi"], resume_path=pathlib.Path("records.json")
+    )
+    assert_type(text_records, list[CallResultRecord[str]])
+    assert_type(structured_records, list[CallResultRecord[_Answer]])
 
 
 def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:

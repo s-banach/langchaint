@@ -130,6 +130,8 @@ Document every public parameter and cross-provider difference.
 ## Module map
 
 - `llm.py`: client binding and generation.
+- `_config_fingerprint.py`: deterministic binding and generation-input fingerprints.
+- `_generate_many_records.py`: validated JSON resume state and atomic result-record persistence.
 - `adapter.py`: the SDK-free neutral adapter contract.
 - `cancellation.py`: cancellation-safe synchronous provider work.
 - `conformance.py`: SDK-free adapter invariants that adapter tests inherit.

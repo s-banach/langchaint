@@ -8,6 +8,7 @@ Each request attempt runs inside `SharedBackoff.admitted`.
 import asyncio
 from collections.abc import Mapping, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
@@ -15,6 +16,12 @@ from pydantic import BaseModel
 from langchaint._config_fingerprint import (
     bound_llm_config_fingerprint,
     capture_response_format_fingerprint_data,
+    generation_input_fingerprint,
+)
+from langchaint._generate_many_records import (
+    _run_resume_io,
+    claim_resume_path,
+    prepare_resume_state,
 )
 from langchaint.adapter import (
     Adapter,
@@ -51,10 +58,12 @@ from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.pricing import ProviderBilling
 from langchaint.response import (
     CallResult,
+    CallResultRecord,
     GenerateResult,
     Response,
     ToolCallTurn,
     _abandoned_call_error,
+    _result_record,
     _success_variant,
 )
 from langchaint.run_many import max_pending_for_requests, run_many
@@ -171,6 +180,10 @@ def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
     if isinstance(generation_input, str):
         return (UserMessage(content=generation_input),)
     return generation_input
+
+
+def _snapshot_generation_input(generation_input: GenerationInput) -> tuple[Message, ...]:
+    return tuple(message.model_copy(deep=True) for message in _as_messages(generation_input))
 
 
 def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
@@ -452,7 +465,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         return self._tool_manager
 
     def config_fingerprint(self) -> str:
-        """Return a versioned SHA-256 fingerprint of the current stored request configuration.
+        """Return a SHA-256 fingerprint of the current stored request configuration.
 
         The fingerprint captures adapter and response-format configuration during binding.
         The fingerprint includes the binding.
@@ -1179,6 +1192,125 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
+    async def generate_many_records(
+        self,
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = None,
+        warm_cache: bool = False,
+        max_working_seconds_per_item: float | None = None,
+    ) -> list[CallResultRecord[OutputT]]:
+        """Restore reusable records and generate the remaining input records.
+
+        The JSON file stores one item per current input.
+        It stores input fingerprints instead of `GenerationInput` values.
+        It stores normalized records without live provider SDK objects.
+        The returned list follows `generation_inputs` order.
+        When `sample_ids=None`, each input is identified by its position in the complete ordered input list.
+        Any ordered input change then replaces a valid resume file.
+        Providing `sample_ids` identifies inputs by those strings.
+        Both cases use one JSON format whose `identity_mode` records whether `sample_ids` was provided.
+        Adding, deleting, or reordering inputs preserves records for unchanged `sample_ids` entries.
+        Deleting a `sample_ids` entry removes its saved item.
+        Reusing a `sample_ids` entry with a changed input generates that item again.
+        Repeated equal inputs remain separate items by position or by distinct `sample_ids` entries.
+        Changing the binding or switching whether `sample_ids` is provided replaces a valid resume file.
+        The file's `binding_fingerprint` is the value from `config_fingerprint()`.
+        Changes excluded by `config_fingerprint()` do not replace the file.
+        A malformed file or unsupported format raises before any provider request and remains unchanged.
+        Missing records, `RetriesExhaustedErrorRecord` values, and `TimedOutErrorRecord` values generate again.
+        The new record replaces the saved error record.
+        The replacement record excludes the earlier call's attempts and billing.
+        Every other saved record is reused.
+        Each generated record is written with an atomic file replacement before its item finishes.
+        A process failure before file replacement can cause a repeated request after restart.
+        Separate processes must not use the same `resume_path` concurrently.
+
+        Args:
+            generation_inputs: The input-aligned text or message values.
+            resume_path: The JSON file whose parent directory already exists.
+            sample_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
+            warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
+            max_working_seconds_per_item: The per-item working-time budget, or `None`.
+
+        Raises:
+            ValueError: `sample_ids` has the wrong length or contains a duplicate.
+            ValueError: `resume_path` contains malformed data or an unsupported format.
+            ValueError: A generated result record cannot be serialized as resume JSON.
+            RuntimeError: Another call in this process is using `resume_path`.
+            TypeError: The binding or an input has no deterministic fingerprint encoding.
+            OSError: The resume file cannot be read, written, or replaced.
+            asyncio.CancelledError: The caller cancels the batch after started items settle.
+            BaseException: An item raises a non-`Exception` value after started items settle.
+        """
+        return await self._generate_many_records_any_binding(
+            generation_inputs,
+            resume_path=resume_path,
+            sample_ids=sample_ids,
+            warm_cache=warm_cache,
+            generate_item=self._generate_one_any_binding,
+            max_working_seconds_per_item=max_working_seconds_per_item,
+        )
+
+    async def _generate_many_records_any_binding(
+        self,
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None,
+        warm_cache: bool,
+        generate_item: "GenerateItem[OutputT]",
+        max_working_seconds_per_item: float | None,
+        # `response_format` selects the concrete record output type at runtime.
+        # `list` invariance requires `Any` across text and structured bindings.
+    ) -> list[Any]:
+        """Restore records and run inputs that have no reusable record."""
+        generation_input_snapshots = tuple(
+            _snapshot_generation_input(generation_input) for generation_input in generation_inputs
+        )
+        input_fingerprints = tuple(
+            generation_input_fingerprint(generation_input)
+            for generation_input in generation_input_snapshots
+        )
+        sample_id_snapshot = None if sample_ids is None else tuple(sample_ids)
+        binding_fingerprint = self.config_fingerprint()
+        resolved_resume_path = await _run_resume_io(resume_path.resolve)
+        with claim_resume_path(resolved_resume_path):
+            resume_state = await _run_resume_io(
+                partial(
+                    prepare_resume_state,
+                    resume_path=resolved_resume_path,
+                    response_format=self.response_format,
+                    binding_fingerprint=binding_fingerprint,
+                    input_fingerprints=input_fingerprints,
+                    sample_ids=sample_id_snapshot,
+                )
+            )
+            pending_indices = resume_state.pending_indices()
+
+            async def run_one(result_index: int) -> None:
+                result = await self._generate_or_failure(
+                    generation_input_snapshots[result_index],
+                    generate_item=generate_item,
+                    deadline=WorkingTimeDeadline(max_working_seconds_per_item),
+                )
+                await _run_resume_io(
+                    partial(
+                        resume_state.store_result_record,
+                        result_index,
+                        _result_record(result),
+                    )
+                )
+
+            run_ones = tuple(partial(run_one, result_index) for result_index in pending_indices)
+            if warm_cache and run_ones:
+                await run_ones[0]()
+                run_ones = run_ones[1:]
+            max_pending = max_pending_for_requests(self.shared_backoff.max_concurrent_requests)
+            _ = await run_many(run_ones, max_pending=max_pending)
+            return resume_state.result_records()
+
     async def _generate_many_any_binding(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1222,7 +1354,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Run the items through run_many, which returns them in input order.
 
         Raises:
-            asyncio.CancelledError: An outer scope cancels `generate_many` after started items settle.
+            asyncio.CancelledError: An outer scope cancels the batch after started items settle.
             BaseException: An item raises a value outside `Exception` after started items settle.
         """
 

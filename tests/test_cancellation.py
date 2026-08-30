@@ -5,7 +5,32 @@ import threading
 
 import pytest
 
+from langchaint._generate_many_records import _run_resume_io
 from langchaint.cancellation import to_thread_cancellation_safe
+
+
+def test_run_resume_io_settles_before_cancellation_propagates() -> None:
+    """Assert `_run_resume_io` waits for started work after cancellation."""
+
+    async def scenario() -> None:
+        """Cancel the awaiting task while its thread remains blocked."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def block() -> None:
+            started.set()
+            assert release.wait(timeout=5.0)
+
+        task = asyncio.create_task(_run_resume_io(block))
+        assert await asyncio.to_thread(started.wait, 5.0)
+        _ = task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
 
 
 def test_thread_work_settles_before_cancellation_propagates() -> None:

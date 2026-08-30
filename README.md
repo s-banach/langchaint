@@ -8,7 +8,7 @@ Alpha: the API is unstable and may change without notice.
 
 ## Why langchaint
 
-- **One consistent API.** Set `system_prompt`, `tools`, `inference_params`, and `response_format` once with `LLM.bind()`. Use the resulting `BoundLLM` with `generate_one()`, `generate_many()`, or `stream_one()`.
+- **One consistent API.** Set `system_prompt`, `tools`, `inference_params`, and `response_format` once with `LLM.bind()`. Use the resulting `BoundLLM` with `generate_one()`, `generate_many()`, `generate_many_records()`, or `stream_one()`.
 - **Types that follow your configuration.** Passing `response_format=Answer` makes `response.output` an `Answer`. Passing `tools` also determines the `tool_manager` type and whether `generate_one()` can return `ToolCallTurn`.
 - **Easy-to-discover result variants.** Every `GenerateResult`, `DispatchOutcome`, and `DispatchManyOutcome` variant has a literal `.kind` value. Every `StreamItem` variant except `str` does too. Editors can autocomplete the values, so a match statement needs no class imports.
 - **Names that explain themselves.** Public names state their meaning, units, and scope through names such as `timeout_seconds`, `max_attempts`, `cost_in_usd`, and `input_tokens_cache_read`.

@@ -5,6 +5,8 @@ Applications configure the OTel SDK.
 
 `TracedBoundLLM` opens one CLIENT span for each generation call.
 `generate_many` opens one span per started input.
+`generate_many_records` opens one span per input that requires generation.
+Restored records open no span.
 `TracedStreamHandle` keeps one CLIENT span open for the stream.
 `TracedToolManager.dispatch` opens one INTERNAL `execute_tool` span.
 `ToolManager.dispatch_many` uses `dispatch` and gets one span per tool call.
@@ -53,6 +55,7 @@ import time
 from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Never, NoReturn, overload, override
 
@@ -93,7 +96,13 @@ from langchaint.messages import (
     TurnPart,
     UserMessage,
 )
-from langchaint.response import CallResult, GenerateResult, Response, ToolCallTurn
+from langchaint.response import (
+    CallResult,
+    CallResultRecord,
+    GenerateResult,
+    Response,
+    ToolCallTurn,
+)
 from langchaint.sequence_not_str import SequenceNotStr
 from langchaint.shared_backoff import SharedBackoff
 from langchaint.streaming import StreamHandle
@@ -1337,6 +1346,48 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         # `_generate_one_any_binding` accepts each overloaded `response_format`.
         return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
             generation_inputs,
+            warm_cache=warm_cache,
+            generate_item=self._generate_one_any_binding,
+            max_working_seconds_per_item=max_working_seconds_per_item,
+        )
+
+    async def generate_many_records(
+        self,
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = None,
+        warm_cache: bool = False,
+        max_working_seconds_per_item: float | None = None,
+    ) -> list[CallResultRecord[OutputT]]:
+        """Restore normalized records and trace each item that requires generation.
+
+        Reused records open no spans.
+        The arguments and resume behavior match `BoundLLM.generate_many_records`.
+        The returned list follows `generation_inputs` order.
+        Separate processes must not use the same `resume_path` concurrently.
+
+        Args:
+            generation_inputs: The input-aligned text or message values.
+            resume_path: The JSON file whose parent directory already exists.
+            sample_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
+            warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
+            max_working_seconds_per_item: The per-item working-time budget, or `None`.
+
+        Raises:
+            ValueError: `sample_ids` has the wrong length or contains a duplicate.
+            ValueError: `resume_path` contains malformed data or an unsupported format.
+            ValueError: A generated result record cannot be serialized as resume JSON.
+            RuntimeError: Another call in this process is using `resume_path`.
+            TypeError: The binding or an input has no deterministic fingerprint encoding.
+            OSError: The resume file cannot be read, written, or replaced.
+            asyncio.CancelledError: The caller cancels the batch after started items settle.
+            BaseException: An item raises a non-`Exception` value after started items settle.
+        """
+        return await self._bound_llm._generate_many_records_any_binding(  # noqa: SLF001
+            generation_inputs,
+            resume_path=resume_path,
+            sample_ids=sample_ids,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
             max_working_seconds_per_item=max_working_seconds_per_item,

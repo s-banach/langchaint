@@ -2,13 +2,15 @@
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import ClassVar, assert_type, override
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from langchaint import (
     LLM,
@@ -17,6 +19,7 @@ from langchaint import (
     AssistantMessage,
     BoundLLM,
     CallResult,
+    CallResultRecord,
     CaptureTool,
     CutOffAttemptRecord,
     DispatchHandled,
@@ -31,6 +34,7 @@ from langchaint import (
     ProviderDeclaredFinalErrorRecord,
     PydanticTool,
     Response,
+    ResponseRecord,
     RetriesExhaustedErrorRecord,
     SchemaViolationErrorRecord,
     SettledAttemptRecord,
@@ -39,8 +43,10 @@ from langchaint import (
     StreamItem,
     StreamProtocolError,
     TextPart,
+    TimedOutErrorRecord,
     ToolCall,
     ToolCallTurn,
+    ToolCallTurnRecord,
     ToolManager,
     ToolSchema,
     TransientError,
@@ -153,6 +159,20 @@ def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
         assert isinstance(result, Response)
         outputs.append(result.output)
     return outputs
+
+
+def _record_outputs(results: list[CallResultRecord[str]]) -> list[str]:
+    """Assert successful records and return each output in order."""
+    outputs: list[str] = []
+    for result in results:
+        assert isinstance(result, ResponseRecord)
+        outputs.append(result.output)
+    return outputs
+
+
+def _resume_json_object(resume_path: Path) -> dict[str, object]:
+    """Parse a resume file as one JSON object."""
+    return TypeAdapter(dict[str, object]).validate_json(resume_path.read_bytes())
 
 
 class _FakeRawResponse(BaseModel):
@@ -1846,10 +1866,20 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         await structured_with_tools.generate_many(["hi"]),
         list[CallResult[_Answer]],
     )
+    assert_type(
+        await structured_with_tools.generate_many_records(
+            ["hi"], resume_path=Path("records.json")
+        ),
+        list[CallResultRecord[_Answer]],
+    )
     structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), Response[_Answer])
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(await text_with_tools.generate_one("hi"), Response[str])
+    assert_type(
+        await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
+        list[CallResultRecord[str]],
+    )
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
 
 
@@ -1876,13 +1906,14 @@ def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> N
 class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
     """A structured bound adapter handing every request one scripted outcome.
 
-    ToolCallTurn split tests generate through this adapter.
+    Structured generation tests use this adapter.
     """
 
     def __init__(self, outcome: ResponseOutcome[_Answer | None]) -> None:
-        """Store the one outcome interpret returns for every response."""
+        """Store the outcome and start `open_count` at zero."""
         self._outcome = outcome
         self.stream = _FakeStream()
+        self.open_count = 0
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1891,7 +1922,7 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Report a fixed identity. No split test reads it."""
+        """Report a fixed identity."""
         return ResponseIdentity(
             model_served="fake-model-served",
             response_id="structured-response",
@@ -1911,6 +1942,7 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
         """Hand back the stored fake stream. interpret ignores the raw it assembles."""
+        self.open_count += 1
         return self.stream
 
 
@@ -1962,6 +1994,57 @@ def test_structured_tool_bound_generate_one_returns_the_response_variant_on_a_fi
         result = await _structured_tool_bound_llm(outcome).generate_one("hi")
         assert isinstance(result, Response)
         assert result.output is answer
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_restores_the_structured_output_type(tmp_path: Path) -> None:
+    """A resumed response record reconstructs the bound `response_format` type."""
+
+    async def scenario() -> None:
+        """Generate one structured record, then restore it without another request."""
+        answer = _Answer(value=7)
+        outcome: AdapterResult[_Answer | None] = AdapterResult(
+            output=answer,
+            assistant_message=AssistantMessage(turn=(TextPart(text=answer.model_dump_json()),)),
+            stop_reason="end_turn",
+        )
+        bound_llm = _structured_tool_bound_llm(outcome)
+        structured_adapter = bound_llm._bound_adapter
+        assert isinstance(structured_adapter, _ScriptedStructuredBoundAdapter)
+        resume_path = tmp_path / "records.json"
+        generated = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
+        restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
+        generated_record = generated[0]
+        restored_record = restored[0]
+        assert isinstance(generated_record, ResponseRecord)
+        assert isinstance(restored_record, ResponseRecord)
+        assert generated_record.output == answer
+        assert restored_record.output == answer
+        assert isinstance(restored_record.output, _Answer)
+        assert structured_adapter.open_count == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_restores_a_structured_tool_call_turn(tmp_path: Path) -> None:
+    """A resumed tool-call record retains `output=None` and its tool calls."""
+
+    async def scenario() -> None:
+        """Generate one tool-call record, then restore it without another request."""
+        bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN)
+        structured_adapter = bound_llm._bound_adapter
+        assert isinstance(structured_adapter, _ScriptedStructuredBoundAdapter)
+        resume_path = tmp_path / "records.json"
+        generated = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
+        restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
+        generated_record = generated[0]
+        restored_record = restored[0]
+        assert isinstance(generated_record, ToolCallTurnRecord)
+        assert isinstance(restored_record, ToolCallTurnRecord)
+        assert restored_record.output is None
+        assert restored_record.tool_calls == (_FAKE_TOOL_CALL,)
+        assert structured_adapter.open_count == 1
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -2031,10 +2114,10 @@ def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
     assert bound_llm.rebind(extra_body=None).binding.extra_body is None
 
 
-def test_config_fingerprint_has_a_fixed_versioned_digest() -> None:
-    """Pin the canonical format and SHA-256 result for the default fake binding."""
+def test_config_fingerprint_has_a_fixed_digest() -> None:
+    """Pin the canonical encoding and SHA-256 result for the default fake binding."""
     fingerprint = LLM(_FakeAdapter()).bind().config_fingerprint()
-    assert fingerprint == "sha256:ade90c6f8015578b706794b62ef0636d7241e4a08d2d2aeedfc22874a075890c"
+    assert fingerprint == "sha256:b96483ff927dc5b7d0336344ee64681913aae3d15e7f306e5095a7d2262c674a"
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
@@ -2290,6 +2373,362 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
         assert second.output == "b"
 
     asyncio.run(scenario())
+
+
+def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_path: Path) -> None:
+    """A complete batch without `sample_ids` persists records that the next binding reuses."""
+
+    async def scenario() -> None:
+        """Generate two records, inspect the JSON document, then resume without another request."""
+        resume_path = tmp_path / "records.json"
+        first_adapter = _FakeAdapter(echo=True)
+        first_bound = LLM(first_adapter).bind()
+        first_records = await first_bound.generate_many_records(
+            ["a", "b"], resume_path=resume_path
+        )
+        assert _record_outputs(first_records) == ["a", "b"]
+        assert first_adapter.bound_adapters[0].open_count == 2
+        resume_data = _resume_json_object(resume_path)
+        assert resume_data["format_version"] == 1
+        assert resume_data["identity_mode"] == "position"
+        resume_items = TypeAdapter(list[dict[str, object]]).validate_python(resume_data["items"])
+        assert len(resume_items) == 2
+
+        resumed_adapter = _FakeAdapter(echo=True)
+        resumed_bound = LLM(resumed_adapter).bind()
+        resumed_records = await resumed_bound.generate_many_records(
+            ["a", "b"], resume_path=resume_path
+        )
+        assert _record_outputs(resumed_records) == ["a", "b"]
+        assert resumed_adapter.bound_adapters[0].open_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_uses_one_background_thread_for_resume_io(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Assert `Path.resolve` and `Path.replace` use one background thread."""
+    resume_path = tmp_path / "records.json"
+    original_resolve = Path.resolve
+    original_replace = Path.replace
+    first_result_replace_started = threading.Event()
+    release_first_result_replace = threading.Event()
+    resolve_thread_ids: list[int] = []
+    replace_thread_ids: list[int] = []
+
+    def observed_resolve(path: Path, *, strict: bool = False) -> Path:
+        """Record resolution for the test's `resume_path`."""
+        if path == resume_path:
+            resolve_thread_ids.append(threading.get_ident())
+        return original_resolve(path, strict=strict)
+
+    def observed_replace(path: Path, target: Path) -> Path:
+        """Block the first result replacement and record every document replacement."""
+        if target == resume_path:
+            replace_thread_ids.append(threading.get_ident())
+            if len(replace_thread_ids) == 2:
+                first_result_replace_started.set()
+                assert release_first_result_replace.wait(timeout=5.0)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "resolve", observed_resolve)
+    monkeypatch.setattr(Path, "replace", observed_replace)
+
+    async def scenario() -> None:
+        """Let a second request start while the first result replacement remains blocked."""
+        event_loop_thread_id = threading.get_ident()
+        adapter = _FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        task = asyncio.create_task(
+            bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        )
+        assert await asyncio.to_thread(first_result_replace_started.wait, 5.0)
+        while adapter.bound_adapters[0].open_count < 2:
+            await asyncio.sleep(0)
+        assert not task.done()
+        release_first_result_replace.set()
+        records = await task
+        assert _record_outputs(records) == ["a", "b"]
+        assert len(resolve_thread_ids) == 1
+        assert len(replace_thread_ids) == 3
+        assert set(resolve_thread_ids) == set(replace_thread_ids)
+        assert resolve_thread_ids[0] != event_loop_thread_id
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path) -> None:
+    """A saved RetriesExhaustedErrorRecord remains pending until a later call succeeds."""
+
+    async def scenario() -> None:
+        """Exhaust one request, resume to success, then reuse that success."""
+        adapter = _FakeAdapter(echo=True, failures=[TransientError("try again")])
+        bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(max_attempts=1)
+        resume_path = tmp_path / "records.json"
+        first = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert isinstance(first[0], RetriesExhaustedErrorRecord)
+        second = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert _record_outputs(second) == ["a"]
+        third = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert _record_outputs(third) == ["a"]
+        assert adapter.bound_adapters[0].open_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_retries_a_timed_out_record(tmp_path: Path) -> None:
+    """A later call with more working time regenerates a saved `TimedOutErrorRecord`."""
+
+    async def scenario() -> None:
+        """Time out one request, then resume the same input without a working-time limit."""
+        resume_path = tmp_path / "records.json"
+        timed_out_adapter = _FakeAdapter(echo=True, hang_from_open=1)
+        timed_out_bound = LLM(
+            timed_out_adapter,
+            shared_backoff=_fast_shared_backoff(),
+        ).bind()
+        timed_out = await timed_out_bound.generate_many_records(
+            ["a"],
+            resume_path=resume_path,
+            max_working_seconds_per_item=0.01,
+        )
+        assert isinstance(timed_out[0], TimedOutErrorRecord)
+
+        resumed_adapter = _FakeAdapter(echo=True)
+        resumed_bound = LLM(resumed_adapter).bind()
+        resumed = await resumed_bound.generate_many_records(["a"], resume_path=resume_path)
+        assert _record_outputs(resumed) == ["a"]
+        assert resumed_adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) -> None:
+    """A saved terminal error record prevents another provider request."""
+
+    async def scenario() -> None:
+        """Save one refusal and restore the same record on the next call."""
+        adapter = _FakeAdapter(
+            echo=True,
+            failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
+        )
+        bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
+        resume_path = tmp_path / "records.json"
+        generated = await bound.generate_many_records(["a"], resume_path=resume_path)
+        restored = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert generated[0].kind == "refusal_error"
+        assert restored[0].kind == "refusal_error"
+        record_adapter = TypeAdapter(list[CallResultRecord[str]])
+        assert record_adapter.dump_json(restored) == record_adapter.dump_json(generated)
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_without_sample_ids_replaces_changed_input_lists(
+    tmp_path: Path,
+) -> None:
+    """`sample_ids=None` replaces the batch after an input is reordered, added, or deleted."""
+
+    async def scenario() -> None:
+        """Change the ordered input list three ways and count the replacement requests."""
+        adapter = _FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        resume_path = tmp_path / "records.json"
+        first = await bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        reordered = await bound.generate_many_records(["b", "a"], resume_path=resume_path)
+        added = await bound.generate_many_records(["b", "a", "c"], resume_path=resume_path)
+        deleted = await bound.generate_many_records(["b"], resume_path=resume_path)
+        assert _record_outputs(first) == ["a", "b"]
+        assert _record_outputs(reordered) == ["b", "a"]
+        assert _record_outputs(added) == ["b", "a", "c"]
+        assert _record_outputs(deleted) == ["b"]
+        assert adapter.bound_adapters[0].open_count == 8
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_path: Path) -> None:
+    """A `binding_fingerprint` or `identity_mode` change replaces the saved batch."""
+
+    async def scenario() -> None:
+        """Change the binding, provide `sample_ids`, then omit `sample_ids` again."""
+        adapter = _FakeAdapter(echo=True)
+        position_bound = LLM(adapter).bind()
+        resume_path = tmp_path / "records.json"
+        await position_bound.generate_many_records(["a"], resume_path=resume_path)
+        changed_bound = position_bound.rebind(system_prompt="changed")
+        await changed_bound.generate_many_records(["a"], resume_path=resume_path)
+        await changed_bound.generate_many_records(
+            ["a"], resume_path=resume_path, sample_ids=["sample-a"]
+        )
+        await changed_bound.generate_many_records(["a"], resume_path=resume_path)
+        assert adapter.bound_adapters[0].open_count == 1
+        assert adapter.bound_adapters[1].open_count == 3
+        assert _resume_json_object(resume_path)["identity_mode"] == "position"
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_sample_ids_support_batch_edits_and_equal_inputs(
+    tmp_path: Path,
+) -> None:
+    """`sample_ids` preserves unchanged records across reorder, add, and delete operations."""
+
+    async def scenario() -> None:
+        """Track equal inputs, delete one `sample_ids` entry, add it again, and change another input."""
+        adapter = _FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        resume_path = tmp_path / "records.json"
+        first = await bound.generate_many_records(
+            ["same", "same"],
+            resume_path=resume_path,
+            sample_ids=["left", "right"],
+        )
+        reordered = await bound.generate_many_records(
+            ["same", "same"],
+            resume_path=resume_path,
+            sample_ids=["right", "left"],
+        )
+        added = await bound.generate_many_records(
+            ["same", "third", "same"],
+            resume_path=resume_path,
+            sample_ids=["right", "third", "left"],
+        )
+        deleted = await bound.generate_many_records(
+            ["third", "same"],
+            resume_path=resume_path,
+            sample_ids=["third", "left"],
+        )
+        restored = await bound.generate_many_records(
+            ["third", "same", "same"],
+            resume_path=resume_path,
+            sample_ids=["third", "left", "right"],
+        )
+        changed = await bound.generate_many_records(
+            ["third", "changed", "same"],
+            resume_path=resume_path,
+            sample_ids=["third", "left", "right"],
+        )
+        assert _record_outputs(first) == ["same", "same"]
+        assert _record_outputs(reordered) == ["same", "same"]
+        assert _record_outputs(added) == ["same", "third", "same"]
+        assert _record_outputs(deleted) == ["third", "same"]
+        assert _record_outputs(restored) == ["third", "same", "same"]
+        assert _record_outputs(changed) == ["third", "changed", "same"]
+        assert adapter.bound_adapters[0].open_count == 5
+        items = TypeAdapter(list[dict[str, object]]).validate_python(
+            _resume_json_object(resume_path)["items"]
+        )
+        assert [item["sample_id"] for item in items] == ["third", "left", "right"]
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_rejects_invalid_sample_ids_before_requests(tmp_path: Path) -> None:
+    """Duplicate or misaligned `sample_ids` raises before the file or provider changes."""
+
+    async def scenario() -> None:
+        """Pass each invalid `sample_ids` sequence to a fresh path."""
+        adapter = _FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        resume_path = tmp_path / "records.json"
+        with pytest.raises(ValueError, match="sample_ids"):
+            await bound.generate_many_records(
+                ["a", "b"], resume_path=resume_path, sample_ids=["same", "same"]
+            )
+        with pytest.raises(ValueError, match="sample_ids"):
+            await bound.generate_many_records(
+                ["a", "b"], resume_path=resume_path, sample_ids=["only-one"]
+            )
+        assert not resume_path.exists()
+        assert adapter.bound_adapters[0].open_count == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "resume_text",
+    [
+        "not json\n",
+        '{"format_version": 999, "binding_fingerprint": "x", "identity_mode": "position", "items": []}\n',
+        '{"unrelated": true}\n',
+    ],
+    ids=["malformed", "unsupported-version", "unrelated-json"],
+)
+def test_generate_many_records_preserves_an_unrecognized_file(
+    tmp_path: Path, resume_text: str
+) -> None:
+    """An unrecognized existing file raises before changing the file or sending a request."""
+
+    async def scenario() -> None:
+        """Attempt to resume from the supplied text and verify its bytes remain unchanged."""
+        resume_path = tmp_path / "records.json"
+        _ = resume_path.write_text(resume_text)
+        adapter = _FakeAdapter(echo=True)
+        bound = LLM(adapter).bind()
+        with pytest.raises(ValueError, match="resume"):
+            await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert resume_path.read_text() == resume_text
+        assert adapter.bound_adapters[0].open_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_persists_a_settled_item_before_batch_cancellation(
+    tmp_path: Path,
+) -> None:
+    """A settled item survives cancellation while a later item is still running."""
+
+    async def scenario() -> None:
+        """Cancel after the second request starts, then resume only the missing second item."""
+        resume_path = tmp_path / "records.json"
+        first_adapter = _FakeAdapter(echo=True, hang_from_open=2)
+        first_bound = LLM(
+            first_adapter,
+            shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
+        ).bind()
+        task = asyncio.create_task(
+            first_bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        )
+        while first_adapter.bound_adapters[0].open_count < 2:
+            await asyncio.sleep(0)
+        _ = task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        resumed_adapter = _FakeAdapter(echo=True)
+        resumed_bound = LLM(resumed_adapter).bind()
+        resumed = await resumed_bound.generate_many_records(["a", "b"], resume_path=resume_path)
+        assert _record_outputs(resumed) == ["a", "b"]
+        assert resumed_adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_rejects_concurrent_use_of_one_path(tmp_path: Path) -> None:
+    """A second active call with the same resume path raises before sending a request."""
+
+    async def scenario() -> None:
+        """Hold the first request open while the second call uses the same path."""
+        adapter = _FakeAdapter(echo=True, hang_from_open=1)
+        bound = LLM(adapter).bind()
+        resume_path = tmp_path / "records.json"
+        first_call = asyncio.create_task(
+            bound.generate_many_records(["a"], resume_path=resume_path)
+        )
+        while adapter.bound_adapters[0].open_count < 1:
+            await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="active generate_many_records"):
+            await bound.generate_many_records(["b"], resume_path=resume_path)
+        assert adapter.bound_adapters[0].open_count == 1
+        _ = first_call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_call
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def test_invalid_request_fails_only_its_item() -> None:

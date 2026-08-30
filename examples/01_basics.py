@@ -1,10 +1,11 @@
 """Demonstrate OpenAI generation results."""
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
-from langchaint import CallResultRecord, GenerationError, InferenceParams, to_tables
+from langchaint import InferenceParams, to_tables
 from langchaint.openai import OpenAI
 
 
@@ -20,7 +21,7 @@ async def basics() -> None:
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
-        GenerationError: Generation fails.
+        GenerationError: A `generate_one` call fails.
     """
     openai = OpenAI()
     llm = openai.model("gpt-5.6-terra")
@@ -43,11 +44,9 @@ async def basics() -> None:
     bridge = await detailed.generate_one("How does a suspension bridge carry load?")
     print(bridge.output)
 
-    results = await assistant.generate_many(["Define entropy.", "Define enthalpy."])
-    generation_error_count = sum(isinstance(result, GenerationError) for result in results)
-    result_record_adapter = TypeAdapter(list[CallResultRecord[str]])
-    result_records_json = result_record_adapter.dump_json([result.record for result in results])
-    restored_result_records = result_record_adapter.validate_json(result_records_json)
-    calls, attempts = to_tables(restored_result_records)
-    print(f"{generation_error_count} generation errors")
+    result_records = await assistant.generate_many_records(
+        ["Define entropy.", "Define enthalpy."],
+        resume_path=Path("definition-records.json"),
+    )
+    calls, attempts = to_tables(result_records)
     print(f"{len(calls)} calls over {len(attempts)} attempts")

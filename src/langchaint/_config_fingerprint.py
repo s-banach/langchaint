@@ -1,10 +1,10 @@
-"""Canonical encoding for `BoundLLM.config_fingerprint`."""
+"""Canonical encodings for request fingerprints."""
 
 import base64
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TypeIs
@@ -14,14 +14,13 @@ from pydantic import BaseModel
 
 from langchaint.adapter import Adapter, AllowedToolsChoice, Binding, SpecificToolChoice
 from langchaint.inference_params import InferenceParams
+from langchaint.messages import Message
 from langchaint.tools import ToolSchema
 
 type _CanonicalValue = None | bool | str | list[_CanonicalValue]
 type _ConfigContainer = (
     Mapping[object, object] | list[object] | tuple[object, ...] | set[object] | frozenset[object]
 )
-
-_FINGERPRINT_FORMAT = "langchaint.bound_llm.config_fingerprint.v1"
 
 
 @dataclass(frozen=True)
@@ -61,7 +60,6 @@ def bound_llm_config_fingerprint(
         raise TypeError(response_format_fingerprint_data.message)
     canonicalizer = _Canonicalizer()
     payload: _CanonicalValue = [
-        _FINGERPRINT_FORMAT,
         [
             "adapter",
             _class_identity(adapter_class),
@@ -79,6 +77,13 @@ def bound_llm_config_fingerprint(
         ["response_format", response_format_fingerprint_data],
     ]
     digest = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+    return f"sha256:{digest}"
+
+
+def generation_input_fingerprint(messages: Sequence[Message]) -> str:
+    """Hash one normalized message sequence."""
+    encoded_messages = _Canonicalizer().value(list(messages), path="messages")
+    digest = hashlib.sha256(_canonical_json(encoded_messages).encode()).hexdigest()
     return f"sha256:{digest}"
 
 

@@ -495,6 +495,10 @@ class InvalidRequest:
     kind: Literal["invalid_request"] = "invalid_request"
 
 
+class _NotSendableError(Exception):
+    """Carry `InvalidRequest.reason` through nested request conversion functions."""
+
+
 @dataclass(frozen=True, kw_only=True)
 class RequestParams(ABC):
     """One request, built once per call and sent once per attempt.

@@ -118,6 +118,7 @@ from langchaint.adapter import (
     ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
+    _NotSendableError,
     narrowed_request,
     reject_extra_body_keys_the_adapter_populates,
     request_json,
@@ -229,18 +230,6 @@ class _ChatCompletionsRequestParams(RequestParams):
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
         return request_json(self, omitted_class=Omit)
-
-
-class _NotSendableError(Exception):
-    """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
-
-    Never leaves this module: build_request turns it into the InvalidRequest it returns.
-    Per-part converters raise it when a `Sequence[Message]` is unsendable.
-    """
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
 
 
 def _reasoning_content_extra(model: BaseModel) -> str | None:
@@ -1073,7 +1062,7 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         try:
             wire_messages = _wire_messages(messages)
         except _NotSendableError as not_sendable:
-            return InvalidRequest(reason=not_sendable.reason)
+            return InvalidRequest(reason=str(not_sendable))
         return _ChatCompletionsRequestParams(
             precomputed=self._precomputed_fields,
             messages=[*self._precomputed_fields.messages_prefix, *wire_messages],

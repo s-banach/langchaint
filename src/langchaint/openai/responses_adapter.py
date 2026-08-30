@@ -115,6 +115,7 @@ from langchaint.adapter import (
     ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
+    _NotSendableError,
     narrowed_request,
     reject_extra_body_keys_the_adapter_populates,
     request_json,
@@ -261,15 +262,6 @@ class _OpenAIRequestParams(RequestParams):
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
         return request_json(self, omitted_class=Omit)
-
-
-class _NotSendableError(Exception):
-    """A Sequence[Message] this adapter cannot send."""
-
-    def __init__(self, reason: str) -> None:
-        """Store the InvalidRequest.reason."""
-        super().__init__(reason)
-        self.reason = reason
 
 
 def _user_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInputImageParam:
@@ -1114,7 +1106,7 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         try:
             wire_input = _wire_input(messages)
         except _NotSendableError as not_sendable:
-            return InvalidRequest(reason=not_sendable.reason)
+            return InvalidRequest(reason=str(not_sendable))
         return _OpenAIRequestParams(
             precomputed=self._precomputed_fields,
             input=[*self._precomputed_fields.input_prefix, *wire_input],

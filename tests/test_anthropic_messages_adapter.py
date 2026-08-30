@@ -71,6 +71,7 @@ from langchaint.adapter import (
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
+    _NotSendableError,
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
@@ -95,7 +96,6 @@ from langchaint.anthropic.messages_adapter import (
     _BoundAnthropicStructured,
     _BoundAnthropicText,
     _normalized_stop_reason,
-    _NotSendableError,
     _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,

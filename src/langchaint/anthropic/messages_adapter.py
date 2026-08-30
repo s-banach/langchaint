@@ -111,6 +111,7 @@ from langchaint.adapter import (
     ToolCallDelta,
     ToolChoice,
     UnfinishedTurn,
+    _NotSendableError,
     narrowed_request,
     record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
@@ -563,18 +564,6 @@ class _AnthropicRequestParams(RequestParams):
         return request_json(self, omitted_class=Omit)
 
 
-class _NotSendableError(Exception):
-    """A Sequence[Message] this adapter will not put on the wire, raised by a conversion helper.
-
-    `_request_messages` converts it to the `InvalidRequest` returned by `build_request`.
-    Per-part converters raise it when a `Sequence[Message]` is unsendable.
-    """
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
 def _part_block(
     part: ContentPart, *, message_class: type[UserMessage] | type[ToolMessage]
 ) -> TextBlockParam | ImageBlockParam:
@@ -798,7 +787,7 @@ def _request_messages(
             message_mark_budget=precomputed_fields.message_mark_budget,
         )
     except _NotSendableError as not_sendable:
-        return InvalidRequest(reason=not_sendable.reason)
+        return InvalidRequest(reason=str(not_sendable))
     except json.JSONDecodeError as not_json:
         return InvalidRequest(reason=f"a tool call's args_json is not valid JSON: {not_json}")
 

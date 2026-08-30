@@ -98,6 +98,7 @@ from langchaint.adapter import (
     StreamItem,
     ToolChoice,
     UnfinishedTurn,
+    _NotSendableError,
     narrowed_request,
     record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
@@ -582,17 +583,6 @@ def _billing_from_response(
     )
 
 
-class _NotSendableError(Exception):
-    """Report a Sequence[Message] that this adapter cannot send.
-
-    _request_contents converts this exception to InvalidRequest.
-    """
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
 def _tool_call_from(function_call: types.FunctionCall) -> ToolCall:
     """Build the neutral ToolCall, synthesizing the id from the name when the provider sent none.
 
@@ -894,7 +884,7 @@ def _request_contents(messages: Sequence[Message]) -> list[types.Content] | Inva
     try:
         return _wire_contents(messages)
     except _NotSendableError as not_sendable:
-        return InvalidRequest(reason=not_sendable.reason)
+        return InvalidRequest(reason=str(not_sendable))
     except json.JSONDecodeError as not_json:
         return InvalidRequest(reason=f"a tool call's args_json is not valid JSON: {not_json}")
 

@@ -68,7 +68,7 @@ from langchaint.shared_backoff import (
     Verdict,
 )
 from langchaint.streaming import StreamHandle, _close_stream_quietly
-from langchaint.tools import Tool, ToolManager, ToolSchema
+from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
 
 class _StreamObservations(NamedTuple):
@@ -240,7 +240,7 @@ def _bind_adapter(
 
 
 def _resolve_tool_manager(
-    tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None,
+    tools: ToolManager | ToolSequence | None,
 ) -> ToolManager | None:
     """Raise `ValueError` when a `tools` sequence contains duplicate names."""
     if isinstance(tools, ToolManager) or tools is None:
@@ -294,7 +294,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -324,7 +324,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -353,7 +353,7 @@ class LLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
@@ -509,7 +509,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -554,7 +554,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -599,7 +599,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -644,12 +644,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tools: (
-            ToolManager
-            | Sequence[Tool[BaseModel | Mapping[str, object] | None]]
-            | None
-            | Unchanged
-        ) = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,

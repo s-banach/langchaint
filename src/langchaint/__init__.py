@@ -116,6 +116,7 @@ from langchaint.tools import (
     ToolOutput,
     ToolOutputExplicit,
     ToolSchema,
+    ToolSequence,
     tool,
 )
 from langchaint.usage import ZERO_USAGE, Usage
@@ -236,6 +237,7 @@ __all__ = [
     "ToolOutput",
     "ToolOutputExplicit",
     "ToolSchema",
+    "ToolSequence",
     "TransientError",
     "TransientErrorRecord",
     "TurnPart",

@@ -110,9 +110,9 @@ from langchaint.tools import (
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
-    Tool,
     ToolManager,
     ToolSchema,
+    ToolSequence,
 )
 from langchaint.usage import Usage
 
@@ -222,7 +222,7 @@ class _SpanConfig:
 
 
 def _resolve_traced_tool_manager(
-    tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None,
+    tools: ToolManager | ToolSequence | None,
     *,
     span_config: _SpanConfig,
 ) -> ToolManager | None:
@@ -845,7 +845,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
         inference_params: InferenceParams | None = ...,
@@ -875,7 +875,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
         inference_params: InferenceParams | None = ...,
@@ -904,7 +904,7 @@ class TracedLLM:
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]] | None = None,
+        tools: ToolManager | ToolSequence | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
         inference_params: InferenceParams | None = None,
@@ -1020,7 +1020,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: type[NewModelT],
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1065,7 +1065,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self,
         *,
         response_format: None,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1110,7 +1110,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
-        tools: ToolManager | Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
@@ -1155,12 +1155,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
         system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tools: (
-            ToolManager
-            | Sequence[Tool[BaseModel | Mapping[str, object] | None]]
-            | None
-            | Unchanged
-        ) = UNCHANGED,
+        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
@@ -1697,7 +1692,7 @@ class TracedToolManager(ToolManager):
 
     def __init__(
         self,
-        tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolSequence,
         *,
         capture_message_content: bool,
         tracer: Tracer | None = None,

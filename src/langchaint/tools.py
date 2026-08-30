@@ -391,6 +391,9 @@ class Tool[AppDataT](Protocol):
         ...
 
 
+type ToolSequence = Sequence[Tool[BaseModel | Mapping[str, object] | None]]
+
+
 def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDetail]) -> str:
     """Build the model-facing content for an argument-validation failure.
 
@@ -490,7 +493,7 @@ def _handled_outcome[AppDataT](
 class ToolManager:
     """Index tools by name and route calls to them."""
 
-    def __init__(self, tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]]) -> None:
+    def __init__(self, tools: ToolSequence) -> None:
         """Index the tools by name.
 
         Args:

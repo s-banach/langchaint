@@ -34,7 +34,6 @@ from events import (
     gui_emitter_var,
 )
 from opentelemetry.trace import Tracer
-from pydantic import BaseModel
 from tools import CritiqueVerdict, DelegateArgs, build_critique_tool, search_tool
 
 from langchaint import (
@@ -46,11 +45,11 @@ from langchaint import (
     Message,
     PydanticTool,
     Response,
-    Tool,
     ToolCall,
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
+    ToolSequence,
     Usage,
     UserMessage,
     tool,
@@ -434,8 +433,8 @@ def top_level_path(name: str) -> str:
 
 def _tools_for(
     config: AgentConfig,
-    tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
-) -> Sequence[Tool[BaseModel | Mapping[str, object] | None]]:
+    tools: ToolSequence,
+) -> ToolSequence:
     """Add a fresh critique tool when self_correction_enabled."""
     return [*tools, build_critique_tool()] if config.self_correction_enabled else tools
 
@@ -540,7 +539,7 @@ class App:
         self,
         *,
         name: str,
-        tools: Sequence[Tool[BaseModel | Mapping[str, object] | None]],
+        tools: ToolSequence,
         prompt: str,
     ) -> ReActAgent:
         """Build and register one graph node."""

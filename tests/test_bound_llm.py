@@ -208,6 +208,11 @@ def _billed(outcome: ResponseOutcome[str]) -> _ScriptedResponse:
 
 _REJECTED_TURN = AssistantMessage(turn=(TextPart(text="what the rejected 200 carried"),))
 """The turn a 200 that produced no output still carried, which every such variant takes."""
+_REFUSAL = Refusal(assistant_message=_REJECTED_TURN)
+_UNFINISHED_TURN = UnfinishedTurn(
+    reason="anthropic returned stop_reason 'pause_turn'",
+    assistant_message=_REJECTED_TURN,
+)
 
 
 def _success_result(content: str) -> AdapterResult[str]:
@@ -225,12 +230,12 @@ _FAKE_TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": "tide"}')
 class _FakeStream(AdapterStream):
     """Provide fixed stream items and an assembled response."""
 
-    def __init__(self) -> None:
-        """Start unclosed. `close` records that it ran."""
+    def __init__(self, *, outcome: ResponseOutcome[str] | None = None) -> None:
         self.closed = False
         self.raw = _FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
         """What billing_reported wraps; None stands for an adapter with no such channel."""
+        self._outcome = outcome
 
     @override
     def billing_reported(self) -> ProviderBilling | None:
@@ -246,14 +251,9 @@ class _FakeStream(AdapterStream):
 
     def scripted_response(self) -> _ScriptedResponse:
         """Return the assembled result the SDK would produce, and what the stream billed."""
-        return _ScriptedResponse(
-            outcome=AdapterResult(
-                output="ab",
-                assistant_message=AssistantMessage(turn=(TextPart(text="ab"),)),
-                stop_reason="end_turn",
-            ),
-            usage=_USAGE_STREAM,
-        )
+        if self._outcome is not None:
+            return _billed(self._outcome)
+        return _ScriptedResponse(outcome=_success_result("ab"), usage=_USAGE_STREAM)
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -271,83 +271,18 @@ class _FakeStream(AdapterStream):
         self.closed = True
 
 
-class _RefusingStream(_FakeStream):
-    """A stream that yields items normally but whose assembled response holds a refusal.
-
-    Report Refusal with the model's refusal turn.
-    """
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the refusal instead of a result, carrying this attempt's billing."""
-        return _billed(Refusal(assistant_message=_REJECTED_TURN))
-
-
-class _UnfinishedTurnStream(_FakeStream):
-    """A stream that yields items normally but whose assembled message is not a finished turn.
-
-    Report UnfinishedTurn with the provider reason.
-    """
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the unfinished turn instead of a result, carrying this attempt's billing."""
-        return _billed(
-            UnfinishedTurn(
-                reason="anthropic returned stop_reason 'pause_turn'",
-                assistant_message=_REJECTED_TURN,
-            )
-        )
-
-
 _VALIDATION_ERROR_JSON = (
     '[{"type":"value_error","loc":["celsius"],'
     '"msg":"Value error, SENTINEL is not a temperature","input":"SENTINEL"}]'
 )
 """A pydantic rejection whose msg embeds the rejected value, as a caller's field_validator writes it."""
-
-
-class _SchemaViolationStream(_FakeStream):
-    """A stream that yields items normally but whose assembled text the response_format rejects.
-
-    Report SchemaViolation with pydantic's ValidationError.
-    """
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the rejection instead of a result, carrying this attempt's billing."""
-        return _billed(
-            SchemaViolation(
-                validation_error_json=_VALIDATION_ERROR_JSON, assistant_message=_REJECTED_TURN
-            )
-        )
-
-
-class _MaxCompletionTokensExceededStream(_FakeStream):
-    """A stream whose assembled response reached the token cap before its JSON closed."""
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the truncation instead of a result, carrying this attempt's billing."""
-        return _billed(MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN))
-
-
-class _EmptyTurnStream(_FakeStream):
-    """A stream whose assembled turn produced no instance and no tool call."""
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the empty turn instead of a result, carrying this attempt's billing."""
-        return _billed(EmptyTurn(assistant_message=_REJECTED_TURN))
-
-
-class _ContextWindowExceededStream(_FakeStream):
-    """A stream whose assembled response reports the request overflowed the context window."""
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the overflow instead of a result, carrying this attempt's billing."""
-        return _billed(ContextWindowExceeded(assistant_message=_REJECTED_TURN))
+_SCHEMA_VIOLATION = SchemaViolation(
+    validation_error_json=_VALIDATION_ERROR_JSON,
+    assistant_message=_REJECTED_TURN,
+)
+_MAX_COMPLETION_TOKENS_EXCEEDED = MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN)
+_EMPTY_TURN = EmptyTurn(assistant_message=_REJECTED_TURN)
+_CONTEXT_WINDOW_EXCEEDED = ContextWindowExceeded(assistant_message=_REJECTED_TURN)
 
 
 _PROVIDER_FAILURE_REASON = "The server had an error while processing your request."
@@ -357,31 +292,10 @@ _PROVIDER_FAILED_TRANSIENTLY = ProviderFailedTransiently(
     reason=_PROVIDER_FAILURE_REASON, is_rate_limit=False, assistant_message=_REJECTED_TURN
 )
 """One 200 whose body reports a failure a resend may get past, with no rate limit named."""
-
-
-class _ProviderFailedTransientlyStream(_FakeStream):
-    """A stream whose assembled response reports a provider failure a resend may get past.
-
-    Report ProviderFailedTransiently with the assembled response's Billing.
-    """
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the failure instead of a result, carrying this attempt's billing."""
-        return _billed(_PROVIDER_FAILED_TRANSIENTLY)
-
-
-class _ProviderFailedTerminallyStream(_FakeStream):
-    """A stream whose assembled response reports a provider failure a resend would hit again."""
-
-    @override
-    def scripted_response(self) -> _ScriptedResponse:
-        """Report the failure instead of a result, carrying this attempt's billing."""
-        return _billed(
-            ProviderFailedTerminally(
-                reason=_PROVIDER_FAILURE_REASON, assistant_message=_REJECTED_TURN
-            )
-        )
+_PROVIDER_FAILED_TERMINALLY = ProviderFailedTerminally(
+    reason=_PROVIDER_FAILURE_REASON,
+    assistant_message=_REJECTED_TURN,
+)
 
 
 class _FinalRaisesStream(_FakeStream):
@@ -1159,7 +1073,7 @@ def test_refusal_outcome_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the Refusal variant."""
-        adapter = _FakeAdapter(failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))])
+        adapter = _FakeAdapter(failures=[_billed(_REFUSAL)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as refusal:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1182,13 +1096,13 @@ def test_refusal_outcome_raises_without_retry() -> None:
     ("outcome", "expected_error", "expected_stop_reason"),
     [
         (
-            MaxCompletionTokensExceeded(assistant_message=_REJECTED_TURN),
+            _MAX_COMPLETION_TOKENS_EXCEEDED,
             GenerationError,
             "max_tokens",
         ),
-        (EmptyTurn(assistant_message=_REJECTED_TURN), GenerationError, "end_turn"),
+        (_EMPTY_TURN, GenerationError, "end_turn"),
         (
-            ContextWindowExceeded(assistant_message=_REJECTED_TURN),
+            _CONTEXT_WINDOW_EXCEEDED,
             GenerationError,
             "context_window_exceeded",
         ),
@@ -1222,16 +1136,7 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports SchemaViolation."""
-        adapter = _FakeAdapter(
-            failures=[
-                _billed(
-                    SchemaViolation(
-                        validation_error_json=_VALIDATION_ERROR_JSON,
-                        assistant_message=_REJECTED_TURN,
-                    )
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[_billed(_SCHEMA_VIOLATION)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as schema_violation:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1255,16 +1160,7 @@ def test_unfinished_turn_outcome_raises_carrying_the_adapter_s_reason() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports UnfinishedTurn."""
-        adapter = _FakeAdapter(
-            failures=[
-                _billed(
-                    UnfinishedTurn(
-                        reason="anthropic returned stop_reason 'pause_turn'",
-                        assistant_message=_REJECTED_TURN,
-                    )
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[_billed(_UNFINISHED_TURN)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unfinished_turn:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1335,15 +1231,7 @@ def test_provider_failed_terminally_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the terminal failure."""
-        adapter = _FakeAdapter(
-            failures=[
-                _billed(
-                    ProviderFailedTerminally(
-                        reason=_PROVIDER_FAILURE_REASON, assistant_message=_REJECTED_TURN
-                    )
-                )
-            ]
-        )
+        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TERMINALLY)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as provider_failure:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -2357,7 +2245,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
         """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
+            failures=[_billed(_REFUSAL)],
         )
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
@@ -2512,7 +2400,7 @@ def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) ->
         """Save one refusal and restore the same record on the next call."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[_billed(Refusal(assistant_message=_REJECTED_TURN))],
+            failures=[_billed(_REFUSAL)],
         )
         bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         resume_path = tmp_path / "records.json"
@@ -3162,7 +3050,7 @@ def test_a_stream_cancelled_after_final_raised_sets_no_abandoned() -> None:
 
     async def scenario() -> None:
         """Absorb a refusal from final() inside the block, then hang into the caller's deadline."""
-        adapter = _FakeAdapter(stream=_RefusingStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_REFUSAL))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -3502,7 +3390,7 @@ def test_stream_final_refusal_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drain a stream whose final() reports Refusal, then read the raised GenerationError."""
-        adapter = _FakeAdapter(stream=_RefusingStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_REFUSAL))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as refusal:
@@ -3524,7 +3412,7 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
 
     async def scenario() -> None:
         """Drain a stream whose final() reports UnfinishedTurn, then read the raised error."""
-        adapter = _FakeAdapter(stream=_UnfinishedTurnStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_UNFINISHED_TURN))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as unfinished_turn:
@@ -3547,7 +3435,7 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
 
     async def scenario() -> None:
         """Drain a stream whose final() reports SchemaViolation, then read the raised error."""
-        adapter = _FakeAdapter(stream=_SchemaViolationStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_SCHEMA_VIOLATION))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as schema_violation:
@@ -3567,9 +3455,9 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
 @pytest.mark.parametrize(
     ("stream", "expected_error"),
     [
-        (_MaxCompletionTokensExceededStream(), GenerationError),
-        (_EmptyTurnStream(), GenerationError),
-        (_ContextWindowExceededStream(), GenerationError),
+        (_FakeStream(outcome=_MAX_COMPLETION_TOKENS_EXCEEDED), GenerationError),
+        (_FakeStream(outcome=_EMPTY_TURN), GenerationError),
+        (_FakeStream(outcome=_CONTEXT_WINDOW_EXCEEDED), GenerationError),
     ],
     ids=["max_completion_tokens_exceeded", "empty_turn", "context_window_exceeded"],
 )
@@ -3599,7 +3487,7 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
 
     async def scenario() -> None:
         """Drain a stream whose final() reports the failure, then read the raised error."""
-        adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as retry_unavailable:
@@ -3624,7 +3512,7 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
 
     async def scenario() -> None:
         """Drain a stream whose final() reports the terminal failure, then read the raised error."""
-        adapter = _FakeAdapter(stream=_ProviderFailedTerminallyStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_PROVIDER_FAILED_TERMINALLY))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as provider_failure:
@@ -3647,7 +3535,7 @@ def test_a_stream_cancelled_after_absorbing_a_provider_failure_sets_no_abandoned
 
     async def scenario() -> None:
         """Absorb the failure from final() inside the block, then hang into the caller's deadline."""
-        adapter = _FakeAdapter(stream=_ProviderFailedTransientlyStream())
+        adapter = _FakeAdapter(stream=_FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY))
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         handle = bound_llm.stream_one([UserMessage(content="hi")])
 
@@ -4043,8 +3931,8 @@ def test_stream_final_is_idempotent() -> None:
 @pytest.mark.parametrize(
     ("stream", "expected_error"),
     [
-        (_RefusingStream(), GenerationError),
-        (_ProviderFailedTransientlyStream(), GenerationError),
+        (_FakeStream(outcome=_REFUSAL), GenerationError),
+        (_FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY), GenerationError),
         (_ProtocolErrorStream(), StreamProtocolError),
     ],
     ids=["refusal", "provider_failed_transiently", "protocol_error"],

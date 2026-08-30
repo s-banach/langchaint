@@ -26,21 +26,14 @@ from langchaint.adapter import (
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
     AbandonedCallErrorRecord,
-    ContextWindowExceededErrorRecord,
-    EmptyTurnErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
-    MaxCompletionTokensExceededErrorRecord,
     ProviderDeclaredFinalErrorRecord,
-    ProviderFailedTerminallyErrorRecord,
-    RefusalErrorRecord,
     RetriesExhaustedErrorRecord,
     RetryUnavailableErrorRecord,
-    SchemaViolationErrorRecord,
     StreamProtocolError,
     TimedOutErrorRecord,
     TransientError,
-    UnfinishedTurnErrorRecord,
     UnknownExceptionErrorRecord,
 )
 from langchaint.messages import Message
@@ -51,7 +44,7 @@ from langchaint.response import (
     Response,
     ToolCallTurn,
     _abandoned_call_error,
-    _success_variant,
+    _call_result_from_response_outcome,
 )
 from langchaint.shared_backoff import (
     Admission,
@@ -622,71 +615,10 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             error=None,
             assistant_message=outcome.assistant_message,
         )
-        match outcome.kind:
-            case "adapter_result":
-                return _success_variant(
-                    splits_tool_call_turns=self._splits_tool_call_turns,
-                    output=outcome.output,
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    provider_attempts=self._ledger.provider_attempts,
-                    stop_reason=outcome.stop_reason,
-                )
-            case "refusal":
-                return GenerationError(
-                    record=RefusalErrorRecord(
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "max_completion_tokens_exceeded":
-                return GenerationError(
-                    record=MaxCompletionTokensExceededErrorRecord(
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "empty_turn":
-                return GenerationError(
-                    record=EmptyTurnErrorRecord(
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "schema_violation":
-                return GenerationError(
-                    record=SchemaViolationErrorRecord(
-                        validation_error_json=outcome.validation_error_json,
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "context_window_exceeded":
-                return GenerationError(
-                    record=ContextWindowExceededErrorRecord(
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "unfinished_turn":
-                return GenerationError(
-                    record=UnfinishedTurnErrorRecord(
-                        reason=outcome.reason,
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
-            case "provider_failed_terminally":
-                return GenerationError(
-                    record=ProviderFailedTerminallyErrorRecord(
-                        reason=outcome.reason,
-                        call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-                    ),
-                    request=self._request,
-                    provider_attempts=self._ledger.provider_attempts,
-                )
+        return _call_result_from_response_outcome(
+            outcome,
+            call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+            provider_attempts=self._ledger.provider_attempts,
+            request=self._request,
+            splits_tool_call_turns=self._splits_tool_call_turns,
+        )

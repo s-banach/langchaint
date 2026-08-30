@@ -6,6 +6,7 @@ from typing import Annotated, Generic, Literal, NamedTuple, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, model_validator
 
+from langchaint.adapter import RequestParams, ResponseOutcome
 from langchaint.call import (
     AttemptProviderData,
     CallRecord,
@@ -325,6 +326,48 @@ def _success_variant[OutputT](
         )
     return Response(
         record=ResponseRecord(output=output, call=call, stop_reason=stop_reason),
+        provider_attempts=provider_attempts,
+    )
+
+
+def _call_result_from_response_outcome[OutputT](
+    outcome: ResponseOutcome[OutputT],
+    *,
+    call: CallRecord,
+    provider_attempts: tuple[AttemptProviderData, ...],
+    request: RequestParams | None,
+    splits_tool_call_turns: bool,
+) -> CallResult[OutputT]:
+    match outcome.kind:
+        case "adapter_result":
+            return _success_variant(
+                splits_tool_call_turns=splits_tool_call_turns,
+                output=outcome.output,
+                call=call,
+                provider_attempts=provider_attempts,
+                stop_reason=outcome.stop_reason,
+            )
+        case "refusal":
+            record = RefusalErrorRecord(call=call)
+        case "max_completion_tokens_exceeded":
+            record = MaxCompletionTokensExceededErrorRecord(call=call)
+        case "empty_turn":
+            record = EmptyTurnErrorRecord(call=call)
+        case "schema_violation":
+            record = SchemaViolationErrorRecord(
+                validation_error_json=outcome.validation_error_json, call=call
+            )
+        case "context_window_exceeded":
+            record = ContextWindowExceededErrorRecord(call=call)
+        case "unfinished_turn":
+            record = UnfinishedTurnErrorRecord(reason=outcome.reason, call=call)
+        case "provider_failed_terminally":
+            record = ProviderFailedTerminallyErrorRecord(reason=outcome.reason, call=call)
+        case "provider_failed_transiently":
+            raise ValueError("ProviderFailedTransiently requires the caller's retry policy")
+    return GenerationError(
+        record=record,
+        request=request,
         provider_attempts=provider_attempts,
     )
 

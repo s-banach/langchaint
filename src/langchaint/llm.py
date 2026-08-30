@@ -6,7 +6,7 @@ Each request attempt runs inside `SharedBackoff.admitted`.
 """
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, overload
@@ -35,22 +35,15 @@ from langchaint.adapter import (
 )
 from langchaint.call import _CallLedger
 from langchaint.exceptions import (
-    ContextWindowExceededErrorRecord,
-    EmptyTurnErrorRecord,
     EscapedExceptionErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
-    MaxCompletionTokensExceededErrorRecord,
     ParserContractError,
     ProviderDeclaredFinalErrorRecord,
-    ProviderFailedTerminallyErrorRecord,
-    RefusalErrorRecord,
     RetriesExhaustedErrorRecord,
-    SchemaViolationErrorRecord,
     StreamProtocolError,
     TimedOutErrorRecord,
     TransientError,
-    UnfinishedTurnErrorRecord,
     UnknownExceptionErrorRecord,
 )
 from langchaint.inference_params import InferenceParams
@@ -63,8 +56,8 @@ from langchaint.response import (
     Response,
     ToolCallTurn,
     _abandoned_call_error,
+    _call_result_from_response_outcome,
     _result_record,
-    _success_variant,
 )
 from langchaint.run_many import max_pending_for_requests, run_many
 from langchaint.sequence_not_str import SequenceNotStr
@@ -95,6 +88,12 @@ class Unchanged:
 
 
 UNCHANGED: Unchanged = Unchanged()
+
+
+def _resolved_replacement[T](replacement: T | Unchanged, current: T) -> T:
+    if isinstance(replacement, Unchanged):
+        return current
+    return replacement
 
 
 type GenerationInput = str | Sequence[Message]
@@ -184,6 +183,19 @@ def _as_messages(generation_input: GenerationInput) -> Sequence[Message]:
 
 def _snapshot_generation_input(generation_input: GenerationInput) -> tuple[Message, ...]:
     return tuple(message.model_copy(deep=True) for message in _as_messages(generation_input))
+
+
+async def _run_many_with_warm_cache[OutputT](
+    run_ones: tuple[Callable[[], Coroutine[object, object, OutputT]], ...],
+    *,
+    warm_cache: bool,
+    max_pending: int,
+) -> list[OutputT]:
+    if not warm_cache or not run_ones:
+        return await run_many(run_ones, max_pending=max_pending)
+    first_result = await run_ones[0]()
+    remaining_results = await run_many(run_ones[1:], max_pending=max_pending)
+    return [first_result, *remaining_results]
 
 
 def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
@@ -682,50 +694,31 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         else:
             tool_manager = _resolve_tool_manager(tools)
             tool_schemas = () if tool_manager is None else tool_manager.schemas()
+        resolved_automatic_cache_breakpoints = _resolved_replacement(
+            automatic_cache_breakpoints, self.binding.automatic_cache_breakpoints
+        )
         new_binding = _build_binding(
-            system_prompt=(
-                self.binding.system_prompt
-                if isinstance(system_prompt, Unchanged)
-                else system_prompt
-            ),
+            system_prompt=_resolved_replacement(system_prompt, self.binding.system_prompt),
             tool_schemas=tool_schemas,
-            provider_executed_tools=(
-                self.binding.provider_executed_tools
-                if isinstance(provider_executed_tools, Unchanged)
-                else provider_executed_tools
+            provider_executed_tools=_resolved_replacement(
+                provider_executed_tools, self.binding.provider_executed_tools
             ),
-            tool_choice=(
-                self.binding.tool_choice if isinstance(tool_choice, Unchanged) else tool_choice
+            tool_choice=_resolved_replacement(tool_choice, self.binding.tool_choice),
+            parallel_tool_calls=_resolved_replacement(
+                parallel_tool_calls, self.binding.parallel_tool_calls
             ),
-            parallel_tool_calls=(
-                self.binding.parallel_tool_calls
-                if isinstance(parallel_tool_calls, Unchanged)
-                else parallel_tool_calls
-            ),
-            inference_params=(
-                self.binding.inference_params
-                if isinstance(inference_params, Unchanged)
-                else inference_params
+            inference_params=_resolved_replacement(
+                inference_params, self.binding.inference_params
             ),
             automatic_cache_breakpoints=(
-                self.binding.automatic_cache_breakpoints
-                if isinstance(automatic_cache_breakpoints, Unchanged)
-                else (
-                    self.adapter.automatic_cache_breakpoints_default
-                    if automatic_cache_breakpoints is None
-                    else automatic_cache_breakpoints
-                )
+                self.adapter.automatic_cache_breakpoints_default
+                if resolved_automatic_cache_breakpoints is None
+                else resolved_automatic_cache_breakpoints
             ),
-            extra_body=(
-                self.binding.extra_body if isinstance(extra_body, Unchanged) else extra_body
-            ),
+            extra_body=_resolved_replacement(extra_body, self.binding.extra_body),
         )
-        new_response_format = (
-            self.response_format if isinstance(response_format, Unchanged) else response_format
-        )
-        new_max_attempts = (
-            self.max_attempts if isinstance(max_attempts, Unchanged) else max_attempts
-        )
+        new_response_format = _resolved_replacement(response_format, self.response_format)
+        new_max_attempts = _resolved_replacement(max_attempts, self.max_attempts)
         return BoundLLM(
             adapter=self.adapter,
             bound_adapter=_bind_adapter(self.adapter, new_binding, new_response_format),
@@ -975,64 +968,16 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     raise terminal from exc
             else:
                 ledger.record(error=None, assistant_message=outcome.assistant_message)
-                match outcome.kind:
-                    case "adapter_result":
-                        return _success_variant(
-                            splits_tool_call_turns=self._splits_tool_call_turns,
-                            output=outcome.output,
-                            call=ledger.freeze(),
-                            provider_attempts=ledger.provider_attempts,
-                            stop_reason=outcome.stop_reason,
-                        )
-                    case "refusal":
-                        raise GenerationError(
-                            record=RefusalErrorRecord(call=ledger.freeze()),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "max_completion_tokens_exceeded":
-                        raise GenerationError(
-                            record=MaxCompletionTokensExceededErrorRecord(call=ledger.freeze()),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "empty_turn":
-                        raise GenerationError(
-                            record=EmptyTurnErrorRecord(call=ledger.freeze()),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "schema_violation":
-                        raise GenerationError(
-                            record=SchemaViolationErrorRecord(
-                                validation_error_json=outcome.validation_error_json,
-                                call=ledger.freeze(),
-                            ),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "context_window_exceeded":
-                        raise GenerationError(
-                            record=ContextWindowExceededErrorRecord(call=ledger.freeze()),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "unfinished_turn":
-                        raise GenerationError(
-                            record=UnfinishedTurnErrorRecord(
-                                reason=outcome.reason, call=ledger.freeze()
-                            ),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
-                    case "provider_failed_terminally":
-                        raise GenerationError(
-                            record=ProviderFailedTerminallyErrorRecord(
-                                reason=outcome.reason, call=ledger.freeze()
-                            ),
-                            request=request,
-                            provider_attempts=ledger.provider_attempts,
-                        )
+                result = _call_result_from_response_outcome(
+                    outcome,
+                    call=ledger.freeze(),
+                    provider_attempts=ledger.provider_attempts,
+                    request=request,
+                    splits_tool_call_turns=self._splits_tool_call_turns,
+                )
+                if isinstance(result, GenerationError):
+                    raise result
+                return result
         raise GenerationError(
             record=RetriesExhaustedErrorRecord(call=ledger.freeze()),
             request=request,
@@ -1303,12 +1248,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     )
                 )
 
-            run_ones = tuple(partial(run_one, result_index) for result_index in pending_indices)
-            if warm_cache and run_ones:
-                await run_ones[0]()
-                run_ones = run_ones[1:]
-            max_pending = max_pending_for_requests(self.shared_backoff.max_concurrent_requests)
-            _ = await run_many(run_ones, max_pending=max_pending)
+            _ = await _run_many_with_warm_cache(
+                tuple(partial(run_one, result_index) for result_index in pending_indices),
+                warm_cache=warm_cache,
+                max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
+            )
             return resume_state.result_records()
 
     async def _generate_many_any_binding(
@@ -1324,38 +1268,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         Raises:
             asyncio.CancelledError: The caller cancels the batch.
             BaseException: An item raises a non-`Exception` value.
-        """
-        # The slices convert `SequenceNotStr` to the `Sequence` that `_run_items` takes.
-        if warm_cache and generation_inputs:
-            first_result = await self._generate_or_failure(
-                generation_inputs[0],
-                generate_item=generate_item,
-                deadline=WorkingTimeDeadline(max_working_seconds_per_item),
-            )
-            rest = await self._run_items(
-                generation_inputs[1:],
-                generate_item=generate_item,
-                max_working_seconds_per_item=max_working_seconds_per_item,
-            )
-            return [first_result, *rest]
-        return await self._run_items(
-            generation_inputs[0:],
-            generate_item=generate_item,
-            max_working_seconds_per_item=max_working_seconds_per_item,
-        )
-
-    async def _run_items(
-        self,
-        generation_inputs: Sequence[GenerationInput],
-        *,
-        generate_item: "GenerateItem[OutputT]",
-        max_working_seconds_per_item: float | None,
-    ) -> list[CallResult[OutputT | None]]:
-        """Run the items through run_many, which returns them in input order.
-
-        Raises:
-            asyncio.CancelledError: An outer scope cancels the batch after started items settle.
-            BaseException: An item raises a value outside `Exception` after started items settle.
         """
 
         async def run_one(
@@ -1375,8 +1287,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         run_ones = tuple(
             partial(run_one, generation_input) for generation_input in generation_inputs
         )
-        max_pending = max_pending_for_requests(self.shared_backoff.max_concurrent_requests)
-        return await run_many(run_ones, max_pending=max_pending)
+        return await _run_many_with_warm_cache(
+            run_ones,
+            warm_cache=warm_cache,
+            max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
+        )
 
     @overload
     def stream_one(

@@ -883,6 +883,7 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
         inference_geo="us",
     )
     assert adapter.config_fingerprint_data() == {
+        "uses_top_level_cache_control": True,
         "cache_ttl": "1h",
         "default_max_completion_tokens": 8192,
         "inference_geo": "us",
@@ -1593,6 +1594,53 @@ def _kwarg_sent[OutputT](
     asyncio.run(scenario())
     (kwarg,) = captured
     return kwarg
+
+
+@pytest.mark.parametrize(
+    ("client", "uses_top_level_cache_control"),
+    [
+        (AsyncAnthropic(api_key="test"), True),
+        (AsyncAnthropicBedrockMantle(aws_region="us-east-1"), True),
+        (AsyncAnthropicBedrock(aws_region="us-east-1"), False),
+    ],
+    ids=["anthropic", "bedrock_mantle", "bedrock_legacy"],
+)
+def test_automatic_cache_breakpoints_select_final_caching_by_client(
+    monkeypatch: pytest.MonkeyPatch,
+    client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
+    *,
+    uses_top_level_cache_control: bool,
+) -> None:
+    """Direct and Mantle clients use top-level caching, while legacy Bedrock marks the final block."""
+    adapter = AnthropicMessagesAdapter(
+        client=client,
+        model="m",
+        pricing=_PRICING,
+        provider_name=("anthropic" if isinstance(client, AsyncAnthropic) else "aws.bedrock"),
+        cache_ttl="1h",
+    )
+    precomputed_fields = adapter._precompute_fields(
+        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
+    )
+    bound = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
+    request = bound.build_request([
+        UserMessage(
+            content=tuple(
+                TextPart(text=str(index), cache_breakpoint=index < 4) for index in range(5)
+            )
+        )
+    ])
+    assert isinstance(request, _AnthropicRequestParams)
+    blocks = _content_blocks(request.messages[-1])
+    assert ["cache_control" in block for block in blocks[:4]] == [False, False, True, True]
+    final_block = blocks[-1]
+    stream_cache_control = _kwarg_sent(monkeypatch, bound, "cache_control")
+    if uses_top_level_cache_control:
+        assert "cache_control" not in final_block
+        assert stream_cache_control == {"type": "ephemeral", "ttl": "1h"}
+    else:
+        assert final_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+        assert isinstance(stream_cache_control, anthropic.Omit)
 
 
 def test_identity_reads_the_messages_own_id_and_served_model() -> None:

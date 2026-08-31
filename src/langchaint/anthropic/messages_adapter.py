@@ -13,21 +13,23 @@ The API filters earlier thinking blocks.
 The API rejects consecutive thinking blocks outside their original order.
 The adapter replays every `ReasoningPart` in turn order.
 
-`automatic_cache_breakpoints=True` marks the frozen prefix and the last message block.
+`automatic_cache_breakpoints=True` marks the frozen prefix.
+For `AsyncAnthropic` and `AsyncAnthropicBedrockMantle`, it also sends top-level `cache_control`.
+Top-level `cache_control` selects the final cacheable block.
+For `AsyncAnthropicBedrock`, it instead marks the last message block.
 The frozen prefix ends at the system prompt or at the last tool when no system prompt exists.
 `automatic_cache_breakpoints=False` adds no automatic marker.
-The adapter never sends top-level automatic `cache_control` because Bedrock does not support it.
 A marked user part adds `cache_control` to its text or image block.
 A marked final `ToolMessage` part adds `cache_control` to its enclosing `tool_result` block.
 A marked non-final `ToolMessage` part returns `InvalidRequest` because the boundary would move.
 A parts `system_prompt` produces one system block per part and preserves marked boundaries.
 
-The API accepts at most four `cache_control` markers per request.
+The API accepts at most four cache breakpoints per request.
 Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-07-25.
-System marks and automatic marks reduce `message_mark_budget`.
+Top-level `cache_control`, system marks, and automatic marks reduce `message_mark_budget`.
 Binding fails with `ValueError` when its marks exceed the limit.
 The adapter marks only the latest message parts that fit `message_mark_budget`.
-Each marker uses `cache_ttl`.
+Top-level `cache_control` and each marker use `cache_ttl`.
 The default `"5m"` omits the API-default `ttl` key.
 `"1h"` sends `ttl="1h"` and uses `cache_write_1h_usd_per_million_tokens`.
 
@@ -483,12 +485,13 @@ class _AnthropicPrecomputedFields:
     thinking: ThinkingConfigParam | Omit
     service_tier: AnthropicServiceTier | Omit
     inference_geo: str | Omit
-    automatic_cache_breakpoints: bool
+    cache_control: CacheControlEphemeralParam | Omit
+    automatic_message_cache_breakpoint: bool
     cache_ttl: CacheTTL
     message_mark_budget: int
     """The remaining per-request part markers under the API's four-marker request limit.
 
-    System marks, the frozen-prefix marker, and the last-message marker reduce this value.
+    System marks, the frozen-prefix marker, and top-level or last-message automatic caching reduce this value.
     """
 
     extra_body: Mapping[str, object] | None
@@ -535,6 +538,7 @@ def _extra_body_with_temperature(
 
 
 _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
+    "cache_control",
     "model",
     "max_tokens",
     "temperature",
@@ -782,7 +786,7 @@ def _request_messages(
     try:
         return _wire_messages(
             messages,
-            automatic_cache_breakpoints=precomputed_fields.automatic_cache_breakpoints,
+            automatic_cache_breakpoints=precomputed_fields.automatic_message_cache_breakpoint,
             cache_ttl=precomputed_fields.cache_ttl,
             message_mark_budget=precomputed_fields.message_mark_budget,
         )
@@ -1115,7 +1119,7 @@ class AnthropicMessagesAdapter(Adapter):
 
         `provider_name` is `"anthropic"` for `AsyncAnthropic` and `"aws.bedrock"` for Bedrock clients.
         The stored client disables SDK retries and preserves custom Bedrock transports.
-        `cache_ttl` applies to every automatic and explicit cache marker.
+        `cache_ttl` applies to top-level `cache_control` and every automatic and explicit cache marker.
         `"5m"` writes bill 1.25 times base input, and `"1h"` writes bill twice base input.
         Mixed TTLs require one-hour markers before five-minute markers.
         Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching.
@@ -1136,6 +1140,9 @@ class AnthropicMessagesAdapter(Adapter):
         self.pricing: AnthropicPricingTable = pricing
         self.default_max_completion_tokens: int = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl
+        self._uses_top_level_cache_control: bool = not isinstance(
+            self.client, AsyncAnthropicBedrock
+        )
         self.service_tier: AnthropicServiceTier | None = service_tier
         self.inference_geo: str | None = inference_geo
 
@@ -1143,6 +1150,7 @@ class AnthropicMessagesAdapter(Adapter):
     def config_fingerprint_data(self) -> Mapping[str, object]:
         """Return stored request configuration outside `Binding`."""
         return {
+            "uses_top_level_cache_control": self._uses_top_level_cache_control,
             "cache_ttl": self.cache_ttl,
             "default_max_completion_tokens": self.default_max_completion_tokens,
             "inference_geo": self.inference_geo,
@@ -1212,13 +1220,13 @@ class AnthropicMessagesAdapter(Adapter):
             tool_choice = _wire_tool_choice(
                 binding.tool_choice, parallel_tool_calls=binding.parallel_tool_calls
             )
-        last_message_marker_count = 1 if binding.automatic_cache_breakpoints else 0
+        automatic_cache_breakpoint_count = 1 if binding.automatic_cache_breakpoints else 0
         message_mark_budget = (
-            _CACHE_MARKER_REQUEST_LIMIT - bind_marker_count - last_message_marker_count
+            _CACHE_MARKER_REQUEST_LIMIT - bind_marker_count - automatic_cache_breakpoint_count
         )
         if message_mark_budget < 0:
             raise ValueError(
-                f"the binding writes {bind_marker_count + last_message_marker_count} cache markers, "
+                f"the binding writes {bind_marker_count + automatic_cache_breakpoint_count} cache markers, "
                 f"over the API's limit of {_CACHE_MARKER_REQUEST_LIMIT} per request; "
                 f"unmark some system parts"
             )
@@ -1247,7 +1255,14 @@ class AnthropicMessagesAdapter(Adapter):
             thinking=thinking,
             service_tier=self.service_tier if self.service_tier is not None else omit,
             inference_geo=self.inference_geo if self.inference_geo is not None else omit,
-            automatic_cache_breakpoints=binding.automatic_cache_breakpoints,
+            cache_control=(
+                _cache_control_param(self.cache_ttl)
+                if binding.automatic_cache_breakpoints and self._uses_top_level_cache_control
+                else omit
+            ),
+            automatic_message_cache_breakpoint=(
+                binding.automatic_cache_breakpoints and not self._uses_top_level_cache_control
+            ),
             cache_ttl=self.cache_ttl,
             message_mark_budget=message_mark_budget,
             extra_body=binding.extra_body,
@@ -1495,6 +1510,7 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
             thinking=precomputed.thinking,
             service_tier=precomputed.service_tier,
             inference_geo=precomputed.inference_geo,
+            cache_control=precomputed.cache_control,
             messages=params.messages,
             extra_body=_extra_body_with_temperature(precomputed),
         )

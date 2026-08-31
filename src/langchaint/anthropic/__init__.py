@@ -188,7 +188,7 @@ class Anthropic:
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
         `default_max_completion_tokens` fills an unstated bound completion limit.
-        `cache_ttl` applies to every cache marker.
+        `cache_ttl` applies to automatic `cache_control` and every cache marker.
         `service_tier` sets the requested Anthropic service tier.
         `inference_geo` requests the inference geography.
         The reported service tier selects pricing.
@@ -286,7 +286,7 @@ class AnthropicBedrock:
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing` and a passed `client`.
         `default_max_completion_tokens` fills an unstated bound completion limit.
-        `cache_ttl` applies to every cache marker.
+        `cache_ttl` applies to automatic `cache_control` and every cache marker.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
         Raises:

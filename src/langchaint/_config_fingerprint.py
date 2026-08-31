@@ -232,26 +232,29 @@ class _Canonicalizer:
         ]
 
     def _container(self, value: _ConfigContainer, *, path: str) -> _CanonicalValue:
-        if isinstance(value, Mapping):
-            return self._mapping(value, path=path)
-        if isinstance(value, list):
-            return self._sequence("list", value, path=path)
-        if isinstance(value, tuple):
-            return self._sequence("tuple", value, path=path)
-        if isinstance(value, set):
-            return self._set("set", value, path=path)
-        return self._set("frozenset", value, path=path)
-
-    def _mapping(self, value: Mapping[object, object], *, path: str) -> _CanonicalValue:
-        container_id = self._enter_container(value, path=path)
+        container_id = id(value)
+        if container_id in self._active_container_ids:
+            raise TypeError(f"{path} contains a cycle")
+        self._active_container_ids.add(container_id)
         try:
-            entries: list[_CanonicalValue] = [
-                [key, self.value(value[key], path=f"{path}[{key!r}]")]
-                for key in self._sorted_string_keys(value, path=path)
-            ]
-            return ["mapping", entries]
+            if isinstance(value, Mapping):
+                return self._mapping(value, path=path)
+            if isinstance(value, list):
+                return self._sequence("list", value, path=path)
+            if isinstance(value, tuple):
+                return self._sequence("tuple", value, path=path)
+            if isinstance(value, set):
+                return self._set("set", value, path=path)
+            return self._set("frozenset", value, path=path)
         finally:
             self._active_container_ids.remove(container_id)
+
+    def _mapping(self, value: Mapping[object, object], *, path: str) -> _CanonicalValue:
+        entries: list[_CanonicalValue] = [
+            [key, self.value(value[key], path=f"{path}[{key!r}]")]
+            for key in self._sorted_string_keys(value, path=path)
+        ]
+        return ["mapping", entries]
 
     def _sequence(
         self,
@@ -260,12 +263,8 @@ class _Canonicalizer:
         *,
         path: str,
     ) -> _CanonicalValue:
-        container_id = self._enter_container(value, path=path)
-        try:
-            items = [self.value(item, path=f"{path}[{index}]") for index, item in enumerate(value)]
-            return [kind, items]
-        finally:
-            self._active_container_ids.remove(container_id)
+        items = [self.value(item, path=f"{path}[{index}]") for index, item in enumerate(value)]
+        return [kind, items]
 
     def _set(
         self,
@@ -274,20 +273,9 @@ class _Canonicalizer:
         *,
         path: str,
     ) -> _CanonicalValue:
-        container_id = self._enter_container(value, path=path)
-        try:
-            items = [self.value(item, path=f"{path}[set item]") for item in value]
-            items.sort(key=_canonical_json)
-            return [kind, items]
-        finally:
-            self._active_container_ids.remove(container_id)
-
-    def _enter_container(self, value: object, *, path: str) -> int:
-        container_id = id(value)
-        if container_id in self._active_container_ids:
-            raise TypeError(f"{path} contains a cycle")
-        self._active_container_ids.add(container_id)
-        return container_id
+        items = [self.value(item, path=f"{path}[set item]") for item in value]
+        items.sort(key=_canonical_json)
+        return [kind, items]
 
     @staticmethod
     def _sorted_string_keys(value: Mapping[object, object], *, path: str) -> list[str]:

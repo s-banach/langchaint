@@ -90,7 +90,7 @@ testpaths = ["tests"]
 pythonpath = ["examples/full_app"]
 filterwarnings = [
     "error",
-    # google-genai emits this warning during import.
+    # google-genai emits this warning during import on Python 3.14.
     # tests/test_provider_facts.py detects its removal.
     "ignore:'_UnionGenericAlias' is deprecated and slated for removal in Python 3\\.17$:DeprecationWarning:google\\.genai\\.types",
 ]

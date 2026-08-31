@@ -13,6 +13,7 @@ import boto3
 import botocore.session
 import httpx2
 import openai
+import pytest
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from anthropic.types import (
     ImageBlockParam,
@@ -427,6 +428,9 @@ def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
     )
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="Python 3.13 does not emit this deprecation warning."
+)
 def test_google_genai_deprecation_filter_remains_necessary() -> None:
     """Fail when the exact google-genai warning exemption can be removed."""
     warning_text = "'_UnionGenericAlias' is deprecated and slated for removal in Python 3.17"

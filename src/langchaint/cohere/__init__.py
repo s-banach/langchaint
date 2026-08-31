@@ -226,13 +226,11 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         client_cache: _CohereBedrockClientCache,
         model: _CohereBedrockEmbeddingModelName,
         dimension: int,
-        supports_dimension: bool,
     ) -> None:
         """Store one model's validated request configuration."""
         self._client_cache = client_cache
         self.model = model
         self.dimension = dimension
-        self._supports_dimension = supports_dimension
 
     def _request_body(
         self,
@@ -246,7 +244,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
             "embedding_types": ["float"],
             "truncate": "NONE",
         }
-        if self._supports_dimension:
+        if self.model in _COHERE_EMBED_V4_MODELS:
             payload["output_dimension"] = self.dimension
         return json.dumps(
             payload,
@@ -266,7 +264,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         current: list[str] = []
         target_bytes = (
             _COHERE_V4_BODY_TARGET_BYTES
-            if self._supports_dimension
+            if self.model in _COHERE_EMBED_V4_MODELS
             else _INVOKE_MODEL_MAX_BODY_BYTES
         )
         for input_text in inputs:
@@ -466,19 +464,16 @@ class CohereBedrock:
                 raise ValueError(
                     f"dimension is invalid for Cohere Embed v4: {selected_dimension!r}"
                 )
-            supports_dimension = True
         elif model in _COHERE_EMBED_V3_MODELS:
             if dimension is not _DIMENSION_UNSET:
                 raise ValueError("Cohere Embed v3 accepts no dimension argument")
             selected_dimension = 1024
-            supports_dimension = False
         else:
             raise ValueError(f"model {model!r} is not in COHERE_BEDROCK_EMBEDDING_MODELS")
         adapter = _CohereBedrockEmbeddingAdapter(
             client_cache=self._client_cache,
             model=model,
             dimension=selected_dimension,
-            supports_dimension=supports_dimension,
         )
         return EmbeddingModel(
             adapter=adapter,

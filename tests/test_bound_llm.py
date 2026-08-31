@@ -1570,6 +1570,12 @@ class _OtherAnswer(BaseModel):
     value: str
 
 
+class _NonRoundTrippableAnswer(BaseModel):
+    """A response format used to test JSON round-trip validation."""
+
+    value: float
+
+
 class _UnschematizableAnswer(BaseModel):
     """A response format whose callable field has no JSON Schema."""
 
@@ -1802,13 +1808,13 @@ def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> N
     assert llm.bind(response_format=_Answer, tools=tool_manager)._splits_tool_call_turns
 
 
-class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
+class _ScriptedStructuredBoundAdapter[OutputT](BoundAdapter[OutputT]):
     """A structured bound adapter handing every request one scripted outcome.
 
     Structured generation tests use this adapter.
     """
 
-    def __init__(self, outcome: ResponseOutcome[_Answer | None]) -> None:
+    def __init__(self, outcome: ResponseOutcome[OutputT]) -> None:
         """Store the outcome and start `open_count` at zero."""
         self._outcome = outcome
         self.stream = _FakeStream()
@@ -1829,7 +1835,7 @@ class _ScriptedStructuredBoundAdapter(BoundAdapter[_Answer | None]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[_Answer | None]:
+    def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
         """Return the scripted outcome, whichever raw the request path produced."""
         return self._outcome
 
@@ -1922,6 +1928,40 @@ def test_generate_many_records_restores_the_structured_output_type(tmp_path: Pat
         assert restored_record.output == answer
         assert isinstance(restored_record.output, _Answer)
         assert structured_adapter.open_count == 1
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_validates_serialized_bytes_before_replacing_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A result that cannot round-trip through JSON leaves the prepared resume document unchanged."""
+    resume_path = tmp_path / "records.json"
+    original_replace = Path.replace
+    replaced_document_json: list[bytes] = []
+
+    def observed_replace(path: Path, target: Path) -> Path:
+        replaced_path = original_replace(path, target)
+        if target == resume_path:
+            replaced_document_json.append(target.read_bytes())
+        return replaced_path
+
+    monkeypatch.setattr(Path, "replace", observed_replace)
+
+    async def scenario() -> None:
+        answer = _NonRoundTrippableAnswer(value=float("nan"))
+        outcome: AdapterResult[_NonRoundTrippableAnswer] = AdapterResult(
+            output=answer,
+            assistant_message=AssistantMessage(turn=(TextPart(text=answer.model_dump_json()),)),
+            stop_reason="end_turn",
+        )
+        bound_llm = LLM(_FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
+        bound_llm._bound_adapter = _ScriptedStructuredBoundAdapter(outcome)
+        with pytest.raises(ValueError, match="Input should be a valid number"):
+            await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
+        assert len(replaced_document_json) == 1
+        assert resume_path.read_bytes() == replaced_document_json[0]
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

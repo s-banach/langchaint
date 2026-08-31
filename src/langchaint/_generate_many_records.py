@@ -189,28 +189,9 @@ class ResumeState[OutputT]:
         index: int,
         result_record: CallResultRecord[OutputT],
     ) -> _PositionDocument[OutputT] | _SampleIdDocument[OutputT]:
-        if isinstance(self._document, _PositionDocument):
-            items = list(self._document.items)
-            current_item = items[index]
-            items[index] = _PositionItem(
-                input_fingerprint=current_item.input_fingerprint,
-                result_record=result_record,
-            )
-            return _PositionDocument(
-                binding_fingerprint=self._document.binding_fingerprint,
-                items=tuple(items),
-            )
         items = list(self._document.items)
-        current_item = items[index]
-        items[index] = _SampleIdItem(
-            sample_id=current_item.sample_id,
-            input_fingerprint=current_item.input_fingerprint,
-            result_record=result_record,
-        )
-        return _SampleIdDocument(
-            binding_fingerprint=self._document.binding_fingerprint,
-            items=tuple(items),
-        )
+        items[index] = items[index].model_copy(update={"result_record": result_record})
+        return self._document.model_copy(update={"items": tuple(items)})
 
 
 @overload
@@ -367,28 +348,16 @@ def _prepare_sample_id_document[OutputT](
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...],
 ) -> _SampleIdDocument[OutputT]:
+    stored_items: dict[str, _SampleIdItem[OutputT]] = {}
     if (
-        loaded_document is None
-        or not isinstance(loaded_document.document, _SampleIdDocument)
-        or loaded_document.document.binding_fingerprint != binding_fingerprint
+        loaded_document is not None
+        and isinstance(loaded_document.document, _SampleIdDocument)
+        and loaded_document.document.binding_fingerprint == binding_fingerprint
     ):
-        return _SampleIdDocument(
-            binding_fingerprint=binding_fingerprint,
-            items=tuple(
-                _SampleIdItem(
-                    sample_id=sample_id,
-                    input_fingerprint=input_fingerprint,
-                    result_record=None,
-                )
-                for sample_id, input_fingerprint in zip(
-                    sample_ids, input_fingerprints, strict=True
-                )
-            ),
-        )
-    restored = document_adapter.validate_json(loaded_document.document_json)
-    if not isinstance(restored, _SampleIdDocument):
-        raise TypeError("the sample_id discriminator changed during validation")
-    stored_items = {item.sample_id: item for item in restored.items}
+        restored = document_adapter.validate_json(loaded_document.document_json)
+        if not isinstance(restored, _SampleIdDocument):
+            raise TypeError("the sample_id discriminator changed during validation")
+        stored_items = {item.sample_id: item for item in restored.items}
     reconciled_items: list[_SampleIdItem[OutputT]] = []
     for sample_id, input_fingerprint in zip(sample_ids, input_fingerprints, strict=True):
         stored_item = stored_items.get(sample_id)
@@ -418,6 +387,7 @@ def _write_document[OutputT](
 ) -> _PositionDocument[OutputT] | _SampleIdDocument[OutputT]:
     validated_document = document_adapter.validate_python(document)
     document_json = document_adapter.dump_json(validated_document, indent=2) + b"\n"
+    validated_document = document_adapter.validate_json(document_json)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

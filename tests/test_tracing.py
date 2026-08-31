@@ -57,11 +57,8 @@ from langchaint import (
 )
 from langchaint.adapter import (
     AdapterResult,
-    Binding,
-    BoundAdapter,
     InvalidRequest,
     Refusal,
-    ResponseOutcome,
     UnfinishedTurn,
 )
 from langchaint.tracing import (
@@ -83,10 +80,10 @@ from tests.test_bound_llm import (
     _USAGE,
     _billed,
     _FakeAdapter,
-    _FakeBoundAdapter,
     _FakeStream,
     _fast_shared_backoff,
     _HangsAfterFirstItemStream,
+    _ScriptedResponse,
 )
 
 _SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
@@ -338,7 +335,7 @@ def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports Refusal, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[_billed(_REFUSAL)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_REFUSAL)])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -362,7 +359,7 @@ def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports MaxCompletionTokensExceeded, then inspect the error span."""
-        adapter = _FakeAdapter(failures=[_billed(_MAX_COMPLETION_TOKENS_EXCEEDED)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_MAX_COMPLETION_TOKENS_EXCEEDED)])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -385,7 +382,7 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
 
     async def scenario() -> None:
         """Exhaust the budget on transport failures and inspect the error span."""
-        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -560,7 +557,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
 
     async def scenario() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -585,7 +582,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[_billed(_REFUSAL)],
+            scripted_attempts=[_billed(_REFUSAL)],
         )
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         tracer, exporter = _in_memory_tracer()
@@ -828,7 +825,7 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
 
     async def scenario() -> None:
         """Enter a stream whose every open fails, and inspect the span it left."""
-        adapter = _FakeAdapter(failures=[TransientError("connection reset")] * 4)
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("connection reset")] * 4)
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -2010,77 +2007,31 @@ def test_a_payload_that_violates_its_schema_fails_the_span() -> None:
         span.set_attribute("gen_ai.output.messages", json.dumps({"role": "assistant"}))
 
 
-class _ReasoningOnlyBoundAdapter(_FakeBoundAdapter):
-    """A bound adapter whose success carries a turn of reasoning and nothing else."""
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose assistant turn holds one ReasoningPart and no text."""
-        return AdapterResult(
-            output="",
-            assistant_message=AssistantMessage(turn=(ReasoningPart(raw={"signature": "opaque"}),)),
-            stop_reason="end_turn",
+_REASONING_ONLY_OUTCOME = AdapterResult(
+    output="",
+    assistant_message=AssistantMessage(turn=(ReasoningPart(raw={"signature": "opaque"}),)),
+    stop_reason="end_turn",
+)
+_EMPTY_TEXT_TURN_OUTCOME = AdapterResult(
+    output="",
+    assistant_message=AssistantMessage(
+        turn=(
+            ReasoningPart(raw={"signature": "opaque"}, text=""),
+            TextPart(text=""),
         )
-
-
-class _ReasoningOnlyAdapter(_FakeAdapter):
-    """An adapter handing out bound adapters whose turns hold only reasoning."""
-
-    @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        return _ReasoningOnlyBoundAdapter()
-
-
-class _EmptyTextTurnBoundAdapter(_FakeBoundAdapter):
-    """A bound adapter returning empty ReasoningPart.text and TextPart.text."""
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose turn holds one empty-text ReasoningPart and one empty TextPart."""
-        return AdapterResult(
-            output="",
-            assistant_message=AssistantMessage(
-                turn=(
-                    ReasoningPart(raw={"signature": "opaque"}, text=""),
-                    TextPart(text=""),
-                )
-            ),
-            stop_reason="end_turn",
+    ),
+    stop_reason="end_turn",
+)
+_REASONING_WITH_TEXT_OUTCOME = AdapterResult(
+    output="answer",
+    assistant_message=AssistantMessage(
+        turn=(
+            ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
+            TextPart(text="answer"),
         )
-
-
-class _EmptyTextTurnAdapter(_FakeAdapter):
-    """An adapter returning TurnPart values with empty text."""
-
-    @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        return _EmptyTextTurnBoundAdapter()
-
-
-class _ReasoningWithTextBoundAdapter(_FakeBoundAdapter):
-    """A bound adapter whose success carries reasoning with readable text, then text."""
-
-    @override
-    def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Return a result whose turn holds one texted ReasoningPart and one TextPart."""
-        return AdapterResult(
-            output="answer",
-            assistant_message=AssistantMessage(
-                turn=(
-                    ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
-                    TextPart(text="answer"),
-                )
-            ),
-            stop_reason="end_turn",
-        )
-
-
-class _ReasoningWithTextAdapter(_FakeAdapter):
-    """An adapter handing out bound adapters whose reasoning carries readable text."""
-
-    @override
-    def bind_text(self, binding: Binding) -> BoundAdapter[str]:
-        return _ReasoningWithTextBoundAdapter()
+    ),
+    stop_reason="end_turn",
+)
 
 
 def _captured(exporter: InMemorySpanExporter, key: str) -> object:
@@ -2242,19 +2193,25 @@ def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data(
 
 
 @pytest.mark.parametrize(
-    "adapter",
-    [_ReasoningOnlyAdapter(), _EmptyTextTurnAdapter()],
+    "outcome",
+    [_REASONING_ONLY_OUTCOME, _EMPTY_TEXT_TURN_OUTCOME],
     ids=["text_free_reasoning_alone", "empty_text_on_every_part"],
 )
 def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_array(
-    adapter: _FakeAdapter,
+    outcome: AdapterResult[str],
 ) -> None:
     """A turn without readable text records empty output parts."""
 
     async def scenario() -> None:
         """Generate the turn and read the output messages back."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(adapter), tracer=tracer, capture_message_content=True)
+        traced = TracedLLM(
+            LLM(
+                _FakeAdapter(scripted_attempts=[_ScriptedResponse(outcome=outcome, usage=_USAGE)])
+            ),
+            tracer=tracer,
+            capture_message_content=True,
+        )
         await traced.bind().generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
             {"role": "assistant", "parts": [], "finish_reason": "stop"}
@@ -2277,7 +2234,15 @@ def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
         """Generate a texted ReasoningPart and TextPart, then read both messages."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_ReasoningWithTextAdapter()), tracer=tracer, capture_message_content=True
+            LLM(
+                _FakeAdapter(
+                    scripted_attempts=[
+                        _ScriptedResponse(outcome=_REASONING_WITH_TEXT_OUTCOME, usage=_USAGE)
+                    ]
+                )
+            ),
+            tracer=tracer,
+            capture_message_content=True,
         )
         await traced.bind().generate_one("hi")
         assert _captured(exporter, "gen_ai.output.messages") == [
@@ -2341,7 +2306,7 @@ def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> Non
 
     async def scenario() -> None:
         """Drive a refusal under capture and inspect the error span."""
-        adapter = _FakeAdapter(failures=[_billed(_REFUSAL)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_REFUSAL)])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -2367,7 +2332,7 @@ def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
 
     async def scenario() -> None:
         """Exhaust the retry budget on transport failures and inspect the error span."""
-        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(adapter, shared_backoff=_fast_shared_backoff()),
@@ -2725,7 +2690,7 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
     async def scenario() -> None:
         """Fail two attempts and inspect content channels."""
         adapter = _FakeAdapter(
-            failures=[
+            scripted_attempts=[
                 TransientError("the first attempt failed"),
                 _billed(Refusal(assistant_message=turn)),
             ]
@@ -2766,7 +2731,7 @@ def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reas
     async def scenario() -> None:
         """Capture an unfinished turn's finish_reason."""
         adapter = _FakeAdapter(
-            failures=[
+            scripted_attempts=[
                 _billed(UnfinishedTurn(assistant_message=_REJECTED_TURN, reason="in_progress"))
             ]
         )

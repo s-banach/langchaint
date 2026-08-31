@@ -728,14 +728,6 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
         span.set_attributes(attributes)
 
 
-def _apply_extra_attributes(span: Span, extra_attributes: SpanAttributes) -> None:
-    """Set the constant extra_attributes on a just-started span, when recording and non-empty.
-
-    These attributes apply first. Module-owned attributes win later key collisions.
-    """
-    _set_span_attributes(span, extra_attributes)
-
-
 def _apply_operation_name(span: Span, operation_name: str) -> None:
     """Set gen_ai.operation.name on a just-started span.
 
@@ -1273,7 +1265,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         try:
-            _apply_extra_attributes(span, self._span_config.extra_attributes)
+            _set_span_attributes(span, self._span_config.extra_attributes)
             _apply_operation_name(span, _CHAT_OPERATION)
             self._apply_input_content(span, generation_input)
             try:
@@ -1488,7 +1480,7 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         """
         span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
         self._span = span
-        _apply_extra_attributes(span, self._span_config.extra_attributes)
+        _set_span_attributes(span, self._span_config.extra_attributes)
         _apply_operation_name(span, _CHAT_OPERATION)
         if self._span_config.capture_message_content:
             _apply_content_attributes(
@@ -1745,7 +1737,7 @@ class TracedToolManager(ToolManager):
             span, end_on_exit=False, record_exception=False, set_status_on_exception=False
         ):
             try:
-                _apply_extra_attributes(span, self._extra_attributes)
+                _set_span_attributes(span, self._extra_attributes)
                 with _guarding_telemetry_failures("setting the tool identity attributes"):
                     if _is_recording(span):
                         span.set_attributes({

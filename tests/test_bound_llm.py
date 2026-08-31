@@ -519,7 +519,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
     def __init__(
         self,
         *,
-        failures: Sequence[_ScriptedAttempt] = (),
+        scripted_attempts: Sequence[_ScriptedAttempt] = (),
         invalid_requests: Sequence[InvalidRequest] = (),
         echo: bool = False,
         stream: _FakeStream | None = None,
@@ -530,13 +530,13 @@ class _FakeBoundAdapter(BoundAdapter[str]):
     ) -> None:
         """Configure fake request and stream behavior.
 
-        failures and invalid_requests provide ordered outcomes.
+        scripted_attempts and invalid_requests provide ordered outcomes.
         stream overrides unscripted streams.
         open_seconds and open_barrier control concurrency.
         hang_from_open suspends matching calls.
         final_raws records assembled response objects.
         """
-        self._failures = list(failures)
+        self._scripted_attempts = list(scripted_attempts)
         self._invalid_requests = list(invalid_requests)
         self._echo = echo
         self._explicit_stream = stream
@@ -580,11 +580,11 @@ class _FakeBoundAdapter(BoundAdapter[str]):
         return _FakeRequest(messages=tuple(messages))
 
     def _attempt_stream(
-        self, scripted: _ScriptedResponse, *, content: str | None
+        self, scripted_response: _ScriptedResponse, *, content: str | None
     ) -> _ScriptedAttemptStream:
         """Register the scripted response under a fresh raw and wrap it in this attempt's stream."""
         raw = _FakeRawResponse(id=f"fake-response-{self.open_count}")
-        self._scripted_by_raw_id[raw.id] = scripted
+        self._scripted_by_raw_id[raw.id] = scripted_response
         self.final_raws.append(raw)
         return _ScriptedAttemptStream(raw=raw, content=content)
 
@@ -608,11 +608,11 @@ class _FakeBoundAdapter(BoundAdapter[str]):
                 await asyncio.Event().wait()
             if self._open_seconds:
                 await asyncio.sleep(self._open_seconds)
-            if self._failures:
-                scripted = self._failures.pop(0)
-                if isinstance(scripted, Exception):
-                    raise scripted
-                return self._attempt_stream(scripted, content=None)
+            if self._scripted_attempts:
+                scripted_attempt = self._scripted_attempts.pop(0)
+                if isinstance(scripted_attempt, Exception):
+                    raise scripted_attempt
+                return self._attempt_stream(scripted_attempt, content=None)
             if self._explicit_stream is not None:
                 stream = self._explicit_stream
                 self._scripted_by_raw_id[stream.raw.id] = stream.scripted_response()
@@ -688,7 +688,7 @@ class _FakeAdapter(Adapter):
     def __init__(
         self,
         *,
-        failures: Sequence[_ScriptedAttempt] = (),
+        scripted_attempts: Sequence[_ScriptedAttempt] = (),
         invalid_requests: Sequence[InvalidRequest] = (),
         echo: bool = False,
         stream: _FakeStream | None = None,
@@ -708,7 +708,7 @@ class _FakeAdapter(Adapter):
             provider_name="fake",
             automatic_cache_breakpoints_default=automatic_cache_breakpoints_default,
         )
-        self._failures = failures
+        self._scripted_attempts = scripted_attempts
         self._invalid_requests = invalid_requests
         self._echo = echo
         self._stream = stream
@@ -728,7 +728,7 @@ class _FakeAdapter(Adapter):
     @override
     def bind_text(self, binding: Binding) -> BoundAdapter[str]:
         bound = self._bound_adapter_class(
-            failures=self._failures,
+            scripted_attempts=self._scripted_attempts,
             invalid_requests=self._invalid_requests,
             echo=self._echo,
             stream=self._stream,
@@ -851,7 +851,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one through a single transient failure."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(system_prompt="s")
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert response.output == "ok"
@@ -901,14 +901,16 @@ def test_a_call_builds_one_request_and_sends_it_once_per_attempt() -> None:
     async def scenario() -> None:
         """Drive generate_one and stream_one through two transient failures."""
         generate_adapter = _FakeAdapter(
-            failures=[TransientError("boom"), TransientError("boom again")]
+            scripted_attempts=[TransientError("boom"), TransientError("boom again")]
         )
         generate_llm = LLM(generate_adapter, shared_backoff=_fast_shared_backoff()).bind()
         await generate_llm.generate_one([UserMessage(content="hi")])
         generate_bound = generate_adapter.bound_adapters[0]
         assert (generate_bound.build_count, generate_bound.open_count) == (1, 3)
 
-        retried = _FakeAdapter(failures=[TransientError("boom"), TransientError("boom again")])
+        retried = _FakeAdapter(
+            scripted_attempts=[TransientError("boom"), TransientError("boom again")]
+        )
         assert await streamed_counts(retried) == (1, 3)
 
     asyncio.run(scenario())
@@ -920,7 +922,10 @@ def test_a_failed_attempt_records_the_request_id_off_its_error() -> None:
     async def scenario() -> None:
         """Drive one generate_one through two transient failures, the first naming its request."""
         adapter = _FakeAdapter(
-            failures=[_RequestIdError("boom", "req-from-error"), TransientError("boom again")],
+            scripted_attempts=[
+                _RequestIdError("boom", "req-from-error"),
+                TransientError("boom again"),
+            ],
             classify_result="transient",
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
@@ -940,14 +945,14 @@ def test_an_adapter_raised_transient_error_still_names_its_request() -> None:
     async def scenario() -> None:
         """Fail one generate attempt and one stream open with a transient error naming its request."""
         generate_adapter = _FakeAdapter(
-            failures=[_TransientRequestIdError("boom", "req-from-generate-transient")]
+            scripted_attempts=[_TransientRequestIdError("boom", "req-from-generate-transient")]
         )
         generate_llm = LLM(generate_adapter, shared_backoff=_fast_shared_backoff()).bind()
         generated = await generate_llm.generate_one([UserMessage(content="hi")])
         assert generated.attempt_records[0].request_id == "req-from-generate-transient"
 
         stream_adapter = _FakeAdapter(
-            failures=[_TransientRequestIdError("boom", "req-from-open-transient")]
+            scripted_attempts=[_TransientRequestIdError("boom", "req-from-open-transient")]
         )
         bound_llm = LLM(stream_adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
@@ -962,7 +967,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one to exhaustion under a two-attempt budget."""
-        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=2,
         )
@@ -993,7 +998,7 @@ def test_attempt_record_bracket_excludes_the_backoff_sleep(
 
     async def scenario() -> None:
         """Recover from one failure under a visible 0.05s backoff."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
         shared_backoff = SharedBackoff(
             parse=_parse_fake,
             failure_types=(TransientError,),
@@ -1045,7 +1050,7 @@ def test_rejection_after_transient_attempts_carries_their_records() -> None:
     async def scenario() -> None:
         """Settle one billed transient attempt, then have classify call the next one a rejection."""
         classified_adapter = _FakeAdapter(
-            failures=[
+            scripted_attempts=[
                 _billed(_PROVIDER_FAILED_TRANSIENTLY),
                 ValueError("bad request"),
             ],
@@ -1073,7 +1078,7 @@ def test_refusal_outcome_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the Refusal variant."""
-        adapter = _FakeAdapter(failures=[_billed(_REFUSAL)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_REFUSAL)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as refusal:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1118,7 +1123,7 @@ def test_a_no_output_outcome_raises_without_retry(
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the outcome."""
-        adapter = _FakeAdapter(failures=[_billed(outcome)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(outcome)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(expected_error) as caught:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1136,7 +1141,7 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports SchemaViolation."""
-        adapter = _FakeAdapter(failures=[_billed(_SCHEMA_VIOLATION)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_SCHEMA_VIOLATION)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as schema_violation:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1160,7 +1165,7 @@ def test_unfinished_turn_outcome_raises_carrying_the_adapter_s_reason() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports UnfinishedTurn."""
-        adapter = _FakeAdapter(failures=[_billed(_UNFINISHED_TURN)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_UNFINISHED_TURN)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unfinished_turn:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1177,7 +1182,7 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose first attempt reports the failure and whose second succeeds."""
-        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_PROVIDER_FAILED_TRANSIENTLY)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         response = await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 2
@@ -1202,7 +1207,7 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
         """Spend the whole budget on rate-limited failures, so the pause is still running at the end."""
         shared_backoff = _fast_shared_backoff()
         adapter = _FakeAdapter(
-            failures=[
+            scripted_attempts=[
                 _billed(
                     ProviderFailedTransiently(
                         reason="Rate limit reached for gpt-5.6",
@@ -1231,7 +1236,7 @@ def test_provider_failed_terminally_raises_without_retry() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt reports the terminal failure."""
-        adapter = _FakeAdapter(failures=[_billed(_PROVIDER_FAILED_TERMINALLY)])
+        adapter = _FakeAdapter(scripted_attempts=[_billed(_PROVIDER_FAILED_TERMINALLY)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as provider_failure:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1251,7 +1256,7 @@ def test_a_plain_exception_classified_transient_is_retried() -> None:
     async def scenario() -> None:
         """Drive one generate_one over two classify-transient failures."""
         adapter = _FakeAdapter(
-            failures=[ValueError("x1"), ValueError("x2")], classify_result="transient"
+            scripted_attempts=[ValueError("x1"), ValueError("x2")], classify_result="transient"
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         response = await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1269,7 +1274,9 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt raises a classify-invalid_request exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="invalid_request")
+        adapter = _FakeAdapter(
+            scripted_attempts=[ValueError("boom")], classify_result="invalid_request"
+        )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1289,7 +1296,9 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt raises a classify-unknown_exception exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unknown_exception")
+        adapter = _FakeAdapter(
+            scripted_attempts=[ValueError("boom")], classify_result="unknown_exception"
+        )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1315,7 +1324,9 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
 
     async def scenario() -> None:
         """Drive one generate_one whose attempt raises a classify-declared_final exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="declared_final")
+        adapter = _FakeAdapter(
+            scripted_attempts=[ValueError("boom")], classify_result="declared_final"
+        )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as declared_final:
             await bound_llm.generate_one([UserMessage(content="hi")])
@@ -1340,7 +1351,7 @@ def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_lim
         """Drive one generate_one whose only failure parses to PauseAllDoNotRetry."""
         shared_backoff = _fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
         adapter = _FakeAdapter(
-            failures=[TransientError("throttled")], classify_result="invalid_request"
+            scripted_attempts=[TransientError("throttled")], classify_result="invalid_request"
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         with pytest.raises(GenerationError):
@@ -1489,7 +1500,7 @@ def test_an_unplaceable_exception_fails_only_its_item() -> None:
     async def scenario() -> None:
         """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt is unplaceable."""
         adapter = _FakeAdapter(
-            echo=True, failures=[ValueError("boom")], classify_result="unknown_exception"
+            echo=True, scripted_attempts=[ValueError("boom")], classify_result="unknown_exception"
         )
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
@@ -2218,7 +2229,7 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
         The scripted failure lands on the first item.
         The remaining items succeed at their input indexes.
         """
-        adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
+        adapter = _FakeAdapter(echo=True, scripted_attempts=[TransientError("x")])
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
             max_attempts=1,
@@ -2245,7 +2256,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
         """Serialize a two-item batch (max_concurrent_requests=1) whose first attempt reports Refusal."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[_billed(_REFUSAL)],
+            scripted_attempts=[_billed(_REFUSAL)],
         )
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
@@ -2352,7 +2363,7 @@ def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path
 
     async def scenario() -> None:
         """Exhaust one request, resume to success, then reuse that success."""
-        adapter = _FakeAdapter(echo=True, failures=[TransientError("try again")])
+        adapter = _FakeAdapter(echo=True, scripted_attempts=[TransientError("try again")])
         bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(max_attempts=1)
         resume_path = tmp_path / "records.json"
         first = await bound.generate_many_records(["a"], resume_path=resume_path)
@@ -2400,7 +2411,7 @@ def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) ->
         """Save one refusal and restore the same record on the next call."""
         adapter = _FakeAdapter(
             echo=True,
-            failures=[_billed(_REFUSAL)],
+            scripted_attempts=[_billed(_REFUSAL)],
         )
         bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         resume_path = tmp_path / "records.json"
@@ -2694,7 +2705,7 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
 
     async def scenario() -> None:
         """Fail the deterministic first attempt under a one-attempt budget. The other two succeed."""
-        adapter = _FakeAdapter(echo=True, failures=[TransientError("x")])
+        adapter = _FakeAdapter(echo=True, scripted_attempts=[TransientError("x")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=1,
         )
@@ -2744,7 +2755,7 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
 
     async def scenario() -> None:
         """Raise past the retry loop on the one item whose attempt fails, and let the other succeed."""
-        adapter = _ClassifyRaisesAdapter(failures=[ValueError("defect")], echo=True)
+        adapter = _ClassifyRaisesAdapter(scripted_attempts=[ValueError("defect")], echo=True)
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         results = await bound_llm.generate_many([
             [UserMessage(content="a")],
@@ -2770,7 +2781,7 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
 
     async def scenario() -> None:
         """Fail the one attempt and let classify raise past the retry loop."""
-        adapter = _ClassifyRaisesAdapter(failures=[ValueError("defect")])
+        adapter = _ClassifyRaisesAdapter(scripted_attempts=[ValueError("defect")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
@@ -2790,7 +2801,7 @@ def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provide
 
     async def scenario() -> None:
         """Fail the one attempt with a TransientError whose parse raises."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
@@ -2805,7 +2816,7 @@ def test_a_parse_contract_violation_on_a_stream_open_reaches_the_caller() -> Non
 
     async def scenario() -> None:
         """Fail the one open with a TransientError whose parse raises."""
-        adapter = _FakeAdapter(failures=[TransientError("boom")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind()
         with pytest.raises(ParserContractError):
             async with bound_llm.stream_one([UserMessage(content="hi")]):
@@ -3613,7 +3624,7 @@ def test_stream_retry_populates_attempt_records() -> None:
     async def scenario() -> None:
         """Open a stream whose first open_stream call fails, then drain it."""
         adapter = _FakeAdapter(
-            failures=[_RequestIdError("connection reset", "req-from-open-failure")],
+            scripted_attempts=[_RequestIdError("connection reset", "req-from-open-failure")],
             classify_result="transient",
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
@@ -3675,7 +3686,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
     async def scenario() -> None:
         """Enter a handle whose first open fails transiently and whose second is rejected."""
         adapter = _FakeAdapter(
-            failures=[TransientError("connection reset"), ValueError("boom")],
+            scripted_attempts=[TransientError("connection reset"), ValueError("boom")],
             classify_result="invalid_request",
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
@@ -3723,7 +3734,9 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
 
     async def scenario() -> None:
         """Enter a handle whose open raises a classify-unknown_exception exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="unknown_exception")
+        adapter = _FakeAdapter(
+            scripted_attempts=[ValueError("boom")], classify_result="unknown_exception"
+        )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unplaceable:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
@@ -3745,7 +3758,9 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
 
     async def scenario() -> None:
         """Enter a handle whose open raises a classify-declared_final exception."""
-        adapter = _FakeAdapter(failures=[ValueError("boom")], classify_result="declared_final")
+        adapter = _FakeAdapter(
+            scripted_attempts=[ValueError("boom")], classify_result="declared_final"
+        )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as declared_final:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
@@ -3768,7 +3783,7 @@ def test_terminal_pause_stops_stream_open_and_pauses_rate_limit_quota() -> None:
         """Enter a handle whose open failure parses to PauseAllDoNotRetry."""
         shared_backoff = _fast_shared_backoff(parse=_parse_pause_all_do_not_retry)
         adapter = _FakeAdapter(
-            failures=[TransientError("throttled")], classify_result="invalid_request"
+            scripted_attempts=[TransientError("throttled")], classify_result="invalid_request"
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         with pytest.raises(GenerationError):
@@ -3879,7 +3894,7 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
 
     async def scenario() -> None:
         """Open a stream under a two-attempt budget whose every open_stream fails transiently."""
-        adapter = _FakeAdapter(failures=[TransientError("e1"), TransientError("e2")])
+        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(
             max_attempts=2,
         )
@@ -4017,7 +4032,9 @@ def test_a_retry_this_one_retry_after_floors_the_private_wait() -> None:
         """Recover from one failure whose server-stated wait exceeds the tiny private ceiling."""
         retry_after_seconds = 0.05
         adapter = _FakeAdapter(
-            failures=[TransientError("slow down", retry_after_seconds=retry_after_seconds)]
+            scripted_attempts=[
+                TransientError("slow down", retry_after_seconds=retry_after_seconds)
+            ]
         )
         shared_backoff = _fast_shared_backoff(longest_wait_seconds=1.0)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(
@@ -4063,7 +4080,7 @@ def test_backoff_sleep_does_not_hold_the_permit() -> None:
         """Interleave a retrying item with a clean one under one permit."""
         retry_after_seconds = 0.2
         adapter = _FakeAdapter(
-            failures=[TransientError("boom", retry_after_seconds=retry_after_seconds)]
+            scripted_attempts=[TransientError("boom", retry_after_seconds=retry_after_seconds)]
         )
         shared_backoff = _fast_shared_backoff(
             max_concurrent_requests=1,
@@ -4127,7 +4144,7 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
     async def scenario() -> None:
         """Retry a stream open through a rate-limit failure, then finish the stream."""
         adapter = _FakeAdapter(
-            failures=[
+            scripted_attempts=[
                 TransientError("rate limited", retry_after_seconds=0.001, is_rate_limit=True)
             ]
         )
@@ -4166,7 +4183,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
     async def scenario() -> None:
         """Fail settled_attempts requests transiently, then hang the next past a deadline."""
         adapter = _FakeAdapter(
-            failures=[TransientError("settled attempt")] * settled_attempts,
+            scripted_attempts=[TransientError("settled attempt")] * settled_attempts,
             # 1-based, so the request that hangs is the one after the settled ones.
             hang_from_open=settled_attempts + 1,
         )
@@ -4325,7 +4342,9 @@ def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
         adapter = _FakeAdapter(
             echo=True,
             open_seconds=0.05,
-            failures=[TransientError("slow down", retry_after_seconds=0.3, is_rate_limit=True)],
+            scripted_attempts=[
+                TransientError("slow down", retry_after_seconds=0.3, is_rate_limit=True)
+            ],
         )
         shared_backoff = _fast_shared_backoff(
             max_concurrent_requests=None,
@@ -4348,7 +4367,7 @@ def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
         adapter = _FakeAdapter(
             echo=True,
             open_seconds=0.12,
-            failures=[TransientError("try again")],
+            scripted_attempts=[TransientError("try again")],
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         results = await bound_llm.generate_many(

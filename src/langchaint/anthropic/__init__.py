@@ -105,77 +105,6 @@ _BEDROCK_CLIENT_CLASS: dict[
 }
 
 
-def _bedrock_routing(model: str) -> BedrockRouting | None:
-    """Return routing for one exact catalog identifier."""
-    return ANTHROPIC_BEDROCK.get(model)
-
-
-def _anthropic_adapter(
-    model: str,
-    *,
-    client: AsyncAnthropic,
-    pricing: AnthropicPricingTable | None = None,
-    default_max_completion_tokens: int = 4096,
-    cache_ttl: CacheTTL = "5m",
-    service_tier: AnthropicServiceTier | None = None,
-    inference_geo: str | None = None,
-) -> AnthropicMessagesAdapter:
-    """Build the adapter for one Messages API model.
-
-    Raises:
-        ValueError: An uncataloged model lacks `pricing`.
-    """
-    catalog_table = _PRICING_BY_MODEL_ID.get(model)
-    if catalog_table is None:
-        if pricing is None:
-            raise ValueError(
-                f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
-            )
-    else:
-        pricing = pricing or catalog_table
-    return AnthropicMessagesAdapter(
-        client=client,
-        model=model,
-        pricing=pricing,
-        provider_name="anthropic",
-        default_max_completion_tokens=default_max_completion_tokens,
-        cache_ttl=cache_ttl,
-        service_tier=service_tier,
-        inference_geo=inference_geo,
-    )
-
-
-def _anthropic_bedrock_adapter(
-    model: str,
-    *,
-    client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
-    catalog_table: AnthropicPricingTable | None,
-    pricing: AnthropicPricingTable | None = None,
-    default_max_completion_tokens: int = 4096,
-    cache_ttl: CacheTTL = "5m",
-) -> AnthropicMessagesAdapter:
-    """Build the adapter for one Bedrock model.
-
-    Raises:
-        ValueError: An uncataloged model lacks `pricing`.
-    """
-    if catalog_table is None:
-        if pricing is None:
-            raise ValueError(
-                f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
-            )
-    else:
-        pricing = pricing or catalog_table
-    return AnthropicMessagesAdapter(
-        client=client,
-        model=model,
-        pricing=pricing,
-        provider_name="aws.bedrock",
-        default_max_completion_tokens=default_max_completion_tokens,
-        cache_ttl=cache_ttl,
-    )
-
-
 class Anthropic:
     """Create `LLM` values for Anthropic."""
 
@@ -267,10 +196,19 @@ class Anthropic:
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
         """
-        adapter = _anthropic_adapter(
-            model,
+        catalog_table = _PRICING_BY_MODEL_ID.get(model)
+        if catalog_table is None:
+            if pricing is None:
+                raise ValueError(
+                    f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
+                )
+        else:
+            pricing = pricing or catalog_table
+        adapter = AnthropicMessagesAdapter(
             client=self.client,
+            model=model,
             pricing=pricing,
+            provider_name="anthropic",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
             service_tier=service_tier,
@@ -356,7 +294,7 @@ class AnthropicBedrock:
             ValueError: An uncataloged model lacks `pricing` or a passed `client`.
                 Also raised when a passed SDK client cannot serve `model`.
         """
-        routing = _bedrock_routing(model)
+        routing = ANTHROPIC_BEDROCK.get(model)
         client = self._passed_client
         if client is None:
             if routing is None:
@@ -378,11 +316,19 @@ class AnthropicBedrock:
                     f"{model!r} is served by the {routing.api!r} Bedrock API, which requires a "
                     f"{required_class.__name__} client, but a {type(client).__name__} was passed."
                 )
-        adapter = _anthropic_bedrock_adapter(
-            model,
+        catalog_table = ANTHROPIC_BEDROCK_PRICING.get(model)
+        if catalog_table is None:
+            if pricing is None:
+                raise ValueError(
+                    f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
+                )
+        else:
+            pricing = pricing or catalog_table
+        adapter = AnthropicMessagesAdapter(
             client=client,
-            catalog_table=ANTHROPIC_BEDROCK_PRICING.get(model),
+            model=model,
             pricing=pricing,
+            provider_name="aws.bedrock",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         )

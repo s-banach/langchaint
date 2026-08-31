@@ -1,7 +1,7 @@
 """Provider-neutral exception and normalized generation error records."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Self, override
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, override
 
 from pydantic import Field, ValidationError, model_validator
 
@@ -73,10 +73,7 @@ class _GenerationErrorRecordBase(_CallResultRecordBase):
                 return attempt.assistant_message
         return None
 
-    @property
-    def stop_reason(self) -> StopReason | None:
-        """Return the normalized stop reason when this variant defines one."""
-        return None
+    stop_reason: ClassVar[StopReason | None] = None
 
     @property
     def error_summary(self) -> str:
@@ -215,10 +212,7 @@ class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
 
     kind: Literal["refusal_error"] = "refusal_error"
 
-    @property
-    @override
-    def stop_reason(self) -> Literal["refusal"]:
-        return "refusal"
+    stop_reason: ClassVar[Literal["refusal"]] = "refusal"
 
     @property
     @override
@@ -234,10 +228,7 @@ class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase)
 
     kind: Literal["max_completion_tokens_exceeded_error"] = "max_completion_tokens_exceeded_error"
 
-    @property
-    @override
-    def stop_reason(self) -> Literal["max_tokens"]:
-        return "max_tokens"
+    stop_reason: ClassVar[Literal["max_tokens"]] = "max_tokens"
 
     @property
     @override
@@ -253,10 +244,7 @@ class EmptyTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
 
     kind: Literal["empty_turn_error"] = "empty_turn_error"
 
-    @property
-    @override
-    def stop_reason(self) -> Literal["end_turn"]:
-        return "end_turn"
+    stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
 
     @property
     @override
@@ -273,10 +261,7 @@ class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
     validation_error_json: str
     kind: Literal["schema_violation_error"] = "schema_violation_error"
 
-    @property
-    @override
-    def stop_reason(self) -> Literal["end_turn"]:
-        return "end_turn"
+    stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
 
     @property
     @override
@@ -292,10 +277,7 @@ class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
 
     kind: Literal["context_window_exceeded_error"] = "context_window_exceeded_error"
 
-    @property
-    @override
-    def stop_reason(self) -> Literal["context_window_exceeded"]:
-        return "context_window_exceeded"
+    stop_reason: ClassVar[Literal["context_window_exceeded"]] = "context_window_exceeded"
 
     @property
     @override

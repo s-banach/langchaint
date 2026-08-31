@@ -127,21 +127,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         self._state: _State = "unopened"
         self._request: RequestParams | None = None
 
-    def _request_for_this_call(self) -> RequestParams:
-        """Return the request every attempt of this call sends, building it on the first ask.
-
-        Every open attempt gets the same request.
-
-        Raises:
-            GenerationError: `build_request` returned `InvalidRequest`, so nothing can be sent.
-        """
-        if self._request is None:
-            built = self._bound_adapter.build_request(self._messages)
-            if isinstance(built, InvalidRequest):
-                raise self._invalid_request_error(built.reason, None)
-            self._request = built
-        return self._request
-
     async def __aenter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
         """Open the request and return self.
 
@@ -385,19 +370,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             provider_attempts=self._ledger.provider_attempts,
         )
 
-    def _invalid_request_error(self, reason: str, cause: Exception | None) -> GenerationError:
-        """Build this handle's GenerationError, chained to cause when there is one.
-
-        `cause` is `None` when `build_request` returns `InvalidRequest` before sending anything.
-        """
-        invalid_request = GenerationError(
-            record=InvalidRequestErrorRecord(reason=reason, call=self._ledger.freeze()),
-            request=self._request,
-            provider_attempts=self._ledger.provider_attempts,
-        )
-        invalid_request.__cause__ = cause
-        return invalid_request
-
     def __aiter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
         """Return `self` because the handle is its own iterator."""
         return self
@@ -415,7 +387,15 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 Open failures consume `max_attempts`.
             ParserContractError: `Adapter.parse` violates its contract.
         """
-        request = self._request_for_this_call()
+        built = self._bound_adapter.build_request(self._messages)
+        if isinstance(built, InvalidRequest):
+            raise GenerationError(
+                record=InvalidRequestErrorRecord(reason=built.reason, call=self._ledger.freeze()),
+                request=None,
+                provider_attempts=self._ledger.provider_attempts,
+            ) from None
+        request = built
+        self._request = request
         while self._adapter_stream is None:
             self._admission = await self._shared_backoff.admitted().__aenter__()
             self._ledger.start_attempt()

@@ -88,6 +88,12 @@ testpaths = ["tests"]
 # Example modules import each other by bare name.
 # tests/test_full_app.py imports task_stream through the same path.
 pythonpath = ["examples/full_app"]
+filterwarnings = [
+    "error",
+    # google-genai emits this warning during import.
+    # tests/test_provider_facts.py detects its removal.
+    "ignore:'_UnionGenericAlias' is deprecated and slated for removal in Python 3\\.17$:DeprecationWarning:google\\.genai\\.types",
+]
 
 [tool.coverage.run]
 branch = true

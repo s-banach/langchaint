@@ -1,11 +1,11 @@
 """Pin SDK facts used by langchaint arithmetic and request mapping.
 
 These tests inspect declared fields, method signatures, and Bedrock service models.
-Current facts target anthropic 1.0.0 and openai 3.1.0.
-They also target google-genai 2.18.1 and botocore 1.43.72.
 """
 
 import inspect
+import subprocess
+import sys
 import typing
 
 import anthropic
@@ -424,6 +424,32 @@ def test_the_gemini_sdk_retryable_statuses_are_all_retried_or_paused() -> None:
     assert set(_api_client._RETRY_HTTP_STATUS_CODES) <= (
         generate_content_adapter._PAUSE_STATUSES
         | generate_content_adapter._RETRY_THIS_ONE_STATUSES
+    )
+
+
+def test_google_genai_deprecation_filter_remains_necessary() -> None:
+    """Fail when the exact google-genai warning exemption can be removed."""
+    warning_text = "'_UnionGenericAlias' is deprecated and slated for removal in Python 3.17"
+    source = (
+        "import warnings\n"
+        "with warnings.catch_warnings(record=True) as caught:\n"
+        '    warnings.simplefilter("always")\n'
+        "    from google import genai\n"
+        "assert len(caught) == 1, caught\n"
+        "warning = caught[0]\n"
+        f"assert str(warning.message) == {warning_text!r}, warning\n"
+        "assert warning.category is DeprecationWarning, warning\n"
+        'assert warning.filename.replace("\\\\", "/").endswith("/google/genai/types.py"), warning\n'
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, (
+        "google-genai changed its import warning; remove or update its filterwarnings exemption\n"
+        f"{completed.stderr}"
     )
 
 

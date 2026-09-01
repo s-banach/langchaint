@@ -1,14 +1,14 @@
 name: Refresh GenAI semantic-convention data
 
-# This job refreshes payload schemas and provider names monthly.
-# It opens a pull request when either source changes.
+# This job refreshes the resolved chat span declaration and structured schemas weekly.
+# It opens a pull request when the committed semantic-convention data changes.
 # GitHub-token pull requests do not start workflows.
 # Therefore, this job runs the gate before opening the pull request.
 
 on:
   schedule:
-    # 07:00 UTC on the 1st of each month.
-    - cron: "0 7 1 * *"
+    # 07:00 UTC each Monday.
+    - cron: "0 7 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -23,6 +23,25 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out GenAI semantic conventions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: open-telemetry/semantic-conventions-genai
+          ref: main
+          path: build/semantic-conventions-genai-source
+
+      - name: Prepare the source commit and read the Weaver version
+        id: source
+        working-directory: build/semantic-conventions-genai-source
+        run: |
+          git update-ref refs/langchaint/prepared HEAD
+          echo "weaver_version=$(sed -n 's/^WEAVER_VERSION=//p' versions.env)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Weaver
+        uses: open-telemetry/weaver/.github/actions/setup-weaver@26c685ff52b925056ff1d53476c6022638c01220 # v0.25.1
+        with:
+          version: ${{ steps.source.outputs.weaver_version }}
+
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -30,15 +49,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      # The script stores every run parameter as a constant.
       - name: Refresh vendored data
         run: uv run python -m scripts.refresh_semconv_genai
 
-      # JSON diffs detect payload-schema or provider-name changes.
       - name: Detect vendored data changes
         id: drift
         run: |
-          if [ -z "$(git status --porcelain --untracked-files=all -- 'tests/semconv_genai/*.json')" ]; then
+          if [ -z "$(git status --porcelain --untracked-files=all -- tests/semconv_genai)" ]; then
             echo "moved=false" >> "$GITHUB_OUTPUT"
             echo "The vendored data matches upstream; nothing to do."
           else
@@ -46,9 +63,6 @@ jobs:
             git diff --stat -- tests/semconv_genai
           fi
 
-      # The gate validates payloads and built-in provider names.
-      # continue-on-error keeps the pull-request step reachable.
-      # The final step restores a failed gate status.
       - name: Run the gate against refreshed data
         if: steps.drift.outputs.moved == 'true'
         id: gate
@@ -60,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ steps.gate.outcome }}" = "success" ]; then
-            verdict="The gate passes. Every tested payload validates. Every built-in provider name remains registered. Catch-all schema variants still admit unrecognized element types."
+            verdict="The gate passes against the refreshed chat span declaration and structured schemas."
           else
             verdict="The gate fails. The run log identifies the rejected assertion."
           fi
@@ -78,7 +92,6 @@ jobs:
             gh pr comment "$BRANCH" --body "Refreshed again. $verdict"
           fi
 
-      # This step applies the gate result to the job.
       - name: Report the gate's verdict
         if: steps.drift.outputs.moved == 'true' && steps.gate.outcome != 'success'
         run: |

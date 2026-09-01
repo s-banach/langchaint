@@ -1,0 +1,77 @@
+templates:
+  - template: chat-span-attributes.json.j2
+    filter: >-
+      def normalized_attribute($condition): {
+        name: .key,
+        value_type: (
+          if (.type | type) == "object" then "string"
+          elif .type == "template[string]" then "string"
+          else .type
+          end
+        ),
+        allowed_values: (
+          if (.type | type) == "object" then [.type.members[].value]
+          else null
+          end
+        ),
+        presence_rule: .requirement_level,
+        condition: $condition,
+        structured_schema: (.annotations.type.json_schema // null),
+        template_prefix: (
+          if .type == "template[string]" then (.key + ".")
+          else null
+          end
+        )
+      };
+      def provider_name($id):
+        if $id == "azure.ai.inference.client" then "azure.ai.inference"
+        else ($id | sub("\\.inference\\.client$"; ""))
+        end;
+      (
+          .registry.spans[]
+          | select(.type == "gen_ai.inference.client")
+          | .attributes
+        ) as $base_attributes
+      | {
+        span_type: "gen_ai.inference.client",
+        operation_name: "chat",
+        attributes: [
+          $base_attributes[]
+          | normalized_attribute(null)
+        ],
+        refinements: [
+          .refinements.spans[]
+          | select(
+              .type == "gen_ai.inference.client"
+              and .id != "gen_ai.inference.client"
+            )
+          | provider_name(.id) as $provider_name
+          | {
+              id: .id,
+              condition: {
+                attribute: "gen_ai.provider.name",
+                equals: $provider_name
+              },
+              attributes: [
+                .attributes[]
+                  | select(
+                      . as $refinement_attribute
+                      | (
+                          $base_attributes
+                          | map(select(.key == $refinement_attribute.key))
+                          | first
+                        ) as $base_attribute
+                      | $base_attribute == null
+                        or ($refinement_attribute | normalized_attribute(null))
+                          != ($base_attribute | normalized_attribute(null))
+                    )
+                  | normalized_attribute({
+                    attribute: "gen_ai.provider.name",
+                    equals: $provider_name
+                  })
+              ]
+            }
+        ]
+      }
+    application_mode: single
+    file_name: chat-span-attributes.json

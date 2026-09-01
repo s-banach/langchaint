@@ -1,20 +1,27 @@
-"""Refresh vendored GenAI validation data from OpenTelemetry.
+"""Refresh committed GenAI semantic-convention data through Weaver.
 
 Run `uv run python -m scripts.refresh_semconv_genai`.
 """
 
 import json
 import pathlib
-import re
-import urllib.request
+import shutil
+import subprocess
+import tempfile
 
-REPO = "open-telemetry/semantic-conventions-genai"
-BRANCH = "main"
-MODEL_DIR = "model/gen-ai"
-DESTINATION = pathlib.Path(__file__).parent.parent / "tests" / "semconv_genai"
+ROOT = pathlib.Path(__file__).parent.parent
+SOURCE_REPOSITORY = "open-telemetry/semantic-conventions-genai"
+SOURCE_URL = f"https://github.com/{SOURCE_REPOSITORY}.git"
+SOURCE_REFERENCE = "main"
+SOURCE_CHECKOUT = ROOT / "build" / "semantic-conventions-genai-source"
+PREPARED_SOURCE_REF = "refs/langchaint/prepared"
+SOURCE_MODEL_DIRECTORY = SOURCE_CHECKOUT / "model"
+DESTINATION = ROOT / "tests" / "semconv_genai"
 SOURCE_DOC = DESTINATION / "SOURCE.md"
-REGISTRY_FILE = "registry.yaml"
-PROVIDER_NAME_VALUES_FILE = "provider-name-values.json"
+TEMPLATES = ROOT / "scripts" / "semconv_genai_templates"
+GENERATED_ATTRIBUTES_FILE = "chat-span-attributes.json"
+WEAVER_TARGET = "chat-span"
+OBSOLETE_FILES = {"provider-name-values.json"}
 
 ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.system_instructions": "gen-ai-system-instructions.json",
@@ -24,151 +31,184 @@ ATTRIBUTE_SCHEMA_FILES = {
     "gen_ai.tool.call.arguments": "gen-ai-tool-call-arguments.json",
     "gen_ai.tool.call.result": "gen-ai-tool-call-result.json",
 }
-"""Map each traced payload attribute to its validation schema."""
+"""Map each structured attribute to its committed JSON schema."""
 
 
-def fetch(url: str) -> bytes:
-    """Read one URL.
+def _run(command: list[str], *, working_directory: pathlib.Path = ROOT) -> str:
+    completed = subprocess.run(
+        command,
+        cwd=working_directory,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
 
-    Raises:
-        urllib.error.HTTPError: The server returns an error status.
-        urllib.error.URLError: The host cannot be reached.
-    """
-    with urllib.request.urlopen(url) as response:
-        content: bytes = response.read()
-    return content
 
-
-def resolve_head_sha() -> str:
-    """Resolve BRANCH to an upstream revision.
-
-    Raises:
-        urllib.error.HTTPError: The commits endpoint returns an error status.
-        urllib.error.URLError: The host cannot be reached.
-        json.JSONDecodeError: The response body is not JSON.
-        KeyError: The response contains no sha.
-    """
-    payload = json.loads(fetch(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"))
-    sha: str = payload["sha"]
+def _resolved_main_sha() -> str:
+    output = _run(["git", "ls-remote", SOURCE_URL, f"refs/heads/{SOURCE_REFERENCE}"])
+    fields = output.split()
+    if len(fields) != 2 or fields[1] != f"refs/heads/{SOURCE_REFERENCE}":
+        raise ValueError(f"git ls-remote returned malformed {SOURCE_REFERENCE!r} output")
+    sha = fields[0]
+    if len(sha) != 40 or any(character not in "0123456789abcdef" for character in sha):
+        raise ValueError(f"git ls-remote returned malformed commit SHA {sha!r}")
     return sha
 
 
-def provider_name_values_from_registry(content: bytes) -> tuple[str, ...]:
-    """Extract and sort gen_ai.provider.name values.
+def _prepare_source_checkout(resolved_sha: str) -> None:
+    SOURCE_CHECKOUT.parent.mkdir(parents=True, exist_ok=True)
+    if not (SOURCE_CHECKOUT / ".git").is_dir():
+        if SOURCE_CHECKOUT.exists():
+            raise ValueError(f"{SOURCE_CHECKOUT} exists without a Git checkout")
+        _ = _run(["git", "clone", SOURCE_URL, str(SOURCE_CHECKOUT)])
+    origin_url = _run(["git", "remote", "get-url", "origin"], working_directory=SOURCE_CHECKOUT)
+    if origin_url.rstrip("/").removesuffix(".git") != SOURCE_URL.removesuffix(".git"):
+        raise ValueError(f"{SOURCE_CHECKOUT} origin is {origin_url!r}, expected {SOURCE_URL!r}")
+    status = _run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        working_directory=SOURCE_CHECKOUT,
+    )
+    if status:
+        raise ValueError(f"{SOURCE_CHECKOUT} contains uncommitted files")
+    current_sha = _run(["git", "rev-parse", "HEAD"], working_directory=SOURCE_CHECKOUT)
+    if current_sha != resolved_sha:
+        _ = _run(["git", "fetch", "origin", resolved_sha], working_directory=SOURCE_CHECKOUT)
+        _ = _run(["git", "checkout", "--detach", resolved_sha], working_directory=SOURCE_CHECKOUT)
+        current_sha = _run(["git", "rev-parse", "HEAD"], working_directory=SOURCE_CHECKOUT)
+        if current_sha != resolved_sha:
+            raise ValueError(f"{SOURCE_CHECKOUT} is at {current_sha}, expected {resolved_sha}")
 
-    Raises:
-        ValueError: The registry attribute is missing, duplicated, empty, or malformed.
-    """
-    try:
-        lines = content.decode("utf-8").splitlines()
-    except UnicodeDecodeError as error:
-        raise ValueError(f"{REGISTRY_FILE} must be UTF-8") from error
-    attribute_pattern = re.compile(r"^  - key: gen_ai\.provider\.name\s*$")
-    starts = [index for index, line in enumerate(lines) if attribute_pattern.fullmatch(line)]
-    if len(starts) != 1:
-        raise ValueError(f"{REGISTRY_FILE} must define gen_ai.provider.name exactly once")
-    start = starts[0]
-    end = next(
-        (index for index in range(start + 1, len(lines)) if lines[index].startswith("  - key:")),
-        len(lines),
-    )
-    attribute_lines = lines[start:end]
-    if attribute_lines.count("    type:") != 1:
-        raise ValueError("gen_ai.provider.name must define one type mapping")
-    if attribute_lines.count("      members:") != 1:
-        raise ValueError("gen_ai.provider.name type must define one `members` list")
-    members_start = attribute_lines.index("      members:") + 1
-    members_end = next(
-        (
-            index
-            for index in range(members_start, len(attribute_lines))
-            if attribute_lines[index].strip()
-            and len(attribute_lines[index]) - len(attribute_lines[index].lstrip()) <= 6
-        ),
-        len(attribute_lines),
-    )
-    member_starts = [
-        index
-        for index in range(members_start, members_end)
-        if attribute_lines[index].startswith("        - ")
-    ]
-    if not member_starts:
-        raise ValueError("gen_ai.provider.name `members` must not be empty")
-    values: list[str] = []
-    for position, member_start in enumerate(member_starts):
-        member_end = (
-            member_starts[position + 1] if position + 1 < len(member_starts) else members_end
-        )
-        value_lines = [
-            line.removeprefix("          value: ")
-            for line in attribute_lines[member_start:member_end]
-            if line.startswith("          value: ")
-        ]
-        if len(value_lines) != 1:
-            raise ValueError("each entry in gen_ai.provider.name `members` must define one value")
+
+def _resolved_source_sha() -> str:
+    if (SOURCE_CHECKOUT / ".git").is_dir():
         try:
-            value: object = json.loads(value_lines[0])
-        except json.JSONDecodeError as error:
-            raise ValueError("gen_ai.provider.name values must be JSON strings") from error
-        if not isinstance(value, str) or not value:
-            raise ValueError("gen_ai.provider.name values must be non-empty strings")
-        values.append(value)
-    if len(values) != len(set(values)):
-        raise ValueError("gen_ai.provider.name values must be unique")
-    return tuple(sorted(values))
+            return _run(
+                ["git", "rev-parse", "--verify", PREPARED_SOURCE_REF],
+                working_directory=SOURCE_CHECKOUT,
+            )
+        except subprocess.CalledProcessError:
+            pass
+    return _resolved_main_sha()
 
 
-def render_source_doc() -> str:
-    """Render SOURCE_DOC with source paths and refresh instructions."""
-    lines = [
-        "# Vendored GenAI semantic-convention data",
-        "",
-        f"Source repository: <https://github.com/{REPO}>.",
-        f"Source branch: `{BRANCH}`.",
-        "",
-        f"Payload schemas come from `{MODEL_DIR}/gen-ai-*.json`.",
-        f"Provider names come from `{MODEL_DIR}/{REGISTRY_FILE}`.",
-        "",
-        "OpenTelemetry Authors license these files under Apache-2.0.",
-        "Payload schemas are copied unchanged.",
-        "Provider names are extracted and sorted.",
-        "",
-        "Refresh with `uv run python -m scripts.refresh_semconv_genai`, then read `git diff`.",
-        "",
-        "| attribute | schema |",
-        "| --- | --- |",
+def _required_weaver_version() -> str:
+    versions_path = SOURCE_CHECKOUT / "versions.env"
+    matches = [
+        line.removeprefix("WEAVER_VERSION=")
+        for line in versions_path.read_text().splitlines()
+        if line.startswith("WEAVER_VERSION=")
     ]
-    lines.extend(f"| `{key}` | `{file}` |" for key, file in sorted(ATTRIBUTE_SCHEMA_FILES.items()))
-    return "\n".join(lines) + "\n"
+    if len(matches) != 1 or not matches[0].startswith("v"):
+        raise ValueError(f"{versions_path} must define one WEAVER_VERSION")
+    return matches[0]
+
+
+def _weaver_executable(required_version: str) -> str:
+    executable = shutil.which("weaver")
+    if executable is None:
+        raise ValueError(
+            f"install Weaver {required_version} from https://github.com/open-telemetry/weaver/releases"
+        )
+    version_output = _run([executable, "--version"])
+    expected_output = f"weaver {required_version.removeprefix('v')}"
+    if version_output != expected_output:
+        raise ValueError(
+            f"{executable} reports {version_output!r}; install Weaver {required_version}"
+        )
+    return executable
+
+
+def _validate_json_file(path: pathlib.Path) -> None:
+    value: object = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+
+
+def _render_source_doc(resolved_sha: str, weaver_version: str) -> str:
+    schema_paths = "\n".join(
+        f"- `model/gen-ai/{file}` for `{attribute}`."
+        for attribute, file in sorted(ATTRIBUTE_SCHEMA_FILES.items())
+    )
+    return f"""# Committed GenAI semantic-convention data
+
+Source repository: <https://github.com/{SOURCE_REPOSITORY}>.
+Tracked reference: `{SOURCE_REFERENCE}`.
+Resolved commit SHA: `{resolved_sha}`.
+Resolved Weaver version: `{weaver_version}`.
+License: Apache-2.0.
+
+`{GENERATED_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
+
+Structured schemas are copied from these source paths:
+
+{schema_paths}
+
+Refresh with `uv run python -m scripts.refresh_semconv_genai`.
+"""
+
+
+def _generate_staged_files(
+    temporary_directory: pathlib.Path,
+    weaver_executable: str,
+    resolved_sha: str,
+    weaver_version: str,
+) -> pathlib.Path:
+    generated_directory = temporary_directory / "generated"
+    staged_directory = temporary_directory / "staged"
+    staged_directory.mkdir()
+    _ = _run([
+        weaver_executable,
+        "registry",
+        "generate",
+        WEAVER_TARGET,
+        str(generated_directory),
+        "--templates",
+        str(TEMPLATES),
+        "--registry",
+        str(SOURCE_MODEL_DIRECTORY),
+        "--v2",
+    ])
+    generated_attributes = generated_directory / GENERATED_ATTRIBUTES_FILE
+    _validate_json_file(generated_attributes)
+    _ = shutil.copyfile(generated_attributes, staged_directory / GENERATED_ATTRIBUTES_FILE)
+    for schema_file in sorted(ATTRIBUTE_SCHEMA_FILES.values()):
+        source_path = SOURCE_MODEL_DIRECTORY / "gen-ai" / schema_file
+        _validate_json_file(source_path)
+        _ = shutil.copyfile(source_path, staged_directory / schema_file)
+    _ = (staged_directory / SOURCE_DOC.name).write_text(
+        _render_source_doc(resolved_sha, weaver_version)
+    )
+    return staged_directory
+
+
+def _replace_committed_files(staged_directory: pathlib.Path) -> None:
+    DESTINATION.mkdir(parents=True, exist_ok=True)
+    for obsolete_file in OBSOLETE_FILES:
+        obsolete_path = DESTINATION / obsolete_file
+        if obsolete_path.exists():
+            obsolete_path.unlink()
+    for staged_path in sorted(staged_directory.iterdir()):
+        destination_path = DESTINATION / staged_path.name
+        _ = staged_path.replace(destination_path)
+        print(f"wrote {destination_path}")
 
 
 def main() -> None:
-    """Fetch every vendored file from one upstream commit.
-
-    Raises:
-        urllib.error.HTTPError: An upstream request returns an error status.
-        urllib.error.URLError: An upstream host cannot be reached.
-        json.JSONDecodeError: The commits endpoint response is not JSON.
-        KeyError: The commits endpoint response contains no sha.
-        ValueError: `registry.yaml` is invalid.
-        OSError: A vendored path cannot be created or written.
-    """
-    sha = resolve_head_sha()
-    schema_contents = {
-        file: fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{file}")
-        for file in sorted(ATTRIBUTE_SCHEMA_FILES.values())
-    }
-    registry = fetch(f"https://raw.githubusercontent.com/{REPO}/{sha}/{MODEL_DIR}/{REGISTRY_FILE}")
-    provider_name_values = provider_name_values_from_registry(registry)
-    DESTINATION.mkdir(parents=True, exist_ok=True)
-    for file, content in schema_contents.items():
-        _ = (DESTINATION / file).write_bytes(content)
-        print(f"wrote {DESTINATION / file} ({len(content)} bytes)")
-    provider_name_values_path = DESTINATION / PROVIDER_NAME_VALUES_FILE
-    _ = provider_name_values_path.write_text(json.dumps(provider_name_values, indent=2) + "\n")
-    print(f"wrote {provider_name_values_path}")
-    _ = SOURCE_DOC.write_text(render_source_doc())
-    print(f"wrote {SOURCE_DOC} at {sha}")
+    """Refresh committed data from one resolved source commit with its required Weaver."""
+    resolved_sha = _resolved_source_sha()
+    _prepare_source_checkout(resolved_sha)
+    weaver_version = _required_weaver_version()
+    weaver_executable = _weaver_executable(weaver_version)
+    print(f"reference: {SOURCE_REFERENCE}")
+    print(f"commit: {resolved_sha}")
+    print(f"weaver: {weaver_version}")
+    with tempfile.TemporaryDirectory(prefix="semconv-genai-", dir=ROOT / "build") as directory:
+        staged_directory = _generate_staged_files(
+            pathlib.Path(directory), weaver_executable, resolved_sha, weaver_version
+        )
+        _replace_committed_files(staged_directory)
 
 
 if __name__ == "__main__":

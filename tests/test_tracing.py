@@ -11,6 +11,7 @@ import json
 import logging
 import pathlib
 import re
+import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import assert_type, override
 
@@ -20,7 +21,6 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai_semconv
 from opentelemetry.semconv.attributes import error_attributes as error_semconv
 from opentelemetry.trace import NonRecordingSpan, SpanKind, StatusCode
 from pydantic import BaseModel
@@ -1918,22 +1918,6 @@ def _emitted_convention_keys() -> set[str]:
     return set(re.findall(r'"(gen_ai\.[a-z_.]+)"', source))
 
 
-_SEMANTIC_CONVENTIONS_GENAI_KEYS = {"gen_ai.request.reasoning.level"}
-
-
-def test_emitted_convention_keys_are_installed_or_explicitly_sourced() -> None:
-    """Each emitted convention key exists in an OTel convention source."""
-    defined = {
-        value
-        for name, value in vars(gen_ai_semconv).items()
-        if name.startswith("GEN_AI_") and isinstance(value, str)
-    }
-    emitted = _emitted_convention_keys()
-    assert emitted, "the source scan found no keys, so this assertion would pass vacuously"
-    assert emitted <= defined | _SEMANTIC_CONVENTIONS_GENAI_KEYS
-    assert error_semconv.ERROR_TYPE == "error.type"
-
-
 def test_vendored_schemas_and_the_payload_attributes_account_for_each_other() -> None:
     """Vendored schemas match mapped and emitted payload attributes.
 
@@ -1948,92 +1932,89 @@ def test_vendored_schemas_and_the_payload_attributes_account_for_each_other() ->
         assert file == key.replace(".", "-").replace("_", "-") + ".json"
 
 
-def test_provider_name_values_from_registry_returns_sorted_values() -> None:
-    """The refresh extracts and sorts provider names."""
-    registry = b"""attributes:
-  - key: gen_ai.provider.name
-    type:
-      members:
-        - id: zeta
-          value: "zeta"
-        - id: alpha
-          value: "alpha"
-    stability: development
-  - key: gen_ai.request.model
-    type: string
-"""
-    assert refresh_semconv_genai.provider_name_values_from_registry(registry) == (
-        "alpha",
-        "zeta",
-    )
-
-
-@pytest.mark.parametrize(
-    "registry",
-    [
-        b"attributes:\n  - key: gen_ai.request.model\n    type: string\n",
-        b"""attributes:
-  - key: gen_ai.provider.name
-    type:
-      members:
-        - id: first
-          value: "first"
-  - key: gen_ai.provider.name
-    type:
-      members:
-        - id: second
-          value: "second"
-""",
-        b"""attributes:
-  - key: gen_ai.provider.name
-    type:
-      members:
-        - id: empty
-          value: ""
-""",
-        b"""attributes:
-  - key: gen_ai.provider.name
-    type:
-      members: malformed
-""",
-        b"""attributes:
-  - key: gen_ai.provider.name
-    type:
-      members:
-        - id: duplicate
-          value: "duplicate"
-        - id: duplicate_again
-          value: "duplicate"
-""",
-    ],
-)
-def test_provider_name_values_from_registry_rejects_invalid_registry(
-    registry: bytes,
-) -> None:
-    """The refresh rejects missing, duplicated, empty, or malformed registry data."""
-    with pytest.raises(ValueError, match=r"registry|gen_ai.provider.name"):
-        _ = refresh_semconv_genai.provider_name_values_from_registry(registry)
-
-
-def test_refresh_validates_registry_before_writing(
+def test_refresh_creates_a_populated_source_checkout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """Malformed registry data leaves every destination unwritten."""
+    """git clone populates SOURCE_CHECKOUT before the cleanliness check."""
+    source_checkout = tmp_path / "semantic-conventions-genai-source"
+    resolved_sha = "a" * 40
+    commands: list[list[str]] = []
 
-    def fake_fetch(url: str) -> bytes:
-        """Return one malformed registry beside valid metadata and schemas."""
-        if "/commits/" in url:
-            return b'{"sha": "revision"}'
-        if url.endswith("/registry.yaml"):
-            return b"attributes:\n"
-        return b"{}"
+    def fake_run(
+        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
+    ) -> str:
+        assert working_directory in (refresh_semconv_genai.ROOT, source_checkout)
+        commands.append(command)
+        if command[:2] == ["git", "clone"]:
+            assert "--no-checkout" not in command
+            source_checkout.joinpath(".git").mkdir(parents=True)
+            return ""
+        if command == ["git", "remote", "get-url", "origin"]:
+            return refresh_semconv_genai.SOURCE_URL
+        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
+            return ""
+        if command == ["git", "rev-parse", "HEAD"]:
+            return resolved_sha
+        raise AssertionError(f"unexpected command: {command!r}")
 
-    monkeypatch.setattr(refresh_semconv_genai, "DESTINATION", tmp_path)
-    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_DOC", tmp_path / "SOURCE.md")
-    monkeypatch.setattr(refresh_semconv_genai, "fetch", fake_fetch)
-    with pytest.raises(ValueError, match="registry"):
-        refresh_semconv_genai.main()
-    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
+    monkeypatch.setattr(refresh_semconv_genai, "_run", fake_run)
+    refresh_semconv_genai._prepare_source_checkout(resolved_sha)
+    assert commands[0][:2] == ["git", "clone"]
+
+
+def test_refresh_uses_the_workflow_prepared_source_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """PREPARED_SOURCE_REF prevents a second resolution of main."""
+    source_checkout = tmp_path / "semantic-conventions-genai-source"
+    source_checkout.joinpath(".git").mkdir(parents=True)
+    resolved_sha = "a" * 40
+
+    def fake_run(
+        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
+    ) -> str:
+        assert command == [
+            "git",
+            "rev-parse",
+            "--verify",
+            refresh_semconv_genai.PREPARED_SOURCE_REF,
+        ]
+        assert working_directory == source_checkout
+        return resolved_sha
+
+    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
+    monkeypatch.setattr(refresh_semconv_genai, "_run", fake_run)
+    assert refresh_semconv_genai._resolved_source_sha() == resolved_sha
+
+
+def test_refresh_resolves_main_without_a_prepared_source_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A missing PREPARED_SOURCE_REF makes a local refresh resolve main."""
+    source_checkout = tmp_path / "semantic-conventions-genai-source"
+    source_checkout.joinpath(".git").mkdir(parents=True)
+    resolved_sha = "a" * 40
+
+    def missing_prepared_ref(
+        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
+    ) -> str:
+        assert command == [
+            "git",
+            "rev-parse",
+            "--verify",
+            refresh_semconv_genai.PREPARED_SOURCE_REF,
+        ]
+        assert working_directory == source_checkout
+        raise subprocess.CalledProcessError(1, command)
+
+    def resolved_main_sha() -> str:
+        return resolved_sha
+
+    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
+    monkeypatch.setattr(refresh_semconv_genai, "_run", missing_prepared_ref)
+    monkeypatch.setattr(refresh_semconv_genai, "_resolved_main_sha", resolved_main_sha)
+    assert refresh_semconv_genai._resolved_source_sha() == resolved_sha
 
 
 def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:

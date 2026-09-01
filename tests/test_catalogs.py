@@ -4,7 +4,6 @@ These tests cover identifiers, pricing objects, overrides, and client routing.
 """
 
 import asyncio
-import json
 import pathlib
 from collections.abc import Callable
 
@@ -13,8 +12,9 @@ import pytest
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
 from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
+from pydantic import TypeAdapter
 
-from langchaint import LLM
+from langchaint import LLM, JsonValue
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_PRICING,
@@ -88,17 +88,29 @@ _ARBITRARY_GEMINI_PRICING: dict[str, GeminiPricingTable] = {
 }
 """The gemini counterpart of _ARBITRARY_PRICING, for adapters built without a catalog."""
 
+_JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+
 
 @pytest.fixture(scope="module", name="provider_name_values")
 def _provider_name_values_fixture() -> set[str]:
-    path = pathlib.Path(__file__).parent / "semconv_genai" / "provider-name-values.json"
-    payload: object = json.loads(path.read_text())
-    assert isinstance(payload, list)
+    path = pathlib.Path(__file__).parent / "semconv_genai" / "chat-span-attributes.json"
+    payload = _JSON_VALUE_ADAPTER.validate_json(path.read_text())
+    assert isinstance(payload, dict)
+    attributes = payload["attributes"]
+    assert isinstance(attributes, list)
+    provider_entries = [
+        entry
+        for entry in attributes
+        if isinstance(entry, dict) and entry.get("name") == "gen_ai.provider.name"
+    ]
+    assert len(provider_entries) == 1
+    allowed_values = provider_entries[0]["allowed_values"]
+    assert isinstance(allowed_values, list)
     values: set[str] = set()
-    for value in payload:
+    for value in allowed_values:
         assert isinstance(value, str)
         values.add(value)
-    assert len(values) == len(payload)
+    assert len(values) == len(allowed_values)
     return values
 
 

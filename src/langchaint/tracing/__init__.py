@@ -48,6 +48,7 @@ Reasoning usage uses `gen_ai.usage.reasoning.output_tokens`.
 Readable reasoning uses `ReasoningPart` in content payloads.
 Content payloads follow the convention's JSON schemas.
 `gen_ai.tool.call.arguments` may carry a JSON value other than an object.
+
 """
 
 import importlib.metadata
@@ -115,6 +116,11 @@ from langchaint.tools import (
     ToolManager,
     ToolSchema,
     ToolSequence,
+)
+from langchaint.tracing._span_parsing import (
+    ExtractedOutputMessage,
+    ParsedChatSpan,
+    reconstruct_bound_llm,
 )
 from langchaint.usage import Usage
 
@@ -562,6 +568,7 @@ def _tool_call_response_part(message: ToolMessage) -> dict[str, object]:
     return {
         "type": "tool_call_response",
         "id": message.tool_call_id,
+        "is_error": message.is_error,
         "response": _content_parts(message.content),
     }
 
@@ -1870,6 +1877,8 @@ class TracedToolManager(ToolManager):
 
 __all__ = [
     "AttributeMapper",
+    "ExtractedOutputMessage",
+    "ParsedChatSpan",
     "SpanAttributes",
     "TracedBoundLLM",
     "TracedLLM",
@@ -1877,4 +1886,5 @@ __all__ = [
     "TracedToolManager",
     "agent_span",
     "gen_ai_attributes",
+    "reconstruct_bound_llm",
 ]

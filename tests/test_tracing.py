@@ -2196,6 +2196,7 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
                     {
                         "type": "tool_call_response",
                         "id": "call1",
+                        "is_error": False,
                         "response": [{"type": "text", "content": "x"}],
                     }
                 ],
@@ -2574,6 +2575,7 @@ def test_tool_span_captures_arguments_and_result_under_capture() -> None:
         assert _captured(exporter, "gen_ai.tool.call.result") == {
             "type": "tool_call_response",
             "id": "call1",
+            "is_error": False,
             "response": [{"type": "text", "content": "hi"}],
         }
 
@@ -2750,6 +2752,7 @@ def test_tool_span_captures_the_result_on_both_variants_where_no_tool_ran() -> N
             assert _captured(exporter, "gen_ai.tool.call.result") == {
                 "type": "tool_call_response",
                 "id": call.id,
+                "is_error": expected.tool_message.is_error,
                 "response": [{"type": "text", "content": expected.tool_message.content}],
             }
 

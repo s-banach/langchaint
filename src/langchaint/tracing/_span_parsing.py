@@ -1,7 +1,6 @@
 """Extract langchaint values from OTel span attributes."""
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
@@ -10,14 +9,14 @@ from pydantic import (
     ConfigDict,
     Field,
     FiniteFloat,
-    StrictInt,
-    StrictStr,
     TypeAdapter,
     ValidationError,
+    field_validator,
+    model_validator,
 )
 
 from langchaint.checked_copy import CheckedCopyModel
-from langchaint.llm import GenerationInput
+from langchaint.llm import LLM, BoundLLM, GenerationInput
 from langchaint.messages import (
     AssistantMessage,
     AudioPart,
@@ -28,10 +27,14 @@ from langchaint.messages import (
     Message,
     TextPart,
     ToolCall,
+    ToolMessage,
     UserMessage,
 )
 from langchaint.tools import ToolSchema
 
+PROVIDER_NAME = "gen_ai.provider.name"
+REQUEST_MODEL = "gen_ai.request.model"
+OUTPUT_TYPE = "gen_ai.output.type"
 MAX_TOKENS = "gen_ai.request.max_tokens"
 REASONING_LEVEL = "gen_ai.request.reasoning.level"
 TEMPERATURE = "gen_ai.request.temperature"
@@ -40,23 +43,18 @@ TOOL_DEFINITIONS = "gen_ai.tool.definitions"
 INPUT_MESSAGES = "gen_ai.input.messages"
 OUTPUT_MESSAGES = "gen_ai.output.messages"
 
-EXTRACTED_REQUEST_ATTRIBUTES: frozenset[str] = frozenset({
-    "gen_ai.request.choice.count",
-    "gen_ai.request.frequency_penalty",
+REQUEST_ATTRIBUTE_PREFIX = "gen_ai.request."
+PARSED_ATTRIBUTES: frozenset[str] = frozenset({
+    PROVIDER_NAME,
+    REQUEST_MODEL,
+    OUTPUT_TYPE,
     MAX_TOKENS,
-    "gen_ai.request.model",
-    "gen_ai.request.presence_penalty",
-    "gen_ai.request.previous_response.id",
     REASONING_LEVEL,
-    "gen_ai.request.seed",
-    "gen_ai.request.stop_sequences",
-    "gen_ai.request.stream_cursor",
     TEMPERATURE,
-    "gen_ai.request.top_k",
-    "gen_ai.request.top_p",
-})
-IGNORED_REQUEST_ATTRIBUTES: frozenset[str] = frozenset({
-    "gen_ai.request.stream",
+    SYSTEM_INSTRUCTIONS,
+    TOOL_DEFINITIONS,
+    INPUT_MESSAGES,
+    OUTPUT_MESSAGES,
 })
 
 
@@ -134,8 +132,28 @@ class OtelAssistantMessage(OtelModel):
     name: None = None
 
 
+type OtelToolResponse = str | Annotated[tuple[OtelUserPart, ...], Field(strict=False)]
+
+
+class OtelToolCallResponsePart(OtelModel):
+    """Pydantic validates one OTel tool call response that ToolMessage can represent."""
+
+    type: Literal["tool_call_response"]
+    id: str
+    is_error: bool
+    response: OtelToolResponse
+
+
+class OtelToolMessage(OtelModel):
+    """Pydantic validates one OTel tool message that ToolMessage can represent."""
+
+    role: Literal["tool"]
+    parts: Annotated[tuple[OtelToolCallResponsePart], Field(strict=False)]
+    name: None = None
+
+
 type OtelInputMessage = Annotated[
-    OtelUserMessage | OtelAssistantMessage,
+    OtelUserMessage | OtelAssistantMessage | OtelToolMessage,
     Field(discriminator="role"),
 ]
 
@@ -157,9 +175,7 @@ class OtelFunctionTool(OtelModel):
 
 type StrictFiniteFloat = Annotated[FiniteFloat, Field(strict=True)]
 
-MAX_TOKENS_ADAPTER: TypeAdapter[int] = TypeAdapter(StrictInt)
-TEMPERATURE_ADAPTER: TypeAdapter[float] = TypeAdapter(StrictFiniteFloat)
-REASONING_LEVEL_ADAPTER: TypeAdapter[str] = TypeAdapter(StrictStr)
+RAW_SPAN_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 SYSTEM_INSTRUCTIONS_ADAPTER: TypeAdapter[tuple[OtelTextPart, ...]] = TypeAdapter(
     tuple[OtelTextPart, ...]
 )
@@ -180,84 +196,103 @@ class ExtractedOutputMessage:
     finish_reason: str
 
 
-@dataclass(frozen=True, kw_only=True)
-class SpanParameterExtraction:
-    binding_parameters: Mapping[str, object]
-    request_parameters: Mapping[str, object]
-    generation_input: GenerationInput | None
-    output_messages: tuple[ExtractedOutputMessage, ...] | None
+class ParsedChatSpan(OtelModel):
+    """Pydantic validates one raw OTel chat span attribute object.
+
+    Other `gen_ai.request.*` attributes remain in `unapplied_request_parameters`.
+    Attributes outside the parsed fields and `unapplied_request_parameters` are discarded.
+    """
+
+    provider_name: str = Field(alias=PROVIDER_NAME)
+    model: str = Field(alias=REQUEST_MODEL)
+    output_type: Literal["text", "json"] | None = Field(default=None, alias=OUTPUT_TYPE)
+    system_prompt: tuple[TextPart, ...] | None = Field(default=None, alias=SYSTEM_INSTRUCTIONS)
+    tool_schemas: tuple[ToolSchema, ...] = Field(default=(), alias=TOOL_DEFINITIONS)
+    max_completion_tokens: int | None = Field(default=None, alias=MAX_TOKENS)
+    reasoning_level: str | None = Field(default=None, alias=REASONING_LEVEL)
+    temperature: StrictFiniteFloat | None = Field(default=None, alias=TEMPERATURE)
+    unapplied_request_parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    generation_input: GenerationInput | None = Field(default=None, alias=INPUT_MESSAGES)
+    output_messages: tuple[ExtractedOutputMessage, ...] | None = Field(
+        default=None, alias=OUTPUT_MESSAGES
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _partition_raw_span(cls, input_value: object) -> object:
+        raw_span = RAW_SPAN_ADAPTER.validate_python(input_value)
+        parsed_attributes: dict[str, JsonValue] = {
+            attribute_name: attribute_value
+            for attribute_name, attribute_value in raw_span.items()
+            if attribute_name in PARSED_ATTRIBUTES
+        }
+        parsed_attributes["unapplied_request_parameters"] = {
+            attribute_name: attribute_value
+            for attribute_name, attribute_value in raw_span.items()
+            if attribute_name.startswith(REQUEST_ATTRIBUTE_PREFIX)
+            and attribute_name not in PARSED_ATTRIBUTES
+        }
+        return parsed_attributes
+
+    @field_validator("system_prompt", mode="before")
+    @classmethod
+    def _parse_system_prompt(cls, attribute_value: JsonValue) -> tuple[TextPart, ...]:
+        return parse_system_instructions(attribute_value)
+
+    @field_validator("tool_schemas", mode="before")
+    @classmethod
+    def _parse_tool_schemas(cls, attribute_value: JsonValue) -> tuple[ToolSchema, ...]:
+        return parse_tool_definitions(attribute_value)
+
+    @field_validator("generation_input", mode="before")
+    @classmethod
+    def _parse_generation_input(cls, attribute_value: JsonValue) -> GenerationInput:
+        return parse_generation_input(attribute_value)
+
+    @field_validator("output_messages", mode="before")
+    @classmethod
+    def _parse_output_messages(
+        cls, attribute_value: JsonValue
+    ) -> tuple[ExtractedOutputMessage, ...]:
+        return parse_output_messages(attribute_value)
 
 
-def extract_span_parameters(attributes: Mapping[str, object]) -> SpanParameterExtraction:
-    request_parameters = extract_request_parameters(attributes)
-    binding_parameters = extract_request_binding_parameters(request_parameters)
+def reconstruct_bound_llm(
+    parsed_span: ParsedChatSpan,
+    *,
+    llm: LLM,
+) -> BoundLLM[str, None]:
+    """Bind the provider-neutral request fields recorded by `parsed_span`.
 
-    if SYSTEM_INSTRUCTIONS in attributes:
-        system_prompt = parse_system_instructions(attributes[SYSTEM_INSTRUCTIONS])
-        if system_prompt:
-            binding_parameters["system_prompt"] = system_prompt
+    The returned `BoundLLM` does not apply `tool_schemas`, `output_type`, or `unapplied_request_parameters`.
 
-    if TOOL_DEFINITIONS in attributes:
-        tool_schemas = parse_tool_definitions(attributes[TOOL_DEFINITIONS])
-        if tool_schemas:
-            binding_parameters["tool_schemas"] = tool_schemas
+    Args:
+        parsed_span: The validated OTel chat span attribute object.
+        llm: The provider SDK client state and request-admission configuration.
 
-    generation_input = None
-    if INPUT_MESSAGES in attributes:
-        generation_input = parse_generation_input(attributes[INPUT_MESSAGES])
-
-    output_messages = None
-    if OUTPUT_MESSAGES in attributes:
-        output_messages = parse_output_messages(attributes[OUTPUT_MESSAGES])
-
-    return SpanParameterExtraction(
-        binding_parameters=binding_parameters,
-        request_parameters=request_parameters,
-        generation_input=generation_input,
-        output_messages=output_messages,
+    Raises:
+        ValueError: The provider name or model on `llm` differs from `parsed_span`.
+        ValueError: A parsed binding field is invalid for the adapter.
+    """
+    if llm.adapter.provider_name != parsed_span.provider_name:
+        raise ValueError(
+            f"LLM provider_name {llm.adapter.provider_name!r} differs from parsed span "
+            f"provider_name {parsed_span.provider_name!r}"
+        )
+    if llm.adapter.model != parsed_span.model:
+        raise ValueError(
+            f"LLM model {llm.adapter.model!r} differs from parsed span model {parsed_span.model!r}"
+        )
+    system_prompt = parsed_span.system_prompt or None
+    return llm.bind(
+        system_prompt=system_prompt,
+        max_completion_tokens=parsed_span.max_completion_tokens,
+        reasoning_level=parsed_span.reasoning_level,
+        temperature=parsed_span.temperature,
     )
 
 
-def extract_request_parameters(attributes: Mapping[str, object]) -> dict[str, object]:
-    request_parameters: dict[str, object] = {}
-    for attribute_name in attributes:
-        if not attribute_name.startswith("gen_ai.request."):
-            continue
-        if attribute_name in EXTRACTED_REQUEST_ATTRIBUTES:
-            request_parameters[attribute_name] = attributes[attribute_name]
-            continue
-        if attribute_name in IGNORED_REQUEST_ATTRIBUTES:
-            continue
-        raise ValueError(f"{attribute_name} is unsupported by langchaint's OTel request parser")
-    return request_parameters
-
-
-def extract_request_binding_parameters(
-    request_parameters: Mapping[str, object],
-) -> dict[str, object]:
-    binding_parameters: dict[str, object] = {}
-    if MAX_TOKENS in request_parameters:
-        binding_parameters["max_completion_tokens"] = validate_scalar_attribute(
-            MAX_TOKENS_ADAPTER,
-            MAX_TOKENS,
-            request_parameters[MAX_TOKENS],
-        )
-    if REASONING_LEVEL in request_parameters:
-        binding_parameters["reasoning_level"] = validate_scalar_attribute(
-            REASONING_LEVEL_ADAPTER,
-            REASONING_LEVEL,
-            request_parameters[REASONING_LEVEL],
-        )
-    if TEMPERATURE in request_parameters:
-        binding_parameters["temperature"] = validate_scalar_attribute(
-            TEMPERATURE_ADAPTER,
-            TEMPERATURE,
-            request_parameters[TEMPERATURE],
-        )
-    return binding_parameters
-
-
-def parse_system_instructions(attribute_value: object) -> tuple[TextPart, ...]:
+def parse_system_instructions(attribute_value: JsonValue) -> tuple[TextPart, ...]:
     parts = validate_structured_attribute(
         SYSTEM_INSTRUCTIONS_ADAPTER,
         SYSTEM_INSTRUCTIONS,
@@ -266,7 +301,7 @@ def parse_system_instructions(attribute_value: object) -> tuple[TextPart, ...]:
     return tuple(TextPart(text=part.content) for part in parts)
 
 
-def parse_tool_definitions(attribute_value: object) -> tuple[ToolSchema, ...]:
+def parse_tool_definitions(attribute_value: JsonValue) -> tuple[ToolSchema, ...]:
     definitions = validate_structured_attribute(
         TOOL_DEFINITIONS_ADAPTER,
         TOOL_DEFINITIONS,
@@ -282,7 +317,7 @@ def parse_tool_definitions(attribute_value: object) -> tuple[ToolSchema, ...]:
     )
 
 
-def parse_generation_input(attribute_value: object) -> GenerationInput:
+def parse_generation_input(attribute_value: JsonValue) -> GenerationInput:
     messages = validate_structured_attribute(
         INPUT_MESSAGES_ADAPTER,
         INPUT_MESSAGES,
@@ -291,7 +326,7 @@ def parse_generation_input(attribute_value: object) -> GenerationInput:
     return tuple(message_from_otel(message) for message in messages)
 
 
-def parse_output_messages(attribute_value: object) -> tuple[ExtractedOutputMessage, ...]:
+def parse_output_messages(attribute_value: JsonValue) -> tuple[ExtractedOutputMessage, ...]:
     messages = validate_structured_attribute(
         OUTPUT_MESSAGES_ADAPTER,
         OUTPUT_MESSAGES,
@@ -314,6 +349,18 @@ def message_from_otel(message: OtelInputMessage) -> Message:
             )
         case "assistant":
             return assistant_message_from_otel(message)
+        case "tool":
+            return tool_message_from_otel(message)
+
+
+def tool_message_from_otel(message: OtelToolMessage) -> ToolMessage:
+    part = message.parts[0]
+    content = (
+        part.response
+        if isinstance(part.response, str)
+        else tuple(content_part_from_otel(response_part) for response_part in part.response)
+    )
+    return ToolMessage(tool_call_id=part.id, content=content, is_error=part.is_error)
 
 
 def assistant_message_from_otel(message: OtelAssistantMessage) -> AssistantMessage:
@@ -346,23 +393,10 @@ def assistant_part_from_otel(part: OtelAssistantPart) -> TextPart | ToolCall:
             )
 
 
-def validate_scalar_attribute[ValueT](
-    adapter: TypeAdapter[ValueT],
-    attribute_name: str,
-    attribute_value: object,
-) -> ValueT:
-    try:
-        return adapter.validate_python(attribute_value)
-    except ValidationError as error:
-        raise ValueError(
-            f"{attribute_name} is outside langchaint's reconstructable OTel subset: {error}"
-        ) from error
-
-
 def validate_structured_attribute[ValueT](
     adapter: TypeAdapter[ValueT],
     attribute_name: str,
-    attribute_value: object,
+    attribute_value: JsonValue,
 ) -> ValueT:
     try:
         if isinstance(attribute_value, str):

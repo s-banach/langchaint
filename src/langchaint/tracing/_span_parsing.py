@@ -140,7 +140,7 @@ class OtelToolCallResponsePart(OtelModel):
 
     type: Literal["tool_call_response"]
     id: str
-    is_error: bool
+    is_error: bool = False
     response: OtelToolResponse
 
 

@@ -151,8 +151,8 @@ def test_parses_supported_span_values_and_preserves_unapplied_request_parameters
     )
 
 
-def test_parses_tool_response_content_parts_from_json_lists() -> None:
-    """Convert a JSON list response into ToolMessage content parts."""
+def test_parses_standard_tool_response_without_is_error() -> None:
+    """Use ToolMessage.is_error=False when a standard tool response omits is_error."""
     parsed_span = ParsedChatSpan.model_validate(
         _span_with({
             "gen_ai.input.messages": [
@@ -162,13 +162,8 @@ def test_parses_tool_response_content_parts_from_json_lists() -> None:
                         {
                             "type": "tool_call_response",
                             "id": "call-1",
-                            "is_error": False,
                             "response": [
                                 {"type": "text", "content": "result"},
-                                {
-                                    "type": "image_url",
-                                    "url": "https://example.com/image.png",
-                                },
                             ],
                         }
                     ],
@@ -180,10 +175,7 @@ def test_parses_tool_response_content_parts_from_json_lists() -> None:
     assert parsed_span.generation_input == (
         ToolMessage(
             tool_call_id="call-1",
-            content=(
-                TextPart(text="result"),
-                ImageUrlPart(url="https://example.com/image.png"),
-            ),
+            content=(TextPart(text="result"),),
             is_error=False,
         ),
     )
@@ -265,30 +257,11 @@ def test_decodes_foreign_inline_media_and_image_uris() -> None:
                             {
                                 "type": "tool_call_response",
                                 "id": "call-1",
-                                "response": "result",
-                            }
-                        ],
-                    }
-                ]
-            },
-            "is_error",
-        ),
-        (
-            {
-                "gen_ai.input.messages": [
-                    {
-                        "role": "tool",
-                        "parts": [
-                            {
-                                "type": "tool_call_response",
-                                "id": "call-1",
-                                "is_error": False,
                                 "response": "first",
                             },
                             {
                                 "type": "tool_call_response",
                                 "id": "call-2",
-                                "is_error": False,
                                 "response": "second",
                             },
                         ],

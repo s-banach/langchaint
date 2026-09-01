@@ -27,7 +27,6 @@ from langchaint import (
     ContentPart,
     ImagePart,
     ImageUrlPart,
-    InferenceParams,
     JsonValue,
     RawPart,
     ReasoningDelta,
@@ -714,7 +713,9 @@ def _binding(
     tool_schemas: tuple[ToolSchema, ...] = (),
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     tool_choice: ToolChoice = "auto",
-    inference_params: InferenceParams | None = None,
+    max_completion_tokens: int | None = None,
+    reasoning_level: str | None = None,
+    temperature: float | None = None,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
     """Assemble a binding with the fields these request tests vary."""
@@ -724,7 +725,9 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=True,
-        inference_params=inference_params if inference_params is not None else InferenceParams(),
+        max_completion_tokens=max_completion_tokens,
+        reasoning_level=reasoning_level,
+        temperature=temperature,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
@@ -825,14 +828,10 @@ def test_build_request_reports_a_raw_part_in_a_turn_as_invalid_request() -> None
     assert "no Chat Completions wire form" in request.reason
 
 
-def test_request_maps_the_inference_params_and_omits_the_unset() -> None:
+def test_request_maps_generation_fields_and_omits_the_unset() -> None:
     """Each set parameter lands on its wire field. Unset ones leave the omit sentinel."""
     fields_set = _adapter()._precompute_fields(
-        _binding(
-            inference_params=InferenceParams(
-                max_completion_tokens=5, temperature=0.2, reasoning_effort="high"
-            )
-        )
+        _binding(max_completion_tokens=5, temperature=0.2, reasoning_level="high")
     )
     assert fields_set.max_completion_tokens == 5
     assert fields_set.temperature == 0.2

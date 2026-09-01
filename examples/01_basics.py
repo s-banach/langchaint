@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from langchaint import InferenceParams, to_tables
+from langchaint import to_tables
 from langchaint.openai import OpenAI
 
 
@@ -17,7 +17,7 @@ class Sentiment(BaseModel):
 
 
 async def basics() -> None:
-    """Demonstrate text, structured, rebound, and batch generation.
+    """Demonstrate text generation, structured generation, `BoundLLM.bind()`, and batch generation.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
@@ -37,9 +37,9 @@ async def basics() -> None:
     classification = await classifier.generate_one("Best day I have had in months.")
     print(f"{classification.output.label}: {classification.output.confidence}")
 
-    detailed = assistant.rebind(
+    detailed = assistant.bind(
         system_prompt="Explain the answer in one paragraph.",
-        inference_params=InferenceParams(max_completion_tokens=2048),
+        max_completion_tokens=2048,
     )
     bridge = await detailed.generate_one("How does a suspension bridge carry load?")
     print(bridge.output)

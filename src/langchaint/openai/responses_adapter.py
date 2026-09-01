@@ -121,7 +121,6 @@ from langchaint.adapter import (
 )
 from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError
-from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
     ContentPart,
@@ -178,9 +177,7 @@ _UNPRICEABLE_OUTPUT_TYPES = frozenset({
 })
 
 
-def _wire_reasoning(
-    effort: ReasoningEffort | None, summary: ReasoningSummary | None
-) -> Reasoning | Omit:
+def _wire_reasoning(effort: str | None, summary: ReasoningSummary | None) -> Reasoning | Omit:
     """Assemble the reasoning object from the keys that are set, omitting it when neither is.
 
     `Reasoning` permits explicit `None`, which differs from omitting a key.
@@ -188,7 +185,11 @@ def _wire_reasoning(
     """
     reasoning: Reasoning = {}
     if effort is not None:
-        reasoning["effort"] = effort
+        # cast: `reasoning_level` deliberately exceeds the OpenAI SDK effort literal.
+        reasoning["effort"] = cast(
+            "Literal['high', 'low', 'max', 'medium', 'minimal', 'none', 'xhigh']",
+            effort,
+        )
     if summary is not None:
         reasoning["summary"] = summary
     return reasoning or omit
@@ -809,18 +810,12 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
             instructions=instructions,
             input_prefix=input_prefix,
             max_output_tokens=(
-                binding.inference_params.max_completion_tokens
-                if binding.inference_params.max_completion_tokens is not None
+                binding.max_completion_tokens
+                if binding.max_completion_tokens is not None
                 else omit
             ),
-            temperature=(
-                binding.inference_params.temperature
-                if binding.inference_params.temperature is not None
-                else omit
-            ),
-            reasoning=_wire_reasoning(
-                binding.inference_params.reasoning_effort, self.reasoning_summary
-            ),
+            temperature=(binding.temperature if binding.temperature is not None else omit),
+            reasoning=_wire_reasoning(binding.reasoning_level, self.reasoning_summary),
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,

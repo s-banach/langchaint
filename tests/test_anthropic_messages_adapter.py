@@ -36,7 +36,6 @@ from langchaint import (
     Billing,
     ImagePart,
     ImageUrlPart,
-    InferenceParams,
     Message,
     PydanticTool,
     RawPart,
@@ -908,7 +907,9 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=False,
-        inference_params=InferenceParams(reasoning_effort="high", temperature=temperature),
+        max_completion_tokens=None,
+        reasoning_level="high",
+        temperature=temperature,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
@@ -1147,7 +1148,7 @@ def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
     assert precomputed.message_mark_budget == 2
 
 
-def test_request_passes_widened_reasoning_effort_through() -> None:
+def test_request_passes_reasoning_level_through() -> None:
     """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
     binding = Binding(
         system_prompt=None,
@@ -1155,7 +1156,9 @@ def test_request_passes_widened_reasoning_effort_through() -> None:
         provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
-        inference_params=InferenceParams(reasoning_effort="minimal"),
+        max_completion_tokens=None,
+        reasoning_level="minimal",
+        temperature=None,
         automatic_cache_breakpoints=False,
     )
     precomputed_fields = _adapter()._precompute_fields(binding)
@@ -1163,15 +1166,17 @@ def test_request_passes_widened_reasoning_effort_through() -> None:
     assert precomputed_fields.thinking == {"type": "adaptive"}
 
 
-def test_request_omits_thinking_and_output_config_without_reasoning_effort() -> None:
-    """A None reasoning_effort leaves both output_config and thinking at the omit sentinel."""
+def test_request_omits_thinking_and_output_config_without_reasoning_level() -> None:
+    """A None reasoning_level leaves both output_config and thinking at the omit sentinel."""
     binding = Binding(
         system_prompt=None,
         tool_schemas=(),
         provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
-        inference_params=InferenceParams(),
+        max_completion_tokens=None,
+        reasoning_level=None,
+        temperature=None,
         automatic_cache_breakpoints=False,
     )
     precomputed_fields = _adapter()._precompute_fields(binding)

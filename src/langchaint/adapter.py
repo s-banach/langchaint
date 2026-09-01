@@ -14,7 +14,6 @@ from pydantic import BaseModel
 
 from langchaint.call import ResponseIdentity
 from langchaint.exceptions import TransientError
-from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
 from langchaint.pricing import ProviderBilling as ProviderBilling  # noqa: PLC0414
 from langchaint.shared_backoff import (
@@ -309,7 +308,9 @@ class Binding:
 
     tool_choice: ToolChoice
     parallel_tool_calls: bool
-    inference_params: InferenceParams
+    max_completion_tokens: int | None
+    reasoning_level: str | None
+    temperature: float | None
     automatic_cache_breakpoints: bool
     """Whether `automatic_cache_breakpoints` is enabled.
 

@@ -25,7 +25,6 @@ from langchaint.adapter import (
 )
 from langchaint.call import CallRecord, SettledAttemptRecord
 from langchaint.exceptions import AbandonedCallErrorRecord, StreamProtocolError, TransientError
-from langchaint.inference_params import InferenceParams
 from langchaint.messages import (
     AssistantMessage,
     AudioPart,
@@ -53,7 +52,9 @@ _PLAIN_TEXT_BINDING = Binding(
     provider_executed_tools=(),
     tool_choice="auto",
     parallel_tool_calls=True,
-    inference_params=InferenceParams(),
+    max_completion_tokens=None,
+    reasoning_level=None,
+    temperature=None,
     automatic_cache_breakpoints=True,
 )
 """The binding every invariant here binds under: text output and nothing else stated."""

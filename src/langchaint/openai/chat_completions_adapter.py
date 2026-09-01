@@ -123,7 +123,6 @@ from langchaint.adapter import (
 )
 from langchaint.call import ResponseIdentity
 from langchaint.exceptions import StreamProtocolError
-from langchaint.inference_params import ReasoningEffort
 from langchaint.messages import (
     AssistantMessage,
     ContentPart,
@@ -182,7 +181,7 @@ class _ChatCompletionsPrecomputedFields:
 
     max_completion_tokens: int | Omit
     temperature: float | Omit
-    reasoning_effort: ReasoningEffort | Omit
+    reasoning_effort: str | Omit
     tools: list[ChatCompletionFunctionToolParam] | Omit
     tool_choice: _WireToolChoice | Omit
     parallel_tool_calls: bool | Omit
@@ -768,19 +767,13 @@ class OpenAIChatCompletionsAdapter(_OpenAIGenerationAdapterBase):
             model=self.model,
             messages_prefix=messages_prefix,
             max_completion_tokens=(
-                binding.inference_params.max_completion_tokens
-                if binding.inference_params.max_completion_tokens is not None
+                binding.max_completion_tokens
+                if binding.max_completion_tokens is not None
                 else omit
             ),
-            temperature=(
-                binding.inference_params.temperature
-                if binding.inference_params.temperature is not None
-                else omit
-            ),
+            temperature=(binding.temperature if binding.temperature is not None else omit),
             reasoning_effort=(
-                binding.inference_params.reasoning_effort
-                if binding.inference_params.reasoning_effort is not None
-                else omit
+                binding.reasoning_level if binding.reasoning_level is not None else omit
             ),
             tools=tools,
             tool_choice=tool_choice,
@@ -1053,7 +1046,11 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
             messages=params.messages,
             max_completion_tokens=precomputed.max_completion_tokens,
             temperature=precomputed.temperature,
-            reasoning_effort=precomputed.reasoning_effort,
+            # cast: `reasoning_level` deliberately exceeds the OpenAI SDK effort literal.
+            reasoning_effort=cast(
+                "Literal['high', 'low', 'max', 'medium', 'minimal', 'none', 'xhigh'] | Omit",
+                precomputed.reasoning_effort,
+            ),
             tools=precomputed.tools,
             tool_choice=precomputed.tool_choice,
             parallel_tool_calls=precomputed.parallel_tool_calls,

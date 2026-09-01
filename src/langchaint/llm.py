@@ -44,7 +44,6 @@ from langchaint.exceptions import (
     TransientError,
     _terminal_error_record,
 )
-from langchaint.inference_params import InferenceParams
 from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.pricing import ProviderBilling
 from langchaint.response import (
@@ -78,7 +77,7 @@ class _StreamObservations(NamedTuple):
 
 
 class Unchanged:
-    """Sentinel type for an omitted `rebind` keyword."""
+    """Sentinel type for an omitted `bind` keyword."""
 
     def __repr__(self) -> str:
         """Render the default as `UNCHANGED` in signatures and `help()` output."""
@@ -203,7 +202,9 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
     provider_executed_tools: Sequence[Mapping[str, object]],
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
-    inference_params: InferenceParams,
+    max_completion_tokens: int | None,
+    reasoning_level: str | None,
+    temperature: float | None,
     automatic_cache_breakpoints: bool,
     extra_body: Mapping[str, object] | None,
 ) -> Binding:
@@ -225,7 +226,9 @@ def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
         provider_executed_tools=tuple(provider_executed_tools),
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
-        inference_params=inference_params,
+        max_completion_tokens=max_completion_tokens,
+        reasoning_level=reasoning_level,
+        temperature=temperature,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
@@ -297,7 +300,9 @@ class LLM:
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -312,7 +317,9 @@ class LLM:
         tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -327,7 +334,9 @@ class LLM:
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -342,7 +351,9 @@ class LLM:
         tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -356,7 +367,9 @@ class LLM:
         tools: ToolManager | ToolSequence | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
-        inference_params: InferenceParams | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
@@ -373,7 +386,10 @@ class LLM:
             tools: The application tools or an existing `ToolManager`.
             provider_executed_tools: The provider-shaped tool definitions executed by the provider.
             response_format: The pydantic model for structured output, or `None` for text.
-            inference_params: The inference parameters, or `None` for defaults.
+            max_completion_tokens: The maximum generated tokens, or `None` to let the adapter select the value.
+                `AnthropicMessagesAdapter` uses `default_max_completion_tokens` when this value is `None`.
+            reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
+            temperature: The sampling temperature, or `None` for the provider default.
             tool_choice: The provider-neutral tool choice.
             parallel_tool_calls: Whether the provider may request parallel tool calls.
             extra_body: Additional provider wire-body fields, or `None`.
@@ -387,6 +403,7 @@ class LLM:
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_attempts` is boolean or below one.
+            ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
@@ -398,9 +415,9 @@ class LLM:
             provider_executed_tools=provider_executed_tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
-            inference_params=(
-                inference_params if inference_params is not None else InferenceParams()
-            ),
+            max_completion_tokens=max_completion_tokens,
+            reasoning_level=reasoning_level,
+            temperature=temperature,
             automatic_cache_breakpoints=(
                 self.adapter.automatic_cache_breakpoints_default
                 if automatic_cache_breakpoints is None
@@ -505,7 +522,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         return self.response_format is not None and self._tool_manager is not None
 
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self,
         *,
         response_format: type[NewModelT],
@@ -514,13 +531,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManager]": ...
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self,
         *,
         response_format: type[NewModelT],
@@ -529,13 +548,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, None]": ...
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
@@ -544,13 +565,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[NewModelT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         response_format: None,
@@ -559,13 +582,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         response_format: None,
@@ -574,13 +599,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
@@ -589,13 +616,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[str, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -604,13 +633,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -619,13 +650,15 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "BoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -634,12 +667,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManagerT]": ...
-    def rebind(  # noqa: PLR0913 (rebind takes every field bind takes, each replaceable alone)
+    def bind(  # noqa: PLR0913 (each binding field can be replaced independently)
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
@@ -648,7 +683,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
-        inference_params: InferenceParams | Unchanged = UNCHANGED,
+        max_completion_tokens: int | None | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_attempts: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
@@ -665,7 +702,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             provider_executed_tools: The replacement provider-shaped tools or `UNCHANGED`.
             tool_choice: The replacement tool choice or `UNCHANGED`.
             parallel_tool_calls: The replacement parallel-tool setting or `UNCHANGED`.
-            inference_params: The replacement inference parameters or `UNCHANGED`.
+            max_completion_tokens: The replacement token limit, `None`, or `UNCHANGED`.
+            reasoning_level: The replacement exact provider string, `None`, or `UNCHANGED`.
+            temperature: The replacement sampling temperature, `None`, or `UNCHANGED`.
             extra_body: The replacement provider wire-body fields, `None`, or `UNCHANGED`.
             max_attempts: The replacement request limit or `UNCHANGED`.
             automatic_cache_breakpoints: The replacement automatic cache setting or `UNCHANGED`.
@@ -677,6 +716,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_attempts` is boolean or below one.
+            ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
@@ -700,9 +740,11 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             parallel_tool_calls=_resolved_replacement(
                 parallel_tool_calls, self.binding.parallel_tool_calls
             ),
-            inference_params=_resolved_replacement(
-                inference_params, self.binding.inference_params
+            max_completion_tokens=_resolved_replacement(
+                max_completion_tokens, self.binding.max_completion_tokens
             ),
+            reasoning_level=_resolved_replacement(reasoning_level, self.binding.reasoning_level),
+            temperature=_resolved_replacement(temperature, self.binding.temperature),
             automatic_cache_breakpoints=(
                 self.adapter.automatic_cache_breakpoints_default
                 if resolved_automatic_cache_breakpoints is None

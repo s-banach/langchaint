@@ -52,8 +52,7 @@ Request and response mappings:
 - The adapter uses the function name when the provider omits the id.
 - Replay sends the id only when it differs from the function name.
 - Same-name calls without provider ids share an id and match results by order.
-- `reasoning_effort="none"` sends `thinking_budget=0`.
-- Other values send uppercase `thinking_level` with `include_thoughts=True` and pass through unchanged.
+- `reasoning_level` sends the exact `thinking_level` string with `include_thoughts=True`.
 - The provider reports unsupported values through its own error.
 - `parallel_tool_calls=False` raises at bind because Gemini has no disabling field.
 - `MAX_TOKENS` maps to `"max_tokens"`, and refusal reasons map to `"refusal"`.
@@ -1238,12 +1237,15 @@ class GeminiGenerateContentAdapter(Adapter):
                 include_server_side_tool_invocations=True,
             )
         thinking_config: types.ThinkingConfig | None = None
-        reasoning_effort = binding.inference_params.reasoning_effort
-        if reasoning_effort == "none":
-            thinking_config = types.ThinkingConfig(thinking_budget=0)
-        elif reasoning_effort is not None:
+        if binding.reasoning_level is not None:
+            thinking_level = types.ThinkingLevel(binding.reasoning_level)
+            if thinking_level.value != binding.reasoning_level:
+                raise ValueError(
+                    f"reasoning_level {binding.reasoning_level!r} is not an exact Gemini value; "
+                    f"the Gemini SDK normalizes it to {thinking_level.value!r}"
+                )
             thinking_config = types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel(reasoning_effort.upper()),
+                thinking_level=thinking_level,
                 include_thoughts=True,
             )
         # `HttpOptions.extra_body` requires a `dict`, and the copied values retain their identities.
@@ -1252,8 +1254,8 @@ class GeminiGenerateContentAdapter(Adapter):
                 system_instruction=system_instruction,
                 tools=tools,
                 tool_config=tool_config,
-                temperature=binding.inference_params.temperature,
-                max_output_tokens=binding.inference_params.max_completion_tokens,
+                temperature=binding.temperature,
+                max_output_tokens=binding.max_completion_tokens,
                 thinking_config=thinking_config,
                 service_tier=(
                     types.ServiceTier(self.service_tier) if self.service_tier is not None else None

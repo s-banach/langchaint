@@ -314,6 +314,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
         assert span.attributes is not None
         assert dict(span.attributes) == {
             "gen_ai.operation.name": "chat",
+            "gen_ai.output.type": "text",
             "gen_ai.provider.name": "fake",
             "gen_ai.request.model": "fake-model",
             "gen_ai.response.model": "fake-model-served",
@@ -869,16 +870,69 @@ def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
 
 
 class _Answer(BaseModel):
-    """A response_format model for the rebind and covariance type checks."""
+    """A response_format model for the bind and covariance type checks."""
 
     value: int
 
 
-def test_rebind_stays_traced_and_shares_the_mapper() -> None:
-    """The rebound object stays traced: its generate and stream spans use the same custom mapper."""
+@pytest.mark.parametrize(
+    ("stream", "response_format", "output_type"),
+    [(False, None, "text"), (True, None, "text"), (False, _Answer, "json")],
+)
+def test_request_attributes_cover_generate_stream_and_structured_output(
+    *,
+    stream: bool,
+    response_format: type[_Answer] | None,
+    output_type: str,
+) -> None:
+    """Request attributes describe text, structured, and streaming calls."""
 
     async def scenario() -> None:
-        """Rebind, then generate and stream on the rebound object under a key-recording mapper."""
+        """Run the selected call and inspect its request attributes."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeAdapter(echo=True)),
+            tracer=tracer,
+            capture_message_content=False,
+        )
+        bound = traced.bind(
+            response_format=response_format,
+            max_completion_tokens=123,
+            reasoning_level="high",
+            temperature=0.25,
+        )
+        if response_format is not None:
+            with pytest.raises(GenerationError):
+                await bound.generate_one("hi")
+        elif stream:
+            async with bound.stream_one("hi") as handle:
+                await handle.final()
+        else:
+            await bound.generate_one("hi")
+
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        expected: dict[str, object] = {
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
+            "gen_ai.request.max_tokens": 123,
+            "gen_ai.request.reasoning.level": "high",
+            "gen_ai.request.temperature": 0.25,
+            "gen_ai.output.type": output_type,
+        }
+        if stream:
+            expected["gen_ai.request.stream"] = True
+        assert {key: span.attributes[key] for key in expected} == expected
+        assert ("gen_ai.request.stream" in span.attributes) is stream
+
+    asyncio.run(scenario())
+
+
+def test_bind_stays_traced_and_shares_the_mapper() -> None:
+    """The replacement object stays traced and uses the same custom mapper."""
+
+    async def scenario() -> None:
+        """Generate and stream on a replacement object under a key-recording mapper."""
         keys_seen: list[frozenset[str]] = []
 
         def _mapper(_result: CallResult[object]) -> SpanAttributes:
@@ -893,10 +947,10 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
             tracer=tracer,
             capture_message_content=False,
         )
-        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
-        assert_type(rebound, TracedBoundLLM[str])
-        await rebound.generate_one("hi")
-        async with rebound.stream_one("hi") as stream:
+        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
+        assert_type(replacement_bound, TracedBoundLLM[str])
+        await replacement_bound.generate_one("hi")
+        async with replacement_bound.stream_one("hi") as stream:
             async for _item in stream:
                 pass
             await stream.final()
@@ -904,6 +958,9 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
         # gen_ai.operation.name is the wrapper's required attribute, outside the mapper's control.
         assert generate_span.attributes == {
             "gen_ai.operation.name": "chat",
+            "gen_ai.output.type": "text",
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
             "custom.mapped": True,
         }
         assert stream_span.attributes is not None
@@ -914,7 +971,7 @@ def test_rebind_stays_traced_and_shares_the_mapper() -> None:
     asyncio.run(scenario())
 
 
-def test_traced_bind_and_rebind_forward_binding_options() -> None:
+def test_traced_initial_and_replacement_bind_forward_binding_options() -> None:
     """Forward binding options through initial, omitted, replacement, and clearing values."""
     extra_body = {"safety_identifier": "user-7"}
     provider_tool = {"type": "web_search"}
@@ -927,44 +984,59 @@ def test_traced_bind_and_rebind_forward_binding_options() -> None:
         extra_body=extra_body,
         provider_executed_tools=[provider_tool],
         automatic_cache_breakpoints=True,
+        max_completion_tokens=100,
+        reasoning_level="HIGH",
+        temperature=0.2,
         max_attempts=2,
     )
     assert bound.binding.extra_body is extra_body
     assert bound.binding.provider_executed_tools == (provider_tool,)
     assert bound.binding.provider_executed_tools[0] is provider_tool
     assert bound.binding.automatic_cache_breakpoints is True
+    assert bound.binding.max_completion_tokens == 100
+    assert bound.binding.reasoning_level == "HIGH"
+    assert bound.binding.temperature == 0.2
     assert bound.max_attempts == 2
 
-    kept = bound.rebind()
+    kept = bound.bind()
     assert kept.binding.extra_body is extra_body
     assert kept.binding.provider_executed_tools[0] is provider_tool
     assert kept.binding.automatic_cache_breakpoints is True
+    assert kept.binding.max_completion_tokens == 100
+    assert kept.binding.reasoning_level == "HIGH"
+    assert kept.binding.temperature == 0.2
     assert kept.max_attempts == 2
 
     replacement = {"safety_identifier": "user-8"}
     replacement_tool = {"type": "file_search"}
-    replaced = bound.rebind(
+    replaced = bound.bind(
         extra_body=replacement,
         provider_executed_tools=[replacement_tool],
         automatic_cache_breakpoints=None,
+        max_completion_tokens=None,
+        reasoning_level="LOW",
+        temperature=0.8,
         max_attempts=4,
     )
     assert replaced.binding.extra_body is replacement
     assert replaced.binding.provider_executed_tools == (replacement_tool,)
     assert replaced.binding.provider_executed_tools[0] is replacement_tool
     assert replaced.binding.automatic_cache_breakpoints is False
+    assert replaced.binding.max_completion_tokens is None
+    assert replaced.binding.reasoning_level == "LOW"
+    assert replaced.binding.temperature == 0.8
     assert replaced.max_attempts == 4
 
-    cleared = bound.rebind(extra_body=None, provider_executed_tools=())
+    cleared = bound.bind(extra_body=None, provider_executed_tools=())
     assert cleared.binding.extra_body is None
     assert cleared.binding.provider_executed_tools == ()
 
 
-def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
+def test_custom_attribute_mapper_replaces_default_result_attributes() -> None:
     """A custom attribute_mapper replaces default result attributes."""
 
     async def scenario() -> None:
-        """Generate under a two-key mapper and assert the span carries those two plus the required one."""
+        """Generate under a two-key mapper and inspect the wrapper and mapper attributes."""
 
         def _mapper(result: CallResult[object]) -> SpanAttributes:
             """Emit two fixed attributes drawn from the result."""
@@ -981,6 +1053,9 @@ def test_custom_attribute_mapper_emits_exactly_its_keys() -> None:
         (span,) = exporter.get_finished_spans()
         assert span.attributes == {
             "gen_ai.operation.name": "chat",
+            "gen_ai.output.type": "text",
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
             "custom.model": "fake-model",
             "custom.attempts": 1,
         }
@@ -1143,11 +1218,11 @@ def _bind_overload_pin() -> None:
         TracedBoundLLM[str, ToolManager],
     )
     assert_type(
-        structured.rebind(tools=[_echo_tool()]),
+        structured.bind(tools=[_echo_tool()]),
         TracedBoundLLM[_Answer, ToolManager],
     )
-    assert_type(structured.rebind(tools=tool_manager), TracedBoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(tools=None), TracedBoundLLM[_Answer])
+    assert_type(structured.bind(tools=tool_manager), TracedBoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.bind(tools=None), TracedBoundLLM[_Answer])
 
 
 async def _generate_many_records_overload_pin() -> None:
@@ -1217,11 +1292,10 @@ def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() ->
     asyncio.run(scenario())
 
 
-def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans() -> None:
-    """extra_attributes pass through rebind and land on the stream span and each batch item's span."""
+def test_extra_attributes_survive_bind_and_reach_stream_and_batch_item_spans() -> None:
+    """extra_attributes pass through bind and land on the stream span and each batch item's span."""
 
     async def scenario() -> None:
-        """Rebind, then stream and batch under one extra_attributes mapping. Every span carries it."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
             LLM(
@@ -1232,10 +1306,13 @@ def test_extra_attributes_survive_rebind_and_reach_stream_and_batch_item_spans()
             tracer=tracer,
             capture_message_content=False,
         )
-        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
-        async with rebound.stream_one("hi") as stream:
+        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
+        async with replacement_bound.stream_one("hi") as stream:
             await stream.final()
-        await rebound.generate_many([[UserMessage(content="a")], [UserMessage(content="b")]])
+        await replacement_bound.generate_many([
+            [UserMessage(content="a")],
+            [UserMessage(content="b")],
+        ])
         spans = exporter.get_finished_spans()
         # One stream span plus one per batch item.
         assert len(spans) == 3
@@ -1501,19 +1578,19 @@ def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
     asyncio.run(scenario())
 
 
-def test_traced_bind_and_rebind_preserve_tool_manager() -> None:
-    """`TracedLLM.bind` and `TracedBoundLLM.rebind` preserve `tools=ToolManager(...)`."""
+def test_traced_initial_and_replacement_bind_preserve_tool_manager() -> None:
+    """`TracedLLM.bind` and `TracedBoundLLM.bind` preserve `tools=ToolManager(...)`."""
     traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
     bound_tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
     bound = traced.bind(tools=bound_tool_manager)
     assert bound.tool_manager is bound_tool_manager
-    rebound_tool_manager = ToolManager([_echo_tool()])
-    rebound = bound.rebind(tools=rebound_tool_manager)
-    assert rebound.tool_manager is rebound_tool_manager
+    replacement_tool_manager = ToolManager([_echo_tool()])
+    replacement_bound = bound.bind(tools=replacement_tool_manager)
+    assert replacement_bound.tool_manager is replacement_tool_manager
 
 
-def test_traced_bind_and_rebind_sequences_construct_traced_tool_managers() -> None:
-    """`TracedLLM.bind` and `TracedBoundLLM.rebind` construct `TracedToolManager` from sequences."""
+def test_traced_bind_sequences_construct_traced_tool_managers() -> None:
+    """`TracedLLM.bind` and `TracedBoundLLM.bind` construct `TracedToolManager` from sequences."""
 
     async def scenario() -> None:
         tracer, exporter = _in_memory_tracer()
@@ -1524,14 +1601,14 @@ def test_traced_bind_and_rebind_sequences_construct_traced_tool_managers() -> No
             capture_message_content=True,
         )
         bound = traced.bind(tools=[_echo_tool()])
-        rebound = bound.rebind(tools=[_echo_tool()])
+        replacement_bound = bound.bind(tools=[_echo_tool()])
         assert isinstance(bound.tool_manager, TracedToolManager)
-        assert isinstance(rebound.tool_manager, TracedToolManager)
-        assert rebound.tool_manager is not bound.tool_manager
+        assert isinstance(replacement_bound.tool_manager, TracedToolManager)
+        assert replacement_bound.tool_manager is not bound.tool_manager
         await bound.tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
         )
-        await rebound.tool_manager.dispatch(
+        await replacement_bound.tool_manager.dispatch(
             ToolCall(id="call2", name="echo", args_json='{"text": "b"}')
         )
         spans = exporter.get_finished_spans()
@@ -1841,8 +1918,11 @@ def _emitted_convention_keys() -> set[str]:
     return set(re.findall(r'"(gen_ai\.[a-z_.]+)"', source))
 
 
-def test_emitted_convention_keys_are_defined_at_the_pinned_revision() -> None:
-    """Each emitted convention key exists in the installed conventions."""
+_SEMANTIC_CONVENTIONS_GENAI_KEYS = {"gen_ai.request.reasoning.level"}
+
+
+def test_emitted_convention_keys_are_installed_or_explicitly_sourced() -> None:
+    """Each emitted convention key exists in an OTel convention source."""
     defined = {
         value
         for name, value in vars(gen_ai_semconv).items()
@@ -1850,7 +1930,7 @@ def test_emitted_convention_keys_are_defined_at_the_pinned_revision() -> None:
     }
     emitted = _emitted_convention_keys()
     assert emitted, "the source scan found no keys, so this assertion would pass vacuously"
-    assert emitted <= defined
+    assert emitted <= defined | _SEMANTIC_CONVENTIONS_GENAI_KEYS
     assert error_semconv.ERROR_TYPE == "error.type"
 
 
@@ -2457,15 +2537,15 @@ def test_the_stream_span_captures_input_at_start_and_output_at_final() -> None:
     asyncio.run(scenario())
 
 
-def test_capture_survives_rebind_and_reaches_the_rebound_binding() -> None:
-    """Rebind carries capture_message_content through, so a rebound object cannot silently lose it."""
+def test_capture_survives_bind_and_reaches_the_replacement_binding() -> None:
+    """A replacement object retains capture_message_content."""
 
     async def scenario() -> None:
-        """Rebind a captured binding and confirm the new one still captures."""
+        """Replace a captured binding and confirm the new one still captures."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        rebound = traced.bind(system_prompt="s").rebind(system_prompt="s2")
-        await rebound.generate_one("hi")
+        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
+        await replacement_bound.generate_one("hi")
         assert _captured(exporter, "gen_ai.system_instructions") == [
             {"type": "text", "content": "s2"}
         ]

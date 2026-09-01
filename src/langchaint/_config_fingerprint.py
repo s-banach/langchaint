@@ -13,7 +13,6 @@ import pydantic
 from pydantic import BaseModel
 
 from langchaint.adapter import Adapter, AllowedToolsChoice, Binding, SpecificToolChoice
-from langchaint.inference_params import InferenceParams
 from langchaint.messages import Message
 from langchaint.tools import ToolSchema
 
@@ -142,8 +141,6 @@ class _Canonicalizer:
             return self._scalar(value, path=path)
         if isinstance(value, Binding):
             return self._binding(value, path=path)
-        if isinstance(value, InferenceParams):
-            return self._inference_params(value, path=path)
         if isinstance(value, ToolSchema):
             return self._tool_schema(value, path=path)
         if isinstance(value, SpecificToolChoice):
@@ -189,27 +186,15 @@ class _Canonicalizer:
             self._field(path, "provider_executed_tools", binding.provider_executed_tools),
             self._field(path, "tool_choice", binding.tool_choice),
             self._field(path, "parallel_tool_calls", binding.parallel_tool_calls),
-            self._field(path, "inference_params", binding.inference_params),
+            self._field(path, "max_completion_tokens", binding.max_completion_tokens),
+            self._field(path, "reasoning_level", binding.reasoning_level),
+            self._field(path, "temperature", binding.temperature),
             self._field(
                 path,
                 "automatic_cache_breakpoints",
                 binding.automatic_cache_breakpoints,
             ),
             self._field(path, "extra_body", binding.extra_body),
-        ]
-
-    def _inference_params(
-        self, inference_params: InferenceParams, *, path: str
-    ) -> _CanonicalValue:
-        return [
-            "InferenceParams",
-            self._field(
-                path,
-                "max_completion_tokens",
-                inference_params.max_completion_tokens,
-            ),
-            self._field(path, "reasoning_effort", inference_params.reasoning_effort),
-            self._field(path, "temperature", inference_params.temperature),
         ]
 
     def _tool_schema(self, tool_schema: ToolSchema, *, path: str) -> _CanonicalValue:

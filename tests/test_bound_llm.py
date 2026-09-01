@@ -631,35 +631,35 @@ class _FakeBoundAdapter(BoundAdapter[str]):
 
 
 class _FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
-    """A structured bound adapter for response_format rebind tests. It never generates.
+    """A structured bound adapter for response_format replacement tests. It never generates.
 
-    The rebind tests check binding identity and the switched content type.
+    The replacement tests check binding identity and the switched content type.
     open_stream stays unreachable.
     """
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
-        """Unreachable: response_format rebind tests do not generate."""
+        """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
     @override
     def identity_from_raw(self, raw: BaseModel, *, request_id: str | None) -> ResponseIdentity:
-        """Unreachable: response_format rebind tests do not generate."""
+        """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT]:
-        """Unreachable: response_format rebind tests do not generate."""
+        """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
     @override
     def build_request(self, messages: Sequence[Message]) -> RequestParams:
-        """Unreachable: response_format rebind tests do not generate."""
+        """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
     @override
     async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Unreachable: response_format rebind tests do not generate."""
+        """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
 
@@ -797,12 +797,12 @@ def test_llm_rejects_invalid_max_attempts() -> None:
             )
 
 
-def test_rebind_rejects_invalid_max_attempts() -> None:
+def test_bind_rejects_invalid_max_attempts() -> None:
     """Reject replacement `max_attempts` values below one and boolean values."""
     bound_llm = LLM(_FakeAdapter(), shared_backoff=_fast_shared_backoff()).bind()
     for max_attempts in (True, False, 0, -1):
         with pytest.raises(ValueError, match="max_attempts"):
-            _ = bound_llm.rebind(max_attempts=max_attempts)
+            _ = bound_llm.bind(max_attempts=max_attempts)
 
 
 def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_record() -> None:
@@ -1545,21 +1545,21 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
     [(UNCHANGED, "s", True), ("s2", "s2", False)],
     ids=["all_unchanged", "changed_field"],
 )
-def test_rebind_builds_a_new_bound_adapter_whether_or_not_the_binding_changed(
+def test_bind_builds_a_new_bound_adapter_whether_or_not_the_binding_changed(
     new_system_prompt: str | Unchanged, expected_system_prompt: str, *, binding_is_equal: bool
 ) -> None:
-    """A rebind always binds again. The Binding is what tracks whether a field actually changed."""
+    """A bind always binds again. The Binding is what tracks whether a field actually changed."""
     adapter = _FakeAdapter()
     bound_llm = LLM(adapter).bind(system_prompt="s")
-    rebound = bound_llm.rebind(system_prompt=new_system_prompt)
-    assert (rebound.binding == bound_llm.binding) is binding_is_equal
-    assert rebound.binding.system_prompt == expected_system_prompt
-    assert rebound._bound_adapter is not bound_llm._bound_adapter
+    replacement_bound = bound_llm.bind(system_prompt=new_system_prompt)
+    assert (replacement_bound.binding == bound_llm.binding) is binding_is_equal
+    assert replacement_bound.binding.system_prompt == expected_system_prompt
+    assert replacement_bound._bound_adapter is not bound_llm._bound_adapter
     assert len(adapter.bound_adapters) == 2
 
 
 class _Answer(BaseModel):
-    """A response_format model for the rebind content-type tests."""
+    """A response_format model for the replacement content-type tests."""
 
     value: int
 
@@ -1641,34 +1641,34 @@ def test_allowed_tools_choice_rejects_an_unbound_name_before_adapter_binding() -
     assert adapter.bound_adapters == []
 
 
-def test_rebind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
+def test_bind_reuses_tool_schemas_when_tools_are_unchanged() -> None:
     """Changing only tool_choice preserves the converted tool definitions by identity."""
     tool = _SchemaOnceTool()
     bound = LLM(_FakeAdapter()).bind(tools=[tool])
-    rebound = bound.rebind(
+    replacement_bound = bound.bind(
         tool_choice=AllowedToolsChoice(mode="required", tool_names=(tool.name,))
     )
     assert tool.schema_calls == 1
-    assert rebound.tool_manager is bound.tool_manager
-    assert rebound.binding.tool_schemas is bound.binding.tool_schemas
+    assert replacement_bound.tool_manager is bound.tool_manager
+    assert replacement_bound.binding.tool_schemas is bound.binding.tool_schemas
 
 
-def test_rebind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
+def test_bind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
     """Omission preserves the output type, while a value selects structured or text binding."""
     adapter = _FakeAdapter()
     text = LLM(adapter).bind(system_prompt="s")
-    same = text.rebind()
+    same = text.bind()
     assert_type(same, BoundLLM[str])
-    structured = text.rebind(response_format=_Answer)
+    structured = text.bind(response_format=_Answer)
     assert_type(structured, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 1
     assert structured.binding == text.binding
     assert structured._bound_adapter is not text._bound_adapter
-    rebound = structured.rebind(system_prompt="s2")
-    assert_type(rebound, BoundLLM[_Answer])
+    replacement_bound = structured.bind(system_prompt="s2")
+    assert_type(replacement_bound, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 2
-    assert rebound._bound_adapter is not structured._bound_adapter
-    text_again = structured.rebind(response_format=None)
+    assert replacement_bound._bound_adapter is not structured._bound_adapter
+    text_again = structured.bind(response_format=None)
     assert_type(text_again, BoundLLM[str])
     assert len(adapter.bound_adapters) == 3
     assert text_again._bound_adapter is not structured._bound_adapter
@@ -1687,7 +1687,7 @@ def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
     assert LLM(_FakeAdapter()).bind(tools=tool_manager).tool_manager is tool_manager
 
 
-def test_duplicate_tool_names_fail_before_bind_and_rebind_reach_the_adapter() -> None:
+def test_duplicate_tool_names_fail_before_initial_and_replacement_bind_reach_adapter() -> None:
     """Duplicate tool names fail before either adapter-binding route."""
     adapter = _FakeAdapter()
     duplicate = _capture_tool()
@@ -1696,24 +1696,24 @@ def test_duplicate_tool_names_fail_before_bind_and_rebind_reach_the_adapter() ->
     assert adapter.bound_adapters == []
     bound = LLM(adapter).bind()
     with pytest.raises(ValueError, match="duplicate tool name"):
-        _ = bound.rebind(tools=[duplicate, duplicate])
+        _ = bound.bind(tools=[duplicate, duplicate])
     assert len(adapter.bound_adapters) == 1
 
 
-def test_rebind_tools_replace_the_manager_and_none_removes_it() -> None:
-    """`BoundLLM.rebind(tools=[...])` replaces `ToolManager`. `tools=None` removes it."""
+def test_bind_tools_replace_the_manager_and_none_removes_it() -> None:
+    """`BoundLLM.bind(tools=[...])` replaces `ToolManager`. `tools=None` removes it."""
     original = _capture_tool("original")
     replacement = _capture_tool("replacement")
     bound = LLM(_FakeAdapter()).bind(tools=[original])
-    rebound = bound.rebind(tools=[replacement])
-    assert rebound.tool_manager is not bound.tool_manager
-    assert rebound.tool_manager.schemas() == (replacement.schema(),)
-    assert rebound.rebind(tools=None).tool_manager is None
+    replacement_bound = bound.bind(tools=[replacement])
+    assert replacement_bound.tool_manager is not bound.tool_manager
+    assert replacement_bound.tool_manager.schemas() == (replacement.schema(),)
+    assert replacement_bound.bind(tools=None).tool_manager is None
     tool_manager = ToolManager([replacement])
-    assert bound.rebind(tools=tool_manager).tool_manager is tool_manager
+    assert bound.bind(tools=tool_manager).tool_manager is tool_manager
 
 
-def _pin_bind_and_rebind_types(llm: LLM, tool_manager: ToolManager) -> None:
+def _pin_initial_and_replacement_bind_types(llm: LLM, tool_manager: ToolManager) -> None:
     text = llm.bind()
     assert_type(text, BoundLLM[str, None])
     text_with_constructed_tools = llm.bind(tools=[_capture_tool()])
@@ -1735,7 +1735,7 @@ def _pin_bind_and_rebind_types(llm: LLM, tool_manager: ToolManager) -> None:
     )
     assert_type(text_with_provider_tool, BoundLLM[str, None])
     assert_type(
-        structured.rebind(provider_executed_tools=provider_tool),
+        structured.bind(provider_executed_tools=provider_tool),
         BoundLLM[_Answer, None],
     )
 
@@ -1745,13 +1745,13 @@ def _pin_bind_and_rebind_types(llm: LLM, tool_manager: ToolManager) -> None:
     assert_type(text_with_tools.tool_manager, ToolManager)
     assert_type(text.tool_manager, None)
 
-    rebound_with_tool_manager = structured.rebind(tools=tool_manager)
-    assert_type(rebound_with_tool_manager, BoundLLM[_Answer, ToolManager])
-    assert_type(structured.rebind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(tools=None), BoundLLM[_Answer, None])
-    assert_type(text_with_tools.rebind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.rebind(response_format=None), BoundLLM[str, ToolManager])
-    assert_type(structured_with_tools.rebind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
+    replacement_with_tool_manager = structured.bind(tools=tool_manager)
+    assert_type(replacement_with_tool_manager, BoundLLM[_Answer, ToolManager])
+    assert_type(structured.bind(tools=[_capture_tool()]), BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.bind(tools=None), BoundLLM[_Answer, None])
+    assert_type(text_with_tools.bind(response_format=_Answer), BoundLLM[_Answer, ToolManager])
+    assert_type(structured_with_tools.bind(response_format=None), BoundLLM[str, ToolManager])
+    assert_type(structured_with_tools.bind(system_prompt="s"), BoundLLM[_Answer, ToolManager])
 
 
 async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) -> None:
@@ -1788,14 +1788,14 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
 
 
-def test_response_format_is_a_public_field_bind_and_rebind_carry_it() -> None:
-    """response_format is public inspectable state that bind sets and rebind carries and switches."""
+def test_response_format_is_public_state_that_replacement_bind_carries() -> None:
+    """response_format is inspectable state that replacement bindings carry and switch."""
     adapter = _FakeAdapter()
     assert LLM(adapter).bind().response_format is None
     structured = LLM(adapter).bind(response_format=_Answer)
     assert structured.response_format is _Answer
-    assert structured.rebind(system_prompt="s2").response_format is _Answer
-    assert structured.rebind(response_format=None).response_format is None
+    assert structured.bind(system_prompt="s2").response_format is _Answer
+    assert structured.bind(response_format=None).response_format is None
 
 
 def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> None:
@@ -2005,10 +2005,10 @@ def test_automatic_cache_breakpoints_participates_in_binding_equality() -> None:
     """`automatic_cache_breakpoints` participates in `Binding` equality."""
     adapter = _FakeAdapter()
     bound_llm = LLM(adapter).bind(automatic_cache_breakpoints=True)
-    flipped = bound_llm.rebind(automatic_cache_breakpoints=False)
+    flipped = bound_llm.bind(automatic_cache_breakpoints=False)
     assert flipped.binding != bound_llm.binding
     assert flipped._bound_adapter is not bound_llm._bound_adapter
-    unchanged = bound_llm.rebind(automatic_cache_breakpoints=True)
+    unchanged = bound_llm.bind(automatic_cache_breakpoints=True)
     assert unchanged.binding == bound_llm.binding
     assert unchanged._bound_adapter is not bound_llm._bound_adapter
 
@@ -2026,7 +2026,7 @@ def test_bind_resolves_automatic_cache_breakpoints_default(*, default_value: boo
 
 
 @pytest.mark.parametrize("default_value", [False, True])
-def test_rebind_omission_preserves_and_none_resets_automatic_cache_breakpoints(
+def test_bind_omission_preserves_and_none_resets_automatic_cache_breakpoints(
     *, default_value: bool
 ) -> None:
     """Omission preserves the value. None resolves `automatic_cache_breakpoints_default`."""
@@ -2034,29 +2034,29 @@ def test_rebind_omission_preserves_and_none_resets_automatic_cache_breakpoints(
     bound = LLM(_FakeAdapter(automatic_cache_breakpoints_default=default_value)).bind(
         automatic_cache_breakpoints=override_value
     )
-    assert bound.rebind().binding.automatic_cache_breakpoints is override_value
+    assert bound.bind().binding.automatic_cache_breakpoints is override_value
     assert (
-        bound.rebind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
+        bound.bind(automatic_cache_breakpoints=None).binding.automatic_cache_breakpoints
         is default_value
     )
 
 
-def test_bind_and_rebind_carry_extra_body_by_reference() -> None:
-    """LLM.bind puts extra_body on the Binding unchanged. rebind keeps, replaces, or clears it."""
+def test_initial_and_replacement_bind_carry_extra_body_by_reference() -> None:
+    """LLM.bind stores extra_body unchanged. BoundLLM.bind keeps, replaces, or clears it."""
     adapter = _FakeAdapter()
     extra_body = {"safety_identifier": "user-7"}
     bound_llm = LLM(adapter).bind(extra_body=extra_body)
     assert bound_llm.binding.extra_body is extra_body
-    assert bound_llm.rebind(system_prompt="s").binding.extra_body is extra_body
+    assert bound_llm.bind(system_prompt="s").binding.extra_body is extra_body
     replacement = {"safety_identifier": "user-8"}
-    assert bound_llm.rebind(extra_body=replacement).binding.extra_body is replacement
-    assert bound_llm.rebind(extra_body=None).binding.extra_body is None
+    assert bound_llm.bind(extra_body=replacement).binding.extra_body is replacement
+    assert bound_llm.bind(extra_body=None).binding.extra_body is None
 
 
 def test_config_fingerprint_has_a_fixed_digest() -> None:
     """Pin the canonical encoding and SHA-256 result for the default fake binding."""
     fingerprint = LLM(_FakeAdapter()).bind().config_fingerprint()
-    assert fingerprint == "sha256:b96483ff927dc5b7d0336344ee64681913aae3d15e7f306e5095a7d2262c674a"
+    assert fingerprint == "sha256:5ed4b01ba8c91b5caf398531228f76e30777147deade680d3b1d9379dad2031b"
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
@@ -2125,18 +2125,18 @@ def test_config_fingerprint_reads_binding_values_and_captures_adapter_values() -
     adapter.automatic_cache_breakpoints_default = True
     assert initial != after_binding_mutation
     assert after_binding_mutation == bound.config_fingerprint()
-    assert after_binding_mutation != bound.rebind().config_fingerprint()
+    assert after_binding_mutation != bound.bind().config_fingerprint()
 
 
-def test_config_fingerprint_tracks_response_format_and_rebind() -> None:
-    """Structured response configuration and rebound fields participate."""
+def test_config_fingerprint_tracks_response_format_and_bind() -> None:
+    """Structured response configuration and replacement fields participate."""
     text = LLM(_FakeAdapter()).bind()
     answer = LLM(_FakeAdapter()).bind(response_format=_Answer)
     other_answer = LLM(_FakeAdapter()).bind(response_format=_OtherAnswer)
-    rebound = answer.rebind(system_prompt="changed")
+    replacement_bound = answer.bind(system_prompt="changed")
     assert text.config_fingerprint() != answer.config_fingerprint()
     assert answer.config_fingerprint() != other_answer.config_fingerprint()
-    assert answer.config_fingerprint() != rebound.config_fingerprint()
+    assert answer.config_fingerprint() != replacement_bound.config_fingerprint()
 
 
 def test_config_fingerprint_excludes_retry_admission_and_tool_functions() -> None:
@@ -2227,8 +2227,8 @@ def test_config_fingerprint_captures_the_response_schema_during_binding() -> Non
         _ = _MutableSchemaAnswer.model_rebuild(force=True)
 
 
-def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
-    """Rebind preserves omitted tools and removes them with an empty tuple."""
+def test_bind_keeps_replaces_and_removes_provider_executed_tools() -> None:
+    """Preserve omitted provider_executed_tools and replace or clear specified values."""
     first_tool = {"type": "web_search"}
     second_tool = {"type": "file_search", "vector_store_ids": ["vs_1"]}
     bound = LLM(_FakeAdapter()).bind(
@@ -2236,11 +2236,11 @@ def test_rebind_keeps_replaces_and_removes_provider_executed_tools() -> None:
         max_attempts=5,
     )
     assert bound.binding.provider_executed_tools == (first_tool,)
-    assert bound.rebind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
-    replaced = bound.rebind(provider_executed_tools=(second_tool,))
+    assert bound.bind(system_prompt="s").binding.provider_executed_tools == (first_tool,)
+    replaced = bound.bind(provider_executed_tools=(second_tool,))
     assert replaced.binding.provider_executed_tools == (second_tool,)
     assert replaced.max_attempts == 5
-    assert bound.rebind(provider_executed_tools=()).binding.provider_executed_tools == ()
+    assert bound.bind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
 def test_generate_many_aligns_results_with_inputs() -> None:
@@ -2498,7 +2498,7 @@ def test_generate_many_records_replaces_a_changed_binding_or_identity_mode(tmp_p
         position_bound = LLM(adapter).bind()
         resume_path = tmp_path / "records.json"
         await position_bound.generate_many_records(["a"], resume_path=resume_path)
-        changed_bound = position_bound.rebind(system_prompt="changed")
+        changed_bound = position_bound.bind(system_prompt="changed")
         await changed_bound.generate_many_records(["a"], resume_path=resume_path)
         await changed_bound.generate_many_records(
             ["a"], resume_path=resume_path, sample_ids=["sample-a"]

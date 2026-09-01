@@ -15,13 +15,15 @@ Restored records open no span.
 
 Each traced class requires `capture_message_content` because prompt recording is a privacy choice.
 `extra_attributes` sets constant attributes when each span starts.
-Completion attributes replace matching `extra_attributes` keys.
+Request and completion attributes replace matching `extra_attributes` keys.
 Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
 They report provider, request model, response model, finish reasons, token usage, attempts, and cost.
+They report the standard attributes for each set request field.
+They report `gen_ai.output.type` for every call.
 With capture enabled, they report system instructions, tool definitions, input messages, and output messages.
-Stream spans also report `gen_ai.response.time_to_first_chunk`.
+Stream spans also report `gen_ai.request.stream=True` and `gen_ai.response.time_to_first_chunk`.
 Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
 Agent spans use `gen_ai.operation.name="invoke_agent"` and report agent name and `langchaint.agent_path`.
@@ -37,7 +39,8 @@ A mapper may set only attribute names and values.
 A mapper cannot change the span name, kind, or status.
 Mapper failures are logged and never propagate.
 
-Attribute names match opentelemetry-semantic-conventions 0.64b0.
+Attribute names except `gen_ai.request.reasoning.level` match opentelemetry-semantic-conventions 0.64b0.
+`gen_ai.request.reasoning.level` comes from the OpenTelemetry semantic-conventions-genai repository.
 `GenAiOperationNameValues.CHAT`, `.EXECUTE_TOOL`, and `.INVOKE_AGENT` define the operation values.
 Tool identity uses `gen_ai.tool.name` and `gen_ai.tool.call.id`.
 Agent identity uses `gen_ai.agent.name`.
@@ -74,7 +77,6 @@ except ModuleNotFoundError as exc:
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
 from langchaint.call import SettledAttemptRecord
 from langchaint.exceptions import AbandonedCallErrorRecord, GenerationError
-from langchaint.inference_params import InferenceParams
 from langchaint.llm import (
     LLM,
     UNCHANGED,
@@ -617,6 +619,30 @@ def _input_content_attributes(
     return attributes
 
 
+def _request_attributes(
+    *,
+    adapter: Adapter,
+    binding: Binding,
+    response_format_is_set: bool,
+    stream: bool,
+) -> dict[str, SpanAttributeValue]:
+    """Map stored request configuration onto standard OTel attributes."""
+    attributes: dict[str, SpanAttributeValue] = {
+        "gen_ai.provider.name": adapter.provider_name,
+        "gen_ai.request.model": adapter.model,
+        "gen_ai.output.type": "json" if response_format_is_set else "text",
+    }
+    if binding.max_completion_tokens is not None:
+        attributes["gen_ai.request.max_tokens"] = binding.max_completion_tokens
+    if binding.reasoning_level is not None:
+        attributes["gen_ai.request.reasoning.level"] = binding.reasoning_level
+    if binding.temperature is not None:
+        attributes["gen_ai.request.temperature"] = binding.temperature
+    if stream:
+        attributes["gen_ai.request.stream"] = True
+    return attributes
+
+
 def _output_content_attributes(
     assistant_message: AssistantMessage, stop_reason: StopReason | None
 ) -> dict[str, SpanAttributeValue]:
@@ -802,12 +828,13 @@ class TracedLLM:
         The convention says instrumentations SHOULD NOT capture content by default.
         It says they SHOULD provide an opt-in.
         This required keyword supplies the opt-in.
-        The value passes unchanged to every binding, rebound object, and stream handle.
+        The value passes unchanged to every binding, replacement object, and stream handle.
         `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
         `attribute_mapper` passes unchanged to every binding.
         It defaults to `gen_ai_attributes`.
         `extra_attributes` applies at the start of every span.
         `extra_attributes=None` supplies no extra attributes.
+        Request attributes replace matching `extra_attributes` keys at span start.
         A key the mapper also emits resolves to the mapper's value, set at completion.
         """
         self._llm = llm
@@ -840,7 +867,9 @@ class TracedLLM:
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -855,7 +884,9 @@ class TracedLLM:
         tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: type[ModelT],
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -870,7 +901,9 @@ class TracedLLM:
         tools: ToolManager | ToolSequence,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -885,7 +918,9 @@ class TracedLLM:
         tools: None = ...,
         provider_executed_tools: Sequence[Mapping[str, object]] = ...,
         response_format: None = ...,
-        inference_params: InferenceParams | None = ...,
+        max_completion_tokens: int | None = ...,
+        reasoning_level: str | None = ...,
+        temperature: float | None = ...,
         tool_choice: ToolChoice = ...,
         parallel_tool_calls: bool = ...,
         extra_body: Mapping[str, object] | None = ...,
@@ -899,7 +934,9 @@ class TracedLLM:
         tools: ToolManager | ToolSequence | None = None,
         provider_executed_tools: Sequence[Mapping[str, object]] = (),
         response_format: type[BaseModel] | None = None,
-        inference_params: InferenceParams | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_level: str | None = None,
+        temperature: float | None = None,
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         extra_body: Mapping[str, object] | None = None,
@@ -908,7 +945,7 @@ class TracedLLM:
     ) -> "TracedBoundLLM[Any, Any]":
         """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
 
-        `system_prompt`, `provider_executed_tools`, `response_format`, and `inference_params` pass through.
+        Binding fields pass through to `LLM.bind`.
         `tool_choice`, `parallel_tool_calls`, `extra_body`, and `automatic_cache_breakpoints` pass through.
         A `tools` sequence constructs `TracedToolManager`.
         `tools=ToolManager(...)` binds that `ToolManager` unchanged.
@@ -918,6 +955,7 @@ class TracedLLM:
         Raises:
             ValueError: A `tools` sequence contains duplicate names.
                 Also raised when the wrapped `LLM.bind` rejects the binding.
+                `GeminiGenerateContentAdapter` rejects a `reasoning_level` that the Gemini SDK normalizes.
             TypeError: The wrapped `LLM.bind` rejects `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
@@ -929,7 +967,9 @@ class TracedLLM:
                 tools=tools,
                 provider_executed_tools=provider_executed_tools,
                 response_format=response_format,
-                inference_params=inference_params,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 extra_body=extra_body,
@@ -1008,7 +1048,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         return self._bound_llm.config_fingerprint()
 
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self,
         *,
         response_format: type[NewModelT],
@@ -1017,13 +1057,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self,
         *,
         response_format: type[NewModelT],
@@ -1032,13 +1074,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, None]": ...
     @overload
-    def rebind[NewModelT: BaseModel](
+    def bind[NewModelT: BaseModel](
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: type[NewModelT],
@@ -1047,13 +1091,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         response_format: None,
@@ -1062,13 +1108,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self,
         *,
         response_format: None,
@@ -1077,13 +1125,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: None,
@@ -1092,13 +1142,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[str, ToolManagerT]": ...
     @overload
-    def rebind(
+    def bind(
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -1107,13 +1159,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
     @overload
-    def rebind(
+    def bind(
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -1122,13 +1176,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, None]": ...
     @overload
-    def rebind(
+    def bind(
         self: "TracedBoundLLM[OutputT, ToolManagerT]",
         *,
         response_format: Unchanged = ...,
@@ -1137,12 +1193,14 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
         tool_choice: ToolChoice | Unchanged = ...,
         parallel_tool_calls: bool | Unchanged = ...,
-        inference_params: InferenceParams | Unchanged = ...,
+        max_completion_tokens: int | None | Unchanged = ...,
+        reasoning_level: str | None | Unchanged = ...,
+        temperature: float | None | Unchanged = ...,
         extra_body: Mapping[str, object] | None | Unchanged = ...,
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
-    def rebind(  # noqa: PLR0913 (mirrors BoundLLM.rebind, which takes every field bind takes)
+    def bind(  # noqa: PLR0913 (mirrors BoundLLM.bind)
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
@@ -1151,16 +1209,18 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
         tool_choice: ToolChoice | Unchanged = UNCHANGED,
         parallel_tool_calls: bool | Unchanged = UNCHANGED,
-        inference_params: InferenceParams | Unchanged = UNCHANGED,
+        max_completion_tokens: int | None | Unchanged = UNCHANGED,
+        reasoning_level: str | None | Unchanged = UNCHANGED,
+        temperature: float | None | Unchanged = UNCHANGED,
         extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
         max_attempts: int | Unchanged = UNCHANGED,
         automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
     ) -> "TracedBoundLLM[Any, Any]":
-        """Return a traced wrapper around the rebound `BoundLLM`.
+        """Return a traced wrapper around a replacement `BoundLLM`.
 
         This preserves `_SpanConfig`.
         `response_format`, `provider_executed_tools`, `system_prompt`, and `tool_choice` pass through.
-        `parallel_tool_calls`, `inference_params`, `extra_body`, and `max_attempts` pass through.
+        Request fields, `extra_body`, and `max_attempts` pass through.
         `automatic_cache_breakpoints` passes through.
         A `tools` sequence constructs a replacement `TracedToolManager`.
         `tools=ToolManager(...)` binds that replacement unchanged.
@@ -1169,22 +1229,25 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             ValueError: A `tools` sequence contains duplicate names.
-                Also raised when the wrapped `BoundLLM.rebind` rejects the binding.
-            TypeError: The wrapped `BoundLLM.rebind` rejects `tool_choice`.
+                Also raised when the wrapped `BoundLLM.bind` rejects the binding.
+                `GeminiGenerateContentAdapter` rejects a `reasoning_level` that the Gemini SDK normalizes.
+            TypeError: The wrapped `BoundLLM.bind` rejects `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
             pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
         """
         if not isinstance(tools, Unchanged):
             tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
         return TracedBoundLLM(
-            bound_llm=self._bound_llm.rebind(
+            bound_llm=self._bound_llm.bind(
                 response_format=response_format,
                 system_prompt=system_prompt,
                 tools=tools,
                 provider_executed_tools=provider_executed_tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
-                inference_params=inference_params,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_level=reasoning_level,
+                temperature=temperature,
                 extra_body=extra_body,
                 max_attempts=max_attempts,
                 automatic_cache_breakpoints=automatic_cache_breakpoints,
@@ -1267,6 +1330,15 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         try:
             _set_span_attributes(span, self._span_config.extra_attributes)
             _apply_operation_name(span, _CHAT_OPERATION)
+            _set_span_attributes(
+                span,
+                _request_attributes(
+                    adapter=self._bound_llm.adapter,
+                    binding=self._bound_llm.binding,
+                    response_format_is_set=self._bound_llm.response_format is not None,
+                    stream=False,
+                ),
+            )
             self._apply_input_content(span, generation_input)
             try:
                 result = await call
@@ -1424,7 +1496,9 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ),
             span_config=self._span_config,
             span_name=self._span_name,
+            adapter=self._bound_llm.adapter,
             binding=self._bound_llm.binding,
+            response_format_is_set=self._bound_llm.response_format is not None,
             generation_input=generation_input,
         )
 
@@ -1446,7 +1520,9 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         stream_handle: StreamHandle[OutputT, ToolTurnT],
         span_config: _SpanConfig,
         span_name: str,
+        adapter: Adapter,
         binding: Binding,
+        response_format_is_set: bool,
         generation_input: GenerationInput,
     ) -> None:
         """Store the wrapped handle and span configuration without starting the span.
@@ -1457,7 +1533,9 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         self._stream_handle = stream_handle
         self._span_config = span_config
         self._span_name = span_name
+        self._adapter = adapter
         self._binding = binding
+        self._response_format_is_set = response_format_is_set
         self._generation_input = generation_input
         self._span: Span | None = None
         self._span_started_at_monotonic_seconds: float | None = None
@@ -1482,6 +1560,15 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         self._span = span
         _set_span_attributes(span, self._span_config.extra_attributes)
         _apply_operation_name(span, _CHAT_OPERATION)
+        _set_span_attributes(
+            span,
+            _request_attributes(
+                adapter=self._adapter,
+                binding=self._binding,
+                response_format_is_set=self._response_format_is_set,
+                stream=True,
+            ),
+        )
         if self._span_config.capture_message_content:
             _apply_content_attributes(
                 span, lambda: _input_content_attributes(self._binding, self._generation_input)

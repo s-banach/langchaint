@@ -147,7 +147,6 @@ Document every public parameter and cross-provider difference.
 - `checked_copy.py`: the base for langchaint pydantic models.
 - `pricing.py`: SDK-free rate arithmetic and per-attempt `Billing`.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: backend subpackages that require their SDKs.
-- `inference_params.py`: inference parameters.
 - `run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
 - `sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
 - `tracing/`: the optional OTel subpackage.

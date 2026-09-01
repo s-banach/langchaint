@@ -208,7 +208,7 @@ lint.ignore = [
     "suppressible-exception",
     "magic-value-comparison",
     "raise-vanilla-args",
-    # The bind/rebind signatures write `X | None | Unchanged` to keep the sentinel
+    # The `bind` signatures write `X | None | Unchanged` to keep the sentinel
     # adjacent to its `= UNCHANGED` default; obeying the rule would bury it.
     "none-not-at-end-of-union",
 ]

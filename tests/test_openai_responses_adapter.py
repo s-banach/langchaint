@@ -55,12 +55,10 @@ from langchaint import (
     AudioPart,
     ImagePart,
     ImageUrlPart,
-    InferenceParams,
     JsonValue,
     Message,
     RawPart,
     ReasoningDelta,
-    ReasoningEffort,
     ReasoningPart,
     SpecificToolChoice,
     StopReason,
@@ -771,7 +769,7 @@ def _binding(
     automatic_cache_breakpoints: bool,
     system_prompt: str | tuple[TextPart, ...] | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
-    reasoning_effort: ReasoningEffort | None = None,
+    reasoning_level: str | None = None,
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     tool_choice: ToolChoice = "auto",
     extra_body: Mapping[str, object] | None = None,
@@ -783,14 +781,16 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=True,
-        inference_params=InferenceParams(reasoning_effort=reasoning_effort),
+        max_completion_tokens=None,
+        reasoning_level=reasoning_level,
+        temperature=None,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
 
 
 @pytest.mark.parametrize(
-    ("reasoning_summary", "reasoning_effort", "expected_reasoning"),
+    ("reasoning_summary", "reasoning_level", "expected_reasoning"),
     [
         ("detailed", None, {"summary": "detailed"}),
         (None, "high", {"effort": "high"}),
@@ -801,12 +801,12 @@ def _binding(
 )
 def test_request_assembles_the_reasoning_object_key_by_key(
     reasoning_summary: ReasoningSummary | None,
-    reasoning_effort: ReasoningEffort | None,
+    reasoning_level: str | None,
     expected_reasoning: dict[str, str] | None,
 ) -> None:
     """The request includes only stated reasoning fields."""
     precomputed_fields = _adapter(reasoning_summary=reasoning_summary)._precompute_fields(
-        _binding(automatic_cache_breakpoints=True, reasoning_effort=reasoning_effort)
+        _binding(automatic_cache_breakpoints=True, reasoning_level=reasoning_level)
     )
     if expected_reasoning is None:
         assert isinstance(precomputed_fields.reasoning, openai.Omit)
@@ -891,7 +891,9 @@ def test_request_maps_temperature_and_omits_it_when_unset() -> None:
         provider_executed_tools=(),
         tool_choice="auto",
         parallel_tool_calls=True,
-        inference_params=InferenceParams(temperature=0.2),
+        max_completion_tokens=None,
+        reasoning_level=None,
+        temperature=0.2,
         automatic_cache_breakpoints=True,
     )
     assert _adapter()._precompute_fields(binding).temperature == 0.2

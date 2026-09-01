@@ -38,7 +38,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
 | callbacks and LangSmith | `langchaint.tracing` with OTel |
-| `temperature=` | `InferenceParams(temperature=...)` |
+| `temperature=` | `temperature=` |
 | unmatched provider fields | `extra_body={...}` |
 | `SystemMessage` | `system_prompt=` on `bind` |
 | `HumanMessage` | `UserMessage` |
@@ -88,26 +88,24 @@ Uncataloged models require explicit pricing.
 `OpenAI.model` also requires `supports_prompt_cache_options` for uncataloged models.
 `OpenAIBedrock.model` always requires both values.
 
-## Bind and rebind
+## Bind again
 
 `LLM.bind` freezes request configuration.
-`BoundLLM.rebind` returns another binding with selected fields replaced.
+`BoundLLM.bind` returns another binding with selected fields replaced.
 
 ```python
-from langchaint import InferenceParams
-
 concise = llm.bind(
     system_prompt="Answer in one sentence.",
-    inference_params=InferenceParams(temperature=0.2),
+    temperature=0.2,
     max_attempts=3,
 )
-creative = concise.rebind(
+creative = concise.bind(
     system_prompt="Write a vivid paragraph.",
-    inference_params=InferenceParams(temperature=0.8),
+    temperature=0.8,
 )
 ```
 
-`rebind` replaces the complete `InferenceParams` value.
+`BoundLLM.bind` preserves every omitted field.
 
 Use `AllowedToolsChoice` to change `tool_choice` without changing `tools`:
 
@@ -115,7 +113,7 @@ Use `AllowedToolsChoice` to change `tool_choice` without changing `tools`:
 from langchaint import AllowedToolsChoice
 
 bound = llm.bind(tools=[search, final_response])
-search_only = bound.rebind(
+search_only = bound.bind(
     tool_choice=AllowedToolsChoice(mode="required", tool_names=(search.name,))
 )
 ```
@@ -249,7 +247,7 @@ See [`05_prompt_caching.py`](05_prompt_caching.py) for measured cache counters.
 
 ## Unmatched provider fields
 
-`InferenceParams` contains `max_completion_tokens`, `reasoning_effort`, and `temperature`.
+`LLM.bind` accepts `max_completion_tokens`, `reasoning_level`, and `temperature` directly.
 Use `extra_body` for other provider wire fields.
 
 ```python
@@ -305,7 +303,7 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | --- | --- |
 | `before_model` | before `await bound.generate_one(messages)` |
 | `after_model` | after receiving `Response` or `ToolCallTurn` |
-| `modify_model_request` | `bound = bound.rebind(...)` |
+| `modify_model_request` | `bound = bound.bind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |
 | concurrent tool calls | `ToolManager.dispatch_many(tool_calls)` |

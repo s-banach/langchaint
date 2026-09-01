@@ -24,7 +24,6 @@ from langchaint import (
     ContentPart,
     ImagePart,
     ImageUrlPart,
-    InferenceParams,
     Message,
     RawPart,
     ReasoningDelta,
@@ -162,7 +161,9 @@ def _binding(
     provider_executed_tools: tuple[Mapping[str, object], ...] = (),
     tool_choice: ToolChoice = "auto",
     parallel_tool_calls: bool = True,
-    inference_params: InferenceParams | None = None,
+    max_completion_tokens: int | None = None,
+    reasoning_level: str | None = None,
+    temperature: float | None = None,
     automatic_cache_breakpoints: bool = False,
     extra_body: Mapping[str, object] | None = None,
 ) -> Binding:
@@ -173,7 +174,9 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
-        inference_params=inference_params if inference_params is not None else InferenceParams(),
+        max_completion_tokens=max_completion_tokens,
+        reasoning_level=reasoning_level,
+        temperature=temperature,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
         extra_body=extra_body,
     )
@@ -652,11 +655,9 @@ def test_provider_executed_tools_reject_allowed_tools_choice() -> None:
         )
 
 
-def test_inference_params_map_to_generation_fields() -> None:
-    """The InferenceParams fields land as temperature and max_output_tokens. None omits either."""
-    config = _bound_config(
-        _binding(inference_params=InferenceParams(max_completion_tokens=64, temperature=0.5))
-    )
+def test_binding_maps_to_generation_fields() -> None:
+    """The binding fields land as temperature and max_output_tokens. None omits either."""
+    config = _bound_config(_binding(max_completion_tokens=64, temperature=0.5))
     assert config.temperature == 0.5
     assert config.max_output_tokens == 64
     defaulted = _bound_config(_binding())
@@ -664,26 +665,24 @@ def test_inference_params_map_to_generation_fields() -> None:
     assert defaulted.max_output_tokens is None
 
 
-def test_reasoning_effort_none_disables_thinking() -> None:
-    """Effort "none" is thinking_budget=0, Gemini's disable form."""
-    config = _bound_config(_binding(inference_params=InferenceParams(reasoning_effort="none")))
-    assert config.thinking_config == types.ThinkingConfig(thinking_budget=0)
-
-
-def test_reasoning_effort_maps_to_thinking_level() -> None:
-    """A known tier upper-cases onto thinking_level, with include_thoughts True."""
-    config = _bound_config(_binding(inference_params=InferenceParams(reasoning_effort="high")))
+def test_reasoning_level_maps_to_thinking_level() -> None:
+    """The exact provider value reaches thinking_level with include_thoughts True."""
+    config = _bound_config(_binding(reasoning_level="HIGH"))
     assert config.thinking_config == types.ThinkingConfig(
         thinking_level=types.ThinkingLevel.HIGH, include_thoughts=True
     )
 
 
-def test_reasoning_effort_outside_the_sdk_enum_passes_through() -> None:
-    """Effort "xhigh" reaches the wire as "XHIGH"."""
+def test_reasoning_level_rejects_sdk_normalization() -> None:
+    """A value the Gemini SDK would change does not reach the request."""
+    with pytest.raises(ValueError, match="normalizes it to 'HIGH'"):
+        _ = _bound_config(_binding(reasoning_level="high"))
+
+
+def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
+    """The exact provider value "XHIGH" reaches the wire unchanged."""
     with pytest.warns(UserWarning, match="XHIGH"):
-        config = _bound_config(
-            _binding(inference_params=InferenceParams(reasoning_effort="xhigh"))
-        )
+        config = _bound_config(_binding(reasoning_level="XHIGH"))
     assert config.thinking_config is not None
     assert config.thinking_config.thinking_level is not None
     assert config.thinking_config.thinking_level.value == "XHIGH"
@@ -1052,7 +1051,7 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
     request = _built_request(
         [UserMessage(content="hi")],
         _binding(
-            inference_params=InferenceParams(temperature=0.5),
+            temperature=0.5,
             extra_body={"cachedContent": "caches/abc"},
         ),
     )

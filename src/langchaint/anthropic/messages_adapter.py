@@ -44,9 +44,9 @@ Request and response mappings:
 - Consecutive `ToolMessage` values share one user message because the API requires alternating roles.
 - `end_turn`, `tool_use`, `max_tokens`, and `refusal` preserve their `stop_reason` values.
 - Other `stop_reason` values map to `"other"`.
-- `reasoning_effort` sends `output_config.effort` with `thinking={"type": "adaptive"}`.
+- `reasoning_level` sends `output_config.effort` with `thinking={"type": "adaptive"}`.
 - The adapter sends neither field alone because effort applies only to adaptive thinking.
-- `ReasoningEffort` accepts values wider than the SDK literal and sends each value unchanged.
+- `reasoning_level` accepts values wider than the SDK literal and sends each value unchanged.
 - The provider reports unsupported values through its own error.
 - The adapter never sends `thinking.display`.
 - The SDK default `"summarized"` returns thinking text, while `"omitted"` redacts it.
@@ -1182,7 +1182,7 @@ class AnthropicMessagesAdapter(Adapter):
                 rate_name="web_search_usd_per_invocation",
                 rate=self.pricing.web_search_usd_per_invocation,
             )
-        max_tokens = binding.inference_params.max_completion_tokens
+        max_tokens = binding.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
         bind_marker_count = 0
         if binding.system_prompt is not None:
@@ -1232,22 +1232,16 @@ class AnthropicMessagesAdapter(Adapter):
             )
         output_config: OutputConfigParam | Omit = omit
         thinking: ThinkingConfigParam | Omit = omit
-        if binding.inference_params.reasoning_effort is not None:
-            # cast: `ReasoningEffort` deliberately exceeds the SDK effort literal.
-            output_config = cast(
-                "OutputConfigParam", {"effort": binding.inference_params.reasoning_effort}
-            )
+        if binding.reasoning_level is not None:
+            # cast: `reasoning_level` deliberately exceeds the SDK effort literal.
+            output_config = cast("OutputConfigParam", {"effort": binding.reasoning_level})
             thinking = {"type": "adaptive"}
         return _AnthropicPrecomputedFields(
             model=self.model,
             max_tokens=(
                 max_tokens if max_tokens is not None else self.default_max_completion_tokens
             ),
-            temperature=(
-                binding.inference_params.temperature
-                if binding.inference_params.temperature is not None
-                else omit
-            ),
+            temperature=(binding.temperature if binding.temperature is not None else omit),
             system=system,
             tools=tools,
             tool_choice=tool_choice,

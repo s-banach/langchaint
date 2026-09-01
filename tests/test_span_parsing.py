@@ -8,7 +8,7 @@ from typing import assert_type
 import pytest
 from pydantic import BaseModel, ValidationError
 
-import langchaint.tracing
+import langchaint.span_parsing
 from langchaint import (
     LLM,
     ZERO_USAGE,
@@ -22,8 +22,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
-from langchaint.tracing import (
+from langchaint.span_parsing import (
     ExtractedOutputMessage,
     OtelBlobPart,
     OtelChatSpan,
@@ -43,16 +42,15 @@ from langchaint.tracing import (
     OtelToolCallPart,
     OtelToolCallResponsePart,
     OtelUriPart,
+    _output_messages_from_otel,
+    _system_prompt_from_otel,
+    _tool_schemas_from_otel,
     generation_input_from_otel,
     parse_otel,
     reconstruct_bound_llm,
     response_record_from_otel,
 )
-from langchaint.tracing._span_parsing import (
-    _output_messages_from_otel,
-    _system_prompt_from_otel,
-    _tool_schemas_from_otel,
-)
+from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
 from scripts import refresh_semconv_genai
 from tests.test_bound_llm import _FakeAdapter
 
@@ -304,13 +302,16 @@ def test_only_chat_operation_is_required() -> None:
 
 
 def test_public_conversion_functions_are_exported() -> None:
-    """langchaint.tracing exports each supported conversion function."""
-    assert "generation_input_from_otel" in langchaint.tracing.__all__
-    assert "response_record_from_otel" in langchaint.tracing.__all__
-    assert "reconstruct_bound_llm" in langchaint.tracing.__all__
-    assert "output_messages_from_otel" not in langchaint.tracing.__all__
-    assert "system_prompt_from_otel" not in langchaint.tracing.__all__
-    assert "tool_schemas_from_otel" not in langchaint.tracing.__all__
+    """Keep `_output_messages_from_otel` and `_system_prompt_from_otel` out of `__all__`.
+
+    Keep `_tool_schemas_from_otel` out of `__all__`.
+    """
+    assert "generation_input_from_otel" in langchaint.span_parsing.__all__
+    assert "response_record_from_otel" in langchaint.span_parsing.__all__
+    assert "reconstruct_bound_llm" in langchaint.span_parsing.__all__
+    assert "_output_messages_from_otel" not in langchaint.span_parsing.__all__
+    assert "_system_prompt_from_otel" not in langchaint.span_parsing.__all__
+    assert "_tool_schemas_from_otel" not in langchaint.span_parsing.__all__
 
 
 @pytest.mark.parametrize("raw_attributes", [{}, {"gen_ai.operation.name": "embeddings"}])

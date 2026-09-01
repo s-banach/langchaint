@@ -323,6 +323,8 @@ MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
 
 @dataclass(frozen=True, kw_only=True)
 class ExtractedOutputMessage:
+    """Retain `finish_reason` because `AssistantMessage` defines only `turn` and `kind`."""
+
     assistant_message: AssistantMessage
     finish_reason: str | None
 
@@ -977,3 +979,36 @@ def _unsupported(value: OtelModel, description: str) -> OtelToLangchaintConversi
     return OtelToLangchaintConversionError(
         f"{type(value).__name__} has no langchaint representation for {description}"
     )
+
+
+__all__ = [
+    "ExtractedOutputMessage",
+    "OtelBlobPart",
+    "OtelChatSpan",
+    "OtelCompactionPart",
+    "OtelFilePart",
+    "OtelFunctionTool",
+    "OtelGenericPart",
+    "OtelGenericServerToolCall",
+    "OtelGenericServerToolCallResponse",
+    "OtelGenericSystemInstructionPart",
+    "OtelGenericTool",
+    "OtelImageUrlPart",
+    "OtelInputMessage",
+    "OtelMessagePart",
+    "OtelOutputMessage",
+    "OtelReasoningPart",
+    "OtelServerToolCallPart",
+    "OtelServerToolCallResponsePart",
+    "OtelSystemInstructionPart",
+    "OtelTextPart",
+    "OtelToLangchaintConversionError",
+    "OtelToolCallPart",
+    "OtelToolCallResponsePart",
+    "OtelToolDefinition",
+    "OtelUriPart",
+    "generation_input_from_otel",
+    "parse_otel",
+    "reconstruct_bound_llm",
+    "response_record_from_otel",
+]

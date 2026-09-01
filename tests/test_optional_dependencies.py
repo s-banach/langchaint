@@ -5,9 +5,9 @@ import sys
 from pathlib import Path
 
 
-def _run_without_numpy(source: str) -> subprocess.CompletedProcess[str]:
-    """Run `source` after blocking `numpy` imports."""
-    blocked_source = 'import sys\nsys.modules["numpy"] = None\n' + source
+def _run_with_blocked_import(module_name: str, source: str) -> subprocess.CompletedProcess[str]:
+    """Run `source` after blocking imports of `module_name`."""
+    blocked_source = f"import sys\nsys.modules[{module_name!r}] = None\n" + source
     return subprocess.run(
         [sys.executable, "-c", blocked_source],
         cwd=Path(__file__).parents[1],
@@ -19,11 +19,24 @@ def _run_without_numpy(source: str) -> subprocess.CompletedProcess[str]:
 
 def test_generation_imports_without_numpy() -> None:
     """Import generation APIs without importing `numpy`."""
-    completed = _run_without_numpy(
+    completed = _run_with_blocked_import(
+        "numpy",
         "import langchaint\n"
         "from langchaint.openai import OpenAI\n"
         'assert langchaint.LLM.__name__ == "LLM"\n'
-        'assert OpenAI.__name__ == "OpenAI"\n'
+        'assert OpenAI.__name__ == "OpenAI"\n',
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_span_parsing_imports_without_opentelemetry() -> None:
+    """Run `parse_otel` when `opentelemetry` is unavailable."""
+    completed = _run_with_blocked_import(
+        "opentelemetry",
+        "from langchaint.span_parsing import parse_otel\n"
+        'parsed = parse_otel({"gen_ai.operation.name": "chat"})\n'
+        'assert parsed.operation_name == "chat"\n',
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -55,7 +68,8 @@ def test_normalized_error_validation_imports_no_provider_backend() -> None:
 
 def test_embedding_apis_name_the_install_for_missing_numpy() -> None:
     """Name each supported install when an embedding API lacks `numpy`."""
-    completed = _run_without_numpy(
+    completed = _run_with_blocked_import(
+        "numpy",
         "import asyncio\n"
         "import langchaint\n"
         "from openai import AsyncOpenAI\n"
@@ -77,7 +91,7 @@ def test_embedding_apis_name_the_install_for_missing_numpy() -> None:
         "else:\n"
         '    raise AssertionError("embedding_model did not require numpy")\n'
         "finally:\n"
-        "    asyncio.run(client.close())\n"
+        "    asyncio.run(client.close())\n",
     )
 
     assert completed.returncode == 0, completed.stderr

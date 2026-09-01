@@ -3,6 +3,7 @@
 import json
 import math
 from dataclasses import dataclass
+from importlib.resources import files
 from typing import Annotated, Literal, overload
 
 import jsonschema
@@ -57,7 +58,22 @@ type StringTuple = Annotated[tuple[str, ...], Field(strict=False)]
 RAW_SPAN_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
 JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+_STRUCTURED_ATTRIBUTE_NAMES_ADAPTER: TypeAdapter[frozenset[str]] = TypeAdapter(frozenset[str])
+_STRUCTURED_ATTRIBUTE_NAMES = _STRUCTURED_ATTRIBUTE_NAMES_ADAPTER.validate_json(
+    files("langchaint").joinpath("_semconv_genai_structured_attributes.json").read_text()
+)
 _OTEL_RAW_CONTEXT = {"otel_raw": True}
+
+
+def _reject_non_json_constant(constant: str) -> None:
+    raise ValueError(f"{constant} is not valid JSON")
+
+
+def _decode_semconv_attribute(name: str, value: JsonValue) -> JsonValue:
+    if name not in _STRUCTURED_ATTRIBUTE_NAMES or not isinstance(value, str):
+        return value
+    decoded_value: object = json.loads(value, parse_constant=_reject_non_json_constant)
+    return JSON_VALUE_ADAPTER.validate_python(decoded_value)
 
 
 def _string_keyed_object_dict(value: object) -> dict[str, object]:
@@ -457,7 +473,7 @@ class OtelChatSpan(OtelModel):
     def _partition_raw_span(cls, input_value: object) -> object:
         raw_span = RAW_SPAN_ADAPTER.validate_python(input_value)
         parsed_attributes: dict[str, JsonValue] = {
-            name: value
+            name: _decode_semconv_attribute(name, value)
             for name, value in raw_span.items()
             if name in _OTEL_CHAT_SPAN_FIXED_ALIASES
         }
@@ -468,7 +484,7 @@ class OtelChatSpan(OtelModel):
         }
         parsed_attributes["prompt_variables"] = prompt_variables
         parsed_attributes["unused_attributes"] = {
-            name: value
+            name: _decode_semconv_attribute(name, value)
             for name, value in raw_span.items()
             if name not in _OTEL_CHAT_SPAN_FIXED_ALIASES
             and not name.startswith(PROMPT_VARIABLE_PREFIX)
@@ -864,8 +880,6 @@ def _require_matching_response_format(
 def _validate_structured_attribute[ValueT](
     adapter: TypeAdapter[ValueT], attribute_value: JsonValue
 ) -> ValueT:
-    if isinstance(attribute_value, str):
-        return adapter.validate_json(attribute_value, context=_OTEL_RAW_CONTEXT)
     return adapter.validate_python(attribute_value, context=_OTEL_RAW_CONTEXT)
 
 

@@ -75,3 +75,12 @@ templates:
       }
     application_mode: single
     file_name: chat-span-attributes.json
+  - template: structured-attributes.json.j2
+    filter: >-
+      .registry.attributes
+      | map(
+          select(.annotations.type.json_schema != null)
+          | .key
+        )
+    application_mode: single
+    file_name: _semconv_genai_structured_attributes.json

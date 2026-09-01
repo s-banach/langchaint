@@ -23,6 +23,8 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.span_parsing import (
+    _OTEL_CHAT_SPAN_FIXED_ALIASES,
+    _STRUCTURED_ATTRIBUTE_NAMES,
     ExtractedOutputMessage,
     OtelBlobPart,
     OtelChatSpan,
@@ -410,6 +412,42 @@ def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
     assert from_text.system_instructions == (
         OtelTextPart(type="text", content="Follow the rules."),
     )
+
+
+def test_decodes_each_schema_declared_structured_attribute() -> None:
+    """The generated semantic-convention catalog selects JSON decoding."""
+    assert {
+        "gen_ai.input.messages",
+        "gen_ai.memory.records",
+        "gen_ai.output.messages",
+        "gen_ai.retrieval.documents",
+        "gen_ai.system_instructions",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+        "gen_ai.tool.definitions",
+    } == _STRUCTURED_ATTRIBUTE_NAMES
+    encoded_value = json.dumps([])
+    parsed = parse_otel(_chat_span({name: encoded_value for name in _STRUCTURED_ATTRIBUTE_NAMES}))
+    parsed_by_alias = parsed.model_dump(by_alias=True)
+    decoded_chat_attributes = _STRUCTURED_ATTRIBUTE_NAMES & _OTEL_CHAT_SPAN_FIXED_ALIASES
+    for name in decoded_chat_attributes:
+        assert parsed_by_alias[name] == ()
+    for name in _STRUCTURED_ATTRIBUTE_NAMES - decoded_chat_attributes:
+        assert parsed.unused_attributes[name] == []
+
+
+def test_preserves_json_text_for_a_scalar_attribute() -> None:
+    """A scalar semantic-convention attribute remains text when its value is valid JSON."""
+    encoded_value = '{"provider": "custom"}'
+    parsed = parse_otel(_chat_span({"gen_ai.provider.name": encoded_value}))
+    assert parsed.provider_name == encoded_value
+
+
+@pytest.mark.parametrize("encoded_value", ["NaN", "Infinity", "-Infinity"])
+def test_rejects_non_json_constants_in_structured_attributes(encoded_value: str) -> None:
+    """Reject non-JSON constants in structured semantic-convention attributes."""
+    with pytest.raises(ValidationError, match="is not valid JSON"):
+        _ = parse_otel(_chat_span({"gen_ai.input.messages": encoded_value}))
 
 
 def test_preserves_known_and_generic_additional_properties() -> None:

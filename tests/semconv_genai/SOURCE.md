@@ -7,6 +7,7 @@ Resolved Weaver version: `v0.25.1`.
 License: Apache-2.0.
 
 `chat-span-attributes.json` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+`src/langchaint/_semconv_genai_structured_attributes.json` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 
 Structured schemas are copied from these source paths:

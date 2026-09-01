@@ -2017,6 +2017,24 @@ def test_refresh_resolves_main_without_a_prepared_source_commit(
     assert refresh_semconv_genai._resolved_source_sha() == resolved_sha
 
 
+def test_refresh_accepts_a_structured_attribute_name_array(tmp_path: pathlib.Path) -> None:
+    """Accept generated structured attribute names as a JSON array of strings."""
+    generated_path = tmp_path / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE
+    _ = generated_path.write_text('["gen_ai.input.messages"]')
+    refresh_semconv_genai._validate_json_file(generated_path, expected_shape="string_array")
+
+
+@pytest.mark.parametrize("content", ['{"gen_ai.input.messages": true}', "[1]"])
+def test_refresh_rejects_a_malformed_structured_attribute_name_array(
+    content: str, tmp_path: pathlib.Path
+) -> None:
+    """Reject generated structured attribute names outside a JSON array of strings."""
+    generated_path = tmp_path / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE
+    _ = generated_path.write_text(content)
+    with pytest.raises(TypeError, match="must contain a JSON array of strings"):
+        refresh_semconv_genai._validate_json_file(generated_path, expected_shape="string_array")
+
+
 def test_the_exempted_attribute_still_disagrees_with_its_schema() -> None:
     """The exempted payload still violates its schema."""
     assert frozenset({"gen_ai.tool.call.arguments"}) == _UNVALIDATED_PAYLOAD_ATTRIBUTES

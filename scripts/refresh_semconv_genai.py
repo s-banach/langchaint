@@ -8,6 +8,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+from typing import Literal
 
 ROOT = pathlib.Path(__file__).parent.parent
 SOURCE_REPOSITORY = "open-telemetry/semantic-conventions-genai"
@@ -17,9 +18,11 @@ SOURCE_CHECKOUT = ROOT / "build" / "semantic-conventions-genai-source"
 PREPARED_SOURCE_REF = "refs/langchaint/prepared"
 SOURCE_MODEL_DIRECTORY = SOURCE_CHECKOUT / "model"
 DESTINATION = ROOT / "tests" / "semconv_genai"
+RUNTIME_DESTINATION = ROOT / "src" / "langchaint"
 SOURCE_DOC = DESTINATION / "SOURCE.md"
 TEMPLATES = ROOT / "scripts" / "semconv_genai_templates"
 GENERATED_ATTRIBUTES_FILE = "chat-span-attributes.json"
+RUNTIME_STRUCTURED_ATTRIBUTES_FILE = "_semconv_genai_structured_attributes.json"
 WEAVER_TARGET = "chat-span"
 OBSOLETE_FILES = {"provider-name-values.json"}
 
@@ -119,10 +122,19 @@ def _weaver_executable(required_version: str) -> str:
     return executable
 
 
-def _validate_json_file(path: pathlib.Path) -> None:
+def _validate_json_file(
+    path: pathlib.Path, *, expected_shape: Literal["object", "string_array"] = "object"
+) -> None:
     value: object = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"{path} must contain a JSON object")
+    match expected_shape:
+        case "object":
+            valid = isinstance(value, dict)
+            description = "a JSON object"
+        case "string_array":
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+            description = "a JSON array of strings"
+    if not valid:
+        raise TypeError(f"{path} must contain {description}")
 
 
 def _render_source_doc(resolved_sha: str, weaver_version: str) -> str:
@@ -139,6 +151,7 @@ Resolved Weaver version: `{weaver_version}`.
 License: Apache-2.0.
 
 `{GENERATED_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+`src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 
 Structured schemas are copied from these source paths:
@@ -173,6 +186,12 @@ def _generate_staged_files(
     generated_attributes = generated_directory / GENERATED_ATTRIBUTES_FILE
     _validate_json_file(generated_attributes)
     _ = shutil.copyfile(generated_attributes, staged_directory / GENERATED_ATTRIBUTES_FILE)
+    generated_structured_attributes = generated_directory / RUNTIME_STRUCTURED_ATTRIBUTES_FILE
+    _validate_json_file(generated_structured_attributes, expected_shape="string_array")
+    _ = shutil.copyfile(
+        generated_structured_attributes,
+        staged_directory / RUNTIME_STRUCTURED_ATTRIBUTES_FILE,
+    )
     for schema_file in sorted(ATTRIBUTE_SCHEMA_FILES.values()):
         source_path = SOURCE_MODEL_DIRECTORY / "gen-ai" / schema_file
         _validate_json_file(source_path)
@@ -190,7 +209,12 @@ def _replace_committed_files(staged_directory: pathlib.Path) -> None:
         if obsolete_path.exists():
             obsolete_path.unlink()
     for staged_path in sorted(staged_directory.iterdir()):
-        destination_path = DESTINATION / staged_path.name
+        destination_directory = (
+            RUNTIME_DESTINATION
+            if staged_path.name == RUNTIME_STRUCTURED_ATTRIBUTES_FILE
+            else DESTINATION
+        )
+        destination_path = destination_directory / staged_path.name
         _ = staged_path.replace(destination_path)
         print(f"wrote {destination_path}")
 

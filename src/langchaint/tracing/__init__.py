@@ -146,6 +146,7 @@ from langchaint.tracing._span_parsing import (
     generation_input_from_otel,
     parse_otel,
     reconstruct_bound_llm,
+    response_record_from_otel,
 )
 from langchaint.usage import Usage
 
@@ -1937,4 +1938,5 @@ __all__ = [
     "generation_input_from_otel",
     "parse_otel",
     "reconstruct_bound_llm",
+    "response_record_from_otel",
 ]

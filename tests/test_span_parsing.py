@@ -1,15 +1,20 @@
 """Test OTel-native chat span parsing and explicit langchaint conversion."""
 
 import json
+import math
 import pathlib
+from typing import assert_type
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import langchaint.tracing
 from langchaint import (
     LLM,
+    ZERO_USAGE,
     AssistantMessage,
+    BoundLLM,
+    DispatchHandled,
     ImagePart,
     JsonValue,
     TextPart,
@@ -17,7 +22,7 @@ from langchaint import (
     ToolMessage,
     UserMessage,
 )
-from langchaint.tools import ToolSchema
+from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
 from langchaint.tracing import (
     ExtractedOutputMessage,
     OtelBlobPart,
@@ -41,6 +46,7 @@ from langchaint.tracing import (
     generation_input_from_otel,
     parse_otel,
     reconstruct_bound_llm,
+    response_record_from_otel,
 )
 from langchaint.tracing._span_parsing import (
     _output_messages_from_otel,
@@ -65,6 +71,78 @@ def _chat_span(attributes: dict[str, JsonValue] | None = None) -> dict[str, Json
     if attributes is not None:
         raw_attributes.update(attributes)
     return raw_attributes
+
+
+def _successful_chat_span(
+    attributes: dict[str, JsonValue] | None = None,
+) -> OtelChatSpan:
+    raw_attributes: dict[str, JsonValue] = {
+        "gen_ai.provider.name": "fake",
+        "gen_ai.request.model": "fake-model",
+        "gen_ai.response.finish_reasons": ["stop"],
+        "gen_ai.output.messages": [
+            {"role": "assistant", "parts": [{"type": "text", "content": "done"}]}
+        ],
+    }
+    if attributes is not None:
+        raw_attributes.update(attributes)
+    return parse_otel(_chat_span(raw_attributes))
+
+
+async def _return_tool_arguments(arguments: dict[str, object]) -> str:
+    """Return the arguments as stable JSON text."""
+    return json.dumps(arguments, sort_keys=True)
+
+
+def _json_schema_tool(
+    *,
+    name: str = "lookup",
+    description: str = "Look up one value.",
+    args_schema: dict[str, object] | None = None,
+) -> JSONSchemaTool[None]:
+    return JSONSchemaTool(
+        name=name,
+        description=description,
+        args_schema={"type": "object"} if args_schema is None else args_schema,
+        function=_return_tool_arguments,
+    )
+
+
+def _captured_tool_definition(
+    *,
+    name: str = "lookup",
+    description: str = "Look up one value.",
+    parameters: JsonValue = None,
+) -> dict[str, JsonValue]:
+    return {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object"} if parameters is None else parameters,
+    }
+
+
+class _StructuredResponse(BaseModel):
+    """Provide a concrete structured response type for binding tests."""
+
+    answer: str
+
+
+class _CountingTool:
+    def __init__(self) -> None:
+        self.name = "lookup"
+        self.schema_calls = 0
+
+    def schema(self) -> ToolSchema:
+        self.schema_calls += 1
+        return ToolSchema(
+            name=self.name,
+            description="Look up one value.",
+            args_schema={"type": "object"},
+        )
+
+    async def dispatch(self, call: ToolCall) -> DispatchHandled[None]:
+        return DispatchHandled(tool_message=ToolMessage(tool_call_id=call.id, content="done"))
 
 
 def _assert_refinements(
@@ -225,9 +303,11 @@ def test_only_chat_operation_is_required() -> None:
     })
 
 
-def test_only_generation_input_conversion_is_public() -> None:
-    """Only generation_input_from_otel is a public conversion function in langchaint.tracing."""
+def test_public_conversion_functions_are_exported() -> None:
+    """langchaint.tracing exports each supported conversion function."""
     assert "generation_input_from_otel" in langchaint.tracing.__all__
+    assert "response_record_from_otel" in langchaint.tracing.__all__
+    assert "reconstruct_bound_llm" in langchaint.tracing.__all__
     assert "output_messages_from_otel" not in langchaint.tracing.__all__
     assert "system_prompt_from_otel" not in langchaint.tracing.__all__
     assert "tool_schemas_from_otel" not in langchaint.tracing.__all__
@@ -636,3 +716,449 @@ def test_public_models_validate_direct_construction() -> None:
     """Public structured models use the same strict validation outside parse_otel."""
     message = OtelInputMessage(role="user", parts=(OtelTextPart(type="text", content="hi"),))
     assert generation_input_from_otel((message,)) == (UserMessage(content=(TextPart(text="hi"),)),)
+
+
+def test_reconstructs_text_response_record_and_synthetic_fields() -> None:
+    """response_record_from_otel preserves supported output and identity values."""
+    span = _successful_chat_span({
+        "gen_ai.output.messages": [
+            {
+                "role": "assistant",
+                "parts": [
+                    {"type": "text", "content": "before"},
+                    {
+                        "type": "tool_call",
+                        "id": "call-1",
+                        "name": "lookup",
+                        "arguments": {"key": "value"},
+                    },
+                    {"type": "text", "content": "after"},
+                ],
+            }
+        ],
+        "gen_ai.response.model": "served-model",
+        "gen_ai.response.id": "response-1",
+        "gen_ai.usage.input_tokens": 100,
+        "openai.response.service_tier": "priority",
+    })
+    record = response_record_from_otel(span)
+    assert record.output == "beforeafter"
+    assert record.stop_reason == "end_turn"
+    assert record.call.model == "fake-model"
+    assert record.call.provider_name == "fake"
+    assert record.call.elapsed_seconds == 0.0
+    assert record.assistant_message == AssistantMessage(
+        turn=(
+            TextPart(text="before"),
+            ToolCall(id="call-1", name="lookup", args_json='{"key":"value"}'),
+            TextPart(text="after"),
+        )
+    )
+    attempt = record.attempt_records[0]
+    assert attempt.started_after_seconds == 0.0
+    assert attempt.elapsed_seconds == 0.0
+    assert attempt.seconds_to_first_item is None
+    assert attempt.error is None
+    assert attempt.model_served == "served-model"
+    assert attempt.response_id == "response-1"
+    assert attempt.request_id is None
+    assert attempt.billing is not None
+    assert attempt.billing.usage == ZERO_USAGE
+    assert attempt.billing.service_tier == "unknown"
+    assert math.isnan(attempt.billing.input_cache_none_usd_per_million_tokens)
+    assert math.isnan(attempt.billing.cache_read_usd_per_million_tokens)
+    assert math.isnan(attempt.billing.cache_write_usd_per_million_tokens)
+    assert math.isnan(attempt.billing.output_usd_per_million_tokens)
+
+
+@pytest.mark.parametrize("output", [42, [1, "two"], {"answer": True}])
+def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
+    """Declared JSON output accepts JSON scalars, arrays, and objects."""
+    span = _successful_chat_span({
+        "gen_ai.output.type": "json",
+        "gen_ai.output.messages": [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": json.dumps(output)}],
+            }
+        ],
+    })
+    assert response_record_from_otel(span).output == output
+
+
+def test_rejects_invalid_declared_json_output() -> None:
+    """Declared JSON output rejects text that is not a JSON value."""
+    span = _successful_chat_span({
+        "gen_ai.output.type": "json",
+        "gen_ai.output.messages": [
+            {"role": "assistant", "parts": [{"type": "text", "content": "not json"}]}
+        ],
+    })
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
+def test_response_record_rejects_unsupported_output_type(output_type: str) -> None:
+    """ResponseRecord[JsonValue] rejects each unsupported output type."""
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
+        _ = response_record_from_otel(_successful_chat_span({"gen_ai.output.type": output_type}))
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [{"type": "tool_call", "name": "lookup", "arguments": {}}],
+        [{"type": "reasoning", "content": "thinking"}],
+        [{"type": "provider_part", "value": 1}],
+    ],
+)
+def test_response_record_rejects_unsupported_assistant_parts(parts: list[JsonValue]) -> None:
+    """Output conversion rejects assistant parts without a lossless representation."""
+    span = _successful_chat_span({
+        "gen_ai.output.messages": [{"role": "assistant", "parts": parts}]
+    })
+    with pytest.raises(OtelToLangchaintConversionError):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "parts": [{"type": "text", "content": "done"}]},
+        {
+            "role": "assistant",
+            "name": "named",
+            "parts": [{"type": "text", "content": "done"}],
+        },
+        {
+            "role": "assistant",
+            "provider_value": 1,
+            "parts": [{"type": "text", "content": "done"}],
+        },
+    ],
+)
+def test_response_record_rejects_unsupported_output_message_metadata(
+    message: dict[str, JsonValue],
+) -> None:
+    """Output conversion rejects unsupported role, name, and additional properties."""
+    span = _successful_chat_span({"gen_ai.output.messages": [message]})
+    with pytest.raises(OtelToLangchaintConversionError):
+        _ = response_record_from_otel(span)
+
+
+def test_response_record_rejects_output_part_additional_properties() -> None:
+    """Output conversion rejects additional properties on a supported part."""
+    span = _successful_chat_span({
+        "gen_ai.output.messages": [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "done", "provider_value": 1}],
+            }
+        ]
+    })
+    with pytest.raises(OtelToLangchaintConversionError, match="additional properties"):
+        _ = response_record_from_otel(span)
+
+
+def test_response_record_requires_output_messages() -> None:
+    """Output conversion rejects an absent output_messages attribute."""
+    span = _successful_chat_span().model_copy(update={"output_messages": None})
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.messages"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize(
+    "output_messages",
+    [
+        [],
+        [
+            {"role": "assistant", "parts": [{"type": "text", "content": "one"}]},
+            {"role": "assistant", "parts": [{"type": "text", "content": "two"}]},
+        ],
+    ],
+)
+def test_response_record_requires_exactly_one_output_message(
+    output_messages: list[JsonValue],
+) -> None:
+    """Output conversion rejects empty and multiple output message sequences."""
+    span = _successful_chat_span({"gen_ai.output.messages": output_messages})
+    with pytest.raises(OtelToLangchaintConversionError, match="exactly one"):
+        _ = response_record_from_otel(span)
+
+
+def test_response_record_rejects_error_type() -> None:
+    """error.type marks a span as failed before output conversion."""
+    with pytest.raises(OtelToLangchaintConversionError, match=r"error\.type"):
+        _ = response_record_from_otel(_successful_chat_span({"error.type": "ProviderError"}))
+
+
+def test_response_record_rejects_error_finish_reason() -> None:
+    """The selected error finish reason marks a span as failed."""
+    span = _successful_chat_span({"gen_ai.response.finish_reasons": ["error"]})
+    with pytest.raises(OtelToLangchaintConversionError, match="finish_reason"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "stop_reason"),
+    [
+        ("stop", "end_turn"),
+        ("tool_call", "tool_use"),
+        ("length", "max_tokens"),
+        ("content_filter", "refusal"),
+        ("end_turn", "end_turn"),
+        ("tool_use", "tool_use"),
+        ("max_tokens", "max_tokens"),
+        ("refusal", "refusal"),
+        ("context_window_exceeded", "context_window_exceeded"),
+        ("other", "other"),
+        ("provider_defined", "other"),
+    ],
+)
+def test_response_record_maps_selected_finish_reason(finish_reason: str, stop_reason: str) -> None:
+    """Finish-reason conversion maps known values and uses other for unknown values."""
+    span = _successful_chat_span({"gen_ai.response.finish_reasons": [finish_reason]})
+    assert response_record_from_otel(span).stop_reason == stop_reason
+
+
+def test_response_record_falls_back_to_message_finish_reason() -> None:
+    """The deprecated message finish_reason supplies the value when the span attribute is absent."""
+    span = _successful_chat_span({
+        "gen_ai.output.messages": [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "done"}],
+                "finish_reason": "length",
+            }
+        ]
+    }).model_copy(update={"response_finish_reasons": None})
+    assert response_record_from_otel(span).stop_reason == "max_tokens"
+
+
+def test_response_record_requires_matching_finish_reason_locations() -> None:
+    """Span-level and message-level finish reasons must agree when both are present."""
+    span = _successful_chat_span({
+        "gen_ai.output.messages": [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "done"}],
+                "finish_reason": "length",
+            }
+        ]
+    })
+    with pytest.raises(OtelToLangchaintConversionError, match="differs"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize("finish_reasons", [[], ["stop", "length"]])
+def test_response_record_requires_one_span_finish_reason(
+    finish_reasons: list[str],
+) -> None:
+    """A present span finish-reason sequence must contain one value."""
+    span = _successful_chat_span().model_copy(
+        update={"response_finish_reasons": tuple(finish_reasons)}
+    )
+    with pytest.raises(OtelToLangchaintConversionError, match="exactly one"):
+        _ = response_record_from_otel(span)
+
+
+def test_response_record_requires_a_finish_reason() -> None:
+    """Output conversion rejects spans with neither finish-reason location."""
+    span = _successful_chat_span().model_copy(update={"response_finish_reasons": None})
+    with pytest.raises(OtelToLangchaintConversionError, match="contain no value"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize("field_name", ["provider_name", "request_model"])
+@pytest.mark.parametrize("field_value", [None, ""])
+def test_response_record_requires_call_identity(field_name: str, field_value: str | None) -> None:
+    """CallRecord identity requires a provider name and requested model."""
+    span = _successful_chat_span().model_copy(update={field_name: field_value})
+    with pytest.raises(OtelToLangchaintConversionError, match="is required"):
+        _ = response_record_from_otel(span)
+
+
+@pytest.mark.parametrize("conversion_case", ["reasoning", "cardinality", "invalid_json"])
+def test_response_record_errors_exclude_generated_content(conversion_case: str) -> None:
+    """Conversion error text excludes generated content for each content-bearing failure."""
+    secret = "generated-secret-value"
+    if conversion_case == "reasoning":
+        span = _successful_chat_span({
+            "gen_ai.output.messages": [
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "reasoning", "content": secret}],
+                }
+            ]
+        })
+    elif conversion_case == "cardinality":
+        span = _successful_chat_span({
+            "gen_ai.output.messages": [
+                {"role": "assistant", "parts": [{"type": "text", "content": secret}]},
+                {"role": "assistant", "parts": [{"type": "text", "content": "done"}]},
+            ]
+        })
+    else:
+        span = _successful_chat_span({
+            "gen_ai.output.type": "json",
+            "gen_ai.output.messages": [
+                {"role": "assistant", "parts": [{"type": "text", "content": secret}]}
+            ],
+        })
+    with pytest.raises(OtelToLangchaintConversionError) as rejected:
+        _ = response_record_from_otel(span)
+    assert secret not in str(rejected.value)
+
+
+def test_reconstruction_preserves_tool_manager_and_checks_captured_schemas() -> None:
+    """Tool reconstruction preserves ToolManager identity and reads each caller schema once."""
+    tool = _CountingTool()
+    tool_manager = ToolManager([tool])
+    span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
+    bound_llm = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tool_manager)
+    assert bound_llm.tool_manager is tool_manager
+    assert bound_llm.binding.tool_schemas == (
+        ToolSchema(
+            name="lookup",
+            description="Look up one value.",
+            args_schema={"type": "object"},
+        ),
+    )
+    assert tool.schema_calls == 1
+
+
+def test_reconstruction_converts_tool_sequence_once() -> None:
+    """A caller tool sequence constructs one ToolManager before binding."""
+    span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
+    bound_llm = reconstruct_bound_llm(
+        span,
+        llm=LLM(_FakeAdapter()),
+        tools=[_json_schema_tool()],
+    )
+    assert isinstance(bound_llm.tool_manager, ToolManager)
+    assert bound_llm.binding.tool_schemas == (
+        ToolSchema(
+            name="lookup",
+            description="Look up one value.",
+            args_schema={"type": "object"},
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [_json_schema_tool(name="different")],
+        [_json_schema_tool(description="Different description.")],
+        [_json_schema_tool(args_schema={"type": "object", "required": ["value"]})],
+        [_json_schema_tool(name="second"), _json_schema_tool(name="lookup")],
+    ],
+)
+def test_reconstruction_rejects_tool_schema_mismatch(
+    tools: list[JSONSchemaTool[None]],
+) -> None:
+    """Captured tool schemas must equal caller schemas in captured order."""
+    if len(tools) == 1:
+        span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
+    else:
+        span = _successful_chat_span({
+            "gen_ai.tool.definitions": [
+                _captured_tool_definition(),
+                _captured_tool_definition(name="second"),
+            ]
+        })
+    with pytest.raises(OtelToLangchaintConversionError, match="differs"):
+        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+
+
+def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
+    """Captured tool definitions reject duplicate names."""
+    span = _successful_chat_span({
+        "gen_ai.tool.definitions": [
+            _captured_tool_definition(),
+            _captured_tool_definition(),
+        ]
+    })
+    with pytest.raises(OtelToLangchaintConversionError, match="duplicate"):
+        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=None)
+
+
+def test_reconstruction_rejects_duplicate_caller_tool_names() -> None:
+    """ToolManager rejects duplicate caller tool names before binding."""
+    span = _successful_chat_span()
+    with pytest.raises(ValueError, match="duplicate tool name"):
+        _ = reconstruct_bound_llm(
+            span,
+            llm=LLM(_FakeAdapter()),
+            tools=[_json_schema_tool(), _json_schema_tool()],
+        )
+
+
+@pytest.mark.parametrize(
+    ("definitions", "tools", "accepted"),
+    [
+        (None, None, True),
+        (None, [_json_schema_tool()], True),
+        ([], None, True),
+        ([], [_json_schema_tool()], False),
+        ([_captured_tool_definition()], None, False),
+    ],
+)
+def test_reconstruction_applies_tool_definition_presence_contract(
+    definitions: list[JsonValue] | None,
+    tools: list[JSONSchemaTool[None]] | None,
+    *,
+    accepted: bool,
+) -> None:
+    """Absent definitions skip comparison while present definitions require exact schemas."""
+    span = _successful_chat_span()
+    if definitions:
+        span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
+    elif definitions == []:
+        span = span.model_copy(update={"tool_definitions": ()})
+    if accepted:
+        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+    else:
+        with pytest.raises(OtelToLangchaintConversionError, match="differs"):
+            _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+
+
+def test_reconstruction_binds_structured_response_model() -> None:
+    """JSON output binds the caller-supplied structured response model."""
+    span = _successful_chat_span({"gen_ai.output.type": "json"})
+    bound_llm = reconstruct_bound_llm(
+        span,
+        llm=LLM(_FakeAdapter()),
+        response_format=_StructuredResponse,
+    )
+    assert_type(bound_llm, BoundLLM[_StructuredResponse, None])
+    assert bound_llm.response_format is _StructuredResponse
+
+
+@pytest.mark.parametrize(
+    ("output_type", "response_format"),
+    [("json", None), ("text", _StructuredResponse), (None, _StructuredResponse)],
+)
+def test_reconstruction_rejects_response_format_mismatch(
+    output_type: str | None,
+    response_format: type[BaseModel] | None,
+) -> None:
+    """output_type and response_format must select the same output form."""
+    span = _successful_chat_span()
+    if output_type is not None:
+        span = _successful_chat_span({"gen_ai.output.type": output_type})
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
+        _ = reconstruct_bound_llm(
+            span,
+            llm=LLM(_FakeAdapter()),
+            response_format=response_format,
+        )
+
+
+@pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
+def test_reconstruction_rejects_unsupported_output_type(output_type: str) -> None:
+    """Binding reconstruction rejects unsupported output types."""
+    span = _successful_chat_span({"gen_ai.output.type": output_type})
+    with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
+        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()))

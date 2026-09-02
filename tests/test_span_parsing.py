@@ -34,7 +34,6 @@ from langchaint.span_parsing import (
     OtelGenericPart,
     OtelGenericSystemInstructionPart,
     OtelGenericTool,
-    OtelInputMessage,
     OtelOutputMessage,
     OtelReasoningPart,
     OtelServerToolCallPart,
@@ -603,7 +602,7 @@ def test_parsing_succeeds_before_unsupported_conversion_fails() -> None:
     assert parsed.input_messages is not None
     assert isinstance(parsed.input_messages[0].parts[0], OtelReasoningPart)
     with pytest.raises(OtelToLangchaintConversionError, match="assistant part type"):
-        _ = generation_input_from_otel(parsed.input_messages)
+        _ = generation_input_from_otel(parsed)
 
 
 def test_tool_response_conversion_wraps_malformed_nested_parts() -> None:
@@ -620,7 +619,7 @@ def test_tool_response_conversion_wraps_malformed_nested_parts() -> None:
     )
     assert parsed.input_messages is not None
     with pytest.raises(OtelToLangchaintConversionError, match="tool response value"):
-        _ = generation_input_from_otel(parsed.input_messages)
+        _ = generation_input_from_otel(parsed)
 
 
 def test_converts_representable_input_messages() -> None:
@@ -667,7 +666,7 @@ def test_converts_representable_input_messages() -> None:
         })
     )
     assert parsed.input_messages is not None
-    assert generation_input_from_otel(parsed.input_messages) == (
+    assert generation_input_from_otel(parsed) == (
         UserMessage(
             content=(
                 TextPart(text="question"),
@@ -682,6 +681,131 @@ def test_converts_representable_input_messages() -> None:
         ),
         ToolMessage(tool_call_id="call-1", content="failed", is_error=True),
     )
+
+
+@pytest.mark.parametrize("empty_system_instructions", [False, True])
+def test_leading_system_message_supplies_the_binding_system_prompt(
+    *, empty_system_instructions: bool
+) -> None:
+    """A leading system message supplies the binding and stays outside GenerationInput."""
+    attributes: dict[str, JsonValue] = {
+        "gen_ai.provider.name": "fake",
+        "gen_ai.request.model": "fake-model",
+        "gen_ai.input.messages": [
+            {"role": "system", "parts": [{"type": "text", "content": "Be brief."}]},
+            {"role": "user", "parts": [{"type": "text", "content": "Question"}]},
+        ],
+    }
+    if empty_system_instructions:
+        attributes["gen_ai.system_instructions"] = list[JsonValue]()
+    parsed = parse_otel(_chat_span(attributes))
+    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+    assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
+    assert generation_input_from_otel(parsed) == (
+        UserMessage(content=(TextPart(text="Question"),)),
+    )
+
+
+def test_rejects_combined_system_instructions_and_system_message() -> None:
+    """A nonempty system-instructions attribute conflicts with a system message."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
+            "gen_ai.system_instructions": [{"type": "text", "content": "First"}],
+            "gen_ai.input.messages": [
+                {"role": "system", "parts": [{"type": "text", "content": "Second"}]}
+            ],
+        })
+    )
+    with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
+        _ = generation_input_from_otel(parsed)
+    with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
+        _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+
+
+@pytest.mark.parametrize(
+    ("input_messages", "error_match"),
+    [
+        (
+            [
+                {"role": "user", "parts": [{"type": "text", "content": "Question"}]},
+                {"role": "system", "parts": [{"type": "text", "content": "Rules"}]},
+            ],
+            "after the first message",
+        ),
+        (
+            [
+                {"role": "system", "parts": [{"type": "text", "content": "First"}]},
+                {"role": "system", "parts": [{"type": "text", "content": "Second"}]},
+            ],
+            "multiple role='system' messages",
+        ),
+    ],
+)
+def test_rejects_system_message_position_and_cardinality(
+    input_messages: list[JsonValue], error_match: str
+) -> None:
+    """System messages require one entry at the start of input messages."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
+            "gen_ai.input.messages": input_messages,
+        })
+    )
+    with pytest.raises(OtelToLangchaintConversionError, match=error_match):
+        _ = generation_input_from_otel(parsed)
+    with pytest.raises(OtelToLangchaintConversionError, match=error_match):
+        _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+
+
+@pytest.mark.parametrize(
+    ("system_message", "error_match"),
+    [
+        ({"role": "system", "parts": []}, "system message without parts"),
+        (
+            {
+                "role": "system",
+                "parts": [
+                    {
+                        "type": "blob",
+                        "modality": "image",
+                        "mime_type": "image/png",
+                        "content": "aW1hZ2U=",
+                    }
+                ],
+            },
+            "system instruction type",
+        ),
+        (
+            {
+                "role": "system",
+                "name": "named",
+                "parts": [{"type": "text", "content": "Rules"}],
+            },
+            "message name",
+        ),
+        (
+            {
+                "role": "system",
+                "parts": [{"type": "text", "content": "Rules", "provider_value": 1}],
+            },
+            "additional properties",
+        ),
+    ],
+)
+def test_rejects_unrepresentable_leading_system_message(
+    system_message: dict[str, JsonValue], error_match: str
+) -> None:
+    """A leading system message must convert losslessly to the binding system prompt."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.input.messages": [system_message],
+        })
+    )
+    with pytest.raises(OtelToLangchaintConversionError, match=error_match):
+        _ = generation_input_from_otel(parsed)
 
 
 def test_converts_system_instructions_tools_and_output_messages() -> None:
@@ -764,8 +888,11 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
 
 def test_public_models_validate_direct_construction() -> None:
     """Public structured models use the same strict validation outside parse_otel."""
-    message = OtelInputMessage(role="user", parts=(OtelTextPart(type="text", content="hi"),))
-    assert generation_input_from_otel((message,)) == (UserMessage(content=(TextPart(text="hi"),)),)
+    span = OtelChatSpan.model_validate({
+        "gen_ai.operation.name": "chat",
+        "gen_ai.input.messages": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
+    })
+    assert generation_input_from_otel(span) == (UserMessage(content=(TextPart(text="hi"),)),)
 
 
 def test_reconstructs_text_response_record_and_synthetic_fields() -> None:

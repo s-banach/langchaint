@@ -544,16 +544,47 @@ def parse_otel(raw_attributes: dict[str, JsonValue]) -> OtelChatSpan:
 
 
 def _system_prompt_from_otel(
-    system_instructions: tuple[OtelSystemInstructionPart, ...],
+    system_prompt_parts: tuple[OtelSystemInstructionPart, ...] | tuple[OtelMessagePart, ...],
 ) -> tuple[TextPart, ...]:
     """Convert supported OTel system instructions into langchaint text parts."""
     converted: list[TextPart] = []
-    for part in system_instructions:
+    for part in system_prompt_parts:
         if not isinstance(part, OtelTextPart):
             raise _unsupported(part, "system instruction type")
         _require_no_additional_properties(part)
         converted.append(TextPart(text=part.content))
     return tuple(converted)
+
+
+def _system_prompt_from_chat_span(
+    otel_chat_span: OtelChatSpan,
+) -> tuple[TextPart, ...] | None:
+    input_messages = otel_chat_span.input_messages or ()
+    system_message_indexes = [
+        index for index, message in enumerate(input_messages) if message.role == "system"
+    ]
+    if system_message_indexes and otel_chat_span.system_instructions:
+        raise OtelToLangchaintConversionError(
+            f"{SYSTEM_INSTRUCTIONS} and an {INPUT_MESSAGES} role='system' message both provide "
+            "the system prompt"
+        )
+    if len(system_message_indexes) > 1:
+        raise _attribute_conversion_error(
+            INPUT_MESSAGES, "contains multiple role='system' messages"
+        )
+    if system_message_indexes and system_message_indexes[0] != 0:
+        raise _attribute_conversion_error(
+            INPUT_MESSAGES, "contains a role='system' message after the first message"
+        )
+    if system_message_indexes:
+        system_message = input_messages[0]
+        _require_message_metadata(system_message)
+        if not system_message.parts:
+            raise _unsupported(system_message, "system message without parts")
+        return _system_prompt_from_otel(system_message.parts)
+    if otel_chat_span.system_instructions:
+        return _system_prompt_from_otel(otel_chat_span.system_instructions)
+    return None
 
 
 def _tool_schemas_from_otel(
@@ -590,13 +621,20 @@ def _tool_schemas_from_otel(
 
 
 def generation_input_from_otel(
-    input_messages: tuple[OtelInputMessage, ...],
+    otel_chat_span: OtelChatSpan,
 ) -> GenerationInput:
-    """Convert supported OTel input messages into one langchaint generation input.
+    """Convert one parsed OTel chat span into one langchaint generation input.
+
+    Args:
+        otel_chat_span: The parsed OTel chat span attributes.
 
     Raises:
         OtelToLangchaintConversionError: An input value has no lossless langchaint representation.
     """
+    _ = _system_prompt_from_chat_span(otel_chat_span)
+    input_messages = otel_chat_span.input_messages or ()
+    if input_messages and input_messages[0].role == "system":
+        input_messages = input_messages[1:]
     return tuple(_message_from_otel(message) for message in input_messages)
 
 
@@ -767,11 +805,7 @@ def reconstruct_bound_llm[ModelT: BaseModel](
             f"LLM model {llm.adapter.model!r} differs from parsed span model "
             f"{otel_chat_span.request_model!r}"
         )
-    system_prompt = (
-        _system_prompt_from_otel(otel_chat_span.system_instructions)
-        if otel_chat_span.system_instructions
-        else None
-    )
+    system_prompt = _system_prompt_from_chat_span(otel_chat_span)
     _require_matching_response_format(otel_chat_span.output_type, response_format)
     captured_tool_schemas = (
         _tool_schemas_from_otel(otel_chat_span.tool_definitions)

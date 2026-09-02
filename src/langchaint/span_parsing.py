@@ -302,7 +302,7 @@ class OtelOutputMessage(OtelStructuredModel):
 class OtelFunctionTool(OtelStructuredModel):
     """Pydantic validates one function definition and its optional JSON Schema."""
 
-    type: Literal["function"]
+    type: Literal["function"] = "function"
     name: str
     description: str | None = None
     parameters: Draft7Schema | None = None
@@ -315,6 +315,9 @@ class OtelGenericTool(OtelStructuredModel):
     name: str
 
 
+# The OTel schema requires `type`.
+# `OtelFunctionTool.type` deliberately accepts a missing `type` as `"function"`.
+# A new `OtelToolDefinition` variant may require removing that default.
 type OtelToolDefinition = Annotated[
     OtelFunctionTool | OtelGenericTool,
     Field(union_mode="left_to_right"),

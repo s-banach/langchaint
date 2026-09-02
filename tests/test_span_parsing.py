@@ -403,6 +403,17 @@ def test_known_tool_type_can_use_the_generic_schema_variant() -> None:
     assert definition.additional_properties == {"description": 42}
 
 
+def test_missing_tool_type_defaults_to_function() -> None:
+    """A missing tool type selects the function schema variant."""
+    tool_definition = _captured_tool_definition()
+    del tool_definition["type"]
+    parsed = parse_otel(_chat_span({"gen_ai.tool.definitions": [tool_definition]}))
+    assert parsed.tool_definitions is not None
+    definition = parsed.tool_definitions[0]
+    assert isinstance(definition, OtelFunctionTool)
+    assert definition.type == "function"
+
+
 def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
     """Structured attributes accept JSON text and its decoded JSON value."""
     value: list[JsonValue] = [{"type": "text", "content": "Follow the rules."}]

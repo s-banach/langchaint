@@ -415,7 +415,6 @@ _REFUSAL_MESSAGE_ITEM: dict[str, object] = {
 
 
 def _incomplete_response(reason: Literal["max_output_tokens", "content_filter"]) -> OpenAIResponse:
-    """Build an incomplete response reporting one of the two reasons the API declares."""
     return _response(
         usage=None, status="incomplete", incomplete_details=IncompleteDetails(reason=reason)
     )

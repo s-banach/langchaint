@@ -49,6 +49,7 @@ from pydantic import BaseModel
 
 from langchaint.anthropic import messages_adapter
 from langchaint.gemini import generate_content_adapter
+from langchaint.openai import responses_adapter as openai_responses
 from langchaint.openai import shared as openai_shared
 
 _ANTHROPIC_LISTED_STATUSES = (
@@ -243,13 +244,11 @@ def test_openai_response_statuses_are_the_set_the_adapter_maps() -> None:
     )
 
 
-def test_openai_incomplete_reasons_are_the_set_the_adapter_maps() -> None:
-    """max_output_tokens is MaxCompletionTokensExceeded and content_filter is not. A third value would fall through."""
+def test_openai_incomplete_reasons_have_dispositions() -> None:
+    """Fail when the installed SDK adds an incomplete reason without an adapter disposition."""
     annotation = _field_annotation(IncompleteDetails, "reason")
-    assert typing.get_args(typing.get_args(annotation)[0]) == (
-        "max_output_tokens",
-        "content_filter",
-    )
+    reasons = set(typing.get_args(typing.get_args(annotation)[0]))
+    assert reasons <= openai_responses._STOP_REASON_BY_INCOMPLETE_REASON.keys()
 
 
 def test_every_openai_error_code_has_a_disposition() -> None:

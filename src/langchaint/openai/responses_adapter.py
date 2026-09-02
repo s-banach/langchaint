@@ -45,7 +45,9 @@ Request and response mappings:
 - Anthropic 0.120.0 represents refusals as text with the same `stop_reason`.
 - A `function_call` output item maps to `stop_reason="tool_use"`.
 - Status `"completed"` maps to `"end_turn"`.
-- Status `"incomplete"` maps `"max_output_tokens"` to `"max_tokens"` and `"content_filter"` to `"refusal"`.
+- Status `"incomplete"` maps `"max_output_tokens"` to `"max_tokens"`.
+  Status `"incomplete"` maps `"content_filter"` to `"refusal"`.
+  OpenAI 3.7.0 incomplete reason `"max_messages"` maps to `"other"`.
 - Other outcomes map to `"other"`.
 - Status `"failed"` returns `_provider_failure` with billing, even when emitted text validates.
 - Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one `ToolCall` per completed item.
@@ -537,6 +539,13 @@ def _first_output_text(response: OpenAIResponse) -> str | None:
     return None
 
 
+_STOP_REASON_BY_INCOMPLETE_REASON: dict[str, StopReason] = {
+    "max_output_tokens": "max_tokens",
+    "content_filter": "refusal",
+    "max_messages": "other",
+}
+
+
 def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
     """Derive the stop reason.
 
@@ -548,21 +557,14 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
         return "refusal"
     if any(item.type == "function_call" for item in response.output):
         return "tool_use"
-    match response.status:
-        case "completed":
-            return "end_turn"
-        case "incomplete" if (
-            response.incomplete_details is not None
-            and response.incomplete_details.reason == "max_output_tokens"
-        ):
-            return "max_tokens"
-        case "incomplete" if (
-            response.incomplete_details is not None
-            and response.incomplete_details.reason == "content_filter"
-        ):
-            return "refusal"
-        case _:
-            return "other"
+    if response.status == "completed":
+        return "end_turn"
+    if response.status != "incomplete" or response.incomplete_details is None:
+        return "other"
+    reason = response.incomplete_details.reason
+    if reason is None:
+        return "other"
+    return _STOP_REASON_BY_INCOMPLETE_REASON.get(reason, "other")
 
 
 def _reasoning_text(item: ResponseReasoningItem) -> str | None:

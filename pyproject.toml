@@ -1,6 +1,6 @@
 [project]
 name = "langchaint"
-version = "0.20.2"
+version = "0.20.3"
 description = "It ain't langchain."
 readme = "README.md"
 license = "MIT"
@@ -30,9 +30,7 @@ openai-bedrock = ["openai[bedrock]>=3.0.0"]
 tracing = ["opentelemetry-api>=1.30.0"]
 
 [project.urls]
-Homepage = "https://github.com/s-banach/langchaint"
 Repository = "https://github.com/s-banach/langchaint"
-Issues = "https://github.com/s-banach/langchaint/issues"
 
 [build-system]
 requires = ["uv_build>=0.11.26,<1.0"]

@@ -543,7 +543,7 @@ def parse_otel(raw_attributes: dict[str, JsonValue]) -> OtelChatSpan:
     return OtelChatSpan.model_validate(raw_attributes, context=_OTEL_RAW_CONTEXT)
 
 
-def _system_prompt_from_otel(
+def _system_prompt_from_parts(
     system_prompt_parts: tuple[OtelSystemInstructionPart, ...] | tuple[OtelMessagePart, ...],
 ) -> tuple[TextPart, ...]:
     """Convert supported OTel system instructions into langchaint text parts."""
@@ -556,9 +556,20 @@ def _system_prompt_from_otel(
     return tuple(converted)
 
 
-def _system_prompt_from_chat_span(
+def system_prompt_from_otel(
     otel_chat_span: OtelChatSpan,
 ) -> tuple[TextPart, ...] | None:
+    """Convert the system prompt from one parsed OTel chat span.
+
+    Args:
+        otel_chat_span: The parsed OTel chat span attributes.
+
+    Returns:
+        The converted text parts, or `None` when the span has no system prompt.
+
+    Raises:
+        OtelToLangchaintConversionError: The system prompt has no lossless langchaint representation.
+    """
     input_messages = otel_chat_span.input_messages or ()
     system_message_indexes = [
         index for index, message in enumerate(input_messages) if message.role == "system"
@@ -581,16 +592,27 @@ def _system_prompt_from_chat_span(
         _require_message_metadata(system_message)
         if not system_message.parts:
             raise _unsupported(system_message, "system message without parts")
-        return _system_prompt_from_otel(system_message.parts)
+        return _system_prompt_from_parts(system_message.parts)
     if otel_chat_span.system_instructions:
-        return _system_prompt_from_otel(otel_chat_span.system_instructions)
+        return _system_prompt_from_parts(otel_chat_span.system_instructions)
     return None
 
 
-def _tool_schemas_from_otel(
-    tool_definitions: tuple[OtelToolDefinition, ...],
-) -> tuple[ToolSchema, ...]:
-    """Convert supported OTel function definitions into langchaint tool schemas."""
+def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ...] | None:
+    """Convert tool definitions from one parsed OTel chat span.
+
+    Args:
+        otel_chat_span: The parsed OTel chat span attributes.
+
+    Returns:
+        The converted tool schemas, or `None` when the span has no tool definitions.
+
+    Raises:
+        OtelToLangchaintConversionError: A tool definition has no lossless langchaint representation.
+    """
+    tool_definitions = otel_chat_span.tool_definitions
+    if tool_definitions is None:
+        return None
     converted: list[ToolSchema] = []
     converted_names: set[str] = set()
     for definition in tool_definitions:
@@ -631,17 +653,30 @@ def generation_input_from_otel(
     Raises:
         OtelToLangchaintConversionError: An input value has no lossless langchaint representation.
     """
-    _ = _system_prompt_from_chat_span(otel_chat_span)
+    _ = system_prompt_from_otel(otel_chat_span)
     input_messages = otel_chat_span.input_messages or ()
     if input_messages and input_messages[0].role == "system":
         input_messages = input_messages[1:]
     return tuple(_message_from_otel(message) for message in input_messages)
 
 
-def _output_messages_from_otel(
-    output_messages: tuple[OtelOutputMessage, ...],
-) -> tuple[ExtractedOutputMessage, ...]:
-    """Convert supported OTel output messages into langchaint assistant messages."""
+def output_messages_from_otel(
+    otel_chat_span: OtelChatSpan,
+) -> tuple[ExtractedOutputMessage, ...] | None:
+    """Convert output messages from one parsed OTel chat span.
+
+    Args:
+        otel_chat_span: The parsed OTel chat span attributes.
+
+    Returns:
+        The converted output messages, or `None` when the span has no output messages.
+
+    Raises:
+        OtelToLangchaintConversionError: An output message has no lossless langchaint representation.
+    """
+    output_messages = otel_chat_span.output_messages
+    if output_messages is None:
+        return None
     converted: list[ExtractedOutputMessage] = []
     for message in output_messages:
         _require_message_metadata(message)
@@ -685,7 +720,9 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
             OUTPUT_MESSAGES,
             "must contain exactly one output message",
         )
-    extracted_output = _output_messages_from_otel(output_messages)[0]
+    extracted_output_messages = output_messages_from_otel(otel_chat_span)
+    assert extracted_output_messages is not None
+    extracted_output = extracted_output_messages[0]
     stop_reason = _stop_reason_from_otel(otel_chat_span, extracted_output.finish_reason)
     output = _output_from_otel(otel_chat_span.output_type, extracted_output.assistant_message)
     if not otel_chat_span.provider_name:
@@ -805,13 +842,9 @@ def reconstruct_bound_llm[ModelT: BaseModel](
             f"LLM model {llm.adapter.model!r} differs from parsed span model "
             f"{otel_chat_span.request_model!r}"
         )
-    system_prompt = _system_prompt_from_chat_span(otel_chat_span)
+    system_prompt = system_prompt_from_otel(otel_chat_span)
     _require_matching_response_format(otel_chat_span.output_type, response_format)
-    captured_tool_schemas = (
-        _tool_schemas_from_otel(otel_chat_span.tool_definitions)
-        if otel_chat_span.tool_definitions is not None
-        else None
-    )
+    captured_tool_schemas = tool_schemas_from_otel(otel_chat_span)
     bound_llm = llm.bind(
         system_prompt=system_prompt,
         tools=tools,
@@ -1059,7 +1092,10 @@ __all__ = [
     "OtelToolDefinition",
     "OtelUriPart",
     "generation_input_from_otel",
+    "output_messages_from_otel",
     "parse_otel",
     "reconstruct_bound_llm",
     "response_record_from_otel",
+    "system_prompt_from_otel",
+    "tool_schemas_from_otel",
 ]

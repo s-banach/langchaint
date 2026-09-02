@@ -8,7 +8,6 @@ from typing import assert_type
 import pytest
 from pydantic import BaseModel, ValidationError
 
-import langchaint.span_parsing
 from langchaint import (
     LLM,
     ZERO_USAGE,
@@ -34,7 +33,6 @@ from langchaint.span_parsing import (
     OtelGenericPart,
     OtelGenericSystemInstructionPart,
     OtelGenericTool,
-    OtelOutputMessage,
     OtelReasoningPart,
     OtelServerToolCallPart,
     OtelServerToolCallResponsePart,
@@ -43,13 +41,13 @@ from langchaint.span_parsing import (
     OtelToolCallPart,
     OtelToolCallResponsePart,
     OtelUriPart,
-    _output_messages_from_otel,
-    _system_prompt_from_otel,
-    _tool_schemas_from_otel,
     generation_input_from_otel,
+    output_messages_from_otel,
     parse_otel,
     reconstruct_bound_llm,
     response_record_from_otel,
+    system_prompt_from_otel,
+    tool_schemas_from_otel,
 )
 from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
 from scripts import refresh_semconv_genai
@@ -300,19 +298,6 @@ def test_only_chat_operation_is_required() -> None:
     assert parse_otel(_chat_span()) == OtelChatSpan.model_validate({
         "gen_ai.operation.name": "chat"
     })
-
-
-def test_public_conversion_functions_are_exported() -> None:
-    """Keep `_output_messages_from_otel` and `_system_prompt_from_otel` out of `__all__`.
-
-    Keep `_tool_schemas_from_otel` out of `__all__`.
-    """
-    assert "generation_input_from_otel" in langchaint.span_parsing.__all__
-    assert "response_record_from_otel" in langchaint.span_parsing.__all__
-    assert "reconstruct_bound_llm" in langchaint.span_parsing.__all__
-    assert "_output_messages_from_otel" not in langchaint.span_parsing.__all__
-    assert "_system_prompt_from_otel" not in langchaint.span_parsing.__all__
-    assert "_tool_schemas_from_otel" not in langchaint.span_parsing.__all__
 
 
 @pytest.mark.parametrize("raw_attributes", [{}, {"gen_ai.operation.name": "embeddings"}])
@@ -584,7 +569,7 @@ def test_parses_boolean_draft_07_schema_before_conversion_fails() -> None:
     )
     assert parsed.tool_definitions is not None
     with pytest.raises(OtelToLangchaintConversionError, match="description and parameters"):
-        _ = _tool_schemas_from_otel(parsed.tool_definitions)
+        _ = tool_schemas_from_otel(parsed)
 
 
 def test_parsing_succeeds_before_unsupported_conversion_fails() -> None:
@@ -810,29 +795,28 @@ def test_rejects_unrepresentable_leading_system_message(
 
 def test_converts_system_instructions_tools_and_output_messages() -> None:
     """Explicit conversion functions produce the prior langchaint values."""
-    assert _system_prompt_from_otel((OtelTextPart(type="text", content="Be brief."),)) == (
-        TextPart(text="Be brief."),
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.system_instructions": [{"type": "text", "content": "Be brief."}],
+            "gen_ai.tool.definitions": [_captured_tool_definition()],
+            "gen_ai.output.messages": [
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "content": "done"}],
+                    "finish_reason": "stop",
+                }
+            ],
+        })
     )
-    assert _tool_schemas_from_otel((
-        OtelFunctionTool(
-            type="function",
-            name="lookup",
-            description="Look up one value.",
-            parameters={"type": "object"},
-        ),
-    )) == (
+    assert system_prompt_from_otel(parsed) == (TextPart(text="Be brief."),)
+    assert tool_schemas_from_otel(parsed) == (
         ToolSchema(
             name="lookup",
             description="Look up one value.",
             args_schema={"type": "object"},
         ),
     )
-    output = OtelOutputMessage(
-        role="assistant",
-        parts=(OtelTextPart(type="text", content="done"),),
-        finish_reason="stop",
-    )
-    assert _output_messages_from_otel((output,)) == (
+    assert output_messages_from_otel(parsed) == (
         ExtractedOutputMessage(
             assistant_message=AssistantMessage(turn=(TextPart(text="done"),)),
             finish_reason="stop",
@@ -850,12 +834,20 @@ def test_output_message_without_deprecated_finish_reason_parses_and_converts() -
         })
     )
     assert parsed.output_messages is not None
-    assert _output_messages_from_otel(parsed.output_messages) == (
+    assert output_messages_from_otel(parsed) == (
         ExtractedOutputMessage(
             assistant_message=AssistantMessage(turn=(TextPart(text="done"),)),
             finish_reason=None,
         ),
     )
+
+
+def test_absent_optional_values_return_none() -> None:
+    """Conversion functions return `None` when the span has no corresponding value."""
+    parsed = parse_otel(_chat_span())
+    assert system_prompt_from_otel(parsed) is None
+    assert output_messages_from_otel(parsed) is None
+    assert tool_schemas_from_otel(parsed) is None
 
 
 def test_reconstructs_provider_neutral_binding_fields() -> None:

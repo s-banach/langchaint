@@ -27,6 +27,7 @@ from langchaint import (
     DoNotRetry,
     EscapedExceptionErrorRecord,
     GenerationError,
+    GenerationErrorRecord,
     InvalidRequestErrorRecord,
     Message,
     ParserContractError,
@@ -161,7 +162,7 @@ def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
     return outputs
 
 
-def _record_outputs(results: list[CallResultRecord[str]]) -> list[str]:
+def _record_outputs(results: Sequence[CallResultRecord[str]]) -> list[str]:
     """Assert successful records and return each output in order."""
     outputs: list[str] = []
     for result in results:
@@ -1779,13 +1780,31 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     )
     structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), Response[_Answer])
+    assert_type(
+        await structured.generate_many_records(["hi"], resume_path=Path("records.json")),
+        list[ResponseRecord[_Answer] | GenerationErrorRecord],
+    )
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(await text_with_tools.generate_one("hi"), Response[str])
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[CallResultRecord[str]],
+        list[ResponseRecord[str] | GenerationErrorRecord],
     )
     assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
+
+
+async def _pin_generic_request_method_return_types[
+    OutputT: str | BaseModel,
+    ToolManagerT: ToolManager | None,
+](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
+    assert_type(
+        await bound_llm.generate_many(["hi"]),
+        list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]],
+    )
+    assert_type(
+        await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
+        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]],
+    )
 
 
 def test_response_format_is_public_state_that_replacement_bind_carries() -> None:
@@ -2459,7 +2478,7 @@ def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) ->
         restored = await bound.generate_many_records(["a"], resume_path=resume_path)
         assert generated[0].kind == "refusal_error"
         assert restored[0].kind == "refusal_error"
-        record_adapter = TypeAdapter(list[CallResultRecord[str]])
+        record_adapter = TypeAdapter(list[ResponseRecord[str] | GenerationErrorRecord])
         assert record_adapter.dump_json(restored) == record_adapter.dump_json(generated)
         assert adapter.bound_adapters[0].open_count == 1
 

@@ -36,6 +36,7 @@ from langchaint.call import _CallLedger
 from langchaint.exceptions import (
     EscapedExceptionErrorRecord,
     GenerationError,
+    GenerationErrorRecord,
     InvalidRequestErrorRecord,
     ParserContractError,
     RetriesExhaustedErrorRecord,
@@ -51,6 +52,7 @@ from langchaint.response import (
     CallResultRecord,
     GenerateResult,
     Response,
+    ResponseRecord,
     ToolCallTurn,
     _abandoned_call_error,
     _call_result_from_response_outcome,
@@ -1120,6 +1122,14 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "BoundLLM[OutputT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1152,6 +1162,48 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
+    @overload
+    async def generate_many_records(
+        self: "BoundLLM[str, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[ResponseRecord[str] | GenerationErrorRecord]: ...
+    @overload
+    async def generate_many_records(
+        self: "BoundLLM[OutputT, ToolManager]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResultRecord[OutputT]]: ...
+    @overload
+    async def generate_many_records(
+        self: "BoundLLM[OutputT, None]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord]: ...
+    @overload
+    async def generate_many_records(
+        self: "BoundLLM[OutputT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> (
+        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]
+    ): ...
     async def generate_many_records(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1160,7 +1212,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         sample_ids: SequenceNotStr[str] | None = None,
         warm_cache: bool = False,
         max_working_seconds_per_item: float | None = None,
-    ) -> list[CallResultRecord[OutputT]]:
+    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]:
         """Restore reusable records and generate the remaining input records.
 
         The JSON file stores one item per current input.

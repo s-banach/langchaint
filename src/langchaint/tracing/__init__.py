@@ -77,7 +77,11 @@ except ModuleNotFoundError as exc:
 
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
 from langchaint.call import SettledAttemptRecord
-from langchaint.exceptions import AbandonedCallErrorRecord, GenerationError
+from langchaint.exceptions import (
+    AbandonedCallErrorRecord,
+    GenerationError,
+    GenerationErrorRecord,
+)
 from langchaint.llm import (
     LLM,
     UNCHANGED,
@@ -104,6 +108,7 @@ from langchaint.response import (
     CallResultRecord,
     GenerateResult,
     Response,
+    ResponseRecord,
     ToolCallTurn,
 )
 from langchaint.sequence_not_str import SequenceNotStr
@@ -1383,6 +1388,14 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_item: float | None = ...,
     ) -> list[Response[OutputT] | GenerationError]: ...
+    @overload
+    async def generate_many(
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1412,6 +1425,48 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             max_working_seconds_per_item=max_working_seconds_per_item,
         )
 
+    @overload
+    async def generate_many_records(
+        self: "TracedBoundLLM[str, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[ResponseRecord[str] | GenerationErrorRecord]: ...
+    @overload
+    async def generate_many_records(
+        self: "TracedBoundLLM[OutputT, ToolManager]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResultRecord[OutputT]]: ...
+    @overload
+    async def generate_many_records(
+        self: "TracedBoundLLM[OutputT, None]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord]: ...
+    @overload
+    async def generate_many_records(
+        self: "TracedBoundLLM[OutputT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> (
+        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]
+    ): ...
     async def generate_many_records(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1420,7 +1475,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         sample_ids: SequenceNotStr[str] | None = None,
         warm_cache: bool = False,
         max_working_seconds_per_item: float | None = None,
-    ) -> list[CallResultRecord[OutputT]]:
+    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]:
         """Restore normalized records and trace each item that requires generation.
 
         Reused records open no spans.

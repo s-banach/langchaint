@@ -37,6 +37,7 @@ from langchaint import (
     DispatchOutcome,
     DispatchUnknownTool,
     GenerationError,
+    GenerationErrorRecord,
     ImagePart,
     ImageUrlPart,
     JSONSchemaTool,
@@ -1234,8 +1235,28 @@ async def _generate_many_records_overload_pin() -> None:
     structured_records = await traced.bind(response_format=_Answer).generate_many_records(
         ["hi"], resume_path=pathlib.Path("records.json")
     )
-    assert_type(text_records, list[CallResultRecord[str]])
-    assert_type(structured_records, list[CallResultRecord[_Answer]])
+    structured_tool_records = await traced.bind(
+        response_format=_Answer, tools=[_echo_tool()]
+    ).generate_many_records(["hi"], resume_path=pathlib.Path("records.json"))
+    assert_type(text_records, list[ResponseRecord[str] | GenerationErrorRecord])
+    assert_type(
+        structured_records,
+        list[ResponseRecord[_Answer] | GenerationErrorRecord],
+    )
+    assert_type(structured_tool_records, list[CallResultRecord[_Answer]])
+
+
+async def _generic_batch_overload_pin[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
+    bound_llm: TracedBoundLLM[OutputT, ToolManagerT],
+) -> None:
+    assert_type(
+        await bound_llm.generate_many(["hi"]),
+        list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]],
+    )
+    assert_type(
+        await bound_llm.generate_many_records(["hi"], resume_path=pathlib.Path("records.json")),
+        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]],
+    )
 
 
 def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:

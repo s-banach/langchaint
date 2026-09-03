@@ -390,7 +390,9 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         built = self._bound_adapter.build_request(self._messages)
         if isinstance(built, InvalidRequest):
             raise GenerationError(
-                record=InvalidRequestErrorRecord(reason=built.reason, call=self._ledger.freeze()),
+                record=InvalidRequestErrorRecord(
+                    error_text=built.reason, call=self._ledger.freeze()
+                ),
                 request=None,
                 provider_attempts=self._ledger.provider_attempts,
             ) from None

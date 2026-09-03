@@ -772,13 +772,15 @@ def _apply_operation_name(span: Span, operation_name: str) -> None:
 
 
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
-    """Set error.type and error status from a terminal GenerationError, whose attributes are set separately.
-
-    error.type is the normalized error record class name, which groups errors independently of error_text.
-    """
-    _set_span_attribute(span, "error.type", type(error.record).__name__)
+    """Set error.type and error status from a terminal GenerationError."""
+    _set_span_attribute(span, "error.type", error.kind)
     with _guarding_telemetry_failures("setting the error status"):
-        span.set_status(Status(StatusCode.ERROR, error.error_text))
+        status = (
+            Status(StatusCode.ERROR, error.error_text)
+            if error.error_text
+            else Status(StatusCode.ERROR)
+        )
+        span.set_status(status)
 
 
 def _record_other_exception(span: Span, exc: Exception) -> None:

@@ -1,5 +1,6 @@
 """Test normalized generation records, live wrappers, result normalization, and tables."""
 
+import json
 import math
 from collections.abc import Callable
 from typing import override
@@ -20,6 +21,7 @@ from langchaint import (
     EmptyTurnErrorRecord,
     EscapedExceptionErrorRecord,
     GenerationError,
+    GenerationErrorKind,
     GenerationErrorRecord,
     InvalidRequestErrorRecord,
     MaxCompletionTokensExceededErrorRecord,
@@ -379,58 +381,123 @@ def test_success_variant_constructs_one_normalized_record() -> None:
     assert result.record.call is call
 
 
-def _error_records() -> list[GenerationErrorRecord]:
+def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKind, str]]:
     completed = _completed_turn_call()
     failed = _failed_call()
+    multiline_failed = _call(
+        _settled(
+            elapsed_seconds=0.5,
+            error=TransientErrorRecord(message="connection\nreset"),
+            billing=None,
+            assistant_message=None,
+        ),
+        _settled(
+            started_after_seconds=0.5,
+            elapsed_seconds=0.5,
+            error=TransientErrorRecord(message=""),
+            billing=None,
+            assistant_message=None,
+        ),
+    )
     terminal = _call(_settled(billing=None, assistant_message=None))
     cut_off = _call(CutOffAttemptRecord(started_after_seconds=0.0, billing=_BILLING))
     return [
-        RetriesExhaustedErrorRecord(call=failed),
-        RetryUnavailableErrorRecord(call=failed),
-        RefusalErrorRecord(call=completed),
-        MaxCompletionTokensExceededErrorRecord(call=completed),
-        EmptyTurnErrorRecord(call=completed),
-        SchemaViolationErrorRecord(call=completed, validation_error_json="[]"),
-        ContextWindowExceededErrorRecord(call=completed),
-        UnfinishedTurnErrorRecord(call=completed, reason="unfinished"),
-        ProviderFailedTerminallyErrorRecord(call=completed, reason="failed"),
-        InvalidRequestErrorRecord(
-            call=CallRecord(
-                model="model", provider_name="provider", attempt_records=(), elapsed_seconds=0.0
-            ),
-            reason="invalid",
+        (
+            RetriesExhaustedErrorRecord(call=multiline_failed),
+            "retries_exhausted_error",
+            "attempt 1: connection\n  reset\nattempt 2: ",
         ),
-        ProviderDeclaredFinalErrorRecord(call=terminal, reason="terminal"),
-        UnknownExceptionErrorRecord(
-            call=CallRecord(
-                model="model", provider_name="provider", attempt_records=(), elapsed_seconds=0.0
-            ),
-            reason="unknown",
+        (RetryUnavailableErrorRecord(call=failed), "retry_unavailable_error", "retry"),
+        (RefusalErrorRecord(call=completed), "refusal_error", ""),
+        (
+            MaxCompletionTokensExceededErrorRecord(call=completed),
+            "max_completion_tokens_exceeded_error",
+            "",
         ),
-        EscapedExceptionErrorRecord(
-            call=CallRecord(
-                model="model", provider_name="provider", attempt_records=(), elapsed_seconds=0.0
-            ),
-            reason="escaped",
+        (EmptyTurnErrorRecord(call=completed), "empty_turn_error", ""),
+        (
+            SchemaViolationErrorRecord(call=completed, validation_error_json="[]"),
+            "schema_violation_error",
+            "",
         ),
-        AbandonedCallErrorRecord(call=cut_off),
-        TimedOutErrorRecord(call=cut_off),
+        (ContextWindowExceededErrorRecord(call=completed), "context_window_exceeded_error", ""),
+        (
+            UnfinishedTurnErrorRecord(call=completed, error_text="unfinished"),
+            "unfinished_turn_error",
+            "unfinished",
+        ),
+        (
+            ProviderFailedTerminallyErrorRecord(call=completed, error_text="failed"),
+            "provider_failed_terminally_error",
+            "failed",
+        ),
+        (
+            InvalidRequestErrorRecord(
+                call=CallRecord(
+                    model="model",
+                    provider_name="provider",
+                    attempt_records=(),
+                    elapsed_seconds=0.0,
+                ),
+                error_text="invalid",
+            ),
+            "invalid_request_error",
+            "invalid",
+        ),
+        (
+            ProviderDeclaredFinalErrorRecord(call=terminal, error_text="terminal"),
+            "provider_declared_final_error",
+            "terminal",
+        ),
+        (
+            UnknownExceptionErrorRecord(
+                call=CallRecord(
+                    model="model",
+                    provider_name="provider",
+                    attempt_records=(),
+                    elapsed_seconds=0.0,
+                ),
+                error_text="unknown",
+            ),
+            "unknown_exception_error",
+            "unknown",
+        ),
+        (
+            EscapedExceptionErrorRecord(
+                call=CallRecord(
+                    model="model",
+                    provider_name="provider",
+                    attempt_records=(),
+                    elapsed_seconds=0.0,
+                ),
+                error_text="escaped",
+            ),
+            "escaped_exception_error",
+            "escaped",
+        ),
+        (AbandonedCallErrorRecord(call=cut_off), "abandoned_call_error", ""),
+        (TimedOutErrorRecord(call=cut_off), "timed_out_error", ""),
     ]
 
 
 def test_every_error_record_round_trips_through_the_closed_union() -> None:
     """The closed error union reconstructs each built-in error record."""
     adapter = TypeAdapter(GenerationErrorRecord)
-    for record in _error_records():
+    for record, expected_kind, expected_error_text in _error_record_cases():
         assert record.model_config.get("frozen") is True
+        assert record.kind == expected_kind
+        assert record.error_text == expected_error_text
         record_json_text = record.model_dump_json()
+        assert json.loads(record_json_text)["error_text"] == expected_error_text
         restored_direct = type(record).model_validate_json(record_json_text)
         assert restored_direct.model_dump_json() == record_json_text
         record_json_bytes = adapter.dump_json(record)
         restored = adapter.validate_json(record_json_bytes)
         assert type(restored) is type(record)
         assert adapter.dump_json(restored) == record_json_bytes
-        assert str(restored) == restored.error_summary
+        assert restored.kind == expected_kind
+        assert restored.error_text == expected_error_text
+        assert str(restored) == restored.error_text
 
 
 def test_closed_result_unions_reject_unknown_kinds() -> None:
@@ -444,8 +511,8 @@ def test_closed_result_unions_reject_unknown_kinds() -> None:
         _ = TypeAdapter(CallResultRecord[Report]).validate_python(payload)
 
 
-def test_error_record_properties_and_stable_text() -> None:
-    """Error records retain normalized properties and tracing-safe text."""
+def test_error_record_properties_and_error_text() -> None:
+    """Error records retain normalized properties and error_text."""
     exhausted = RetriesExhaustedErrorRecord(call=_failed_call())
     assert [str(error) for error in exhausted.errors_from_attempts] == ["retry"]
     assert exhausted.error_text == "attempt 1: retry"
@@ -454,6 +521,21 @@ def test_error_record_properties_and_stable_text() -> None:
     assert refusal.stop_reason == "refusal"
     assert refusal.assistant_message == _TURN
     assert refusal.usage == _USAGE
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: RetriesExhaustedErrorRecord(call=_failed_call(), error_text="different text"),
+        lambda: RetryUnavailableErrorRecord(call=_failed_call(), error_text="different text"),
+    ],
+)
+def test_retry_error_records_reject_error_text_that_disagrees_with_call(
+    factory: Callable[[], GenerationErrorRecord],
+) -> None:
+    """Retry records derive error_text from call."""
+    with pytest.raises(ValidationError, match="error_text must match"):
+        _ = factory()
 
 
 @pytest.mark.parametrize(
@@ -466,7 +548,7 @@ def test_error_record_properties_and_stable_text() -> None:
                 call=CallRecord(
                     model="m", provider_name="p", attempt_records=(), elapsed_seconds=0.0
                 ),
-                reason="terminal",
+                error_text="terminal",
             ),
             "final provider result",
         ),
@@ -489,7 +571,8 @@ def test_generation_error_delegates_record_and_keeps_live_only_state() -> None:
     )
     assert failure.request is not None
     assert failure.provider_attempts is provider_attempts
-    assert str(failure) == record.error_summary
+    assert failure.kind == record.kind
+    assert str(failure) == record.error_text
     assert failure.error_text == record.error_text
     assert failure.call == record.call
     assert failure.attempt_records == record.attempt_records
@@ -529,6 +612,8 @@ def test_to_tables_reads_live_only_request_and_provider_usage() -> None:
     normalized_tables = to_tables(record)
     assert live_tables.calls[0]["request_json"] == '{"prompt":"hi"}'
     assert normalized_tables.calls[0]["request_json"] is None
+    assert live_tables.calls[0]["error_text"] == ""
+    assert "error_summary" not in live_tables.calls[0]
     assert live_tables.attempts[0]["usage_raw_json"] == '{"billed_units":17}'
     assert normalized_tables.attempts[0]["usage_raw_json"] is None
     assert live_tables.attempts[0]["started_after_seconds"] == 0.0

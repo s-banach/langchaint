@@ -980,7 +980,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
         assert [
             str(record.error) for record in _settled_attempt_records(failure.attempt_records)
         ] == ["e1", "e2"]
-        assert failure.error_text == "attempt 1: e1; attempt 2: e2"
+        assert failure.error_text == "attempt 1: e1\nattempt 2: e2"
         assert failure.attempts == 2
         assert failure.model == adapter.model
         assert failure.provider_name == adapter.provider_name
@@ -1035,7 +1035,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
         assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
-        assert rejected.value.record.reason == "nope"
+        assert rejected.value.record.error_text == "nope"
         assert rejected.value.error_text == "nope"
         assert rejected.value.model == adapter.model
         assert rejected.value.provider_name == adapter.provider_name
@@ -1132,6 +1132,7 @@ def test_a_no_output_outcome_raises_without_retry(
         failure = caught.value
         assert failure.attempts == 1
         assert failure.stop_reason == expected_stop_reason
+        assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
@@ -1152,7 +1153,7 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
         assert failure.stop_reason == "end_turn"
         assert isinstance(failure.record, SchemaViolationErrorRecord)
         assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
-        assert "SENTINEL" not in failure.error_text
+        assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
@@ -1172,7 +1173,7 @@ def test_unfinished_turn_outcome_raises_carrying_the_adapter_s_reason() -> None:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = unfinished_turn.value
-        assert "pause_turn" in failure.error_text
+        assert failure.error_text == "anthropic returned stop_reason 'pause_turn'"
         assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
@@ -1245,7 +1246,7 @@ def test_provider_failed_terminally_raises_without_retry() -> None:
         failure = provider_failure.value
         assert failure.attempts == 1
         assert failure.stop_reason is None
-        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.error_text == _PROVIDER_FAILURE_REASON
         assert failure.usage.cost_in_usd == 0.25
 
     asyncio.run(scenario())
@@ -1283,7 +1284,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
-        assert rejected.value.record.reason == "the provider rejected the request: boom"
+        assert rejected.value.record.error_text == "boom"
         assert isinstance(rejected.value.__cause__, ValueError)
 
     asyncio.run(scenario())
@@ -1308,7 +1309,7 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
         assert isinstance(failure, GenerationError)
         assert isinstance(failure.record, UnknownExceptionErrorRecord)
         assert isinstance(failure.__cause__, ValueError)
-        assert failure.error_text == "langchaint could not place this exception: boom"
+        assert failure.error_text == "boom"
         assert failure.stop_reason is None
         assert failure.attempt_records == ()
         assert failure.model == adapter.model
@@ -1335,7 +1336,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
         failure = declared_final.value
         assert isinstance(failure.record, ProviderDeclaredFinalErrorRecord)
         assert isinstance(failure.__cause__, ValueError)
-        assert failure.error_text == "a final error from the provider: boom"
+        assert failure.error_text == "boom"
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
         assert failure.provider_attempts[0].raw is None
@@ -2709,7 +2710,7 @@ def test_invalid_request_fails_only_its_item() -> None:
         first, second = results
         assert isinstance(first, GenerationError)
         assert isinstance(first.record, InvalidRequestErrorRecord)
-        assert first.record.reason == "misconfigured"
+        assert first.record.error_text == "misconfigured"
         assert isinstance(second, Response)
         assert second.output == "b"
 
@@ -2827,7 +2828,7 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
         failure = failures[0]
         assert isinstance(failure.record, EscapedExceptionErrorRecord)
         assert isinstance(failure.__cause__, RuntimeError)
-        assert "classify defect" in failure.error_text
+        assert failure.error_text == "classify defect"
         assert failure.request is None
         # The attempt was in flight when the defect escaped, so no attempt is settled.
         assert failure.call.attempt_records == ()
@@ -2844,7 +2845,7 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
-        assert str(raised.value) == "an exception escaped langchaint: classify defect"
+        assert str(raised.value) == "classify defect"
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -3468,6 +3469,7 @@ def test_stream_final_refusal_raises_without_retry() -> None:
         failure = refusal.value
         assert failure.attempts == 1
         assert failure.stop_reason == "refusal"
+        assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
         assert failure.usage.output_tokens == _USAGE.output_tokens
         (record,) = _settled_attempt_records(failure.attempt_records)
@@ -3489,7 +3491,7 @@ def test_stream_final_unfinished_turn_raises_carrying_the_adapter_s_reason() -> 
                 await handle.final()
         failure = unfinished_turn.value
         assert failure.attempts == 1
-        assert "pause_turn" in failure.error_text
+        assert failure.error_text == "anthropic returned stop_reason 'pause_turn'"
         assert failure.usage.cost_in_usd == 0.25
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
@@ -3514,7 +3516,7 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
         assert failure.attempts == 1
         assert isinstance(failure.record, SchemaViolationErrorRecord)
         assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
-        assert "SENTINEL" not in failure.error_text
+        assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
@@ -3545,6 +3547,7 @@ def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
                 await handle.final()
         failure = caught.value
         assert failure.attempts == 1
+        assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
@@ -3564,7 +3567,7 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
                 await handle.final()
         failure = retry_unavailable.value
         assert failure.attempts == 1
-        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.error_text == _PROVIDER_FAILURE_REASON
         assert failure.usage.cost_in_usd == 0.25
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert str(record.error) == _PROVIDER_FAILURE_REASON
@@ -3589,7 +3592,7 @@ def test_stream_final_provider_failed_terminally_raises_carrying_the_providers_r
                 await handle.final()
         failure = provider_failure.value
         assert failure.attempts == 1
-        assert _PROVIDER_FAILURE_REASON in failure.error_text
+        assert failure.error_text == _PROVIDER_FAILURE_REASON
         assert failure.usage.cost_in_usd == 0.25
         (record,) = _settled_attempt_records(failure.attempt_records)
         assert record.error is None
@@ -3754,7 +3757,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
                 pass
         assert isinstance(rejected.value.__cause__, ValueError)
         assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
-        assert rejected.value.record.reason == "the provider rejected the request: boom"
+        assert rejected.value.record.error_text == "boom"
         transient_record, rejected_record = _settled_attempt_records(
             rejected.value.attempt_records
         )
@@ -3781,7 +3784,7 @@ def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
         assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
-        assert rejected.value.record.reason == "nope"
+        assert rejected.value.record.error_text == "nope"
         assert rejected.value.model == adapter.model
         assert rejected.value.attempt_records == ()
 
@@ -3803,7 +3806,7 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
         assert adapter.bound_adapters[0].open_count == 1
         assert isinstance(unplaceable.value.record, UnknownExceptionErrorRecord)
         assert isinstance(unplaceable.value.__cause__, ValueError)
-        assert unplaceable.value.error_text == "langchaint could not place this exception: boom"
+        assert unplaceable.value.error_text == "boom"
         assert unplaceable.value.attempt_records == ()
 
     asyncio.run(scenario())
@@ -3827,7 +3830,7 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
         assert adapter.bound_adapters[0].open_count == 1
         assert isinstance(declared_final.value.record, ProviderDeclaredFinalErrorRecord)
         assert isinstance(declared_final.value.__cause__, ValueError)
-        assert declared_final.value.error_text == "a final error from the provider: boom"
+        assert declared_final.value.error_text == "boom"
         (record,) = _settled_attempt_records(declared_final.value.attempt_records)
         assert record.error is None
         assert record.usage == ZERO_USAGE
@@ -3869,9 +3872,7 @@ def test_a_pause_all_do_not_retry_verdict_ends_an_open_stream_with_the_items_fai
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as declared_final:
                 _ = await anext(handle)
-        assert declared_final.value.error_text == (
-            "a final error from the provider: dropped before the first item"
-        )
+        assert declared_final.value.error_text == "dropped before the first item"
 
     asyncio.run(scenario())
 
@@ -4255,7 +4256,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
         assert isinstance(timed_out.attempt_records[-1], CutOffAttemptRecord)
         assert timed_out.attempt_records[-1].billing is None
         assert timed_out.usage == ZERO_USAGE
-        assert str(timed_out) == "the call timed out before it produced a result"
+        assert str(timed_out) == ""
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 

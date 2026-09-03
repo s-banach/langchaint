@@ -407,11 +407,8 @@ def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() 
     asyncio.run(scenario())
 
 
-def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None:
-    """A rejected request takes error status under its own error.type, not the base class name.
-
-    error.type distinguishes provider rejection from unknown errors.
-    """
+def test_generate_one_rejection_span_uses_kind_for_error_type() -> None:
+    """A rejected request records kind in error.type."""
 
     async def scenario() -> None:
         """Drive one generate_one whose build_request reports InvalidRequest, then read its span."""
@@ -428,7 +425,7 @@ def test_generate_one_rejection_span_names_its_own_class_in_error_type() -> None
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == "misconfigured"
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "InvalidRequestErrorRecord"
+        assert span.attributes["error.type"] == "invalid_request_error"
         # Nothing was sent, so the usage attributes are the zeros of a call that never billed.
         assert span.attributes["langchaint.cost_in_usd"] == 0.0
         assert "gen_ai.response.finish_reasons" not in span.attributes
@@ -523,8 +520,9 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         assert handle.abandoned is None
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
+        assert span.status.description is None
         assert span.attributes is not None
-        assert span.attributes[error_semconv.ERROR_TYPE] == "TimedOutErrorRecord"
+        assert span.attributes[error_semconv.ERROR_TYPE] == "timed_out_error"
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -609,7 +607,8 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         # max_concurrent_requests=1 serializes the batch, so the refused item is the first span to end.
         refused, *succeeded = spans
         assert refused.status.status_code == StatusCode.ERROR
-        assert _attribute(refused, "error.type") == "RefusalErrorRecord"
+        assert refused.status.description is None
+        assert _attribute(refused, "error.type") == "refusal_error"
         assert all(span.status.status_code == StatusCode.OK for span in succeeded)
 
     asyncio.run(scenario())
@@ -813,7 +812,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "RetryUnavailableErrorRecord"
+        assert span.attributes["error.type"] == "retry_unavailable_error"
         assert [event.name for event in span.events] == ["langchaint.attempt_failed"]
 
     asyncio.run(scenario())
@@ -840,7 +839,10 @@ def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes(
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "RetriesExhaustedErrorRecord"
+        assert span.attributes["error.type"] == "retries_exhausted_error"
+        assert span.status.description == (
+            "attempt 1: connection reset\nattempt 2: connection reset"
+        )
         assert span.attributes["langchaint.attempts"] == 2
         assert [event.name for event in span.events] == ["langchaint.attempt_failed"] * 2
 
@@ -2420,7 +2422,7 @@ def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> Non
         assert span.attributes is not None
         assert "gen_ai.input.messages" in span.attributes
         assert "gen_ai.system_instructions" in span.attributes
-        assert span.attributes["error.type"] == "RefusalErrorRecord"
+        assert span.attributes["error.type"] == "refusal_error"
         (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
         assert message["role"] == "assistant"
         assert message["finish_reason"] == "refusal"

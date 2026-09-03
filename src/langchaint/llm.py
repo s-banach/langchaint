@@ -1012,7 +1012,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         built = self._bound_adapter.build_request(messages)
         if isinstance(built, InvalidRequest):
             raise GenerationError(
-                record=InvalidRequestErrorRecord(reason=built.reason, call=ledger.freeze()),
+                record=InvalidRequestErrorRecord(error_text=built.reason, call=ledger.freeze()),
                 request=None,
                 provider_attempts=ledger.provider_attempts,
             )
@@ -1076,7 +1076,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             raise
         except Exception as escaped:
             raise GenerationError(
-                record=EscapedExceptionErrorRecord(reason=str(escaped), call=ledger.freeze()),
+                record=EscapedExceptionErrorRecord(error_text=str(escaped), call=ledger.freeze()),
                 request=None,
                 provider_attempts=ledger.provider_attempts,
             ) from escaped

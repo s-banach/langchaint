@@ -24,6 +24,8 @@ from langchaint import (
     EmptyTurnErrorRecord,
     EscapedExceptionErrorRecord,
     GenerateResult,
+    GenerationError,
+    GenerationErrorKind,
     GenerationErrorRecord,
     ImagePart,
     ImageUrlPart,
@@ -225,7 +227,7 @@ def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requi
             return record.errors_from_attempts
         case "retry_unavailable_error":
             assert_type(record, RetryUnavailableErrorRecord)
-            return record.error_summary
+            return record.error_text
         case "refusal_error":
             assert_type(record, RefusalErrorRecord)
             return record.stop_reason
@@ -243,22 +245,22 @@ def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requi
             return record.stop_reason
         case "unfinished_turn_error":
             assert_type(record, UnfinishedTurnErrorRecord)
-            return record.reason
+            return record.error_text
         case "provider_failed_terminally_error":
             assert_type(record, ProviderFailedTerminallyErrorRecord)
-            return record.reason
+            return record.error_text
         case "invalid_request_error":
             assert_type(record, InvalidRequestErrorRecord)
-            return record.reason
+            return record.error_text
         case "provider_declared_final_error":
             assert_type(record, ProviderDeclaredFinalErrorRecord)
-            return record.reason
+            return record.error_text
         case "unknown_exception_error":
             assert_type(record, UnknownExceptionErrorRecord)
-            return record.reason
+            return record.error_text
         case "escaped_exception_error":
             assert_type(record, EscapedExceptionErrorRecord)
-            return record.reason
+            return record.error_text
         case "abandoned_call_error":
             assert_type(record, AbandonedCallErrorRecord)
             return record.attempts
@@ -436,16 +438,27 @@ def test_a_generation_error_record_kind_narrows_every_record_variant() -> None:
         EmptyTurnErrorRecord(call=completed_call),
         SchemaViolationErrorRecord(call=completed_call, validation_error_json="[]"),
         ContextWindowExceededErrorRecord(call=completed_call),
-        UnfinishedTurnErrorRecord(call=completed_call, reason="unfinished"),
-        ProviderFailedTerminallyErrorRecord(call=completed_call, reason="failed"),
-        InvalidRequestErrorRecord(call=empty_call, reason="invalid"),
-        ProviderDeclaredFinalErrorRecord(call=terminal_call, reason="terminal"),
-        UnknownExceptionErrorRecord(call=empty_call, reason="unknown"),
-        EscapedExceptionErrorRecord(call=empty_call, reason="escaped"),
+        UnfinishedTurnErrorRecord(call=completed_call, error_text="unfinished"),
+        ProviderFailedTerminallyErrorRecord(call=completed_call, error_text="failed"),
+        InvalidRequestErrorRecord(call=empty_call, error_text="invalid"),
+        ProviderDeclaredFinalErrorRecord(call=terminal_call, error_text="terminal"),
+        UnknownExceptionErrorRecord(call=empty_call, error_text="unknown"),
+        EscapedExceptionErrorRecord(call=empty_call, error_text="escaped"),
         AbandonedCallErrorRecord(call=cut_off_call),
         TimedOutErrorRecord(call=cut_off_call),
     )
     assert all(_by_generation_error_record_kind(record) is not None for record in records)
+
+
+def test_generation_error_kind_has_the_public_closed_type() -> None:
+    """GenerationError.kind exposes the record category through GenerationErrorKind."""
+    error = GenerationError(
+        record=InvalidRequestErrorRecord(call=call_record((), elapsed_seconds=0.0), error_text=""),
+        request=None,
+        provider_attempts=(),
+    )
+    assert_type(error.kind, GenerationErrorKind)
+    assert error.kind == "invalid_request_error"
 
 
 def test_a_verdict_kind_selects_the_variant_that_carries_the_field_read() -> None:

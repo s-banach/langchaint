@@ -488,7 +488,7 @@ class UnfinishedTurn(NoOutput):
 class InvalidRequest:
     """A `Sequence[Message]` the adapter will not put on the wire.
 
-    The retry loop records no attempt and raises `GenerationError` with `reason`.
+    The retry loop records no attempt and raises `GenerationError` whose `error_text` is `reason`.
     Nothing was sent or billed.
     """
 

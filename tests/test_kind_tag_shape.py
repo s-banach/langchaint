@@ -10,6 +10,7 @@ import re
 from types import UnionType
 from typing import Union, get_args, get_origin
 
+from langchaint import GenerationErrorKind
 from tests.helpers import package_modules
 
 
@@ -109,3 +110,10 @@ def test_every_tag_is_built_from_its_own_class_name() -> None:
         if not _is_word_subsequence(_tag_of(variant).split("_"), _words(variant.__name__))
     )
     assert not misnamed
+
+
+def test_generation_error_kind_matches_the_error_record_variants() -> None:
+    """GenerationErrorKind contains each GenerationErrorRecord discriminator."""
+    alias_values = set(get_args(GenerationErrorKind.__value__))
+    record_values = {_tag_of(variant) for variant in _TAGGED_UNIONS["GenerationErrorRecord"]}
+    assert alias_values == record_values

@@ -75,20 +75,12 @@ class _GenerationErrorRecordBase(_CallResultRecordBase):
 
     stop_reason: ClassVar[StopReason | None] = None
 
-    @property
-    def error_summary(self) -> str:
-        """Return the tracing-safe terminal failure summary."""
-        return "generation failed"
-
-    @property
-    def error_text(self) -> str:
-        """Return the tracing-safe complete failure text."""
-        return self.error_summary
+    error_text: str
 
     @override
     def __str__(self) -> str:
-        """Return `error_summary`."""
-        return self.error_summary
+        """Return `error_text`."""
+        return self.error_text
 
 
 class _CompletedModelTurnErrorRecordBase(_GenerationErrorRecordBase):
@@ -103,13 +95,37 @@ class _CompletedModelTurnErrorRecordBase(_GenerationErrorRecordBase):
         return self
 
 
-def _require_retry_failures(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
+def _require_retry_failures(call: CallRecord) -> tuple[TransientErrorRecord, ...]:
     attempts = _settled_attempts(call)
     if not attempts:
         raise ValueError("call must contain at least one settled attempt")
-    if any(attempt.error is None for attempt in attempts):
-        raise ValueError("every attempt must contain a transient error")
-    return attempts
+    errors: list[TransientErrorRecord] = []
+    for attempt in attempts:
+        if attempt.error is None:
+            raise ValueError("every attempt must contain a transient error")
+        errors.append(attempt.error)
+    return tuple(errors)
+
+
+def _retries_exhausted_error_text(call: CallRecord) -> str:
+    entries: list[str] = []
+    for attempt_number, error in enumerate(_require_retry_failures(call), start=1):
+        indented_message = error.message.replace("\n", "\n  ")
+        entries.append(f"attempt {attempt_number}: {indented_message}")
+    return "\n".join(entries)
+
+
+def _retry_unavailable_error_text(call: CallRecord) -> str:
+    return _require_retry_failures(call)[-1].message
+
+
+def _set_or_validate_retry_error_text(
+    record: _GenerationErrorRecordBase, expected_error_text: str
+) -> None:
+    if "error_text" not in record.model_fields_set:
+        object.__setattr__(record, "error_text", expected_error_text)
+    elif record.error_text != expected_error_text:
+        raise ValueError("error_text must match the call's transient errors")
 
 
 def _require_terminal_provider_result(call: CallRecord, *, permit_empty: bool) -> None:
@@ -153,34 +169,19 @@ class RetriesExhaustedErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["retries_exhausted_error"] = "retries_exhausted_error"
 
     @model_validator(mode="after")
     def _validate_retry_failures(self) -> Self:
-        _ = _require_retry_failures(self.call)
+        expected_error_text = _retries_exhausted_error_text(self.call)
+        _set_or_validate_retry_error_text(self, expected_error_text)
         return self
 
     @property
     def errors_from_attempts(self) -> tuple[TransientErrorRecord, ...]:
         """Return each attempt's normalized transient error."""
-        return tuple(
-            attempt.error for attempt in _settled_attempts(self.call) if attempt.error is not None
-        )
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        errors = self.errors_from_attempts
-        return f"{len(errors)} attempts failed; last: {errors[-1]}"
-
-    @property
-    @override
-    def error_text(self) -> str:
-        """Return one transient error entry per request."""
-        return "; ".join(
-            f"attempt {index + 1}: {attempt.error}"
-            for index, attempt in enumerate(_settled_attempts(self.call))
-        )
+        return _require_retry_failures(self.call)
 
 
 class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
@@ -189,19 +190,14 @@ class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["retry_unavailable_error"] = "retry_unavailable_error"
 
     @model_validator(mode="after")
     def _validate_retry_failures(self) -> Self:
-        _ = _require_retry_failures(self.call)
+        expected_error_text = _retry_unavailable_error_text(self.call)
+        _set_or_validate_retry_error_text(self, expected_error_text)
         return self
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        """Return the final transient error in the stable summary."""
-        error = _require_retry_failures(self.call)[-1].error
-        return f"no retry was available for a transient failure: {error}"
 
 
 class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -210,14 +206,10 @@ class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["refusal_error"] = "refusal_error"
 
     stop_reason: ClassVar[Literal["refusal"]] = "refusal"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "no structured output: the model refused or a provider filter blocked the turn"
 
 
 class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -226,14 +218,10 @@ class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase)
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["max_completion_tokens_exceeded_error"] = "max_completion_tokens_exceeded_error"
 
     stop_reason: ClassVar[Literal["max_tokens"]] = "max_tokens"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the structured response reached max_completion_tokens before its JSON parsed"
 
 
 class EmptyTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -242,14 +230,10 @@ class EmptyTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["empty_turn_error"] = "empty_turn_error"
 
     stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the model completed its turn without producing output"
 
 
 class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -259,14 +243,10 @@ class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
     """
 
     validation_error_json: str
+    error_text: str = ""
     kind: Literal["schema_violation_error"] = "schema_violation_error"
 
     stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the turn's text is not an instance of the bound response_format"
 
 
 class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -275,14 +255,10 @@ class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["context_window_exceeded_error"] = "context_window_exceeded_error"
 
     stop_reason: ClassVar[Literal["context_window_exceeded"]] = "context_window_exceeded"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the request exceeded the model's context window"
 
 
 class UnfinishedTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -291,13 +267,7 @@ class UnfinishedTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["unfinished_turn_error"] = "unfinished_turn_error"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return self.reason
 
 
 class ProviderFailedTerminallyErrorRecord(_CompletedModelTurnErrorRecordBase):
@@ -306,13 +276,7 @@ class ProviderFailedTerminallyErrorRecord(_CompletedModelTurnErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["provider_failed_terminally_error"] = "provider_failed_terminally_error"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return f"the provider reported that generating the response failed: {self.reason}"
 
 
 class InvalidRequestErrorRecord(_GenerationErrorRecordBase):
@@ -321,18 +285,12 @@ class InvalidRequestErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["invalid_request_error"] = "invalid_request_error"
 
     @model_validator(mode="after")
     def _validate_terminal_provider_result(self) -> Self:
         _require_terminal_provider_result(self.call, permit_empty=True)
         return self
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return self.reason
 
 
 class ProviderDeclaredFinalErrorRecord(_GenerationErrorRecordBase):
@@ -341,18 +299,12 @@ class ProviderDeclaredFinalErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["provider_declared_final_error"] = "provider_declared_final_error"
 
     @model_validator(mode="after")
     def _validate_terminal_provider_result(self) -> Self:
         _require_terminal_provider_result(self.call, permit_empty=False)
         return self
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return f"a final error from the provider: {self.reason}"
 
 
 class UnknownExceptionErrorRecord(_GenerationErrorRecordBase):
@@ -361,13 +313,7 @@ class UnknownExceptionErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["unknown_exception_error"] = "unknown_exception_error"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return f"langchaint could not place this exception: {self.reason}"
 
 
 class EscapedExceptionErrorRecord(_GenerationErrorRecordBase):
@@ -376,13 +322,7 @@ class EscapedExceptionErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    reason: str
     kind: Literal["escaped_exception_error"] = "escaped_exception_error"
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return f"an exception escaped langchaint: {self.reason}"
 
 
 class AbandonedCallErrorRecord(_GenerationErrorRecordBase):
@@ -391,17 +331,13 @@ class AbandonedCallErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["abandoned_call_error"] = "abandoned_call_error"
 
     @model_validator(mode="after")
     def _validate_abandoned_shape(self) -> Self:
         _require_abandoned_shape(self.call)
         return self
-
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the call was cut off before its result reached the caller"
 
 
 class TimedOutErrorRecord(_GenerationErrorRecordBase):
@@ -410,6 +346,7 @@ class TimedOutErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
+    error_text: str = ""
     kind: Literal["timed_out_error"] = "timed_out_error"
 
     @model_validator(mode="after")
@@ -417,10 +354,24 @@ class TimedOutErrorRecord(_GenerationErrorRecordBase):
         _require_abandoned_shape(self.call)
         return self
 
-    @property
-    @override
-    def error_summary(self) -> str:
-        return "the call timed out before it produced a result"
+
+type GenerationErrorKind = Literal[
+    "retries_exhausted_error",
+    "retry_unavailable_error",
+    "refusal_error",
+    "max_completion_tokens_exceeded_error",
+    "empty_turn_error",
+    "schema_violation_error",
+    "context_window_exceeded_error",
+    "unfinished_turn_error",
+    "provider_failed_terminally_error",
+    "invalid_request_error",
+    "provider_declared_final_error",
+    "unknown_exception_error",
+    "escaped_exception_error",
+    "abandoned_call_error",
+    "timed_out_error",
+]
 
 
 type GenerationErrorRecord = Annotated[
@@ -465,12 +416,10 @@ def _terminal_error_record(
     classification: "ErrorClassification", *, reason: str, call: CallRecord
 ) -> GenerationErrorRecord:
     if classification == "invalid_request":
-        return InvalidRequestErrorRecord(
-            reason=f"the provider rejected the request: {reason}", call=call
-        )
+        return InvalidRequestErrorRecord(error_text=reason, call=call)
     if classification == "declared_final":
-        return ProviderDeclaredFinalErrorRecord(reason=reason, call=call)
-    return UnknownExceptionErrorRecord(reason=reason, call=call)
+        return ProviderDeclaredFinalErrorRecord(error_text=reason, call=call)
+    return UnknownExceptionErrorRecord(error_text=reason, call=call)
 
 
 class GenerationError(Exception):
@@ -545,14 +494,19 @@ class GenerationError(Exception):
         return self.record.stop_reason
 
     @property
+    def kind(self) -> GenerationErrorKind:
+        """Return the normalized failure category."""
+        return self.record.kind
+
+    @property
     def error_text(self) -> str:
-        """Return the tracing-safe complete failure text."""
+        """Return the complete failure text."""
         return self.record.error_text
 
     @override
     def __str__(self) -> str:
-        """Return `record.error_summary`."""
-        return self.record.error_summary
+        """Return `error_text`."""
+        return self.error_text
 
 
 class InvalidToolArgsError(Exception):

@@ -311,9 +311,9 @@ def _call_result_from_response_outcome[OutputT](
         case "context_window_exceeded":
             record = ContextWindowExceededErrorRecord(call=call)
         case "unfinished_turn":
-            record = UnfinishedTurnErrorRecord(reason=outcome.reason, call=call)
+            record = UnfinishedTurnErrorRecord(error_text=outcome.reason, call=call)
         case "provider_failed_terminally":
-            record = ProviderFailedTerminallyErrorRecord(reason=outcome.reason, call=call)
+            record = ProviderFailedTerminallyErrorRecord(error_text=outcome.reason, call=call)
         case "provider_failed_transiently":
             raise ValueError("ProviderFailedTransiently requires the caller's retry policy")
     return GenerationError(
@@ -465,7 +465,7 @@ def to_tables[OutputT](
             "elapsed_seconds": record.elapsed_seconds,
             "attempts": record.attempts,
             "stop_reason": record.stop_reason,
-            "error_summary": str(record) if is_error else None,
+            "error_text": record.error_text if is_error else None,
             "request_json": None
             if live_error is None or live_error.request is None
             else live_error.request.as_json(),

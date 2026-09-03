@@ -51,7 +51,7 @@ def test_normalized_error_validation_imports_no_provider_backend() -> None:
             "import sys\n"
             "from pydantic import TypeAdapter\n"
             "from langchaint import GenerationErrorRecord\n"
-            'payload = b\'{"call":{"model":"m","provider_name":"p","attempt_records":[],"elapsed_seconds":0.0},"reason":"bad","kind":"invalid_request_error"}\'\n'
+            'payload = b\'{"call":{"model":"m","provider_name":"p","attempt_records":[],"elapsed_seconds":0.0},"error_text":"bad","kind":"invalid_request_error"}\'\n'
             "record = TypeAdapter(GenerationErrorRecord).validate_json(payload)\n"
             'assert record.kind == "invalid_request_error"\n'
             'provider_prefixes = ("langchaint.anthropic", "langchaint.cohere", "langchaint.deepseek", "langchaint.gemini", "langchaint.openai")\n'

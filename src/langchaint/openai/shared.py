@@ -90,6 +90,7 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
     "invalid_prompt": "terminal",
     "data_residency_mismatch": "terminal",
     "bio_policy": "terminal",
+    "misalignment_policy_violation": "terminal",
     "invalid_image": "terminal",
     "invalid_image_format": "terminal",
     "invalid_base64_image": "terminal",
@@ -105,16 +106,6 @@ _DISPOSITION_BY_ERROR_CODE: Mapping[str, _FailureDisposition] = {
     "failed_to_download_image": "terminal",
     "image_file_not_found": "terminal",
 }
-"""Whether a resend may get past the failure each ResponseError.code names (openai 2.48.0).
-
-Every value of the SDK's code literal is a key.
-`tests/test_provider_facts.py` checks that mapping.
-The unknown-code path handles codes added after the installed SDK.
-The SDK does not document the codes.
-The three transient codes name temporary conditions.
-Each other code names a request property.
-failed_to_download_image is terminal for that reason: a URL the caller got wrong fails identically on every resend.
-"""
 
 
 def _image_data_uri(image_part: ImagePart) -> str:

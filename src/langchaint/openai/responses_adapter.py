@@ -47,7 +47,7 @@ Request and response mappings:
 - Status `"completed"` maps to `"end_turn"`.
 - Status `"incomplete"` maps `"max_output_tokens"` to `"max_tokens"`.
   Status `"incomplete"` maps `"content_filter"` to `"refusal"`.
-  OpenAI 3.7.0 incomplete reason `"max_messages"` maps to `"other"`.
+  OpenAI 3.8.0 incomplete reasons `"max_messages"` and `"steered"` map to `"other"`.
 - Other outcomes map to `"other"`.
 - Status `"failed"` returns `_provider_failure` with billing, even when emitted text validates.
 - Streaming yields answer text, `ReasoningDelta`, `ToolCallDelta`, and one `ToolCall` per completed item.
@@ -543,6 +543,7 @@ _STOP_REASON_BY_INCOMPLETE_REASON: dict[str, StopReason] = {
     "max_output_tokens": "max_tokens",
     "content_filter": "refusal",
     "max_messages": "other",
+    "steered": "other",
 }
 
 
@@ -1129,7 +1130,7 @@ class _BoundOpenAIText(_BoundOpenAI[str]):
         """Read the turn's text as this binding's output, or report the run openai says failed.
 
         A failed status returns `_provider_failure` because emitted items are fragments.
-        An incomplete status returns partial text with `max_tokens` or `refusal`.
+        An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
         `assistant_message.text` includes refusal text that `response.output_text` omits.
 
         Raises:

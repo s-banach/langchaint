@@ -460,6 +460,20 @@ def test_stop_reason_mapping(
     assert _normalized_stop_reason(build_response()) == expected
 
 
+@pytest.mark.parametrize("reason", ["max_messages", "steered"])
+def test_incomplete_response_without_a_dedicated_stop_reason(reason: str) -> None:
+    """Preserve partial text and report `other` for interruption reasons."""
+    response = _response(
+        usage=None,
+        status="incomplete",
+        incomplete_details=IncompleteDetails.model_construct(reason=reason),
+    )
+    outcome = _text_bound().interpret(response)
+    assert isinstance(outcome, AdapterResult)
+    assert outcome.stop_reason == "other"
+    assert outcome.output == "hey"
+
+
 def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
     """A refusal content part becomes a TextPart, so the refused turn replays as the model wrote it.
 
@@ -1878,13 +1892,23 @@ def test_a_rate_limit_error_code_sets_the_rate_limit_flag() -> None:
     assert outcome.is_rate_limit is True
 
 
-def test_a_terminal_error_code_carries_the_providers_message_without_retrying() -> None:
-    """failed_to_download_image is terminal: the request names the image, so a resend fetches it again."""
-    outcome = _text_bound().interpret(
-        _response(usage=None, status="failed", error=_IMAGE_DOWNLOAD_ERROR)
-    )
+@pytest.mark.parametrize(
+    "error",
+    [
+        _IMAGE_DOWNLOAD_ERROR,
+        ResponseError.model_construct(
+            code="misalignment_policy_violation", message="The response violated policy."
+        ),
+    ],
+)
+def test_a_terminal_error_code_carries_the_providers_message_without_retrying(
+    error: ResponseError,
+) -> None:
+    """Preserve the provider's message and emitted text in a terminal failure."""
+    outcome = _text_bound().interpret(_response(usage=None, status="failed", error=error))
     assert isinstance(outcome, ProviderFailedTerminally)
-    assert outcome.reason == _IMAGE_DOWNLOAD_ERROR.message
+    assert outcome.reason == error.message
+    assert outcome.assistant_message.text == "hey"
 
 
 def test_an_error_code_the_installed_sdk_does_not_name_is_terminal() -> None:
@@ -2084,7 +2108,8 @@ def test_parse_openai_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> No
     assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
-def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
+@pytest.mark.parametrize("error_code", ["invalid_prompt", "misalignment_policy_violation"])
+def test_parse_openai_verdicts_a_status_200_by_the_errors_code(error_code: str) -> None:
     """A 200 is a mid-stream error event's raise, so the code picks the verdict the status cannot.
 
     server_error retries one request.
@@ -2096,7 +2121,7 @@ def test_parse_openai_verdicts_a_status_200_by_the_errors_code() -> None:
     assert parse_openai(server_error) == RetryThisOne(retry_after=None)
     throttled = status_error(openai.APIStatusError, 200, error_code="rate_limit_exceeded")
     assert parse_openai(throttled) == PauseAll(retry_after=None)
-    blocked = status_error(openai.APIStatusError, 200, error_code="invalid_prompt")
+    blocked = status_error(openai.APIStatusError, 200, error_code=error_code)
     assert parse_openai(blocked) == DoNotRetry()
     assert dict(PARSE_FALLTHROUGH_COUNTS) == before
 

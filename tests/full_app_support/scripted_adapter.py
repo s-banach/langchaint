@@ -91,11 +91,13 @@ class Turn:
 
     text ends the loop, and tool_calls continue it.
     delay_seconds suspends open_stream before error is raised or output is returned.
+    started signals entry into open_stream before the delay.
     """
 
     text: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     delay_seconds: float = 0.0
+    started: asyncio.Event | None = None
     error: Exception | None = None
 
 
@@ -240,6 +242,8 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         turn_index = script.opens
         turn = script.turns[turn_index]
         script.opens += 1
+        if turn.started is not None:
+            turn.started.set()
         if turn.delay_seconds:
             await asyncio.sleep(turn.delay_seconds)
         if turn.error is not None:
@@ -295,6 +299,7 @@ def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
             parse=adapter.parse,
             failure_types=adapter.failure_types,
             max_concurrent_requests=16,
+            max_request_starts_per_second=10_000.0,
             minimum_wait_ceiling_seconds=0.001,
             longest_wait_seconds=0.01,
         ),

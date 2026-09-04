@@ -28,6 +28,7 @@ from langchaint.adapter import (
         ({"retry-after-ms": "1500"}, 1.5),
         ({"retry-after-ms": "1500", "retry-after": "49"}, 1.5),
         ({"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}, None),
+        ({"retry-after": "Thu, 01 Jan 2026 00:00:30 GMT"}, 30.0),
         ({"retry-after": "0"}, None),
         ({"retry-after": "-5"}, None),
         ({"retry-after-ms": "0", "retry-after": "49"}, 49.0),
@@ -43,7 +44,8 @@ from langchaint.adapter import (
         "seconds_fractional",
         "milliseconds",
         "milliseconds_preferred_over_seconds",
-        "http_date_is_not_parsed",
+        "expired_http_date",
+        "future_http_date",
         "zero_seconds_is_absent",
         "negative_seconds_is_absent",
         "zero_milliseconds_falls_through",
@@ -54,8 +56,11 @@ from langchaint.adapter import (
         "unusable_milliseconds_then_unparseable_seconds",
     ],
 )
-def test_retry_after_seconds_from_headers(headers: dict[str, str], expected: float | None) -> None:
+def test_retry_after_seconds_from_headers(
+    headers: dict[str, str], expected: float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Parse positive retry-after headers in seconds with millisecond precedence."""
+    monkeypatch.setattr("langchaint.adapter.time.time", lambda: 1767225600.0)
     assert retry_after_seconds_from_headers(headers) == expected
 
 

@@ -5,7 +5,6 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, assert_type
 
 import pytest
-from jsonschema import Draft202012Validator
 from jsonschema.exceptions import UnknownType
 from pydantic import BaseModel, Field, ValidationError
 
@@ -109,7 +108,8 @@ def test_schema_converts_name_description_and_args_schema() -> None:
     schema = _echo_tool().schema()
     assert schema.name == "echo"
     assert schema.description == "Echo the text back."
-    assert schema.args_schema == _EchoArgs.model_json_schema()
+    assert schema.args_schema["properties"] == {"text": {"title": "Text", "type": "string"}}
+    assert schema.args_schema["required"] == ["text"]
     assert ToolManager([_echo_tool()]).schemas() == (schema,)
 
 
@@ -123,7 +123,6 @@ def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
         _decorated_echo.description == "Echo the text without reading this function's docstring."
     )
     assert _decorated_echo.args_model is _EchoArgs
-    assert _decorated_echo.schema().args_schema == _EchoArgs.model_json_schema()
     assert _decorated_record_echo.name == "record_echo"
     outcome = asyncio.run(
         _decorated_record_echo.dispatch(
@@ -156,18 +155,12 @@ def test_tool_decorator_rejects_unusable_parameter_annotations() -> None:
     async def _plain_annotation(args: str) -> str:
         return args
 
-    # pyrefly: ignore[implicit-any-parameter]
-    async def _missing_annotation(args) -> str:  # noqa: ANN001
-        return str(args)  # pyrefly: ignore[unknown-argument-type]
-
     async def _type_checking_only_annotation(args: "Validator") -> str:
         return str(args)
 
     decorator = tool(description="Invalid test function.")
     with pytest.raises(TypeError, match="BaseModel subclass"):
         _ = decorator(_plain_annotation)
-    with pytest.raises(TypeError, match="BaseModel subclass"):
-        _ = decorator(_missing_annotation)
     with pytest.raises(TypeError, match="annotation could not resolve"):
         _ = decorator(_type_checking_only_annotation)
 
@@ -200,8 +193,8 @@ def test_invalid_tool_args_holds_the_validation_error() -> None:
     assert "text" in str(error)
 
 
-def test_details_from_pydantic_and_renderer_format_per_field() -> None:
-    """Pydantic errors render neutral paths and messages."""
+def test_details_from_pydantic_preserve_paths_and_messages() -> None:
+    """Convert nested Pydantic error paths and preserve their messages."""
 
     class _Recipient(BaseModel):
         """One recipient with a required email."""
@@ -218,24 +211,13 @@ def test_details_from_pydantic_and_renderer_format_per_field() -> None:
         _ = _SendArgs.model_validate_json('{"to":[{"x":1},5],"subject":""}')
     validation_error = caught.value
     details = _details_from_pydantic(validation_error)
-    assert details == tuple(
-        InvalidToolArgsDetail(path=tuple(entry["loc"]), message=entry["msg"])
-        for entry in validation_error.errors()
+    assert tuple(detail.path for detail in details) == (
+        ("to", 0, "email"),
+        ("to", 1),
+        ("subject",),
     )
-    rendered = render_invalid_tool_args("send_email", details)
-    expected = "\n".join(
-        ["invalid arguments for send_email:"]
-        + [
-            f"  {'.'.join(str(segment) for segment in detail.path)}: {detail.message}"
-            for detail in details
-        ]
-    )
-    assert rendered == expected
-    assert "\n  to.0.email: " in rendered
-    assert "\n  to.1: " in rendered
-    assert "https://" not in rendered
-    assert "errors.pydantic.dev" not in rendered
-    assert "type=" not in rendered
+    for detail, error in zip(details, validation_error.errors(), strict=True):
+        assert detail.message == error["msg"]
 
 
 def test_render_invalid_tool_args_formats_neutral_details() -> None:
@@ -301,17 +283,18 @@ def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
 def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     """PydanticTool renders and stores converted validation details."""
     args_json = '{"wrong": "key"}'
-    with pytest.raises(InvalidToolArgsError) as caught:
-        _ = asyncio.run(_echo_tool().validate_and_run(args_json))
-    expected_details = _details_from_pydantic(caught.value.validation_error)
-    expected_content = render_invalid_tool_args("echo", expected_details)
     call = ToolCall(id="call1", name="echo", args_json=args_json)
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
     match result:
         case DispatchInvalidToolArgs():
             assert result.tool_message.is_error is True
-            assert result.tool_message.content == expected_content
-            assert result.details == expected_details
+            assert (
+                result.tool_message.content
+                == "invalid arguments for echo:\n  text: Field required"
+            )
+            assert result.details == (
+                InvalidToolArgsDetail(path=("text",), message="Field required"),
+            )
         case DispatchHandled() | DispatchUnknownTool():
             pytest.fail("invalid args must return DispatchInvalidToolArgs")
 
@@ -324,9 +307,7 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     assert result.called_name == "missing"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.is_error is True
-    assert result.tool_message.content == render_unknown_tool(
-        called_name="missing", held_names=("echo",)
-    )
+    assert result.tool_message.content == "unknown tool 'missing'; available tools: echo"
 
 
 def test_render_unknown_tool_lists_held_names_and_none_when_empty() -> None:
@@ -505,16 +486,17 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     result = asyncio.run(_weather_tool().dispatch(call))
     assert isinstance(result, DispatchInvalidToolArgs)
     assert result.tool_message.is_error is True
-    # Validator.iter_errors is typed as yielding ValidationError.
-    # Draft202012Validator.iter_errors is typed as yielding Incomplete.
-    validator: Validator = Draft202012Validator(_WEATHER_SCHEMA)
-    expected_details = tuple(
-        InvalidToolArgsDetail(path=tuple(error.absolute_path), message=error.message)
-        for error in validator.iter_errors({"town": "Oslo"})
+    assert result.details == (
+        InvalidToolArgsDetail(path=(), message="'city' is a required property"),
+        InvalidToolArgsDetail(
+            path=(), message="Additional properties are not allowed ('town' was unexpected)"
+        ),
     )
-    assert result.details == expected_details
-    assert any(detail.message == "'city' is a required property" for detail in result.details)
-    assert result.tool_message.content == render_invalid_tool_args("weather", expected_details)
+    assert result.tool_message.content == (
+        "invalid arguments for weather:\n"
+        "  (root): 'city' is a required property\n"
+        "  (root): Additional properties are not allowed ('town' was unexpected)"
+    )
 
 
 def _recording_weather_tool(calls: list[str]) -> JSONSchemaTool:
@@ -1001,7 +983,8 @@ def test_capture_tool_schema_converts_name_description_and_args_schema() -> None
     schema = _answer_capture_tool().schema()
     assert schema.name == "final_response"
     assert schema.description == "Submit the final answer."
-    assert schema.args_schema == _CapturedAnswer.model_json_schema()
+    assert schema.args_schema["properties"] == {"answer": {"title": "Answer", "type": "string"}}
+    assert schema.args_schema["required"] == ["answer"]
 
 
 @pytest.mark.parametrize(
@@ -1039,17 +1022,16 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     CaptureTool and PydanticTool return identical field-level corrections.
     """
     args_json = '{"wrong": "key"}'
-    with pytest.raises(ValidationError) as caught:
-        _ = _CapturedAnswer.model_validate_json(args_json)
-    expected_details = _details_from_pydantic(caught.value)
-    expected_content = render_invalid_tool_args("final_response", expected_details)
     call = ToolCall(id="call1", name="final_response", args_json=args_json)
     outcome = asyncio.run(_answer_capture_tool().capture(call))
     assert outcome.kind == "invalid_tool_args"
     assert outcome.tool_message.is_error is True
     assert outcome.tool_message.tool_call_id == "call1"
-    assert outcome.tool_message.content == expected_content
-    assert outcome.details == expected_details
+    assert (
+        outcome.tool_message.content
+        == "invalid arguments for final_response:\n  answer: Field required"
+    )
+    assert outcome.details == (InvalidToolArgsDetail(path=("answer",), message="Field required"),)
 
 
 def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant() -> None:

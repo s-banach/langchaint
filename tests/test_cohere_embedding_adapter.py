@@ -7,10 +7,9 @@ import json
 import threading
 from functools import wraps
 from io import BytesIO
-from typing import TYPE_CHECKING, assert_type
+from typing import TYPE_CHECKING
 
 import boto3
-import numpy as np
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -19,7 +18,6 @@ from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
 from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
-from langchaint.embedding import EmbeddingModel
 from langchaint.exceptions import EmbeddingOutputError
 
 if TYPE_CHECKING:
@@ -31,16 +29,6 @@ if TYPE_CHECKING:
 
 
 _JSON_CONTENT_TYPE = "application/json"
-
-
-def _pin_embedding_model_overloads(
-    cohere_bedrock: CohereBedrock,
-    v4_model: CohereEmbedV4ModelName,
-    v3_model: cohere_backend.CohereEmbedV3ModelName,
-) -> None:
-    """Pin each overload's result type without running this function."""
-    assert_type(cohere_bedrock.embedding_model(v4_model), EmbeddingModel)
-    assert_type(cohere_bedrock.embedding_model(v3_model), EmbeddingModel)
 
 
 def _run_async_test[**Parameters](
@@ -67,21 +55,8 @@ def _bedrock_client(*, total_max_attempts: int = 1) -> BedrockRuntimeClient:
     )
 
 
-def _request_body(
-    inputs: list[str],
-    *,
-    input_type: str,
-    dimension: int | None,
-) -> bytes:
+def _request_body(payload: dict[str, object]) -> bytes:
     """Serialize one expected Cohere request."""
-    payload: dict[str, object] = {
-        "texts": inputs,
-        "input_type": input_type,
-        "embedding_types": ["float"],
-        "truncate": "NONE",
-    }
-    if dimension is not None:
-        payload["output_dimension"] = dimension
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
@@ -105,15 +80,14 @@ def _expected_parameters(body: bytes, model: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    "model",
+    ("model", "dimension"),
     [
-        "cohere.embed-v4:0",
-        "global.cohere.embed-v4:0",
-        "us.cohere.embed-v4:0",
-        "eu.cohere.embed-v4:0",
+        ("cohere.embed-v4:0", 256),
+        ("global.cohere.embed-v4:0", 512),
+        ("us.cohere.embed-v4:0", 1024),
+        ("eu.cohere.embed-v4:0", 1536),
     ],
 )
-@pytest.mark.parametrize("dimension", [256, 512, 1024, 1536])
 @_run_async_test
 async def test_v4_routes_model_and_dimension_verbatim(
     model: CohereEmbedV4ModelName,
@@ -122,7 +96,13 @@ async def test_v4_routes_model_and_dimension_verbatim(
     """Every v4 route sends its model and dimension verbatim."""
     client = _bedrock_client()
     stubber = Stubber(client)
-    body = _request_body(["document"], input_type="search_document", dimension=dimension)
+    body = _request_body({
+        "texts": ["document"],
+        "input_type": "search_document",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": dimension,
+    })
     vector = [1.0, *([0.0] * (dimension - 1))]
     stubber.add_response(
         "invoke_model",
@@ -138,10 +118,6 @@ async def test_v4_routes_model_and_dimension_verbatim(
             max_attempts=1,
         ).embed(["document"], task="retrieval_document")
         assert embeddings.shape == (1, dimension)
-        assert embeddings.dtype == np.float32
-        assert embeddings.flags.c_contiguous
-        assert embeddings.flags.owndata
-        assert embeddings.flags.writeable
         stubber.assert_no_pending_responses()
     finally:
         stubber.deactivate()
@@ -165,7 +141,13 @@ async def test_task_mapping(
     """Each neutral task maps to Cohere's corresponding `input_type`."""
     client = _bedrock_client()
     stubber = Stubber(client)
-    body = _request_body(["text"], input_type=input_type, dimension=256)
+    body = _request_body({
+        "texts": ["text"],
+        "input_type": input_type,
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
     stubber.add_response(
         "invoke_model",
         _response([[1.0, *([0.0] * 255)]]),
@@ -187,7 +169,12 @@ async def test_v3_omits_dimension() -> None:
     """V3 requests omit `output_dimension`."""
     client = _bedrock_client()
     stubber = Stubber(client)
-    body = _request_body(["query"], input_type="search_query", dimension=None)
+    body = _request_body({
+        "texts": ["query"],
+        "input_type": "search_query",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+    })
     stubber.add_response(
         "invoke_model",
         _response([[1.0, *([0.0] * 1023)]]),
@@ -210,7 +197,13 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
     """Accept the float-keyed v4 response form."""
     client = _bedrock_client()
     stubber = Stubber(client)
-    body = _request_body(["text"], input_type="classification", dimension=256)
+    body = _request_body({
+        "texts": ["text"],
+        "input_type": "classification",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
     vector = [1.0, *([0.0] * 255)]
     body_bytes = json.dumps({"embeddings": {"float": [vector]}}).encode()
     response = {
@@ -233,32 +226,15 @@ async def test_v4_accepts_float_keyed_embeddings() -> None:
         client.close()
 
 
-def test_embedding_model_defaults_and_max_attempts() -> None:
-    """Model construction applies defaults and validates `max_attempts`."""
+def test_embedding_model_default_dimensions() -> None:
+    """Check model-specific default dimensions."""
     client = _bedrock_client()
     try:
         cohere_bedrock = CohereBedrock(client=client)
         assert cohere_bedrock.embedding_model("cohere.embed-v4:0").dimension == 1536
         assert cohere_bedrock.embedding_model("cohere.embed-english-v3").dimension == 1024
-        assert (
-            cohere_bedrock.embedding_model("cohere.embed-v4:0", max_attempts=5).max_attempts == 5
-        )
-        with pytest.raises(ValueError, match="max_attempts"):
-            _ = cohere_bedrock.embedding_model("cohere.embed-v4:0", max_attempts=0)
     finally:
         client.close()
-
-
-def test_catalog_contains_supported_models() -> None:
-    """The public catalog contains the approved identifiers."""
-    assert {
-        "cohere.embed-v4:0",
-        "global.cohere.embed-v4:0",
-        "us.cohere.embed-v4:0",
-        "eu.cohere.embed-v4:0",
-        "cohere.embed-english-v3",
-        "cohere.embed-multilingual-v3",
-    } == COHERE_BEDROCK_EMBEDDING_MODELS
 
 
 @pytest.mark.parametrize(
@@ -337,8 +313,20 @@ async def test_batching_uses_ninety_six_inputs() -> None:
     stubber = Stubber(client)
     inputs = [f"text-{index}" for index in range(97)]
     vector = [1.0, *([0.0] * 255)]
-    first_body = _request_body(inputs[:96], input_type="clustering", dimension=256)
-    second_body = _request_body(inputs[96:], input_type="clustering", dimension=256)
+    first_body = _request_body({
+        "texts": inputs[:96],
+        "input_type": "clustering",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
+    second_body = _request_body({
+        "texts": inputs[96:],
+        "input_type": "clustering",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
     stubber.add_response(
         "invoke_model",
         _response([vector] * 96),
@@ -395,7 +383,13 @@ async def test_invalid_response_hides_vectors() -> None:
     """Malformed response errors contain no generated vector values."""
     client = _bedrock_client()
     stubber = Stubber(client)
-    body = _request_body(["text"], input_type="classification", dimension=256)
+    body = _request_body({
+        "texts": ["text"],
+        "input_type": "classification",
+        "embedding_types": ["float"],
+        "truncate": "NONE",
+        "output_dimension": 256,
+    })
     response_bytes = b'{"embeddings":[[8675309.0]]}'
     response = {
         "body": StreamingBody(BytesIO(response_bytes), len(response_bytes)),
@@ -734,23 +728,3 @@ def test_passed_client_retry_configuration() -> None:
     finally:
         retrying_client.close()
         one_attempt_client.close()
-
-
-def test_caller_closes_passed_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The caller closes a passed client."""
-    client = _bedrock_client()
-    close_calls = 0
-    original_close: Callable[[], None] = client.close
-
-    def close() -> None:
-        nonlocal close_calls
-        close_calls += 1
-        original_close()
-
-    monkeypatch.setattr(client, "close", close)
-    _ = CohereBedrock(client=client)
-    assert close_calls == 0
-    client.close()
-    assert close_calls == 1

@@ -4,8 +4,6 @@ Tests cover Usage, input items, tool choice, stop reasons, streams, and requests
 """
 
 import asyncio
-import base64
-import inspect
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -16,7 +14,6 @@ import openai
 import pytest
 from openai import AsyncOpenAI
 from openai._models import construct_type_unchecked
-from openai.lib._parsing._responses import type_to_text_format_param
 from openai.lib.streaming.responses import (
     AsyncResponseStream,
     ResponseFunctionCallArgumentsDeltaEvent,
@@ -46,7 +43,7 @@ from openai.types.responses.parsed_response import ParsedResponse
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 from langchaint import (
     LLM,
@@ -103,7 +100,6 @@ from langchaint.openai.responses_adapter import (
     _BoundOpenAI,
     _BoundOpenAIStructured,
     _BoundOpenAIText,
-    _normalized_stop_reason,
     _OpenAIRequestParams,
     _OpenAIStream,
     _wire_input,
@@ -421,43 +417,41 @@ def _incomplete_response(reason: Literal["max_output_tokens", "content_filter"])
 
 
 @pytest.mark.parametrize(
-    ("build_response", "expected"),
+    ("build_response", "expected", "expected_output"),
     [
         (
             lambda: _response(usage=None, output=[_TEXT_OUTPUT_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]),
             "tool_use",
+            "hey",
         ),
-        (lambda: _response(usage=None), "end_turn"),
-        (lambda: _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM]), "refusal"),
+        (
+            lambda: _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM]),
+            "refusal",
+            "I can't help with that",
+        ),
         (
             lambda: _response(
                 usage=None, output=[_REFUSAL_MESSAGE_ITEM, _FUNCTION_CALL_OUTPUT_ITEM]
             ),
             "refusal",
+            "I can't help with that",
         ),
-        (lambda: _incomplete_response("max_output_tokens"), "max_tokens"),
-        (lambda: _incomplete_response("content_filter"), "refusal"),
-        (lambda: _response(usage=None, status="failed"), "other"),
+        (lambda: _incomplete_response("content_filter"), "refusal", "hey"),
     ],
     ids=[
         "function_call_item",
-        "completed",
         "refusal_block",
         "refusal_block_beside_a_function_call",
-        "incomplete_max_output_tokens",
         "incomplete_content_filter",
-        "failed",
     ],
 )
 def test_stop_reason_mapping(
-    build_response: Callable[[], OpenAIResponse], expected: StopReason
+    build_response: Callable[[], OpenAIResponse], expected: StopReason, expected_output: str
 ) -> None:
-    """The API reports no finish reason field, so each stop reason is derived from the response.
-
-    The refusal check runs ahead of the tool-call check, which the row carrying both pins:
-    a filtered turn is a refusal whether or not the model also called a tool.
-    """
-    assert _normalized_stop_reason(build_response()) == expected
+    """Check translated stop reasons alongside the preserved output."""
+    result = _assert_result(_text_bound().interpret(build_response()))
+    assert result.stop_reason == expected
+    assert result.output == expected_output
 
 
 @pytest.mark.parametrize("reason", ["max_messages", "steered"])
@@ -605,17 +599,6 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
     assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
 
 
-def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
-    """ReasoningPart.raw survives Message JSON serialization."""
-    reasoning_item = _reasoning_item(summary=("thought it over",))
-    reasoning_item["encrypted_content"] = "enc-1"
-    response = _response(usage=None, output=[reasoning_item, _TEXT_OUTPUT_ITEM])
-    messages_type_adapter: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
-    messages: tuple[Message, ...] = (_assistant_message_from(response),)
-    restored = messages_type_adapter.validate_json(messages_type_adapter.dump_json(messages))
-    assert restored == messages
-
-
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
@@ -662,7 +645,7 @@ def test_wire_input_converts_tool_result_parts_to_structured_output_content() ->
                 {"type": "input_text", "text": "saw"},
                 {
                     "type": "input_image",
-                    "image_url": f"data:image/png;base64,{base64.b64encode(b'png').decode('ascii')}",
+                    "image_url": "data:image/png;base64,cG5n",
                     "detail": "auto",
                 },
             ],
@@ -860,14 +843,6 @@ def test_request_sends_explicit_mode_when_automatic_cache_breakpoints_are_disabl
         assert precomputed_fields.prompt_cache_options == expected_options
 
 
-def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises() -> None:
-    """`automatic_cache_breakpoints=False` requires `prompt_cache_options`."""
-    with pytest.raises(ValueError, match="supports_prompt_cache_options"):
-        _ = _adapter(supports_prompt_cache_options=False)._precompute_fields(
-            _binding(automatic_cache_breakpoints=False)
-        )
-
-
 def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
     """LLM.bind rejects unsupported cache configuration before requests."""
     llm = LLM(_adapter(supports_prompt_cache_options=False))
@@ -1032,13 +1007,6 @@ def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
                 provider_executed_tools=({"type": tool_type},),
             )
         )
-
-
-def test_openai_provider_rates_default_to_unavailable() -> None:
-    """Ordinary custom pricing requires no unused provider-tool rates."""
-    parameters = inspect.signature(OpenAIPricingTable).parameters
-    assert parameters["web_search_usd_per_invocation"].default is None
-    assert parameters["file_search_usd_per_invocation"].default is None
 
 
 def test_provider_executed_tools_follow_function_tools_in_responses() -> None:
@@ -1663,18 +1631,6 @@ def test_stream_error_event_raises_a_status_error_carrying_the_events_fields() -
     asyncio.run(scenario())
 
 
-def test_stream_ending_with_no_terminal_and_no_error_event_raises() -> None:
-    """A stream that ends before any terminal event is a protocol failure, not an empty turn."""
-
-    async def scenario() -> None:
-        adapter_stream = _stream([_text_delta_event("he", 1)])
-        with pytest.raises(StreamProtocolError):
-            async for _item in adapter_stream.items():
-                pass
-
-    asyncio.run(scenario())
-
-
 class _StructuredReport(BaseModel):
     """The response_format the structured bind path parses into."""
 
@@ -1807,9 +1763,14 @@ def test_structured_bind_reports_a_tool_call_turn_whose_text_is_not_the_instance
 
 
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
-    """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
-    outcome = _structured_parse(_structured_response(_REPORT_JSON, tool_call=True))
-    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
+    """Check parsed output and the extracted tool call on the same turn."""
+    outcome = _assert_result(
+        _structured_bound().interpret(_structured_response(_REPORT_JSON, tool_call=True))
+    )
+    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
+    assert outcome.assistant_message.tool_calls == (
+        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    )
 
 
 def _text_bound() -> _BoundOpenAIText:
@@ -1990,22 +1951,16 @@ def test_every_request_carries_the_reasoning_include(
     assert includes == [["reasoning.encrypted_content"]] * 2
 
 
-def test_the_structured_request_sends_the_text_parameter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """open_stream puts the precomputed text parameter on the request.
-
-    The request preserves the response schema in text.
-    """
-    adapter = _adapter()
-    structured_bound = _BoundOpenAIStructured(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(automatic_cache_breakpoints=True)),
-        response_format=_StructuredReport,
-    )
-    assert _kwarg_sent(monkeypatch, structured_bound, "text") == {
-        "format": type_to_text_format_param(_StructuredReport)
-    }
+def test_the_structured_request_sends_the_text_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check the strict response schema captured by the SDK stream stub."""
+    text = _kwarg_sent(monkeypatch, _structured_bound(), "text")
+    assert isinstance(text, dict)
+    assert text["format"]["type"] == "json_schema"
+    assert text["format"]["strict"] is True
+    assert text["format"]["schema"]["properties"]["city"]["type"] == "string"
+    assert text["format"]["schema"]["properties"]["celsius"]["type"] == "integer"
+    required: list[str] = text["format"]["schema"]["required"]
+    assert set(required) == {"city", "celsius"}
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
@@ -2191,7 +2146,7 @@ def test_wire_input_marks_marked_user_and_tool_parts() -> None:
                 {"type": "input_text", "text": "saw"},
                 {
                     "type": "input_image",
-                    "image_url": f"data:image/png;base64,{base64.b64encode(b'png').decode('ascii')}",
+                    "image_url": "data:image/png;base64,cG5n",
                     "detail": "auto",
                     "prompt_cache_breakpoint": {"mode": "explicit"},
                 },

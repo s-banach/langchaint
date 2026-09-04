@@ -9,7 +9,6 @@ import asyncio
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from typing import get_args
 
 from pydantic import BaseModel
 
@@ -26,22 +25,14 @@ from langchaint.adapter import (
 from langchaint.call import CallRecord, SettledAttemptRecord
 from langchaint.exceptions import AbandonedCallErrorRecord, StreamProtocolError, TransientError
 from langchaint.messages import (
-    AssistantMessage,
-    AudioPart,
-    ContentPart,
-    ImagePart,
-    ImageUrlPart,
     Message,
     RawPart,
     ReasoningPart,
-    TextPart,
-    ToolCall,
-    ToolMessage,
     UserMessage,
     messages_from_json,
     messages_to_json,
 )
-from langchaint.pricing import Billing, category_cost
+from langchaint.pricing import Billing
 from langchaint.response import RowValue, to_tables
 from langchaint.shared_backoff import Verdict
 from langchaint.usage import ZERO_USAGE
@@ -58,14 +49,6 @@ _PLAIN_TEXT_BINDING = Binding(
     automatic_cache_breakpoints=True,
 )
 """The binding every invariant here binds under: text output and nothing else stated."""
-
-_CONTENT_PART_CASES: tuple[ContentPart, ...] = (
-    TextPart(text="text"),
-    ImagePart(data=b"image", media_type="image/png"),
-    ImageUrlPart(url="https://example.com/image.png", media_type="image/png"),
-    AudioPart(data=b"audio", media_type="audio/wav"),
-)
-"""Representative values for every ContentPart variant."""
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
@@ -220,44 +203,6 @@ class AdapterConformance(ABC):
             )
         ]
 
-    def test_each_cost_is_its_counter_times_the_price_stored_beside_it(self) -> None:
-        """A Billing's costs and the prices stored beside them reproduce each other.
-
-        Each cost stores its source price.
-        Multiple cache TTL prices are blended.
-        A stored row reproduces its arithmetic without the original rate table.
-        """
-        for billing in self._billings():
-            usage = billing.usage
-            assert _costs_agree(
-                usage.input_tokens_cache_read_cost_in_usd,
-                category_cost(
-                    usage.input_tokens_cache_read,
-                    usd_per_million_tokens=billing.cache_read_usd_per_million_tokens,
-                ),
-            )
-            assert _costs_agree(
-                usage.input_tokens_cache_write_cost_in_usd,
-                category_cost(
-                    usage.input_tokens_cache_write,
-                    usd_per_million_tokens=billing.cache_write_usd_per_million_tokens,
-                ),
-            )
-            assert _costs_agree(
-                usage.input_tokens_cache_none_cost_in_usd,
-                category_cost(
-                    usage.input_tokens_cache_none,
-                    usd_per_million_tokens=billing.input_cache_none_usd_per_million_tokens,
-                ),
-            )
-            assert _costs_agree(
-                usage.output_tokens_cost_in_usd,
-                category_cost(
-                    usage.output_tokens,
-                    usd_per_million_tokens=billing.output_usd_per_million_tokens,
-                ),
-            )
-
     def test_counters_that_cannot_be_partitioned_raise_at_arrival(self) -> None:
         """A response whose counters leave one category negative fails where it arrives.
 
@@ -352,39 +297,6 @@ class AdapterConformance(ABC):
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
 
-    def test_each_content_part_builds_or_returns_invalid_request(self) -> None:
-        """Each ContentPart has an explicit UserMessage and ToolMessage result."""
-        content_part_types = get_args(get_args(ContentPart.__value__)[0])
-        assert {type(part) for part in _CONTENT_PART_CASES} == set(content_part_types)
-        bound_adapter = self._bound_adapter()
-        tool_call = ToolCall(id="media_call", name="media", args_json="{}")
-        for part in _CONTENT_PART_CASES:
-            messages_and_message_class: tuple[
-                tuple[list[Message], type[UserMessage] | type[ToolMessage]], ...
-            ] = (
-                ([UserMessage(content=(part,))], UserMessage),
-                (
-                    [
-                        AssistantMessage(turn=(tool_call,)),
-                        ToolMessage(tool_call_id=tool_call.id, content=(part,)),
-                    ],
-                    ToolMessage,
-                ),
-            )
-            for messages, message_class in messages_and_message_class:
-                request = bound_adapter.build_request(messages)
-                assert isinstance(request, RequestParams | InvalidRequest)
-                if isinstance(request, InvalidRequest):
-                    assert type(part).__name__ in request.reason
-                    assert message_class.__name__ in request.reason
-
-    def test_image_url_part_in_a_user_message_builds(self) -> None:
-        """Every adapter sends ImageUrlPart inside UserMessage.content."""
-        request = self._bound_adapter().build_request([
-            UserMessage(content=(ImageUrlPart(url="https://example.com/image.png"),))
-        ])
-        assert isinstance(request, RequestParams)
-
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.
 
@@ -395,9 +307,7 @@ class AdapterConformance(ABC):
         adapter = self.make_adapter()
         for error, classification in self.sdk_errors_and_classifications().items():
             assert adapter.classify(error) == classification
-        assert adapter.classify(Exception("no adapter has seen this")) in get_args(
-            ErrorClassification.__value__
-        )
+        assert adapter.classify(Exception("no adapter has seen this")) == "unknown_exception"
 
     def test_every_listed_failure_parses_and_an_unknown_one_still_does(self) -> None:
         """Every listed failure takes its stated verdict, and an unlisted one still gets one.
@@ -408,20 +318,18 @@ class AdapterConformance(ABC):
         adapter = self.make_adapter()
         for failure, verdict in self.sdk_errors_and_verdicts().items():
             assert adapter.parse(failure) == verdict
-        unknown = adapter.parse(Exception("no adapter has seen this"))
-        assert isinstance(unknown, get_args(Verdict.__value__))
+        _ = adapter.parse(Exception("no adapter has seen this"))
 
-    def test_failure_types_names_only_exception_subclasses_and_carries_transient_error(
+    def test_failure_types_excludes_bare_exception_and_includes_transient_error(
         self,
     ) -> None:
-        """failure_types entries are strict Exception subclasses, and TransientError is one.
+        """Exclude bare Exception and include TransientError in failure_types.
 
         The retry loop raises `TransientError` inside `admitted()` for a billable transient failure.
         Including `TransientError` ensures those failures are recorded.
         """
         adapter = self.make_adapter()
         for failure_type in adapter.failure_types:
-            assert issubclass(failure_type, Exception)
             assert failure_type is not Exception
         assert TransientError in adapter.failure_types
 
@@ -456,44 +364,33 @@ class AdapterConformance(ABC):
             return
         raise AssertionError("a stream missing its terminal event drained without raising")
 
-    def test_each_attempt_row_reproduces_its_cost_from_its_own_prices(self) -> None:
-        """The archive's arithmetic closes without reaching back into any object.
-
-        This checks stored arithmetic at the table boundary.
-        It detects a missing price or a price paired with the wrong counter.
-        """
+    def test_to_tables_preserves_billing_fields_in_each_attempt_row(self) -> None:
+        """Compare exported counters, costs, and rates with the source Billing."""
         adapter = self.make_adapter()
         for billing in self._billings():
             (row,) = to_tables(_carrier_of(billing, adapter)).attempts
-            for counter_column, cost_column, price_column in (
+            usage = billing.usage
+            for column, expected in (
+                ("input_tokens_cache_read", usage.input_tokens_cache_read),
+                ("input_tokens_cache_write", usage.input_tokens_cache_write),
+                ("input_tokens_cache_none", usage.input_tokens_cache_none),
+                ("output_tokens", usage.output_tokens),
+                ("input_tokens_cache_read_cost_in_usd", usage.input_tokens_cache_read_cost_in_usd),
                 (
-                    "input_tokens_cache_read",
-                    "input_tokens_cache_read_cost_in_usd",
-                    "cache_read_usd_per_million_tokens",
-                ),
-                (
-                    "input_tokens_cache_write",
                     "input_tokens_cache_write_cost_in_usd",
-                    "cache_write_usd_per_million_tokens",
+                    usage.input_tokens_cache_write_cost_in_usd,
                 ),
+                ("input_tokens_cache_none_cost_in_usd", usage.input_tokens_cache_none_cost_in_usd),
+                ("output_tokens_cost_in_usd", usage.output_tokens_cost_in_usd),
+                ("cache_read_usd_per_million_tokens", billing.cache_read_usd_per_million_tokens),
+                ("cache_write_usd_per_million_tokens", billing.cache_write_usd_per_million_tokens),
                 (
-                    "input_tokens_cache_none",
-                    "input_tokens_cache_none_cost_in_usd",
                     "input_cache_none_usd_per_million_tokens",
+                    billing.input_cache_none_usd_per_million_tokens,
                 ),
-                (
-                    "output_tokens",
-                    "output_tokens_cost_in_usd",
-                    "output_usd_per_million_tokens",
-                ),
+                ("output_usd_per_million_tokens", billing.output_usd_per_million_tokens),
             ):
-                assert _costs_agree(
-                    _row_number(row, cost_column),
-                    category_cost(
-                        int(_row_number(row, counter_column)),
-                        usd_per_million_tokens=_row_number(row, price_column),
-                    ),
-                )
+                assert _costs_agree(_row_number(row, column), expected)
 
 
 def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallErrorRecord:

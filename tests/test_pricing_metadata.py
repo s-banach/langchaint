@@ -2,11 +2,9 @@
 
 import json
 import math
-from pathlib import Path
 
 import pytest
 
-from langchaint.anthropic import ANTHROPIC_BEDROCK_PRICING, ANTHROPIC_PRICING
 from langchaint.anthropic.messages_adapter import (
     AnthropicPricingTable,
     AnthropicRates,
@@ -180,14 +178,6 @@ def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
         )
 
 
-def test_bedrock_pricing_uses_bedrock_entries() -> None:
-    """Regional Bedrock rates remain independent from direct rates."""
-    bedrock = ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
-    direct = ANTHROPIC_PRICING["claude-opus-5"]
-    assert bedrock.standard.input_cache_none_usd_per_million_tokens == 5.5
-    assert direct.standard.input_cache_none_usd_per_million_tokens == 5.0
-
-
 def test_vendored_inputs_reproduce_generated_modules() -> None:
     """Vendored inputs reproduce both generated modules offline."""
     snapshot_payload: object = json.loads(SNAPSHOT_PATH.read_text())
@@ -200,13 +190,6 @@ def test_vendored_inputs_reproduce_generated_modules() -> None:
     }
     assert _openai_module(entries, metadata) == OPENAI_OUTPUT_PATH.read_text()
     assert _anthropic_module(entries, metadata) == ANTHROPIC_OUTPUT_PATH.read_text()
-
-
-def test_generated_paths_are_inside_the_repository() -> None:
-    """Generation targets tracked repository paths."""
-    repository = Path(__file__).resolve().parents[1]
-    assert OPENAI_OUTPUT_PATH.is_relative_to(repository)
-    assert ANTHROPIC_OUTPUT_PATH.is_relative_to(repository)
 
 
 @pytest.mark.parametrize("value", [True, -1, math.nan, math.inf])

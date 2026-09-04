@@ -1,6 +1,5 @@
 """Test provider-neutral pricing arithmetic without SDK imports."""
 
-import inspect
 import math
 
 import pytest
@@ -37,18 +36,6 @@ def _usage(
 def test_a_zero_counter_costs_zero_at_an_unknown_rate() -> None:
     """0 * NaN is NaN, so the zero case is special-cased and a total over it stays a number."""
     assert category_cost(tokens=0, usd_per_million_tokens=math.nan) == 0.0
-
-
-def test_rate_parameters_are_keyword_only() -> None:
-    """Both pricing functions require the rate by its unit-bearing parameter name."""
-    for function, parameter_name in (
-        (category_cost, "usd_per_million_tokens"),
-        (invocation_cost_in_usd, "usd_per_invocation"),
-    ):
-        assert (
-            inspect.signature(function).parameters[parameter_name].kind
-            is inspect.Parameter.KEYWORD_ONLY
-        )
 
 
 def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:

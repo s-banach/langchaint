@@ -1,13 +1,11 @@
 """Test Anthropic Messages adapters with constructed SDK objects."""
 
 import asyncio
-import base64
-import inspect
 import json
 import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import TypeIs, get_args, override
+from typing import TypeIs, override
 
 import anthropic
 import anthropic.types as at
@@ -17,7 +15,6 @@ from anthropic import (
     AsyncAnthropic,
     AsyncAnthropicBedrock,
     AsyncAnthropicBedrockMantle,
-    transform_schema,
 )
 from anthropic.lib.streaming import (
     AsyncMessageStream,
@@ -52,7 +49,6 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.adapter import (
-    REASONING_PART_SEPARATOR,
     Adapter,
     AdapterResult,
     AdapterStream,
@@ -73,7 +69,6 @@ from langchaint.adapter import (
     _NotSendableError,
 )
 from langchaint.anthropic import (
-    ANTHROPIC_BEDROCK,
     ANTHROPIC_BEDROCK_PRICING,
     Anthropic,
     AnthropicBedrock,
@@ -85,7 +80,6 @@ from langchaint.anthropic import (
 from langchaint.anthropic.messages_adapter import (
     _NO_ANTHROPIC_PROVIDER_TOOLS,
     PARSE_FALLTHROUGH_COUNTS,
-    _adapter_result,
     _AnthropicProviderTools,
     _AnthropicRequestParams,
     _AnthropicStream,
@@ -94,8 +88,6 @@ from langchaint.anthropic.messages_adapter import (
     _BoundAnthropic,
     _BoundAnthropicStructured,
     _BoundAnthropicText,
-    _normalized_stop_reason,
-    _user_content_blocks,
     _wire_messages,
     _wire_tool_choice,
     parse_anthropic,
@@ -219,6 +211,7 @@ def test_billing_partitions_and_prices_complete_usage() -> None:
     assert billing.service_tier == "standard"
     assert billing.input_cache_none_usd_per_million_tokens == 3.0
     assert billing.cache_read_usd_per_million_tokens == 0.3
+    assert billing.cache_write_usd_per_million_tokens == pytest.approx(5.25)
     assert billing.output_usd_per_million_tokens == 15.0
     assert usage.input_tokens_cache_read == 200
     assert usage.input_tokens_cache_write == 30
@@ -456,43 +449,44 @@ def test_the_reported_tier_selects_the_table() -> None:
     assert reporting_none.usage.cost_in_usd == at_standard.usage.cost_in_usd
 
 
-def test_cache_ttl_is_stored_on_the_adapter() -> None:
-    """`Anthropic.model()` and `AnthropicBedrock.model()` carry `cache_ttl`."""
-    assert (
-        _anthropic_adapter_of(
-            Anthropic(client=AsyncAnthropic(api_key="test")).model(
-                "claude-sonnet-5",
-                cache_ttl="1h",
-            )
-        ).cache_ttl
-        == "1h"
-    )
-    assert (
-        _anthropic_adapter_of(
-            AnthropicBedrock(aws_region="us-east-1").model(
-                "anthropic.claude-sonnet-5",
-                cache_ttl="1h",
-            )
-        ).cache_ttl
-        == "1h"
-    )
+def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
+    """Check the system cache marker built through each model factory."""
+    for llm in (
+        Anthropic(client=AsyncAnthropic(api_key="test")).model("claude-sonnet-5", cache_ttl="1h"),
+        AnthropicBedrock(aws_region="us-east-1").model(
+            "anthropic.claude-sonnet-5", cache_ttl="1h"
+        ),
+    ):
+        bound = llm.adapter.bind_text(
+            _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
+        )
+        request = bound.build_request([UserMessage(content="q")])
+        assert isinstance(request, _AnthropicRequestParams)
+        assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == {
+            "type": "ephemeral",
+            "ttl": "1h",
+        }
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("end_turn", "end_turn"),
-        ("tool_use", "tool_use"),
-        ("max_tokens", "max_tokens"),
-        ("refusal", "refusal"),
         ("model_context_window_exceeded", "context_window_exceeded"),
         ("pause_turn", "other"),
         (None, "other"),
     ],
 )
-def test_stop_reason_mapping(raw: str | None, expected: str) -> None:
-    """Map recognized stop reasons and use other as fallback."""
-    assert _normalized_stop_reason(raw) == expected
+def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
+    """Check translated stop reasons alongside the preserved partial text."""
+    message = _message_snapshot(raw, [at.TextBlock(type="text", text="partial text")])
+    result = (
+        _adapter()
+        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
+        .interpret(message)
+    )
+    assert isinstance(result, AdapterResult)
+    assert result.stop_reason == expected
+    assert result.output == "partial text"
 
 
 def test_adapter_result_extracts_text_and_tool_use() -> None:
@@ -512,7 +506,12 @@ def test_adapter_result_extracts_text_and_tool_use() -> None:
         type="message",
         usage=_usage_with_cache_split(),
     )
-    result = _adapter_result(message, "hello world", _assistant_message_from(message))
+    result = (
+        _adapter()
+        .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
+        .interpret(message)
+    )
+    assert isinstance(result, AdapterResult)
     assert result.output == "hello world"
     assert result.assistant_message.text == "hello world"
     tool_call = result.assistant_message.tool_calls[0]
@@ -761,7 +760,7 @@ def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> 
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": base64.b64encode(b"png").decode("ascii"),
+                "data": "cG5n",
             },
         },
     ]
@@ -920,11 +919,8 @@ def test_request_omits_tool_sentinels_without_tools() -> None:
     precomputed_fields = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    assert precomputed_fields.max_tokens == 4096
     assert isinstance(precomputed_fields.tools, anthropic.Omit)
     assert isinstance(precomputed_fields.tool_choice, anthropic.Omit)
-    assert precomputed_fields.output_config == {"effort": "high"}
-    assert precomputed_fields.thinking == {"type": "adaptive"}
 
 
 def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
@@ -1119,14 +1115,6 @@ def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
         )
 
 
-def test_anthropic_provider_rate_defaults_to_unavailable() -> None:
-    """Ordinary custom pricing requires no unused web-search rate."""
-    parameter = inspect.signature(AnthropicPricingTable).parameters[
-        "web_search_usd_per_invocation"
-    ]
-    assert parameter.default is None
-
-
 def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
     """Provider-executed cache markers count toward Anthropic's request limit."""
     provider_tools = tuple(
@@ -1246,13 +1234,6 @@ def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
     assert "cache_control" not in _block_list(with_system.tools)[-1]
-
-
-def test_user_content_blocks_rejects_unsupported_image_media_type() -> None:
-    """An image media type outside the accepted set is not sendable."""
-    message = UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))
-    with pytest.raises(_NotSendableError):
-        _ = _user_content_blocks(message)
 
 
 class _FakeSDKMessageStream(AsyncMessageStream[None]):
@@ -1498,7 +1479,7 @@ def test_a_redacted_thinking_block_streams_no_text_and_no_extra_blank_line() -> 
     ])
     assert translated == [
         ReasoningDelta(text="First."),
-        ReasoningDelta(text=REASONING_PART_SEPARATOR),
+        ReasoningDelta(text="\n\n"),
         ReasoningDelta(text="Then."),
     ]
 
@@ -1520,32 +1501,6 @@ def test_a_redacted_block_after_a_thinking_block_with_no_text_arms_no_separator(
         _thinking_delta_event("Then.", 2),
     ])
     assert translated == [ReasoningDelta(text="Then.")]
-
-
-def test_stream_final_turn_carries_reasoning() -> None:
-    """final()'s assistant turn includes the thinking block from the SDK-assembled message."""
-
-    async def scenario() -> None:
-        snapshot = _message_snapshot(
-            "end_turn",
-            content=[
-                at.ThinkingBlock(type="thinking", thinking="check", signature="sig-1"),
-                at.TextBlock(type="text", text="hey"),
-            ],
-        )
-        adapter_stream = _anthropic_stream([], snapshot)
-        async for _item in adapter_stream.items():
-            pass
-        assistant_message = _assistant_message_from(await adapter_stream.final())
-        reasoning_part = assistant_message.turn[0]
-        assert isinstance(reasoning_part, ReasoningPart)
-        assert reasoning_part.raw == {
-            "type": "thinking",
-            "thinking": "check",
-            "signature": "sig-1",
-        }
-
-    asyncio.run(scenario())
 
 
 class _StructuredReport(BaseModel):
@@ -1682,22 +1637,16 @@ def _structured_message(
     )
 
 
-def test_structured_bind_merges_the_sdk_schema_into_the_bindings_output_config() -> None:
-    """output_config carries the response schema and bound effort."""
-    adapted_type: TypeAdapter[_StructuredReport] = TypeAdapter(_StructuredReport)
-    assert _structured_bound()._precomputed_fields.output_config == {
-        "effort": "high",
-        "format": {"schema": transform_schema(adapted_type.json_schema()), "type": "json_schema"},
-    }
-
-
-def test_the_structured_request_sends_the_output_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """open_stream sends the precomputed output_config."""
-    structured_bound = _structured_bound()
-    output_config = _kwarg_sent(monkeypatch, structured_bound, "output_config")
-    assert output_config == structured_bound._precomputed_fields.output_config
+def test_the_structured_request_sends_the_output_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check the schema and effort captured by the SDK stream stub."""
+    output_config = _kwarg_sent(monkeypatch, _structured_bound(), "output_config")
+    assert isinstance(output_config, dict)
+    assert output_config["effort"] == "high"
+    assert output_config["format"]["type"] == "json_schema"
+    assert output_config["format"]["schema"]["properties"]["city"]["type"] == "string"
+    assert output_config["format"]["schema"]["properties"]["celsius"]["type"] == "integer"
+    required: list[str] = output_config["format"]["schema"]["required"]
+    assert set(required) == {"city", "celsius"}
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
@@ -2082,13 +2031,6 @@ def test_uncataloged_bedrock_model_requires_pricing() -> None:
         _ = bedrock.model("us.anthropic.claude-next")
 
 
-def test_bedrock_preferred_model_names_equal_anthropic_bedrock_keys() -> None:
-    """`AnthropicBedrockModelName` literals equal `ANTHROPIC_BEDROCK` keys."""
-    preferred_model_names, accepted_string_type = get_args(AnthropicBedrockModelName.__value__)
-    assert accepted_string_type is str
-    assert set(ANTHROPIC_BEDROCK) == set(get_args(preferred_model_names))
-
-
 def test_wire_messages_marks_a_marked_user_part() -> None:
     """A user part with cache_breakpoint carries the marker on its own block. Unmarked siblings carry none."""
     messages = [
@@ -2375,7 +2317,6 @@ def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
         "type": "ephemeral",
         "ttl": "1h",
     }
-    assert precomputed_fields.cache_ttl == "1h"
 
 
 def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:

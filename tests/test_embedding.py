@@ -3,7 +3,7 @@
 import asyncio
 from collections import Counter
 from collections.abc import Sequence
-from typing import ClassVar, assert_type
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -162,7 +162,6 @@ def test_embed_returns_normalized_owned_float32_rows() -> None:
 
     vectors = asyncio.run(_model(adapter).embed(["first", "second"], task="clustering"))
 
-    assert_type(vectors, Float2D)
     assert vectors.dtype == np.float32
     assert vectors.shape == (2, 2)
     assert vectors.flags.c_contiguous

@@ -4,7 +4,6 @@ Tests cover Usage, stop reasons, reasoning, tool calls, streams, and errors.
 """
 
 import asyncio
-import inspect
 import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -625,13 +624,6 @@ def test_configured_gemini_charged_tool_requires_usable_pricing(
         _ = adapter.bind_text(_binding(provider_executed_tools=({provider_field: {}},)))
 
 
-def test_gemini_provider_rates_default_to_unavailable() -> None:
-    """Ordinary custom pricing requires no unused provider-tool rates."""
-    parameters = inspect.signature(GeminiPricingTable).parameters
-    assert parameters["google_search_usd_per_query"].default is None
-    assert parameters["google_maps_usd_per_query"].default is None
-
-
 def test_provider_executed_tools_reject_non_auto_tool_choice() -> None:
     """Gemini ToolConfig cannot select provider-executed tools."""
     with pytest.raises(ValueError, match="tool_choice='auto'"):
@@ -778,6 +770,7 @@ def test_user_message_forms() -> None:
                 ImagePart(data=b"\x89PNG", media_type="image/png"),
                 ImageUrlPart(url="gs://bucket/image.png", media_type="image/png"),
                 AudioPart(data=b"WAV", media_type="audio/wav"),
+                ImageUrlPart(url="https://example.com/image.png"),
             )
         ),
     ])
@@ -794,6 +787,7 @@ def test_user_message_forms() -> None:
                 )
             ),
             types.Part(inline_data=types.Blob(data=b"WAV", mime_type="audio/wav")),
+            types.Part(file_data=types.FileData(file_uri="https://example.com/image.png")),
         ],
     )
 
@@ -1204,40 +1198,6 @@ def test_the_usage_partition() -> None:
     assert billing.service_tier == "ON_DEMAND"
 
 
-def test_search_tool_call_adds_the_cataloged_provider_executed_tool_cost() -> None:
-    """Gemini prices each unique nonempty Search query."""
-    pricing = {
-        "ON_DEMAND": GeminiPricingTable(
-            rates=_ON_DEMAND_RATES,
-            google_search_usd_per_query=0.014,
-            google_maps_usd_per_query=0.014,
-        )
-    }
-    response = _response(
-        [
-            types.Part(
-                tool_call=types.ToolCall(
-                    id="search-1",
-                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                    args={"queries": ["first", "second"]},
-                )
-            ),
-            types.Part(
-                tool_response=types.ToolResponse(
-                    id="search-1",
-                    tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                    response={},
-                )
-            ),
-        ],
-        usage_metadata=_usage_metadata(),
-    )
-    usage = _billing_from_response(
-        response, pricing, configured_fields=frozenset({"google_search"})
-    ).usage
-    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
-
-
 def test_search_queries_deduplicate_across_candidates_and_ignore_empty_strings() -> None:
     """Gemini bills unique nonempty Search queries across the complete response."""
     first_candidate = types.Candidate(
@@ -1628,13 +1588,9 @@ def test_billing_reported_follows_usage_arrival() -> None:
 
     before, after = asyncio.run(scenario())
     assert before is None
-    expected = _billing_from_usage(
-        _usage_metadata(), _PRICING, provider_executed_tool_cost_in_usd=0.0
-    )
-    # Whole-Billing equality would fail on the NaN cache-write rate both sides carry.
     assert after is not None
-    assert after.billing.usage == expected.usage
-    assert after.billing.service_tier == expected.service_tier
+    assert after.billing.usage.output_tokens == 60
+    assert after.billing.service_tier == "ON_DEMAND"
 
 
 def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:

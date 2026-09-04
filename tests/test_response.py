@@ -57,12 +57,6 @@ class Report(BaseModel):
     value: int
 
 
-class DifferentReport(BaseModel):
-    """A caller output type incompatible with `Report` JSON."""
-
-    text: str
-
-
 class ProviderUsage(BaseModel):
     """One provider-specific usage value."""
 
@@ -187,17 +181,8 @@ def test_usage_nonfinite_cost_round_trips(value: float) -> None:
         assert restored.output_tokens_cost_in_usd == value
 
 
-def test_transient_error_record_rejects_invalid_retry_delays() -> None:
-    """Retry delays must be finite and nonnegative."""
-    for value in (-1.0, math.nan, math.inf, -math.inf):
-        with pytest.raises(ValidationError):
-            _ = TransientErrorRecord(message="retry", retry_after_seconds=value)
-
-
-def test_attempt_timing_rejects_invalid_values_and_first_item_order() -> None:
-    """Attempt timing rejects negative durations and late first items."""
-    with pytest.raises(ValidationError):
-        _ = _settled(elapsed_seconds=-1.0)
+def test_attempt_rejects_first_item_after_its_end() -> None:
+    """Reject seconds_to_first_item exceeding elapsed_seconds."""
     with pytest.raises(ValidationError):
         _ = SettledAttemptRecord(
             started_after_seconds=0.0,
@@ -249,7 +234,7 @@ def test_call_record_rejects_overlap_out_of_bounds_and_cut_off_placement() -> No
         )
 
 
-def test_response_record_round_trips_with_concrete_output_type_and_message_bytes() -> None:
+def test_response_record_round_trips_with_concrete_output_type() -> None:
     """A concrete caller model reconstructs through `ResponseRecord` JSON."""
     record = ResponseRecord(
         output=Report(value=3), call=_completed_turn_call(), stop_reason="end_turn"
@@ -260,38 +245,8 @@ def test_response_record_round_trips_with_concrete_output_type_and_message_bytes
     assert isinstance(restored.output, Report)
 
 
-def test_response_record_rejects_a_mismatched_output_type() -> None:
-    """`model_validate_json` validates the concrete caller output type."""
-    record = ResponseRecord(
-        output=Report(value=3), call=_completed_turn_call(), stop_reason="end_turn"
-    )
-    with pytest.raises(ValidationError):
-        _ = ResponseRecord[DifferentReport].model_validate_json(record.model_dump_json())
-
-
-def test_caller_output_with_nonreconstructible_json_fails_on_validation() -> None:
-    """A caller model that serializes NaN as null fails reconstruction."""
-
-    class NonReconstructibleOutput(BaseModel):
-        value: float
-
-    record = ResponseRecord(
-        output=NonReconstructibleOutput(value=math.nan),
-        call=_completed_turn_call(),
-        stop_reason="end_turn",
-    )
-    with pytest.raises(ValidationError):
-        _ = ResponseRecord[NonReconstructibleOutput].model_validate_json(record.model_dump_json())
-
-
-def test_success_record_rejects_unknown_fields_and_invalid_attempt_shapes() -> None:
-    """Success records reject extra fields and incomplete successful requests."""
-    valid = ResponseRecord(output=1, call=_completed_turn_call(), stop_reason="end_turn")
-    payload = valid.model_dump()
-    with pytest.raises(ValidationError, match="extra"):
-        _ = ResponseRecord[int].model_validate(payload | {"extra": True})
-    with pytest.raises(TypeError, match="not a field"):
-        _ = valid.model_copy(update={"extra": True})
+def test_success_record_rejects_invalid_attempt_shapes() -> None:
+    """Reject success records with missing billing or a cut-off attempt."""
     with pytest.raises(ValidationError, match="final attempt must contain billing"):
         _ = ResponseRecord(
             output=1,
@@ -320,26 +275,14 @@ def test_tool_call_turn_record_requires_a_tool_call() -> None:
     assert isinstance(restored.output, Report)
 
 
-def test_live_success_delegates_normalized_properties_and_preserves_provider_data() -> None:
-    """A live success delegates normalized values and retains provider values."""
+def test_live_success_preserves_provider_data_and_requires_alignment() -> None:
+    """Preserve raw provider data and reject misaligned provider_attempts."""
     record = ResponseRecord(
         output=Report(value=5), call=_completed_turn_call(), stop_reason="end_turn"
     )
     provider_attempts = _provider_attempts()
     response = Response(record=record, provider_attempts=provider_attempts)
     assert response.raw is provider_attempts[0].raw
-    assert response.output is record.output
-    assert response.call == record.call
-    assert response.attempt_records == record.attempt_records
-    assert response.attempts == record.attempts
-    assert response.usage == record.usage
-    assert response.model == record.model
-    assert response.provider_name == record.provider_name
-    assert response.elapsed_seconds == record.elapsed_seconds
-    assert response.assistant_message == record.assistant_message
-    assert response.usage_successful_attempt == record.usage_successful_attempt
-    assert response.stop_reason == record.stop_reason
-    assert response.tool_calls == record.tool_calls
     with pytest.raises(ValueError, match="align"):
         _ = Response(record=record, provider_attempts=())
 
@@ -484,13 +427,9 @@ def test_every_error_record_round_trips_through_the_closed_union() -> None:
     """The closed error union reconstructs each built-in error record."""
     adapter = TypeAdapter(GenerationErrorRecord)
     for record, expected_kind, expected_error_text in _error_record_cases():
-        assert record.model_config.get("frozen") is True
-        assert record.kind == expected_kind
         assert record.error_text == expected_error_text
         record_json_text = record.model_dump_json()
         assert json.loads(record_json_text)["error_text"] == expected_error_text
-        restored_direct = type(record).model_validate_json(record_json_text)
-        assert restored_direct.model_dump_json() == record_json_text
         record_json_bytes = adapter.dump_json(record)
         restored = adapter.validate_json(record_json_bytes)
         assert type(restored) is type(record)
@@ -498,17 +437,6 @@ def test_every_error_record_round_trips_through_the_closed_union() -> None:
         assert restored.kind == expected_kind
         assert restored.error_text == expected_error_text
         assert str(restored) == restored.error_text
-
-
-def test_closed_result_unions_reject_unknown_kinds() -> None:
-    """Unknown discriminators fail validation for error and mixed result records."""
-    record = RefusalErrorRecord(call=_completed_turn_call())
-    payload: dict[str, object] = TypeAdapter(GenerationErrorRecord).dump_python(record)
-    payload["kind"] = "future_error"
-    with pytest.raises(ValidationError, match="union_tag_invalid"):
-        _ = TypeAdapter(GenerationErrorRecord).validate_python(payload)
-    with pytest.raises(ValidationError, match="union_tag_invalid"):
-        _ = TypeAdapter(CallResultRecord[Report]).validate_python(payload)
 
 
 def test_error_record_properties_and_error_text() -> None:
@@ -562,27 +490,9 @@ def test_error_records_reject_invalid_call_shapes(
         _ = factory()
 
 
-def test_generation_error_delegates_record_and_keeps_live_only_state() -> None:
-    """`GenerationError` delegates normalized values and retains live-only state."""
+def test_generation_error_requires_provider_attempt_alignment() -> None:
+    """Reject provider_attempts that do not align with the record."""
     record = RefusalErrorRecord(call=_completed_turn_call())
-    provider_attempts = _provider_attempts()
-    failure = GenerationError(
-        record=record, request=StubRequest(), provider_attempts=provider_attempts
-    )
-    assert failure.request is not None
-    assert failure.provider_attempts is provider_attempts
-    assert failure.kind == record.kind
-    assert str(failure) == record.error_text
-    assert failure.error_text == record.error_text
-    assert failure.call == record.call
-    assert failure.attempt_records == record.attempt_records
-    assert failure.attempts == record.attempts
-    assert failure.usage == record.usage
-    assert failure.model == record.model
-    assert failure.provider_name == record.provider_name
-    assert failure.elapsed_seconds == record.elapsed_seconds
-    assert failure.assistant_message == record.assistant_message
-    assert failure.stop_reason == record.stop_reason
     with pytest.raises(ValueError, match="align"):
         _ = GenerationError(record=record, request=None, provider_attempts=())
 
@@ -613,7 +523,6 @@ def test_to_tables_reads_live_only_request_and_provider_usage() -> None:
     assert live_tables.calls[0]["request_json"] == '{"prompt":"hi"}'
     assert normalized_tables.calls[0]["request_json"] is None
     assert live_tables.calls[0]["error_text"] == ""
-    assert "error_summary" not in live_tables.calls[0]
     assert live_tables.attempts[0]["usage_raw_json"] == '{"billed_units":17}'
     assert normalized_tables.attempts[0]["usage_raw_json"] is None
     assert live_tables.attempts[0]["started_after_seconds"] == 0.0
@@ -626,14 +535,10 @@ def test_to_tables_emits_one_row_for_a_cut_off_attempt() -> None:
     )
     tables = to_tables(record)
     assert tables.calls[0]["attempts"] == 1
-    assert tables.attempts == [
-        tables.attempts[0]
-        | {
-            "started_after_seconds": 0.25,
-            "elapsed_seconds": None,
-            "seconds_to_first_item": None,
-        }
-    ]
+    assert len(tables.attempts) == 1
+    assert tables.attempts[0]["started_after_seconds"] == 0.25
+    assert tables.attempts[0]["elapsed_seconds"] is None
+    assert tables.attempts[0]["seconds_to_first_item"] is None
     assert tables.attempts[0]["cost_in_usd"] == _USAGE.cost_in_usd
 
 

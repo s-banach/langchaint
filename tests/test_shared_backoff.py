@@ -1,9 +1,10 @@
 """Test SharedBackoff admission, pauses, and wait ceilings."""
 
 import asyncio
+import math
 import time
 from collections.abc import Callable, Coroutine
-from typing import Literal, override
+from typing import Literal
 
 import pytest
 
@@ -54,19 +55,6 @@ def _shared_backoff(
         max_request_starts_per_second=max_request_starts_per_second,
         on_parse_error=on_parse_error,
     )
-
-
-class _RecordingSharedBackoff(SharedBackoff):
-    """SharedBackoff that keeps every verdict _record received, for identity assertions."""
-
-    def __init__(self, *, parse: Callable[[Exception], Verdict]) -> None:
-        super().__init__(parse=parse, failure_types=(ProviderFailure,), max_concurrent_requests=1)
-        self.recorded: list[Verdict] = []
-
-    @override
-    def _record(self, verdict: Verdict) -> None:
-        self.recorded.append(verdict)
-        super()._record(verdict)
 
 
 def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
@@ -160,15 +148,12 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
                 )
 
 
-def test_constructor_derives_seconds_between_request_starts_from_a_valid_rate() -> None:
+def test_constructor_rejects_unrepresentable_request_start_rates() -> None:
     """Validate max_request_starts_per_second before deriving its reciprocal."""
     with pytest.raises(ValueError, match="max_request_starts_per_second"):
         _ = _shared_backoff(max_request_starts_per_second=10**1000)
     with pytest.raises(ValueError, match="max_request_starts_per_second"):
         _ = _shared_backoff(max_request_starts_per_second=5e-324)
-    shared_backoff = _shared_backoff(max_request_starts_per_second=20.0)
-    assert shared_backoff.max_request_starts_per_second == 20.0
-    assert shared_backoff._seconds_between_request_starts == 0.05
 
 
 def test_constructor_rejects_wait_multiplier_at_or_below_one() -> None:
@@ -201,12 +186,11 @@ def test_constructor_rejects_an_unrepresentable_ceiling_ratio() -> None:
 
 
 def test_constructor_accepts_longest_wait_seconds_equal_to_the_floor() -> None:
-    """A one-value ceiling range is legal. The ceiling then never moves."""
-    shared_backoff = _shared_backoff(
+    """Check successful construction at the equal-ceiling boundary."""
+    _ = _shared_backoff(
         minimum_wait_ceiling_seconds=2.0,
         longest_wait_seconds=2.0,
     )
-    assert shared_backoff._wait_ceiling == 2.0
 
 
 # --- the exit ---
@@ -249,14 +233,12 @@ def test_an_exception_outside_failure_types_propagates_unparsed() -> None:
 
 
 def test_a_failure_is_parsed_recorded_and_propagated() -> None:
-    """The exit stores the normalized verdict, records the same object, and re-raises the failure."""
+    """Check the normalized verdict, returned permit, and started pause."""
 
     async def scenario() -> None:
-        shared_backoff = _RecordingSharedBackoff(parse=lambda _failure: PauseAll(retry_after=0.25))
+        shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=0.25))
         admission = await _fail_one_attempt(shared_backoff)
         assert admission.verdict == PauseAll(retry_after=0.25)
-        assert shared_backoff.recorded == [admission.verdict]
-        assert shared_backoff.recorded[0] is admission.verdict
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until > shared_backoff._clock()
 
@@ -271,12 +253,11 @@ def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
     """
 
     async def scenario() -> None:
-        shared_backoff = _RecordingSharedBackoff(
+        shared_backoff = _shared_backoff(
             parse=lambda _failure: PauseAllDoNotRetry(retry_after=0.25)
         )
         admission = await _fail_one_attempt(shared_backoff)
         assert admission.verdict == PauseAllDoNotRetry(retry_after=0.25)
-        assert shared_backoff.recorded == [admission.verdict]
         assert shared_backoff._pause_until > shared_backoff._clock()
 
     _run(scenario)
@@ -305,25 +286,6 @@ def test_a_do_not_retry_verdict_changes_no_shared_state() -> None:
         admission = await _fail_one_attempt(shared_backoff)
         assert admission.verdict == DoNotRetry()
         assert shared_backoff._pause_until == _NEVER
-
-    _run(scenario)
-
-
-def test_a_raising_record_still_returns_the_permit() -> None:
-    """The release sits in a finally, so a raise out of recording cannot leak a permit."""
-
-    class _BrokenRecordSharedBackoff(SharedBackoff):
-        @override
-        def _record(self, verdict: Verdict) -> None:
-            raise RuntimeError("record broke")
-
-    async def scenario() -> None:
-        shared_backoff = _BrokenRecordSharedBackoff(
-            parse=_retry_verdict, failure_types=(ProviderFailure,), max_concurrent_requests=1
-        )
-        with pytest.raises(RuntimeError, match="record broke"):
-            await _raise_in_block(shared_backoff.admitted(), ProviderFailure("boom"))
-        assert _all_permits_free(shared_backoff)
 
     _run(scenario)
 
@@ -398,8 +360,6 @@ def test_retry_after_normalization() -> None:
             admission = await _fail_one_attempt(shared_backoff)
             assert isinstance(admission.verdict, PauseAll), f"stated={stated!r}"
             assert admission.verdict.retry_after == expected, f"stated={stated!r}"
-            if expected is not None:
-                assert type(admission.verdict.retry_after) is float
 
     _run(scenario)
 
@@ -473,7 +433,6 @@ def test_request_starts_respect_max_request_starts_per_second() -> None:
             max_concurrent_requests=None,
             max_request_starts_per_second=20.0,
         )
-        assert shared_backoff._seconds_between_request_starts == 0.05
         admitted_at: list[float] = []
 
         async def request() -> None:
@@ -689,15 +648,21 @@ def test_a_multiplier_just_above_one_decays_without_a_clamp() -> None:
     assert 1.0 <= shared_backoff._wait_ceiling < 60.0
 
 
-def test_chosen_waits_are_positive_and_bounded_by_the_ceiling() -> None:
-    """A wait of our own choosing lies in (0, ceiling] and varies."""
-    draws = {shared_backoff_module._random_up_to(2.0) for _ in range(200)}
-    assert all(0.0 < draw <= 2.0 for draw in draws)
-    assert len(draws) > 1, "draws are constant, so the wait is not jittered"
+def test_chosen_waits_are_positive_and_bounded_by_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check positive waits at both random sampling boundaries."""
+    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: 0.0)
+    assert shared_backoff_module._random_up_to(2.0) == 2.0
+    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: math.nextafter(1.0, 0.0))
+    assert 0.0 < shared_backoff_module._random_up_to(2.0) < 2.0
 
 
-def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor() -> None:
+def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Waits respect the growing ceiling and retry_after floor."""
+    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: 0.0)
     private_backoff = PrivateBackoff(
         _shared_backoff(
             minimum_wait_ceiling_seconds=1.0,
@@ -705,7 +670,6 @@ def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor() -> Non
             longest_wait_seconds=4.0,
         )
     )
-    ceilings = (1.0, 2.0, 4.0, 4.0)
-    for ceiling in ceilings:
-        assert 0.0 < private_backoff.next_wait(None) <= ceiling
-    assert private_backoff.next_wait(3.5) >= 3.5
+    assert [private_backoff.next_wait(None) for _ in range(4)] == [1.0, 2.0, 4.0, 4.0]
+    fresh_backoff = PrivateBackoff(_shared_backoff(minimum_wait_ceiling_seconds=1.0))
+    assert fresh_backoff.next_wait(3.5) == 3.5

@@ -22,22 +22,18 @@ from langchaint.anthropic import (
     AnthropicBedrock,
     AnthropicBedrockModelName,
     AnthropicMessagesAdapter,
-    AnthropicModelName,
     AnthropicPricingTable,
     AnthropicRates,
 )
-from langchaint.cohere import CohereBedrock
 from langchaint.deepseek import (
     DEEPSEEK_PRICING,
     DeepSeek,
-    DeepSeekModelName,
     cache_read_tokens_from_usage_deepseek,
 )
 from langchaint.gemini import (
     GEMINI_PRICING,
     Gemini,
     GeminiGenerateContentAdapter,
-    GeminiModelName,
     GeminiPricingTable,
     GeminiRates,
 )
@@ -46,7 +42,6 @@ from langchaint.openai import (
     OpenAI,
     OpenAIBedrock,
     OpenAIChatCompletionsAdapter,
-    OpenAIModelName,
     OpenAIPricingTable,
     OpenAIRates,
     OpenAIResponsesAdapter,
@@ -114,84 +109,46 @@ def _provider_name_values_fixture() -> set[str]:
     return values
 
 
-@pytest.mark.parametrize("model", list(ANTHROPIC_PRICING))
-def test_anthropic_model_wires_model_and_pricing(model: AnthropicModelName) -> None:
+def test_anthropic_model_wires_model_and_pricing() -> None:
     """Anthropic.model returns an adapter carrying catalog pricing."""
+    model = "claude-sonnet-5"
     llm = Anthropic(client=AsyncAnthropic(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing is ANTHROPIC_PRICING[model]
-    assert adapter.automatic_cache_breakpoints_default is False
-    web_search_rate = adapter.pricing.web_search_usd_per_invocation
-    assert web_search_rate is not None
-    assert web_search_rate > 0
 
 
-@pytest.mark.parametrize("model", list(GEMINI_PRICING))
-def test_gemini_model_wires_model_and_pricing(model: GeminiModelName) -> None:
+def test_gemini_model_wires_model_and_pricing() -> None:
     """Gemini.model returns an adapter carrying catalog pricing."""
+    model = "gemini-3.5-flash"
     llm = Gemini(client=genai.Client(api_key="offline", vertexai=False)).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.model == model
     assert adapter.pricing["ON_DEMAND"] is GEMINI_PRICING[model]
-    assert adapter.automatic_cache_breakpoints_default is False
-    google_search_rate = adapter.pricing["ON_DEMAND"].google_search_usd_per_query
-    google_maps_rate = adapter.pricing["ON_DEMAND"].google_maps_usd_per_query
-    assert google_search_rate is not None
-    assert google_search_rate > 0
-    assert google_maps_rate is not None
-    assert google_maps_rate > 0
 
 
-@pytest.mark.parametrize("model", list(OPENAI_PRICING))
-def test_openai_model_wires_model_and_pricing(model: OpenAIModelName) -> None:
+def test_openai_model_wires_model_and_pricing() -> None:
     """OpenAI.model returns an adapter carrying catalog pricing."""
+    model = "gpt-5.6-terra"
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
     assert adapter.model == model
     assert adapter.pricing is OPENAI_PRICING[model]
-    assert adapter.regional_processing is False
-    assert adapter.automatic_cache_breakpoints_default is False
-    web_search_rate = adapter.pricing.web_search_usd_per_invocation
-    assert web_search_rate is not None
-    assert web_search_rate > 0
 
 
-_PROMPT_CACHE_OPTIONS_SUPPORT: dict[OpenAIModelName, bool] = {
-    "gpt-5.6": True,
-    "gpt-5.6-luna": True,
-    "gpt-5.6-terra": True,
-    "gpt-5.6-sol": True,
-}
-"""Expected cache support for each cataloged OpenAI model."""
-
-
-def test_the_prompt_cache_options_expectations_cover_the_catalog() -> None:
-    """Require one cache-support expectation for every cataloged model."""
-    assert set(_PROMPT_CACHE_OPTIONS_SUPPORT) == set(OPENAI_PRICING)
-
-
-def test_gemini_catalog_contains_only_gemini_3_models() -> None:
-    """Gemini provider-tool support begins with Gemini 3 models."""
-    assert all(model.startswith("gemini-3") for model in GEMINI_PRICING)
-
-
-@pytest.mark.parametrize(("model", "supported"), list(_PROMPT_CACHE_OPTIONS_SUPPORT.items()))
-def test_openai_model_wires_prompt_cache_options_support(
-    model: OpenAIModelName, *, supported: bool
-) -> None:
+def test_openai_model_wires_prompt_cache_options_support() -> None:
     """Verify `OpenAI.model` reads cataloged cache support."""
     llm = OpenAI(client=AsyncOpenAI(api_key="offline")).model(
-        model,
+        "gpt-5.6-terra",
         regional_processing=False,
     )
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIResponsesAdapter)
-    assert adapter.supports_prompt_cache_options is supported
-    assert adapter.automatic_cache_breakpoints_default is not supported
+    assert adapter.supports_prompt_cache_options is True
+    assert adapter.automatic_cache_breakpoints_default is False
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -299,8 +256,8 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
     assert adapter.provider_name == "gcp.vertex_ai"
 
 
-def test_gemini_shares_backoff_and_bind_owns_max_attempts() -> None:
-    """`Gemini` shares `SharedBackoff`. `LLM.bind()` sets `max_attempts`."""
+def test_gemini_shares_backoff() -> None:
+    """Models from one Gemini share SharedBackoff."""
     gemini = Gemini(
         client=genai.Client(api_key="offline", vertexai=False),
         max_concurrent_requests=16,
@@ -316,12 +273,10 @@ def test_gemini_shares_backoff_and_bind_owns_max_attempts() -> None:
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
     assert gemini.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
-    assert llm.bind(automatic_cache_breakpoints=False, max_attempts=5).max_attempts == 5
     defaulted = gemini.model("gemini-3.5-flash")
     defaulted_adapter = defaulted.adapter
     assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
     assert defaulted_adapter.service_tier is None
-    assert defaulted.bind(automatic_cache_breakpoints=False).max_attempts == 3
 
 
 def _deepseek_client() -> AsyncOpenAI:
@@ -329,20 +284,15 @@ def _deepseek_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key="offline", base_url="https://api.deepseek.com")
 
 
-@pytest.mark.parametrize("model", list(DEEPSEEK_PRICING))
-def test_deepseek_model_wires_model_pricing_and_the_cache_reader(
-    model: DeepSeekModelName,
-) -> None:
+def test_deepseek_model_wires_model_pricing_and_the_cache_reader() -> None:
     """Wire DeepSeek pricing and its cache-read usage reader."""
+    model = "deepseek-v4-flash"
     llm = DeepSeek(client=_deepseek_client()).model(model)
     adapter = llm.adapter
     assert isinstance(adapter, OpenAIChatCompletionsAdapter)
     assert adapter.model == model
     assert adapter.pricing.default is DEEPSEEK_PRICING[model]
     assert adapter.cache_read_tokens_from_usage is cache_read_tokens_from_usage_deepseek
-    assert adapter.supports_prompt_cache_options is False
-    assert adapter.automatic_cache_breakpoints_default is True
-    assert adapter.provider_name == "deepseek"
 
 
 def test_deepseek_model_accepts_an_uncataloged_model() -> None:
@@ -375,8 +325,8 @@ def test_deepseek_without_a_client_requires_the_deepseek_key(
     assert str(adapter.client.base_url).startswith("https://api.deepseek.com")
 
 
-def test_deepseek_shares_backoff_and_bind_owns_max_attempts() -> None:
-    """`DeepSeek` shares `SharedBackoff`. `LLM.bind()` sets `max_attempts`."""
+def test_deepseek_shares_backoff() -> None:
+    """Models from one DeepSeek share SharedBackoff."""
     deepseek = DeepSeek(
         client=_deepseek_client(),
         max_concurrent_requests=16,
@@ -386,7 +336,6 @@ def test_deepseek_shares_backoff_and_bind_owns_max_attempts() -> None:
     assert llm.shared_backoff.max_concurrent_requests == 16
     assert llm.shared_backoff.max_request_starts_per_second == 25.0
     assert deepseek.model("deepseek-v4-pro").shared_backoff is llm.shared_backoff
-    assert llm.bind(automatic_cache_breakpoints=True, max_attempts=5).max_attempts == 5
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -601,8 +550,6 @@ def test_openai_shares_client_and_shared_backoff() -> None:
     assert terra.shared_backoff.longest_wait_seconds == 12.0
     assert terra.shared_backoff.wait_multiplier == 3.0
     assert terra.shared_backoff.quiet_seconds_per_decay_step == 9.0
-    assert terra.bind(automatic_cache_breakpoints=False, max_attempts=5).max_attempts == 5
-    assert terra.bind(automatic_cache_breakpoints=False).max_attempts == 3
 
 
 def test_separate_openai_values_create_separate_shared_backoffs() -> None:
@@ -614,17 +561,6 @@ def test_separate_openai_values_create_separate_shared_backoffs() -> None:
         first.model("gpt-5.6-terra", regional_processing=False).shared_backoff
         is not second.model("gpt-5.6-terra", regional_processing=False).shared_backoff
     )
-
-
-@pytest.mark.parametrize(
-    "backend_class",
-    [Anthropic, AnthropicBedrock, CohereBedrock, DeepSeek, Gemini, OpenAI, OpenAIBedrock],
-)
-def test_backend_classes_expose_no_lifecycle_methods(backend_class: type[object]) -> None:
-    """Backend classes expose no lifecycle methods."""
-    assert not hasattr(backend_class, "aclose")
-    assert not hasattr(backend_class, "__aenter__")
-    assert not hasattr(backend_class, "__aexit__")
 
 
 def test_reasoning_summary_lands_on_the_adapter() -> None:

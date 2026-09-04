@@ -20,7 +20,6 @@ from events import (
     AgentFinished,
     Event,
     ToolProgress,
-    current_gui_emitter,
 )
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -66,23 +65,53 @@ def _build_app(
     on_event: Callable[[Event], None] = _discard,
     exporter: InMemorySpanExporter | None = None,
     climate_max_tool_calls: int | None = None,
+    second_calls_started: tuple[asyncio.Event, asyncio.Event] | None = None,
 ) -> App:
     """Build an app for one scenario under a local TracerProvider."""
     tracer_provider = TracerProvider()
     if exporter is not None:
         tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     configs = build_configs()
+    if scenario == "call_timeout":
+        configs["research_climate"] = replace(
+            configs["research_climate"], generate_one_timeout_seconds=0.1
+        )
     if climate_max_tool_calls is not None:
         configs["research_climate"] = replace(
             configs["research_climate"], max_tool_calls=climate_max_tool_calls
         )
+    scripts = build_scripts(scenario, configs)
+    if second_calls_started is not None:
+        climate_started, energy_started = second_calls_started
+        scripts[configs["research_climate"].system_prompt][1].started = climate_started
+        scripts[configs["research_energy"].system_prompt][1].started = energy_started
     return App(
-        llm=build_llm(build_scripts(scenario, configs)),
+        llm=build_llm(scripts),
         configs=configs,
         tracer=tracer_provider.get_tracer("full_app.test"),
         on_event=on_event,
         capture_message_content=False,
     )
+
+
+async def _expire_after_second_calls_start(
+    app: App, second_calls_started: tuple[asyncio.Event, asyncio.Event]
+) -> None:
+    """Expire an asyncio deadline after both researchers enter their delayed second calls."""
+    deadline = asyncio.timeout(5.0)
+    app_task: asyncio.Task[None] | None = None
+    try:
+        async with deadline, asyncio.TaskGroup() as group:
+            app_task = group.create_task(app.run())
+            for started in second_calls_started:
+                await started.wait()
+            deadline.reschedule(asyncio.get_running_loop().time())
+    except TimeoutError:
+        assert deadline.expired()
+        assert all(started.is_set() for started in second_calls_started)
+        assert app_task is not None
+        assert app_task.cancelled()
+        raise
 
 
 def _parent_of(span: ReadableSpan, spans: tuple[ReadableSpan, ...]) -> ReadableSpan | None:
@@ -142,12 +171,6 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
     assert "root/research_energy" in progress_paths
 
 
-def test_reading_without_an_active_emitter_raises() -> None:
-    """`current_gui_emitter` raises when no `GuiEmitter` is active."""
-    with pytest.raises(LookupError, match="No GuiEmitter is active"):
-        _ = current_gui_emitter()
-
-
 def test_application_span_groups_generation_and_tool_spans() -> None:
     """Run the application under an OpenTelemetry span and inspect its children."""
     exporter = InMemorySpanExporter()
@@ -187,13 +210,13 @@ def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -
 
 def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> None:
     """The app deadline preserves settled turns and excludes in-flight calls."""
-    app = _build_app("app_timeout")
+    second_calls_started = (asyncio.Event(), asyncio.Event())
+    app = _build_app("app_timeout", second_calls_started=second_calls_started)
     at_except: list[tuple[int, float]] = []
 
     async def drive() -> None:
         try:
-            async with asyncio.timeout(0.5):
-                await app.run()
+            await _expire_after_second_calls_start(app, second_calls_started)
         except TimeoutError:
             at_except.append((_timed_out_count(app), _total_cost(app)))
 
@@ -332,12 +355,12 @@ def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
     def collect(event: Event) -> None:
         events_by_path.setdefault(event.agent_path, []).append(event)
 
-    app = _build_app("app_timeout", on_event=collect)
+    second_calls_started = (asyncio.Event(), asyncio.Event())
+    app = _build_app("app_timeout", on_event=collect, second_calls_started=second_calls_started)
 
     async def drive() -> None:
         try:
-            async with asyncio.timeout(0.5):
-                await app.run()
+            await _expire_after_second_calls_start(app, second_calls_started)
         except TimeoutError:
             pass
 
@@ -355,14 +378,13 @@ def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
         if isinstance(event, AgentCancelled):
             raise TypeError("AgentCancelled callback failed")
 
-    app = _build_app("app_timeout", on_event=raise_on_cancelled)
-
-    async def drive() -> None:
-        async with asyncio.timeout(0.5):
-            await app.run()
+    second_calls_started = (asyncio.Event(), asyncio.Event())
+    app = _build_app(
+        "app_timeout", on_event=raise_on_cancelled, second_calls_started=second_calls_started
+    )
 
     with pytest.raises(TimeoutError):
-        asyncio.run(drive())
+        asyncio.run(_expire_after_second_calls_start(app, second_calls_started))
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:

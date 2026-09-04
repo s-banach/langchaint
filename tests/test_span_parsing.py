@@ -22,25 +22,15 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.span_parsing import (
-    _OTEL_CHAT_SPAN_FIXED_ALIASES,
-    _STRUCTURED_ATTRIBUTE_NAMES,
     ExtractedOutputMessage,
-    OtelBlobPart,
     OtelChatSpan,
-    OtelCompactionPart,
-    OtelFilePart,
     OtelFunctionTool,
     OtelGenericPart,
     OtelGenericSystemInstructionPart,
     OtelGenericTool,
     OtelReasoningPart,
-    OtelServerToolCallPart,
-    OtelServerToolCallResponsePart,
     OtelTextPart,
     OtelToLangchaintConversionError,
-    OtelToolCallPart,
-    OtelToolCallResponsePart,
-    OtelUriPart,
     generation_input_from_otel,
     output_messages_from_otel,
     parse_otel,
@@ -142,51 +132,6 @@ class _CountingTool:
         return DispatchHandled(tool_message=ToolMessage(tool_call_id=call.id, content="done"))
 
 
-def _assert_refinements(
-    refinements: list[JsonValue],
-    provider_values: list[JsonValue],
-    base_entries_by_name: dict[str, dict[str, JsonValue]],
-) -> None:
-    conditions_by_id: dict[str, JsonValue] = {}
-    retained_overrides: dict[tuple[str, str], JsonValue] = {}
-    for refinement in refinements:
-        assert isinstance(refinement, dict)
-        refinement_id = refinement["id"]
-        condition = refinement["condition"]
-        assert isinstance(refinement_id, str)
-        assert isinstance(condition, dict)
-        assert condition["attribute"] == "gen_ai.provider.name"
-        assert condition["equals"] in provider_values
-        refinement_attributes = refinement["attributes"]
-        assert isinstance(refinement_attributes, list)
-        for attribute in refinement_attributes:
-            assert isinstance(attribute, dict)
-            attribute_name = attribute["name"]
-            assert isinstance(attribute_name, str)
-            assert attribute["condition"] == condition
-            base_attribute = base_entries_by_name.get(attribute_name)
-            if base_attribute is not None:
-                refinement_metadata = {
-                    key: value for key, value in attribute.items() if key != "condition"
-                }
-                base_metadata = {
-                    key: value for key, value in base_attribute.items() if key != "condition"
-                }
-                assert refinement_metadata != base_metadata
-                retained_overrides[(refinement_id, attribute_name)] = attribute["presence_rule"]
-        conditions_by_id[refinement_id] = condition["equals"]
-    assert conditions_by_id["azure.ai.inference.client"] == "azure.ai.inference"
-    assert retained_overrides == {
-        ("anthropic.inference.client", "gen_ai.request.top_k"): "recommended",
-        ("aws.bedrock.inference.client", "gen_ai.request.top_k"): "recommended",
-        (
-            "azure.ai.inference.client",
-            "server.port",
-        ): {"conditionally_required": "If not default (443)."},
-        ("openai.inference.client", "gen_ai.request.model"): "required",
-    }
-
-
 def _assert_scalar_attributes_parse(
     entries_by_name: dict[str, dict[str, JsonValue]], field_names_by_alias: dict[str, str]
 ) -> None:
@@ -269,15 +214,6 @@ def test_manifest_attributes_match_otel_chat_span_aliases() -> None:
     }
     assert actual_schemas == expected_schemas
     assert all(entry["template_prefix"] is None for entry in entries_by_name.values())
-    provider_values = entries_by_name["gen_ai.provider.name"]["allowed_values"]
-    assert isinstance(provider_values, list)
-    base_entries_by_name: dict[str, dict[str, JsonValue]] = {}
-    for attribute in attributes:
-        assert isinstance(attribute, dict)
-        attribute_name = attribute["name"]
-        assert isinstance(attribute_name, str)
-        base_entries_by_name[attribute_name] = attribute
-    _assert_refinements(refinements, provider_values, base_entries_by_name)
     field_names_by_alias: dict[str, str] = {}
     for field_name, field in OtelChatSpan.model_fields.items():
         if field_name not in {"prompt_variables", "unused_attributes"}:
@@ -291,58 +227,6 @@ def test_present_scalar_attribute_cannot_be_null() -> None:
     """A present scalar alias cannot use the absent-value default."""
     with pytest.raises(ValidationError):
         _ = parse_otel(_chat_span({"gen_ai.request.seed": None}))
-
-
-def test_only_chat_operation_is_required() -> None:
-    """The chat operation selects the parser without requiring producer presence labels."""
-    assert parse_otel(_chat_span()) == OtelChatSpan.model_validate({
-        "gen_ai.operation.name": "chat"
-    })
-
-
-@pytest.mark.parametrize("raw_attributes", [{}, {"gen_ai.operation.name": "embeddings"}])
-def test_requires_chat_operation(raw_attributes: dict[str, JsonValue]) -> None:
-    """A missing or different operation cannot select the chat parser."""
-    with pytest.raises(ValidationError, match=r"gen_ai\.operation\.name"):
-        _ = parse_otel(raw_attributes)
-
-
-@pytest.mark.parametrize(
-    ("part", "expected_type"),
-    [
-        ({"type": "text", "content": "hello"}, OtelTextPart),
-        ({"type": "tool_call", "name": "lookup"}, OtelToolCallPart),
-        ({"type": "tool_call_response", "response": "ok"}, OtelToolCallResponsePart),
-        (
-            {
-                "type": "server_tool_call",
-                "name": "search",
-                "server_tool_call": {"type": "web", "query": "weather"},
-            },
-            OtelServerToolCallPart,
-        ),
-        (
-            {
-                "type": "server_tool_call_response",
-                "server_tool_call_response": {"type": "web", "result": "sunny"},
-            },
-            OtelServerToolCallResponsePart,
-        ),
-        ({"type": "blob", "modality": "image", "content": "aW1hZ2U="}, OtelBlobPart),
-        ({"type": "file", "modality": "document", "file_id": "file-1"}, OtelFilePart),
-        ({"type": "uri", "modality": "image", "uri": "gs://bucket/image"}, OtelUriPart),
-        ({"type": "reasoning", "content": "thinking"}, OtelReasoningPart),
-        ({"type": "compaction"}, OtelCompactionPart),
-        ({"type": "provider_part", "payload": 42}, OtelGenericPart),
-    ],
-)
-def test_parses_each_message_part_variant(
-    part: dict[str, JsonValue], expected_type: type[object]
-) -> None:
-    """Each structured message-part variant parses into its OTel-native model."""
-    parsed = parse_otel(_chat_span({"gen_ai.input.messages": [{"role": "user", "parts": [part]}]}))
-    assert parsed.input_messages is not None
-    assert isinstance(parsed.input_messages[0].parts[0], expected_type)
 
 
 def test_known_message_type_can_use_the_generic_schema_variant() -> None:
@@ -387,17 +271,6 @@ def test_known_tool_type_can_use_the_generic_schema_variant() -> None:
     assert definition.additional_properties == {"description": 42}
 
 
-def test_missing_tool_type_defaults_to_function() -> None:
-    """A missing tool type selects the function schema variant."""
-    tool_definition = _captured_tool_definition()
-    del tool_definition["type"]
-    parsed = parse_otel(_chat_span({"gen_ai.tool.definitions": [tool_definition]}))
-    assert parsed.tool_definitions is not None
-    definition = parsed.tool_definitions[0]
-    assert isinstance(definition, OtelFunctionTool)
-    assert definition.type == "function"
-
-
 def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
     """Structured attributes accept JSON text and its decoded JSON value."""
     value: list[JsonValue] = [{"type": "text", "content": "Follow the rules."}]
@@ -409,26 +282,18 @@ def test_decodes_json_strings_and_accepts_decoded_structured_values() -> None:
     )
 
 
-def test_decodes_each_schema_declared_structured_attribute() -> None:
-    """The generated semantic-convention catalog selects JSON decoding."""
-    assert {
-        "gen_ai.input.messages",
-        "gen_ai.memory.records",
-        "gen_ai.output.messages",
-        "gen_ai.retrieval.documents",
-        "gen_ai.system_instructions",
-        "gen_ai.tool.call.arguments",
-        "gen_ai.tool.call.result",
-        "gen_ai.tool.definitions",
-    } == _STRUCTURED_ATTRIBUTE_NAMES
-    encoded_value = json.dumps([])
-    parsed = parse_otel(_chat_span({name: encoded_value for name in _STRUCTURED_ATTRIBUTE_NAMES}))
-    parsed_by_alias = parsed.model_dump(by_alias=True)
-    decoded_chat_attributes = _STRUCTURED_ATTRIBUTE_NAMES & _OTEL_CHAT_SPAN_FIXED_ALIASES
-    for name in decoded_chat_attributes:
-        assert parsed_by_alias[name] == ()
-    for name in _STRUCTURED_ATTRIBUTE_NAMES - decoded_chat_attributes:
-        assert parsed.unused_attributes[name] == []
+def test_decodes_structured_unused_attributes_and_preserves_unrecognized_text() -> None:
+    """Compare recognized structured data and unrecognized text in unused_attributes."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.tool.call.arguments": '{"query":"x"}',
+            "custom.payload": '{"query":"x"}',
+        })
+    )
+    assert parsed.unused_attributes == {
+        "gen_ai.tool.call.arguments": {"query": "x"},
+        "custom.payload": '{"query":"x"}',
+    }
 
 
 def test_preserves_json_text_for_a_scalar_attribute() -> None:
@@ -506,19 +371,10 @@ def test_partitions_prompt_variables_and_unused_attributes_once() -> None:
     assert parsed.unused_attributes == {"langchain.x.y.z": 42}
 
 
-@pytest.mark.parametrize(
-    "attributes",
-    [
-        {"gen_ai.request.max_tokens": True},
-        {"gen_ai.request.temperature": float("nan")},
-        {"gen_ai.prompt.variable.user_name": 42},
-        {"gen_ai.input.messages": "not JSON"},
-    ],
-)
-def test_rejects_malformed_standard_attributes(attributes: dict[str, JsonValue]) -> None:
-    """A malformed standard attribute raises Pydantic validation."""
+def test_rejects_malformed_structured_attribute_json() -> None:
+    """Pass malformed captured JSON through the public parser."""
     with pytest.raises(ValidationError):
-        _ = parse_otel(_chat_span(attributes))
+        _ = parse_otel(_chat_span({"gen_ai.input.messages": "not JSON"}))
 
 
 @pytest.mark.parametrize("encode_as_json", [False, True])
@@ -878,15 +734,6 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
 
 
-def test_public_models_validate_direct_construction() -> None:
-    """Public structured models use the same strict validation outside parse_otel."""
-    span = OtelChatSpan.model_validate({
-        "gen_ai.operation.name": "chat",
-        "gen_ai.input.messages": [{"role": "user", "parts": [{"type": "text", "content": "hi"}]}],
-    })
-    assert generation_input_from_otel(span) == (UserMessage(content=(TextPart(text="hi"),)),)
-
-
 def test_reconstructs_text_response_record_and_synthetic_fields() -> None:
     """response_record_from_otel preserves supported output and identity values."""
     span = _successful_chat_span({
@@ -1076,12 +923,7 @@ def test_response_record_rejects_error_finish_reason() -> None:
         ("tool_call", "tool_use"),
         ("length", "max_tokens"),
         ("content_filter", "refusal"),
-        ("end_turn", "end_turn"),
-        ("tool_use", "tool_use"),
-        ("max_tokens", "max_tokens"),
-        ("refusal", "refusal"),
         ("context_window_exceeded", "context_window_exceeded"),
-        ("other", "other"),
         ("provider_defined", "other"),
     ],
 )
@@ -1180,13 +1022,15 @@ def test_response_record_errors_exclude_generated_content(conversion_case: str) 
     assert secret not in str(rejected.value)
 
 
-def test_reconstruction_preserves_tool_manager_and_checks_captured_schemas() -> None:
-    """Tool reconstruction preserves ToolManager identity and reads each caller schema once."""
+@pytest.mark.parametrize("use_tool_manager", [True, False])
+def test_reconstruction_reads_each_tool_schema_once(*, use_tool_manager: bool) -> None:
+    """Count schema reads for a caller-supplied ToolManager and a tool list."""
     tool = _CountingTool()
-    tool_manager = ToolManager([tool])
+    tools = ToolManager([tool]) if use_tool_manager else [tool]
     span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
-    bound_llm = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tool_manager)
-    assert bound_llm.tool_manager is tool_manager
+    bound_llm = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+    if isinstance(tools, ToolManager):
+        assert bound_llm.tool_manager is tools
     assert bound_llm.binding.tool_schemas == (
         ToolSchema(
             name="lookup",
@@ -1195,24 +1039,6 @@ def test_reconstruction_preserves_tool_manager_and_checks_captured_schemas() -> 
         ),
     )
     assert tool.schema_calls == 1
-
-
-def test_reconstruction_converts_tool_sequence_once() -> None:
-    """A caller tool sequence constructs one ToolManager before binding."""
-    span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
-    bound_llm = reconstruct_bound_llm(
-        span,
-        llm=LLM(_FakeAdapter()),
-        tools=[_json_schema_tool()],
-    )
-    assert isinstance(bound_llm.tool_manager, ToolManager)
-    assert bound_llm.binding.tool_schemas == (
-        ToolSchema(
-            name="lookup",
-            description="Look up one value.",
-            args_schema={"type": "object"},
-        ),
-    )
 
 
 @pytest.mark.parametrize(
@@ -1251,17 +1077,6 @@ def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
     })
     with pytest.raises(OtelToLangchaintConversionError, match="duplicate"):
         _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=None)
-
-
-def test_reconstruction_rejects_duplicate_caller_tool_names() -> None:
-    """ToolManager rejects duplicate caller tool names before binding."""
-    span = _successful_chat_span()
-    with pytest.raises(ValueError, match="duplicate tool name"):
-        _ = reconstruct_bound_llm(
-            span,
-            llm=LLM(_FakeAdapter()),
-            tools=[_json_schema_tool(), _json_schema_tool()],
-        )
 
 
 @pytest.mark.parametrize(

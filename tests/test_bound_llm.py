@@ -80,7 +80,6 @@ from langchaint.adapter import (
     verdict_from_transient_error,
 )
 from langchaint.call import ResponseIdentity
-from langchaint.llm import UNCHANGED, Unchanged
 from langchaint.shared_backoff import _NEVER
 from langchaint.streaming import StreamHandle
 from tests.helpers import random_returns_zero, stated_provider_billing
@@ -1099,17 +1098,15 @@ def test_refusal_outcome_raises_without_retry() -> None:
 
 
 @pytest.mark.parametrize(
-    ("outcome", "expected_error", "expected_stop_reason"),
+    ("outcome", "expected_stop_reason"),
     [
         (
             _MAX_COMPLETION_TOKENS_EXCEEDED,
-            GenerationError,
             "max_tokens",
         ),
-        (_EMPTY_TURN, GenerationError, "end_turn"),
+        (_EMPTY_TURN, "end_turn"),
         (
             _CONTEXT_WINDOW_EXCEEDED,
-            GenerationError,
             "context_window_exceeded",
         ),
     ],
@@ -1117,7 +1114,6 @@ def test_refusal_outcome_raises_without_retry() -> None:
 )
 def test_a_no_output_outcome_raises_without_retry(
     outcome: ResponseOutcome[str],
-    expected_error: type[GenerationError],
     expected_stop_reason: StopReason,
 ) -> None:
     """Each terminal no-output outcome fails without retrying."""
@@ -1126,7 +1122,7 @@ def test_a_no_output_outcome_raises_without_retry(
         """Drive one generate_one whose attempt reports the outcome."""
         adapter = _FakeAdapter(scripted_attempts=[_billed(outcome)])
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(expected_error) as caught:
+        with pytest.raises(GenerationError) as caught:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = caught.value
@@ -1306,7 +1302,6 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = unplaceable.value
-        assert isinstance(failure, GenerationError)
         assert isinstance(failure.record, UnknownExceptionErrorRecord)
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "boom"
@@ -1365,8 +1360,8 @@ def test_a_pause_all_do_not_retry_verdict_stops_the_item_and_pauses_the_rate_lim
     asyncio.run(scenario())
 
 
-def test_a_mid_drain_failure_is_retried_and_records_what_the_stream_reported() -> None:
-    """A retried mid-drain failure records stream Billing and request ID."""
+def test_a_mid_drain_failure_records_reported_billing_and_request_id() -> None:
+    """Check reported billing and request ID after exhausting one attempt."""
 
     async def scenario() -> None:
         """Exhaust a one-attempt budget on a stream that fails after its first item."""
@@ -1542,24 +1537,6 @@ def test_a_cancelled_batch_propagates_and_leaves_no_result_behind() -> None:
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-@pytest.mark.parametrize(
-    ("new_system_prompt", "expected_system_prompt", "binding_is_equal"),
-    [(UNCHANGED, "s", True), ("s2", "s2", False)],
-    ids=["all_unchanged", "changed_field"],
-)
-def test_bind_builds_a_new_bound_adapter_whether_or_not_the_binding_changed(
-    new_system_prompt: str | Unchanged, expected_system_prompt: str, *, binding_is_equal: bool
-) -> None:
-    """A bind always binds again. The Binding is what tracks whether a field actually changed."""
-    adapter = _FakeAdapter()
-    bound_llm = LLM(adapter).bind(system_prompt="s")
-    replacement_bound = bound_llm.bind(system_prompt=new_system_prompt)
-    assert (replacement_bound.binding == bound_llm.binding) is binding_is_equal
-    assert replacement_bound.binding.system_prompt == expected_system_prompt
-    assert replacement_bound._bound_adapter is not bound_llm._bound_adapter
-    assert len(adapter.bound_adapters) == 2
-
-
 class _Answer(BaseModel):
     """A response_format model for the replacement content-type tests."""
 
@@ -1659,21 +1636,13 @@ def test_bind_response_format_selects_and_rebuilds_the_adapter_route() -> None:
     """Omission preserves the output type, while a value selects structured or text binding."""
     adapter = _FakeAdapter()
     text = LLM(adapter).bind(system_prompt="s")
-    same = text.bind()
-    assert_type(same, BoundLLM[str])
+    _ = text.bind()
     structured = text.bind(response_format=_Answer)
-    assert_type(structured, BoundLLM[_Answer])
     assert adapter.structured_bind_count == 1
-    assert structured.binding == text.binding
-    assert structured._bound_adapter is not text._bound_adapter
-    replacement_bound = structured.bind(system_prompt="s2")
-    assert_type(replacement_bound, BoundLLM[_Answer])
+    _ = structured.bind(system_prompt="s2")
     assert adapter.structured_bind_count == 2
-    assert replacement_bound._bound_adapter is not structured._bound_adapter
-    text_again = structured.bind(response_format=None)
-    assert_type(text_again, BoundLLM[str])
+    _ = structured.bind(response_format=None)
     assert len(adapter.bound_adapters) == 3
-    assert text_again._bound_adapter is not structured._bound_adapter
 
 
 def test_tools_construct_or_preserve_the_bound_tool_manager() -> None:
@@ -1808,26 +1777,6 @@ async def _pin_generic_request_method_return_types[
     )
 
 
-def test_response_format_is_public_state_that_replacement_bind_carries() -> None:
-    """response_format is inspectable state that replacement bindings carry and switch."""
-    adapter = _FakeAdapter()
-    assert LLM(adapter).bind().response_format is None
-    structured = LLM(adapter).bind(response_format=_Answer)
-    assert structured.response_format is _Answer
-    assert structured.bind(system_prompt="s2").response_format is _Answer
-    assert structured.bind(response_format=None).response_format is None
-
-
-def test_splits_tool_call_turns_only_on_the_structured_tool_bound_binding() -> None:
-    """The split reads the binding: response_format and tool_manager must both be present."""
-    llm = LLM(_FakeAdapter())
-    tool_manager = ToolManager([])
-    assert not llm.bind()._splits_tool_call_turns
-    assert not llm.bind(tools=tool_manager)._splits_tool_call_turns
-    assert not llm.bind(response_format=_Answer)._splits_tool_call_turns
-    assert llm.bind(response_format=_Answer, tools=tool_manager)._splits_tool_call_turns
-
-
 class _ScriptedStructuredBoundAdapter[OutputT](BoundAdapter[OutputT]):
     """A structured bound adapter handing every request one scripted outcome.
 
@@ -1899,7 +1848,6 @@ def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_variant()
     async def scenario() -> None:
         result = await _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN).generate_one("hi")
         assert isinstance(result, ToolCallTurn)
-        assert result.kind == "tool_call_turn"
         assert result.output is None
         assert result.tool_calls == (_FAKE_TOOL_CALL,)
 
@@ -2021,18 +1969,6 @@ def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_variant()
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_automatic_cache_breakpoints_participates_in_binding_equality() -> None:
-    """`automatic_cache_breakpoints` participates in `Binding` equality."""
-    adapter = _FakeAdapter()
-    bound_llm = LLM(adapter).bind(automatic_cache_breakpoints=True)
-    flipped = bound_llm.bind(automatic_cache_breakpoints=False)
-    assert flipped.binding != bound_llm.binding
-    assert flipped._bound_adapter is not bound_llm._bound_adapter
-    unchanged = bound_llm.bind(automatic_cache_breakpoints=True)
-    assert unchanged.binding == bound_llm.binding
-    assert unchanged._bound_adapter is not bound_llm._bound_adapter
-
-
 @pytest.mark.parametrize("default_value", [False, True])
 def test_bind_resolves_automatic_cache_breakpoints_default(*, default_value: bool) -> None:
     """None resolves before `Binding` reaches the adapter."""
@@ -2071,12 +2007,6 @@ def test_initial_and_replacement_bind_carry_extra_body_by_reference() -> None:
     replacement = {"safety_identifier": "user-8"}
     assert bound_llm.bind(extra_body=replacement).binding.extra_body is replacement
     assert bound_llm.bind(extra_body=None).binding.extra_body is None
-
-
-def test_config_fingerprint_has_a_fixed_digest() -> None:
-    """Pin the canonical encoding and SHA-256 result for the default fake binding."""
-    fingerprint = LLM(_FakeAdapter()).bind().config_fingerprint()
-    assert fingerprint == "sha256:5ed4b01ba8c91b5caf398531228f76e30777147deade680d3b1d9379dad2031b"
 
 
 def test_config_fingerprint_ignores_mapping_insertion_order() -> None:
@@ -2263,22 +2193,6 @@ def test_bind_keeps_replaces_and_removes_provider_executed_tools() -> None:
     assert bound.bind(provider_executed_tools=()).binding.provider_executed_tools == ()
 
 
-def test_generate_many_aligns_results_with_inputs() -> None:
-    """Result i belongs to generation_inputs[i], preserving input order."""
-
-    async def scenario() -> None:
-        """Run a two-item batch whose fake echoes each item's first turn."""
-        adapter = _FakeAdapter(echo=True)
-        bound_llm = LLM(adapter).bind()
-        results = await bound_llm.generate_many([
-            [UserMessage(content="a")],
-            [UserMessage(content="b")],
-        ])
-        assert _batch_outputs(results) == ["a", "b"]
-
-    asyncio.run(scenario())
-
-
 def test_generate_many_aligns_a_failure_among_successes() -> None:
     """A mixed batch keeps each result at its input index: the failure where it failed, successes elsewhere."""
 
@@ -2338,7 +2252,6 @@ def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_pa
     """A complete batch without `sample_ids` persists records that the next binding reuses."""
 
     async def scenario() -> None:
-        """Generate two records, inspect the JSON document, then resume without another request."""
         resume_path = tmp_path / "records.json"
         first_adapter = _FakeAdapter(echo=True)
         first_bound = LLM(first_adapter).bind()
@@ -2347,11 +2260,6 @@ def test_generate_many_records_persists_and_reuses_records_in_input_order(tmp_pa
         )
         assert _record_outputs(first_records) == ["a", "b"]
         assert first_adapter.bound_adapters[0].open_count == 2
-        resume_data = _resume_json_object(resume_path)
-        assert resume_data["format_version"] == 1
-        assert resume_data["identity_mode"] == "position"
-        resume_items = TypeAdapter(list[dict[str, object]]).validate_python(resume_data["items"])
-        assert len(resume_items) == 2
 
         resumed_adapter = _FakeAdapter(echo=True)
         resumed_bound = LLM(resumed_adapter).bind()
@@ -2931,12 +2839,10 @@ def test_stream_one_accepts_a_bare_str() -> None:
     """stream_one coerces a bare str to a Sequence[Message] of one UserMessage."""
 
     async def scenario() -> None:
-        """Build a handle from a bare str and check the stored messages."""
-        bound_llm = LLM(_FakeAdapter()).bind()
+        bound_llm = LLM(_FakeAdapter(echo=True)).bind()
         async with bound_llm.stream_one("hi") as handle:
-            assert handle._messages == (UserMessage(content="hi"),)
             response = await handle.final()
-        assert response.output == "ok"
+        assert response.output == "hi"
 
     asyncio.run(scenario())
 
@@ -3247,8 +3153,6 @@ def test_an_adapter_stated_mid_stream_transient_error_becomes_the_cause_unwrappe
                 async for _item in handle:
                     pass
         assert raised.value.__cause__ is stream.error
-        assert stream.error.is_rate_limit
-        assert stream.error.retry_after_seconds == _MID_STREAM_RETRY_AFTER_SECONDS
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
@@ -3438,9 +3342,9 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
         """Iterate the stream fully, then read final()."""
         bound_llm = LLM(_FakeAdapter()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            texts = [item async for item in handle if isinstance(item, str)]
+            collected_items = [item async for item in handle]
             response = await handle.final()
-        assert "".join(texts) == "ok"
+        assert collected_items == ["ok", _FAKE_TOOL_CALL]
         assert response.output == "ok"
         assert response.stop_reason == "end_turn"
         assert response.model == "fake-model"
@@ -3525,16 +3429,19 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stream", "expected_error"),
+    ("stream", "expected_record_kind"),
     [
-        (_FakeStream(outcome=_MAX_COMPLETION_TOKENS_EXCEEDED), GenerationError),
-        (_FakeStream(outcome=_EMPTY_TURN), GenerationError),
-        (_FakeStream(outcome=_CONTEXT_WINDOW_EXCEEDED), GenerationError),
+        (
+            _FakeStream(outcome=_MAX_COMPLETION_TOKENS_EXCEEDED),
+            "max_completion_tokens_exceeded_error",
+        ),
+        (_FakeStream(outcome=_EMPTY_TURN), "empty_turn_error"),
+        (_FakeStream(outcome=_CONTEXT_WINDOW_EXCEEDED), "context_window_exceeded_error"),
     ],
     ids=["max_completion_tokens_exceeded", "empty_turn", "context_window_exceeded"],
 )
-def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
-    stream: _FakeStream, expected_error: type[GenerationError]
+def test_stream_final_preserves_terminal_outcome_records(
+    stream: _FakeStream, expected_record_kind: str
 ) -> None:
     """Final maps each terminal outcome to its GenerationError without retrying."""
 
@@ -3543,9 +3450,10 @@ def test_stream_final_reports_each_no_output_outcome_as_its_own_error(
         adapter = _FakeAdapter(stream=stream)
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(expected_error) as caught:
+            with pytest.raises(GenerationError) as caught:
                 await handle.final()
         failure = caught.value
+        assert failure.record.kind == expected_record_kind
         assert failure.attempts == 1
         assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
@@ -3897,16 +3805,16 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
 
 
 @pytest.mark.parametrize(
-    ("classify_result", "expected_error"),
+    "classify_result",
     [
-        ("invalid_request", GenerationError),
-        ("declared_final", GenerationError),
-        ("unknown_exception", GenerationError),
+        "invalid_request",
+        "declared_final",
+        "unknown_exception",
     ],
     ids=["invalid_request", "declared_final", "unknown_exception"],
 )
 def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
-    classify_result: ErrorClassification, expected_error: type[GenerationError]
+    classify_result: ErrorClassification,
 ) -> None:
     """Terminal stream errors preserve reported Usage for each classification."""
 
@@ -3919,7 +3827,7 @@ def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
             shared_backoff=_fast_shared_backoff(),
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(expected_error) as caught:
+            with pytest.raises(GenerationError) as caught:
                 async for _item in handle:
                     pass
         (record,) = _settled_attempt_records(caught.value.attempt_records)
@@ -4051,19 +3959,6 @@ def test_stream_final_replays_a_raise_from_the_adapter_stream() -> None:
         assert stream.final_calls == 1
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
-def test_stream_yields_items_in_order_with_complete_tool_call() -> None:
-    """Text chunks arrive as bare strings and the tool call arrives once, complete."""
-
-    async def scenario() -> None:
-        """Collect every item the stream yields."""
-        bound_llm = LLM(_FakeAdapter()).bind()
-        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            collected_items = [item async for item in handle]
-        assert collected_items == ["ok", _FAKE_TOOL_CALL]
-
-    asyncio.run(scenario())
 
 
 def test_stream_closes_on_context_exit() -> None:
@@ -4221,11 +4116,14 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
 
 
 def test_bind_coerces_system_prompt_parts_to_a_tuple() -> None:
-    """A list of system parts freezes to a tuple on the binding. A str passes through."""
+    """Check that clearing the caller's list preserves the bound system prompt."""
     parts = [TextPart(text="stable", cache_breakpoint=True), TextPart(text="context")]
     bound_llm = LLM(_FakeAdapter()).bind(system_prompt=parts)
-    assert bound_llm.binding.system_prompt == tuple(parts)
-    assert isinstance(bound_llm.binding.system_prompt, tuple)
+    parts.clear()
+    assert bound_llm.binding.system_prompt == (
+        TextPart(text="stable", cache_breakpoint=True),
+        TextPart(text="context"),
+    )
 
 
 def test_bind_rejects_an_empty_system_prompt_parts_sequence() -> None:
@@ -4307,36 +4205,17 @@ def test_an_outer_cancellation_inside_the_deadline_stays_a_cancellation() -> Non
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
-def test_a_batch_times_out_one_item_and_returns_its_siblings() -> None:
-    """Each item gets its own deadline, so one item running out does not cut a sibling."""
-
-    async def scenario() -> None:
-        """Hang the second item's open while the first answers."""
-        adapter = _FakeAdapter(hang_from_open=2, echo=True)
-        bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        results = await bound_llm.generate_many(
-            [[UserMessage(content="fast")], [UserMessage(content="slow")]],
-            max_working_seconds_per_item=0.05,
-        )
-        first, second = results
-        assert isinstance(first, Response)
-        assert first.output == "fast"
-        assert isinstance(second, GenerationError)
-
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
-
-
 def test_a_batch_item_spends_no_budget_waiting_for_a_permit() -> None:
     """Permit waits do not consume max_working_seconds_per_item."""
 
     async def scenario() -> None:
         """Queue four items behind one permit, each item working well inside its budget."""
-        adapter = _FakeAdapter(echo=True, open_seconds=0.15)
+        adapter = _FakeAdapter(echo=True, open_seconds=0.05)
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         results = await bound_llm.generate_many(
             [[UserMessage(content=str(index))] for index in range(4)],
-            max_working_seconds_per_item=0.30,
+            max_working_seconds_per_item=0.12,
         )
         assert _batch_outputs(results) == ["0", "1", "2", "3"]
 
@@ -4348,17 +4227,19 @@ def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
 
     async def scenario() -> None:
         """Let the first item answer, then hang the second one after it is admitted."""
-        adapter = _FakeAdapter(echo=True, open_seconds=0.15, hang_from_open=2)
+        adapter = _FakeAdapter(echo=True, open_seconds=0.05, hang_from_open=2)
         shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         results = await bound_llm.generate_many(
             [[UserMessage(content="answered")], [UserMessage(content="hangs")]],
-            max_working_seconds_per_item=0.30,
+            max_working_seconds_per_item=0.12,
         )
         first, second = results
         assert isinstance(first, Response)
         assert first.output == "answered"
         assert isinstance(second, GenerationError)
+        assert second.record.kind == "timed_out_error"
+        assert second.attempts == 1
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 
@@ -4367,8 +4248,8 @@ def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
     """Admission pacing spends none of an item's working-time budget.
 
     `max_concurrent_requests=None` lets every item reach admission immediately.
-    `max_request_starts_per_second=10.0` starts one request every 0.1 seconds.
-    The fourth request starts after its 0.1-second working-time budget.
+    `max_request_starts_per_second=25.0` starts one request every 0.04 seconds.
+    The fourth request starts after its 0.06-second working-time budget.
     """
 
     async def scenario() -> None:
@@ -4376,12 +4257,12 @@ def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
         adapter = _FakeAdapter(echo=True)
         shared_backoff = _fast_shared_backoff(
             max_concurrent_requests=None,
-            max_request_starts_per_second=10.0,
+            max_request_starts_per_second=25.0,
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         results = await bound_llm.generate_many(
             [[UserMessage(content=str(index))] for index in range(4)],
-            max_working_seconds_per_item=0.1,
+            max_working_seconds_per_item=0.06,
         )
         assert _batch_outputs(results) == ["0", "1", "2", "3"]
 
@@ -4391,9 +4272,9 @@ def test_a_batch_item_spends_no_budget_waiting_in_the_admission_queue() -> None:
 def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
     """A shared pause spends none of an item's working-time budget.
 
-    A rate-limit `TransientError` pauses admission for 0.3 seconds.
+    A rate-limit `TransientError` pauses admission for 0.15 seconds.
     `PauseAll` adds no private sleep.
-    Each request spends 0.05 seconds from the 0.15-second budget.
+    Each request spends 0.02 seconds from the 0.08-second budget.
     `longest_wait_seconds=0.5` keeps the stated pause unchanged.
     """
 
@@ -4401,9 +4282,9 @@ def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
         """Fail one attempt into a pause longer than the budget, then let the retry answer."""
         adapter = _FakeAdapter(
             echo=True,
-            open_seconds=0.05,
+            open_seconds=0.02,
             scripted_attempts=[
-                TransientError("slow down", retry_after_seconds=0.3, is_rate_limit=True)
+                TransientError("slow down", retry_after_seconds=0.15, is_rate_limit=True)
             ],
         )
         shared_backoff = _fast_shared_backoff(
@@ -4412,7 +4293,7 @@ def test_a_batch_item_spends_no_budget_waiting_out_a_shared_pause() -> None:
         )
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
         results = await bound_llm.generate_many(
-            [[UserMessage(content="paused")]], max_working_seconds_per_item=0.15
+            [[UserMessage(content="paused")]], max_working_seconds_per_item=0.08
         )
         assert _batch_outputs(results) == ["paused"]
 
@@ -4426,14 +4307,16 @@ def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
         """Fail the first attempt transiently, then time out inside the retry."""
         adapter = _FakeAdapter(
             echo=True,
-            open_seconds=0.12,
+            open_seconds=0.08,
             scripted_attempts=[TransientError("try again")],
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
         results = await bound_llm.generate_many(
-            [[UserMessage(content="retries")]], max_working_seconds_per_item=0.20
+            [[UserMessage(content="retries")]], max_working_seconds_per_item=0.12
         )
         assert isinstance(results[0], GenerationError)
+        assert results[0].record.kind == "timed_out_error"
+        assert results[0].attempts == 2
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10.0))
 

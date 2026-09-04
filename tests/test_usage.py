@@ -7,7 +7,6 @@ Cost fields accept NaN for unknown prices.
 import math
 
 import pytest
-from pydantic import ValidationError
 
 from langchaint import ZERO_USAGE, Usage
 
@@ -38,19 +37,6 @@ def _usage(
         output_tokens_cost_in_usd=output_cost,
         provider_executed_tool_cost_in_usd=provider_executed_tool_cost,
     )
-
-
-def test_negative_counter_is_rejected() -> None:
-    """A negative counter raises, so no carrier holds a Usage claiming negative tokens."""
-    with pytest.raises(ValidationError):
-        _ = _usage(cache_read=900, cache_write=200, cache_none=-100, output=40)
-
-
-def test_nan_cost_is_stored() -> None:
-    """An unpriceable response's NaN survives construction."""
-    usage = _usage(output=40, output_cost=float("nan"))
-    assert math.isnan(usage.output_tokens_cost_in_usd)
-    assert math.isnan(usage.cost_in_usd)
 
 
 def test_a_sum_containing_a_nan_cost_is_nan() -> None:

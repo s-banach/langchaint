@@ -4,7 +4,6 @@ Tests cover Usage, assistant messages, stop reasons, streams, errors, and reques
 """
 
 import asyncio
-import base64
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -76,7 +75,6 @@ from langchaint.openai.chat_completions_adapter import (
     _ChatCompletionsStream,
     _finished_turn_or_unfinished,
     _FinishedTurn,
-    _normalized_stop_reason,
     _wire_messages,
     _wire_tool_choice,
     cache_read_tokens_from_usage_openai,
@@ -356,14 +354,15 @@ def _finished(completion: ChatCompletion) -> _FinishedTurn:
 
 
 @pytest.mark.parametrize(
-    ("build_completion", "expected"),
+    ("build_completion", "expected", "expected_output"),
     [
-        (lambda: _completion(usage=None), "end_turn"),
+        (lambda: _completion(usage=None), "end_turn", "hey"),
         (
             lambda: _completion(
                 usage=None, message={"content": "on it", "tool_calls": [_TOOL_CALL_WIRE]}
             ),
             "tool_use",
+            "on it",
         ),
         (
             lambda: _completion(
@@ -372,15 +371,17 @@ def _finished(completion: ChatCompletion) -> _FinishedTurn:
                 finish_reason="tool_calls",
             ),
             "tool_use",
+            "",
         ),
-        (lambda: _completion(usage=None, finish_reason="length"), "max_tokens"),
-        (lambda: _completion(usage=None, finish_reason="content_filter"), "refusal"),
+        (lambda: _completion(usage=None, finish_reason="length"), "max_tokens", "hey"),
+        (lambda: _completion(usage=None, finish_reason="content_filter"), "refusal", "hey"),
         (
             lambda: _completion(usage=None, message={"refusal": "I can't help with that"}),
             "refusal",
+            "I can't help with that",
         ),
-        (lambda: _completion(usage=None, finish_reason="function_call"), "other"),
-        (lambda: _lenient_completion("weird"), "other"),
+        (lambda: _completion(usage=None, finish_reason="function_call"), "other", "hey"),
+        (lambda: _lenient_completion("weird"), "other", "hey"),
     ],
     ids=[
         "stop",
@@ -394,13 +395,12 @@ def _finished(completion: ChatCompletion) -> _FinishedTurn:
     ],
 )
 def test_stop_reason_mapping(
-    build_completion: Callable[[], ChatCompletion], expected: StopReason
+    build_completion: Callable[[], ChatCompletion], expected: StopReason, expected_output: str
 ) -> None:
-    """Map each finish_reason row to its neutral StopReason.
-
-    The refusal field is tested ahead of the rows, which the refusal-beside-stop row pins.
-    """
-    assert _normalized_stop_reason(_finished(build_completion())) == expected
+    """Check translated stop reasons alongside the preserved output."""
+    result = _assert_result(_text_bound().interpret(build_completion()))
+    assert result.stop_reason == expected
+    assert result.output == expected_output
 
 
 def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
@@ -573,7 +573,7 @@ def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{base64.b64encode(b'png').decode('ascii')}",
+                        "url": "data:image/png;base64,cG5n",
                         "detail": "auto",
                     },
                     "prompt_cache_breakpoint": {"mode": "explicit"},
@@ -618,7 +618,7 @@ def test_wire_messages_maps_image_url_part_and_audio_part_in_user_message() -> N
                 {
                     "type": "input_audio",
                     "input_audio": {
-                        "data": base64.b64encode(b"wav").decode("ascii"),
+                        "data": "d2F2",
                         "format": "wav",
                     },
                     "prompt_cache_breakpoint": {"mode": "explicit"},
@@ -626,7 +626,7 @@ def test_wire_messages_maps_image_url_part_and_audio_part_in_user_message() -> N
                 {
                     "type": "input_audio",
                     "input_audio": {
-                        "data": base64.b64encode(b"mp3").decode("ascii"),
+                        "data": "bXAz",
                         "format": "mp3",
                     },
                 },
@@ -743,12 +743,6 @@ def test_web_search_options_raise_with_the_responses_interface() -> None:
     """Chat Completions rejects web search because its billing evidence is incomplete."""
     with pytest.raises(ValueError, match="OpenAIResponsesAdapter"):
         _ = _adapter().bind_text(_binding(extra_body={"web_search_options": {}}))
-
-
-def test_request_str_system_becomes_one_system_message_first() -> None:
-    """A str system_prompt is the messages_prefix's one system-role message."""
-    precomputed_fields = _adapter()._precompute_fields(_binding(system_prompt="sys"))
-    assert precomputed_fields.messages_prefix == [{"role": "system", "content": "sys"}]
 
 
 def test_request_system_parts_become_one_system_message_of_marked_parts() -> None:
@@ -1017,8 +1011,6 @@ def _structured_parse(completion: ChatCompletion) -> ResponseOutcome[_Structured
 
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the message's content into the response_format."""
-    outcome = _structured_parse(_structured_completion(_REPORT_JSON))
-    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
     interpreted = _assert_result(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON))
     )
@@ -1115,9 +1107,14 @@ def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
 
 
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
-    """The instance lands on output and the call still lands on tool_calls, so neither fact hides the other."""
-    outcome = _structured_parse(_structured_completion(_REPORT_JSON, tool_call=True))
-    assert _assert_result(outcome).output == _StructuredReport(city="Nairobi", celsius=25)
+    """Check parsed output and the extracted tool call on the same turn."""
+    outcome = _assert_result(
+        _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
+    )
+    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
+    assert outcome.assistant_message.tool_calls == (
+        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+    )
 
 
 def test_structured_bind_reports_refusal_and_never_validates_the_refusal_text() -> None:
@@ -1133,18 +1130,19 @@ def test_structured_bind_reports_refusal_on_a_content_filter_finish() -> None:
     assert isinstance(outcome, Refusal)
 
 
-def test_structured_request_replaces_the_omitted_response_format() -> None:
-    """The structured binding's precomputed fields carry the non-strict JSON-schema format."""
-    response_format = _structured_bound()._precomputed_fields.response_format
-    assert response_format == {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "_StructuredReport",
-            "schema": _StructuredReport.model_json_schema(),
-            "strict": False,
-        },
-    }
-    assert isinstance(_text_bound()._precomputed_fields.response_format, openai.Omit)
+def test_structured_request_replaces_the_omitted_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check the captured structured schema and text request omission."""
+    response_format = _kwarg_sent(monkeypatch, _structured_bound(), "response_format")
+    assert isinstance(response_format, dict)
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is False
+    assert response_format["json_schema"]["schema"]["properties"]["city"]["type"] == "string"
+    assert response_format["json_schema"]["schema"]["properties"]["celsius"]["type"] == "integer"
+    required: list[str] = response_format["json_schema"]["schema"]["required"]
+    assert set(required) == {"city", "celsius"}
+    assert isinstance(_kwarg_sent(monkeypatch, _text_bound(), "response_format"), openai.Omit)
 
 
 def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:

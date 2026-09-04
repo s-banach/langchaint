@@ -11,7 +11,6 @@ Restored records open no span.
 `TracedToolManager.dispatch` opens one INTERNAL `execute_tool` span.
 `ToolManager.dispatch_many` uses `dispatch` and gets one span per tool call.
 `precomputed` opens no span because it executes no tool.
-`agent_span` opens one INTERNAL `invoke_agent` span around an application agent loop.
 
 Each traced class requires `capture_message_content` because prompt recording is a privacy choice.
 `extra_attributes` sets constant attributes when each span starts.
@@ -26,11 +25,8 @@ With capture enabled, they report system instructions, tool definitions, input m
 Stream spans also report `gen_ai.request.stream=True` and `gen_ai.response.time_to_first_chunk`.
 Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
-Agent spans use `gen_ai.operation.name="invoke_agent"` and report agent name and `langchaint.agent_path`.
-Agent spans sum the run's usage partition and cost.
-Agent exit `extra_attributes` add application results.
 
-`langchaint.*` names only attempts, cost, and agent path because the convention has no matching keys.
+`langchaint.*` names attempts and cost because the convention has no matching keys.
 Each failed attempt adds `langchaint.attempt_failed` with `error_text` and `elapsed_seconds`.
 
 Each traced operation starts and ends its span exactly once.
@@ -41,9 +37,8 @@ Mapper failures are logged and never propagate.
 
 Attribute names except `gen_ai.request.reasoning.level` match opentelemetry-semantic-conventions 0.64b0.
 `gen_ai.request.reasoning.level` comes from the OpenTelemetry semantic-conventions-genai repository.
-`GenAiOperationNameValues.CHAT`, `.EXECUTE_TOOL`, and `.INVOKE_AGENT` define the operation values.
+`GenAiOperationNameValues.CHAT` and `.EXECUTE_TOOL` define the operation values.
 Tool identity uses `gen_ai.tool.name` and `gen_ai.tool.call.id`.
-Agent identity uses `gen_ai.agent.name`.
 Reasoning usage uses `gen_ai.usage.reasoning.output_tokens`.
 Readable reasoning uses `ReasoningPart` in content payloads.
 Content payloads follow the convention's JSON schemas.
@@ -122,7 +117,6 @@ from langchaint.tools import (
     ToolSchema,
     ToolSequence,
 )
-from langchaint.usage import Usage
 
 type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
 """One span attribute's value."""
@@ -320,118 +314,6 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     if result.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
     return attributes
-
-
-@contextmanager
-def agent_span(
-    tracer: Tracer,
-    *,
-    agent_name: str,
-    agent_path: str,
-    usage: Callable[[], Usage],
-    extra_attributes: Callable[[], SpanAttributes] | None = None,
-) -> Generator[Span]:
-    """Open one INTERNAL invoke_agent span around an application's own agent loop.
-
-    langchaint ships no agent loop.
-    This context manager records an application's loop with identity, paid usage, and cost.
-    `tracer` starts the span.
-    `agent_name` sets `gen_ai.agent.name` and the span name.
-    `agent_path` sets `langchaint.agent_path`.
-    `usage` returns the completed loop's `Usage` at exit.
-    `extra_attributes` returns application attributes at exit.
-
-    The usage keys are the same ones gen_ai_attributes emits for a single call, here summed over the run:
-    gen_ai.usage.input_tokens is Usage.input_tokens_total.
-    reasoning.output_tokens is the reasoning share.
-    langchaint.cost_in_usd is estimated cost.
-
-    usage and extra_attributes run once at exit.
-    Identity and usage attributes overwrite extra_attributes.
-    A usage key is overwritten only when usage returns.
-
-    An Exception from usage or extra_attributes is logged and does not propagate.
-
-    Guarded helpers start and end the span.
-    trace.use_span disables its exception and status handling.
-    This module records body exceptions and always ends the span.
-
-    Yields:
-        The current invoke_agent span.
-
-    Raises:
-        Exception: the wrapped body raised. error.type and error status are recorded first.
-        BaseException: the body, usage, or extra_attributes raised a non-Exception BaseException.
-    """
-    identity: dict[str, str] = {
-        "gen_ai.operation.name": "invoke_agent",
-        "gen_ai.agent.name": agent_name,
-        "langchaint.agent_path": agent_path,
-    }
-    span = _start_span(tracer, f"invoke_agent {agent_name}", kind=SpanKind.INTERNAL)
-    _set_span_attributes(span, identity)
-    try:
-        try:
-            with trace.use_span(
-                span, end_on_exit=False, record_exception=False, set_status_on_exception=False
-            ):
-                try:
-                    yield span
-                except Exception as exc:
-                    _record_other_exception(span, exc)
-                    raise
-        finally:
-            _apply_agent_exit_attributes(
-                span, identity=identity, usage=usage, extra_attributes=extra_attributes
-            )
-    finally:
-        _end_span(span)
-
-
-def _apply_agent_exit_attributes(
-    span: Span,
-    *,
-    identity: Mapping[str, str],
-    usage: Callable[[], Usage],
-    extra_attributes: Callable[[], SpanAttributes] | None,
-) -> None:
-    """Set an ending invoke_agent span's extras, then re-set its identity, then set its usage.
-
-    Identity overwrites extras. Usage overwrites extras only when usage returns. Each callable has an independent guard.
-    The set_attributes calls are guarded for the same reason.
-    A non-recording span skips attribute construction.
-    """
-    if not _is_recording(span):
-        return
-    if extra_attributes is not None:
-        try:
-            attributes = extra_attributes()
-        except Exception:
-            _logger.warning(
-                "agent_span extra_attributes raised; leaving span attributes partial",
-                exc_info=True,
-            )
-        else:
-            with _guarding_telemetry_failures("setting the agent_span extra attributes"):
-                span.set_attributes(attributes)
-    with _guarding_telemetry_failures("setting the agent_span identity attributes"):
-        span.set_attributes(identity)
-    try:
-        spent = usage()
-    except Exception:
-        _logger.warning(
-            "agent_span usage raised; leaving span usage attributes unset", exc_info=True
-        )
-        return
-    with _guarding_telemetry_failures("setting the agent_span usage attributes"):
-        span.set_attributes({
-            "gen_ai.usage.input_tokens": spent.input_tokens_total,
-            "gen_ai.usage.output_tokens": spent.output_tokens,
-            "gen_ai.usage.reasoning.output_tokens": spent.output_tokens_reasoning,
-            "gen_ai.usage.cache_read.input_tokens": spent.input_tokens_cache_read,
-            "gen_ai.usage.cache_creation.input_tokens": spent.input_tokens_cache_write,
-            "langchaint.cost_in_usd": spent.cost_in_usd,
-        })
 
 
 def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, object]]:
@@ -814,7 +696,6 @@ def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConf
 class TracedLLM:
     """Wraps an LLM so every binding it produces is traced.
 
-    Wrapping is unconditional: an app wraps every LLM at construction and types its signatures as the Traced classes.
     The OTel SDK configures whether tracing records and where it sends spans.
     An application without an SDK configuration gets non-recording no-op spans.
     """
@@ -832,11 +713,6 @@ class TracedLLM:
 
         `llm` is the wrapped `LLM`.
         `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant turns.
-        It is required and has no default.
-        Recording prompts is a privacy choice langchaint never makes.
-        The convention says instrumentations SHOULD NOT capture content by default.
-        It says they SHOULD provide an opt-in.
-        This required keyword supplies the opt-in.
         The value passes unchanged to every binding, replacement object, and stream handle.
         `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
         `attribute_mapper` passes unchanged to every binding.
@@ -1412,8 +1288,6 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         `generation_inputs`, `warm_cache`, and `max_working_seconds_per_item` pass through to `BoundLLM.generate_many`.
 
-        Configure the OTel SDK sampler to limit span volume.
-
         Raises:
             asyncio.CancelledError: an outer scope cancelled the batch. Each started span ended.
             BaseException: an item raised a non-Exception BaseException.
@@ -1863,12 +1737,7 @@ class TracedToolManager(ToolManager):
         """Open one execute_tool span around ToolManager.dispatch and attribute it from the outcome.
 
         `call` passes to `ToolManager.dispatch` unchanged.
-        `ToolManager.dispatch` defines the dispatch behavior.
-        This override adds the span.
         The span is current while the base dispatch runs, so a span the tool function starts nests under it.
-        `trace.use_span` makes the span current with its exception recording and status setting disabled.
-        The `finally` block ends it through `_end_span`.
-        This method records and sets status itself, from the table on the class.
 
         Raises:
             Exception: A tool function raises after the span records the exception and error status.
@@ -1934,6 +1803,5 @@ __all__ = [
     "TracedLLM",
     "TracedStreamHandle",
     "TracedToolManager",
-    "agent_span",
     "gen_ai_attributes",
 ]

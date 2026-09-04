@@ -148,34 +148,31 @@ def test_reading_without_an_active_emitter_raises() -> None:
         _ = current_gui_emitter()
 
 
-def test_sub_agent_span_nests_under_the_delegate_tool_span() -> None:
-    """The specialist span has the delegate tool span as its parent."""
+def test_application_span_groups_generation_and_tool_spans() -> None:
+    """Run the application under an OpenTelemetry span and inspect its children."""
     exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = tracer_provider.get_tracer("full_app.test")
     app = _build_app("happy", exporter=exporter)
-    asyncio.run(app.run())
-    spans = exporter.get_finished_spans()
-    specialist = _named(spans, "invoke_agent specialist")
-    delegate_span = _parent_of(specialist, spans)
-    assert delegate_span is not None
-    assert _attribute(delegate_span, "gen_ai.tool.name") == "delegate"
-    assert _parent_of(delegate_span, spans) is _named(spans, "invoke_agent research_climate")
+    with tracer.start_as_current_span("application"):
+        asyncio.run(app.run())
 
-
-def test_the_agent_span_parents_its_own_generate_spans() -> None:
-    """A run's generate spans have its agent span as parent."""
-    exporter = InMemorySpanExporter()
-    app = _build_app("happy", exporter=exporter)
-    asyncio.run(app.run())
     spans = exporter.get_finished_spans()
-    energy = _named(spans, "invoke_agent research_energy")
-    generate_spans = [
-        span
+    application_span = _named(spans, "application")
+    delegate_span = _named(spans, "execute_tool delegate")
+    assert _parent_of(delegate_span, spans) is application_span
+    for parent_span in (application_span, delegate_span):
+        children = [span for span in spans if _parent_of(span, spans) is parent_span]
+        assert {_attribute(span, "gen_ai.operation.name") for span in children} == {
+            "chat",
+            "execute_tool",
+        }
+    assert all(
+        _parent_of(span, spans) in (application_span, delegate_span)
         for span in spans
-        if _attribute(span, "gen_ai.operation.name") == "chat"
-        and _parent_of(span, spans) is energy
-    ]
-    # research_energy has two scripted turns.
-    assert len(generate_spans) == 2
+        if span is not application_span
+    )
 
 
 def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
@@ -283,7 +280,6 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
             system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,
         ),
-        tracer=tracer,
         registry=registry,
         on_event=_discard,
     )
@@ -322,7 +318,6 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
             system_prompt="Fail.",
             automatic_cache_breakpoints=False,
         ),
-        tracer=TracerProvider().get_tracer("full_app.test"),
         registry={},
         on_event=_discard,
     )
@@ -406,7 +401,6 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
             system_prompt=specialist_prompt,
             automatic_cache_breakpoints=False,
         ),
-        tracer=tracer,
         registry=registry,
         on_event=_discard,
     )
@@ -432,15 +426,11 @@ def test_a_second_run_under_one_agent_path_is_rejected() -> None:
 
     registry: dict[str, AgentRun] = {}
     config = AgentConfig(name="twin", system_prompt="Respond.", automatic_cache_breakpoints=False)
-    tracer = TracerProvider().get_tracer("full_app.test")
-    _ = NoOpRun(
-        agent_path="root/twin", config=config, tracer=tracer, registry=registry, on_event=_discard
-    )
+    _ = NoOpRun(agent_path="root/twin", config=config, registry=registry, on_event=_discard)
     with pytest.raises(ValueError, match="already registered"):
         _ = NoOpRun(
             agent_path="root/twin",
             config=config,
-            tracer=tracer,
             registry=registry,
             on_event=_discard,
         )

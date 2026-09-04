@@ -1,6 +1,6 @@
 """Run a multi-agent app that reports progress through on_event.
 
-AgentRun.final installs GuiEmitter, opens the agent span, emits terminal events, and drives run.
+AgentRun.final installs GuiEmitter, emits terminal events, and drives run.
 on_event executes synchronously inside the run.
 `TimedOutErrorRecord` lets the loop record a timed-out call and continue.
 
@@ -54,7 +54,7 @@ from langchaint import (
     UserMessage,
     tool,
 )
-from langchaint.tracing import TracedBoundLLM, TracedLLM, agent_span
+from langchaint.tracing import TracedBoundLLM, TracedLLM
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,7 @@ class AgentRun(ABC):
     """Report one agent's execution through on_event.
 
     Subclasses implement run and append settled calls to turn_log.
-    final installs GuiEmitter, opens the span, and emits terminal events.
+    final installs GuiEmitter and emits terminal events.
     """
 
     def __init__(
@@ -125,7 +125,6 @@ class AgentRun(ABC):
         *,
         agent_path: str,
         config: AgentConfig,
-        tracer: Tracer,
         registry: dict[str, "AgentRun"],
         on_event: Callable[[Event], None],
     ) -> None:
@@ -142,7 +141,6 @@ class AgentRun(ABC):
             )
         self.agent_path: str = agent_path
         self.config: AgentConfig = config
-        self.tracer: Tracer = tracer
         self.registry: dict[str, AgentRun] = registry
         self.on_event: Callable[[Event], None] = on_event
         self.turn_log: list[TurnRecord] = []
@@ -170,12 +168,8 @@ class AgentRun(ABC):
             if path == self.agent_path or path.startswith(f"{self.agent_path}/")
         )
 
-    def span_attributes(self) -> Mapping[str, str | int | float | bool]:
-        """Return agent span attributes after run finishes."""
-        return {}
-
     async def final(self) -> str:
-        """Run the agent with its GuiEmitter and span.
+        """Run the agent with its GuiEmitter.
 
         Raises:
             Exception: `run()` or `on_event` raises.
@@ -185,14 +179,7 @@ class AgentRun(ABC):
         try:
             self.on_event(AgentStarted(agent_path=self.agent_path))
             try:
-                with agent_span(
-                    self.tracer,
-                    agent_name=self.config.name,
-                    agent_path=self.agent_path,
-                    usage=lambda: self.usage,
-                    extra_attributes=self.span_attributes,
-                ):
-                    answer = await self.run()
+                answer = await self.run()
             except asyncio.CancelledError as error:
                 try:
                     self.on_event(AgentCancelled(agent_path=self.agent_path, usage=self.usage))
@@ -222,7 +209,6 @@ class ReActAgent(AgentRun):
         *,
         agent_path: str,
         config: AgentConfig,
-        tracer: Tracer,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
         bound: TracedBoundLLM[str, ToolManager],
@@ -232,7 +218,6 @@ class ReActAgent(AgentRun):
         super().__init__(
             agent_path=agent_path,
             config=config,
-            tracer=tracer,
             registry=registry,
             on_event=on_event,
         )
@@ -242,11 +227,6 @@ class ReActAgent(AgentRun):
         self.tool_calls_made: int = 0
         self.critique_approved: bool = False
         self.messages: list[Message] = []
-
-    @override
-    def span_attributes(self) -> Mapping[str, str | int | float | bool]:
-        """Return the final turn count for the agent span."""
-        return {"langchaint.agent.turns": self.turn_number}
 
     @override
     async def run(self) -> str:
@@ -444,7 +424,6 @@ def build_delegate_tool(
     llm: TracedLLM,
     parent_path: str,
     sub_config: AgentConfig,
-    tracer: Tracer,
     registry: dict[str, AgentRun],
     on_event: Callable[[Event], None],
 ) -> PydanticTool[DelegateArgs, None]:
@@ -465,7 +444,6 @@ def build_delegate_tool(
         sub_run = ReActAgent(
             agent_path=f"{parent_path}/{sub_config.name}#{next(spawn_counter)}",
             config=sub_config,
-            tracer=tracer,
             registry=registry,
             on_event=on_event,
             bound=llm.bind(
@@ -523,7 +501,6 @@ class App:
         """
         self._llm = TracedLLM(llm, capture_message_content=capture_message_content, tracer=tracer)
         self._configs = configs
-        self._tracer = tracer
         self._on_event = on_event
         self._runs: dict[str, AgentRun] = {}
         self.answers: dict[str, str] = {}
@@ -547,7 +524,6 @@ class App:
         return ReActAgent(
             agent_path=top_level_path(name),
             config=config,
-            tracer=self._tracer,
             registry=self._runs,
             on_event=self._on_event,
             bound=self._llm.bind(
@@ -591,7 +567,6 @@ class App:
             llm=self._llm,
             parent_path=top_level_path(climate_name),
             sub_config=self._configs["specialist"],
-            tracer=self._tracer,
             registry=self._runs,
             on_event=self._on_event,
         )

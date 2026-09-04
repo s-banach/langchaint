@@ -69,10 +69,8 @@ from langchaint.tracing import (
     TracedLLM,
     TracedStreamHandle,
     TracedToolManager,
-    agent_span,
     gen_ai_attributes,
 )
-from langchaint.usage import Usage
 from scripts import refresh_semconv_genai
 from tests.test_bound_llm import (
     _MAX_COMPLETION_TOKENS_EXCEEDED,
@@ -229,11 +227,6 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
             ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
         )
         assert isinstance(outcome, DispatchHandled)
-
-        with agent_span(
-            tracer, agent_name="specialist", agent_path="root/specialist", usage=lambda: _USAGE
-        ):
-            pass
 
     asyncio.run(scenario())
 
@@ -1752,187 +1745,6 @@ def test_extra_attributes_cannot_displace_the_operation_name() -> None:
         assert span.attributes["gen_ai.operation.name"] == "chat"
 
     asyncio.run(scenario())
-
-
-def test_agent_span_carries_the_run_identity_and_summed_usage() -> None:
-    """agent_span emits one INTERNAL invoke_agent span carrying the run's identity, usage, and extras."""
-    tracer, exporter = _in_memory_tracer()
-    spent = Usage(
-        input_tokens_cache_read=2,
-        input_tokens_cache_write=3,
-        input_tokens_cache_none=5,
-        output_tokens=7,
-        output_tokens_reasoning=4,
-        input_tokens_cache_read_cost_in_usd=0.0,
-        input_tokens_cache_write_cost_in_usd=0.0,
-        input_tokens_cache_none_cost_in_usd=0.0,
-        output_tokens_cost_in_usd=0.5,
-        provider_executed_tool_cost_in_usd=0.0,
-    )
-    with agent_span(
-        tracer,
-        agent_name="research_climate",
-        agent_path="root/research_climate",
-        usage=lambda: spent,
-        extra_attributes=lambda: {"langchaint.agent.turns": 3},
-    ) as span:
-        assert span.is_recording()
-    (finished,) = exporter.get_finished_spans()
-    assert finished.name == "invoke_agent research_climate"
-    assert finished.kind == SpanKind.INTERNAL
-    # agent_span leaves status UNSET on success.
-    # agent_span sets status ERROR when the wrapped body raises.
-    # start_as_current_span uses the same UNSET default.
-    assert finished.status.status_code == StatusCode.UNSET
-    assert finished.attributes is not None
-    assert dict(finished.attributes) == {
-        "gen_ai.operation.name": "invoke_agent",
-        "gen_ai.agent.name": "research_climate",
-        "langchaint.agent_path": "root/research_climate",
-        "gen_ai.usage.input_tokens": 10,
-        "gen_ai.usage.output_tokens": 7,
-        "gen_ai.usage.reasoning.output_tokens": 4,
-        "gen_ai.usage.cache_read.input_tokens": 2,
-        "gen_ai.usage.cache_creation.input_tokens": 3,
-        "langchaint.cost_in_usd": 0.5,
-        "langchaint.agent.turns": 3,
-    }
-
-
-def test_agent_span_reads_usage_at_exit_and_records_the_spend_on_an_exception() -> None:
-    """usage() is read on the way out, so a run that raises still closes the span with its final spend."""
-    tracer, exporter = _in_memory_tracer()
-    spent = Usage(
-        input_tokens_cache_read=0,
-        input_tokens_cache_write=0,
-        input_tokens_cache_none=0,
-        output_tokens=0,
-        output_tokens_reasoning=0,
-        input_tokens_cache_read_cost_in_usd=0.0,
-        input_tokens_cache_write_cost_in_usd=0.0,
-        input_tokens_cache_none_cost_in_usd=0.0,
-        output_tokens_cost_in_usd=0.0,
-        provider_executed_tool_cost_in_usd=0.0,
-    )
-    with (  # noqa: PT012
-        pytest.raises(RuntimeError, match="loop gave up"),
-        agent_span(
-            tracer,
-            agent_name="specialist",
-            agent_path="root/specialist",
-            usage=lambda: spent,
-        ),
-    ):
-        spent = Usage(
-            input_tokens_cache_read=0,
-            input_tokens_cache_write=0,
-            input_tokens_cache_none=6,
-            output_tokens=2,
-            output_tokens_reasoning=0,
-            input_tokens_cache_read_cost_in_usd=0.0,
-            input_tokens_cache_write_cost_in_usd=0.0,
-            input_tokens_cache_none_cost_in_usd=0.0,
-            output_tokens_cost_in_usd=0.02,
-            provider_executed_tool_cost_in_usd=0.0,
-        )
-        raise RuntimeError("loop gave up")
-    (finished,) = exporter.get_finished_spans()
-    assert finished.status.status_code == StatusCode.ERROR
-    assert finished.attributes is not None
-    assert finished.attributes["error.type"] == "RuntimeError"
-    assert finished.attributes["gen_ai.usage.input_tokens"] == 6
-    assert finished.attributes["gen_ai.usage.output_tokens"] == 2
-    assert finished.attributes["langchaint.cost_in_usd"] == pytest.approx(0.02)
-
-
-def test_agent_span_extra_attributes_cannot_displace_identity_or_usage_keys() -> None:
-    """Agent identity and Usage attributes override colliding extras."""
-    tracer, exporter = _in_memory_tracer()
-    spent = Usage(
-        input_tokens_cache_read=0,
-        input_tokens_cache_write=0,
-        input_tokens_cache_none=1,
-        output_tokens=1,
-        output_tokens_reasoning=0,
-        input_tokens_cache_read_cost_in_usd=0.0,
-        input_tokens_cache_write_cost_in_usd=0.0,
-        input_tokens_cache_none_cost_in_usd=0.0,
-        output_tokens_cost_in_usd=0.01,
-        provider_executed_tool_cost_in_usd=0.0,
-    )
-    with agent_span(
-        tracer,
-        agent_name="specialist",
-        agent_path="root/specialist",
-        usage=lambda: spent,
-        extra_attributes=lambda: {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.agent.name": "impostor",
-            "gen_ai.usage.input_tokens": 999,
-            "langchaint.agent.turns": 2,
-        },
-    ):
-        pass
-    (finished,) = exporter.get_finished_spans()
-    assert finished.attributes is not None
-    assert finished.attributes["gen_ai.operation.name"] == "invoke_agent"
-    assert finished.attributes["gen_ai.agent.name"] == "specialist"
-    assert finished.attributes["gen_ai.usage.input_tokens"] == 1
-    assert finished.attributes["langchaint.agent.turns"] == 2
-
-
-def test_agent_span_logs_a_raising_usage_callable_instead_of_propagating(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Exit attribute failures log without replacing the body error."""
-    tracer, exporter = _in_memory_tracer()
-
-    def raising_usage() -> Usage:
-        raise ValueError("usage read failed")
-
-    def raising_extras() -> dict[str, int]:
-        raise ValueError("extras read failed")
-
-    with (
-        pytest.raises(RuntimeError, match="loop gave up"),
-        caplog.at_level(logging.WARNING, logger="langchaint.tracing"),
-        agent_span(
-            tracer,
-            agent_name="specialist",
-            agent_path="root/specialist",
-            usage=raising_usage,
-            extra_attributes=raising_extras,
-        ),
-    ):
-        raise RuntimeError("loop gave up")
-    assert "agent_span usage raised" in caplog.text
-    assert "agent_span extra_attributes raised" in caplog.text
-    (finished,) = exporter.get_finished_spans()
-    assert finished.status.status_code == StatusCode.ERROR
-    assert finished.attributes is not None
-    assert "gen_ai.usage.input_tokens" not in finished.attributes
-    assert finished.attributes["gen_ai.agent.name"] == "specialist"
-
-
-def test_agent_span_ends_even_when_the_exit_attribute_pass_raises_a_base_exception() -> None:
-    """A BaseException from usage still ends the agent span."""
-    tracer, exporter = _in_memory_tracer()
-
-    def raising_usage() -> Usage:
-        raise KeyboardInterrupt
-
-    with (
-        pytest.raises(KeyboardInterrupt),
-        agent_span(
-            tracer, agent_name="specialist", agent_path="root/specialist", usage=raising_usage
-        ),
-    ):
-        pass
-    (finished,) = exporter.get_finished_spans()
-    assert finished.name == "invoke_agent specialist"
-    # The identity was set at span start, before usage() ran, so the interrupt does not discard it.
-    assert finished.attributes is not None
-    assert finished.attributes["gen_ai.agent.name"] == "specialist"
 
 
 def _emitted_convention_keys() -> set[str]:

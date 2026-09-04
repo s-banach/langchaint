@@ -97,9 +97,8 @@ Other sub-agent failures become parent-readable tool errors, so the parent can f
 
 ## Tracing
 
-`AgentRun.final` opens one `agent_span` around the loop.
-Its `generate_one` spans become children of that span.
-A delegated run's `agent_span` becomes a child of its `delegate` tool span.
+`TracedLLM` and `TracedToolManager` create generation and tool spans.
+A delegated run's generation and tool spans become children of its `delegate` tool span.
 
 `capture_message_content` controls message content on generated spans.
 OpenTelemetry configuration controls recording and export.

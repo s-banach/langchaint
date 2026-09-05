@@ -4,21 +4,17 @@ langchaint is an opinionated, provider-neutral Python client for LLM application
 It provides fully typed, asynchronous APIs for generation, streaming, embeddings, tools, retries, and billing.
 The application owns the agent loop.
 
-Alpha: the API is unstable and may change without notice.
+Alpha: the API may change without notice.
 
 ## Why langchaint
 
-- **One consistent API.** Set request fields once with `LLM.bind()`. Use the resulting `BoundLLM` with `generate_one()`, `generate_many()`, `generate_many_records()`, or `stream_one()`.
-- **Types that follow your configuration.** Passing `response_format=Answer` makes `response.output` an `Answer`. Passing `tools` also determines the `tool_manager` type and whether `generate_one()` can return `ToolCallTurn`.
-- **Easy-to-discover result variants.** Every `GenerateResult`, `DispatchOutcome`, and `DispatchManyOutcome` variant has a literal `.kind` value. Every `StreamItem` variant except `str` does too. Editors can autocomplete the values, so a match statement needs no class imports.
-- **Names that explain themselves.** Public names state their meaning, units, and scope through names such as `timeout_seconds`, `max_attempts`, `cost_in_usd`, and `input_tokens_cache_read`.
-- **Retries that cooperate.** One `SharedBackoff` coordinates concurrency, request-start pacing, and provider-directed pauses across models that share a rate-limit quota.
+- **Consistent API.** Bind request fields once with `LLM.bind()`, then call `generate_one()`, `generate_many()`, or `stream_one()` on the resulting `BoundLLM`.
+- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `Response[Answer]`. Binding `tools` as well adds `ToolCallTurn[Answer]` to that return type.
+- **Result variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
+- **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
 - **Complete billing.** Successful results and `GenerationError` values retain provider-reported usage from every recorded attempt, including billed retries.
-- **Streaming with clear ownership.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed result with its usage and attempt history.
-- **Agent loops in plain Python.** Provider-neutral messages, typed tools, concurrent dispatch, and explicit result variants support ordinary async control flow.
-
-langchaint ships `py.typed`.
-Static type information preserves structured output types through generation, batching, and streaming.
+- **Streaming.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed result with its usage.
+- **Agent loops in Python.** Provider-neutral messages, typed tools with argument validation, concurrent dispatch, and explicit result variants support async control flow.
 
 ## Install
 
@@ -41,7 +37,7 @@ pip install "langchaint[openai]"
 | OpenAI embeddings | `OpenAI` | `langchaint[openai-embedding]` |
 | OpenAI on Amazon Bedrock | `OpenAIBedrock` | `langchaint[openai-bedrock]` |
 
-Install `langchaint[tracing]` for OTel tracing.
+Install `langchaint[tracing]` for OpenTelemetry tracing.
 
 ## Generate a typed response
 
@@ -76,8 +72,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The Pydantic model determines the output type and validates the provider response.
-The response retains the complete assistant turn, raw SDK response, stop reason, per-attempt history, and billing.
+The Pydantic model validates the provider response.
 
 `generate_many()` returns one result per input in input order.
 A terminal failure becomes that input's `GenerationError`, so sibling results remain available.
@@ -96,12 +91,8 @@ fast_model = openai.model("gpt-5.6-luna")
 strong_model = openai.model("gpt-5.6-sol")
 ```
 
-Both `LLM` values share one `SharedBackoff`.
 A rate-limit response pauses request starts across the shared quota.
-A transient failure local to one request waits and retries that request.
-Each binding keeps its own `max_attempts` limit.
-
-Unlike independent retry loops, `SharedBackoff` can slow the whole quota as soon as one request receives a rate-limit response.
+After a transient failure local to one request, langchaint waits and retries that request.
 
 ## Stream with an explicit lifetime
 
@@ -116,13 +107,10 @@ async with text_assistant.stream_one("Explain photosynthesis.") as stream:
     response = await stream.final()
 ```
 
-The context manager owns the provider stream and the shared request permit.
-Iteration exposes text, reasoning, and tool-call `StreamItem` values.
-`final()` drains unread `StreamItem` values and returns the assembled `Response` or `ToolCallTurn`.
+`final()` consumes the remaining stream and returns the assembled result.
 
-## Build agent loops with ordinary async Python
+## Build agent loops
 
-langchaint provides the messages, typed tools, argument validation, concurrent dispatch, and result variants needed for an agent loop.
 The application controls turn limits, state, approvals, model changes, and persistence.
 
 ```python
@@ -142,23 +130,18 @@ for _ in range(max_turns):
 raise RuntimeError("model did not finish within max_turns")
 ```
 
-`ToolManager.dispatch_many()` runs parallel tool calls concurrently and preserves their order.
+`ToolManager.dispatch_many()` runs tool calls concurrently and preserves their order.
 
 See [`examples/02_tool_loop.py`](examples/02_tool_loop.py) for a complete typed tool loop.
 
 ## Account for the complete call
 
 `response.usage.cost_in_usd` includes every billed retry recorded for the call.
-`response.usage_successful_attempt.cost_in_usd` reports the kept answer.
 `GenerationError.usage` preserves the recorded cost of failed calls.
-
-`Usage` separates uncached input, cache reads, cache writes, output, reasoning output, and provider-executed tool charges.
-Each `Billing` records the service tier and token rates applied to one attempt.
-When a used category has no known rate, its cost is `NaN` instead of zero.
 
 ## More examples
 
-[`examples/README.md`](examples/README.md) covers structured output, batches, streaming, tools, tracing, pricing, failures, prompt caching, reasoning, embeddings, and application structure.
+See [`examples/README.md`](examples/README.md) for complete examples.
 
 ## License
 

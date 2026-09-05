@@ -12,16 +12,15 @@ import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Literal, Protocol, TypeIs
+from typing import Literal, Protocol, Self, TypeIs, override
 
 import jsonschema.exceptions
 import jsonschema.protocols
 import jsonschema.validators
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from langchaint.exceptions import DispatchExceptionGroup, InvalidToolArgsError
-from langchaint.messages import MessageContent, ToolCall, ToolMessage
-from langchaint.sequence_not_str import SequenceNotStr
+from langchaint.common.messages import MessageContent, ToolCall, ToolMessage
+from langchaint.common.sequence_not_str import SequenceNotStr
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -112,6 +111,69 @@ Call a concrete tool's `dispatch` to preserve its `app_data` type.
 
 type DispatchManyOutcome = DispatchOutcome | DispatchPrecomputed
 """One ordered outcome from `ToolManager.dispatch_many`."""
+
+
+class InvalidToolArgsError(Exception):
+    """A tool call's `args_json` failed validation against the tool's `args_model`.
+
+    `PydanticTool._validated_args` raises this error.
+    A tool function does not cause langchaint to raise this error.
+    `ToolManager.dispatch` catches this error and returns `DispatchInvalidToolArgs`.
+    """
+
+    validation_error: ValidationError
+
+    def __init__(self, validation_error: ValidationError) -> None:
+        """Hold `validation_error` by reference."""
+        super().__init__()
+        self.validation_error = validation_error
+
+    @override
+    def __str__(self) -> str:
+        """Render the held validation error."""
+        return str(self.validation_error)
+
+
+class DispatchExceptionGroup(ExceptionGroup[Exception]):
+    """Tool function exceptions from `ToolManager.dispatch_many`.
+
+    `completed_outcomes` preserves settled outcomes in input order.
+    The grouped exceptions preserve input order and their tracebacks.
+    Cancellation propagates separately with this group as its cause when both occur.
+    """
+
+    completed_outcomes: "tuple[DispatchManyOutcome, ...]"
+
+    def __new__(
+        cls,
+        message: str,
+        exceptions: Sequence[Exception],
+        *,
+        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
+    ) -> Self:
+        """Build a group carrying the completed dispatch outcomes."""
+        group = super().__new__(cls, message, exceptions)
+        group.completed_outcomes = completed_outcomes
+        return group
+
+    def __init__(
+        self,
+        message: str,
+        exceptions: Sequence[Exception],
+        *,
+        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
+    ) -> None:
+        """Store grouped exceptions and completed dispatch outcomes."""
+        super().__init__(message, exceptions)
+        self.completed_outcomes = completed_outcomes
+
+    @override
+    # pyrefly: ignore[bad-override]  # Typeshed makes `derive` generic for each call.
+    def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
+        """Return a subgroup with the same `completed_outcomes`."""
+        return DispatchExceptionGroup(
+            self.message, excs, completed_outcomes=self.completed_outcomes
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

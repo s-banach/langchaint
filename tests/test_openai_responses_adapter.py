@@ -81,13 +81,21 @@ from langchaint.adapter import (
     ProviderFailedTransiently,
     Refusal,
     RequestParams,
+    ResponseIdentity,
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
 )
-from langchaint.call import ResponseIdentity
+from langchaint.billing.pricing import Billing
+from langchaint.common.exceptions import StreamProtocolError
+from langchaint.concurrency.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    PauseAllDoNotRetry,
+    RetryThisOne,
+    Verdict,
+)
 from langchaint.conformance import AdapterConformance
-from langchaint.exceptions import StreamProtocolError
 from langchaint.openai import (
     OpenAIPricingTable,
     OpenAIRates,
@@ -109,14 +117,6 @@ from langchaint.openai.responses_adapter import (
     _billing_from_response as _provider_billing_from_response,
 )
 from langchaint.openai.shared import PARSE_FALLTHROUGH_COUNTS, parse_openai
-from langchaint.pricing import Billing
-from langchaint.shared_backoff import (
-    DoNotRetry,
-    PauseAll,
-    PauseAllDoNotRetry,
-    RetryThisOne,
-    Verdict,
-)
 from langchaint.tools import ToolSchema
 from tests.helpers import (
     openai_sdk_errors_and_classifications,

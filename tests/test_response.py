@@ -45,9 +45,9 @@ from langchaint import (
     Usage,
     to_tables,
 )
-from langchaint.adapter import ProviderBilling, RequestParams
-from langchaint.call import ResponseIdentity, _CallLedger, _less_than_or_ulp_close
-from langchaint.response import _abandoned_call_error, _success_variant
+from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity
+from langchaint.generation.call import _CallLedger, _less_than_or_ulp_close
+from langchaint.generation.response import _abandoned_call_error, _success_variant
 from tests.helpers import StubRaw
 
 

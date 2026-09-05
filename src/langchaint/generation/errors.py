@@ -1,11 +1,12 @@
-"""Provider-neutral exception and normalized generation error records."""
+"""Normalized generation error records and live generation failures."""
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, override
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, model_validator
 
-from langchaint.call import (
+from langchaint.billing.usage import Usage
+from langchaint.common.messages import AssistantMessage, StopReason
+from langchaint.generation.call import (
     AttemptProviderData,
     CallRecord,
     CutOffAttemptRecord,
@@ -15,41 +16,9 @@ from langchaint.call import (
     _require_completed_model_turn,
     _settled_attempts,
 )
-from langchaint.messages import AssistantMessage, StopReason
-from langchaint.usage import Usage
 
 if TYPE_CHECKING:
     from langchaint.adapter import ErrorClassification, RequestParams
-    from langchaint.tools import DispatchManyOutcome
-
-
-class TransientError(Exception):
-    """One failed attempt that a retry may fix.
-
-    `__cause__` holds the original provider exception when one exists.
-    Retry loops raise `TransientError` inside `SharedBackoff.admitted()`.
-    `SettledAttemptRecord.error` preserves normalized failure data.
-    `SettledAttemptRecord.billing` preserves billing from the same request.
-    """
-
-    retry_after_seconds: float | None
-    is_rate_limit: bool
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        retry_after_seconds: float | None = None,
-        is_rate_limit: bool = False,
-    ) -> None:
-        """Store the server-stated wait and rate-limit classification."""
-        super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
-        self.is_rate_limit = is_rate_limit
-
-
-class EmbeddingOutputError(RuntimeError):
-    """A provider returned unusable embedding vectors."""
 
 
 class _GenerationErrorRecordBase(_CallResultRecordBase):
@@ -507,94 +476,3 @@ class GenerationError(Exception):
     def __str__(self) -> str:
         """Return `error_text`."""
         return self.error_text
-
-
-class InvalidToolArgsError(Exception):
-    """A tool call's `args_json` failed validation against the tool's `args_model`.
-
-    `PydanticTool._validated_args` raises this error.
-    A tool function does not cause langchaint to raise this error.
-    `ToolManager.dispatch` catches this error and returns `DispatchInvalidToolArgs`.
-    """
-
-    validation_error: ValidationError
-
-    def __init__(self, validation_error: ValidationError) -> None:
-        """Hold `validation_error` by reference."""
-        super().__init__()
-        self.validation_error = validation_error
-
-    @override
-    def __str__(self) -> str:
-        """Render the held validation error."""
-        return str(self.validation_error)
-
-
-class DispatchExceptionGroup(ExceptionGroup[Exception]):
-    """Tool function exceptions from `ToolManager.dispatch_many`.
-
-    `completed_outcomes` preserves settled outcomes in input order.
-    The grouped exceptions preserve input order and their tracebacks.
-    Cancellation propagates separately with this group as its cause when both occur.
-    """
-
-    completed_outcomes: "tuple[DispatchManyOutcome, ...]"
-
-    def __new__(
-        cls,
-        message: str,
-        exceptions: Sequence[Exception],
-        *,
-        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
-    ) -> Self:
-        """Build a group carrying the completed dispatch outcomes."""
-        group = super().__new__(cls, message, exceptions)
-        group.completed_outcomes = completed_outcomes
-        return group
-
-    def __init__(
-        self,
-        message: str,
-        exceptions: Sequence[Exception],
-        *,
-        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
-    ) -> None:
-        """Store grouped exceptions and completed dispatch outcomes."""
-        super().__init__(message, exceptions)
-        self.completed_outcomes = completed_outcomes
-
-    @override
-    # pyrefly: ignore[bad-override]  # Typeshed makes `derive` generic for each call.
-    def derive(self, excs: Sequence[Exception], /) -> "DispatchExceptionGroup":
-        """Return a subgroup with the same `completed_outcomes`."""
-        return DispatchExceptionGroup(
-            self.message, excs, completed_outcomes=self.completed_outcomes
-        )
-
-
-class StreamProtocolError(Exception):
-    """A stream did not follow the event contract.
-
-    A stream that ends without a terminal result raises this error.
-    A missing Messages API stop reason or Responses API terminal response raises this error.
-    A `StreamHandle` that ends without an adapter stream raises this error.
-    `AdapterStream.final()` may raise this error before `AdapterStream.items()` is exhausted.
-    """
-
-
-class GaveUpWaiting(Exception):  # noqa: N818
-    """A budget expired before `SharedBackoff.admitted()` admitted the request.
-
-    The admission holds no permit or queue position and records no request.
-    A new attempt joins the same queue behind the same pause.
-    """
-
-
-class ParserContractError(Exception):
-    """A `SharedBackoff` parse function raised.
-
-    This error identifies a defect in `parse` instead of a provider classification.
-    `__cause__` holds the exception from `parse`.
-    The provider failure passed to `parse` remains as exception context.
-    `SharedBackoff` records no request outcome for this error.
-    """

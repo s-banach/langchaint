@@ -41,7 +41,8 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 import langchaint  # noqa: TC001 (required for runtime type introspection)
-from langchaint.llm import LLM
+from langchaint.concurrency.shared_backoff import SharedBackoff
+from langchaint.generation.llm import LLM
 from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelName
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.responses_adapter import (
@@ -57,7 +58,6 @@ from langchaint.openai.shared import (
     client_without_retries,
     parse_openai,
 )
-from langchaint.shared_backoff import SharedBackoff
 
 type OpenAIEmbeddingModelName = Literal[
     "text-embedding-3-small",

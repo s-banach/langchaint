@@ -10,7 +10,7 @@ from typing import Annotated, Literal, TypeIs
 
 from pydantic import BeforeValidator, ConfigDict, Field, FiniteFloat, TypeAdapter, model_validator
 
-from langchaint.checked_copy import CheckedCopyModel
+from langchaint.common.checked_copy import CheckedCopyModel
 
 
 def _is_object_list(value: object) -> TypeIs[list[object]]:

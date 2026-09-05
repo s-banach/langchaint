@@ -53,8 +53,8 @@ from langchaint.anthropic.messages_adapter import (
     client_without_retries,
     parse_anthropic,
 )
-from langchaint.llm import LLM
-from langchaint.shared_backoff import SharedBackoff
+from langchaint.concurrency.shared_backoff import SharedBackoff
+from langchaint.generation.llm import LLM
 
 _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items())
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""

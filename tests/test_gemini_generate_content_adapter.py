@@ -52,8 +52,9 @@ from langchaint.adapter import (
     ToolChoice,
     UnfinishedTurn,
 )
+from langchaint.common.exceptions import TransientError
+from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.conformance import AdapterConformance
-from langchaint.exceptions import TransientError
 from langchaint.gemini import (
     GeminiGenerateContentAdapter,
     GeminiPricingTable,
@@ -70,7 +71,6 @@ from langchaint.gemini.generate_content_adapter import (
     _GeminiRequestParams,
     _GeminiStream,
 )
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
 from langchaint.tools import ToolSchema
 
 

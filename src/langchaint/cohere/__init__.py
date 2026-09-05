@@ -37,7 +37,18 @@ from langchaint.adapter import (
     ErrorClassification,
     retry_after_seconds_from_headers,
 )
-from langchaint.cancellation import await_task_cancellation_safe, to_thread_cancellation_safe
+from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.concurrency.cancellation import (
+    await_task_cancellation_safe,
+    to_thread_cancellation_safe,
+)
+from langchaint.concurrency.shared_backoff import (
+    DoNotRetry,
+    PauseAll,
+    RetryThisOne,
+    SharedBackoff,
+    Verdict,
+)
 from langchaint.embedding import (
     EmbeddingModel,
     EmbeddingTask,
@@ -45,13 +56,11 @@ from langchaint.embedding import (
     _EmbeddingAdapter,
     _validated_embeddings,
 )
-from langchaint.exceptions import EmbeddingOutputError
-from langchaint.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, SharedBackoff, Verdict
 
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
-    from langchaint.sequence_not_str import SequenceNotStr
+    from langchaint.common.sequence_not_str import SequenceNotStr
 
 
 type CohereEmbedV4Dimension = Literal[256, 512, 1024, 1536]

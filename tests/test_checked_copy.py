@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ConfigDict
 
-from langchaint.checked_copy import CheckedCopyModel
+from langchaint.common.checked_copy import CheckedCopyModel
 
 
 def test_a_subclass_defining_its_own_init_is_rejected() -> None:

@@ -71,22 +71,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
-from langchaint.call import SettledAttemptRecord
-from langchaint.exceptions import (
-    AbandonedCallErrorRecord,
-    GenerationError,
-    GenerationErrorRecord,
-)
-from langchaint.llm import (
-    LLM,
-    UNCHANGED,
-    BoundLLM,
-    Deadline,
-    GenerationInput,
-    Unchanged,
-    WallClockDeadline,
-)
-from langchaint.messages import (
+from langchaint.common.messages import (
     AssistantMessage,
     ContentPart,
     Message,
@@ -98,7 +83,25 @@ from langchaint.messages import (
     TurnPart,
     UserMessage,
 )
-from langchaint.response import (
+from langchaint.common.sequence_not_str import SequenceNotStr
+from langchaint.concurrency.shared_backoff import SharedBackoff
+from langchaint.generation.call import SettledAttemptRecord
+from langchaint.generation.errors import (
+    AbandonedCallErrorRecord,
+    GenerationError,
+    GenerationErrorRecord,
+)
+from langchaint.generation.llm import (
+    LLM,
+    UNCHANGED,
+    BoundLLM,
+    Deadline,
+    GenerationInput,
+    Unchanged,
+    WallClockDeadline,
+    _generate_many,
+)
+from langchaint.generation.response import (
     CallResult,
     CallResultRecord,
     GenerateResult,
@@ -106,9 +109,7 @@ from langchaint.response import (
     ResponseRecord,
     ToolCallTurn,
 )
-from langchaint.sequence_not_str import SequenceNotStr
-from langchaint.shared_backoff import SharedBackoff
-from langchaint.streaming import StreamHandle
+from langchaint.generation.streaming import StreamHandle
 from langchaint.tools import (
     DispatchHandled,
     DispatchInvalidToolArgs,
@@ -1286,7 +1287,7 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         The overloads mirror BoundLLM.generate_many's, so each result's output is typed per binding.
 
-        `generation_inputs`, `warm_cache`, and `max_working_seconds_per_item` pass through to `BoundLLM.generate_many`.
+        `_generate_many` coordinates inputs and invokes `_generate_one_any_binding` for each started item.
 
         Raises:
             asyncio.CancelledError: an outer scope cancelled the batch. Each started span ended.
@@ -1294,8 +1295,9 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 Started items are cancelled and awaited before it propagates.
         """
         # `_generate_one_any_binding` accepts each overloaded `response_format`.
-        return await self._bound_llm._generate_many_any_binding(  # noqa: SLF001
+        return await _generate_many(
             generation_inputs,
+            max_concurrent_requests=self.shared_backoff.max_concurrent_requests,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
             max_working_seconds_per_item=max_working_seconds_per_item,

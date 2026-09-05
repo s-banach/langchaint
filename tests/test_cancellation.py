@@ -5,8 +5,8 @@ import threading
 
 import pytest
 
-from langchaint._generate_many_records import _run_resume_io
-from langchaint.cancellation import to_thread_cancellation_safe
+from langchaint.concurrency.cancellation import to_thread_cancellation_safe
+from langchaint.generation._generate_many_records import _run_resume_io
 
 
 def test_run_resume_io_settles_before_cancellation_propagates() -> None:

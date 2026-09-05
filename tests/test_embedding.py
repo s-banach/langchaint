@@ -10,9 +10,9 @@ import pytest
 
 from langchaint import EmbeddingModel, EmbeddingOutputError, Float2D
 from langchaint.adapter import ErrorClassification
+from langchaint.common.sequence_not_str import SequenceNotStr
+from langchaint.concurrency.shared_backoff import DoNotRetry, RetryThisOne, SharedBackoff, Verdict
 from langchaint.embedding import EmbeddingTask, _validated_embeddings
-from langchaint.sequence_not_str import SequenceNotStr
-from langchaint.shared_backoff import DoNotRetry, RetryThisOne, SharedBackoff, Verdict
 
 
 class _ProviderError(Exception):

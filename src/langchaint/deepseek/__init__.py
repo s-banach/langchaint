@@ -27,7 +27,8 @@ except ModuleNotFoundError as exc:
 
 from openai.types.completion_usage import CompletionUsage
 
-from langchaint.llm import LLM
+from langchaint.concurrency.shared_backoff import SharedBackoff
+from langchaint.generation.llm import LLM
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.shared import (
     OpenAIPricingTable,
@@ -35,7 +36,6 @@ from langchaint.openai.shared import (
     client_without_retries,
     parse_openai,
 )
-from langchaint.shared_backoff import SharedBackoff
 
 type DeepSeekModelName = Literal["deepseek-v4-flash", "deepseek-v4-pro"]
 """Model identifiers with public prices in DEEPSEEK_PRICING."""

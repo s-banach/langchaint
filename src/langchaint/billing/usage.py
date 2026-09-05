@@ -8,7 +8,7 @@ from collections.abc import Iterable
 
 from pydantic import ConfigDict, NonNegativeInt, field_serializer
 
-from langchaint.checked_copy import CheckedCopyModel
+from langchaint.common.checked_copy import CheckedCopyModel
 
 
 class Usage(CheckedCopyModel):

@@ -16,9 +16,9 @@ from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Literal
 
-from langchaint.exceptions import GaveUpWaiting, ParserContractError
+from langchaint.common.exceptions import GaveUpWaiting, ParserContractError
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("langchaint.shared_backoff")
 
 _NEVER = float("-inf")
 """The moment before every other: the initial pause end and the initial admission time."""

@@ -26,7 +26,7 @@ from langchaint import (
     Usage,
 )
 from langchaint.adapter import ErrorClassification, ProviderBilling
-from langchaint.shared_backoff import (
+from langchaint.concurrency.shared_backoff import (
     DoNotRetry,
     PauseAll,
     PauseAllDoNotRetry,

@@ -37,9 +37,9 @@ from langchaint.adapter import (
     ErrorClassification,
     ProviderBilling,
     RequestParams,
+    ResponseIdentity,
     verdict_from_transient_error,
 )
-from langchaint.call import ResponseIdentity
 
 
 class FakeRaw(BaseModel):

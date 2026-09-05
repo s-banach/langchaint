@@ -20,10 +20,10 @@ from pydantic import BaseModel
 
 from langchaint.anthropic import messages_adapter
 from langchaint.cohere import _INVOKE_MODEL_MAX_BODY_BYTES
+from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll
 from langchaint.gemini import generate_content_adapter
 from langchaint.openai import responses_adapter as openai_responses
 from langchaint.openai import shared as openai_shared
-from langchaint.shared_backoff import DoNotRetry, PauseAll
 
 _ANTHROPIC_LISTED_STATUSES = (
     messages_adapter._PAUSE_STATUSES

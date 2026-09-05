@@ -57,7 +57,6 @@ from langchaint import (
     UserMessage,
     Verdict,
 )
-from langchaint import shared_backoff as shared_backoff_module
 from langchaint.adapter import (
     Adapter,
     AdapterResult,
@@ -74,14 +73,15 @@ from langchaint.adapter import (
     ProviderFailedTransiently,
     Refusal,
     RequestParams,
+    ResponseIdentity,
     ResponseOutcome,
     SchemaViolation,
     UnfinishedTurn,
     verdict_from_transient_error,
 )
-from langchaint.call import ResponseIdentity
-from langchaint.shared_backoff import _NEVER
-from langchaint.streaming import StreamHandle
+from langchaint.concurrency import shared_backoff as shared_backoff_module
+from langchaint.concurrency.shared_backoff import _NEVER
+from langchaint.generation.streaming import StreamHandle
 from tests.helpers import random_returns_zero, stated_provider_billing
 
 

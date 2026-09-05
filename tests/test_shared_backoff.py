@@ -8,9 +8,9 @@ from typing import Literal
 
 import pytest
 
-from langchaint import shared_backoff as shared_backoff_module
-from langchaint.exceptions import GaveUpWaiting, ParserContractError
-from langchaint.shared_backoff import (
+from langchaint.common.exceptions import GaveUpWaiting, ParserContractError
+from langchaint.concurrency import shared_backoff as shared_backoff_module
+from langchaint.concurrency.shared_backoff import (
     _NEVER,
     Admission,
     DoNotRetry,

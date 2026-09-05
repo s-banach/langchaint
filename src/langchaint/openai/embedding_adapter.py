@@ -13,20 +13,20 @@ from openai import AsyncOpenAI, omit
 from openai.types import Embedding as OpenAIEmbedding
 
 from langchaint.adapter import ErrorClassification, _require_provider_name
-from langchaint.cancellation import to_thread_cancellation_safe
+from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.sequence_not_str import SequenceNotStr
+from langchaint.concurrency.cancellation import to_thread_cancellation_safe
 from langchaint.embedding import (
     EmbeddingTask,
     Float2D,
     _EmbeddingAdapter,
     _validated_embeddings,
 )
-from langchaint.exceptions import EmbeddingOutputError
 from langchaint.openai.shared import (
     OPENAI_FAILURE_TYPES,
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     classify_openai,
 )
-from langchaint.sequence_not_str import SequenceNotStr
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

@@ -7,7 +7,7 @@ from functools import partial
 
 import pytest
 
-from langchaint.run_many import max_pending_for_requests, run_many
+from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 
 
 class _RunManyFailure(BaseException):

@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, override
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
-from langchaint.checked_copy import CheckedCopyModel
-from langchaint.messages import AssistantMessage
-from langchaint.pricing import Billing, ProviderBilling
-from langchaint.usage import ZERO_USAGE, Usage
+from langchaint.adapter import ResponseIdentity
+from langchaint.billing.pricing import Billing, ProviderBilling
+from langchaint.billing.usage import ZERO_USAGE, Usage
+from langchaint.common.checked_copy import CheckedCopyModel
+from langchaint.common.messages import AssistantMessage
 
 if TYPE_CHECKING:
-    from langchaint.exceptions import TransientError
+    from langchaint.common.exceptions import TransientError
 
 
 type _NonnegativeFiniteFloat = Annotated[FiniteFloat, Field(ge=0)]
@@ -28,14 +29,6 @@ def _less_than_or_ulp_close(left: float, right: float) -> bool:
         rel_tol=0.0,
         abs_tol=4 * max(math.ulp(left), math.ulp(right)),
     )
-
-
-class ResponseIdentity(NamedTuple):
-    """Provider response identifiers recorded on one settled attempt."""
-
-    model_served: str
-    response_id: str
-    request_id: str | None
 
 
 class TransientErrorRecord(CheckedCopyModel):

@@ -24,10 +24,10 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import ErrorClassification
-from langchaint.exceptions import EmbeddingOutputError
-from langchaint.run_many import max_pending_for_requests, run_many
-from langchaint.sequence_not_str import SequenceNotStr
-from langchaint.shared_backoff import (
+from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.sequence_not_str import SequenceNotStr
+from langchaint.concurrency.run_many import max_pending_for_requests, run_many
+from langchaint.concurrency.shared_backoff import (
     DoNotRetry,
     PauseAllDoNotRetry,
     PrivateBackoff,

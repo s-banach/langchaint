@@ -13,16 +13,6 @@ from typing import Any, NamedTuple, Protocol, overload
 
 from pydantic import BaseModel
 
-from langchaint._config_fingerprint import (
-    bound_llm_config_fingerprint,
-    capture_response_format_fingerprint_data,
-    generation_input_fingerprint,
-)
-from langchaint._generate_many_records import (
-    _run_resume_io,
-    claim_resume_path,
-    prepare_resume_state,
-)
 from langchaint.adapter import (
     Adapter,
     Binding,
@@ -32,22 +22,40 @@ from langchaint.adapter import (
     ResponseOutcome,
     ToolChoice,
 )
-from langchaint.call import _CallLedger
-from langchaint.exceptions import (
+from langchaint.billing.pricing import ProviderBilling
+from langchaint.common.exceptions import ParserContractError, StreamProtocolError, TransientError
+from langchaint.common.messages import AssistantMessage, Message, TextPart, UserMessage
+from langchaint.common.sequence_not_str import SequenceNotStr
+from langchaint.concurrency.run_many import max_pending_for_requests, run_many
+from langchaint.concurrency.shared_backoff import (
+    Admission,
+    DoNotRetry,
+    PauseAllDoNotRetry,
+    PrivateBackoff,
+    SharedBackoff,
+    Verdict,
+)
+from langchaint.generation._config_fingerprint import (
+    bound_llm_config_fingerprint,
+    capture_response_format_fingerprint_data,
+    generation_input_fingerprint,
+)
+from langchaint.generation._generate_many_records import (
+    _run_resume_io,
+    claim_resume_path,
+    prepare_resume_state,
+)
+from langchaint.generation.call import _CallLedger
+from langchaint.generation.errors import (
     EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
     InvalidRequestErrorRecord,
-    ParserContractError,
     RetriesExhaustedErrorRecord,
-    StreamProtocolError,
     TimedOutErrorRecord,
-    TransientError,
     _terminal_error_record,
 )
-from langchaint.messages import AssistantMessage, Message, TextPart, UserMessage
-from langchaint.pricing import ProviderBilling
-from langchaint.response import (
+from langchaint.generation.response import (
     CallResult,
     CallResultRecord,
     GenerateResult,
@@ -58,17 +66,7 @@ from langchaint.response import (
     _call_result_from_response_outcome,
     _result_record,
 )
-from langchaint.run_many import max_pending_for_requests, run_many
-from langchaint.sequence_not_str import SequenceNotStr
-from langchaint.shared_backoff import (
-    Admission,
-    DoNotRetry,
-    PauseAllDoNotRetry,
-    PrivateBackoff,
-    SharedBackoff,
-    Verdict,
-)
-from langchaint.streaming import StreamHandle, _close_stream_quietly
+from langchaint.generation.streaming import StreamHandle, _close_stream_quietly
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
 
@@ -265,6 +263,60 @@ class GenerateItem[OutputT](Protocol):
             GenerationError: the call failed; the batch turns it into that item's result.
         """
         ...
+
+
+async def _generate_or_failure[OutputT](
+    generation_input: GenerationInput,
+    *,
+    generate_item: "GenerateItem[OutputT]",
+    deadline: Deadline,
+) -> CallResult[OutputT | None]:
+    """Return one batch item as a success variant or `GenerationError`.
+
+    Raises:
+        BaseException: `generate_item` raises a value other than `GenerationError`.
+    """
+    try:
+        return await generate_item(generation_input, deadline=deadline)
+    except GenerationError as failure:
+        return failure
+
+
+async def _generate_many[OutputT](
+    generation_inputs: SequenceNotStr[GenerationInput],
+    *,
+    max_concurrent_requests: int | None,
+    warm_cache: bool,
+    generate_item: "GenerateItem[OutputT]",
+    max_working_seconds_per_item: float | None,
+) -> list[CallResult[OutputT | None]]:
+    """Run a batch at the widest output type.
+
+    Raises:
+        asyncio.CancelledError: The caller cancels the batch.
+        BaseException: An item raises a non-`Exception` value.
+    """
+
+    async def run_one(
+        generation_input: GenerationInput,
+    ) -> CallResult[OutputT | None]:
+        """Run one batch item under a deadline of its own.
+
+        Raises:
+            BaseException: Generation raises a value other than `GenerationError`.
+        """
+        return await _generate_or_failure(
+            generation_input,
+            generate_item=generate_item,
+            deadline=WorkingTimeDeadline(max_working_seconds_per_item),
+        )
+
+    run_ones = tuple(partial(run_one, generation_input) for generation_input in generation_inputs)
+    return await _run_many_with_warm_cache(
+        run_ones,
+        warm_cache=warm_cache,
+        max_pending=max_pending_for_requests(max_concurrent_requests),
+    )
 
 
 class LLM:
@@ -1081,23 +1133,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 provider_attempts=ledger.provider_attempts,
             ) from escaped
 
-    async def _generate_or_failure(
-        self,
-        generation_input: GenerationInput,
-        *,
-        generate_item: "GenerateItem[OutputT]",
-        deadline: Deadline,
-    ) -> CallResult[OutputT | None]:
-        """Return one batch item as a success variant or `GenerationError`.
-
-        Raises:
-            BaseException: `generate_item` raises a value other than `GenerationError`.
-        """
-        try:
-            return await generate_item(generation_input, deadline=deadline)
-        except GenerationError as failure:
-            return failure
-
     @overload
     async def generate_many(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1155,8 +1190,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             asyncio.CancelledError: The caller cancels the batch.
             BaseException: An item raises a non-`Exception` value.
         """
-        return await self._generate_many_any_binding(
+        return await _generate_many(
             generation_inputs,
+            max_concurrent_requests=self.shared_backoff.max_concurrent_requests,
             warm_cache=warm_cache,
             generate_item=self._generate_one_any_binding,
             max_working_seconds_per_item=max_working_seconds_per_item,
@@ -1302,7 +1338,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             pending_indices = resume_state.pending_indices()
 
             async def run_one(result_index: int) -> None:
-                result = await self._generate_or_failure(
+                result = await _generate_or_failure(
                     generation_input_snapshots[result_index],
                     generate_item=generate_item,
                     deadline=WorkingTimeDeadline(max_working_seconds_per_item),
@@ -1321,44 +1357,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
             )
             return resume_state.result_records()
-
-    async def _generate_many_any_binding(
-        self,
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool,
-        generate_item: "GenerateItem[OutputT]",
-        max_working_seconds_per_item: float | None,
-    ) -> list[CallResult[OutputT | None]]:
-        """Run a batch at the widest output type.
-
-        Raises:
-            asyncio.CancelledError: The caller cancels the batch.
-            BaseException: An item raises a non-`Exception` value.
-        """
-
-        async def run_one(
-            generation_input: GenerationInput,
-        ) -> CallResult[OutputT | None]:
-            """Run one batch item under a deadline of its own.
-
-            Raises:
-                BaseException: Generation raises a value other than `GenerationError`.
-            """
-            return await self._generate_or_failure(
-                generation_input,
-                generate_item=generate_item,
-                deadline=WorkingTimeDeadline(max_working_seconds_per_item),
-            )
-
-        run_ones = tuple(
-            partial(run_one, generation_input) for generation_input in generation_inputs
-        )
-        return await _run_many_with_warm_cache(
-            run_ones,
-            warm_cache=warm_cache,
-            max_pending=max_pending_for_requests(self.shared_backoff.max_concurrent_requests),
-        )
 
     @overload
     def stream_one(

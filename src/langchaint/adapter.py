@@ -8,15 +8,14 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, NamedTuple
 
 from pydantic import BaseModel
 
-from langchaint.call import ResponseIdentity
-from langchaint.exceptions import TransientError
-from langchaint.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
-from langchaint.pricing import ProviderBilling as ProviderBilling  # noqa: PLC0414
-from langchaint.shared_backoff import (
+from langchaint.billing.pricing import ProviderBilling as ProviderBilling  # noqa: PLC0414
+from langchaint.common.exceptions import TransientError
+from langchaint.common.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
+from langchaint.concurrency.shared_backoff import (
     DoNotRetry,
     PauseAll,
     PauseAllDoNotRetry,
@@ -26,6 +25,15 @@ from langchaint.shared_backoff import (
 from langchaint.tools import ToolSchema
 
 _logger = logging.getLogger(__name__)
+
+
+class ResponseIdentity(NamedTuple):
+    """Provider response identifiers recorded on one settled attempt."""
+
+    model_served: str
+    response_id: str
+    request_id: str | None
+
 
 type ErrorClassification = Literal[
     "transient", "invalid_request", "declared_final", "unknown_exception"

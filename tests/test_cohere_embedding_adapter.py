@@ -18,7 +18,7 @@ from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
 from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
-from langchaint.exceptions import EmbeddingOutputError
+from langchaint.common.exceptions import EmbeddingOutputError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine

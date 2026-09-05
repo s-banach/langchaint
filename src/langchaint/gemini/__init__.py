@@ -35,6 +35,7 @@ except ModuleNotFoundError as exc:
         "langchaint's gemini backend requires google-genai; install langchaint[gemini]."
     ) from exc
 
+from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.gemini.generate_content_adapter import (
     GeminiGenerateContentAdapter,
     GeminiPricedServiceTier,
@@ -44,8 +45,7 @@ from langchaint.gemini.generate_content_adapter import (
     assembled_response,
     parse_gemini,
 )
-from langchaint.llm import LLM
-from langchaint.shared_backoff import SharedBackoff
+from langchaint.generation.llm import LLM
 
 type GeminiModelName = Literal[
     "gemini-3.6-flash",

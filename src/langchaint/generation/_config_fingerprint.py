@@ -13,7 +13,7 @@ import pydantic
 from pydantic import BaseModel
 
 from langchaint.adapter import Adapter, AllowedToolsChoice, Binding, SpecificToolChoice
-from langchaint.messages import Message
+from langchaint.common.messages import Message
 from langchaint.tools import ToolSchema
 
 type _CanonicalValue = None | bool | str | list[_CanonicalValue]

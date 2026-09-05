@@ -24,6 +24,9 @@ uv run pyrefly check || ci_exit_status=1
 echo "=== pyrefly coverage check ==="
 uv run pyrefly coverage check || ci_exit_status=1
 
+echo "=== dependency architecture ==="
+uv run python -m scripts.check_architecture || ci_exit_status=1
+
 echo "=== pytest ==="
 uv run pytest || ci_exit_status=1
 

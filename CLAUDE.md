@@ -43,7 +43,7 @@ Document every public parameter and cross-provider difference.
 ## Application API
 
 - Keep request execution, stream consumption, embeddings, and tool dispatch asynchronous.
-- Run synchronous provider work through `cancellation.py` so cancellation waits for the work to settle.
+- Run synchronous provider work through `concurrency/cancellation.py` so cancellation waits for the work to settle.
 - Leave agent loops and tool loops to applications.
 - Make tool functions return data without control-flow signals.
 
@@ -115,6 +115,10 @@ Document every public parameter and cross-provider difference.
 - Applications import from top-level `langchaint` and backend subpackages.
 - Adapter authors import from `langchaint.adapter` and `langchaint.conformance`.
 - Top-level `__all__` re-exports only the SDK-free application surface.
+- Keep source-module imports acyclic, including `TYPE_CHECKING` and function-local imports.
+- Keep dependencies between sibling directories and root modules acyclic.
+- Keep `common/` independent of other langchaint directories and root modules.
+- Run `uv run python -m scripts.check_architecture` to check explicit source imports for these dependency rules.
 
 ## Tracing
 
@@ -129,26 +133,28 @@ Document every public parameter and cross-provider difference.
 
 ## Module map
 
-- `llm.py`: client binding and generation.
-- `_config_fingerprint.py`: deterministic binding and generation-input fingerprints.
-- `_generate_many_records.py`: validated JSON resume state and atomic result-record persistence.
-- `adapter.py`: the SDK-free neutral adapter contract.
-- `cancellation.py`: cancellation-safe synchronous provider work.
+- `generation/llm.py`: client binding, generation, and shared batch coordination.
+- `generation/_config_fingerprint.py`: deterministic binding and generation-input fingerprints.
+- `generation/_generate_many_records.py`: validated JSON resume state and atomic result-record persistence.
+- `adapter.py`: the SDK-free neutral adapter contract and `ResponseIdentity`.
+- `concurrency/cancellation.py`: cancellation-safe synchronous provider work.
 - `conformance.py`: SDK-free adapter invariants that adapter tests inherit.
 - `embedding.py`: provider-neutral embedding execution and output validation.
-- `shared_backoff.py`: request admission for one rate-limit quota.
-- `exceptions.py`: the error types.
-- `response.py`: generation results and tabular call and attempt views.
-- `call.py`: attempt records, immutable call history, and retry accounting.
-- `streaming.py`: the stream handle.
-- `tools.py`: tool forms, dispatch, and dispatch outcomes.
-- `messages.py`: provider-neutral messages, content parts, and JSON round trips.
-- `usage.py`: token accounting and per-category costs.
-- `checked_copy.py`: the base for langchaint pydantic models.
-- `pricing.py`: SDK-free rate arithmetic and per-attempt `Billing`.
+- `concurrency/shared_backoff.py`: request admission for one rate-limit quota.
+- `common/exceptions.py`: basic shared exceptions without langchaint imports.
+- `generation/errors.py`: normalized generation error records and live generation failures.
+- `generation/response.py`: generation results and normalized result records.
+- `generation/tables.py`: tabular call and attempt views.
+- `generation/call.py`: attempt records, immutable call history, and retry accounting.
+- `generation/streaming.py`: the stream handle.
+- `tools.py`: tool forms, dispatch, dispatch outcomes, and tool exceptions.
+- `common/messages.py`: provider-neutral messages, content parts, and JSON round trips.
+- `billing/usage.py`: token accounting and per-category costs.
+- `common/checked_copy.py`: the base for langchaint pydantic models.
+- `billing/pricing.py`: SDK-free rate arithmetic and per-attempt `Billing`.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: backend subpackages that require their SDKs.
-- `run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
-- `sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
+- `concurrency/run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
+- `common/sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
 - `tracing/`: the optional OTel subpackage.
 - `span_parsing.py`: OTel chat span parsing and conversion without OpenTelemetry dependencies.
 

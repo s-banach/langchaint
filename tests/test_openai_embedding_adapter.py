@@ -13,13 +13,13 @@ import pytest
 import tiktoken
 from openai import AsyncOpenAI
 
-from langchaint.exceptions import EmbeddingOutputError
+from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.concurrency.shared_backoff import PrivateBackoff
 from langchaint.openai import OpenAI
 from langchaint.openai.embedding_adapter import (
     _OpenAIEmbeddingAdapter,
     _partition_inputs_sync,
 )
-from langchaint.shared_backoff import PrivateBackoff
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:

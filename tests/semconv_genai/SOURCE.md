@@ -2,8 +2,8 @@
 
 Source repository: <https://github.com/open-telemetry/semantic-conventions-genai>.
 Tracked reference: `main`.
-Resolved commit SHA: `ac46a5d7bfe0b0f47e8ce393e2db3a2c3042f236`.
-Resolved Weaver version: `v0.25.1`.
+Resolved commit SHA: `94f432d7126f5884d30a2cdde6f4e89908ebb6fd`.
+Resolved Weaver version: `v0.26.1`.
 License: Apache-2.0.
 
 `chat-span-attributes.json` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.

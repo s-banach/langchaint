@@ -73,38 +73,28 @@ class Usage(CheckedCopyModel):
         Args:
             usages: The usage values to sum.
         """
-        input_tokens_cache_read = 0
-        input_tokens_cache_write = 0
-        input_tokens_cache_none = 0
-        output_tokens = 0
-        output_tokens_reasoning = 0
-        input_tokens_cache_read_cost_in_usd = 0.0
-        input_tokens_cache_write_cost_in_usd = 0.0
-        input_tokens_cache_none_cost_in_usd = 0.0
-        output_tokens_cost_in_usd = 0.0
-        provider_executed_tool_cost_in_usd = 0.0
-        for usage in usages:
-            input_tokens_cache_read += usage.input_tokens_cache_read
-            input_tokens_cache_write += usage.input_tokens_cache_write
-            input_tokens_cache_none += usage.input_tokens_cache_none
-            output_tokens += usage.output_tokens
-            output_tokens_reasoning += usage.output_tokens_reasoning
-            input_tokens_cache_read_cost_in_usd += usage.input_tokens_cache_read_cost_in_usd
-            input_tokens_cache_write_cost_in_usd += usage.input_tokens_cache_write_cost_in_usd
-            input_tokens_cache_none_cost_in_usd += usage.input_tokens_cache_none_cost_in_usd
-            output_tokens_cost_in_usd += usage.output_tokens_cost_in_usd
-            provider_executed_tool_cost_in_usd += usage.provider_executed_tool_cost_in_usd
+        usage_values = tuple(usages)
         return Usage(
-            input_tokens_cache_read=input_tokens_cache_read,
-            input_tokens_cache_write=input_tokens_cache_write,
-            input_tokens_cache_none=input_tokens_cache_none,
-            output_tokens=output_tokens,
-            output_tokens_reasoning=output_tokens_reasoning,
-            input_tokens_cache_read_cost_in_usd=input_tokens_cache_read_cost_in_usd,
-            input_tokens_cache_write_cost_in_usd=input_tokens_cache_write_cost_in_usd,
-            input_tokens_cache_none_cost_in_usd=input_tokens_cache_none_cost_in_usd,
-            output_tokens_cost_in_usd=output_tokens_cost_in_usd,
-            provider_executed_tool_cost_in_usd=provider_executed_tool_cost_in_usd,
+            input_tokens_cache_read=sum(usage.input_tokens_cache_read for usage in usage_values),
+            input_tokens_cache_write=sum(usage.input_tokens_cache_write for usage in usage_values),
+            input_tokens_cache_none=sum(usage.input_tokens_cache_none for usage in usage_values),
+            output_tokens=sum(usage.output_tokens for usage in usage_values),
+            output_tokens_reasoning=sum(usage.output_tokens_reasoning for usage in usage_values),
+            input_tokens_cache_read_cost_in_usd=sum(
+                usage.input_tokens_cache_read_cost_in_usd for usage in usage_values
+            ),
+            input_tokens_cache_write_cost_in_usd=sum(
+                usage.input_tokens_cache_write_cost_in_usd for usage in usage_values
+            ),
+            input_tokens_cache_none_cost_in_usd=sum(
+                usage.input_tokens_cache_none_cost_in_usd for usage in usage_values
+            ),
+            output_tokens_cost_in_usd=sum(
+                usage.output_tokens_cost_in_usd for usage in usage_values
+            ),
+            provider_executed_tool_cost_in_usd=sum(
+                usage.provider_executed_tool_cost_in_usd for usage in usage_values
+            ),
         )
 
 

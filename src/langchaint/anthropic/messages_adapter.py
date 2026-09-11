@@ -995,18 +995,20 @@ def _billing_from_sdk_usage(
     if provider_tools.web_search and not billing_complete:
         provider_executed_tool_cost_in_usd = nan
     if server_tool_use is not None:
-        known_zero_fee_counters: set[str] = set()
+        accounted_counters = {"web_search_requests"}
         if provider_tools.web_fetch:
-            known_zero_fee_counters.add("web_fetch_requests")
+            accounted_counters.add("web_fetch_requests")
         if provider_tools.tool_search:
-            known_zero_fee_counters.add("tool_search_requests")
+            accounted_counters.add("tool_search_requests")
         if provider_tools.code_execution_exempt:
-            known_zero_fee_counters.add("code_execution_requests")
-        for counter_name, counter in server_tool_use.model_dump().items():
-            if counter_name == "web_search_requests" or counter_name in known_zero_fee_counters:
-                continue
-            if counter_name.endswith("_requests") and counter:
-                provider_executed_tool_cost_in_usd = nan
+            accounted_counters.add("code_execution_requests")
+        unaccounted_counter_fired = any(
+            counter_name.endswith("_requests") and counter
+            for counter_name, counter in server_tool_use.model_dump().items()
+            if counter_name not in accounted_counters
+        )
+        if unaccounted_counter_fired:
+            provider_executed_tool_cost_in_usd = nan
     return rates.price(
         service_tier=service_tier,
         usage_raw=usage,

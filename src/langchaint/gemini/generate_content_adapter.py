@@ -457,11 +457,12 @@ _PROVIDER_FIELD_BY_TOOL_TYPE = {
 
 def _all_candidate_parts(response: types.GenerateContentResponse) -> list[types.Part]:
     """Return every part from every response candidate."""
-    parts: list[types.Part] = []
-    for candidate in response.candidates or []:
-        if candidate.content is not None and candidate.content.parts is not None:
-            parts.extend(candidate.content.parts)
-    return parts
+    return [
+        part
+        for candidate in response.candidates or []
+        if candidate.content is not None and candidate.content.parts is not None
+        for part in candidate.content.parts
+    ]
 
 
 def _queries_from_tool_call(tool_call: types.ToolCall, *, maps: bool) -> list[str] | None:

@@ -554,19 +554,15 @@ def request_json(request: RequestParams, *, omitted_class: type) -> str:
 
 def _without_omitted(value: object, omitted_class: type) -> object:
     if isinstance(value, dict):
-        without_omitted: dict[object, object] = {}
-        for key, item in value.items():
-            key_object: object = key
-            item_object: object = item
-            if not isinstance(item_object, omitted_class):
-                without_omitted[key_object] = _without_omitted(item_object, omitted_class)
-        return without_omitted
+        mapping: Mapping[object, object] = value
+        return {
+            key: _without_omitted(item, omitted_class)
+            for key, item in mapping.items()
+            if not isinstance(item, omitted_class)
+        }
     if isinstance(value, list):
-        without_omitted_items: list[object] = []
-        for item in value:
-            item_object: object = item
-            without_omitted_items.append(_without_omitted(item_object, omitted_class))
-        return without_omitted_items
+        items: Sequence[object] = value
+        return [_without_omitted(item, omitted_class) for item in items]
     return value
 
 

@@ -77,11 +77,10 @@ def _require_retry_failures(call: CallRecord) -> tuple[TransientErrorRecord, ...
 
 
 def _retries_exhausted_error_text(call: CallRecord) -> str:
-    entries: list[str] = []
-    for attempt_number, error in enumerate(_require_retry_failures(call), start=1):
-        indented_message = error.message.replace("\n", "\n  ")
-        entries.append(f"attempt {attempt_number}: {indented_message}")
-    return "\n".join(entries)
+    return "\n".join(
+        f"attempt {attempt_number}: {error.message.replace('\n', '\n  ')}"
+        for attempt_number, error in enumerate(_require_retry_failures(call), start=1)
+    )
 
 
 def _retry_unavailable_error_text(call: CallRecord) -> str:

@@ -91,6 +91,7 @@ from langchaint.concurrency.shared_backoff import (
 )
 from langchaint.conformance import AdapterConformance
 from langchaint.openai import (
+    OpenAILongContextPricing,
     OpenAIPricingTable,
     OpenAIRates,
     OpenAIResponsesAdapter,
@@ -383,6 +384,31 @@ def test_the_reported_tier_selects_the_table() -> None:
     assert at_priority.cost_in_usd == pytest.approx(2 * at_default.cost_in_usd)
     assert reporting_auto.cost_in_usd == at_default.cost_in_usd
     assert reporting_none.cost_in_usd == at_default.cost_in_usd
+
+
+def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> None:
+    """`multiplied` scales every stated tier's token rates and preserves the other fields."""
+    long_context = OpenAILongContextPricing(
+        input_tokens_above=272_000, input_multiplier=2.0, output_multiplier=1.5
+    )
+    table = OpenAIPricingTable(
+        default=_DEFAULT_RATES,
+        flex=_DEFAULT_RATES,
+        scale=_DEFAULT_RATES,
+        long_context=long_context,
+        regional_processing_multiplier=1.1,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
+    )
+    assert table.multiplied(2.0) == OpenAIPricingTable(
+        default=_PRIORITY_RATES,
+        flex=_PRIORITY_RATES,
+        scale=_PRIORITY_RATES,
+        long_context=long_context,
+        regional_processing_multiplier=1.1,
+        web_search_usd_per_invocation=0.01,
+        file_search_usd_per_invocation=0.0025,
+    )
 
 
 def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:

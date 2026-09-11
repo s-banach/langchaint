@@ -11,6 +11,7 @@ DeepSeek charges twice those prices during its documented peak windows.
 Cache hits use `cache_read_usd_per_million_tokens`.
 Cache misses use `input_cache_none_usd_per_million_tokens`.
 Cache writes cost zero.
+`DeepSeek.model(pricing=...)` takes `OpenAIRates` because DeepSeek bills the same categories as OpenAI.
 """
 
 import os
@@ -185,5 +186,6 @@ __all__ = [
     "DEEPSEEK_PRICING",
     "DeepSeek",
     "DeepSeekModelName",
+    "OpenAIRates",
     "cache_read_tokens_from_usage_deepseek",
 ]

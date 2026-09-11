@@ -226,7 +226,11 @@ def client_without_retries[ClientT: AnthropicClient](client: ClientT) -> ClientT
 
 @dataclass(frozen=True, kw_only=True)
 class AnthropicRates:
-    """Anthropic token rates for one service tier."""
+    """Anthropic token rates for one service tier.
+
+    Pass NaN for an unknown rate.
+    A nonzero counter in that category then costs NaN, and a zero counter costs zero.
+    """
 
     input_cache_none_usd_per_million_tokens: float
     output_usd_per_million_tokens: float

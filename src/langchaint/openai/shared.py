@@ -124,7 +124,11 @@ def _priced_tier(
 
 @dataclass(frozen=True, kw_only=True)
 class OpenAIRates:
-    """OpenAI token rates for one service tier."""
+    """OpenAI token rates for one service tier.
+
+    Pass NaN for an unknown rate.
+    A nonzero counter in that category then costs NaN, and a zero counter costs zero.
+    """
 
     input_cache_none_usd_per_million_tokens: float
     output_usd_per_million_tokens: float
@@ -263,6 +267,31 @@ class OpenAIPricingTable:
             return
         if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
             raise ValueError("regional_processing_multiplier must be finite and positive")
+
+    def multiplied(self, multiplier: float) -> "OpenAIPricingTable":
+        """Return the table with every token rate multiplied by one value.
+
+        Long-context multipliers, the regional multiplier, and per-invocation prices are unchanged.
+        """
+
+        def scaled(rates: OpenAIRates | None) -> OpenAIRates | None:
+            if rates is None:
+                return None
+            return rates.multiplied(input_multiplier=multiplier, output_multiplier=multiplier)
+
+        return OpenAIPricingTable(
+            default=self.default.multiplied(
+                input_multiplier=multiplier, output_multiplier=multiplier
+            ),
+            flex=scaled(self.flex),
+            fast=scaled(self.fast),
+            ultrafast=scaled(self.ultrafast),
+            scale=scaled(self.scale),
+            long_context=self.long_context,
+            regional_processing_multiplier=self.regional_processing_multiplier,
+            web_search_usd_per_invocation=self.web_search_usd_per_invocation,
+            file_search_usd_per_invocation=self.file_search_usd_per_invocation,
+        )
 
     def rates_for(
         self,

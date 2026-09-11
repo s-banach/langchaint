@@ -244,11 +244,23 @@ class GeminiRates:
     """One rate per category Gemini bills on a request.
 
     No cache-write rate: no cache write is ever billed, so none exists to state.
+    Pass NaN for an unknown rate.
+    A nonzero counter in that category then costs NaN, and a zero counter costs zero.
     """
 
     input_cache_none_usd_per_million_tokens: float
     cache_read_usd_per_million_tokens: float
     output_usd_per_million_tokens: float
+
+    def multiplied(self, multiplier: float) -> "GeminiRates":
+        """Return token rates multiplied by one value."""
+        return GeminiRates(
+            input_cache_none_usd_per_million_tokens=(
+                self.input_cache_none_usd_per_million_tokens * multiplier
+            ),
+            cache_read_usd_per_million_tokens=self.cache_read_usd_per_million_tokens * multiplier,
+            output_usd_per_million_tokens=self.output_usd_per_million_tokens * multiplier,
+        )
 
 
 _NO_CACHE_WRITE_RATE = float("nan")
@@ -283,6 +295,23 @@ class GeminiPricingTable:
             raise ValueError(
                 "long_prompt_threshold_tokens and long_prompt_rates must be set together"
             )
+
+    def multiplied(self, multiplier: float) -> "GeminiPricingTable":
+        """Return the table with every token rate multiplied by one value.
+
+        Per-query tool prices and the long-prompt threshold are unchanged.
+        """
+        return GeminiPricingTable(
+            rates=self.rates.multiplied(multiplier),
+            google_search_usd_per_query=self.google_search_usd_per_query,
+            google_maps_usd_per_query=self.google_maps_usd_per_query,
+            long_prompt_threshold_tokens=self.long_prompt_threshold_tokens,
+            long_prompt_rates=(
+                None
+                if self.long_prompt_rates is None
+                else self.long_prompt_rates.multiplied(multiplier)
+            ),
+        )
 
     def price(  # noqa: PLR0913 (each normalized category arrives separately)
         self,

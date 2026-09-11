@@ -186,8 +186,8 @@ class Gemini:
 
         `model` is sent verbatim.
         Cataloged models receive `ON_DEMAND` rates from `GEMINI_PRICING`.
-        Stated `pricing` extends or replaces catalog pricing.
-        Uncataloged models require `pricing` with an `"ON_DEMAND"` entry.
+        Stated `pricing` replaces catalog pricing and must contain an `"ON_DEMAND"` entry.
+        Uncataloged models require `pricing`.
         `service_tier` sets the requested Gemini service tier.
         The reported traffic type selects pricing.
 
@@ -196,14 +196,13 @@ class Gemini:
                 Also raised when `pricing` lacks `"ON_DEMAND"`.
                 Also raised when `client` reaches Vertex AI.
         """
-        catalog_table = _PRICING_BY_MODEL_ID.get(model)
-        if catalog_table is None:
-            if pricing is None:
+        if pricing is None:
+            catalog_table = _PRICING_BY_MODEL_ID.get(model)
+            if catalog_table is None:
                 raise ValueError(
                     f"model {model!r} is not in GEMINI_PRICING; pass pricing= stating its rates"
                 )
-        else:
-            pricing = {"ON_DEMAND": catalog_table, **(pricing or {})}
+            pricing = {"ON_DEMAND": catalog_table}
         adapter = GeminiGenerateContentAdapter(
             client=self.client,
             model=model,

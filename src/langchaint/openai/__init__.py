@@ -188,14 +188,18 @@ class OpenAI:
         """
         catalog_table = _PRICING_BY_MODEL_ID.get(model)
         if catalog_table is None:
-            if pricing is None:
+            if pricing is None or supports_prompt_cache_options is None:
+                missing_arguments: list[str] = []
+                if pricing is None:
+                    missing_arguments.append("pricing= stating its rates")
+                if supports_prompt_cache_options is None:
+                    missing_arguments.append(
+                        "supports_prompt_cache_options= stating whether it accepts "
+                        "prompt_cache_options"
+                    )
                 raise ValueError(
-                    f"model {model!r} is not in OPENAI_PRICING; pass pricing= stating its rates"
-                )
-            if supports_prompt_cache_options is None:
-                raise ValueError(
-                    f"model {model!r} is not cataloged, so langchaint cannot know whether it takes "
-                    "prompt_cache_options; pass supports_prompt_cache_options= stating that"
+                    f"model {model!r} is not in OPENAI_PRICING; pass "
+                    + " and ".join(missing_arguments)
                 )
         else:
             pricing = pricing or catalog_table

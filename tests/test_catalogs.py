@@ -204,8 +204,8 @@ def test_gemini_model_accepts_an_uncataloged_model() -> None:
     assert adapter.pricing is _ARBITRARY_GEMINI_PRICING
 
 
-def test_gemini_pricing_override_replaces_the_on_demand_rates() -> None:
-    """A caller-supplied "ON_DEMAND" table replaces the catalog's, and a caller's tier is added."""
+def test_gemini_pricing_override_replaces_catalog_pricing() -> None:
+    """A caller-supplied mapping is the whole pricing; the catalog table is not merged in."""
     custom = GeminiPricingTable(
         rates=GeminiRates(
             input_cache_none_usd_per_million_tokens=2.0,
@@ -215,17 +215,23 @@ def test_gemini_pricing_override_replaces_the_on_demand_rates() -> None:
         google_search_usd_per_query=0.014,
         google_maps_usd_per_query=0.014,
     )
+    pricing = {"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom}
     adapter = (
         Gemini(client=genai.Client(api_key="offline", vertexai=False))
-        .model(
-            "gemini-3.5-flash",
-            pricing={"ON_DEMAND": custom, "ON_DEMAND_FLEX": custom},
-        )
+        .model("gemini-3.5-flash", pricing=pricing)
         .adapter
     )
     assert isinstance(adapter, GeminiGenerateContentAdapter)
-    assert adapter.pricing["ON_DEMAND"] is custom
-    assert adapter.pricing["ON_DEMAND_FLEX"] is custom
+    assert adapter.pricing is pricing
+
+
+def test_gemini_model_requires_on_demand_in_a_pricing_override() -> None:
+    """A cataloged model no longer supplies "ON_DEMAND" when the caller states pricing."""
+    flex_only = {"ON_DEMAND_FLEX": GEMINI_PRICING["gemini-3.5-flash"]}
+    with pytest.raises(ValueError, match="ON_DEMAND"):
+        _ = Gemini(client=genai.Client(api_key="offline", vertexai=False)).model(
+            "gemini-3.5-flash", pricing=flex_only
+        )
 
 
 def test_gemini_adapter_requires_on_demand_pricing() -> None:

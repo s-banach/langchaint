@@ -1429,6 +1429,31 @@ def test_the_long_prompt_fields_are_required_together() -> None:
         )
 
 
+def test_pricing_table_multiplied_scales_both_rate_sets_and_keeps_tool_prices() -> None:
+    """`multiplied` scales base and long-prompt token rates and preserves the threshold and tool prices."""
+    doubled_on_demand_rates = GeminiRates(
+        input_cache_none_usd_per_million_tokens=2.0,
+        cache_read_usd_per_million_tokens=0.2,
+        output_usd_per_million_tokens=20.0,
+    )
+    assert _LONG_PROMPT_TABLE.multiplied(2.0) == GeminiPricingTable(
+        rates=doubled_on_demand_rates,
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
+        long_prompt_threshold_tokens=200,
+        long_prompt_rates=GeminiRates(
+            input_cache_none_usd_per_million_tokens=4.0,
+            cache_read_usd_per_million_tokens=0.4,
+            output_usd_per_million_tokens=40.0,
+        ),
+    )
+    assert _PRICING["ON_DEMAND"].multiplied(2.0) == GeminiPricingTable(
+        rates=doubled_on_demand_rates,
+        google_search_usd_per_query=0.014,
+        google_maps_usd_per_query=0.014,
+    )
+
+
 def test_traffic_type_selects_the_table() -> None:
     """A reported tier prices at its own table. UNSPECIFIED and None price at ON_DEMAND."""
     flex_rates = GeminiRates(

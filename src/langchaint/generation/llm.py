@@ -29,8 +29,6 @@ from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
     Admission,
-    DoNotRetry,
-    PauseAllDoNotRetry,
     PrivateBackoff,
     SharedBackoff,
     Verdict,
@@ -830,7 +828,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """Convert a terminal verdict or `classify` result to `GenerationError`."""
         classification = (
             "declared_final"
-            if isinstance(verdict, PauseAllDoNotRetry)
+            if verdict is not None and verdict.kind == "pause_all_do_not_retry"
             else self.adapter.classify(exc)
         )
         if classification in ("invalid_request", "declared_final") or observations.opened:
@@ -865,7 +863,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
         verdict = admission.verdict
-        if verdict is None or isinstance(verdict, DoNotRetry | PauseAllDoNotRetry):
+        if verdict is None or verdict.kind in ("do_not_retry", "pause_all_do_not_retry"):
             raise self._terminal_error(
                 exc,
                 verdict=verdict,

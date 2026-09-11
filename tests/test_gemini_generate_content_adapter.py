@@ -24,7 +24,6 @@ from langchaint import (
     ImagePart,
     ImageUrlPart,
     Message,
-    RawPart,
     ReasoningDelta,
     ReasoningPart,
     SpecificToolChoice,
@@ -37,20 +36,14 @@ from langchaint import (
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
-    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
     NoOutput,
     ProviderBilling,
-    Refusal,
     RequestParams,
-    SchemaViolation,
     ToolChoice,
-    UnfinishedTurn,
 )
 from langchaint.common.exceptions import TransientError
 from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
@@ -945,7 +938,7 @@ def test_empty_assistant_text_is_skipped_on_replay() -> None:
 def _interpreted_turn(response: types.GenerateContentResponse) -> AssistantMessage:
     """Interpret under the text binding and return the turn."""
     outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     return outcome.assistant_message
 
 
@@ -957,7 +950,7 @@ def test_a_signed_function_call_yields_a_reasoning_part_and_call() -> None:
     )
     turn = _interpreted_turn(_response([original]))
     reasoning_part, tool_call = turn.turn
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.raw == original.model_dump(mode="json", exclude_none=True)
     assert tool_call == ToolCall(id="f", name="f", args_json='{"x": 1}')
     request = _built_request([UserMessage(content="go"), turn])
@@ -970,7 +963,7 @@ def test_signed_answer_text_yields_a_reasoning_part_and_text_part() -> None:
     original = types.Part(text="final answer", thought_signature=b"sig")
     turn = _interpreted_turn(_response([original]))
     reasoning_part, text_part = turn.turn
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text is None
     assert text_part == TextPart(text="final answer")
     assert turn.text == "final answer"
@@ -999,7 +992,7 @@ def test_an_executable_code_part_becomes_a_raw_part_and_replays_as_itself() -> N
     )
     turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
     raw_part, text_part = turn.turn
-    assert isinstance(raw_part, RawPart)
+    assert raw_part.kind == "raw_part"
     assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
     assert text_part == TextPart(text="answer")
     request = _built_request([UserMessage(content="go"), turn])
@@ -1017,7 +1010,7 @@ def test_an_empty_text_beside_a_payload_still_becomes_a_raw_part() -> None:
     )
     turn = _interpreted_turn(_response([original]))
     (raw_part,) = turn.turn
-    assert isinstance(raw_part, RawPart)
+    assert raw_part.kind == "raw_part"
     assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
     request = _built_request([UserMessage(content="go"), turn])
     assert request.contents[1].parts == [original]
@@ -1032,7 +1025,7 @@ def test_thought_text_is_reasoning_part_text_and_not_output() -> None:
         ])
     )
     reasoning_part = turn.turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text == "thinking..."
     assert turn.text == "answer"
 
@@ -1064,25 +1057,25 @@ def test_text_binding_reads_stop_reasons() -> None:
     """STOP is end_turn or tool_use by the turn's calls. MAX_TOKENS and SAFETY name themselves."""
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
-    assert isinstance(ended, AdapterResult)
+    assert ended.kind == "adapter_result"
     assert (ended.output, ended.stop_reason) == ("hi", "end_turn")
     called = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert isinstance(called, AdapterResult)
+    assert called.kind == "adapter_result"
     assert called.stop_reason == "tool_use"
     truncated = bound.interpret(
         _response([types.Part(text="par")], finish_reason=types.FinishReason.MAX_TOKENS)
     )
-    assert isinstance(truncated, AdapterResult)
+    assert truncated.kind == "adapter_result"
     assert (truncated.output, truncated.stop_reason) == ("par", "max_tokens")
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
-    assert isinstance(refused, AdapterResult)
+    assert refused.kind == "adapter_result"
     assert (refused.output, refused.stop_reason) == ("", "refusal")
     other = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert isinstance(other, AdapterResult)
+    assert other.kind == "adapter_result"
     assert other.stop_reason == "other"
 
 
@@ -1090,10 +1083,10 @@ def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
     """A candidate without a finish_reason is a turn that never closed, its partial turn carried."""
     response = _response([types.Part(text="par")], finish_reason=None)
     text_outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert isinstance(text_outcome, UnfinishedTurn)
+    assert text_outcome.kind == "unfinished_turn"
     assert text_outcome.assistant_message.text == "par"
     structured_outcome = _adapter().bind_structured(_binding(), _Answer).interpret(response)
-    assert isinstance(structured_outcome, UnfinishedTurn)
+    assert structured_outcome.kind == "unfinished_turn"
 
 
 def test_no_candidates_reads_the_block_reason() -> None:
@@ -1102,39 +1095,39 @@ def test_no_candidates_reads_the_block_reason() -> None:
     blocked = bound.interpret(
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
     )
-    assert isinstance(blocked, Refusal)
+    assert blocked.kind == "refusal"
     assert blocked.assistant_message.turn == ()
     silent = bound.interpret(_response(None, finish_reason=None))
-    assert isinstance(silent, UnfinishedTurn)
+    assert silent.kind == "unfinished_turn"
 
 
 def test_structured_binding_outcomes() -> None:
     """The structured matrix: instance, tool-call None, refusal, truncation, violation, empty, unfinished."""
     bound = _adapter().bind_structured(_binding(), _Answer)
     parsed = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert isinstance(parsed, AdapterResult)
+    assert parsed.kind == "adapter_result"
     assert parsed.output == _Answer(value=3)
     tool_turn = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert isinstance(tool_turn, AdapterResult)
+    assert tool_turn.kind == "adapter_result"
     assert tool_turn.output is None
     assert tool_turn.stop_reason == "tool_use"
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
-    assert isinstance(refused, Refusal)
+    assert refused.kind == "refusal"
     truncated = bound.interpret(
         _response([types.Part(text='{"value"')], finish_reason=types.FinishReason.MAX_TOKENS)
     )
-    assert isinstance(truncated, MaxCompletionTokensExceeded)
+    assert truncated.kind == "max_completion_tokens_exceeded"
     violated = bound.interpret(_response([types.Part(text='{"value": "not int"}')]))
-    assert isinstance(violated, SchemaViolation)
+    assert violated.kind == "schema_violation"
     assert "value" in violated.validation_error_json
     empty = bound.interpret(_response([]))
-    assert isinstance(empty, EmptyTurn)
+    assert empty.kind == "empty_turn"
     unfinished = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert isinstance(unfinished, UnfinishedTurn)
+    assert unfinished.kind == "unfinished_turn"
     assert "LANGUAGE" in unfinished.reason
 
 
@@ -1147,7 +1140,7 @@ def test_structured_output_may_inherit_no_output() -> None:
 
     bound = _adapter().bind_structured(_binding(), ReportAlsoNoOutput)
     outcome = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == ReportAlsoNoOutput(value=3)
 
 
@@ -1160,7 +1153,7 @@ def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
             types.Part(text='{"value": 7}'),
         ])
     )
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == _Answer(value=7)
 
 
@@ -1565,7 +1558,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
         return await stream.final()
 
     outcome = _adapter().bind_text(_binding()).interpret(asyncio.run(final()))
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
 
 
 def test_billing_reported_follows_usage_arrival() -> None:

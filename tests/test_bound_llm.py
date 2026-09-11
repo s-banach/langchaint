@@ -25,34 +25,26 @@ from langchaint import (
     DispatchHandled,
     DispatchInvalidToolArgs,
     DoNotRetry,
-    EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
-    InvalidRequestErrorRecord,
     Message,
     ParserContractError,
     PauseAllDoNotRetry,
-    ProviderDeclaredFinalErrorRecord,
     PydanticTool,
     Response,
     ResponseRecord,
-    RetriesExhaustedErrorRecord,
-    SchemaViolationErrorRecord,
     SettledAttemptRecord,
     SharedBackoff,
     StopReason,
     StreamItem,
     StreamProtocolError,
     TextPart,
-    TimedOutErrorRecord,
     ToolCall,
     ToolCallTurn,
-    ToolCallTurnRecord,
     ToolManager,
     ToolSchema,
     TransientError,
     TransientErrorRecord,
-    UnknownExceptionErrorRecord,
     Usage,
     UserMessage,
     Verdict,
@@ -88,7 +80,7 @@ from tests.helpers import random_returns_zero, stated_provider_billing
 def _settled_attempt_records(
     records: tuple[SettledAttemptRecord | CutOffAttemptRecord, ...],
 ) -> tuple[SettledAttemptRecord, ...]:
-    settled = tuple(record for record in records if isinstance(record, SettledAttemptRecord))
+    settled = tuple(record for record in records if record.kind == "settled")
     assert len(settled) == len(records)
     return settled
 
@@ -156,7 +148,7 @@ def _batch_outputs(results: list[Response[str] | GenerationError]) -> list[str]:
     """Assert success and return each batch output in order."""
     outputs: list[str] = []
     for result in results:
-        assert isinstance(result, Response)
+        assert result.kind == "response"
         outputs.append(result.output)
     return outputs
 
@@ -165,7 +157,7 @@ def _record_outputs(results: Sequence[CallResultRecord[str]]) -> list[str]:
     """Assert successful records and return each output in order."""
     outputs: list[str] = []
     for result in results:
-        assert isinstance(result, ResponseRecord)
+        assert result.kind == "response"
         outputs.append(result.output)
     return outputs
 
@@ -620,7 +612,7 @@ class _FakeBoundAdapter(BoundAdapter[str]):
             first = messages[0]
             content = (
                 first.content
-                if self._echo and isinstance(first, UserMessage) and isinstance(first.content, str)
+                if self._echo and first.kind == "user" and isinstance(first.content, str)
                 else "ok"
             )
             return self._attempt_stream(
@@ -974,7 +966,7 @@ def test_retry_exhaustion_raises_ordered_failure() -> None:
         with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
         failure = exhausted.value
-        assert isinstance(failure.record, RetriesExhaustedErrorRecord)
+        assert failure.record.kind == "retries_exhausted_error"
         assert [str(error) for error in failure.record.errors_from_attempts] == ["e1", "e2"]
         assert [
             str(record.error) for record in _settled_attempt_records(failure.attempt_records)
@@ -1033,7 +1025,7 @@ def test_build_request_refusing_messages_fails_the_item_with_nothing_sent() -> N
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
-        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.kind == "invalid_request_error"
         assert rejected.value.record.error_text == "nope"
         assert rejected.value.error_text == "nope"
         assert rejected.value.model == adapter.model
@@ -1147,7 +1139,7 @@ def test_schema_violation_outcome_raises_without_retry() -> None:
         failure = schema_violation.value
         assert failure.attempts == 1
         assert failure.stop_reason == "end_turn"
-        assert isinstance(failure.record, SchemaViolationErrorRecord)
+        assert failure.record.kind == "schema_violation_error"
         assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
         assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
@@ -1279,7 +1271,7 @@ def test_exception_classified_invalid_request_fails_the_item_without_retry() -> 
         with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
-        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.kind == "invalid_request_error"
         assert rejected.value.record.error_text == "boom"
         assert isinstance(rejected.value.__cause__, ValueError)
 
@@ -1302,7 +1294,7 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = unplaceable.value
-        assert isinstance(failure.record, UnknownExceptionErrorRecord)
+        assert failure.record.kind == "unknown_exception_error"
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "boom"
         assert failure.stop_reason is None
@@ -1329,7 +1321,7 @@ def test_exception_classified_declared_final_fails_the_item_with_a_record() -> N
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
         failure = declared_final.value
-        assert isinstance(failure.record, ProviderDeclaredFinalErrorRecord)
+        assert failure.record.kind == "provider_declared_final_error"
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "boom"
         (record,) = _settled_attempt_records(failure.attempt_records)
@@ -1393,7 +1385,7 @@ def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.05)
         timed_out = raised.value
         (cut_off,) = timed_out.attempt_records
-        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.kind == "cut_off"
         assert cut_off.billing is not None
         assert cut_off.billing.usage == _USAGE_STREAM
         assert timed_out.usage == _USAGE_STREAM
@@ -1416,7 +1408,7 @@ def test_a_settled_attempts_billing_is_counted_once_after_a_later_deadline_cut()
         timed_out = raised.value
         record, cut_off = timed_out.attempt_records
         assert record.usage == _USAGE_STREAM
-        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.kind == "cut_off"
         assert cut_off.billing is None
         assert timed_out.usage == _USAGE_STREAM
 
@@ -1507,7 +1499,7 @@ def test_an_unplaceable_exception_fails_only_its_item() -> None:
         ])
         first, second = results
         assert isinstance(first, GenerationError)
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
 
     asyncio.run(scenario())
@@ -1847,7 +1839,7 @@ def test_structured_tool_bound_generate_one_returns_the_tool_call_turn_variant()
 
     async def scenario() -> None:
         result = await _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN).generate_one("hi")
-        assert isinstance(result, ToolCallTurn)
+        assert result.kind == "tool_call_turn"
         assert result.output is None
         assert result.tool_calls == (_FAKE_TOOL_CALL,)
 
@@ -1865,7 +1857,7 @@ def test_structured_tool_bound_generate_one_returns_the_response_variant_on_a_fi
             stop_reason="end_turn",
         )
         result = await _structured_tool_bound_llm(outcome).generate_one("hi")
-        assert isinstance(result, Response)
+        assert result.kind == "response"
         assert result.output is answer
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -1890,8 +1882,8 @@ def test_generate_many_records_restores_the_structured_output_type(tmp_path: Pat
         restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         generated_record = generated[0]
         restored_record = restored[0]
-        assert isinstance(generated_record, ResponseRecord)
-        assert isinstance(restored_record, ResponseRecord)
+        assert generated_record.kind == "response"
+        assert restored_record.kind == "response"
         assert generated_record.output == answer
         assert restored_record.output == answer
         assert isinstance(restored_record.output, _Answer)
@@ -1947,8 +1939,8 @@ def test_generate_many_records_restores_a_structured_tool_call_turn(tmp_path: Pa
         restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         generated_record = generated[0]
         restored_record = restored[0]
-        assert isinstance(generated_record, ToolCallTurnRecord)
-        assert isinstance(restored_record, ToolCallTurnRecord)
+        assert generated_record.kind == "tool_call_turn"
+        assert restored_record.kind == "tool_call_turn"
         assert restored_record.output is None
         assert restored_record.tool_calls == (_FAKE_TOOL_CALL,)
         assert structured_adapter.open_count == 1
@@ -1963,7 +1955,7 @@ def test_structured_tool_bound_stream_final_returns_the_tool_call_turn_variant()
         bound_llm = _structured_tool_bound_llm(_STRUCTURED_TOOL_CALL_TURN)
         async with bound_llm.stream_one("hi") as handle:
             result = await handle.final()
-        assert isinstance(result, ToolCallTurn)
+        assert result.kind == "tool_call_turn"
         assert result.tool_calls == (_FAKE_TOOL_CALL,)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -2215,9 +2207,9 @@ def test_generate_many_aligns_a_failure_among_successes() -> None:
         ])
         first, second, third = results
         assert isinstance(first, GenerationError)
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
-        assert isinstance(third, Response)
+        assert third.kind == "response"
         assert third.output == "c"
 
     asyncio.run(scenario())
@@ -2242,7 +2234,7 @@ def test_generate_many_returns_a_refusal_at_its_index() -> None:
         assert isinstance(first, GenerationError)
         assert first.stop_reason == "refusal"
         assert first.usage.cost_in_usd == 0.25
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
 
     asyncio.run(scenario())
@@ -2335,7 +2327,7 @@ def test_generate_many_records_retries_a_retries_exhausted_record(tmp_path: Path
         bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind(max_attempts=1)
         resume_path = tmp_path / "records.json"
         first = await bound.generate_many_records(["a"], resume_path=resume_path)
-        assert isinstance(first[0], RetriesExhaustedErrorRecord)
+        assert first[0].kind == "retries_exhausted_error"
         second = await bound.generate_many_records(["a"], resume_path=resume_path)
         assert _record_outputs(second) == ["a"]
         third = await bound.generate_many_records(["a"], resume_path=resume_path)
@@ -2361,7 +2353,7 @@ def test_generate_many_records_retries_a_timed_out_record(tmp_path: Path) -> Non
             resume_path=resume_path,
             max_working_seconds_per_item=0.01,
         )
-        assert isinstance(timed_out[0], TimedOutErrorRecord)
+        assert timed_out[0].kind == "timed_out_error"
 
         resumed_adapter = _FakeAdapter(echo=True)
         resumed_bound = LLM(resumed_adapter).bind()
@@ -2617,9 +2609,9 @@ def test_invalid_request_fails_only_its_item() -> None:
         ])
         first, second = results
         assert isinstance(first, GenerationError)
-        assert isinstance(first.record, InvalidRequestErrorRecord)
+        assert first.record.kind == "invalid_request_error"
         assert first.record.error_text == "misconfigured"
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -2683,9 +2675,9 @@ def test_generate_many_warm_cache_first_failure_still_admits_the_rest() -> None:
         )
         first, second, third = results
         assert isinstance(first, GenerationError)
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
-        assert isinstance(third, Response)
+        assert third.kind == "response"
         assert third.output == "c"
 
     asyncio.run(scenario())
@@ -2730,11 +2722,11 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
             [UserMessage(content="b")],
         ])
         failures = [result for result in results if isinstance(result, GenerationError)]
-        responses = [result for result in results if isinstance(result, Response)]
+        responses = [result for result in results if result.kind == "response"]
         assert len(failures) == 1
         assert len(responses) == 1
         failure = failures[0]
-        assert isinstance(failure.record, EscapedExceptionErrorRecord)
+        assert failure.record.kind == "escaped_exception_error"
         assert isinstance(failure.__cause__, RuntimeError)
         assert failure.error_text == "classify defect"
         assert failure.request is None
@@ -2773,7 +2765,7 @@ def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provide
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff(parse=_parse_raises)).bind()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
-        assert isinstance(raised.value.record, EscapedExceptionErrorRecord)
+        assert raised.value.record.kind == "escaped_exception_error"
         assert isinstance(raised.value.__cause__, ParserContractError)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
@@ -2912,7 +2904,7 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned() -> None:
         abandoned = handle.abandoned
         assert abandoned is not None
         (cut_off,) = abandoned.attempt_records
-        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.kind == "cut_off"
         assert cut_off.billing is None
         assert abandoned.usage == ZERO_USAGE
         assert abandoned.model == adapter.model
@@ -2941,7 +2933,7 @@ def test_a_cancelled_stream_reports_what_it_billed_before_the_cancellation() -> 
         abandoned = handle.abandoned
         assert abandoned is not None
         (cut_off,) = abandoned.attempt_records
-        assert isinstance(cut_off, CutOffAttemptRecord)
+        assert cut_off.kind == "cut_off"
         assert cut_off.billing is not None
         assert abandoned.usage == _USAGE_STREAM
 
@@ -3418,7 +3410,7 @@ def test_stream_final_schema_violation_raises_carrying_the_rejection() -> None:
                 await handle.final()
         failure = schema_violation.value
         assert failure.attempts == 1
-        assert isinstance(failure.record, SchemaViolationErrorRecord)
+        assert failure.record.kind == "schema_violation_error"
         assert failure.record.validation_error_json == _VALIDATION_ERROR_JSON
         assert failure.error_text == ""
         assert failure.usage.cost_in_usd == 0.25
@@ -3664,7 +3656,7 @@ def test_stream_open_classified_invalid_request_carries_the_prior_attempts_recor
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert isinstance(rejected.value.__cause__, ValueError)
-        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.kind == "invalid_request_error"
         assert rejected.value.record.error_text == "boom"
         transient_record, rejected_record = _settled_attempt_records(
             rejected.value.attempt_records
@@ -3691,7 +3683,7 @@ def test_a_stream_whose_build_request_refuses_fails_the_item_with_nothing_opened
                 pass
         assert adapter.bound_adapters[0].open_count == 0
         assert rejected.value.request is None
-        assert isinstance(rejected.value.record, InvalidRequestErrorRecord)
+        assert rejected.value.record.kind == "invalid_request_error"
         assert rejected.value.record.error_text == "nope"
         assert rejected.value.model == adapter.model
         assert rejected.value.attempt_records == ()
@@ -3712,7 +3704,7 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
-        assert isinstance(unplaceable.value.record, UnknownExceptionErrorRecord)
+        assert unplaceable.value.record.kind == "unknown_exception_error"
         assert isinstance(unplaceable.value.__cause__, ValueError)
         assert unplaceable.value.error_text == "boom"
         assert unplaceable.value.attempt_records == ()
@@ -3736,7 +3728,7 @@ def test_stream_open_classified_declared_final_raises_the_items_failure() -> Non
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
-        assert isinstance(declared_final.value.record, ProviderDeclaredFinalErrorRecord)
+        assert declared_final.value.record.kind == "provider_declared_final_error"
         assert isinstance(declared_final.value.__cause__, ValueError)
         assert declared_final.value.error_text == "boom"
         (record,) = _settled_attempt_records(declared_final.value.attempt_records)
@@ -3871,7 +3863,7 @@ def test_stream_open_exhaustion_raises_retries_exhausted() -> None:
                 await handle.final()
         failure = exhausted.value
         assert failure.attempts == 2
-        assert isinstance(failure.record, RetriesExhaustedErrorRecord)
+        assert failure.record.kind == "retries_exhausted_error"
         assert [str(error) for error in failure.record.errors_from_attempts] == ["e1", "e2"]
         assert failure.model == "fake-model"
         assert failure.provider_name == "fake"
@@ -4151,7 +4143,7 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
         timed_out = raised.value
         assert timed_out.attempts == settled_attempts + 1
         assert len(timed_out.attempt_records) == settled_attempts + 1
-        assert isinstance(timed_out.attempt_records[-1], CutOffAttemptRecord)
+        assert timed_out.attempt_records[-1].kind == "cut_off"
         assert timed_out.attempt_records[-1].billing is None
         assert timed_out.usage == ZERO_USAGE
         assert str(timed_out) == ""
@@ -4235,7 +4227,7 @@ def test_a_batch_item_spends_its_budget_once_it_is_admitted() -> None:
             max_working_seconds_per_item=0.12,
         )
         first, second = results
-        assert isinstance(first, Response)
+        assert first.kind == "response"
         assert first.output == "answered"
         assert isinstance(second, GenerationError)
         assert second.record.kind == "timed_out_error"

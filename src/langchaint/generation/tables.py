@@ -95,7 +95,7 @@ def _attempt_row(
         "kept": kept,
         "started_after_seconds": attempt.started_after_seconds,
     }
-    if isinstance(attempt, CutOffAttemptRecord):
+    if attempt.kind == "cut_off":
         return common | {
             "elapsed_seconds": None,
             "seconds_to_first_item": None,

@@ -28,7 +28,6 @@ from langchaint.common.messages import Message
 from langchaint.concurrency.shared_backoff import (
     Admission,
     PauseAll,
-    PauseAllDoNotRetry,
     PrivateBackoff,
     RetryThisOne,
     SharedBackoff,
@@ -353,7 +352,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         # `classify()` could otherwise return `invalid_request` for status 429.
         classification = (
             "declared_final"
-            if isinstance(verdict, PauseAllDoNotRetry)
+            if verdict is not None and verdict.kind == "pause_all_do_not_retry"
             else self._adapter.classify(exc)
         )
         if (

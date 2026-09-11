@@ -75,17 +75,14 @@ from langchaint.common.messages import (
     AssistantMessage,
     ContentPart,
     Message,
-    ReasoningPart,
     StopReason,
     TextPart,
     ToolCall,
     ToolMessage,
     TurnPart,
-    UserMessage,
 )
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.shared_backoff import SharedBackoff
-from langchaint.generation.call import SettledAttemptRecord
 from langchaint.generation.errors import (
     AbandonedCallErrorRecord,
     GenerationError,
@@ -111,8 +108,6 @@ from langchaint.generation.response import (
 )
 from langchaint.generation.streaming import StreamHandle
 from langchaint.tools import (
-    DispatchHandled,
-    DispatchInvalidToolArgs,
     DispatchOutcome,
     ToolManager,
     ToolSchema,
@@ -297,7 +292,9 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     records = result.attempt_records
     final_record = records[-1] if records else None
     model_served = (
-        final_record.model_served if isinstance(final_record, SettledAttemptRecord) else None
+        final_record.model_served
+        if final_record is not None and final_record.kind == "settled"
+        else None
     )
     attributes: dict[str, SpanAttributeValue] = {
         "gen_ai.provider.name": result.provider_name,
@@ -406,19 +403,22 @@ def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
     """
     parts: list[dict[str, object]] = []
     for part in turn:
-        if isinstance(part, ReasoningPart):
-            if part.text:
-                parts.append({"type": "reasoning", "content": part.text})
-        elif isinstance(part, TextPart):
-            if part.text:
-                parts.append({"type": "text", "content": part.text})
-        elif isinstance(part, ToolCall):
-            parts.append({
-                "type": "tool_call",
-                "id": part.id,
-                "name": part.name,
-                "arguments": _tool_call_arguments(part.args_json),
-            })
+        match part.kind:
+            case "reasoning_part":
+                if part.text:
+                    parts.append({"type": "reasoning", "content": part.text})
+            case "text":
+                if part.text:
+                    parts.append({"type": "text", "content": part.text})
+            case "tool_call":
+                parts.append({
+                    "type": "tool_call",
+                    "id": part.id,
+                    "name": part.name,
+                    "arguments": _tool_call_arguments(part.args_json),
+                })
+            case "raw_part":
+                pass
     return parts
 
 
@@ -435,9 +435,9 @@ def _input_messages(generation_input: GenerationInput) -> list[dict[str, object]
 
 def _message(message: Message) -> dict[str, object]:
     """Render one Message as the convention's {role, parts} shape."""
-    if isinstance(message, UserMessage):
+    if message.kind == "user":
         return {"role": "user", "parts": _content_parts(message.content)}
-    if isinstance(message, ToolMessage):
+    if message.kind == "tool":
         return {"role": "tool", "parts": [_tool_call_response_part(message)]}
     return {"role": "assistant", "parts": _turn_parts(message.turn)}
 
@@ -583,7 +583,7 @@ def _record_attempt_failed_events[OutputT](span: Span, result: CallResult[Output
     They answer the first question a slow traced call raises: was it the request or the retries.
     """
     for record in result.attempt_records:
-        if isinstance(record, SettledAttemptRecord) and record.error is not None:
+        if record.kind == "settled" and record.error is not None:
             span.add_event(
                 "langchaint.attempt_failed",
                 {"error_text": str(record.error), "elapsed_seconds": record.elapsed_seconds},
@@ -1670,11 +1670,13 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
     error.type values "invalid_tool_args" and "unknown_tool" mean the tool function never ran.
     A raising tool function is classified by _record_other_exception with its exception class name instead.
     """
-    if isinstance(outcome, DispatchHandled):
-        return "tool_error" if outcome.tool_message.is_error else None
-    if isinstance(outcome, DispatchInvalidToolArgs):
-        return "invalid_tool_args"
-    return "unknown_tool"
+    match outcome.kind:
+        case "handled":
+            return "tool_error" if outcome.tool_message.is_error else None
+        case "invalid_tool_args":
+            return "invalid_tool_args"
+        case "unknown_tool":
+            return "unknown_tool"
 
 
 class TracedToolManager(ToolManager):

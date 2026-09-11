@@ -48,13 +48,9 @@ from langchaint.adapter import (
     EmptyTurn,
     ErrorClassification,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
     NoOutput,
-    Refusal,
     RequestParams,
     ResponseOutcome,
-    SchemaViolation,
-    UnfinishedTurn,
 )
 from langchaint.billing.pricing import Billing, ProviderBilling
 from langchaint.common.exceptions import StreamProtocolError
@@ -125,7 +121,7 @@ _FUNCTION_CALL_WIRE: dict[str, object] = {
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
     """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     return outcome
 
 
@@ -1034,7 +1030,7 @@ def test_structured_output_may_inherit_no_output() -> None:
         response_format=ReportAlsoNoOutput,
     )
     outcome = bound.interpret(_structured_completion(_REPORT_JSON))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
@@ -1051,7 +1047,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
     outcome = _structured_parse(
         _structured_completion('{"city": "Nairobi", "celsius": "SENTINEL"}')
     )
-    assert isinstance(outcome, SchemaViolation)
+    assert outcome.kind == "schema_violation"
     rejections = json.loads(outcome.validation_error_json)
     assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
     assert rejections[0]["input"] == "SENTINEL"
@@ -1060,7 +1056,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """A length-finished turn whose JSON stopped mid-object is the truncation, not a schema violation."""
     outcome = _structured_parse(_structured_completion('{"city": "Nair', finish_reason="length"))
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_structured_bind_reports_the_truncation_on_a_tool_call_cut_by_the_token_cap() -> None:
@@ -1071,7 +1067,7 @@ def test_structured_bind_reports_the_truncation_on_a_tool_call_cut_by_the_token_
     outcome = _structured_parse(
         _structured_completion(None, finish_reason="length", tool_call=True)
     )
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_structured_bind_reports_refusal_on_a_refusal_beside_a_tool_call() -> None:
@@ -1079,7 +1075,7 @@ def test_structured_bind_reports_refusal_on_a_refusal_beside_a_tool_call() -> No
     outcome = _structured_parse(
         _structured_completion(None, refusal="I can't help", tool_call=True)
     )
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
 
 
 def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -> None:
@@ -1090,7 +1086,7 @@ def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -
         finish_reason="tool_calls",
     )
     outcome = _structured_parse(completion)
-    assert isinstance(outcome, EmptyTurn)
+    assert outcome.kind == "empty_turn"
     assert outcome.assistant_message.turn == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE),)
 
 
@@ -1120,14 +1116,14 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
 def test_structured_bind_reports_refusal_and_never_validates_the_refusal_text() -> None:
     """A refusal is the model declining, so its sentences are never a candidate instance."""
     outcome = _structured_parse(_structured_completion(None, refusal=_REPORT_JSON))
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
     assert outcome.assistant_message.turn == (TextPart(text=_REPORT_JSON),)
 
 
 def test_structured_bind_reports_refusal_on_a_content_filter_finish() -> None:
     """A content_filter finish with no text is Refusal, not EmptyTurn."""
     outcome = _structured_parse(_structured_completion(None, finish_reason="content_filter"))
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
 
 
 def test_structured_request_replaces_the_omitted_response_format(
@@ -1157,14 +1153,14 @@ def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
 def test_a_completion_with_no_choices_is_unfinished_turn() -> None:
     """No choices is a response langchaint cannot read a turn from, with an empty partial turn."""
     outcome = _text_bound().interpret(_completion(usage=None, choices=[]))
-    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.kind == "unfinished_turn"
     assert outcome.assistant_message.turn == ()
 
 
 def test_a_choice_with_no_finish_reason_is_unfinished_turn_carrying_the_partial_turn() -> None:
     """finish_reason reads None at runtime on a lenient snapshot, which is not a finished turn."""
     outcome = _text_bound().interpret(_lenient_completion(None))
-    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.kind == "unfinished_turn"
     assert outcome.assistant_message.text == "hey"
 
 

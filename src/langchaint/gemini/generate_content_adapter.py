@@ -671,7 +671,7 @@ def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) ->
     A part without a match goes on the wire itself.
     """
     function_call = replayed_part.function_call
-    if isinstance(part, ToolCall) and function_call is not None:
+    if part.kind == "tool_call" and function_call is not None:
         name = function_call.name or ""
         try:
             args: object = json.loads(part.args_json)
@@ -682,7 +682,7 @@ def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) ->
             and part.id == (function_call.id or name)
             and args == (function_call.args or {})
         )
-    if isinstance(part, TextPart) and function_call is None:
+    if part.kind == "text" and function_call is None:
         return (
             bool(replayed_part.text)
             and not replayed_part.thought
@@ -711,20 +711,21 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
             replayed_part_with_paired_payload = None
             if _matches_replayed_part_payload(part, replayed_part):
                 continue
-        if isinstance(part, TextPart):
-            if part.text:
-                parts.append(types.Part(text=part.text))
-        elif isinstance(part, ToolCall):
-            parts.append(types.Part(function_call=_function_call_from(part)))
-        elif isinstance(part, ReasoningPart):
-            replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
-            parts.append(replayed_part)
-            if replayed_part.function_call is not None or (
-                replayed_part.text and not replayed_part.thought
-            ):
-                replayed_part_with_paired_payload = replayed_part
-        else:
-            parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
+        match part.kind:
+            case "text":
+                if part.text:
+                    parts.append(types.Part(text=part.text))
+            case "tool_call":
+                parts.append(types.Part(function_call=_function_call_from(part)))
+            case "reasoning_part":
+                replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
+                parts.append(replayed_part)
+                if replayed_part.function_call is not None or (
+                    replayed_part.text and not replayed_part.thought
+                ):
+                    replayed_part_with_paired_payload = replayed_part
+            case "raw_part":
+                parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
     return parts
 
 
@@ -862,16 +863,19 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
             pending_function_responses.clear()
 
     for message in messages:
-        if isinstance(message, ToolMessage):
-            pending_function_responses.append(_function_response_part(message, tool_call_names))
-        elif isinstance(message, UserMessage):
-            flush_function_responses()
-            contents.append(types.Content(role="user", parts=_user_parts(message.content)))
-        else:
-            flush_function_responses()
-            for tool_call in message.tool_calls:
-                tool_call_names[tool_call.id] = tool_call.name
-            contents.append(types.Content(role="model", parts=_assistant_wire_parts(message)))
+        match message.kind:
+            case "tool":
+                pending_function_responses.append(
+                    _function_response_part(message, tool_call_names)
+                )
+            case "user":
+                flush_function_responses()
+                contents.append(types.Content(role="user", parts=_user_parts(message.content)))
+            case "assistant":
+                flush_function_responses()
+                for tool_call in message.tool_calls:
+                    tool_call_names[tool_call.id] = tool_call.name
+                contents.append(types.Content(role="model", parts=_assistant_wire_parts(message)))
     flush_function_responses()
     return contents
 

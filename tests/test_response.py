@@ -37,7 +37,6 @@ from langchaint import (
     TextPart,
     TimedOutErrorRecord,
     ToolCall,
-    ToolCallTurn,
     ToolCallTurnRecord,
     TransientErrorRecord,
     UnfinishedTurnErrorRecord,
@@ -123,7 +122,7 @@ def _call(*attempts: SettledAttemptRecord | CutOffAttemptRecord) -> CallRecord:
     elapsed_seconds = 0.0
     for attempt in attempts:
         attempt_end = attempt.started_after_seconds
-        if isinstance(attempt, SettledAttemptRecord):
+        if attempt.kind == "settled":
             attempt_end += attempt.elapsed_seconds
         elapsed_seconds = max(elapsed_seconds, attempt_end)
     return CallRecord(
@@ -319,8 +318,8 @@ def test_success_variant_constructs_one_normalized_record() -> None:
         provider_attempts=_provider_attempts(),
         stop_reason="tool_use",
     )
-    assert isinstance(result, ToolCallTurn)
-    assert isinstance(result.record, ToolCallTurnRecord)
+    assert result.kind == "tool_call_turn"
+    assert result.record.kind == "tool_call_turn"
     assert result.record.call is call
 
 
@@ -551,7 +550,7 @@ def test_abandoned_call_error_appends_one_cut_off_request_with_live_usage() -> N
     failure = _abandoned_call_error(TimedOutErrorRecord, ledger, provider_billing)
     assert failure.record.kind == "timed_out_error"
     assert len(failure.attempt_records) == 1
-    assert isinstance(failure.attempt_records[0], CutOffAttemptRecord)
+    assert failure.attempt_records[0].kind == "cut_off"
     assert failure.provider_attempts[0].usage_raw == provider_billing.usage_raw
     assert failure.usage == _USAGE
 
@@ -581,5 +580,5 @@ def test_interruption_after_a_staged_response_records_no_cut_off_request() -> No
     )
     failure = _abandoned_call_error(TimedOutErrorRecord, ledger)
     assert len(failure.attempt_records) == 1
-    assert isinstance(failure.attempt_records[0], SettledAttemptRecord)
+    assert failure.attempt_records[0].kind == "settled"
     assert failure.provider_attempts[0].raw is raw

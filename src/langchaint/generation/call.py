@@ -113,7 +113,7 @@ class CallRecord(CheckedCopyModel):
         cut_off_indexes = [
             index
             for index, attempt in enumerate(self.attempt_records)
-            if isinstance(attempt, CutOffAttemptRecord)
+            if attempt.kind == "cut_off"
         ]
         if len(cut_off_indexes) > 1:
             raise ValueError("attempt_records may contain at most one cut-off record")
@@ -126,7 +126,7 @@ class CallRecord(CheckedCopyModel):
                 raise ValueError("attempt records must not overlap")
             if not _less_than_or_ulp_close(attempt.started_after_seconds, self.elapsed_seconds):
                 raise ValueError("an attempt start must fall within the call")
-            if isinstance(attempt, SettledAttemptRecord):
+            if attempt.kind == "settled":
                 attempt_end = attempt.started_after_seconds + attempt.elapsed_seconds
                 if not _less_than_or_ulp_close(attempt_end, self.elapsed_seconds):
                     raise ValueError("a settled attempt end must fall within the call")
@@ -171,9 +171,7 @@ class _CallResultRecordBase(CheckedCopyModel):
 
 
 def _settled_attempts(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
-    attempts = tuple(
-        attempt for attempt in call.attempt_records if isinstance(attempt, SettledAttemptRecord)
-    )
+    attempts = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
     if len(attempts) != len(call.attempt_records):
         raise ValueError("this record does not permit a cut-off attempt")
     return attempts

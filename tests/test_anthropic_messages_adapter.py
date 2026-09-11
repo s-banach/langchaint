@@ -51,7 +51,6 @@ from langchaint import (
 )
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     ContextWindowExceeded,
@@ -66,7 +65,6 @@ from langchaint.adapter import (
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
-    SchemaViolation,
     UnfinishedTurn,
     _NotSendableError,
 )
@@ -486,7 +484,7 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert isinstance(result, AdapterResult)
+    assert result.kind == "adapter_result"
     assert result.stop_reason == expected
     assert result.output == "partial text"
 
@@ -513,7 +511,7 @@ def test_adapter_result_extracts_text_and_tool_use() -> None:
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert isinstance(result, AdapterResult)
+    assert result.kind == "adapter_result"
     assert result.output == "hello world"
     assert result.assistant_message.text == "hello world"
     tool_call = result.assistant_message.tool_calls[0]
@@ -557,7 +555,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         ToolCall,
     ]
     reasoning_part = assistant_message.turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.raw == {
         "type": "thinking",
         "thinking": "check first",
@@ -589,7 +587,7 @@ def test_empty_thinking_text_normalizes_to_none() -> None:
         at.ThinkingBlock(type="thinking", thinking="", signature="sig")
     ])
     reasoning_part = _assistant_message_from(message).turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text is None
     assert reasoning_part.raw["thinking"] == ""
 
@@ -604,7 +602,7 @@ def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
     ])
     assistant_message = _assistant_message_from(message)
     reasoning_part = assistant_message.turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text is None
     assert _assistant_content_blocks(assistant_message) == [
         {"type": "redacted_thinking", "data": "opaque-bytes"}
@@ -627,7 +625,7 @@ def test_a_server_tool_block_becomes_a_raw_part_and_replays_as_itself() -> None:
         ])
     )
     (raw_part,) = assistant_message.turn
-    assert isinstance(raw_part, RawPart)
+    assert raw_part.kind == "raw_part"
     assert _assistant_content_blocks(assistant_message) == [
         {
             "type": "server_tool_use",
@@ -1717,7 +1715,7 @@ def test_temperature_keeps_caller_extra_body_fields_by_reference(
 def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
     """The structured bound adapter validates the turn's text block into the response_format."""
     outcome = _structured_parse(_structured_message(_REPORT_JSON))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
 
 
@@ -1738,7 +1736,7 @@ def test_structured_output_may_inherit_no_output() -> None:
         response_format=ReportAlsoNoOutput,
     )
     outcome = bound.interpret(_structured_message(_REPORT_JSON))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
@@ -1776,7 +1774,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
     validation_error_json preserves the field, constraint, and rejected value.
     """
     outcome = _structured_parse(_structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}'))
-    assert isinstance(outcome, SchemaViolation)
+    assert outcome.kind == "schema_violation"
     rejections = json.loads(outcome.validation_error_json)
     assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
     assert rejections[0]["input"] == "SENTINEL"
@@ -1785,34 +1783,34 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
     """Truncated JSON at max_tokens returns MaxCompletionTokensExceeded."""
     outcome = _structured_parse(_structured_message('{"city": "Nair', stop_reason="max_tokens"))
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
     """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
     outcome = _structured_parse(_structured_message(None, stop_reason="tool_use"))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output is None
 
 
 def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_as_none() -> None:
     """A tool_use turn whose text block is prose is the tool call, not a schema violation."""
     outcome = _structured_parse(_structured_message("let me look that up", stop_reason="tool_use"))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output is None
 
 
 def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
     """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
-    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.kind == "unfinished_turn"
     assert "pause_turn" in outcome.reason
 
 
 def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation() -> None:
     """A paused turn whose text is not the instance is the pause, which langchaint cannot continue."""
     outcome = _structured_parse(_structured_message("partial thought", stop_reason="pause_turn"))
-    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.kind == "unfinished_turn"
 
 
 def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:

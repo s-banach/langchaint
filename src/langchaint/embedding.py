@@ -28,10 +28,7 @@ from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
-    DoNotRetry,
-    PauseAllDoNotRetry,
     PrivateBackoff,
-    RetryThisOne,
     SharedBackoff,
 )
 
@@ -180,11 +177,14 @@ class EmbeddingModel:
                     return await self._adapter.embed_batch(inputs, task=task)
             except self._adapter.failure_types:
                 verdict = admission.verdict
-                if isinstance(verdict, DoNotRetry | PauseAllDoNotRetry):
+                if verdict is not None and verdict.kind in (
+                    "do_not_retry",
+                    "pause_all_do_not_retry",
+                ):
                     raise
                 if attempt_index == self.max_attempts:
                     raise
-                if isinstance(verdict, RetryThisOne):
+                if verdict is not None and verdict.kind == "retry_this_one":
                     await asyncio.sleep(private_backoff.next_wait(verdict.retry_after))
             except Exception as error:
                 if self._adapter.classify(error) != "transient":

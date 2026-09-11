@@ -129,7 +129,7 @@ def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
             ToolCall(id="call_decorated", name="record_echo", args_json='{"text":"tide"}')
         )
     )
-    assert isinstance(outcome, DispatchHandled)
+    assert outcome.kind == "handled"
     assert outcome.app_data == _EchoRecord(text="tide")
 
 
@@ -245,7 +245,7 @@ def test_dispatch_wraps_success_in_a_tool_message() -> None:
     """A valid call comes back as a DispatchHandled non-error ToolMessage with the call id."""
     call = ToolCall(id="call1", name="echo", args_json='{"text": "tide"}')
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.content == "tide"
     assert result.tool_message.is_error is False
@@ -270,7 +270,7 @@ def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
     )
     call = ToolCall(id="call1", name="render", args_json='{"text": "tide"}')
     result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.content == (
         TextPart(text="tide"),
         ImagePart(data=b"png", media_type="image/png"),
@@ -303,7 +303,7 @@ def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     """An unknown tool name returns DispatchUnknownTool."""
     call = ToolCall(id="call1", name="missing", args_json="{}")
     result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
-    assert isinstance(result, DispatchUnknownTool)
+    assert result.kind == "unknown_tool"
     assert result.called_name == "missing"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.is_error is True
@@ -350,7 +350,7 @@ def test_dispatch_carries_a_returned_is_error_result() -> None:
     )
     call = ToolCall(id="call1", name="picky", args_json='{"text": "tide"}')
     result = asyncio.run(ToolManager([tool]).dispatch(call))
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.is_error is True
     assert result.tool_message.content == "cannot echo 'tide': try a shorter value"
     assert result.tool_message.tool_call_id == "call1"
@@ -388,7 +388,7 @@ def test_dispatch_preserves_mapping_app_data_identity() -> None:
             ToolCall(id="call2", name="mapping", args_json='{"text": "tide"}')
         )
     )
-    assert isinstance(mapping_result, DispatchHandled)
+    assert mapping_result.kind == "handled"
     assert mapping_result.tool_message.is_error is True
     assert mapping_result.app_data is mapping
 
@@ -397,7 +397,7 @@ async def _pin_tool_dispatch_app_data_type(
     tool: PydanticTool[_EchoArgs, _Cites], call: ToolCall
 ) -> None:
     result = await tool.dispatch(call)
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert_type(result.app_data, _Cites | None)
 
 
@@ -484,7 +484,7 @@ def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> No
     """Schema violations return converted jsonschema errors."""
     call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo"}')
     result = asyncio.run(_weather_tool().dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.kind == "invalid_tool_args"
     assert result.tool_message.is_error is True
     assert result.details == (
         InvalidToolArgsDetail(path=(), message="'city' is a required property"),
@@ -522,7 +522,7 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     result = asyncio.run(
         tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
     )
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.content == "sunny in Oslo"
     assert result.tool_message.is_error is False
     assert result.app_data is None
@@ -539,7 +539,7 @@ def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
     result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json=args_json)))
-    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.kind == "invalid_tool_args"
     assert result.tool_message.tool_call_id == "c1"
     assert result.tool_message.is_error is True
     assert "invalid arguments for weather" in result.tool_message.content
@@ -581,7 +581,7 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
     )
     call = ToolCall(id="call1", name="weather", args_json='{"city": "Oslo"}')
     result = asyncio.run(tool.dispatch(call))
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.content == "weather for Oslo"
     raw: Mapping[str, object] | None = result.app_data
     assert raw is raw_result
@@ -602,8 +602,8 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
     weather_result = asyncio.run(
         manager.dispatch(ToolCall(id="c2", name="weather", args_json='{"city": "Oslo"}'))
     )
-    assert isinstance(echo_result, DispatchHandled)
-    assert isinstance(weather_result, DispatchHandled)
+    assert echo_result.kind == "handled"
+    assert weather_result.kind == "handled"
     assert echo_result.tool_message.content == "hi"
     assert weather_result.tool_message.content == "sunny in Oslo"
 
@@ -823,7 +823,7 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
     assert [str(error) for error in group.exceptions] == ["broke on a"]
     assert len(group.completed_outcomes) == 1
     outcome = group.completed_outcomes[0]
-    assert isinstance(outcome, DispatchHandled)
+    assert outcome.kind == "handled"
     assert outcome.tool_message.tool_call_id == "c2"
     assert outcome.tool_message.content == "charged b"
     assert outcome.app_data is receipt
@@ -1051,7 +1051,7 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
     assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
     result = asyncio.run(manager.dispatch(call))
-    assert isinstance(result, DispatchHandled)
+    assert result.kind == "handled"
     assert result.tool_message.content == "Answer received"
     assert result.tool_message.is_error is False
     assert result.app_data == _CapturedAnswer(answer="tide")
@@ -1061,7 +1061,7 @@ def test_capture_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -
     """A manager-routed invalid call comes back as the same DispatchInvalidToolArgs capture returns."""
     call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
     result = asyncio.run(ToolManager([_answer_capture_tool()]).dispatch(call))
-    assert isinstance(result, DispatchInvalidToolArgs)
+    assert result.kind == "invalid_tool_args"
     assert result.tool_message.is_error is True
     assert "invalid arguments for final_response" in result.tool_message.content
     assert any("answer" in detail.path for detail in result.details)

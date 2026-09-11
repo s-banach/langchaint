@@ -14,7 +14,6 @@ from pydantic import BaseModel
 
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     BoundAdapter,
@@ -27,8 +26,6 @@ from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import (
     Message,
-    RawPart,
-    ReasoningPart,
     UserMessage,
     messages_from_json,
     messages_to_json,
@@ -248,10 +245,10 @@ class AdapterConformance(ABC):
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert isinstance(outcome, AdapterResult)
+        assert outcome.kind == "adapter_result"
         turn = outcome.assistant_message.turn
         ((index, reasoning_part),) = [
-            (index, part) for index, part in enumerate(turn) if isinstance(part, ReasoningPart)
+            (index, part) for index, part in enumerate(turn) if part.kind == "reasoning_part"
         ]
         parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
@@ -272,15 +269,15 @@ class AdapterConformance(ABC):
             return
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(response)
-        assert isinstance(outcome, AdapterResult)
+        assert outcome.kind == "adapter_result"
         turn = outcome.assistant_message.turn
-        assert any(isinstance(part, RawPart) for part in turn)
+        assert any(part.kind == "raw_part" for part in turn)
         parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
         assert len(parts) == len(turn)
         for index, part in enumerate(turn):
-            if isinstance(part, RawPart):
+            if part.kind == "raw_part":
                 assert parts[index] == part.raw
 
     def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
@@ -291,7 +288,7 @@ class AdapterConformance(ABC):
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert isinstance(outcome, AdapterResult)
+        assert outcome.kind == "adapter_result"
         original: list[Message] = [UserMessage(content="hi"), outcome.assistant_message]
         restored = messages_from_json(messages_to_json(original))
         assert self._assistant_wire_parts_of(

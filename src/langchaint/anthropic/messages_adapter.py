@@ -691,10 +691,10 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     """
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.turn:
-        if isinstance(part, TextPart):
+        if part.kind == "text":
             if part.text:
                 blocks.append(TextBlockParam(type="text", text=part.text))
-        elif isinstance(part, ToolCall):
+        elif part.kind == "tool_call":
             blocks.append(
                 ToolUseBlockParam(
                     type="tool_use",
@@ -756,24 +756,25 @@ def _wire_messages(
             pending_tool_results.clear()
 
     for message in messages:
-        if isinstance(message, ToolMessage):
-            tool_result_block: ToolResultBlockParam = {
-                "type": "tool_result",
-                "tool_use_id": message.tool_call_id,
-                "content": _tool_result_content(message.content),
-                "is_error": message.is_error,
-            }
-            if _tool_message_is_marked(message):
-                marked_blocks.append(tool_result_block)
-            pending_tool_results.append(tool_result_block)
-        elif isinstance(message, UserMessage):
-            flush_tool_results()
-            blocks, marked = _user_content_blocks(message)
-            marked_blocks.extend(marked)
-            wire.append(("user", blocks))
-        else:
-            flush_tool_results()
-            wire.append(("assistant", _assistant_content_blocks(message)))
+        match message.kind:
+            case "tool":
+                tool_result_block: ToolResultBlockParam = {
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id,
+                    "content": _tool_result_content(message.content),
+                    "is_error": message.is_error,
+                }
+                if _tool_message_is_marked(message):
+                    marked_blocks.append(tool_result_block)
+                pending_tool_results.append(tool_result_block)
+            case "user":
+                flush_tool_results()
+                blocks, marked = _user_content_blocks(message)
+                marked_blocks.extend(marked)
+                wire.append(("user", blocks))
+            case "assistant":
+                flush_tool_results()
+                wire.append(("assistant", _assistant_content_blocks(message)))
     flush_tool_results()
     if message_mark_budget > 0:
         for block in marked_blocks[-message_mark_budget:]:

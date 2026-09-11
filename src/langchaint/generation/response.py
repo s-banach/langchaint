@@ -59,7 +59,7 @@ class _SuccessRecordBase(_CallResultRecordBase):
     def assistant_message(self) -> AssistantMessage:
         """Return the successful attempt's assistant message."""
         final = self.call.attempt_records[-1]
-        assert isinstance(final, SettledAttemptRecord)
+        assert final.kind == "settled"
         assert final.assistant_message is not None
         return final.assistant_message
 
@@ -266,7 +266,7 @@ def _success_variant[OutputT](
 ) -> GenerateResult[OutputT]:
     """Build one live success and its single normalized record."""
     final = call.attempt_records[-1]
-    assert isinstance(final, SettledAttemptRecord)
+    assert final.kind == "settled"
     assert final.assistant_message is not None
     if splits_tool_call_turns and final.assistant_message.tool_calls:
         return ToolCallTurn(

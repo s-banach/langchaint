@@ -38,7 +38,7 @@ class _GenerationErrorRecordBase(_CallResultRecordBase):
     def assistant_message(self) -> AssistantMessage | None:
         """Return the last recorded assistant message."""
         for attempt in reversed(self.call.attempt_records):
-            if isinstance(attempt, SettledAttemptRecord) and attempt.assistant_message is not None:
+            if attempt.kind == "settled" and attempt.assistant_message is not None:
                 return attempt.assistant_message
         return None
 
@@ -112,12 +112,8 @@ def _require_terminal_provider_result(call: CallRecord, *, permit_empty: bool) -
 
 
 def _require_abandoned_shape(call: CallRecord) -> None:
-    settled = tuple(
-        attempt for attempt in call.attempt_records if isinstance(attempt, SettledAttemptRecord)
-    )
-    final_is_cut_off = bool(call.attempt_records) and isinstance(
-        call.attempt_records[-1], CutOffAttemptRecord
-    )
+    settled = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
+    final_is_cut_off = bool(call.attempt_records) and call.attempt_records[-1].kind == "cut_off"
     if final_is_cut_off:
         settled_prefix = settled
     elif settled and settled[-1].error is None:

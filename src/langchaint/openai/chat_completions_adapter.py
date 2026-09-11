@@ -362,32 +362,34 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []
     for part in assistant_message.turn:
-        if isinstance(part, ReasoningPart):
-            param.update(part.raw)
-        elif isinstance(part, TextPart):
-            if part.text:
-                texts.append(part.text)
-        elif isinstance(part, ToolCall):
-            tool_calls.append({
-                "id": part.id,
-                "type": "function",
-                "function": {"name": part.name, "arguments": part.args_json},
-            })
-        elif part.raw.get("type") == "custom":
-            # cast: a deliberately-opaque value re-enters the typed API that serialized it.
-            tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", part.raw))
-        elif len(part.raw) == 1 and "function_call" in part.raw:
-            if "function_call" in param:
-                raise _NotSendableError(
-                    "an assistant turn contains more than one function_call, but Chat Completions "
-                    "has one function_call field"
-                )
-            param.update(part.raw)
-        else:
-            raise _NotSendableError(
-                "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
-                "function_call can hold it; rebuild the turn without it"
-            )
+        match part.kind:
+            case "reasoning_part":
+                param.update(part.raw)
+            case "text":
+                if part.text:
+                    texts.append(part.text)
+            case "tool_call":
+                tool_calls.append({
+                    "id": part.id,
+                    "type": "function",
+                    "function": {"name": part.name, "arguments": part.args_json},
+                })
+            case "raw_part":
+                if part.raw.get("type") == "custom":
+                    # cast: a deliberately-opaque value re-enters the typed API that serialized it.
+                    tool_calls.append(cast("ChatCompletionMessageToolCallUnionParam", part.raw))
+                elif len(part.raw) == 1 and "function_call" in part.raw:
+                    if "function_call" in param:
+                        raise _NotSendableError(
+                            "an assistant turn contains more than one function_call, but Chat "
+                            "Completions has one function_call field"
+                        )
+                    param.update(part.raw)
+                else:
+                    raise _NotSendableError(
+                        "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
+                        "function_call can hold it; rebuild the turn without it"
+                    )
     if texts:
         param["content"] = "".join(texts)
     if tool_calls:
@@ -405,12 +407,13 @@ def _wire_messages(messages: Sequence[Message]) -> list[ChatCompletionMessagePar
     """
     wire: list[ChatCompletionMessageParam] = []
     for message in messages:
-        if isinstance(message, ToolMessage):
-            wire.append(_tool_message(message))
-        elif isinstance(message, UserMessage):
-            wire.append(_user_message(message))
-        else:
-            wire.append(_assistant_message_param(message))
+        match message.kind:
+            case "tool":
+                wire.append(_tool_message(message))
+            case "user":
+                wire.append(_user_message(message))
+            case "assistant":
+                wire.append(_assistant_message_param(message))
     return wire
 
 

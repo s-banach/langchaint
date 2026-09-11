@@ -140,10 +140,10 @@ def verdict_under_retry_directive(
     """
     directive = should_retry_from_headers(headers)
     if directive is False:
-        if isinstance(verdict, PauseAll | PauseAllDoNotRetry):
+        if verdict.kind in ("pause_all", "pause_all_do_not_retry"):
             return PauseAllDoNotRetry(retry_after=verdict.retry_after)
         return DoNotRetry()
-    if directive is True and isinstance(verdict, DoNotRetry):
+    if directive is True and verdict.kind == "do_not_retry":
         return RetryThisOne(retry_after=retry_after)
     return verdict
 

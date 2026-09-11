@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from langchaint import TextPart, ToolMessage, Usage
+from langchaint import ToolMessage, Usage
 
 
 def describe_error(error: BaseException) -> str:
@@ -23,7 +23,7 @@ def content_text(message: ToolMessage) -> str:
     content = message.content
     if isinstance(content, str):
         return content
-    return " ".join(part.text for part in content if isinstance(part, TextPart))
+    return " ".join(part.text for part in content if part.kind == "text")
 
 
 @dataclass(frozen=True)

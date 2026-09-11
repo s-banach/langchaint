@@ -204,7 +204,7 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
 
         assert (await bound.generate_one("hi")).output == "hi"
         (row,) = await bound.generate_many(["hi"])
-        assert isinstance(row, Response)
+        assert row.kind == "response"
         assert row.output == "hi"
 
         async with bound.stream_one("hi") as stream:
@@ -217,7 +217,7 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
         outcome = await tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
         )
-        assert isinstance(outcome, DispatchHandled)
+        assert outcome.kind == "handled"
 
     asyncio.run(scenario())
 
@@ -582,7 +582,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         ])
         first, *rest = results
         assert isinstance(first, GenerationError)
-        assert all(isinstance(result, Response) for result in rest)
+        assert all(result.kind == "response" for result in rest)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -619,7 +619,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             sample_ids=["sample-a", "sample-b"],
         )
-        assert all(isinstance(record, ResponseRecord) for record in first)
+        assert all(record.kind == "response" for record in first)
         assert len(exporter.get_finished_spans()) == 2
 
         resumed = await bound.generate_many_records(
@@ -627,7 +627,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             sample_ids=["sample-b", "sample-c", "sample-a"],
         )
-        assert all(isinstance(record, ResponseRecord) for record in resumed)
+        assert all(record.kind == "response" for record in resumed)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -1122,7 +1122,7 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
 
         def _mapper(result: CallResult[object]) -> SpanAttributes:
             """Record the result mapped and emit it as an attribute."""
-            output = result.output if isinstance(result, Response) else None
+            output = result.output if result.kind == "response" else None
             mapped_outputs.append(output)
             return {"custom.mapped_output": str(output)}
 
@@ -1141,9 +1141,9 @@ def test_generate_many_invokes_the_mapper_once_per_item() -> None:
             [UserMessage(content="b")],
         ])
         first, second = results
-        assert isinstance(first, Response)
+        assert first.kind == "response"
         assert first.output == "a"
-        assert isinstance(second, Response)
+        assert second.kind == "response"
         assert second.output == "b"
         assert mapped_outputs == ["a", "b"]
         spans = exporter.get_finished_spans()
@@ -1488,8 +1488,8 @@ def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}'),
             ToolCall(id="call2", name="missing", args_json="{}"),
         ])
-        assert isinstance(outcomes[0], DispatchHandled)
-        assert isinstance(outcomes[1], DispatchUnknownTool)
+        assert outcomes[0].kind == "handled"
+        assert outcomes[1].kind == "unknown_tool"
         spans = exporter.get_finished_spans()
         assert sorted(span.name for span in spans) == ["execute_tool echo", "execute_tool missing"]
         call_ids = {
@@ -1623,7 +1623,7 @@ def test_generate_many_passes_warm_cache_through() -> None:
         results = await traced.bind().generate_many(
             [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
         )
-        assert all(isinstance(result, Response) for result in results)
+        assert all(result.kind == "response" for result in results)
         assert adapter.bound_adapters[0].peak_in_flight == 2
         # The warming item is traced like every other item, so three items are three spans.
         assert len(exporter.get_finished_spans()) == 3
@@ -2295,7 +2295,7 @@ def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_pa
         outcome = await tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json="not json at all")
         )
-        assert isinstance(outcome, DispatchInvalidToolArgs)
+        assert outcome.kind == "invalid_tool_args"
         assert _captured(exporter, "gen_ai.tool.call.arguments") == "not json at all"
 
     asyncio.run(scenario())

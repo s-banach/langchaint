@@ -462,7 +462,7 @@ class SharedBackoff:
         A negative `retry_after` creates a past pause end.
         A NaN bypasses the cap and corrupts quiet-step arithmetic.
         """
-        if isinstance(verdict, DoNotRetry):
+        if verdict.kind == "do_not_retry":
             return verdict
         if verdict.retry_after is None:
             return verdict
@@ -510,7 +510,7 @@ class SharedBackoff:
         Waiting for admission satisfies every PauseAll.retry_after.
         The pause ends within longest_wait_seconds after the most recent report.
         """
-        if not isinstance(verdict, PauseAll | PauseAllDoNotRetry):
+        if verdict.kind not in ("pause_all", "pause_all_do_not_retry"):
             return
         now = self._clock()
         if now < self._pause_until:

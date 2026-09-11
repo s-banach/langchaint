@@ -72,19 +72,13 @@ from langchaint.adapter import (
     AdapterResult,
     AdapterStream,
     Binding,
-    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
     NoOutput,
-    ProviderFailedTerminally,
     ProviderFailedTransiently,
-    Refusal,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
-    SchemaViolation,
-    UnfinishedTurn,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.common.exceptions import StreamProtocolError
@@ -199,7 +193,7 @@ _FILE_SEARCH_OUTPUT_ITEM: dict[str, object] = {
 
 def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
     """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     return outcome
 
 
@@ -463,7 +457,7 @@ def test_incomplete_response_without_a_dedicated_stop_reason(reason: str) -> Non
         incomplete_details=IncompleteDetails.model_construct(reason=reason),
     )
     outcome = _text_bound().interpret(response)
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.stop_reason == "other"
     assert outcome.output == "hey"
 
@@ -499,7 +493,7 @@ def test_reasoning_round_trips_verbatim_in_position() -> None:
         ToolCall,
     ]
     reasoning_part = assistant_message.turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.raw == _REASONING_OUTPUT_ITEM
     assert assistant_message.text == "hey"
     assert assistant_message.tool_calls == (
@@ -578,7 +572,7 @@ def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_with
     """Reasoning text prefers content, joins parts, and excludes empty text."""
     response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
     reasoning_part = _assistant_message_from(response).turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text == expected_text
 
 
@@ -1326,7 +1320,7 @@ def test_a_summary_part_boundary_streams_the_assembled_reasoning_part_separator(
 
     streamed, assistant_message = asyncio.run(scenario())
     reasoning_part = assistant_message.turn[0]
-    assert isinstance(reasoning_part, ReasoningPart)
+    assert reasoning_part.kind == "reasoning_part"
     assert streamed == reasoning_part.text == "First, water evaporates.\n\nThen it condenses."
 
 
@@ -1532,7 +1526,7 @@ def test_stream_final_turn_carries_reasoning() -> None:
             pass
         result = _assert_result(await _text_final(adapter_stream))
         reasoning_part = result.assistant_message.turn[0]
-        assert isinstance(reasoning_part, ReasoningPart)
+        assert reasoning_part.kind == "reasoning_part"
         assert reasoning_part.raw == _REASONING_OUTPUT_ITEM
 
     asyncio.run(scenario())
@@ -1713,14 +1707,14 @@ def test_structured_output_may_inherit_no_output() -> None:
         response_format=ReportAlsoNoOutput,
     )
     outcome = bound.interpret(_structured_response(_REPORT_JSON))
-    assert isinstance(outcome, AdapterResult)
+    assert outcome.kind == "adapter_result"
     assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
 
 
 def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
     """A completed response with no text part and no tool call is EmptyTurn."""
     outcome = _structured_parse(_structured_response(None))
-    assert isinstance(outcome, EmptyTurn)
+    assert outcome.kind == "empty_turn"
 
 
 def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
@@ -1729,7 +1723,7 @@ def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() ->
     validation_error_json preserves the field, constraint, and rejected value.
     """
     outcome = _structured_parse(_structured_response('{"city": "Nairobi", "celsius": "SENTINEL"}'))
-    assert isinstance(outcome, SchemaViolation)
+    assert outcome.kind == "schema_violation"
     rejections = json.loads(outcome.validation_error_json)
     assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
     assert rejections[0]["input"] == "SENTINEL"
@@ -1747,7 +1741,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
         )
     )
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
@@ -1814,7 +1808,7 @@ def test_structured_bind_reports_the_failure_on_a_failed_status_whose_text_valid
     outcome = _structured_parse(
         _structured_response(_REPORT_JSON, status="failed", error=_SERVER_ERROR)
     )
-    assert isinstance(outcome, ProviderFailedTransiently)
+    assert outcome.kind == "provider_failed_transiently"
 
 
 def test_a_failed_run_carrying_a_refusal_takes_the_failure_variant_under_both_bindings() -> None:
@@ -1825,17 +1819,17 @@ def test_a_failed_run_carrying_a_refusal_takes_the_failure_variant_under_both_bi
     structured_outcome = _structured_parse(
         _structured_response(None, refusal=True, status="failed", error=_SERVER_ERROR)
     )
-    assert isinstance(structured_outcome, ProviderFailedTransiently)
+    assert structured_outcome.kind == "provider_failed_transiently"
     text_outcome = _text_bound().interpret(
         _response(usage=None, output=[_REFUSAL_MESSAGE_ITEM], status="failed", error=_SERVER_ERROR)
     )
-    assert isinstance(text_outcome, ProviderFailedTransiently)
+    assert text_outcome.kind == "provider_failed_transiently"
 
 
 def test_a_transient_error_code_carries_the_providers_message_and_no_rate_limit_flag() -> None:
     """A server_error is transient, and its reason is openai's message verbatim."""
     outcome = _text_bound().interpret(_response(usage=None, status="failed", error=_SERVER_ERROR))
-    assert isinstance(outcome, ProviderFailedTransiently)
+    assert outcome.kind == "provider_failed_transiently"
     assert outcome.reason == _SERVER_ERROR.message
     assert outcome.is_rate_limit is False
 
@@ -1849,7 +1843,7 @@ def test_a_rate_limit_error_code_sets_the_rate_limit_flag() -> None:
             error=ResponseError(code="rate_limit_exceeded", message="Rate limit reached."),
         )
     )
-    assert isinstance(outcome, ProviderFailedTransiently)
+    assert outcome.kind == "provider_failed_transiently"
     assert outcome.is_rate_limit is True
 
 
@@ -1867,7 +1861,7 @@ def test_a_terminal_error_code_carries_the_providers_message_without_retrying(
 ) -> None:
     """Preserve the provider's message and emitted text in a terminal failure."""
     outcome = _text_bound().interpret(_response(usage=None, status="failed", error=error))
-    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.kind == "provider_failed_terminally"
     assert outcome.reason == error.message
     assert outcome.assistant_message.text == "hey"
 
@@ -1881,28 +1875,28 @@ def test_an_error_code_the_installed_sdk_does_not_name_is_terminal() -> None:
             error=ResponseError.construct(code="a_code_from_a_later_sdk", message="Something."),
         )
     )
-    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.kind == "provider_failed_terminally"
     assert outcome.reason == "Something."
 
 
 def test_a_failed_status_with_no_error_object_is_terminal() -> None:
     """A failed run naming nothing gives no ground to resend on, and says that in its reason."""
     outcome = _text_bound().interpret(_response(usage=None, status="failed"))
-    assert isinstance(outcome, ProviderFailedTerminally)
+    assert outcome.kind == "provider_failed_terminally"
     assert outcome.reason == "openai reported status 'failed' and no error object"
 
 
 def test_a_run_that_stopped_short_of_a_turn_is_unfinished_turn_naming_the_status() -> None:
     """A cancelled run is neither a failure openai described nor a turn, so it names its status."""
     outcome = _structured_parse(_structured_response(None, status="cancelled"))
-    assert isinstance(outcome, UnfinishedTurn)
+    assert outcome.kind == "unfinished_turn"
     assert outcome.reason == "openai returned status 'cancelled'"
 
 
 def test_structured_bind_reports_refusal_on_a_refusal_block() -> None:
     """A response carrying a refusal content block is Refusal."""
     outcome = _structured_parse(_structured_response(None, refusal=True))
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
 
 
 def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_tokens_incomplete() -> (
@@ -1916,7 +1910,7 @@ def test_structured_bind_reports_max_completion_tokens_exceeded_on_a_max_output_
             incomplete_details=IncompleteDetails(reason="max_output_tokens"),
         )
     )
-    assert isinstance(outcome, MaxCompletionTokensExceeded)
+    assert outcome.kind == "max_completion_tokens_exceeded"
 
 
 def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> None:
@@ -1931,7 +1925,7 @@ def test_structured_bind_reports_refusal_on_a_content_filter_incomplete() -> Non
             incomplete_details=IncompleteDetails(reason="content_filter"),
         )
     )
-    assert isinstance(outcome, Refusal)
+    assert outcome.kind == "refusal"
 
 
 def test_every_request_carries_the_reasoning_include(

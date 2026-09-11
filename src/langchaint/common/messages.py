@@ -240,7 +240,7 @@ class AssistantMessage(CheckedCopyModel):
         Raises:
             ValueError: A `TextPart` in `turn` sets `cache_breakpoint`.
         """
-        if any(isinstance(part, TextPart) and part.cache_breakpoint for part in self.turn):
+        if any(part.kind == "text" and part.cache_breakpoint for part in self.turn):
             raise ValueError(
                 "cache_breakpoint is not supported on assistant turn text. "
                 "openai has no breakpoint on assistant replay text. "
@@ -254,12 +254,12 @@ class AssistantMessage(CheckedCopyModel):
 
         Return an empty string when `turn` contains no `TextPart`.
         """
-        return "".join(part.text for part in self.turn if isinstance(part, TextPart))
+        return "".join(part.text for part in self.turn if part.kind == "text")
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
         """Return the `ToolCall` values from `turn` in emission order."""
-        return tuple(part for part in self.turn if isinstance(part, ToolCall))
+        return tuple(part for part in self.turn if part.kind == "tool_call")
 
 
 class ToolMessage(CheckedCopyModel):

@@ -137,7 +137,6 @@ from langchaint.common.messages import (
     StopReason,
     TextPart,
     ToolCall,
-    ToolMessage,
     TurnPart,
     UserMessage,
 )
@@ -393,10 +392,10 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             pending_texts.clear()
 
     for part in assistant_message.turn:
-        if isinstance(part, TextPart):
+        if part.kind == "text":
             if part.text:
                 pending_texts.append(part.text)
-        elif isinstance(part, ToolCall):
+        elif part.kind == "tool_call":
             flush_text_run()
             function_call_item: ResponseFunctionToolCallParam = {
                 "type": "function_call",
@@ -422,17 +421,18 @@ def _wire_input(messages: Sequence[Message]) -> list[ResponseInputItemParam]:
     """
     wire: list[ResponseInputItemParam] = []
     for message in messages:
-        if isinstance(message, ToolMessage):
-            function_call_output: FunctionCallOutput = {
-                "type": "function_call_output",
-                "call_id": message.tool_call_id,
-                "output": _function_call_output(message.content),
-            }
-            wire.append(function_call_output)
-        elif isinstance(message, UserMessage):
-            wire.append(_user_item(message))
-        else:
-            wire.extend(_assistant_items(message))
+        match message.kind:
+            case "tool":
+                function_call_output: FunctionCallOutput = {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": _function_call_output(message.content),
+                }
+                wire.append(function_call_output)
+            case "user":
+                wire.append(_user_item(message))
+            case "assistant":
+                wire.extend(_assistant_items(message))
     return wire
 
 

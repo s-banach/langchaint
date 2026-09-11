@@ -378,6 +378,19 @@ class AnthropicPricingTable:
             return _UNPRICED_RATES
         return rates.multiplied(multiplier)
 
+    def multiplied(self, multiplier: float) -> "AnthropicPricingTable":
+        """Return the table with every token rate multiplied by one value.
+
+        Modifiers and per-invocation prices are unchanged.
+        """
+        return AnthropicPricingTable(
+            standard=self.standard.multiplied(multiplier),
+            priority=None if self.priority is None else self.priority.multiplied(multiplier),
+            batch=None if self.batch is None else self.batch.multiplied(multiplier),
+            inference_geo_us_multiplier=self.inference_geo_us_multiplier,
+            web_search_usd_per_invocation=self.web_search_usd_per_invocation,
+        )
+
 
 def _cache_control_param(cache_ttl: CacheTTL) -> CacheControlEphemeralParam:
     """Build one cache_control marker.

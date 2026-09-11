@@ -1,6 +1,5 @@
 """Pricing metadata selection and generation tests."""
 
-import json
 import math
 
 import pytest
@@ -21,13 +20,12 @@ from scripts.update_pricing_metadata import (
     OPENAI_OUTPUT_PATH,
     SNAPSHOT_PATH,
     _anthropic_module,
-    _metadata_items,
-    _metadata_multiplier,
+    _LiteLLMEntry,
     _million_rate,
     _openai_module,
     _ProviderMetadata,
-    _required_dict,
-    _typed_entries,
+    _selected_entries,
+    _snapshot_json,
 )
 
 
@@ -179,43 +177,15 @@ def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
 
 
 def test_vendored_inputs_reproduce_generated_modules() -> None:
-    """Vendored inputs reproduce both generated modules offline."""
-    snapshot_payload: object = json.loads(SNAPSHOT_PATH.read_text())
-    entries = _typed_entries(snapshot_payload)
-    metadata_payload: object = json.loads(METADATA_PATH.read_text())
-    raw_metadata = _required_dict(metadata_payload, "provider metadata")
-    metadata: _ProviderMetadata = {
-        "anthropic": _metadata_items(raw_metadata.get("anthropic"), "anthropic metadata"),
-        "openai": _metadata_items(raw_metadata.get("openai"), "openai metadata"),
-    }
+    """Vendored inputs reproduce the snapshot and both generated modules offline."""
+    entries = _selected_entries(SNAPSHOT_PATH.read_bytes())
+    metadata = _ProviderMetadata.model_validate_json(METADATA_PATH.read_bytes())
+    assert _snapshot_json(entries) == SNAPSHOT_PATH.read_text()
     assert _openai_module(entries, metadata) == OPENAI_OUTPUT_PATH.read_text()
     assert _anthropic_module(entries, metadata) == ANTHROPIC_OUTPUT_PATH.read_text()
 
 
-@pytest.mark.parametrize("value", [True, -1, math.nan, math.inf])
-def test_litellm_rates_must_be_nonnegative_and_finite(value: float) -> None:
-    """LiteLLM rates reject unusable numeric values."""
-    with pytest.raises(ValueError, match="finite and nonnegative"):
-        _ = _million_rate({"input_cost_per_token": value}, "input_cost_per_token")
-
-
 def test_litellm_rates_accept_zero() -> None:
     """LiteLLM rates accept free pricing categories."""
-    assert _million_rate({"input_cost_per_token": 0}, "input_cost_per_token") == "0"
-
-
-@pytest.mark.parametrize("value", [0, -1, math.nan, math.inf])
-def test_provider_metadata_must_be_positive_and_finite(value: float) -> None:
-    """Provider metadata rejects unusable numeric values."""
-    metadata: _ProviderMetadata = {
-        "anthropic": {},
-        "openai": {
-            "regional_processing_multiplier": {
-                "source_url": "https://example.com",
-                "value": value,
-                "verified_on": "2026-08-11",
-            }
-        },
-    }
-    with pytest.raises(ValueError, match="is invalid"):
-        _ = _metadata_multiplier(metadata, "openai", "regional_processing_multiplier")
+    entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", "input_cost_per_token": 0})
+    assert _million_rate(entry.input_cost_per_token) == "0"

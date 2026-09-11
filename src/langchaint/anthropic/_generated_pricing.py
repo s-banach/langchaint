@@ -111,6 +111,17 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
         inference_geo_us_multiplier=None,
         web_search_usd_per_invocation=0.01,
     ),
+    "anthropic.claude-opus-5": AnthropicPricingTable(
+        standard=AnthropicRates(
+            input_cache_none_usd_per_million_tokens=5,
+            output_usd_per_million_tokens=25,
+            cache_read_usd_per_million_tokens=0.5,
+            cache_write_5m_usd_per_million_tokens=6.25,
+            cache_write_1h_usd_per_million_tokens=10,
+        ),
+        inference_geo_us_multiplier=None,
+        web_search_usd_per_invocation=0.01,
+    ),
     "anthropic.claude-opus-4-8": AnthropicPricingTable(
         standard=AnthropicRates(
             input_cache_none_usd_per_million_tokens=5,
@@ -178,3 +189,14 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
         web_search_usd_per_invocation=0.01,
     ),
 }
+
+BEDROCK_CROSS_REGION_MULTIPLIER: dict[str, float] = {
+    "us": 1.1,
+    "eu": 1.1,
+    "au": 1.1,
+    "jp": 1.1,
+    "apac": 1.1,
+    "global": 1.0,
+    "us-gov": 1.2,
+}
+"""Token-rate multiplier for each Bedrock cross-region inference profile prefix."""

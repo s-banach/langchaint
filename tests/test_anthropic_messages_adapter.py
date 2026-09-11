@@ -5,6 +5,7 @@ import json
 import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from typing import TypeIs, override
 
 import anthropic
@@ -71,6 +72,7 @@ from langchaint.adapter import (
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK_PRICING,
+    BEDROCK_CROSS_REGION_MULTIPLIER,
     Anthropic,
     AnthropicBedrock,
     AnthropicBedrockModelName,
@@ -1954,8 +1956,11 @@ def _anthropic_adapter_of(llm: LLM) -> AnthropicMessagesAdapter:
     ("model", "expected_client_class"),
     [
         ("anthropic.claude-fable-5", AsyncAnthropicBedrockMantle),
+        ("anthropic.claude-opus-5", AsyncAnthropicBedrockMantle),
         ("anthropic.claude-opus-4-8", AsyncAnthropicBedrockMantle),
         ("anthropic.claude-haiku-4-5", AsyncAnthropicBedrockMantle),
+        ("us.anthropic.claude-opus-5", AsyncAnthropicBedrockMantle),
+        ("us-gov.anthropic.claude-sonnet-5", AsyncAnthropicBedrockMantle),
         ("us.anthropic.claude-opus-4-6-v1", AsyncAnthropicBedrock),
         ("us.anthropic.claude-sonnet-4-6", AsyncAnthropicBedrock),
     ],
@@ -1977,6 +1982,52 @@ def test_bedrock_model_uses_its_bedrock_pricing_object() -> None:
         AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
     )
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
+
+
+@pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
+def test_prefixed_bedrock_model_applies_its_premium_by_default(prefix: str) -> None:
+    """Every cross-region prefix multiplies the unprefixed token rates by its multiplier."""
+    adapter = _anthropic_adapter_of(
+        AnthropicBedrock(aws_region="us-east-1").model(f"{prefix}.anthropic.claude-sonnet-5")
+    )
+    base = ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
+    multiplier = BEDROCK_CROSS_REGION_MULTIPLIER[prefix]
+    assert adapter.pricing == replace(base, standard=base.standard.multiplied(multiplier))
+
+
+@pytest.mark.parametrize("prefix", sorted(BEDROCK_CROSS_REGION_MULTIPLIER))
+def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled(
+    prefix: str,
+) -> None:
+    """`apply_cross_region_premium=False` resolves to the unprefixed catalog table itself."""
+    adapter = _anthropic_adapter_of(
+        AnthropicBedrock(aws_region="us-east-1", apply_cross_region_premium=False).model(
+            f"{prefix}.anthropic.claude-sonnet-5"
+        )
+    )
+    assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
+
+
+def test_exact_prefixed_catalog_entry_ignores_the_premium() -> None:
+    """A verbatim catalog entry already states its regional rates."""
+    adapter = _anthropic_adapter_of(
+        AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
+    )
+    assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
+
+
+def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> None:
+    """`multiplied` scales standard, priority, and batch rates and preserves the other fields."""
+    table = AnthropicPricingTable(
+        standard=_PRICING.standard,
+        priority=_PRICING.standard,
+        batch=_PRICING.standard,
+        inference_geo_us_multiplier=1.1,
+        web_search_usd_per_invocation=0.01,
+    )
+    scaled = table.multiplied(2.0)
+    doubled = _PRICING.standard.multiplied(2.0)
+    assert scaled == replace(table, standard=doubled, priority=doubled, batch=doubled)
 
 
 def test_bedrock_model_uses_a_matching_supplied_client() -> None:

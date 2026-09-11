@@ -7,6 +7,8 @@ Importing this subpackage requires `anthropic`.
 
 Cataloged Anthropic models receive `ANTHROPIC_PRICING`.
 Cataloged Bedrock models receive `ANTHROPIC_BEDROCK_PRICING`.
+A Bedrock identifier with a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix resolves through the unprefixed identifier.
+`AnthropicBedrock` multiplies those token rates by the prefix multiplier unless `apply_cross_region_premium=False`.
 Uncataloged Anthropic models require `pricing`.
 Uncataloged Bedrock models also require a passed `client`.
 Missing optional rates produce NaN token costs.
@@ -26,7 +28,7 @@ One-hour cache writes cost twice base input.
 """
 
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 try:
     import httpx2
@@ -42,6 +44,7 @@ except ModuleNotFoundError as exc:
 from langchaint.anthropic._generated_pricing import (
     ANTHROPIC_BEDROCK_PRICING,
     ANTHROPIC_PRICING,
+    BEDROCK_CROSS_REGION_MULTIPLIER,
     AnthropicModelName,
 )
 from langchaint.anthropic.messages_adapter import (
@@ -63,6 +66,7 @@ _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items(
 type AnthropicBedrockModelName = (
     Literal[
         "anthropic.claude-fable-5",
+        "anthropic.claude-opus-5",
         "anthropic.claude-opus-4-8",
         "anthropic.claude-opus-4-7",
         "anthropic.claude-sonnet-5",
@@ -76,7 +80,31 @@ type AnthropicBedrockModelName = (
 
 Each identifier is sent verbatim.
 The literal values offer preferred endpoint-specific identifiers.
+A `BEDROCK_CROSS_REGION_MULTIPLIER` prefix on a literal value resolves the same routing and catalog pricing.
 """
+
+
+class _CatalogResolution(NamedTuple):
+    """The catalog identifier a Bedrock identifier resolves through."""
+
+    catalog_id: str
+    cross_region_multiplier: float | None
+    """The `BEDROCK_CROSS_REGION_MULTIPLIER` entry of a stripped prefix, or `None` when no prefix was stripped."""
+
+
+def _resolve_catalog_id(model: str) -> _CatalogResolution:
+    """Resolve `model` to its catalog identifier.
+
+    An exact catalog identifier resolves to itself.
+    Otherwise a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped.
+    """
+    if model in ANTHROPIC_BEDROCK_PRICING:
+        return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
+    prefix, _, unprefixed = model.partition(".")
+    multiplier = BEDROCK_CROSS_REGION_MULTIPLIER.get(prefix)
+    if multiplier is None:
+        return _CatalogResolution(catalog_id=model, cross_region_multiplier=None)
+    return _CatalogResolution(catalog_id=unprefixed, cross_region_multiplier=multiplier)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -88,6 +116,7 @@ class BedrockRouting:
 
 ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
     "anthropic.claude-fable-5": BedrockRouting(api="mantle"),
+    "anthropic.claude-opus-5": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-4-8": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-4-7": BedrockRouting(api="mantle"),
     "anthropic.claude-sonnet-5": BedrockRouting(api="mantle"),
@@ -196,14 +225,12 @@ class Anthropic:
         Raises:
             ValueError: An uncataloged model lacks `pricing`.
         """
-        catalog_table = _PRICING_BY_MODEL_ID.get(model)
-        if catalog_table is None:
-            if pricing is None:
-                raise ValueError(
-                    f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
-                )
-        else:
-            pricing = pricing or catalog_table
+        if pricing is None:
+            pricing = _PRICING_BY_MODEL_ID.get(model)
+        if pricing is None:
+            raise ValueError(
+                f"model {model!r} is not in ANTHROPIC_PRICING; pass pricing= stating its rates"
+            )
         adapter = AnthropicMessagesAdapter(
             client=self.client,
             model=model,
@@ -226,6 +253,7 @@ class AnthropicBedrock:
         aws_region: str | None = None,
         client: AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
         http_client: httpx2.AsyncClient | None = None,
+        apply_cross_region_premium: bool = True,
         max_concurrent_requests: int | None = 8,
         max_request_starts_per_second: float = 50.0,
         minimum_wait_ceiling_seconds: float = 1.0,
@@ -237,6 +265,7 @@ class AnthropicBedrock:
 
         `aws_region` selects the region for SDK clients created by `AnthropicBedrock`.
         `http_client` applies to SDK clients created by `AnthropicBedrock`.
+        `apply_cross_region_premium=False` leaves a prefixed identifier's catalog rates unmultiplied.
         `max_concurrent_requests` limits concurrent admitted requests.
         `max_request_starts_per_second` limits starts during queued demand.
         `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
@@ -264,6 +293,7 @@ class AnthropicBedrock:
         )
         self.aws_region: str | None = aws_region
         self.http_client: httpx2.AsyncClient | None = http_client
+        self.apply_cross_region_premium: bool = apply_cross_region_premium
         self._passed_client = client_without_retries(client) if client is not None else None
         self._clients_by_api: dict[
             Literal["mantle", "legacy"], AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle
@@ -281,7 +311,8 @@ class AnthropicBedrock:
 
         `model` is sent verbatim.
         An exact catalog identifier selects pricing.
-        An exact preferred Mantle identifier selects `AsyncAnthropicBedrockMantle`.
+        Otherwise a `BEDROCK_CROSS_REGION_MULTIPLIER` prefix is stripped before the catalog lookups.
+        A preferred Mantle identifier selects `AsyncAnthropicBedrockMantle`.
         Other known identifiers select `AsyncAnthropicBedrock`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing` and a passed `client`.
@@ -294,51 +325,89 @@ class AnthropicBedrock:
             ValueError: An uncataloged model lacks `pricing` or a passed `client`.
                 Also raised when a passed SDK client cannot serve `model`.
         """
-        routing = ANTHROPIC_BEDROCK.get(model)
-        client = self._passed_client
-        if client is None:
-            if routing is None:
-                raise ValueError(
-                    f"model {model!r} has no matching BedrockRouting; pass client= with its SDK client class"
-                )
-            client = self._clients_by_api.get(routing.api)
-            if client is None:
-                client = _BEDROCK_CLIENT_CLASS[routing.api](
-                    aws_region=self.aws_region,
-                    http_client=self.http_client,
-                    max_retries=0,
-                )
-                self._clients_by_api[routing.api] = client
-        elif routing is not None:
-            required_class = _BEDROCK_CLIENT_CLASS[routing.api]
-            if not isinstance(client, required_class):
-                raise ValueError(
-                    f"{model!r} is served by the {routing.api!r} Bedrock API, which requires a "
-                    f"{required_class.__name__} client, but a {type(client).__name__} was passed."
-                )
-        catalog_table = ANTHROPIC_BEDROCK_PRICING.get(model)
-        if catalog_table is None:
-            if pricing is None:
-                raise ValueError(
-                    f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
-                )
-        else:
-            pricing = pricing or catalog_table
+        resolution = _resolve_catalog_id(model)
+        routing = ANTHROPIC_BEDROCK.get(resolution.catalog_id)
+        client = self._client_for(routing, model)
         adapter = AnthropicMessagesAdapter(
             client=client,
             model=model,
-            pricing=pricing,
+            pricing=pricing if pricing is not None else self._catalog_pricing(model, resolution),
             provider_name="aws.bedrock",
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff)
 
+    def _client_for(
+        self, routing: BedrockRouting | None, model: str
+    ) -> AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle:
+        """Return the passed client after checking it serves `routing`, or the client `routing` selects.
+
+        Raises:
+            anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
+            ValueError: `routing` is `None` with no passed client, or the passed client cannot
+                serve `model`.
+        """
+        client = self._passed_client
+        if client is None:
+            return self._owned_client(routing, model)
+        if routing is not None and not isinstance(client, _BEDROCK_CLIENT_CLASS[routing.api]):
+            raise ValueError(
+                f"{model!r} is served by the {routing.api!r} Bedrock API, which requires a "
+                f"{_BEDROCK_CLIENT_CLASS[routing.api].__name__} client, but a "
+                f"{type(client).__name__} was passed."
+            )
+        return client
+
+    def _owned_client(
+        self, routing: BedrockRouting | None, model: str
+    ) -> AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle:
+        """Return the client `AnthropicBedrock` creates for `routing`, one per Bedrock API.
+
+        Raises:
+            anthropic.AnthropicError: A mantle client cannot resolve its region or base URL.
+            ValueError: `routing` is `None`.
+        """
+        if routing is None:
+            raise ValueError(
+                f"model {model!r} has no matching BedrockRouting; pass client= with its SDK client class"
+            )
+        cached_client = self._clients_by_api.get(routing.api)
+        if cached_client is not None:
+            return cached_client
+        created_client = _BEDROCK_CLIENT_CLASS[routing.api](
+            aws_region=self.aws_region,
+            http_client=self.http_client,
+            max_retries=0,
+        )
+        self._clients_by_api[routing.api] = created_client
+        return created_client
+
+    def _catalog_pricing(
+        self, model: str, resolution: _CatalogResolution
+    ) -> AnthropicPricingTable:
+        """Return the catalog table for `resolution`.
+
+        `apply_cross_region_premium` multiplies the table by the prefix multiplier of `resolution`.
+
+        Raises:
+            ValueError: The catalog identifier is not in `ANTHROPIC_BEDROCK_PRICING`.
+        """
+        catalog_table = ANTHROPIC_BEDROCK_PRICING.get(resolution.catalog_id)
+        if catalog_table is None:
+            raise ValueError(
+                f"model {model!r} is not in ANTHROPIC_BEDROCK_PRICING; pass pricing= stating its rates"
+            )
+        if resolution.cross_region_multiplier is None or not self.apply_cross_region_premium:
+            return catalog_table
+        return catalog_table.multiplied(resolution.cross_region_multiplier)
+
 
 __all__ = [
     "ANTHROPIC_BEDROCK",
     "ANTHROPIC_BEDROCK_PRICING",
     "ANTHROPIC_PRICING",
+    "BEDROCK_CROSS_REGION_MULTIPLIER",
     "Anthropic",
     "AnthropicBedrock",
     "AnthropicBedrockModelName",

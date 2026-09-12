@@ -28,7 +28,7 @@ The gpt-5.6 family bills cache writes and accepts `prompt_cache_options`.
 
 from __future__ import annotations
 
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 try:
     from openai import AsyncBedrockOpenAI, AsyncOpenAI
@@ -40,7 +40,6 @@ except ModuleNotFoundError as exc:
         "langchaint[openai], langchaint[openai-embedding], or langchaint[openai-bedrock]."
     ) from exc
 
-import langchaint  # noqa: TC001 (required for runtime type introspection)
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
 from langchaint.openai._generated_pricing import OPENAI_PRICING, OpenAIModelName
@@ -58,6 +57,9 @@ from langchaint.openai.shared import (
     client_without_retries,
     parse_openai,
 )
+
+if TYPE_CHECKING:
+    from langchaint.embedding import EmbeddingModel
 
 type OpenAIEmbeddingModelName = Literal[
     "text-embedding-3-small",
@@ -224,7 +226,7 @@ class OpenAI:
         *,
         dimension: int = 1536,
         max_attempts: int = 3,
-    ) -> langchaint.EmbeddingModel: ...
+    ) -> EmbeddingModel: ...
 
     @overload
     def embedding_model(
@@ -233,7 +235,7 @@ class OpenAI:
         *,
         dimension: int = 3072,
         max_attempts: int = 3,
-    ) -> langchaint.EmbeddingModel: ...
+    ) -> EmbeddingModel: ...
 
     @overload
     def embedding_model(
@@ -241,7 +243,7 @@ class OpenAI:
         model: Literal["text-embedding-ada-002"],
         *,
         max_attempts: int = 3,
-    ) -> langchaint.EmbeddingModel: ...
+    ) -> EmbeddingModel: ...
 
     def embedding_model(
         self,
@@ -249,7 +251,7 @@ class OpenAI:
         *,
         dimension: int | None = None,
         max_attempts: int = 3,
-    ) -> langchaint.EmbeddingModel:
+    ) -> EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged OpenAI model.
 
         Third-generation models accept their documented dimension range.

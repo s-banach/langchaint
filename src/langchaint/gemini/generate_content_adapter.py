@@ -67,7 +67,6 @@ from abc import ABC
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from math import nan
 from typing import ClassVar, Literal, override
 
 import httpx
@@ -517,7 +516,7 @@ def _provider_executed_tool_cost_in_usd(
 ) -> float:
     """Price paired Search and Maps calls from one assembled response."""
     if not billing_complete and configured_fields & _CHARGED_PROVIDER_TOOL_FIELDS:
-        return nan
+        return float("nan")
     tool_calls: list[types.ToolCall] = []
     tool_responses: list[types.ToolResponse] = []
     for part in provider_tool_parts:
@@ -532,31 +531,31 @@ def _provider_executed_tool_cost_in_usd(
     for tool_call in tool_calls:
         tool_type = tool_call.tool_type
         if tool_call.id is None or tool_type is None:
-            return nan
+            return float("nan")
         call_keys[(tool_call.id, tool_type)] += 1
         typed_tool_calls.append((tool_call, tool_type))
     for tool_response in tool_responses:
         if tool_response.id is None or tool_response.tool_type is None:
-            return nan
+            return float("nan")
         response_keys[(tool_response.id, tool_response.tool_type)] += 1
     if call_keys != response_keys:
-        return nan
+        return float("nan")
 
     search_queries: set[str] = set()
     maps_query_count = 0
     for tool_call, tool_type in typed_tool_calls:
         provider_field = _PROVIDER_FIELD_BY_TOOL_TYPE.get(tool_type)
         if provider_field is None or provider_field not in configured_fields:
-            return nan
+            return float("nan")
         if provider_field == "google_search":
             queries = _queries_from_tool_call(tool_call, maps=False)
             if queries is None:
-                return nan
+                return float("nan")
             search_queries.update(query for query in queries if query)
         elif provider_field == "google_maps":
             queries = _queries_from_tool_call(tool_call, maps=True)
             if queries is None:
-                return nan
+                return float("nan")
             maps_query_count += len(queries)
 
     google_search_rate = table.google_search_usd_per_query

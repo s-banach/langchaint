@@ -595,7 +595,7 @@ def test_gemini_vertex_rejects_provider_tools() -> None:
 
 
 @pytest.mark.parametrize("provider_field", ["google_search", "google_maps"])
-@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
 def test_configured_gemini_charged_tool_requires_usable_pricing(
     provider_field: str, rate: float | None
 ) -> None:

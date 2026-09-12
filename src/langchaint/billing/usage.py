@@ -116,8 +116,8 @@ ZERO_USAGE: Usage = Usage(
 def _serialize_nonfinite_float(value: float) -> float | str:
     if math.isnan(value):
         return "NaN"
-    if value == math.inf:
+    if value == float("inf"):
         return "Infinity"
-    if value == -math.inf:
+    if value == float("-inf"):
         return "-Infinity"
     return value

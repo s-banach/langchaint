@@ -88,9 +88,9 @@ _BILLING = Billing(
     usage=_USAGE,
     service_tier="standard",
     input_cache_none_usd_per_million_tokens=1.0,
-    cache_read_usd_per_million_tokens=math.nan,
-    cache_write_usd_per_million_tokens=math.inf,
-    output_usd_per_million_tokens=-math.inf,
+    cache_read_usd_per_million_tokens=float("nan"),
+    cache_write_usd_per_million_tokens=float("inf"),
+    output_usd_per_million_tokens=float("-inf"),
 )
 
 _TURN = AssistantMessage(turn=(TextPart(text="done"),))
@@ -165,11 +165,11 @@ def test_usage_and_billing_nonfinite_values_round_trip_as_strings() -> None:
     assert '"-Infinity"' in billing_json
     restored = Billing.model_validate_json(billing_json)
     assert math.isnan(restored.cache_read_usd_per_million_tokens)
-    assert restored.cache_write_usd_per_million_tokens == math.inf
-    assert restored.output_usd_per_million_tokens == -math.inf
+    assert restored.cache_write_usd_per_million_tokens == float("inf")
+    assert restored.output_usd_per_million_tokens == float("-inf")
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_usage_nonfinite_cost_round_trips(value: float) -> None:
     """Each supported non-finite usage cost reconstructs its float value."""
     usage = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": value})

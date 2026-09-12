@@ -6,7 +6,6 @@ Sync tests use asyncio.run for async behavior.
 """
 
 import asyncio
-import math
 from collections.abc import Callable
 from dataclasses import replace
 from typing import override
@@ -227,7 +226,7 @@ def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> 
 
 def test_a_cost_limit_rejects_unknown_cost() -> None:
     """max_cost_in_usd rejects NaN cost."""
-    unknown_cost = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": math.nan})
+    unknown_cost = ZERO_USAGE.model_copy(update={"output_tokens_cost_in_usd": float("nan")})
     with pytest.raises(RuntimeError, match="cost_in_usd is NaN"):
         _check_cost_limit(unknown_cost, 1.0)
 
@@ -239,7 +238,7 @@ def test_agent_config_rejects_a_nan_cost_limit() -> None:
             name="limited",
             system_prompt="Answer.",
             automatic_cache_breakpoints=False,
-            max_cost_in_usd=math.nan,
+            max_cost_in_usd=float("nan"),
         )
 
 

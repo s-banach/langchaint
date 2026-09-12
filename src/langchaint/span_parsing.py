@@ -1,7 +1,6 @@
 """Parse OTel chat span attributes and convert supported values into langchaint values."""
 
 import json
-import math
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import Annotated, Literal, overload
@@ -732,10 +731,10 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
     billing = Billing(
         usage=ZERO_USAGE,
         service_tier="unknown",
-        input_cache_none_usd_per_million_tokens=math.nan,
-        cache_read_usd_per_million_tokens=math.nan,
-        cache_write_usd_per_million_tokens=math.nan,
-        output_usd_per_million_tokens=math.nan,
+        input_cache_none_usd_per_million_tokens=float("nan"),
+        cache_read_usd_per_million_tokens=float("nan"),
+        cache_write_usd_per_million_tokens=float("nan"),
+        output_usd_per_million_tokens=float("nan"),
     )
     attempt = SettledAttemptRecord(
         started_after_seconds=0.0,

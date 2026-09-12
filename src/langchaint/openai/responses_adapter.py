@@ -57,7 +57,6 @@ Request and response mappings:
 from abc import ABC
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import nan
 from typing import Any, Literal, cast, override
 
 import openai
@@ -651,7 +650,7 @@ def _billing_from_response(
         usd_per_invocation=pricing.file_search_usd_per_invocation,
     )
     if any(item.type in _UNPRICEABLE_OUTPUT_TYPES for item in response.output):
-        provider_executed_tool_cost_in_usd = nan
+        provider_executed_tool_cost_in_usd = float("nan")
     if usage is None:
         return rates.price(
             service_tier=service_tier,
@@ -1012,7 +1011,7 @@ class _OpenAIStream(AdapterStream):
             input_tokens_cache_none=0,
             output_tokens=0,
             output_tokens_reasoning=0,
-            provider_executed_tool_cost_in_usd=nan,
+            provider_executed_tool_cost_in_usd=float("nan"),
         )
 
     @override

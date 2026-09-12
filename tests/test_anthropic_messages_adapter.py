@@ -350,7 +350,7 @@ def test_truncated_anthropic_web_search_billing_produces_nan() -> None:
     assert math.isnan(usage.provider_executed_tool_cost_in_usd)
 
 
-@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
 def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None) -> None:
     """A configured search rejects an unusable caller rate before requests."""
     pricing = AnthropicPricingTable(

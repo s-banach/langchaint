@@ -54,11 +54,11 @@ Request and response mappings:
 
 import base64
 import json
+import math
 from abc import ABC
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import isfinite, nan
 from typing import Any, ClassVar, Literal, cast, override
 
 import anthropic
@@ -356,7 +356,7 @@ class AnthropicPricingTable:
         multiplier = self.inference_geo_us_multiplier
         if multiplier is None:
             return
-        if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+        if isinstance(multiplier, bool) or not math.isfinite(multiplier) or multiplier <= 0:
             raise ValueError("inference_geo_us_multiplier must be finite and positive")
 
     def rates_for(
@@ -998,7 +998,7 @@ def _billing_from_sdk_usage(
         usd_per_invocation=pricing.web_search_usd_per_invocation,
     )
     if provider_tools.web_search and not billing_complete:
-        provider_executed_tool_cost_in_usd = nan
+        provider_executed_tool_cost_in_usd = float("nan")
     if server_tool_use is not None:
         accounted_counters = {"web_search_requests"}
         if provider_tools.web_fetch:
@@ -1013,7 +1013,7 @@ def _billing_from_sdk_usage(
             if counter_name not in accounted_counters
         )
         if unaccounted_counter_fired:
-            provider_executed_tool_cost_in_usd = nan
+            provider_executed_tool_cost_in_usd = float("nan")
     return rates.price(
         service_tier=service_tier,
         usage_raw=usage,

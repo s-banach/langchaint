@@ -110,6 +110,8 @@ Document every public parameter and cross-provider difference.
 - Use a frozen dataclass or `NamedTuple` otherwise.
 - Use runtime checks only for invalid values that a correctly typed argument can contain.
 - Delete tests that suppress the type checker only to reach a runtime type check.
+- Write a non-finite float constant as `float("nan")`, `float("inf")`, or `float("-inf")`.
+- Import `math` as a module and reach its functions through it, as in `math.isnan`.
 - Keep a `cast` only when an opaque value re-enters the typed API that serialized it or a langchaint value deliberately exceeds an SDK parameter type.
 - Add a comment that names the boundary for every remaining `cast`.
 - Applications import from top-level `langchaint` and backend subpackages.

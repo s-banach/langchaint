@@ -35,7 +35,7 @@ def _usage(
 
 def test_a_zero_counter_costs_zero_at_an_unknown_rate() -> None:
     """0 * NaN is NaN, so the zero case is special-cased and a total over it stays a number."""
-    assert category_cost(tokens=0, usd_per_million_tokens=math.nan) == 0.0
+    assert category_cost(tokens=0, usd_per_million_tokens=float("nan")) == 0.0
 
 
 def test_invocation_cost_uses_nan_only_for_positive_unpriced_counts() -> None:
@@ -72,11 +72,11 @@ def test_cache_savings_negative_nan_and_zero_boundaries() -> None:
             stated_billing(
                 _usage(
                     input_tokens_cache_read=1000,
-                    input_tokens_cache_read_cost_in_usd=math.nan,
+                    input_tokens_cache_read_cost_in_usd=float("nan"),
                 ),
-                input_cache_none_usd_per_million_tokens=math.nan,
+                input_cache_none_usd_per_million_tokens=float("nan"),
             ),
-            math.nan,
+            float("nan"),
         ),
         (stated_billing(ZERO_USAGE), 0.0),
     ):

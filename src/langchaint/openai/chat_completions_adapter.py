@@ -66,7 +66,6 @@ import base64
 from abc import ABC
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import nan
 from typing import Literal, cast, override
 
 import openai
@@ -619,7 +618,7 @@ def _billing_from_chat_completion(
         regional_processing=False,
     )
     provider_executed_tool_cost_in_usd = (
-        nan if any(choice.message.annotations for choice in completion.choices) else 0.0
+        float("nan") if any(choice.message.annotations for choice in completion.choices) else 0.0
     )
     if usage is None:
         return rates.price(

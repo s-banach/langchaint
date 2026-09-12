@@ -4,9 +4,9 @@ Provider subpackages define rate tables.
 A nonzero category with no configured rate costs NaN.
 """
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from math import isfinite, nan
 
 from pydantic import BaseModel, ConfigDict, field_serializer
 
@@ -62,7 +62,7 @@ def invocation_cost_in_usd(invocations: int, *, usd_per_invocation: float | None
     if not invocations:
         return 0.0
     if usd_per_invocation is None:
-        return nan
+        return float("nan")
     return invocations * usd_per_invocation
 
 
@@ -76,7 +76,7 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
     Raises:
         ValueError: `rate` is unavailable, boolean, negative, infinite, or NaN.
     """
-    if rate is None or isinstance(rate, bool) or not isfinite(rate) or rate < 0:
+    if rate is None or isinstance(rate, bool) or not math.isfinite(rate) or rate < 0:
         raise ValueError(f"{rate_name} must be finite and nonnegative")
 
 

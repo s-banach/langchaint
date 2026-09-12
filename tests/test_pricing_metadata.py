@@ -161,7 +161,7 @@ def test_anthropic_missing_modifier_rates_produce_nan() -> None:
     assert math.isnan(regional.input_cache_none_usd_per_million_tokens)
 
 
-@pytest.mark.parametrize("value", [True, 0.0, -1.0, math.nan, math.inf])
+@pytest.mark.parametrize("value", [True, 0.0, -1.0, float("nan"), float("inf")])
 def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
     """Both provider tables validate regional multipliers."""
     with pytest.raises(ValueError, match="regional_processing_multiplier"):

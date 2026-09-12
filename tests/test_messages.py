@@ -1,7 +1,6 @@
 """Test custom message validation and JSON round trips."""
 
 import json
-import math
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -212,7 +211,7 @@ def test_raw_parts_accept_finite_recursive_json() -> None:
         assert restored == part
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 @pytest.mark.parametrize("part_type", [ReasoningPart, RawPart])
 def test_raw_parts_reject_nonfinite_recursive_json(
     value: float, part_type: type[ReasoningPart] | type[RawPart]

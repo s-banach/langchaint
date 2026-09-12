@@ -997,7 +997,7 @@ def test_provider_executed_tools_require_direct_openai_billing() -> None:
 
 
 @pytest.mark.parametrize("tool_type", ["web_search", "file_search"])
-@pytest.mark.parametrize("rate", [None, True, math.nan, math.inf, -0.01])
+@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
 def test_configured_openai_tool_rates_must_be_finite_and_nonnegative(
     tool_type: str, rate: float | None
 ) -> None:

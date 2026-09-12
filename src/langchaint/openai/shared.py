@@ -5,11 +5,11 @@ This module imports neither adapter nor private SDK modules.
 """
 
 import base64
+import math
 from abc import ABC
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
-from math import isfinite
 from typing import ClassVar, Literal, override
 
 import openai
@@ -238,7 +238,7 @@ class OpenAILongContextPricing:
             ("input_multiplier", self.input_multiplier),
             ("output_multiplier", self.output_multiplier),
         ):
-            if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+            if isinstance(multiplier, bool) or not math.isfinite(multiplier) or multiplier <= 0:
                 raise ValueError(f"{name} must be finite and positive")
 
 
@@ -265,7 +265,7 @@ class OpenAIPricingTable:
         multiplier = self.regional_processing_multiplier
         if multiplier is None:
             return
-        if isinstance(multiplier, bool) or not isfinite(multiplier) or multiplier <= 0:
+        if isinstance(multiplier, bool) or not math.isfinite(multiplier) or multiplier <= 0:
             raise ValueError("regional_processing_multiplier must be finite and positive")
 
     def multiplied(self, multiplier: float) -> "OpenAIPricingTable":

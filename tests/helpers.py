@@ -4,7 +4,6 @@ A helper lands here when a second module needs it. One used by a single module s
 """
 
 import importlib
-import math
 import pkgutil
 from collections.abc import Iterator, Mapping
 from types import ModuleType
@@ -42,23 +41,23 @@ class StubRaw(BaseModel):
 def stated_billing(
     usage: Usage,
     *,
-    input_cache_none_usd_per_million_tokens: float = math.nan,
+    input_cache_none_usd_per_million_tokens: float = float("nan"),
 ) -> Billing:
     """Build normalized Billing from test-stated Usage and an optional cache rate."""
     return Billing(
         usage=usage,
         service_tier="stub",
         input_cache_none_usd_per_million_tokens=input_cache_none_usd_per_million_tokens,
-        cache_read_usd_per_million_tokens=math.nan,
-        cache_write_usd_per_million_tokens=math.nan,
-        output_usd_per_million_tokens=math.nan,
+        cache_read_usd_per_million_tokens=float("nan"),
+        cache_write_usd_per_million_tokens=float("nan"),
+        output_usd_per_million_tokens=float("nan"),
     )
 
 
 def stated_provider_billing(
     usage: Usage,
     *,
-    input_cache_none_usd_per_million_tokens: float = math.nan,
+    input_cache_none_usd_per_million_tokens: float = float("nan"),
     usage_raw: BaseModel | None = None,
 ) -> ProviderBilling:
     """Build provider billing from normalized Billing and optional raw usage."""
@@ -76,7 +75,7 @@ def attempt_record(
     error: TransientError | TransientErrorRecord | None,
     usage: Usage = ZERO_USAGE,
     reported_billing: bool = True,
-    input_cache_none_usd_per_million_tokens: float = math.nan,
+    input_cache_none_usd_per_million_tokens: float = float("nan"),
     started_after_seconds: float = 0.0,
     elapsed_seconds: float = 0.0,
     seconds_to_first_item: float | None = None,

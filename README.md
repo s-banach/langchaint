@@ -145,4 +145,4 @@ See [`examples/README.md`](examples/README.md) for complete examples.
 
 ## License
 
-langchaint uses the [MIT License](LICENSE).
+[MIT License](LICENSE)

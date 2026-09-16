@@ -576,6 +576,29 @@ def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessa
     return _assistant_message_from_parts(message.parts)
 
 
+def output_messages_from_otel(
+    otel_chat_span: OtelChatSpan,
+) -> tuple[AssistantMessage, ...] | None:
+    """Convert every output message from one parsed OTel chat span.
+
+    Entry `i` converts `otel_chat_span.output_messages[i]`, whose `finish_reason` stays on the parsed span.
+    No finish reason, provider name, or model is required.
+
+    Args:
+        otel_chat_span: The parsed OTel chat span attributes.
+
+    Returns:
+        The converted output messages, or `None` when the span has no output messages.
+
+    Raises:
+        OtelToLangchaintConversionError: An output message has no lossless langchaint representation.
+    """
+    output_messages = otel_chat_span.output_messages
+    if output_messages is None:
+        return None
+    return tuple(_assistant_message_from_output(message) for message in output_messages)
+
+
 def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[JsonValue]:
     """Convert one successful parsed OTel chat span into a normalized response record.
 
@@ -962,6 +985,7 @@ __all__ = [
     "OtelToolDefinition",
     "OtelUriPart",
     "generation_input_from_otel",
+    "output_messages_from_otel",
     "parse_otel",
     "reconstruct_bound_llm",
     "response_record_from_otel",

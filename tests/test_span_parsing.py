@@ -30,6 +30,7 @@ from langchaint.span_parsing import (
     OtelTextPart,
     OtelToLangchaintConversionError,
     generation_input_from_otel,
+    output_messages_from_otel,
     parse_otel,
     reconstruct_bound_llm,
     response_record_from_otel,
@@ -689,10 +690,27 @@ def test_converts_system_instructions_and_tools() -> None:
     )
 
 
+def test_converts_every_output_message_without_span_identity_or_finish_reason() -> None:
+    """Output message conversion requires no provider name, model, or finish reason."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.output.messages": [
+                {"role": "assistant", "parts": [{"type": "text", "content": "one"}]},
+                {"role": "assistant", "parts": [{"type": "text", "content": "two"}]},
+            ]
+        })
+    )
+    assert output_messages_from_otel(parsed) == (
+        AssistantMessage(turn=(TextPart(text="one"),)),
+        AssistantMessage(turn=(TextPart(text="two"),)),
+    )
+
+
 def test_absent_optional_values_return_none() -> None:
     """Conversion functions return `None` when the span has no corresponding value."""
     parsed = parse_otel(_chat_span())
     assert system_prompt_from_otel(parsed) is None
+    assert output_messages_from_otel(parsed) is None
     assert tool_schemas_from_otel(parsed) is None
 
 

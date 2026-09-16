@@ -319,7 +319,7 @@ def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, obj
 
     A str becomes one text part.
     ImagePart and AudioPart become blob metadata without data.
-    ImageUrlPart keeps url and its optional media_type.
+    ImageUrlPart becomes an image uri part with its optional media_type as mime_type.
     """
     if isinstance(content, str):
         return [{"type": "text", "content": content}]
@@ -331,10 +331,14 @@ def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, obj
             case "image":
                 parts.append({"type": "blob", "mime_type": part.media_type})
             case "image_url":
-                image_url: dict[str, object] = {"type": "image_url", "url": part.url}
+                image_uri: dict[str, object] = {
+                    "type": "uri",
+                    "modality": "image",
+                    "uri": part.url,
+                }
                 if part.media_type is not None:
-                    image_url["mime_type"] = part.media_type
-                parts.append(image_url)
+                    image_uri["mime_type"] = part.media_type
+                parts.append(image_uri)
             case "audio":
                 parts.append({"type": "blob", "mime_type": part.media_type})
     return parts

@@ -1,7 +1,6 @@
 """Parse OTel chat span attributes and convert supported values into langchaint values."""
 
 import json
-from dataclasses import dataclass
 from importlib.resources import files
 from typing import Annotated, Literal, overload
 
@@ -15,8 +14,6 @@ from pydantic import (
     FiniteFloat,
     TypeAdapter,
     ValidationError,
-    ValidationInfo,
-    field_validator,
     model_validator,
 )
 from pydantic_core import PydanticCustomError
@@ -54,40 +51,19 @@ OUTPUT_MESSAGES = "gen_ai.output.messages"
 type StrictFiniteFloat = Annotated[FiniteFloat, Field(strict=True)]
 type StringTuple = Annotated[tuple[str, ...], Field(strict=False)]
 
-RAW_SPAN_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
-BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
-JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+_RAW_SPAN_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
+_BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
+_JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _STRUCTURED_ATTRIBUTE_NAMES_ADAPTER: TypeAdapter[frozenset[str]] = TypeAdapter(frozenset[str])
 _STRUCTURED_ATTRIBUTE_NAMES = _STRUCTURED_ATTRIBUTE_NAMES_ADAPTER.validate_json(
     files("langchaint").joinpath("_semconv_genai_structured_attributes.json").read_text()
 )
-_OTEL_RAW_CONTEXT = {"otel_raw": True}
-
-
-def _reject_non_json_constant(constant: str) -> None:
-    raise ValueError(f"{constant} is not valid JSON")
 
 
 def _decode_semconv_attribute(name: str, value: JsonValue) -> JsonValue:
     if name not in _STRUCTURED_ATTRIBUTE_NAMES or not isinstance(value, str):
         return value
-    decoded_value: object = json.loads(value, parse_constant=_reject_non_json_constant)
-    return JSON_VALUE_ADAPTER.validate_python(decoded_value)
-
-
-def _string_keyed_object_dict(value: object) -> dict[str, object]:
-    if not _is_object_dict(value):
-        raise PydanticCustomError(
-            "otel_structured_object", "an OTel structured value must be an object"
-        )
-    result: dict[str, object] = {}
-    for key, item in value.items():
-        if type(key) is not str:
-            raise PydanticCustomError(
-                "otel_structured_object_key", "an OTel structured object key must be a string"
-            )
-        result[key] = item
-    return result
+    return _JSON_VALUE_ADAPTER.validate_json(value)
 
 
 def _validate_draft_07_schema(value: JsonValue) -> JsonValue:
@@ -114,34 +90,32 @@ class OtelModel(CheckedCopyModel):
 
 
 class OtelStructuredModel(OtelModel):
-    """Pydantic validates declared fields and retains permitted additional JSON properties."""
+    """Pydantic validates declared fields and retains permitted additional JSON properties.
+
+    Every dictionary input is a raw OTel object, so a raw property named `additional_properties`
+    is retained as an additional property.
+    Strict validation of `additional_properties` rejects a non-string key.
+    """
 
     additional_properties: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
-    def _partition_additional_properties(
-        cls, input_value: object, validation_info: ValidationInfo
-    ) -> object:
+    def _partition_additional_properties(cls, input_value: object) -> object:
         if isinstance(input_value, OtelStructuredModel):
             return input_value
-        raw_object = _string_keyed_object_dict(input_value)
-        raw_otel_value = (
-            validation_info.context is not None and validation_info.context.get("otel_raw") is True
-        )
-        declared_values: dict[str, object] = {}
-        additional_properties: dict[str, object] = {}
-        for key, value in raw_object.items():
-            if key in cls.model_fields and (key != "additional_properties" or not raw_otel_value):
-                declared_values[key] = value
-            else:
-                additional_properties[key] = value
-        if "additional_properties" in declared_values:
-            supplied_additional_properties = declared_values.pop("additional_properties")
-            validated_supplied = _string_keyed_object_dict(supplied_additional_properties)
-            validated_supplied.update(additional_properties)
-            additional_properties = validated_supplied
-        declared_values["additional_properties"] = additional_properties
+        if not _is_object_dict(input_value):
+            raise PydanticCustomError(
+                "otel_structured_object", "an OTel structured value must be an object"
+            )
+        declared_values: dict[str, object] = {
+            name: input_value[name]
+            for name in cls.model_fields
+            if name != "additional_properties" and name in input_value
+        }
+        declared_values["additional_properties"] = {
+            key: value for key, value in input_value.items() if key not in declared_values
+        }
         return declared_values
 
 
@@ -180,7 +154,10 @@ class OtelUriPart(OtelStructuredModel):
 
 
 class OtelImageUrlPart(OtelStructuredModel):
-    """Pydantic validates langchaint's image URL extension and retains additional properties."""
+    """Pydantic validates the image_url part in spans from earlier langchaint releases.
+
+    Current langchaint releases emit an `ImageUrlPart` as a `uri` part with `modality="image"`.
+    """
 
     type: Literal["image_url"]
     url: str
@@ -212,21 +189,24 @@ class OtelToolCallPart(OtelStructuredModel):
 
 
 class OtelToolCallResponsePart(OtelStructuredModel):
-    """Pydantic validates the declared tool-response fields and retains additional properties."""
+    """Pydantic validates the declared tool-response fields and retains additional properties.
+
+    `is_error` is langchaint's extension that records `ToolMessage.is_error`.
+    A part whose `is_error` is not a boolean validates as `OtelGenericObject` instead.
+    """
 
     type: Literal["tool_call_response"]
     response: JsonValue
     id: str | None = None
+    is_error: bool = False
 
 
-class OtelGenericServerToolCall(OtelStructuredModel):
-    """Pydantic requires a server-tool type and retains its provider-defined properties."""
+class OtelGenericObject(OtelStructuredModel):
+    """Pydantic requires a type and retains every other property of an OTel object.
 
-    type: str
-
-
-class OtelGenericServerToolCallResponse(OtelStructuredModel):
-    """Pydantic requires a server-tool-response type and retains provider-defined properties."""
+    `OtelGenericObject` is the fallback for a message part, a system instruction part, and the
+    provider-defined objects nested in server tool call parts.
+    """
 
     type: str
 
@@ -236,7 +216,7 @@ class OtelServerToolCallPart(OtelStructuredModel):
 
     type: Literal["server_tool_call"]
     name: str
-    server_tool_call: OtelGenericServerToolCall
+    server_tool_call: OtelGenericObject
     id: str | None = None
 
 
@@ -244,20 +224,8 @@ class OtelServerToolCallResponsePart(OtelStructuredModel):
     """Pydantic validates server-tool-response fields and retains additional properties."""
 
     type: Literal["server_tool_call_response"]
-    server_tool_call_response: OtelGenericServerToolCallResponse
+    server_tool_call_response: OtelGenericObject
     id: str | None = None
-
-
-class OtelGenericPart(OtelStructuredModel):
-    """Pydantic requires a part type and retains its properties for schema fallback."""
-
-    type: str
-
-
-class OtelGenericSystemInstructionPart(OtelStructuredModel):
-    """Pydantic requires an instruction type and retains its properties for schema fallback."""
-
-    type: str
 
 
 type OtelMessagePart = Annotated[
@@ -272,11 +240,11 @@ type OtelMessagePart = Annotated[
     | OtelImageUrlPart
     | OtelReasoningPart
     | OtelCompactionPart
-    | OtelGenericPart,
+    | OtelGenericObject,
     Field(union_mode="left_to_right"),
 ]
 type OtelSystemInstructionPart = Annotated[
-    OtelTextPart | OtelGenericSystemInstructionPart,
+    OtelTextPart | OtelGenericObject,
     Field(union_mode="left_to_right"),
 ]
 
@@ -314,37 +282,16 @@ class OtelGenericTool(OtelStructuredModel):
     name: str
 
 
-# The OTel schema requires `type`.
-# `OtelFunctionTool.type` deliberately accepts a missing `type` as `"function"`.
-# A new `OtelToolDefinition` variant may require removing that default.
+# The OTel schema requires `type`, but OpenLLMetry omits it on tool definitions.
+# `OtelFunctionTool.type` defaults to `"function"` so those definitions convert.
 type OtelToolDefinition = Annotated[
     OtelFunctionTool | OtelGenericTool,
     Field(union_mode="left_to_right"),
 ]
 
-SYSTEM_INSTRUCTIONS_ADAPTER: TypeAdapter[tuple[OtelSystemInstructionPart, ...]] = TypeAdapter(
-    tuple[OtelSystemInstructionPart, ...]
-)
-TOOL_DEFINITIONS_ADAPTER: TypeAdapter[tuple[OtelToolDefinition, ...]] = TypeAdapter(
-    tuple[OtelToolDefinition, ...]
-)
-INPUT_MESSAGES_ADAPTER: TypeAdapter[tuple[OtelInputMessage, ...]] = TypeAdapter(
-    tuple[OtelInputMessage, ...]
-)
-OUTPUT_MESSAGES_ADAPTER: TypeAdapter[tuple[OtelOutputMessage, ...]] = TypeAdapter(
-    tuple[OtelOutputMessage, ...]
-)
-MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
+_MESSAGE_PARTS_ADAPTER: TypeAdapter[tuple[OtelMessagePart, ...]] = TypeAdapter(
     tuple[OtelMessagePart, ...]
 )
-
-
-@dataclass(frozen=True, kw_only=True)
-class ExtractedOutputMessage:
-    """Retain `finish_reason` because `AssistantMessage` defines only `turn` and `kind`."""
-
-    assistant_message: AssistantMessage
-    finish_reason: str | None
 
 
 class OtelChatSpan(OtelModel):
@@ -356,9 +303,11 @@ class OtelChatSpan(OtelModel):
         default=None, alias="gen_ai.conversation.compacted"
     )
     conversation_id: str | None = Field(default=None, alias="gen_ai.conversation.id")
-    input_messages: tuple[OtelInputMessage, ...] | None = Field(default=None, alias=INPUT_MESSAGES)
+    input_messages: tuple[OtelInputMessage, ...] | None = Field(
+        default=None, alias=INPUT_MESSAGES, strict=False
+    )
     output_messages: tuple[OtelOutputMessage, ...] | None = Field(
-        default=None, alias=OUTPUT_MESSAGES
+        default=None, alias=OUTPUT_MESSAGES, strict=False
     )
     output_type: str | None = Field(default=None, alias="gen_ai.output.type")
     prompt_name: str | None = Field(default=None, alias="gen_ai.prompt.name")
@@ -399,10 +348,10 @@ class OtelChatSpan(OtelModel):
         default=None, alias="gen_ai.response.time_to_first_chunk"
     )
     system_instructions: tuple[OtelSystemInstructionPart, ...] | None = Field(
-        default=None, alias=SYSTEM_INSTRUCTIONS
+        default=None, alias=SYSTEM_INSTRUCTIONS, strict=False
     )
     tool_definitions: tuple[OtelToolDefinition, ...] | None = Field(
-        default=None, alias=TOOL_DEFINITIONS
+        default=None, alias=TOOL_DEFINITIONS, strict=False
     )
     usage_audio_cache_read_input_tokens: int | None = Field(
         default=None, alias="gen_ai.usage.audio.cache_read.input_tokens"
@@ -463,63 +412,29 @@ class OtelChatSpan(OtelModel):
     )
     unused_attributes: dict[str, JsonValue] = Field(default_factory=dict)
 
-    @field_validator("*", mode="before")
-    @classmethod
-    def _reject_present_null(cls, attribute_value: object) -> object:
-        if attribute_value is None:
-            raise ValueError("a present OTel attribute cannot be null")
-        return attribute_value
-
     @model_validator(mode="before")
     @classmethod
     def _partition_raw_span(cls, input_value: object) -> object:
-        raw_span = RAW_SPAN_ADAPTER.validate_python(input_value)
-        parsed_attributes: dict[str, JsonValue] = {
-            name: _decode_semconv_attribute(name, value)
-            for name, value in raw_span.items()
-            if name in _OTEL_CHAT_SPAN_FIXED_ALIASES
-        }
-        prompt_variables = {
-            name.removeprefix(PROMPT_VARIABLE_PREFIX): value
-            for name, value in raw_span.items()
-            if name.startswith(PROMPT_VARIABLE_PREFIX)
-        }
+        raw_span = _RAW_SPAN_ADAPTER.validate_python(input_value)
+        parsed_attributes: dict[str, JsonValue] = {}
+        prompt_variables: dict[str, JsonValue] = {}
+        unused_attributes: dict[str, JsonValue] = {}
+        for name, value in raw_span.items():
+            if name in _OTEL_CHAT_SPAN_FIXED_ALIASES:
+                if value is None:
+                    raise ValueError(f"a present OTel attribute cannot be null: {name}")
+                parsed_attributes[name] = _decode_semconv_attribute(name, value)
+            elif name.startswith(PROMPT_VARIABLE_PREFIX):
+                prompt_variables[name.removeprefix(PROMPT_VARIABLE_PREFIX)] = value
+            else:
+                unused_attributes[name] = _decode_semconv_attribute(name, value)
         parsed_attributes["prompt_variables"] = prompt_variables
-        parsed_attributes["unused_attributes"] = {
-            name: _decode_semconv_attribute(name, value)
-            for name, value in raw_span.items()
-            if name not in _OTEL_CHAT_SPAN_FIXED_ALIASES
-            and not name.startswith(PROMPT_VARIABLE_PREFIX)
-        }
+        parsed_attributes["unused_attributes"] = unused_attributes
         return parsed_attributes
-
-    @field_validator("system_instructions", mode="before")
-    @classmethod
-    def _parse_system_instructions(
-        cls, attribute_value: JsonValue
-    ) -> tuple[OtelSystemInstructionPart, ...]:
-        return _validate_structured_attribute(SYSTEM_INSTRUCTIONS_ADAPTER, attribute_value)
-
-    @field_validator("tool_definitions", mode="before")
-    @classmethod
-    def _parse_tool_definitions(cls, attribute_value: JsonValue) -> tuple[OtelToolDefinition, ...]:
-        return _validate_structured_attribute(TOOL_DEFINITIONS_ADAPTER, attribute_value)
-
-    @field_validator("input_messages", mode="before")
-    @classmethod
-    def _parse_input_messages(cls, attribute_value: JsonValue) -> tuple[OtelInputMessage, ...]:
-        return _validate_structured_attribute(INPUT_MESSAGES_ADAPTER, attribute_value)
-
-    @field_validator("output_messages", mode="before")
-    @classmethod
-    def _parse_output_messages(cls, attribute_value: JsonValue) -> tuple[OtelOutputMessage, ...]:
-        return _validate_structured_attribute(OUTPUT_MESSAGES_ADAPTER, attribute_value)
 
 
 _OTEL_CHAT_SPAN_FIXED_ALIASES: frozenset[str] = frozenset(
-    field.alias
-    for name, field in OtelChatSpan.model_fields.items()
-    if name not in {"prompt_variables", "unused_attributes"} and field.alias is not None
+    field.alias for field in OtelChatSpan.model_fields.values() if field.alias is not None
 )
 
 
@@ -539,7 +454,7 @@ def parse_otel(raw_attributes: dict[str, JsonValue]) -> OtelChatSpan:
     Raises:
         pydantic.ValidationError: A standard attribute is malformed or the operation is not `chat`.
     """
-    return OtelChatSpan.model_validate(raw_attributes, context=_OTEL_RAW_CONTEXT)
+    return OtelChatSpan.model_validate(raw_attributes)
 
 
 def _system_prompt_from_parts(
@@ -569,6 +484,14 @@ def system_prompt_from_otel(
     Raises:
         OtelToLangchaintConversionError: The system prompt has no lossless langchaint representation.
     """
+    system_prompt, _ = _split_system_prompt(otel_chat_span)
+    return system_prompt
+
+
+def _split_system_prompt(
+    otel_chat_span: OtelChatSpan,
+) -> tuple[tuple[TextPart, ...] | None, tuple[OtelInputMessage, ...]]:
+    """Convert the system prompt and return it with the input messages that remain."""
     input_messages = otel_chat_span.input_messages or ()
     system_message_indexes = [
         index for index, message in enumerate(input_messages) if message.role == "system"
@@ -590,11 +513,13 @@ def system_prompt_from_otel(
         system_message = input_messages[0]
         _require_message_metadata(system_message)
         if not system_message.parts:
-            raise _unsupported(system_message, "system message without parts")
-        return _system_prompt_from_parts(system_message.parts)
+            raise _attribute_conversion_error(
+                INPUT_MESSAGES, "contains a role='system' message without parts"
+            )
+        return _system_prompt_from_parts(system_message.parts), input_messages[1:]
     if otel_chat_span.system_instructions:
-        return _system_prompt_from_parts(otel_chat_span.system_instructions)
-    return None
+        return _system_prompt_from_parts(otel_chat_span.system_instructions), input_messages
+    return None, input_messages
 
 
 def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ...] | None:
@@ -652,42 +577,15 @@ def generation_input_from_otel(
     Raises:
         OtelToLangchaintConversionError: An input value has no lossless langchaint representation.
     """
-    _ = system_prompt_from_otel(otel_chat_span)
-    input_messages = otel_chat_span.input_messages or ()
-    if input_messages and input_messages[0].role == "system":
-        input_messages = input_messages[1:]
+    _, input_messages = _split_system_prompt(otel_chat_span)
     return tuple(_message_from_otel(message) for message in input_messages)
 
 
-def output_messages_from_otel(
-    otel_chat_span: OtelChatSpan,
-) -> tuple[ExtractedOutputMessage, ...] | None:
-    """Convert output messages from one parsed OTel chat span.
-
-    Args:
-        otel_chat_span: The parsed OTel chat span attributes.
-
-    Returns:
-        The converted output messages, or `None` when the span has no output messages.
-
-    Raises:
-        OtelToLangchaintConversionError: An output message has no lossless langchaint representation.
-    """
-    output_messages = otel_chat_span.output_messages
-    if output_messages is None:
-        return None
-    converted: list[ExtractedOutputMessage] = []
-    for message in output_messages:
-        _require_message_metadata(message)
-        if message.role != "assistant":
-            raise _unsupported(message, "output message role")
-        converted.append(
-            ExtractedOutputMessage(
-                assistant_message=_assistant_message_from_parts(message.parts),
-                finish_reason=message.finish_reason,
-            )
-        )
-    return tuple(converted)
+def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessage:
+    _require_message_metadata(message)
+    if message.role != "assistant":
+        raise _unsupported(message, "output message role")
+    return _assistant_message_from_parts(message.parts)
 
 
 def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[JsonValue]:
@@ -719,11 +617,10 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
             OUTPUT_MESSAGES,
             "must contain exactly one output message",
         )
-    extracted_output_messages = output_messages_from_otel(otel_chat_span)
-    assert extracted_output_messages is not None
-    extracted_output = extracted_output_messages[0]
-    stop_reason = _stop_reason_from_otel(otel_chat_span, extracted_output.finish_reason)
-    output = _output_from_otel(otel_chat_span.output_type, extracted_output.assistant_message)
+    output_message = output_messages[0]
+    assistant_message = _assistant_message_from_output(output_message)
+    stop_reason = _stop_reason_from_otel(otel_chat_span, output_message.finish_reason)
+    output = _output_from_otel(otel_chat_span.output_type, assistant_message)
     if not otel_chat_span.provider_name:
         raise _attribute_conversion_error("gen_ai.provider.name", "is required")
     if not otel_chat_span.request_model:
@@ -742,7 +639,7 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
         seconds_to_first_item=None,
         error=None,
         billing=billing,
-        assistant_message=extracted_output.assistant_message,
+        assistant_message=assistant_message,
         model_served=otel_chat_span.response_model,
         response_id=otel_chat_span.response_id,
         request_id=None,
@@ -887,9 +784,11 @@ def _stop_reason_from_otel(
             f"gen_ai.response.finish_reasons {response_finish_reasons!r} and "
             f"{OUTPUT_MESSAGES} finish_reason {message_finish_reason!r} contain no value"
         )
-    if selected_finish_reason == "error":
-        raise _attribute_conversion_error("selected finish_reason", "reports a failed span")
     match selected_finish_reason:
+        case "error":
+            raise OtelToLangchaintConversionError(
+                f"finish_reason {selected_finish_reason!r} reports a failed span"
+            )
         case "stop":
             return "end_turn"
         case "tool_call":
@@ -911,13 +810,17 @@ def _stop_reason_from_otel(
             return "other"
 
 
+def _selected_output_type(output_type: str | None) -> str:
+    return "text" if output_type is None else output_type
+
+
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
-    selected_output_type = "text" if output_type is None else output_type
+    selected_output_type = _selected_output_type(output_type)
     if selected_output_type == "text":
         return assistant_message.text
     if selected_output_type == "json":
         try:
-            return JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
+            return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
         except ValidationError as error:
             raise _attribute_conversion_error(
                 "gen_ai.output.type",
@@ -932,7 +835,7 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
 def _require_matching_response_format(
     output_type: str | None, response_format: type[BaseModel] | None
 ) -> None:
-    selected_output_type = "text" if output_type is None else output_type
+    selected_output_type = _selected_output_type(output_type)
     if selected_output_type == "json" and response_format is None:
         raise OtelToLangchaintConversionError(
             f"gen_ai.output.type {output_type!r} requires response_format, got {response_format!r}"
@@ -944,12 +847,6 @@ def _require_matching_response_format(
         )
     if selected_output_type not in {"json", "text"}:
         raise _attribute_conversion_error("gen_ai.output.type", "has no supported response_format")
-
-
-def _validate_structured_attribute[ValueT](
-    adapter: TypeAdapter[ValueT], attribute_value: JsonValue
-) -> ValueT:
-    return adapter.validate_python(attribute_value, context=_OTEL_RAW_CONTEXT)
 
 
 def _message_from_otel(message: OtelInputMessage) -> Message:
@@ -971,25 +868,18 @@ def _tool_message_from_otel(message: OtelInputMessage) -> ToolMessage:
     part = message.parts[0]
     if part.id is None:
         raise _unsupported(part, "tool response without id")
-    is_error_value = part.additional_properties.get("is_error", False)
-    if type(is_error_value) is not bool:
-        raise _unsupported(part, "non-boolean is_error")
-    remaining_properties = {
-        key: value for key, value in part.additional_properties.items() if key != "is_error"
-    }
-    if remaining_properties:
-        raise _unsupported(part, "additional properties")
+    _require_no_additional_properties(part)
     if isinstance(part.response, str):
         content: str | tuple[ContentPart, ...] = part.response
     elif isinstance(part.response, list):
         try:
-            response_parts = _validate_structured_attribute(MESSAGE_PARTS_ADAPTER, part.response)
+            response_parts = _MESSAGE_PARTS_ADAPTER.validate_python(part.response)
         except ValidationError as error:
             raise _unsupported(part, "tool response value") from error
         content = _content_parts_from_otel(response_parts)
     else:
         raise _unsupported(part, "tool response value")
-    return ToolMessage(tool_call_id=part.id, content=content, is_error=is_error_value)
+    return ToolMessage(tool_call_id=part.id, content=content, is_error=part.is_error)
 
 
 def _assistant_message_from_parts(parts: tuple[OtelMessagePart, ...]) -> AssistantMessage:
@@ -1026,7 +916,7 @@ def _content_part_from_otel(part: OtelMessagePart) -> ContentPart:
         if part.mime_type is None:
             raise _unsupported(part, "blob without mime_type")
         try:
-            data = BASE64_BYTES_ADAPTER.validate_python(part.content)
+            data = _BASE64_BYTES_ADAPTER.validate_python(part.content)
         except ValidationError as error:
             raise OtelToLangchaintConversionError("blob content is not base64") from error
         if part.modality == "image":
@@ -1065,16 +955,12 @@ def _unsupported(value: OtelModel, description: str) -> OtelToLangchaintConversi
 
 
 __all__ = [
-    "ExtractedOutputMessage",
     "OtelBlobPart",
     "OtelChatSpan",
     "OtelCompactionPart",
     "OtelFilePart",
     "OtelFunctionTool",
-    "OtelGenericPart",
-    "OtelGenericServerToolCall",
-    "OtelGenericServerToolCallResponse",
-    "OtelGenericSystemInstructionPart",
+    "OtelGenericObject",
     "OtelGenericTool",
     "OtelImageUrlPart",
     "OtelInputMessage",
@@ -1091,7 +977,6 @@ __all__ = [
     "OtelToolDefinition",
     "OtelUriPart",
     "generation_input_from_otel",
-    "output_messages_from_otel",
     "parse_otel",
     "reconstruct_bound_llm",
     "response_record_from_otel",

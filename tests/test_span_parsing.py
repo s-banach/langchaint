@@ -22,17 +22,14 @@ from langchaint import (
     UserMessage,
 )
 from langchaint.span_parsing import (
-    ExtractedOutputMessage,
     OtelChatSpan,
     OtelFunctionTool,
-    OtelGenericPart,
-    OtelGenericSystemInstructionPart,
+    OtelGenericObject,
     OtelGenericTool,
     OtelReasoningPart,
     OtelTextPart,
     OtelToLangchaintConversionError,
     generation_input_from_otel,
-    output_messages_from_otel,
     parse_otel,
     reconstruct_bound_llm,
     response_record_from_otel,
@@ -230,7 +227,7 @@ def test_present_scalar_attribute_cannot_be_null() -> None:
 
 
 def test_known_message_type_can_use_the_generic_schema_variant() -> None:
-    """OtelGenericPart accepts a known type when the dedicated model does not match."""
+    """OtelGenericObject accepts a known part type when the dedicated model does not match."""
     parsed = parse_otel(
         _chat_span({
             "gen_ai.input.messages": [
@@ -240,19 +237,19 @@ def test_known_message_type_can_use_the_generic_schema_variant() -> None:
     )
     assert parsed.input_messages is not None
     part = parsed.input_messages[0].parts[0]
-    assert isinstance(part, OtelGenericPart)
+    assert isinstance(part, OtelGenericObject)
     assert part.type == "text"
     assert part.additional_properties == {"provider_value": 1}
 
 
 def test_known_system_type_can_use_the_generic_schema_variant() -> None:
-    """OtelGenericSystemInstructionPart accepts text when OtelTextPart does not match."""
+    """OtelGenericObject accepts a system text part when OtelTextPart does not match."""
     parsed = parse_otel(
         _chat_span({"gen_ai.system_instructions": [{"type": "text", "provider_value": 1}]})
     )
     assert parsed.system_instructions is not None
     part = parsed.system_instructions[0]
-    assert isinstance(part, OtelGenericSystemInstructionPart)
+    assert isinstance(part, OtelGenericObject)
     assert part.type == "text"
     assert part.additional_properties == {"provider_value": 1}
 
@@ -306,7 +303,7 @@ def test_preserves_json_text_for_a_scalar_attribute() -> None:
 @pytest.mark.parametrize("encoded_value", ["NaN", "Infinity", "-Infinity"])
 def test_rejects_non_json_constants_in_structured_attributes(encoded_value: str) -> None:
     """Reject non-JSON constants in structured semantic-convention attributes."""
-    with pytest.raises(ValidationError, match="is not valid JSON"):
+    with pytest.raises(ValidationError, match="must be finite"):
         _ = parse_otel(_chat_span({"gen_ai.input.messages": encoded_value}))
 
 
@@ -329,7 +326,7 @@ def test_preserves_known_and_generic_additional_properties() -> None:
     text_part, generic_part = parsed.input_messages[0].parts
     assert isinstance(text_part, OtelTextPart)
     assert text_part.additional_properties == {"langchain.x.y.z": 42}
-    assert isinstance(generic_part, OtelGenericPart)
+    assert isinstance(generic_part, OtelGenericObject)
     assert generic_part.additional_properties == {"provider_value": True}
 
 
@@ -524,6 +521,31 @@ def test_converts_representable_input_messages() -> None:
     )
 
 
+def test_non_boolean_is_error_parses_generically_and_fails_conversion() -> None:
+    """A tool response with a non-boolean is_error is an OtelGenericObject without conversion."""
+    parsed = parse_otel(
+        _chat_span({
+            "gen_ai.input.messages": [
+                {
+                    "role": "tool",
+                    "parts": [
+                        {
+                            "type": "tool_call_response",
+                            "id": "call-1",
+                            "is_error": "yes",
+                            "response": "failed",
+                        }
+                    ],
+                }
+            ]
+        })
+    )
+    assert parsed.input_messages is not None
+    assert isinstance(parsed.input_messages[0].parts[0], OtelGenericObject)
+    with pytest.raises(OtelToLangchaintConversionError, match="tool message parts"):
+        _ = generation_input_from_otel(parsed)
+
+
 @pytest.mark.parametrize("empty_system_instructions", [False, True])
 def test_leading_system_message_supplies_the_binding_system_prompt(
     *, empty_system_instructions: bool
@@ -604,7 +626,7 @@ def test_rejects_system_message_position_and_cardinality(
 @pytest.mark.parametrize(
     ("system_message", "error_match"),
     [
-        ({"role": "system", "parts": []}, "system message without parts"),
+        ({"role": "system", "parts": []}, "role='system' message without parts"),
         (
             {
                 "role": "system",
@@ -649,19 +671,12 @@ def test_rejects_unrepresentable_leading_system_message(
         _ = generation_input_from_otel(parsed)
 
 
-def test_converts_system_instructions_tools_and_output_messages() -> None:
+def test_converts_system_instructions_and_tools() -> None:
     """Explicit conversion functions produce the prior langchaint values."""
     parsed = parse_otel(
         _chat_span({
             "gen_ai.system_instructions": [{"type": "text", "content": "Be brief."}],
             "gen_ai.tool.definitions": [_captured_tool_definition()],
-            "gen_ai.output.messages": [
-                {
-                    "role": "assistant",
-                    "parts": [{"type": "text", "content": "done"}],
-                    "finish_reason": "stop",
-                }
-            ],
         })
     )
     assert system_prompt_from_otel(parsed) == (TextPart(text="Be brief."),)
@@ -672,37 +687,12 @@ def test_converts_system_instructions_tools_and_output_messages() -> None:
             args_schema={"type": "object"},
         ),
     )
-    assert output_messages_from_otel(parsed) == (
-        ExtractedOutputMessage(
-            assistant_message=AssistantMessage(turn=(TextPart(text="done"),)),
-            finish_reason="stop",
-        ),
-    )
-
-
-def test_output_message_without_deprecated_finish_reason_parses_and_converts() -> None:
-    """The selected schema makes the deprecated finish_reason field optional."""
-    parsed = parse_otel(
-        _chat_span({
-            "gen_ai.output.messages": [
-                {"role": "assistant", "parts": [{"type": "text", "content": "done"}]}
-            ]
-        })
-    )
-    assert parsed.output_messages is not None
-    assert output_messages_from_otel(parsed) == (
-        ExtractedOutputMessage(
-            assistant_message=AssistantMessage(turn=(TextPart(text="done"),)),
-            finish_reason=None,
-        ),
-    )
 
 
 def test_absent_optional_values_return_none() -> None:
     """Conversion functions return `None` when the span has no corresponding value."""
     parsed = parse_otel(_chat_span())
     assert system_prompt_from_otel(parsed) is None
-    assert output_messages_from_otel(parsed) is None
     assert tool_schemas_from_otel(parsed) is None
 
 

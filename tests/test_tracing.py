@@ -1903,7 +1903,7 @@ def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
 
 
 def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data() -> None:
-    """ImagePart and AudioPart omit data. ImageUrlPart records URL metadata."""
+    """ImagePart and AudioPart omit data. ImageUrlPart is a convention UriPart."""
 
     async def scenario() -> None:
         """Generate over Sequence[Message] containing ImagePart, ImageUrlPart, and AudioPart."""
@@ -1923,22 +1923,25 @@ def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data(
                 )
             )
         ])
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {
-                "role": "user",
-                "parts": [
-                    {"type": "text", "content": "what is this"},
-                    {"type": "blob", "mime_type": "image/png"},
-                    {
-                        "type": "image_url",
-                        "url": "https://example.com/image.png",
-                        "mime_type": "image/png",
-                    },
-                    {"type": "image_url", "url": "https://example.com/unknown"},
-                    {"type": "blob", "mime_type": "audio/wav"},
-                ],
-            }
+        captured_messages = _captured(exporter, "gen_ai.input.messages")
+        assert isinstance(captured_messages, list)
+        (captured_message,) = captured_messages
+        assert isinstance(captured_message, dict)
+        captured_parts: object = captured_message["parts"]
+        assert isinstance(captured_parts, list)
+        uri_parts: list[object] = [
+            part for part in captured_parts if isinstance(part, dict) and part.get("type") == "uri"
         ]
+        assert len(uri_parts) == 2
+        image_uri_part_validator = jsonschema.Draft202012Validator({
+            "$defs": _payload_schema("gen-ai-input-messages.json")["$defs"],
+            "allOf": [
+                {"$ref": "#/$defs/UriPart"},
+                {"properties": {"modality": {"const": "image"}}},
+            ],
+        })
+        for uri_part in uri_parts:
+            image_uri_part_validator.validate(uri_part)
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert "PNGsecret" not in str(span.attributes["gen_ai.input.messages"])

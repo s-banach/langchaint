@@ -123,25 +123,20 @@ class Admission:
         self.verdict: Verdict | None = None
 
     async def __aenter__(self) -> "Admission":
-        """Acquire a permit when `max_concurrent_requests` is set.
+        """Wait in the queue until the request may start.
 
-        Once this returns, the request is admitted. A later pause does not revoke that admission.
-        Cancellation during entry removes the request from the queue. Cancellation returns any acquired permit.
+        Once this returns, the request is admitted and holds a permit when `max_concurrent_requests` is set.
+        A later pause does not revoke that admission.
+        Cancellation during entry removes the request from the queue and returns any acquired permit.
 
         Raises:
             GaveUpWaiting: `budget` expired before admission.
         """
-        shared_backoff = self._shared_backoff
         try:
             async with asyncio.timeout(self._budget_seconds):
-                await shared_backoff._acquire_permit()  # noqa: SLF001 (same-module machinery)
-                try:
-                    await shared_backoff._wait_turn()  # noqa: SLF001 (same-module machinery)
-                except BaseException:
-                    shared_backoff._release_permit()  # noqa: SLF001 (same-module machinery)
-                    raise
+                await self._shared_backoff._wait_turn()  # noqa: SLF001 (same-module machinery)
         except TimeoutError:
-            shared_backoff.event_counts["gave_up_waiting"] += 1
+            self._shared_backoff.event_counts["gave_up_waiting"] += 1
             _logger.info(
                 "gave up waiting for admission after a budget of %s seconds", self._budget_seconds
             )
@@ -291,9 +286,12 @@ class SharedBackoff:
         """
         self._queue: deque[asyncio.Future[None]] = deque()
         """Requests waiting for admission, released in the order they joined."""
-        self._permits = (
-            None if max_concurrent_requests is None else asyncio.Semaphore(max_concurrent_requests)
-        )
+        self._permits_held = 0
+        """Admitted requests that have not yet exited their block.
+
+        _admit_waiting keeps this at or below max_concurrent_requests when that is set.
+        A counter binds no event loop, so one SharedBackoff serves consecutive event loops.
+        """
         self._admit_timer: asyncio.TimerHandle | None = None
         """Wakes _admit_waiting when the front of the queue becomes admissible."""
         self._clock: Callable[[], float] = time.monotonic
@@ -310,15 +308,14 @@ class SharedBackoff:
     def max_concurrent_requests(self) -> int | None:
         """The number of requests allowed inside admitted() blocks at once, or None for no bound.
 
-        `__init__` fixes both this value and the permit count.
-        The property is read-only to keep them consistent.
+        `__init__` validates and fixes this value, so the property is read-only.
         """
         return self._max_concurrent_requests
 
     def admitted(self, *, budget: float | None = None) -> Admission:
         """Return an `Admission` block for one attempt.
 
-        `budget` limits permit acquisition and admission waits.
+        `budget` limits the admission wait.
         `budget=None` permits an indefinite wait.
 
         Args:
@@ -330,36 +327,19 @@ class SharedBackoff:
         budget_seconds = None if budget is None else _validated_positive_float("budget", budget)
         return Admission(self, budget_seconds)
 
-    async def _acquire_permit(self) -> None:
-        """Hold one permit after earlier waiters.
-
-        Do nothing when there is no concurrency bound.
-
-        Raises:
-            asyncio.CancelledError: the wait was cancelled; no permit is held.
-        """
-        if self._permits is None:
-            return
-        _ = await self._permits.acquire()
-
     def _release_permit(self) -> None:
-        """Return one permit and wake the longest-waiting live waiter.
-
-        Do nothing when there is no concurrency bound.
-        """
-        if self._permits is None:
-            return
-        self._permits.release()
+        """Return one permit and admit the front of the queue when it may start."""
+        self._permits_held -= 1
+        self._admit_waiting()
 
     async def _wait_turn(self) -> None:
-        """Wait until the shared pause and request-start interval permit admission.
+        """Wait until a permit, the shared pause, and the request-start interval permit admission.
 
         Cancellation before the grant removes the request from the queue.
-        Cancellation after the grant may consume one request-start interval.
-        The caller returns the permit.
+        Cancellation after the grant returns the permit and may consume one request-start interval.
 
         Raises:
-            asyncio.CancelledError: the wait was cancelled; the request is out of the queue.
+            asyncio.CancelledError: the wait was cancelled; the request is out of the queue and holds no permit.
         """
         granted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.append(granted)
@@ -367,7 +347,9 @@ class SharedBackoff:
         try:
             await granted
         except asyncio.CancelledError:
-            if not (granted.done() and not granted.cancelled()):
+            if granted.done() and not granted.cancelled():
+                self._release_permit()
+            else:
                 try:
                     self._queue.remove(granted)
                 except ValueError:
@@ -377,8 +359,9 @@ class SharedBackoff:
     def _admit_waiting(self) -> None:
         """Admit the front of the queue or schedule _admit_waiting for its earliest admission.
 
-        Admission requires no active pause and one elapsed request-start interval.
-        Granting records the moment in _last_admission_at.
+        Admission requires a free permit, no active pause, and one elapsed request-start interval.
+        No timer is armed while every permit is held because _release_permit calls this method.
+        Granting takes a permit and records the moment in _last_admission_at.
         A queued burst starts at max_request_starts_per_second.
         Spent entries (cancelled waiters) at the front are dropped, never granted.
         """
@@ -386,6 +369,11 @@ class SharedBackoff:
             if self._queue[0].done():
                 _ = self._queue.popleft()
                 continue
+            if (
+                self._max_concurrent_requests is not None
+                and self._permits_held >= self._max_concurrent_requests
+            ):
+                return
             now = self._clock()
             admissible_at = max(
                 self._pause_until,
@@ -396,6 +384,7 @@ class SharedBackoff:
                 return
             self._log_pause_end()
             granted = self._queue.popleft()
+            self._permits_held += 1
             self._last_admission_at = now
             granted.set_result(None)
 
@@ -414,10 +403,7 @@ class SharedBackoff:
     def _log_pause_end(self) -> None:
         """Log the ended pause's length and the queue depth, on the first admission after its end.
 
-        Queue depth cannot exceed `max_concurrent_requests` when configured.
-        Otherwise it cannot exceed the worker pool size.
-        A full queue means every permit or worker is idle.
-        Upstream bounds must report additional waiting work.
+        The queue holds every request waiting for admission, including requests waiting for a permit.
         """
         if self._pause_until == _NEVER or self._last_admission_at > self._pause_until:
             return

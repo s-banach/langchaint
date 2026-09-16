@@ -63,13 +63,8 @@ def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
 
 
 def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
-    """Report whether every permit is free: none held, none leaked, no live waiter queued.
-
-    Read CPython's private semaphore count for tests.
-    """
-    permits = shared_backoff._permits
-    assert permits is not None
-    return permits._value == shared_backoff.max_concurrent_requests and not permits.locked()
+    """Report whether every permit is free: none held, none leaked, no waiter queued."""
+    return shared_backoff._permits_held == 0 and not shared_backoff._queue
 
 
 async def _raise_in_block(admission: Admission, failure: Exception) -> None:
@@ -508,8 +503,8 @@ def test_a_budget_expiring_in_the_queue_leaves_nothing_held() -> None:
     _run(scenario)
 
 
-def test_a_budget_expiring_on_the_permit_takes_no_permit() -> None:
-    """Expiry during permit acquisition never reaches the queue."""
+def test_a_budget_expiring_while_every_permit_is_held_takes_no_permit() -> None:
+    """Expiry while another request holds the only permit leaves the queue and holds nothing."""
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff()
@@ -529,6 +524,22 @@ def test_a_budget_expiring_on_the_permit_takes_no_permit() -> None:
         assert _all_permits_free(shared_backoff)
 
     _run(scenario)
+
+
+def test_one_shared_backoff_serves_consecutive_event_loops() -> None:
+    """Permit contention in one event loop does not bind the SharedBackoff to that loop."""
+    shared_backoff = _shared_backoff()
+
+    async def hold_the_permit_briefly() -> None:
+        async with shared_backoff.admitted():
+            await asyncio.sleep(0.01)
+
+    async def two_contending_requests() -> None:
+        await asyncio.gather(hold_the_permit_briefly(), hold_the_permit_briefly())
+
+    _run(two_contending_requests)
+    _run(two_contending_requests)
+    assert _all_permits_free(shared_backoff)
 
 
 def test_cancellation_while_queued_leaves_an_empty_queue_and_a_full_permit_count() -> None:

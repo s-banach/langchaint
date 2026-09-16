@@ -5,6 +5,7 @@ The tests inspect recorded span names, kinds, statuses, attributes, events, and 
 """
 
 import asyncio
+import base64
 import functools
 import json
 import logging
@@ -29,6 +30,7 @@ from langchaint import (
     AudioPart,
     CallResult,
     CallResultRecord,
+    ContentPart,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
@@ -49,6 +51,7 @@ from langchaint import (
     ToolMessage,
     ToolOutputExplicit,
     TransientError,
+    TurnPart,
     UserMessage,
     to_tables,
 )
@@ -58,8 +61,10 @@ from langchaint.adapter import (
     Refusal,
     UnfinishedTurn,
 )
+from langchaint.span_parsing import generation_input_from_otel, parse_otel
 from langchaint.tracing import (
     AttributeMapper,
+    ContentFilter,
     SpanAttributes,
     TracedBoundLLM,
     TracedLLM,
@@ -1902,39 +1907,65 @@ def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
     asyncio.run(scenario())
 
 
-def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data() -> None:
-    """ImagePart and AudioPart omit data. ImageUrlPart is a convention UriPart."""
+_MULTIMODAL_USER_MESSAGE = UserMessage(
+    content=(
+        TextPart(text="what is this"),
+        ImagePart(data=b"\x89PNGsecret", media_type="image/png"),
+        ImageUrlPart(url="https://example.com/image.png", media_type="image/png"),
+        ImageUrlPart(url="https://example.com/unknown"),
+        AudioPart(data=b"WAVsecret", media_type="audio/wav"),
+    )
+)
+"""One user message holding every ContentPart variant."""
+
+
+def _drop_binary(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+    """Keep every part except inline bytes, the filter the TracedLLM docstring shows."""
+    return None if part.kind in ("image", "audio") else part
+
+
+def _captured_user_parts(exporter: InMemorySpanExporter) -> list[object]:
+    """Read the parts of the one recorded input message."""
+    captured_messages = _captured(exporter, "gen_ai.input.messages")
+    assert isinstance(captured_messages, list)
+    (captured_message,) = captured_messages
+    assert isinstance(captured_message, dict)
+    captured_parts: object = captured_message["parts"]
+    assert isinstance(captured_parts, list)
+    return captured_parts
+
+
+def _parts_of_type(parts: list[object], part_type: str) -> list[object]:
+    """Select the recorded parts whose type field is part_type."""
+    return [part for part in parts if isinstance(part, dict) and part.get("type") == part_type]
+
+
+def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> None:
+    """capture_message_content=True records ImagePart and AudioPart as convention BlobPart objects.
+
+    ImageUrlPart is a convention UriPart.
+    span_parsing converts the recorded message back to the original message.
+    """
 
     async def scenario() -> None:
-        """Generate over Sequence[Message] containing ImagePart, ImageUrlPart, and AudioPart."""
+        """Generate over the multimodal message and read the recorded parts back."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind().generate_one([
-            UserMessage(
-                content=(
-                    TextPart(text="what is this"),
-                    ImagePart(data=b"\x89PNGsecret", media_type="image/png"),
-                    ImageUrlPart(
-                        url="https://example.com/image.png",
-                        media_type="image/png",
-                    ),
-                    ImageUrlPart(url="https://example.com/unknown"),
-                    AudioPart(data=b"WAVsecret", media_type="audio/wav"),
-                )
-            )
-        ])
-        captured_messages = _captured(exporter, "gen_ai.input.messages")
-        assert isinstance(captured_messages, list)
-        (captured_message,) = captured_messages
-        assert isinstance(captured_message, dict)
-        captured_parts: object = captured_message["parts"]
-        assert isinstance(captured_parts, list)
-        uri_parts: list[object] = [
-            part for part in captured_parts if isinstance(part, dict) and part.get("type") == "uri"
-        ]
+        await traced.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
+        captured_parts = _captured_user_parts(exporter)
+        schema_definitions = _payload_schema("gen-ai-input-messages.json")["$defs"]
+        blob_parts = _parts_of_type(captured_parts, "blob")
+        assert len(blob_parts) == 2
+        blob_part_validator = jsonschema.Draft202012Validator({
+            "$defs": schema_definitions,
+            "$ref": "#/$defs/BlobPart",
+        })
+        for blob_part in blob_parts:
+            blob_part_validator.validate(blob_part)
+        uri_parts = _parts_of_type(captured_parts, "uri")
         assert len(uri_parts) == 2
         image_uri_part_validator = jsonschema.Draft202012Validator({
-            "$defs": _payload_schema("gen-ai-input-messages.json")["$defs"],
+            "$defs": schema_definitions,
             "allOf": [
                 {"$ref": "#/$defs/UriPart"},
                 {"properties": {"modality": {"const": "image"}}},
@@ -1944,8 +1975,221 @@ def test_image_part_image_url_part_and_audio_part_capture_metadata_without_data(
             image_uri_part_validator.validate(uri_part)
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
-        assert "PNGsecret" not in str(span.attributes["gen_ai.input.messages"])
-        assert "WAVsecret" not in str(span.attributes["gen_ai.input.messages"])
+        input_messages_json = span.attributes["gen_ai.input.messages"]
+        assert isinstance(input_messages_json, str)
+        parsed = parse_otel({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": input_messages_json,
+        })
+        assert generation_input_from_otel(parsed) == (_MULTIMODAL_USER_MESSAGE,)
+
+    asyncio.run(scenario())
+
+
+def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
+    """_drop_binary leaves the text and uri parts and records no blob part."""
+
+    async def scenario() -> None:
+        """Generate over the multimodal message under _drop_binary and read the recorded parts back."""
+        tracer, exporter = _in_memory_tracer()
+        content_filter: ContentFilter = _drop_binary
+        traced = TracedLLM(
+            LLM(_FakeAdapter()),
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=content_filter,
+        )
+        await traced.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
+        captured_parts = _captured_user_parts(exporter)
+        assert [part.get("type") for part in captured_parts if isinstance(part, dict)] == [
+            "text",
+            "uri",
+            "uri",
+        ]
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        input_messages_json = str(span.attributes["gen_ai.input.messages"])
+        assert base64.b64encode(b"\x89PNGsecret").decode("ascii") not in input_messages_json
+        assert base64.b64encode(b"WAVsecret").decode("ascii") not in input_messages_json
+
+    asyncio.run(scenario())
+
+
+_MARKER = "SECRET-MARKER"
+"""The text a scrubbing filter must remove from every content attribute."""
+
+
+def _scrub_marker(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+    """Replace _MARKER in every text-carrying part and keep the rest unchanged."""
+    match part.kind:
+        case "text":
+            return TextPart(text=part.text.replace(_MARKER, "[redacted]"))
+        case "reasoning_part":
+            if part.text is None:
+                return part
+            return part.model_copy(update={"text": part.text.replace(_MARKER, "[redacted]")})
+        case "tool_call":
+            return part.model_copy(
+                update={"args_json": part.args_json.replace(_MARKER, "[redacted]")}
+            )
+        case _:
+            return part
+
+
+def test_a_scrubbing_filter_reaches_every_content_attribute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_MARKER placed in every part position is absent from every recorded content attribute."""
+
+    async def scenario() -> None:
+        """Generate and dispatch under _scrub_marker, then scan every content attribute on both spans."""
+        tracer, exporter = _in_memory_tracer()
+        scripted_turn = AssistantMessage(
+            turn=(
+                ReasoningPart(raw={"signature": "opaque"}, text=f"thinking {_MARKER}"),
+                TextPart(text=f"answer {_MARKER}"),
+            )
+        )
+        traced = TracedLLM(
+            LLM(
+                _FakeAdapter(
+                    scripted_attempts=[
+                        _ScriptedResponse(
+                            outcome=AdapterResult(
+                                output="answer",
+                                assistant_message=scripted_turn,
+                                stop_reason="end_turn",
+                            ),
+                            usage=_USAGE,
+                        )
+                    ]
+                )
+            ),
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=_scrub_marker,
+        )
+        bound = traced.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
+        tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
+        await bound.generate_one([
+            UserMessage(content=f"question {_MARKER}"),
+            AssistantMessage(turn=(tool_call,)),
+            ToolMessage(tool_call_id="call1", content=f"echoed {_MARKER}"),
+        ])
+        tool_manager = TracedToolManager(
+            [_echo_tool()],
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=_scrub_marker,
+        )
+        with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
+            await tool_manager.dispatch(tool_call)
+        assert "content capture raised" not in caplog.text
+        recorded_content_keys: set[str] = set()
+        for span in exporter.get_finished_spans():
+            assert span.attributes is not None
+            for key, value in span.attributes.items():
+                if key in _PAYLOAD_SCHEMA_FILES:
+                    recorded_content_keys.add(key)
+                    assert _MARKER not in str(value), f"{span.name}: {key} leaks {_MARKER}"
+        assert recorded_content_keys == set(_PAYLOAD_SCHEMA_FILES)
+
+    asyncio.run(scenario())
+
+
+def _drop_system_instructions(
+    name: str, part: ContentPart | TurnPart
+) -> ContentPart | TurnPart | None:
+    """Omit every part of the system prompt and keep every other part."""
+    return None if name == "gen_ai.system_instructions" else part
+
+
+def test_a_system_prompt_whose_every_part_filters_away_omits_gen_ai_system_instructions() -> None:
+    """A system prompt with no parts left to record omits the key instead of recording an empty array."""
+
+    async def scenario() -> None:
+        """Generate under the bound prompt and read the span back."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeAdapter()),
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=_drop_system_instructions,
+        )
+        await traced.bind(system_prompt="rules").generate_one("hi")
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert "gen_ai.system_instructions" not in span.attributes
+        assert "gen_ai.input.messages" in span.attributes
+
+    asyncio.run(scenario())
+
+
+def test_a_filter_that_raises_on_an_input_part_omits_the_three_input_attributes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The three input keys build as one dict, so one raise drops all three and the call proceeds."""
+
+    def raise_on_input_messages(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
+        if name == "gen_ai.input.messages":
+            raise RuntimeError("filter defect")
+        return part
+
+    async def scenario() -> None:
+        """Generate under the raising filter, then read the span and the log."""
+        tracer, exporter = _in_memory_tracer()
+        traced = TracedLLM(
+            LLM(_FakeAdapter()),
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=raise_on_input_messages,
+        )
+        bound = traced.bind(system_prompt="rules", tools=ToolManager([_echo_tool()]))
+        with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
+            response = await bound.generate_one("hi")
+        assert response.output == "ok"
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert not {
+            "gen_ai.system_instructions",
+            "gen_ai.tool.definitions",
+            "gen_ai.input.messages",
+        } & set(span.attributes)
+        assert "gen_ai.output.messages" in span.attributes
+        assert "content capture raised" in caplog.text
+        assert "filter defect" in caplog.text
+
+    asyncio.run(scenario())
+
+
+def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A TextPart returned for the ToolCall cannot take its place, so the arguments key is omitted."""
+
+    def text_for_tool_call(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
+        return TextPart(text="not a tool call") if part.kind == "tool_call" else part
+
+    async def scenario() -> None:
+        """Dispatch under the mismatching filter, then read the span and the log."""
+        tracer, exporter = _in_memory_tracer()
+        tool_manager = TracedToolManager(
+            [_echo_tool()],
+            tracer=tracer,
+            capture_message_content=True,
+            content_filter=text_for_tool_call,
+        )
+        with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
+            outcome = await tool_manager.dispatch(
+                ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
+            )
+        assert isinstance(outcome, DispatchHandled)
+        (span,) = exporter.get_finished_spans()
+        assert span.attributes is not None
+        assert "gen_ai.tool.call.arguments" not in span.attributes
+        assert "gen_ai.tool.call.result" in span.attributes
+        assert "content capture raised" in caplog.text
+        assert "returned TextPart for ToolCall" in caplog.text
 
     asyncio.run(scenario())
 

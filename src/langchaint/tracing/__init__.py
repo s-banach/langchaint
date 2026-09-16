@@ -13,6 +13,11 @@ Restored records open no span.
 `precomputed` opens no span because it executes no tool.
 
 Each traced class requires `capture_message_content` because prompt recording is a privacy choice.
+`capture_message_content=True` records every content part unchanged, including image and audio bytes.
+`content_filter` decides per part what each content attribute records.
+`gen_ai.tool.definitions` is not filtered because a tool schema is not a message part.
+A filter that raises or returns a part of another kind is logged, and every attribute in the same build is omitted.
+Organisation-wide redaction of recorded text belongs in an OpenTelemetry Collector processor.
 `extra_attributes` sets constant attributes when each span starts.
 Request and completion attributes replace matching `extra_attributes` keys.
 Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
@@ -46,6 +51,7 @@ Content payloads follow the convention's JSON schemas.
 
 """
 
+import base64
 import importlib.metadata
 import json
 import logging
@@ -56,7 +62,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Never, NoReturn, overload, override
+from typing import Any, Literal, Never, NoReturn, overload, override
 
 from pydantic import BaseModel
 
@@ -80,6 +86,7 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     TurnPart,
+    UserMessage,
 )
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.shared_backoff import SharedBackoff
@@ -128,6 +135,116 @@ No mapper receives `GenerationInput`, so `gen_ai_attributes` cannot put a prompt
 A custom mapper can reach `CallResult.raw`, which holds the SDK response by reference.
 `capture_message_content` controls prompt capture because the wrapper receives `GenerationInput` as a method argument.
 """
+
+type ContentFilter = Callable[[str, ContentPart | TurnPart], ContentPart | TurnPart | None]
+"""Decides what one content attribute records for one part.
+
+The first argument is the content attribute name, such as `"gen_ai.input.messages"`.
+The second argument is the part langchaint would record.
+The return value is the part to record, or `None` to omit the part.
+A returned part must have the same `kind` as the part passed in.
+`gen_ai.tool.call.arguments` holds one `ToolCall`, so `None` omits that attribute.
+A user or assistant message whose every part is omitted records an empty `parts` array.
+A tool message whose every part is omitted records one tool_call_response part with an empty `response`.
+A bare `str` prompt or content is passed as one `TextPart`.
+Message-level fields such as `role`, `tool_call_id`, `is_error`, and `finish_reason` never reach the filter.
+"""
+
+
+def _record_every_part(
+    _attribute_name: str, part: ContentPart | TurnPart
+) -> ContentPart | TurnPart:
+    """Return `part` unchanged, as the filter that `content_filter=None` selects."""
+    return part
+
+
+@overload
+def _filtered_part(
+    content_filter: ContentFilter, attribute_name: str, part: ToolCall
+) -> ToolCall | None: ...
+@overload
+def _filtered_part(
+    content_filter: ContentFilter, attribute_name: str, part: ContentPart
+) -> ContentPart | None: ...
+@overload
+def _filtered_part(
+    content_filter: ContentFilter, attribute_name: str, part: TurnPart
+) -> TurnPart | None: ...
+def _filtered_part(
+    content_filter: ContentFilter, attribute_name: str, part: ContentPart | TurnPart
+) -> ContentPart | TurnPart | None:
+    """Run the filter on one part.
+
+    The overloads state what the `isinstance` check guarantees: a kept part has the class of `part`.
+
+    Raises:
+        TypeError: The filter returned a part of another kind, which cannot take the place of `part`.
+    """
+    filtered = content_filter(attribute_name, part)
+    if filtered is None or isinstance(filtered, type(part)):
+        return filtered
+    raise TypeError(
+        f"the content filter for {attribute_name} returned {type(filtered).__name__} "
+        f"for {type(part).__name__}"
+    )
+
+
+def _filtered_content(
+    content: str | tuple[ContentPart, ...], content_filter: ContentFilter, attribute_name: str
+) -> tuple[ContentPart, ...]:
+    """Pass each `ContentPart` through the filter, with a str as one `TextPart`.
+
+    A bound system prompt is a str or a tuple of `TextPart`, so it passes through this function too.
+    """
+    content_parts: tuple[ContentPart, ...] = (
+        (TextPart(text=content),) if isinstance(content, str) else content
+    )
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in content_parts)
+    return tuple(part for part in kept if part is not None)
+
+
+def _filtered_turn(
+    turn: tuple[TurnPart, ...], content_filter: ContentFilter, attribute_name: str
+) -> tuple[TurnPart, ...]:
+    """Pass each `TurnPart` through the filter."""
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in turn)
+    return tuple(part for part in kept if part is not None)
+
+
+def _filtered_tool_message(
+    message: ToolMessage, content_filter: ContentFilter, attribute_name: str
+) -> ToolMessage:
+    """Copy the message with its content filtered; `tool_call_id` and `is_error` never reach the filter."""
+    return ToolMessage(
+        tool_call_id=message.tool_call_id,
+        content=_filtered_content(message.content, content_filter, attribute_name),
+        is_error=message.is_error,
+    )
+
+
+def _filtered_message(message: Message, content_filter: ContentFilter) -> Message:
+    """Copy one input message with its parts filtered under gen_ai.input.messages."""
+    attribute_name = "gen_ai.input.messages"
+    if message.kind == "user":
+        return UserMessage(
+            content=_filtered_content(message.content, content_filter, attribute_name)
+        )
+    if message.kind == "tool":
+        return _filtered_tool_message(message, content_filter, attribute_name)
+    return AssistantMessage(turn=_filtered_turn(message.turn, content_filter, attribute_name))
+
+
+def _filtered_messages(
+    generation_input: GenerationInput, content_filter: ContentFilter
+) -> tuple[Message, ...]:
+    """Copy the generation input with every part filtered, with a bare str as one user message."""
+    messages = (
+        (UserMessage(content=generation_input),)
+        if isinstance(generation_input, str)
+        else generation_input
+    )
+    return tuple(_filtered_message(message, content_filter) for message in messages)
+
 
 _PACKAGE_VERSION = importlib.metadata.version("langchaint")
 _CHAT_OPERATION = "chat"
@@ -217,6 +334,7 @@ class _SpanConfig:
     attribute_mapper: AttributeMapper
     extra_attributes: SpanAttributes
     capture_message_content: bool
+    content_filter: ContentFilter
 
 
 def _resolve_traced_tool_manager(
@@ -227,11 +345,19 @@ def _resolve_traced_tool_manager(
     """Raise `ValueError` when a `tools` sequence contains duplicate names."""
     if isinstance(tools, ToolManager) or tools is None:
         return tools
+    if span_config.capture_message_content:
+        return TracedToolManager(
+            tools,
+            tracer=span_config.tracer,
+            extra_attributes=span_config.extra_attributes,
+            capture_message_content=True,
+            content_filter=span_config.content_filter,
+        )
     return TracedToolManager(
         tools,
         tracer=span_config.tracer,
         extra_attributes=span_config.extra_attributes,
-        capture_message_content=span_config.capture_message_content,
+        capture_message_content=False,
     )
 
 
@@ -314,12 +440,24 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     return attributes
 
 
+def _blob_part(modality: str, media_type: str, data: bytes) -> dict[str, object]:
+    """Render inline bytes as the convention's BlobPart with standard base64 content."""
+    return {
+        "type": "blob",
+        "modality": modality,
+        "mime_type": media_type,
+        "content": base64.b64encode(data).decode("ascii"),
+    }
+
+
 def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, object]]:
     """Render a MessageContent as the convention's parts array.
 
     A str becomes one text part.
-    ImagePart and AudioPart become blob metadata without data.
+    ImagePart and AudioPart become BlobPart objects carrying their bytes.
     ImageUrlPart becomes an image uri part with its optional media_type as mime_type.
+    gen_ai.system_instructions uses the same rendering because its items share the text part shape.
+    `cache_breakpoint` is omitted because the convention has no corresponding field.
     """
     if isinstance(content, str):
         return [{"type": "text", "content": content}]
@@ -329,7 +467,7 @@ def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, obj
             case "text":
                 parts.append({"type": "text", "content": part.text})
             case "image":
-                parts.append({"type": "blob", "mime_type": part.media_type})
+                parts.append(_blob_part("image", part.media_type, part.data))
             case "image_url":
                 image_uri: dict[str, object] = {
                     "type": "uri",
@@ -340,7 +478,7 @@ def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, obj
                     image_uri["mime_type"] = part.media_type
                 parts.append(image_uri)
             case "audio":
-                parts.append({"type": "blob", "mime_type": part.media_type})
+                parts.append(_blob_part("audio", part.media_type, part.data))
     return parts
 
 
@@ -426,19 +564,11 @@ def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
     return parts
 
 
-def _input_messages(generation_input: GenerationInput) -> list[dict[str, object]]:
-    """Render a GenerationInput as the convention's message array.
+def _message(message: Message) -> dict[str, object]:
+    """Render one Message as the convention's {role, parts} shape.
 
-    A bare str is the one-user-message form BoundLLM accepts, and renders as that message.
     A `ToolMessage` becomes a tool_call_response part inside a tool-role message.
     """
-    if isinstance(generation_input, str):
-        return [{"role": "user", "parts": [{"type": "text", "content": generation_input}]}]
-    return [_message(message) for message in generation_input]
-
-
-def _message(message: Message) -> dict[str, object]:
-    """Render one Message as the convention's {role, parts} shape."""
     if message.kind == "user":
         return {"role": "user", "parts": _content_parts(message.content)}
     if message.kind == "tool":
@@ -460,18 +590,6 @@ def _tool_call_response_part(message: ToolMessage) -> dict[str, object]:
     }
 
 
-def _system_instructions(system_prompt: str | tuple[TextPart, ...]) -> list[dict[str, object]]:
-    """Render a bound system prompt as the convention's instruction array.
-
-    A bound `str` is one element.
-    Each bound `TextPart` is one element.
-    `cache_breakpoint` is omitted because the convention has no corresponding field.
-    """
-    if isinstance(system_prompt, str):
-        return [{"type": "text", "content": system_prompt}]
-    return [{"type": "text", "content": part.text} for part in system_prompt]
-
-
 def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, object]]:
     """Render the bound tool schemas as the convention's tool-definition array.
 
@@ -490,24 +608,29 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
 
 
 def _input_content_attributes(
-    binding: Binding, generation_input: GenerationInput
+    binding: Binding, generation_input: GenerationInput, *, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
     """Build the input-side content attributes for one call, each a JSON string.
 
     OTel attribute values cannot nest, so structured values use the permitted JSON string form.
     A key whose source is empty or absent is omitted.
-    `system_prompt=None` omits gen_ai.system_instructions.
+    `system_prompt=None` omits gen_ai.system_instructions, and so does a prompt whose every part filters away.
     No bound tools omits gen_ai.tool.definitions.
     These omissions are indistinguishable from disabled capture.
+    gen_ai.tool.definitions does not pass through `content_filter` because a tool schema is not a part.
     """
     attributes: dict[str, SpanAttributeValue] = {}
     if binding.system_prompt is not None:
-        attributes["gen_ai.system_instructions"] = json.dumps(
-            _system_instructions(binding.system_prompt)
+        system_instructions = _content_parts(
+            _filtered_content(binding.system_prompt, content_filter, "gen_ai.system_instructions")
         )
+        if system_instructions:
+            attributes["gen_ai.system_instructions"] = json.dumps(system_instructions)
     if binding.tool_schemas:
         attributes["gen_ai.tool.definitions"] = json.dumps(_tool_definitions(binding.tool_schemas))
-    input_messages = _input_messages(generation_input)
+    input_messages = [
+        _message(message) for message in _filtered_messages(generation_input, content_filter)
+    ]
     if input_messages:
         attributes["gen_ai.input.messages"] = json.dumps(input_messages)
     return attributes
@@ -538,7 +661,7 @@ def _request_attributes(
 
 
 def _output_content_attributes(
-    assistant_message: AssistantMessage, stop_reason: StopReason | None
+    turn: tuple[TurnPart, ...], stop_reason: StopReason | None
 ) -> dict[str, SpanAttributeValue]:
     """Build gen_ai.output.messages from one assistant turn.
 
@@ -549,7 +672,7 @@ def _output_content_attributes(
         "gen_ai.output.messages": json.dumps([
             {
                 "role": "assistant",
-                "parts": _turn_parts(assistant_message.turn),
+                "parts": _turn_parts(turn),
                 "finish_reason": (
                     _NO_COMPLETED_TURN_FINISH_REASON
                     if stop_reason is None
@@ -575,7 +698,13 @@ def _apply_output_content[OutputT](
         return
     stop_reason = result.stop_reason
     _apply_content_attributes(
-        span, lambda: _output_content_attributes(assistant_message, stop_reason)
+        span,
+        lambda: _output_content_attributes(
+            _filtered_turn(
+                assistant_message.turn, span_config.content_filter, "gen_ai.output.messages"
+            ),
+            stop_reason,
+        ),
     )
 
 
@@ -631,6 +760,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
     The content keys are JSON strings, and some of what they serialize is arbitrary application data:
     An application supplies `JSONSchemaTool.args_schema` values verbatim.
     `json.dumps` can reject one of those values.
+    A `ContentFilter` can raise or return a part of another kind.
     A build Exception is logged and does not propagate. Existing span attributes remain.
     Building inside the is_recording guard is why the GenerationInput is serialized here rather than earlier:
     an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
@@ -705,6 +835,18 @@ class TracedLLM:
     An application without an SDK configuration gets non-recording no-op spans.
     """
 
+    @overload
+    def __init__(
+        self,
+        llm: LLM,
+        *,
+        capture_message_content: Literal[True],
+        content_filter: ContentFilter | None = None,
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
+        extra_attributes: SpanAttributes | None = None,
+        tracer: Tracer | None = None,
+    ) -> None: ...
+    @overload
     def __init__(
         self,
         llm: LLM,
@@ -713,12 +855,30 @@ class TracedLLM:
         attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
         tracer: Tracer | None = None,
+    ) -> None: ...
+    def __init__(
+        self,
+        llm: LLM,
+        *,
+        capture_message_content: bool,
+        content_filter: ContentFilter | None = None,
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
+        extra_attributes: SpanAttributes | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         """Resolve the tracer once, at construction.
 
         `llm` is the wrapped `LLM`.
         `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant turns.
-        The value passes unchanged to every binding, replacement object, and stream handle.
+        `content_filter` decides per part what those attributes record.
+        The overloads accept `content_filter` only with `capture_message_content=True`.
+        `content_filter=None` records every part unchanged, including image and audio bytes.
+        A filter that keeps everything except inline bytes:
+
+            def drop_binary(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+                return None if part.kind in ("image", "audio") else part
+
+        Both values pass unchanged to every binding, replacement object, and stream handle.
         `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
         `attribute_mapper` passes unchanged to every binding.
         It defaults to `gen_ai_attributes`.
@@ -737,6 +897,7 @@ class TracedLLM:
             attribute_mapper=attribute_mapper,
             extra_attributes=extra_attributes if extra_attributes is not None else {},
             capture_message_content=capture_message_content,
+            content_filter=content_filter if content_filter is not None else _record_every_part,
         )
 
     @property
@@ -900,7 +1061,12 @@ class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """
         if self._span_config.capture_message_content:
             _apply_content_attributes(
-                span, lambda: _input_content_attributes(self._bound_llm.binding, generation_input)
+                span,
+                lambda: _input_content_attributes(
+                    self._bound_llm.binding,
+                    generation_input,
+                    content_filter=self._span_config.content_filter,
+                ),
             )
 
     @property
@@ -1510,7 +1676,12 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         )
         if self._span_config.capture_message_content:
             _apply_content_attributes(
-                span, lambda: _input_content_attributes(self._binding, self._generation_input)
+                span,
+                lambda: _input_content_attributes(
+                    self._binding,
+                    self._generation_input,
+                    content_filter=self._span_config.content_filter,
+                ),
             )
         self._span_started_at_monotonic_seconds = time.monotonic()
         return span
@@ -1668,6 +1839,16 @@ class TracedStreamHandle[OutputT, ToolTurnT = Never]:
         return result
 
 
+def _tool_call_arguments_attribute(
+    call: ToolCall, content_filter: ContentFilter
+) -> dict[str, SpanAttributeValue]:
+    """Build gen_ai.tool.call.arguments from the call, empty when the filter omits the call."""
+    filtered = _filtered_part(content_filter, "gen_ai.tool.call.arguments", call)
+    if filtered is None:
+        return {}
+    return {"gen_ai.tool.call.arguments": json.dumps(_tool_call_arguments(filtered.args_json))}
+
+
 def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
     """Classify a dispatch outcome for error.type, or None where the call succeeded.
 
@@ -1704,12 +1885,25 @@ class TracedToolManager(ToolManager):
     invalid_tool_args and unknown_tool mean that the tool function never ran.
 
     capture_message_content records gen_ai.tool.call.arguments at span start and gen_ai.tool.call.result at completion.
+    content_filter sees the `ToolCall` under gen_ai.tool.call.arguments.
+    It sees each result part under gen_ai.tool.call.result.
     gen_ai.tool.call.arguments uses best-effort JSON deserialization.
     Unparseable text is preserved as a quoted JSON string.
     gen_ai.tool.call.result records each `DispatchOutcome`, including correction messages.
     `extra_attributes` supplies application constants.
     """
 
+    @overload
+    def __init__(
+        self,
+        tools: ToolSequence,
+        *,
+        capture_message_content: Literal[True],
+        content_filter: ContentFilter | None = None,
+        tracer: Tracer | None = None,
+        extra_attributes: SpanAttributes | None = None,
+    ) -> None: ...
+    @overload
     def __init__(
         self,
         tools: ToolSequence,
@@ -1717,11 +1911,23 @@ class TracedToolManager(ToolManager):
         capture_message_content: bool,
         tracer: Tracer | None = None,
         extra_attributes: SpanAttributes | None = None,
+    ) -> None: ...
+    def __init__(
+        self,
+        tools: ToolSequence,
+        *,
+        capture_message_content: bool,
+        content_filter: ContentFilter | None = None,
+        tracer: Tracer | None = None,
+        extra_attributes: SpanAttributes | None = None,
     ) -> None:
         """Index the tools (ToolManager.__init__) and resolve the span pieces once.
 
         `tools` supplies the indexed tool definitions.
         `capture_message_content` has no default because content capture affects privacy.
+        `content_filter` decides per part what the two content attributes record.
+        The overloads accept `content_filter` only with `capture_message_content=True`.
+        `content_filter=None` records every part unchanged.
         `tracer=None` resolves the langchaint tracer.
         `extra_attributes=None` sets no constant dispatch attributes.
         Dispatch attributes override colliding `extra_attributes` keys.
@@ -1739,6 +1945,9 @@ class TracedToolManager(ToolManager):
             extra_attributes if extra_attributes is not None else {}
         )
         self._capture_message_content = capture_message_content
+        self._content_filter: ContentFilter = (
+            content_filter if content_filter is not None else _record_every_part
+        )
 
     @override
     async def dispatch(self, call: ToolCall) -> DispatchOutcome:
@@ -1770,12 +1979,7 @@ class TracedToolManager(ToolManager):
                         })
                 if self._capture_message_content:
                     _apply_content_attributes(
-                        span,
-                        lambda: {
-                            "gen_ai.tool.call.arguments": json.dumps(
-                                _tool_call_arguments(call.args_json)
-                            )
-                        },
+                        span, lambda: _tool_call_arguments_attribute(call, self._content_filter)
                     )
                 try:
                     outcome = await super().dispatch(call)
@@ -1790,7 +1994,13 @@ class TracedToolManager(ToolManager):
                         span,
                         lambda: {
                             "gen_ai.tool.call.result": json.dumps(
-                                _tool_call_response_part(outcome.tool_message)
+                                _tool_call_response_part(
+                                    _filtered_tool_message(
+                                        outcome.tool_message,
+                                        self._content_filter,
+                                        "gen_ai.tool.call.result",
+                                    )
+                                )
                             )
                         },
                     )
@@ -1806,6 +2016,7 @@ class TracedToolManager(ToolManager):
 
 __all__ = [
     "AttributeMapper",
+    "ContentFilter",
     "SpanAttributes",
     "TracedBoundLLM",
     "TracedLLM",

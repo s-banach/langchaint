@@ -153,17 +153,6 @@ class OtelUriPart(OtelStructuredModel):
     mime_type: str | None = None
 
 
-class OtelImageUrlPart(OtelStructuredModel):
-    """Pydantic validates the image_url part in spans from earlier langchaint releases.
-
-    Current langchaint releases emit an `ImageUrlPart` as a `uri` part with `modality="image"`.
-    """
-
-    type: Literal["image_url"]
-    url: str
-    mime_type: str | None = None
-
-
 class OtelReasoningPart(OtelStructuredModel):
     """Pydantic validates the declared reasoning-part fields and retains additional properties."""
 
@@ -237,7 +226,6 @@ type OtelMessagePart = Annotated[
     | OtelBlobPart
     | OtelFilePart
     | OtelUriPart
-    | OtelImageUrlPart
     | OtelReasoningPart
     | OtelCompactionPart
     | OtelGenericObject,
@@ -926,8 +914,6 @@ def _content_part_from_otel(part: OtelMessagePart) -> ContentPart:
         raise _unsupported(part, "blob modality")
     if isinstance(part, OtelUriPart) and part.modality == "image":
         return ImageUrlPart(url=part.uri, media_type=part.mime_type)
-    if isinstance(part, OtelImageUrlPart):
-        return ImageUrlPart(url=part.url, media_type=part.mime_type)
     raise _unsupported(part, "user content part type")
 
 
@@ -962,7 +948,6 @@ __all__ = [
     "OtelFunctionTool",
     "OtelGenericObject",
     "OtelGenericTool",
-    "OtelImageUrlPart",
     "OtelInputMessage",
     "OtelMessagePart",
     "OtelOutputMessage",

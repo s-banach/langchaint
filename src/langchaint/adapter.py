@@ -36,13 +36,18 @@ class ResponseIdentity(NamedTuple):
 
 
 type ErrorClassification = Literal[
-    "transient", "invalid_request", "declared_final", "unknown_exception"
+    "transient", "auth", "invalid_request", "declared_final", "unknown_exception"
 ]
 """The retry loop's action for an unparsed failure or `DoNotRetry`.
 
 `transient` retries this request.
-`invalid_request`, `declared_final`, and `unknown_exception` fail this request with distinct errors.
+`auth`, `invalid_request`, `declared_final`, and `unknown_exception` fail this request with distinct errors.
+`auth` names a provider rejection of the client's credentials or permissions.
+`BoundLLM.config_fingerprint()` excludes credentials, so the same request can succeed after the caller repairs them.
 """
+
+AUTH_STATUSES = frozenset({401, 403})
+"""The HTTP statuses for failed authentication and denied permission."""
 
 
 def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None:
@@ -90,7 +95,7 @@ def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None
 
 def terminal_classification_from_response(
     *, status_code: int, headers: Mapping[str, str]
-) -> Literal["invalid_request", "declared_final", "unknown_exception"]:
+) -> Literal["auth", "invalid_request", "declared_final", "unknown_exception"]:
     """Name one terminal error using its status and retry directive.
 
     Args:
@@ -99,6 +104,8 @@ def terminal_classification_from_response(
     """
     if status_code == 200:
         return "declared_final"
+    if status_code in AUTH_STATUSES:
+        return "auth"
     if 400 <= status_code < 500:
         return "invalid_request"
     if should_retry_from_headers(headers) is False:

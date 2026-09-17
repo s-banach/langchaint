@@ -75,6 +75,7 @@ from google.genai import errors, types
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.adapter import (
+    AUTH_STATUSES,
     REASONING_PART_SEPARATOR,
     Adapter,
     AdapterResult,
@@ -1360,13 +1361,16 @@ class GeminiGenerateContentAdapter(Adapter):
         """Sort an exception parse gave no verdict, or name the terminal error for a DoNotRetry.
 
         google-genai 2.16.0 retry_args classifies both httpx exceptions as retryable transport failures.
-        A 4xx APIError is an invalid request. Any other APIError is unknown_exception.
+        A 401 or 403 APIError is an auth error. Any other 4xx APIError is an invalid request.
+        Any other APIError is unknown_exception.
         Anything else the SDK raises is unknown_exception, which fails this item without a retry.
         """
         if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
             return "transient"
         if not isinstance(error, errors.APIError):
             return "unknown_exception"
+        if error.code in AUTH_STATUSES:
+            return "auth"
         if error.code is not None and 400 <= error.code < 500:
             return "invalid_request"
         return "unknown_exception"

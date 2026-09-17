@@ -35,6 +35,7 @@ from langchaint.concurrency.shared_backoff import (
 )
 from langchaint.generation.call import _CallLedger
 from langchaint.generation.errors import (
+    _PROVIDER_ANSWERED_CLASSIFICATIONS,
     AbandonedCallErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
@@ -356,7 +357,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             else self._adapter.classify(exc)
         )
         if (
-            classification in ("invalid_request", "declared_final")
+            classification in _PROVIDER_ANSWERED_CLASSIFICATIONS
             or self._adapter_stream is not None
         ):
             self._ledger.record(error=None, assistant_message=None, billing=stream_billing)

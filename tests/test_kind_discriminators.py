@@ -8,6 +8,7 @@ from typing import assert_type
 
 from langchaint import (
     AbandonedCallErrorRecord,
+    AuthErrorRecord,
     ContentPart,
     ContextWindowExceededErrorRecord,
     DispatchManyOutcome,
@@ -200,6 +201,9 @@ def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requi
             return record.error_text
         case "provider_failed_terminally_error":
             assert_type(record, ProviderFailedTerminallyErrorRecord)
+            return record.error_text
+        case "auth_error":
+            assert_type(record, AuthErrorRecord)
             return record.error_text
         case "invalid_request_error":
             assert_type(record, InvalidRequestErrorRecord)

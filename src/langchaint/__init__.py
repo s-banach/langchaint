@@ -68,6 +68,7 @@ from langchaint.generation.call import (
 )
 from langchaint.generation.errors import (
     AbandonedCallErrorRecord,
+    AuthErrorRecord,
     ContextWindowExceededErrorRecord,
     EmptyTurnErrorRecord,
     EscapedExceptionErrorRecord,
@@ -157,6 +158,7 @@ __all__ = [
     "AttemptProviderData",
     "AttemptRecord",
     "AudioPart",
+    "AuthErrorRecord",
     "Billing",
     "BoundLLM",
     "CallRecord",

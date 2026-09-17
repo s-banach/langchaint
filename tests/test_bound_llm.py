@@ -26,6 +26,7 @@ from langchaint import (
     DispatchInvalidToolArgs,
     DoNotRetry,
     GenerationError,
+    GenerationErrorKind,
     GenerationErrorRecord,
     Message,
     ParserContractError,
@@ -1305,23 +1306,30 @@ def test_exception_classified_unknown_exception_fails_the_item_without_retry() -
     asyncio.run(scenario())
 
 
-def test_exception_classified_declared_final_fails_the_item_with_a_record() -> None:
-    """A plain exception classified declared_final raises GenerationError, unretried.
+@pytest.mark.parametrize(
+    ("classify_result", "kind"),
+    [("declared_final", "provider_declared_final_error"), ("auth", "auth_error")],
+    ids=["declared_final", "auth"],
+)
+def test_exception_classified_declared_final_or_auth_fails_the_item_with_a_record(
+    classify_result: ErrorClassification, kind: GenerationErrorKind
+) -> None:
+    """A plain exception classified declared_final or auth raises GenerationError, unretried.
 
     A provider response creates an AttemptRecord with ZERO_USAGE when it reports no Billing.
     """
 
     async def scenario() -> None:
-        """Drive one generate_one whose attempt raises a classify-declared_final exception."""
+        """Drive one generate_one whose attempt raises an exception with that classification."""
         adapter = _FakeAdapter(
-            scripted_attempts=[ValueError("boom")], classify_result="declared_final"
+            scripted_attempts=[ValueError("boom")], classify_result=classify_result
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(GenerationError) as declared_final:
+        with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 1
-        failure = declared_final.value
-        assert failure.record.kind == "provider_declared_final_error"
+        failure = raised.value
+        assert failure.record.kind == kind
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "boom"
         (record,) = _settled_attempt_records(failure.attempt_records)
@@ -2362,6 +2370,48 @@ def test_generate_many_records_retries_a_timed_out_record(tmp_path: Path) -> Non
         assert resumed_adapter.bound_adapters[0].open_count == 1
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def test_generate_many_records_retries_an_auth_record(tmp_path: Path) -> None:
+    """A saved `AuthErrorRecord` remains pending until a later call succeeds."""
+
+    async def scenario() -> None:
+        """Fail one request on auth, resume to success, then reuse that success."""
+        adapter = _FakeAdapter(
+            echo=True, scripted_attempts=[ValueError("expired key")], classify_result="auth"
+        )
+        bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
+        resume_path = tmp_path / "records.json"
+        first = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert first[0].kind == "auth_error"
+        second = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert _record_outputs(second) == ["a"]
+        third = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert _record_outputs(third) == ["a"]
+        assert adapter.bound_adapters[0].open_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_generate_many_records_reuses_an_invalid_request_record(tmp_path: Path) -> None:
+    """A saved `InvalidRequestErrorRecord` prevents another provider request."""
+
+    async def scenario() -> None:
+        """Save one provider rejection and restore the same record on the next call."""
+        adapter = _FakeAdapter(
+            echo=True,
+            scripted_attempts=[ValueError("bad request")],
+            classify_result="invalid_request",
+        )
+        bound = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
+        resume_path = tmp_path / "records.json"
+        generated = await bound.generate_many_records(["a"], resume_path=resume_path)
+        restored = await bound.generate_many_records(["a"], resume_path=resume_path)
+        assert generated[0].kind == "invalid_request_error"
+        assert restored[0].kind == "invalid_request_error"
+        assert adapter.bound_adapters[0].open_count == 1
+
+    asyncio.run(scenario())
 
 
 def test_generate_many_records_reuses_a_terminal_error_record(tmp_path: Path) -> None:
@@ -3712,26 +3762,33 @@ def test_stream_open_classified_unknown_exception_raises_the_items_failure() -> 
     asyncio.run(scenario())
 
 
-def test_stream_open_classified_declared_final_raises_the_items_failure() -> None:
-    """An open failure the provider declared final raises GenerationError, unretried.
+@pytest.mark.parametrize(
+    ("classify_result", "kind"),
+    [("declared_final", "provider_declared_final_error"), ("auth", "auth_error")],
+    ids=["declared_final", "auth"],
+)
+def test_stream_open_classified_declared_final_or_auth_raises_the_items_failure(
+    classify_result: ErrorClassification, kind: GenerationErrorKind
+) -> None:
+    """An open failure classified declared_final or auth raises GenerationError, unretried.
 
     The open reached the provider, which answered, so that attempt has a record.
     """
 
     async def scenario() -> None:
-        """Enter a handle whose open raises a classify-declared_final exception."""
+        """Enter a handle whose open raises an exception with that classification."""
         adapter = _FakeAdapter(
-            scripted_attempts=[ValueError("boom")], classify_result="declared_final"
+            scripted_attempts=[ValueError("boom")], classify_result=classify_result
         )
         bound_llm = LLM(adapter, shared_backoff=_fast_shared_backoff()).bind()
-        with pytest.raises(GenerationError) as declared_final:
+        with pytest.raises(GenerationError) as raised:
             async with bound_llm.stream_one([UserMessage(content="hi")]):
                 pass
         assert adapter.bound_adapters[0].open_count == 1
-        assert declared_final.value.record.kind == "provider_declared_final_error"
-        assert isinstance(declared_final.value.__cause__, ValueError)
-        assert declared_final.value.error_text == "boom"
-        (record,) = _settled_attempt_records(declared_final.value.attempt_records)
+        assert raised.value.record.kind == kind
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert raised.value.error_text == "boom"
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
         assert record.error is None
         assert record.usage == ZERO_USAGE
 
@@ -3799,11 +3856,12 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
 @pytest.mark.parametrize(
     "classify_result",
     [
+        "auth",
         "invalid_request",
         "declared_final",
         "unknown_exception",
     ],
-    ids=["invalid_request", "declared_final", "unknown_exception"],
+    ids=["auth", "invalid_request", "declared_final", "unknown_exception"],
 )
 def test_a_terminal_mid_stream_error_records_what_the_stream_reported(
     classify_result: ErrorClassification,

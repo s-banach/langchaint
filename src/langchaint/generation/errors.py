@@ -243,6 +243,21 @@ class ProviderFailedTerminallyErrorRecord(_CompletedModelTurnErrorRecordBase):
     kind: Literal["provider_failed_terminally_error"] = "provider_failed_terminally_error"
 
 
+class AuthErrorRecord(_GenerationErrorRecordBase):
+    """A provider rejected the client's credentials or permissions for one request.
+
+    The same request can succeed after the caller repairs the credentials or permissions.
+    Validation rejects unknown fields.
+    """
+
+    kind: Literal["auth_error"] = "auth_error"
+
+    @model_validator(mode="after")
+    def _validate_terminal_provider_result(self) -> Self:
+        _require_terminal_provider_result(self.call, permit_empty=False)
+        return self
+
+
 class InvalidRequestErrorRecord(_GenerationErrorRecordBase):
     """An adapter or provider rejected one request.
 
@@ -329,6 +344,7 @@ type GenerationErrorKind = Literal[
     "context_window_exceeded_error",
     "unfinished_turn_error",
     "provider_failed_terminally_error",
+    "auth_error",
     "invalid_request_error",
     "provider_declared_final_error",
     "unknown_exception_error",
@@ -348,6 +364,7 @@ type GenerationErrorRecord = Annotated[
     | ContextWindowExceededErrorRecord
     | UnfinishedTurnErrorRecord
     | ProviderFailedTerminallyErrorRecord
+    | AuthErrorRecord
     | InvalidRequestErrorRecord
     | ProviderDeclaredFinalErrorRecord
     | UnknownExceptionErrorRecord
@@ -367,6 +384,7 @@ _GENERATION_ERROR_RECORD_CLASSES = (
     ContextWindowExceededErrorRecord,
     UnfinishedTurnErrorRecord,
     ProviderFailedTerminallyErrorRecord,
+    AuthErrorRecord,
     InvalidRequestErrorRecord,
     ProviderDeclaredFinalErrorRecord,
     UnknownExceptionErrorRecord,
@@ -376,9 +394,19 @@ _GENERATION_ERROR_RECORD_CLASSES = (
 )
 
 
+_PROVIDER_ANSWERED_CLASSIFICATIONS = ("auth", "invalid_request", "declared_final")
+"""The classifications that show the provider answered the terminal request.
+
+The caller records a settled attempt for that answer before `_terminal_error_record`.
+`_require_terminal_provider_result` validates that attempt on the records for these classifications.
+"""
+
+
 def _terminal_error_record(
     classification: "ErrorClassification", *, reason: str, call: CallRecord
 ) -> GenerationErrorRecord:
+    if classification == "auth":
+        return AuthErrorRecord(error_text=reason, call=call)
     if classification == "invalid_request":
         return InvalidRequestErrorRecord(error_text=reason, call=call)
     if classification == "declared_final":

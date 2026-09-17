@@ -16,7 +16,11 @@ from pydantic import ConfigDict, Field, TypeAdapter, ValidationError, model_vali
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
-from langchaint.generation.errors import RetriesExhaustedErrorRecord, TimedOutErrorRecord
+from langchaint.generation.errors import (
+    AuthErrorRecord,
+    RetriesExhaustedErrorRecord,
+    TimedOutErrorRecord,
+)
 from langchaint.generation.response import CallResultRecord
 
 _RESUME_FORMAT_VERSION = 1
@@ -144,7 +148,7 @@ class ResumeState[OutputT]:
             if item.result_record is None
             or isinstance(
                 item.result_record,
-                (RetriesExhaustedErrorRecord, TimedOutErrorRecord),
+                (RetriesExhaustedErrorRecord, TimedOutErrorRecord, AuthErrorRecord),
             )
         }
 

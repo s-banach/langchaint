@@ -45,6 +45,7 @@ from langchaint.generation._generate_many_records import (
 )
 from langchaint.generation.call import _CallLedger
 from langchaint.generation.errors import (
+    _PROVIDER_ANSWERED_CLASSIFICATIONS,
     EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
@@ -831,7 +832,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             if verdict is not None and verdict.kind == "pause_all_do_not_retry"
             else self.adapter.classify(exc)
         )
-        if classification in ("invalid_request", "declared_final") or observations.opened:
+        if classification in _PROVIDER_ANSWERED_CLASSIFICATIONS or observations.opened:
             ledger.record(error=None, assistant_message=None, billing=observations.billing)
         return GenerationError(
             record=_terminal_error_record(classification, reason=str(exc), call=ledger.freeze()),
@@ -1265,7 +1266,9 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         The file's `binding_fingerprint` is the value from `config_fingerprint()`.
         Changes excluded by `config_fingerprint()` do not replace the file.
         A malformed file or unsupported format raises before any provider request and remains unchanged.
-        Missing records, `RetriesExhaustedErrorRecord` values, and `TimedOutErrorRecord` values generate again.
+        Missing records generate again.
+        `RetriesExhaustedErrorRecord`, `TimedOutErrorRecord`, and `AuthErrorRecord` values generate again.
+        The fingerprints exclude the causes of those errors, so the same input can succeed later.
         The new record replaces the saved error record.
         The replacement record excludes the earlier call's attempts and billing.
         Every other saved record is reused.

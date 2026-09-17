@@ -13,6 +13,7 @@ from langchaint import (
     AbandonedCallErrorRecord,
     AssistantMessage,
     AttemptProviderData,
+    AuthErrorRecord,
     Billing,
     CallRecord,
     CallResultRecord,
@@ -373,6 +374,7 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
             "provider_failed_terminally_error",
             "failed",
         ),
+        (AuthErrorRecord(call=terminal, error_text="auth"), "auth_error", "auth"),
         (
             InvalidRequestErrorRecord(
                 call=CallRecord(

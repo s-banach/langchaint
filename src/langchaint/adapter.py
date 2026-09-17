@@ -46,7 +46,7 @@ type ErrorClassification = Literal[
 `BoundLLM.config_fingerprint()` excludes credentials, so the same request can succeed after the caller repairs them.
 """
 
-AUTH_STATUSES = frozenset({401, 403})
+AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
 """The HTTP statuses for failed authentication and denied permission."""
 
 

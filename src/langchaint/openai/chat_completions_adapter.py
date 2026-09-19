@@ -983,13 +983,16 @@ class _ChatCompletionsStream(AdapterStream):
 
 
 class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
-    """What both Chat Completions bindings share: the request path, and what a response says about itself.
+    """What both Chat Completions bindings share: the request path, and what a response says about itself."""
 
-    A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.
-    """
-
-    _adapter: OpenAIChatCompletionsAdapter
-    _precomputed_fields: _ChatCompletionsPrecomputedFields
+    def __init__(
+        self,
+        *,
+        adapter: OpenAIChatCompletionsAdapter,
+        precomputed_fields: _ChatCompletionsPrecomputedFields,
+    ) -> None:
+        self._adapter = adapter
+        self._precomputed_fields = precomputed_fields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1073,15 +1076,6 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
 class _BoundChatCompletionsText(_BoundChatCompletions[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(
-        self,
-        *,
-        adapter: OpenAIChatCompletionsAdapter,
-        precomputed_fields: _ChatCompletionsPrecomputedFields,
-    ) -> None:
-        self._adapter = adapter
-        self._precomputed_fields = precomputed_fields
-
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn, whose concatenated text is this binding's output.
@@ -1111,10 +1105,12 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
 
         It replaces the omitted binding field in every request.
         """
-        self._adapter = adapter
         self._response_format = response_format
-        self._precomputed_fields = replace(
-            precomputed_fields, response_format=_wire_response_format(response_format)
+        super().__init__(
+            adapter=adapter,
+            precomputed_fields=replace(
+                precomputed_fields, response_format=_wire_response_format(response_format)
+            ),
         )
 
     def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:

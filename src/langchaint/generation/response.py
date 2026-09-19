@@ -34,6 +34,8 @@ from langchaint.generation.errors import (
     _GenerationErrorRecordBase,
 )
 
+# Declared covariant because pyrefly infers a PEP 695 parameter invariant through the record's
+# `output` field, and `AttributeMapper` takes `CallResult[object]`.
 _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 
@@ -42,6 +44,8 @@ class _SuccessRecordBase(_CallResultRecordBase):
 
     Validation rejects unknown fields.
     """
+
+    stop_reason: StopReason
 
     @model_validator(mode="after")
     def _validate_success(self) -> Self:
@@ -81,7 +85,6 @@ class ResponseRecord[OutputT](_SuccessRecordBase):
     """
 
     output: OutputT
-    stop_reason: StopReason
     kind: Literal["response"] = "response"
 
 
@@ -92,7 +95,6 @@ class ToolCallTurnRecord[OutputT](_SuccessRecordBase):
     """
 
     output: OutputT | None
-    stop_reason: StopReason
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     @model_validator(mode="after")
@@ -102,10 +104,11 @@ class ToolCallTurnRecord[OutputT](_SuccessRecordBase):
         return self
 
 
-class _LiveSuccess(Generic[_OutputT_co]):  # noqa: UP046
+@dataclass(frozen=True, kw_only=True)
+class _LiveSuccess[RecordT: _SuccessRecordBase]:
     """Delegate live success properties to one normalized record."""
 
-    record: ResponseRecord[_OutputT_co] | ToolCallTurnRecord[_OutputT_co]
+    record: RecordT
     provider_attempts: tuple[AttemptProviderData, ...]
 
     def __post_init__(self) -> None:
@@ -176,13 +179,9 @@ class _LiveSuccess(Generic[_OutputT_co]):  # noqa: UP046
 
 
 @dataclass(frozen=True, kw_only=True)
-class Response(_LiveSuccess[_OutputT_co], Generic[_OutputT_co]):  # noqa: UP046
+class Response(_LiveSuccess[ResponseRecord[_OutputT_co]], Generic[_OutputT_co]):  # noqa: UP046
     """A live success with a normalized record and provider SDK values."""
 
-    # pyrefly: ignore[bad-override]  # The frozen live value makes this field read-only.
-    record: ResponseRecord[_OutputT_co]
-    # pyrefly: ignore[bad-override]  # The frozen live value makes this field read-only.
-    provider_attempts: tuple[AttemptProviderData, ...]
     kind: Literal["response"] = "response"
 
     @property
@@ -192,13 +191,9 @@ class Response(_LiveSuccess[_OutputT_co], Generic[_OutputT_co]):  # noqa: UP046
 
 
 @dataclass(frozen=True, kw_only=True)
-class ToolCallTurn(_LiveSuccess[_OutputT_co], Generic[_OutputT_co]):  # noqa: UP046
+class ToolCallTurn(_LiveSuccess[ToolCallTurnRecord[_OutputT_co]], Generic[_OutputT_co]):  # noqa: UP046
     """A live tool-call turn with normalized and provider SDK values."""
 
-    # pyrefly: ignore[bad-override]  # The frozen live value makes this field read-only.
-    record: ToolCallTurnRecord[_OutputT_co]
-    # pyrefly: ignore[bad-override]  # The frozen live value makes this field read-only.
-    provider_attempts: tuple[AttemptProviderData, ...]
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     @property

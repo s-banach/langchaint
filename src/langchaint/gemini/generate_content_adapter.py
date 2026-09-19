@@ -1700,14 +1700,18 @@ def _adapter_result[OutputT](
 
 
 class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
-    """What both gemini bindings share: the request path, and what a response says about itself.
+    """What both gemini bindings share: the request path, and what a response says about itself."""
 
-    A subclass sets _adapter and _config in its own __init__ and implements interpret.
-    """
-
-    _adapter: GeminiGenerateContentAdapter
-    _config: types.GenerateContentConfig
-    _provider_tool_fields: frozenset[str]
+    def __init__(
+        self,
+        *,
+        adapter: GeminiGenerateContentAdapter,
+        config: types.GenerateContentConfig,
+        provider_tool_fields: frozenset[str],
+    ) -> None:
+        self._adapter = adapter
+        self._config = config
+        self._provider_tool_fields = provider_tool_fields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1781,17 +1785,6 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
 class _BoundGeminiText(_BoundGemini[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(
-        self,
-        *,
-        adapter: GeminiGenerateContentAdapter,
-        config: types.GenerateContentConfig,
-        provider_tool_fields: frozenset[str],
-    ) -> None:
-        self._adapter = adapter
-        self._config = config
-        self._provider_tool_fields = provider_tool_fields
-
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn, whose concatenated text is this binding's output.
@@ -1818,9 +1811,7 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         provider_tool_fields: frozenset[str],
         output_type_adapter: TypeAdapter[ModelT],
     ) -> None:
-        self._adapter = adapter
-        self._config = config
-        self._provider_tool_fields = provider_tool_fields
+        super().__init__(adapter=adapter, config=config, provider_tool_fields=provider_tool_fields)
         self._output_type_adapter = output_type_adapter
 
     def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:

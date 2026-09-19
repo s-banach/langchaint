@@ -1031,13 +1031,13 @@ class _OpenAIStream(AdapterStream):
 
 
 class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
-    """What both openai bindings share: the request path, and what a response says about itself.
+    """What both openai bindings share: the request path, and what a response says about itself."""
 
-    A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.
-    """
-
-    _adapter: OpenAIResponsesAdapter
-    _precomputed_fields: _OpenAIPrecomputedFields
+    def __init__(
+        self, *, adapter: OpenAIResponsesAdapter, precomputed_fields: _OpenAIPrecomputedFields
+    ) -> None:
+        self._adapter = adapter
+        self._precomputed_fields = precomputed_fields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1118,12 +1118,6 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
 class _BoundOpenAIText(_BoundOpenAI[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(
-        self, *, adapter: OpenAIResponsesAdapter, precomputed_fields: _OpenAIPrecomputedFields
-    ) -> None:
-        self._adapter = adapter
-        self._precomputed_fields = precomputed_fields
-
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
         """Read the turn's text as this binding's output, or report the run openai says failed.
@@ -1157,10 +1151,12 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         `type_to_text_format_param` matches `responses.parse(text_format=...)`.
         The format replaces the omitted binding field in every request.
         """
-        self._adapter = adapter
         self._response_format = response_format
-        self._precomputed_fields = replace(
-            precomputed_fields, text={"format": type_to_text_format_param(response_format)}
+        super().__init__(
+            adapter=adapter,
+            precomputed_fields=replace(
+                precomputed_fields, text={"format": type_to_text_format_param(response_format)}
+            ),
         )
 
     def _no_instance(

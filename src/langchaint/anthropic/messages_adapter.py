@@ -1458,13 +1458,13 @@ class _AnthropicStream(AdapterStream):
 
 
 class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
-    """What both anthropic bindings share: the request path, and what a response says about itself.
+    """What both anthropic bindings share: the request path, and what a response says about itself."""
 
-    A subclass sets _adapter and _precomputed_fields in its own __init__ and implements interpret.
-    """
-
-    _adapter: AnthropicMessagesAdapter
-    _precomputed_fields: _AnthropicPrecomputedFields
+    def __init__(
+        self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
+    ) -> None:
+        self._adapter = adapter
+        self._precomputed_fields = precomputed_fields
 
     @override
     def billing_from_raw(self, raw: BaseModel) -> ProviderBilling:
@@ -1538,12 +1538,6 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
 class _BoundAnthropicText(_BoundAnthropic[str]):
     """Text-bound adapter: output is the concatenated text of the turn."""
 
-    def __init__(
-        self, *, adapter: AnthropicMessagesAdapter, precomputed_fields: _AnthropicPrecomputedFields
-    ) -> None:
-        self._adapter = adapter
-        self._precomputed_fields = precomputed_fields
-
     @override
     def interpret(self, raw: BaseModel) -> AdapterResult[str]:
         """Read the turn, whose concatenated text is this binding's output.
@@ -1574,7 +1568,6 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         The merge is what keeps a reasoning effort the binding set: output_config carries both keys.
         The merged value replaces the binding value in every request.
         """
-        self._adapter = adapter
         self._output_type_adapter: TypeAdapter[ModelT] = TypeAdapter(response_format)
         output_format = JSONOutputFormatParam(
             schema=transform_schema(self._output_type_adapter.json_schema()), type="json_schema"
@@ -1585,7 +1578,10 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
             if isinstance(bound_output_config, Omit)
             else {**bound_output_config, "format": output_format}
         )
-        self._precomputed_fields = replace(precomputed_fields, output_config=output_config)
+        super().__init__(
+            adapter=adapter,
+            precomputed_fields=replace(precomputed_fields, output_config=output_config),
+        )
 
     def _parsed_outcome(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage

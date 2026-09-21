@@ -2,7 +2,7 @@
 
 Source repository: <https://github.com/open-telemetry/semantic-conventions-genai>.
 Tracked reference: `main`.
-Resolved commit SHA: `0c87594975195608dc91b3f702e250a7b240c151`.
+Resolved commit SHA: `c88d504ab3d9879f8e50d3cc87e69775e11db234`.
 Resolved Weaver version: `v0.26.1`.
 License: Apache-2.0.
 

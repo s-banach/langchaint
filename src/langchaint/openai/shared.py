@@ -35,6 +35,9 @@ _PAUSE_STATUSES = frozenset({429, 503})
 """429 rate limits and documented 503 forms throttle the rate-limit quota.
 
 Every request sharing the rate-limit quota pauses.
+The SDK's `api_reference/openapi.transformed.yml` (openai 3.17.0) documents only these
+two error statuses on chat completions, responses, and embeddings.
+It describes both as retryable after an optional integer-seconds `Retry-After` header.
 """
 
 _SPEND_LIMIT_CODES = frozenset({

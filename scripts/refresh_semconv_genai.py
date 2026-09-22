@@ -150,6 +150,9 @@ Resolved commit SHA: `{resolved_sha}`.
 Resolved Weaver version: `{weaver_version}`.
 License: Apache-2.0.
 
+The resolved commit SHA is the upstream commit resolved by the last refresh that changed the committed data.
+A refresh that produces identical data leaves this file unchanged.
+
 `{GENERATED_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
 `src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
@@ -202,19 +205,41 @@ def _generate_staged_files(
     return staged_directory
 
 
+def _destination_path(staged_path: pathlib.Path) -> pathlib.Path:
+    if staged_path.name == RUNTIME_STRUCTURED_ATTRIBUTES_FILE:
+        return RUNTIME_DESTINATION / staged_path.name
+    return DESTINATION / staged_path.name
+
+
 def _replace_committed_files(staged_directory: pathlib.Path) -> None:
+    """Replace committed data files, and SOURCE.md only when a data file changed.
+
+    Upstream commits that touch nothing langchaint consumes still move the resolved SHA.
+    Leaving SOURCE.md untouched then keeps the recorded SHA at the commit that last changed the committed data.
+    The refresh workflow therefore opens no pull request for a SHA-only change.
+    """
     DESTINATION.mkdir(parents=True, exist_ok=True)
-    for obsolete_file in OBSOLETE_FILES:
-        obsolete_path = DESTINATION / obsolete_file
-        if obsolete_path.exists():
-            obsolete_path.unlink()
-    for staged_path in sorted(staged_directory.iterdir()):
-        destination_directory = (
-            RUNTIME_DESTINATION
-            if staged_path.name == RUNTIME_STRUCTURED_ATTRIBUTES_FILE
-            else DESTINATION
-        )
-        destination_path = destination_directory / staged_path.name
+    obsolete_paths = [
+        DESTINATION / obsolete_file
+        for obsolete_file in sorted(OBSOLETE_FILES)
+        if (DESTINATION / obsolete_file).exists()
+    ]
+    staged_data_paths = sorted(
+        path for path in staged_directory.iterdir() if path.name != SOURCE_DOC.name
+    )
+    data_changed = bool(obsolete_paths) or any(
+        not _destination_path(path).exists()
+        or _destination_path(path).read_bytes() != path.read_bytes()
+        for path in staged_data_paths
+    )
+    if not data_changed:
+        print("committed data matches upstream; SOURCE.md left unchanged")
+        return
+    for obsolete_path in obsolete_paths:
+        obsolete_path.unlink()
+        print(f"removed {obsolete_path}")
+    for staged_path in [*staged_data_paths, staged_directory / SOURCE_DOC.name]:
+        destination_path = _destination_path(staged_path)
         _ = staged_path.replace(destination_path)
         print(f"wrote {destination_path}")
 

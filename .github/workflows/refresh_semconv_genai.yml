@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BRANCH: semconv-genai-refresh
+      VENDORED_PATHS: tests/semconv_genai src/langchaint/_semconv_genai_structured_attributes.json
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,12 +56,12 @@ jobs:
       - name: Detect vendored data changes
         id: drift
         run: |
-          if [ -z "$(git status --porcelain --untracked-files=all -- tests/semconv_genai)" ]; then
+          if [ -z "$(git status --porcelain --untracked-files=all -- $VENDORED_PATHS)" ]; then
             echo "moved=false" >> "$GITHUB_OUTPUT"
             echo "The vendored data matches upstream; nothing to do."
           else
             echo "moved=true" >> "$GITHUB_OUTPUT"
-            git diff --stat -- tests/semconv_genai
+            git diff --stat -- $VENDORED_PATHS
           fi
 
       - name: Run the gate against refreshed data
@@ -81,7 +82,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C "$BRANCH"
-          git add tests/semconv_genai
+          git add $VENDORED_PATHS
           git commit -m "Refresh vendored GenAI semantic-convention data"
           git push --force origin "$BRANCH"
           if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then

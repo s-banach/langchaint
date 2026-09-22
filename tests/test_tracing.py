@@ -1766,6 +1766,60 @@ def test_refresh_rejects_a_malformed_structured_attribute_name_array(
         refresh_semconv_genai._validate_json_file(generated_path, expected_shape="string_array")
 
 
+def _stage_refresh_directories(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Return staged, destination, and runtime directories with matching committed data."""
+    staged = tmp_path / "staged"
+    destination = tmp_path / "destination"
+    runtime = tmp_path / "runtime"
+    for directory in (staged, destination, runtime):
+        directory.mkdir()
+    _ = (staged / refresh_semconv_genai.GENERATED_ATTRIBUTES_FILE).write_text("{}")
+    _ = (destination / refresh_semconv_genai.GENERATED_ATTRIBUTES_FILE).write_text("{}")
+    _ = (staged / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE).write_text("[]")
+    _ = (runtime / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE).write_text("[]")
+    _ = (staged / "SOURCE.md").write_text("Resolved commit SHA: `new`.\n")
+    _ = (destination / "SOURCE.md").write_text("Resolved commit SHA: `old`.\n")
+    monkeypatch.setattr(refresh_semconv_genai, "DESTINATION", destination)
+    monkeypatch.setattr(refresh_semconv_genai, "RUNTIME_DESTINATION", runtime)
+    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_DOC", destination / "SOURCE.md")
+    return staged, destination, runtime
+
+
+def test_refresh_leaves_source_doc_unchanged_when_data_matches(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the recorded SHA when every staged data file matches its committed copy."""
+    staged, destination, _ = _stage_refresh_directories(tmp_path, monkeypatch)
+    refresh_semconv_genai._replace_committed_files(staged)
+    assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `old`.\n"
+
+
+def test_refresh_rewrites_source_doc_when_runtime_data_changes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Write the runtime data file and SOURCE.md when only the runtime data differs."""
+    staged, destination, runtime = _stage_refresh_directories(tmp_path, monkeypatch)
+    runtime_file = refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE
+    _ = (staged / runtime_file).write_text('["gen_ai.input.messages"]')
+    refresh_semconv_genai._replace_committed_files(staged)
+    assert (runtime / runtime_file).read_text() == '["gen_ai.input.messages"]'
+    assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
+
+
+def test_refresh_removes_an_obsolete_file_and_rewrites_source_doc(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat a committed obsolete file as a data change."""
+    staged, destination, _ = _stage_refresh_directories(tmp_path, monkeypatch)
+    obsolete_path = destination / "provider-name-values.json"
+    _ = obsolete_path.write_text("{}")
+    refresh_semconv_genai._replace_committed_files(staged)
+    assert not obsolete_path.exists()
+    assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
+
+
 _REASONING_ONLY_OUTCOME = AdapterResult(
     output="",
     assistant_message=AssistantMessage(turn=(ReasoningPart(raw={"signature": "opaque"}),)),

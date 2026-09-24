@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 concurrency:
@@ -24,7 +25,35 @@ jobs:
           python-version: "3.14"
           prune-cache: true
       - name: Refresh pricing metadata
-        run: uv run python -m scripts.update_pricing_metadata
+        run: uv run python -m scripts.update_pricing_metadata > "$RUNNER_TEMP/untracked-model-keys.txt"
+      - name: Report untracked models
+        id: report
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: New LiteLLM models to price or ignore
+        run: |
+          issue=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --limit 100 --json number,title | jq -r --arg title "$ISSUE_TITLE" 'map(select(.title == $title))[0].number // empty')
+          if [ ! -s "$RUNNER_TEMP/untracked-model-keys.txt" ]; then
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" --comment "No OpenAI or Anthropic direct-API text model in LiteLLM remains unpriced and unignored."
+            fi
+            exit 0
+          fi
+          sed 's/.*/- `&`/' "$RUNNER_TEMP/untracked-model-keys.txt" > "$RUNNER_TEMP/untracked-model-list.md"
+          cat .github/untracked-models-issue-body.md "$RUNNER_TEMP/untracked-model-list.md" > "$RUNNER_TEMP/untracked-models-issue.md"
+          if [ -z "$issue" ]; then
+            gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/untracked-models-issue.md"
+            exit 0
+          fi
+          # Compare only the model lines, so a template edit or CRLF line endings do not count as a change.
+          body=$(gh issue view "$issue" --json body --jq .body)
+          listed_models=$(printf '%s\n' "$body" | tr -d '\r' | { grep '^- `' || true; })
+          if [ "$listed_models" != "$(cat "$RUNNER_TEMP/untracked-model-list.md")" ]; then
+            # Comment before editing, so a failed comment is retried on the next run.
+            gh issue comment "$issue" --body "The list of untracked models changed."
+            gh issue edit "$issue" --body-file "$RUNNER_TEMP/untracked-models-issue.md"
+          fi
       - name: Detect pricing changes
         id: changes
         run: |
@@ -57,4 +86,7 @@ jobs:
           gh pr comment "$BRANCH" --body "scripts/CI.sh outcome: $CI_OUTCOME"
       - name: Report CI failure
         if: steps.changes.outputs.changed == 'true' && steps.ci.outcome == 'failure'
+        run: exit 1
+      - name: Report untracked-model issue failure
+        if: steps.report.outcome == 'failure'
         run: exit 1

@@ -26,6 +26,8 @@ from langchaint.common.checked_copy import CheckedCopyModel
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_PATH = ROOT / "scripts/pricing/litellm-pricing-snapshot.json"
 METADATA_PATH = ROOT / "scripts/pricing/provider-pricing-metadata.json"
+IGNORED_MODEL_KEYS_PATH = ROOT / "scripts/pricing/ignored-litellm-model-keys.json"
+"""Hand-maintained direct-API LiteLLM keys that langchaint deliberately does not price."""
 OPENAI_OUTPUT_PATH = ROOT / "src/langchaint/openai/_generated_pricing.py"
 ANTHROPIC_OUTPUT_PATH = ROOT / "src/langchaint/anthropic/_generated_pricing.py"
 
@@ -260,7 +262,28 @@ class _GitHubCommit(BaseModel):
     sha: Annotated[str, StringConstraints(min_length=1)]
 
 
+class _LiteLLMModelKind(BaseModel):
+    """The LiteLLM entry fields that decide whether new-model detection reports an entry.
+
+    Entries carry many other fields, so this model ignores extras and does not inherit
+    `CheckedCopyModel`.
+    """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    litellm_provider: str | None = None
+    mode: str | None = None
+
+    def is_direct_api_text_model(self) -> bool:
+        """Report whether the entry is an OpenAI or Anthropic direct-API text generation model."""
+        return self.litellm_provider in {"openai", "anthropic"} and self.mode in {
+            "chat",
+            "responses",
+        }
+
+
 _LITELLM_FILE = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
+_MODEL_KEYS = TypeAdapter[frozenset[str]](frozenset[str])
 
 
 def _download(url: str) -> bytes:
@@ -621,14 +644,13 @@ def _validated_entry(key: str, raw_entry: JsonValue) -> _LiteLLMEntry:
     return entry
 
 
-def _selected_entries(litellm_json: bytes) -> dict[str, _LiteLLMEntry]:
+def _selected_entries(raw_entries: Mapping[str, JsonValue]) -> dict[str, _LiteLLMEntry]:
     """Select and validate the LiteLLM entries the generated modules use.
 
     Raises:
         KeyError: A required LiteLLM key is missing.
-        ValueError: LiteLLM data has the wrong shape, or a selected entry is invalid.
+        ValueError: A selected entry is invalid.
     """
-    raw_entries = _LITELLM_FILE.validate_json(litellm_json)
     required_keys = {
         *OPENAI_LITELLM_KEYS.values(),
         *ANTHROPIC_LITELLM_KEYS.values(),
@@ -645,6 +667,29 @@ def _selected_entries(litellm_json: bytes) -> dict[str, _LiteLLMEntry]:
     }
 
 
+def _untracked_model_keys(
+    raw_entries: Mapping[str, JsonValue], ignored_keys: frozenset[str]
+) -> list[str]:
+    """List the direct-API text model keys that are neither generated nor ignored.
+
+    An OpenAI or Anthropic direct-API LiteLLM key equals the model id, so an alias key such as
+    `gpt-5.6` counts as generated.
+    """
+    generated_keys = {
+        *OPENAI_LITELLM_KEYS.values(),
+        *OPENAI_ALIASES,
+        *ANTHROPIC_LITELLM_KEYS.values(),
+        *ANTHROPIC_ALIASES,
+    }
+    return sorted(
+        key
+        for key, raw_entry in raw_entries.items()
+        if key not in generated_keys
+        and key not in ignored_keys
+        and _LiteLLMModelKind.model_validate(raw_entry).is_direct_api_text_model()
+    )
+
+
 def _snapshot_json(entries: Mapping[str, _LiteLLMEntry]) -> str:
     """Render the selected entries as the vendored snapshot, field for field as upstream lists them."""
     payload = {key: entry.model_dump(exclude_unset=True) for key, entry in entries.items()}
@@ -654,6 +699,9 @@ def _snapshot_json(entries: Mapping[str, _LiteLLMEntry]) -> str:
 def main() -> None:
     """Refresh pricing files from current upstream data.
 
+    Print one line per direct-API text model key that is neither generated nor in
+    `IGNORED_MODEL_KEYS_PATH`, so the refresh workflow can report new models.
+
     Raises:
         OSError: A download or file operation fails.
         KeyError: A required model entry is missing.
@@ -661,8 +709,13 @@ def main() -> None:
         SyntaxError: Generated Python is invalid.
     """
     metadata = _ProviderMetadata.model_validate_json(METADATA_PATH.read_bytes())
+    ignored_keys = _MODEL_KEYS.validate_json(IGNORED_MODEL_KEYS_PATH.read_bytes())
     commit = _GitHubCommit.model_validate_json(_download(LITELLM_COMMIT_URL))
-    entries = _selected_entries(_download(LITELLM_RAW_URL.format(revision=commit.sha)))
+    raw_entries = _LITELLM_FILE.validate_json(
+        _download(LITELLM_RAW_URL.format(revision=commit.sha))
+    )
+    entries = _selected_entries(raw_entries)
+    untracked_model_keys = _untracked_model_keys(raw_entries, ignored_keys)
     snapshot = _snapshot_json(entries)
     openai_module = _openai_module(entries, metadata)
     anthropic_module = _anthropic_module(entries, metadata)
@@ -671,6 +724,8 @@ def main() -> None:
     _ = SNAPSHOT_PATH.write_text(snapshot)
     _ = OPENAI_OUTPUT_PATH.write_text(openai_module)
     _ = ANTHROPIC_OUTPUT_PATH.write_text(anthropic_module)
+    for key in untracked_model_keys:
+        print(key)
 
 
 if __name__ == "__main__":

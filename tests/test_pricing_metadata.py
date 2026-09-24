@@ -15,6 +15,7 @@ from langchaint.openai.shared import (
     OpenAIResponsesServiceTier,
 )
 from scripts.update_pricing_metadata import (
+    _LITELLM_FILE,
     ANTHROPIC_OUTPUT_PATH,
     METADATA_PATH,
     OPENAI_OUTPUT_PATH,
@@ -26,6 +27,7 @@ from scripts.update_pricing_metadata import (
     _ProviderMetadata,
     _selected_entries,
     _snapshot_json,
+    _untracked_model_keys,
 )
 
 
@@ -178,11 +180,29 @@ def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
 
 def test_vendored_inputs_reproduce_generated_modules() -> None:
     """Vendored inputs reproduce the snapshot and both generated modules offline."""
-    entries = _selected_entries(SNAPSHOT_PATH.read_bytes())
+    entries = _selected_entries(_LITELLM_FILE.validate_json(SNAPSHOT_PATH.read_bytes()))
     metadata = _ProviderMetadata.model_validate_json(METADATA_PATH.read_bytes())
     assert _snapshot_json(entries) == SNAPSHOT_PATH.read_text()
     assert _openai_module(entries, metadata) == OPENAI_OUTPUT_PATH.read_text()
     assert _anthropic_module(entries, metadata) == ANTHROPIC_OUTPUT_PATH.read_text()
+
+
+def test_untracked_model_keys_report_only_new_direct_api_text_models() -> None:
+    """Detection skips generated, aliased, ignored, non-text, and non-direct-API entries."""
+    raw_entries = _LITELLM_FILE.validate_python({
+        "gpt-6-sol": {"litellm_provider": "openai", "mode": "responses"},
+        "claude-opus-5-5": {"litellm_provider": "anthropic", "mode": "chat"},
+        "gpt-5.6-sol": {"litellm_provider": "openai", "mode": "chat"},
+        "gpt-5.6": {"litellm_provider": "openai", "mode": "chat"},
+        "gpt-4o": {"litellm_provider": "openai", "mode": "chat"},
+        "gpt-6-image": {"litellm_provider": "openai", "mode": "image_generation"},
+        "azure/gpt-6-sol": {"litellm_provider": "azure", "mode": "chat"},
+        "sample_spec": {"litellm_provider": "one of https://docs.litellm.ai/docs/providers"},
+    })
+    assert _untracked_model_keys(raw_entries, frozenset({"gpt-4o"})) == [
+        "claude-opus-5-5",
+        "gpt-6-sol",
+    ]
 
 
 def test_litellm_rates_accept_zero() -> None:

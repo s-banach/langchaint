@@ -10,7 +10,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
     Adapter,
@@ -19,12 +19,14 @@ from langchaint.adapter import (
     BoundAdapter,
     ErrorClassification,
     InvalidRequest,
+    NoOutput,
     RequestParams,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.billing.usage import ZERO_USAGE
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import (
+    AssistantMessage,
     Message,
     UserMessage,
     messages_from_json,
@@ -47,6 +49,28 @@ _PLAIN_TEXT_BINDING = Binding(
     automatic_cache_breakpoints=True,
 )
 """The binding every invariant here binds under: text output and nothing else stated."""
+
+
+class _WeatherReport(BaseModel):
+    """The response_format of the structured-output invariants, standing in for a caller's model."""
+
+    city: str
+    celsius: int
+
+
+class _WeatherReportAlsoNoOutput(_WeatherReport, NoOutput):
+    """A caller's response_format that also inherits NoOutput, the base of every no-output outcome."""
+
+    assistant_message: AssistantMessage = AssistantMessage(turn=())
+
+
+def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
+    """Return pydantic's error JSON, without documentation URLs, for text that response_format rejects."""
+    try:
+        _ = response_format.model_validate_json(text)
+    except ValidationError as validation_error:
+        return validation_error.json(include_url=False)
+    raise AssertionError(f"{response_format.__name__} accepted {text!r}")
 
 
 def _costs_agree(actual: float, expected: float) -> bool:
@@ -109,6 +133,15 @@ class AdapterConformance(ABC):
         """Return an SDK response whose counters cannot be partitioned, leaving one negative.
 
         Use a negative count or a cache count above its input total.
+        """
+        ...
+
+    @abstractmethod
+    def response_with_text(self, text: str) -> BaseModel:
+        """Return an SDK response for a finished turn whose only answer text is text.
+
+        Args:
+            text: The answer text, which the structured-output invariants validate.
         """
         ...
 
@@ -294,6 +327,32 @@ class AdapterConformance(ABC):
         assert self._assistant_wire_parts_of(
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
+
+    def test_structured_output_may_inherit_no_output(self) -> None:
+        """A validated instance is output in an AdapterResult even when its class inherits NoOutput.
+
+        The outcome kind, not the output's class, separates output from a no-output outcome.
+        """
+        bound_adapter = self.make_adapter().bind_structured(
+            _PLAIN_TEXT_BINDING, _WeatherReportAlsoNoOutput
+        )
+        outcome = bound_adapter.interpret(
+            self.response_with_text('{"city": "Nairobi", "celsius": 25}')
+        )
+        assert outcome.kind == "adapter_result"
+        assert outcome.output == _WeatherReportAlsoNoOutput(city="Nairobi", celsius=25)
+
+    def test_text_the_response_format_rejects_is_a_schema_violation(self) -> None:
+        """A finished turn whose text fails response_format validation is SchemaViolation.
+
+        validation_error_json is pydantic's error JSON without documentation URLs.
+        It keeps each rejected field and value for the caller.
+        """
+        text = '{"city": "Nairobi", "celsius": "SENTINEL"}'
+        bound_adapter = self.make_adapter().bind_structured(_PLAIN_TEXT_BINDING, _WeatherReport)
+        outcome = bound_adapter.interpret(self.response_with_text(text))
+        assert outcome.kind == "schema_violation"
+        assert outcome.validation_error_json == _validation_error_json(_WeatherReport, text)
 
     def test_every_sdk_exception_classifies_and_an_unknown_one_still_does(self) -> None:
         """Every listed exception takes its stated classification, and an unlisted one still gets one.

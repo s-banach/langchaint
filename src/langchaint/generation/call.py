@@ -207,7 +207,10 @@ class _StagedResponse(NamedTuple):
 
 
 class _CallLedger:
-    """Accumulate live attempt state and freeze provider-neutral records."""
+    """Accumulate live attempt state and freeze provider-neutral records.
+
+    Building a ledger starts the call.
+    """
 
     def __init__(self, *, model: str, provider_name: str) -> None:
         self._model = model
@@ -233,10 +236,6 @@ class _CallLedger:
         self._staged_response = _StagedResponse(
             raw=raw, provider_billing=billing, identity=identity
         )
-
-    def start_call(self) -> None:
-        """Set the call origin immediately before generation starts."""
-        self._started_at_monotonic_seconds = time.monotonic()
 
     def start_attempt(self) -> None:
         """Start one request attempt."""

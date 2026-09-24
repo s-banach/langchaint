@@ -39,6 +39,7 @@ from langchaint import ZERO_USAGE, DispatchExceptionGroup, ToolCall, tool
 from langchaint.tracing import TracedLLM
 from tests.full_app_support.scenarios import build_scripts
 from tests.full_app_support.scripted_adapter import Turn, build_llm, call
+from tests.helpers import run_with_timeout
 
 
 def _discard(event: Event) -> None:
@@ -145,7 +146,7 @@ def test_one_on_event_receives_the_whole_tree() -> None:
     """One on_event receives every run's events."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
-    asyncio.run(app.run())
+    run_with_timeout(app.run())
     assert {event.agent_path for event in events} == {
         "root/research_climate",
         "root/research_climate/specialist#0",
@@ -164,7 +165,7 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
     """ToolProgress carries the dispatching run's agent_path."""
     events: list[Event] = []
     app = _build_app("happy", on_event=events.append)
-    asyncio.run(app.run())
+    run_with_timeout(app.run())
     progress_paths = [event.agent_path for event in events if isinstance(event, ToolProgress)]
     assert "root/research_climate/specialist#0" in progress_paths
     assert "root/research_energy" in progress_paths
@@ -178,7 +179,7 @@ def test_application_span_groups_generation_and_tool_spans() -> None:
     tracer = tracer_provider.get_tracer("full_app.test")
     app = _build_app("happy", exporter=exporter)
     with tracer.start_as_current_span("application"):
-        asyncio.run(app.run())
+        run_with_timeout(app.run())
 
     spans = exporter.get_finished_spans()
     application_span = _named(spans, "application")
@@ -200,7 +201,7 @@ def test_application_span_groups_generation_and_tool_spans() -> None:
 def test_a_call_that_runs_out_of_time_is_recorded_and_the_run_answers_anyway() -> None:
     """A timed-out call is recorded before the next turn."""
     app = _build_app("call_timeout")
-    asyncio.run(app.run())
+    run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
     assert _timed_out_count(app) == 1
     assert "root/research_climate" in app.answers
@@ -219,7 +220,7 @@ def test_the_app_deadline_leaves_every_settled_turn_readable_in_the_except() -> 
         except TimeoutError:
             at_except.append((_timed_out_count(app), _total_cost(app)))
 
-    asyncio.run(drive())
+    run_with_timeout(drive())
     # Climate spends $0.014, and energy spends $0.012.
     assert at_except == [(0, pytest.approx(0.026))]
 
@@ -245,7 +246,7 @@ def test_agent_config_rejects_a_nan_cost_limit() -> None:
 def test_tool_call_budget_uses_call_positions() -> None:
     """max_tool_calls dispatches the first position and declines the second."""
     app = _build_app("happy", climate_max_tool_calls=1)
-    asyncio.run(app.run())
+    run_with_timeout(app.run())
     climate = app.runs["root/research_climate"]
     assert isinstance(climate, ReActAgent)
     first_turn_tools = [
@@ -310,7 +311,7 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
         with pytest.raises(DispatchExceptionGroup):
             await delegate_tool.validate_and_run('{"question": "q"}')
 
-    asyncio.run(invoke())
+    run_with_timeout(invoke())
 
 
 def test_settle_node_propagates_a_tool_function_defect() -> None:
@@ -344,7 +345,7 @@ def test_settle_node_propagates_a_tool_function_defect() -> None:
         on_event=_discard,
     )
     with pytest.raises(DispatchExceptionGroup):
-        asyncio.run(app._settle_node(run))
+        run_with_timeout(app._settle_node(run))
 
 
 def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
@@ -363,7 +364,7 @@ def test_a_run_cancelled_from_outside_emits_agent_cancelled() -> None:
         except TimeoutError:
             pass
 
-    asyncio.run(drive())
+    run_with_timeout(drive())
     climate = events_by_path["root/research_climate"]
     assert climate, "the cancelled run emitted events before the deadline"
     assert isinstance(climate[-1], AgentCancelled)
@@ -383,14 +384,14 @@ def test_agent_cancelled_callback_failure_preserves_cancellation() -> None:
     )
 
     with pytest.raises(TimeoutError):
-        asyncio.run(_expire_after_second_calls_start(app, second_calls_started))
+        run_with_timeout(_expire_after_second_calls_start(app, second_calls_started))
 
 
 def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers() -> None:
     """A failed sub-agent returns an error ToolMessage and preserves its spend."""
     events: list[Event] = []
     app = _build_app("subagent_error", on_event=events.append)
-    asyncio.run(app.run())
+    run_with_timeout(app.run())
     specialist_terminals = [
         type(event)
         for event in events
@@ -430,7 +431,7 @@ def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
         await delegate_tool.validate_and_run('{"question": "q1"}')
         await delegate_tool.validate_and_run('{"question": "q2"}')
 
-    asyncio.run(spawn_twice())
+    run_with_timeout(spawn_twice())
     assert set(registry) == {"root/parent/specialist#0", "root/parent/specialist#1"}
 
 

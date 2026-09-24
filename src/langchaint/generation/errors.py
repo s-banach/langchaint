@@ -12,6 +12,7 @@ from langchaint.generation.call import (
     CutOffAttemptRecord,
     SettledAttemptRecord,
     TransientErrorRecord,
+    _CallLedger,
     _CallResultRecordBase,
     _require_completed_model_turn,
     _settled_attempts,
@@ -19,6 +20,8 @@ from langchaint.generation.call import (
 
 if TYPE_CHECKING:
     from langchaint.adapter import ErrorClassification, RequestParams
+    from langchaint.billing.pricing import ProviderBilling
+    from langchaint.failure_step import _Terminal
 
 
 class _GenerationErrorRecordBase(_CallResultRecordBase):
@@ -397,7 +400,7 @@ _GENERATION_ERROR_RECORD_CLASSES = (
 _PROVIDER_ANSWERED_CLASSIFICATIONS = ("auth", "invalid_request", "declared_final")
 """The classifications that show the provider answered the terminal request.
 
-The caller records a settled attempt for that answer before `_terminal_error_record`.
+`_terminal_generation_error` records a settled attempt for that answer.
 `_require_terminal_provider_result` validates that attempt on the records for these classifications.
 """
 
@@ -499,3 +502,26 @@ class GenerationError(Exception):
     def __str__(self) -> str:
         """Return `error_text`."""
         return self.error_text
+
+
+def _terminal_generation_error(
+    step: "_Terminal",
+    *,
+    reason: str,
+    ledger: _CallLedger,
+    billing: "ProviderBilling | None",
+    request: "RequestParams | None",
+    stream_opened: bool,
+) -> GenerationError:
+    """Settle the failed attempt when the provider answered or the stream opened, then build the call's error.
+
+    `billing` is the provider-reported billing of the failed attempt.
+    `stream_opened` is true when the provider stream opened before the failure.
+    """
+    if step.classification in _PROVIDER_ANSWERED_CLASSIFICATIONS or stream_opened:
+        ledger.record(error=None, assistant_message=None, billing=billing)
+    return GenerationError(
+        record=_terminal_error_record(step.classification, reason=reason, call=ledger.freeze()),
+        request=request,
+        provider_attempts=ledger.provider_attempts,
+    )

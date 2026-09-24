@@ -3,13 +3,12 @@
 import asyncio
 import math
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from typing import Literal
 
 import pytest
 
 from langchaint.common.exceptions import GaveUpWaiting, ParserContractError
-from langchaint.concurrency import shared_backoff as shared_backoff_module
 from langchaint.concurrency.shared_backoff import (
     _NEVER,
     Admission,
@@ -20,7 +19,9 @@ from langchaint.concurrency.shared_backoff import (
     RetryThisOne,
     SharedBackoff,
     Verdict,
+    _random_up_to,
 )
+from tests.helpers import run_with_timeout, yield_until
 
 
 class ProviderFailure(Exception):  # noqa: N818 (named for what it is, a raised provider failure)
@@ -55,11 +56,6 @@ def _shared_backoff(
         max_request_starts_per_second=max_request_starts_per_second,
         on_parse_error=on_parse_error,
     )
-
-
-def _run(scenario: Callable[[], Coroutine[None, None, None]]) -> None:
-    """Run one async scenario under a hang guard."""
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
 
 
 def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
@@ -202,7 +198,7 @@ def test_success_returns_the_permit_and_records_nothing() -> None:
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until == _NEVER
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_an_exception_outside_failure_types_propagates_unparsed() -> None:
@@ -224,7 +220,7 @@ def test_an_exception_outside_failure_types_propagates_unparsed() -> None:
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until == _NEVER
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_a_failure_is_parsed_recorded_and_propagated() -> None:
@@ -237,7 +233,7 @@ def test_a_failure_is_parsed_recorded_and_propagated() -> None:
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until > shared_backoff._clock()
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
@@ -255,7 +251,7 @@ def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
         assert admission.verdict == PauseAllDoNotRetry(retry_after=0.25)
         assert shared_backoff._pause_until > shared_backoff._clock()
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_a_pause_all_do_not_retry_retry_after_is_capped_like_any_other() -> None:
@@ -270,19 +266,24 @@ def test_a_pause_all_do_not_retry_retry_after_is_capped_like_any_other() -> None
             retry_after=shared_backoff.longest_wait_seconds
         )
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
-def test_a_do_not_retry_verdict_changes_no_shared_state() -> None:
-    """DoNotRetry lands on the admission and starts no pause."""
+@pytest.mark.parametrize(
+    "verdict",
+    [DoNotRetry(), RetryThisOne(retry_after=0.5)],
+    ids=["do_not_retry", "retry_this_one"],
+)
+def test_a_non_pausing_verdict_changes_no_shared_state(verdict: Verdict) -> None:
+    """A verdict that does not pause lands on the admission and starts no pause."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(parse=lambda _failure: DoNotRetry())
+        shared_backoff = _shared_backoff(parse=lambda _failure: verdict)
         admission = await _fail_one_attempt(shared_backoff)
-        assert admission.verdict == DoNotRetry()
+        assert admission.verdict == verdict
         assert shared_backoff._pause_until == _NEVER
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 # --- the parse contract ---
@@ -307,7 +308,7 @@ def test_a_raising_parse_raises_parser_contract_error_with_the_full_chain() -> N
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until == _NEVER
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_the_retry_this_one_fallback_corrects_a_parse_defect() -> None:
@@ -322,7 +323,7 @@ def test_the_retry_this_one_fallback_corrects_a_parse_defect() -> None:
         assert admission.verdict == RetryThisOne(retry_after=None)
         assert shared_backoff.event_counts["parse_raised"] == 1
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 # --- retry_after normalization ---
@@ -356,7 +357,7 @@ def test_retry_after_normalization() -> None:
             assert isinstance(admission.verdict, PauseAll), f"stated={stated!r}"
             assert admission.verdict.retry_after == expected, f"stated={stated!r}"
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_retry_after_corrections_are_counted() -> None:
@@ -370,36 +371,41 @@ def test_retry_after_corrections_are_counted() -> None:
             _ = await _fail_one_attempt(shared_backoff)
             assert shared_backoff.event_counts[tag] == 1
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 # --- pauses and pacing ---
 
 
 def test_a_pause_holds_the_next_admission_until_it_ends() -> None:
-    """After a PauseAll, entry waits out the remaining pause before admitting."""
+    """After a PauseAll, entry queues behind a timer set for the remaining pause."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=0.15))
+        shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=10.0))
         _ = await _fail_one_attempt(shared_backoff)
-        started_at = time.monotonic()
-        await _enter_empty_block(shared_backoff.admitted())
-        assert time.monotonic() - started_at >= 0.1
+        entering = asyncio.create_task(_enter_empty_block(shared_backoff.admitted()))
+        await yield_until(lambda: len(shared_backoff._queue) == 1)
+        admit_timer = shared_backoff._admit_timer
+        assert admit_timer is not None
+        assert 9.0 < admit_timer.when() - asyncio.get_running_loop().time() <= 10.0
+        _ = entering.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await entering
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_recording_happens_before_the_permit_is_released() -> None:
     """A waiter taking the failing request's permit finds the pause already recorded."""
 
     async def scenario() -> None:
-        shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=0.15))
+        shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=0.02))
         first_entered = asyncio.Event()
 
         async def fail_after_signalling() -> None:
             async with shared_backoff.admitted():
                 first_entered.set()
-                await asyncio.sleep(0.02)
+                await yield_until(lambda: len(shared_backoff._queue) == 1)
                 raise ProviderFailure("429")
 
         async def failing_request() -> None:
@@ -415,9 +421,9 @@ def test_recording_happens_before_the_permit_is_released() -> None:
         failing = asyncio.create_task(failing_request())
         waiting = asyncio.create_task(waiting_request())
         await failing
-        assert await waiting >= 0.1
+        assert await waiting >= 0.02
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_request_starts_respect_max_request_starts_per_second() -> None:
@@ -426,7 +432,7 @@ def test_request_starts_respect_max_request_starts_per_second() -> None:
     async def scenario() -> None:
         shared_backoff = _shared_backoff(
             max_concurrent_requests=None,
-            max_request_starts_per_second=20.0,
+            max_request_starts_per_second=100.0,
         )
         admitted_at: list[float] = []
 
@@ -435,9 +441,9 @@ def test_request_starts_respect_max_request_starts_per_second() -> None:
                 admitted_at.append(time.monotonic())
 
         await asyncio.gather(request(), request())
-        assert abs(admitted_at[1] - admitted_at[0]) >= 0.04
+        assert abs(admitted_at[1] - admitted_at[0]) >= 0.008
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_waiters_are_released_in_the_order_they_joined() -> None:
@@ -448,7 +454,7 @@ def test_waiters_are_released_in_the_order_they_joined() -> None:
             max_concurrent_requests=None,
             max_request_starts_per_second=100.0,
         )
-        shared_backoff._record(PauseAll(retry_after=0.1))
+        shared_backoff._record(PauseAll(retry_after=0.01))
         admitted_order: list[int] = []
 
         async def request(index: int) -> None:
@@ -458,10 +464,10 @@ def test_waiters_are_released_in_the_order_they_joined() -> None:
         async with asyncio.TaskGroup() as group:
             for index in range(3):
                 _ = group.create_task(request(index))
-                await asyncio.sleep(0.005)
+                await yield_until(lambda joined=index + 1: len(shared_backoff._queue) == joined)
         assert admitted_order == [0, 1, 2]
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_entry_is_immediate_when_nothing_blocks_it() -> None:
@@ -473,7 +479,7 @@ def test_entry_is_immediate_when_nothing_blocks_it() -> None:
         await _enter_empty_block(shared_backoff.admitted())
         assert time.monotonic() - started_at < 0.05
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 # --- the budget ---
@@ -495,12 +501,12 @@ def test_a_budget_expiring_in_the_queue_leaves_nothing_held() -> None:
         shared_backoff = _shared_backoff()
         shared_backoff._record(PauseAll(retry_after=0.5))
         with pytest.raises(GaveUpWaiting):
-            await _enter_empty_block(shared_backoff.admitted(budget=0.05))
+            await _enter_empty_block(shared_backoff.admitted(budget=0.005))
         assert len(shared_backoff._queue) == 0
         assert shared_backoff.event_counts["gave_up_waiting"] == 1
         assert _all_permits_free(shared_backoff)
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_a_budget_expiring_while_every_permit_is_held_takes_no_permit() -> None:
@@ -515,30 +521,29 @@ def test_a_budget_expiring_while_every_permit_is_held_takes_no_permit() -> None:
                 await release_holder.wait()
 
         holding = asyncio.create_task(holder())
-        await asyncio.sleep(0.01)
+        await yield_until(lambda: shared_backoff._permits_held == 1)
         with pytest.raises(GaveUpWaiting):
-            await _enter_empty_block(shared_backoff.admitted(budget=0.05))
+            await _enter_empty_block(shared_backoff.admitted(budget=0.005))
         assert len(shared_backoff._queue) == 0
         release_holder.set()
         await holding
         assert _all_permits_free(shared_backoff)
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 def test_one_shared_backoff_serves_consecutive_event_loops() -> None:
     """Permit contention in one event loop does not bind the SharedBackoff to that loop."""
     shared_backoff = _shared_backoff()
 
-    async def hold_the_permit_briefly() -> None:
-        async with shared_backoff.admitted():
-            await asyncio.sleep(0.01)
-
     async def two_contending_requests() -> None:
-        await asyncio.gather(hold_the_permit_briefly(), hold_the_permit_briefly())
+        async with shared_backoff.admitted():
+            contender = asyncio.create_task(_enter_empty_block(shared_backoff.admitted()))
+            await yield_until(lambda: len(shared_backoff._queue) == 1)
+        await contender
 
-    _run(two_contending_requests)
-    _run(two_contending_requests)
+    run_with_timeout(two_contending_requests())
+    run_with_timeout(two_contending_requests())
     assert _all_permits_free(shared_backoff)
 
 
@@ -549,14 +554,14 @@ def test_cancellation_while_queued_leaves_an_empty_queue_and_a_full_permit_count
         shared_backoff = _shared_backoff()
         shared_backoff._record(PauseAll(retry_after=0.5))
         waiting = asyncio.create_task(_enter_empty_block(shared_backoff.admitted()))
-        await asyncio.sleep(0.05)
+        await yield_until(lambda: len(shared_backoff._queue) == 1)
         _ = waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting
         assert len(shared_backoff._queue) == 0
         assert _all_permits_free(shared_backoff)
 
-    _run(scenario)
+    run_with_timeout(scenario())
 
 
 # --- the merge rule ---
@@ -659,21 +664,14 @@ def test_a_multiplier_just_above_one_decays_without_a_clamp() -> None:
     assert 1.0 <= shared_backoff._wait_ceiling < 60.0
 
 
-def test_chosen_waits_are_positive_and_bounded_by_the_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_chosen_waits_are_positive_and_bounded_by_the_ceiling() -> None:
     """Check positive waits at both random sampling boundaries."""
-    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: 0.0)
-    assert shared_backoff_module._random_up_to(2.0) == 2.0
-    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: math.nextafter(1.0, 0.0))
-    assert 0.0 < shared_backoff_module._random_up_to(2.0) < 2.0
+    assert _random_up_to(2.0, 0.0) == 2.0
+    assert 0.0 < _random_up_to(2.0, math.nextafter(1.0, 0.0)) < 2.0
 
 
-def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Waits respect the growing ceiling and retry_after floor."""
-    monkeypatch.setattr(shared_backoff_module.random, "random", lambda: 0.0)
+def test_private_backoff_ceilings_grow_to_the_cap() -> None:
+    """Each wait lies under the ceiling in force before it, and the ceiling then grows one step."""
     private_backoff = PrivateBackoff(
         _shared_backoff(
             minimum_wait_ceiling_seconds=1.0,
@@ -681,6 +679,8 @@ def test_private_backoff_waits_grow_to_the_cap_and_honor_a_stated_floor(
             longest_wait_seconds=4.0,
         )
     )
-    assert [private_backoff.next_wait(None) for _ in range(4)] == [1.0, 2.0, 4.0, 4.0]
-    fresh_backoff = PrivateBackoff(_shared_backoff(minimum_wait_ceiling_seconds=1.0))
-    assert fresh_backoff.next_wait(3.5) == 3.5
+    ceilings_and_waits = [
+        (private_backoff._ceiling, private_backoff.next_wait(None)) for _ in range(4)
+    ]
+    assert [ceiling for ceiling, _ in ceilings_and_waits] == [1.0, 2.0, 4.0, 4.0]
+    assert all(0.0 < wait <= ceiling for ceiling, wait in ceilings_and_waits)

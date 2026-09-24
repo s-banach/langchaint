@@ -7,6 +7,7 @@ import pytest
 
 from langchaint.concurrency.cancellation import to_thread_cancellation_safe
 from langchaint.generation._generate_many_records import _run_resume_io
+from tests.helpers import run_with_timeout
 
 
 def test_run_resume_io_settles_before_cancellation_propagates() -> None:
@@ -30,7 +31,7 @@ def test_run_resume_io_settles_before_cancellation_propagates() -> None:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_thread_work_settles_before_cancellation_propagates() -> None:
@@ -57,7 +58,7 @@ def test_thread_work_settles_before_cancellation_propagates() -> None:
             _ = await task
         assert finished.is_set()
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_thread_failure_propagates() -> None:
@@ -73,4 +74,4 @@ def test_thread_failure_propagates() -> None:
         with pytest.raises(FailureError, match="boom"):
             await to_thread_cancellation_safe(fail)
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())

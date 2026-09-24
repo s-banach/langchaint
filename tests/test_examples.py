@@ -1,6 +1,5 @@
 """Verify the numbered examples' offline behavior."""
 
-import asyncio
 import importlib
 from collections.abc import Sequence
 from typing import Protocol, TypeIs
@@ -12,6 +11,7 @@ from langchaint import (
     ToolCall,
     ToolMessage,
 )
+from tests.helpers import run_with_timeout
 
 
 class _ToolFormsExample(Protocol):
@@ -41,12 +41,12 @@ def test_tool_approval_paths() -> None:
         args_json='{"query":"refunds"}',
     )
 
-    approved_messages = asyncio.run(
+    approved_messages = run_with_timeout(
         example_module.dispatch_with_approval(
             (transfer_call, search_call), frozenset({"transfer_1"})
         )
     )
-    denied_messages = asyncio.run(
+    denied_messages = run_with_timeout(
         example_module.dispatch_with_approval((transfer_call,), frozenset())
     )
 
@@ -71,7 +71,7 @@ def test_tool_defect_records_completed_app_data(capsys: pytest.CaptureFixture[st
     )
 
     with pytest.raises(DispatchExceptionGroup):
-        _ = asyncio.run(
+        _ = run_with_timeout(
             example_module.dispatch_with_approval(
                 (transfer_call, failing_call), frozenset({"transfer_2"})
             )

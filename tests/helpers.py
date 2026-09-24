@@ -1,11 +1,13 @@
 """Helpers shared by more than one test module.
 
 A helper lands here when a second module needs it. One used by a single module stays in that module.
+Fake adapters and streams that a second module needs land in tests/fake_adapter.py by the same rule.
 """
 
+import asyncio
 import importlib
 import pkgutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from types import ModuleType
 
 import httpx2
@@ -141,12 +143,67 @@ def package_modules() -> Iterator[ModuleType]:
         yield importlib.import_module(module_info.name)
 
 
-def random_returns_zero() -> float:
-    """Stand in for random.random, returning zero.
+TEST_TIMEOUT_SECONDS = 5.0
+"""How long `run_with_timeout` lets one awaitable run. The slowest test takes under half a second."""
 
-    Patching random.random with this function makes each wait equal its ceiling.
+
+def run_with_timeout[ResultT](awaitable: Awaitable[ResultT]) -> ResultT:
+    """Run `awaitable` in a new event loop and return its result.
+
+    The timeout makes a deadlocked test fail instead of hanging the suite.
+
+    Raises:
+        TimeoutError: `awaitable` ran longer than `TEST_TIMEOUT_SECONDS`.
     """
-    return 0.0
+
+    async def guarded() -> ResultT:
+        return await asyncio.wait_for(awaitable, timeout=TEST_TIMEOUT_SECONDS)
+
+    return asyncio.run(guarded())
+
+
+async def yield_until(condition: Callable[[], bool]) -> None:
+    """Yield to the event loop until `condition` holds.
+
+    A test calls this to wait for another task to reach a state, such as joining a queue.
+    `asyncio.sleep(0)` lets the other ready tasks run without waiting for time to pass.
+    Call it under `run_with_timeout`, whose timeout ends a wait whose condition never holds.
+    """
+    while not condition():
+        await asyncio.sleep(0)
+
+
+async def time_out_when[ResultT](
+    awaitable: Awaitable[ResultT], condition: Callable[[], bool]
+) -> ResultT:
+    """Await `awaitable` in the current task under a timeout that expires once `condition` holds.
+
+    The expiry cancels `awaitable` at the point it has reached, as a caller's own `asyncio.timeout` would.
+    A test calls this instead of a short timeout, so the cancellation lands without waiting for time to pass.
+
+    Raises:
+        TimeoutError: the timeout expired and `awaitable` let the cancellation through.
+        Exception: whatever `condition` raised, after the timeout cancels `awaitable`.
+    """
+    async with asyncio.timeout(None) as scope:
+
+        async def expire_once_condition_holds() -> None:
+            # A condition that raises also expires the scope, so the test fails at once.
+            # The `finally` below then re-raises the condition's exception.
+            try:
+                await yield_until(condition)
+            except Exception:
+                scope.reschedule(asyncio.get_running_loop().time())
+                raise
+            scope.reschedule(asyncio.get_running_loop().time())
+
+        expiry = asyncio.create_task(expire_once_condition_holds())
+        try:
+            return await awaitable
+        finally:
+            _ = expiry.cancel()
+            if expiry.done() and not expiry.cancelled():
+                expiry.result()
 
 
 def status_error[ErrorT: openai.APIStatusError](

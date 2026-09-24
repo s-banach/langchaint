@@ -19,6 +19,7 @@ from botocore.stub import Stubber
 import langchaint.cohere as cohere_backend
 from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
 from langchaint.common.exceptions import EmbeddingOutputError
+from tests.helpers import run_with_timeout
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -39,7 +40,7 @@ def _run_async_test[**Parameters](
     @wraps(function)
     def wrapped(*args: Parameters.args, **kwargs: Parameters.kwargs) -> None:
         # Separate wrappers per pytest signature duplicate event-loop orchestration.
-        asyncio.run(function(*args, **kwargs))
+        run_with_timeout(function(*args, **kwargs))
 
     return wrapped
 

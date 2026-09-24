@@ -3,11 +3,10 @@
 Tests cover Usage, assistant messages, stop reasons, streams, errors, and requests.
 """
 
-import asyncio
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import Literal, override
+from typing import override
 
 import httpx2
 import openai
@@ -23,10 +22,10 @@ from langchaint import (
     AllowedToolsChoice,
     AssistantMessage,
     AudioPart,
-    ContentPart,
     ImagePart,
     ImageUrlPart,
     JsonValue,
+    Message,
     RawPart,
     ReasoningDelta,
     ReasoningPart,
@@ -45,10 +44,9 @@ from langchaint.adapter import (
     AdapterResult,
     AdapterStream,
     Binding,
-    EmptyTurn,
+    BoundAdapter,
     ErrorClassification,
     InvalidRequest,
-    NoOutput,
     RequestParams,
     ResponseOutcome,
 )
@@ -61,24 +59,25 @@ from langchaint.openai import (
     OpenAIChatCompletionsAdapter,
     OpenAIPricingTable,
     OpenAIRates,
+    OpenAIServiceTier,
 )
 from langchaint.openai.chat_completions_adapter import (
     _assistant_message_from,
     _assistant_message_param,
     _billing_from_chat_completion,
-    _BoundChatCompletions,
-    _BoundChatCompletionsStructured,
-    _BoundChatCompletionsText,
     _ChatCompletionsRequestParams,
     _ChatCompletionsStream,
-    _finished_turn_or_unfinished,
-    _FinishedTurn,
     _wire_messages,
     _wire_tool_choice,
     cache_read_tokens_from_usage_openai,
 )
 from langchaint.tools import ToolSchema
-from tests.helpers import openai_sdk_errors_and_classifications, openai_sdk_errors_and_verdicts
+from tests.helpers import (
+    connection_error,
+    openai_sdk_errors_and_classifications,
+    openai_sdk_errors_and_verdicts,
+    run_with_timeout,
+)
 
 _DEFAULT_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=2.5,
@@ -105,6 +104,9 @@ _TOOL_CALL_WIRE: dict[str, object] = {
 }
 """One function tool call as the API returns it on an assistant message."""
 
+_TOOL_CALL = ToolCall(id="call1", name="lookup", args_json='{"q": 1}')
+"""The ToolCall that _TOOL_CALL_WIRE converts to."""
+
 _CUSTOM_TOOL_CALL_WIRE: dict[str, JsonValue] = {
     "id": "c9",
     "type": "custom",
@@ -125,14 +127,36 @@ def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[
     return outcome
 
 
-def _usage_with_cache() -> CompletionUsage:
-    """Return usage whose prompt_tokens includes both cache counters."""
+def _usage(
+    prompt_tokens_details: Mapping[str, int] | None = None,
+    completion_tokens_details: Mapping[str, int] | None = None,
+) -> CompletionUsage:
+    """Return usage of 1000 prompt tokens and 40 completion tokens with the given details."""
     return CompletionUsage.model_validate({
         "prompt_tokens": 1000,
         "completion_tokens": 40,
         "total_tokens": 1040,
-        "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 100},
-        "completion_tokens_details": {"reasoning_tokens": 0},
+        "prompt_tokens_details": prompt_tokens_details,
+        "completion_tokens_details": completion_tokens_details,
+    })
+
+
+def _usage_with_cache() -> CompletionUsage:
+    """Return usage whose prompt_tokens includes both cache counters."""
+    return _usage(
+        prompt_tokens_details={"cached_tokens": 600, "cache_write_tokens": 100},
+        completion_tokens_details={"reasoning_tokens": 0},
+    )
+
+
+def _deepseek_usage() -> CompletionUsage:
+    """Return usage as DeepSeek reports it: the cache partition in extra fields, no details objects."""
+    return CompletionUsage.model_validate({
+        "prompt_tokens": 1000,
+        "completion_tokens": 40,
+        "total_tokens": 1040,
+        "prompt_cache_hit_tokens": 600,
+        "prompt_cache_miss_tokens": 400,
     })
 
 
@@ -195,35 +219,65 @@ def _lenient_completion(finish_reason: str | None) -> ChatCompletion:
     return completion
 
 
-def _billing(
+def _provider_billing(
     completion: ChatCompletion,
     pricing: OpenAIPricingTable = _PRICING,
-) -> Billing:
+    cache_read_tokens_from_usage: Callable[
+        [CompletionUsage], int
+    ] = cache_read_tokens_from_usage_openai,
+) -> ProviderBilling:
+    """Price one completion, with the openai cache-read reader unless another is given."""
+    return _billing_from_chat_completion(
+        completion, pricing=pricing, cache_read_tokens_from_usage=cache_read_tokens_from_usage
+    )
+
+
+def _billing(completion: ChatCompletion, pricing: OpenAIPricingTable = _PRICING) -> Billing:
     """Price one completion with the openai cache-read reader, the adapter's default."""
     return _provider_billing(completion, pricing).billing
 
 
-def _provider_billing(
-    completion: ChatCompletion,
-    pricing: OpenAIPricingTable = _PRICING,
-) -> ProviderBilling:
-    return _billing_from_chat_completion(
-        completion,
-        pricing=pricing,
-        cache_read_tokens_from_usage=cache_read_tokens_from_usage_openai,
-    )
+@pytest.mark.parametrize(
+    ("usage_raw", "cache_read_tokens_from_usage", "expected_counters"),
+    [
+        (_usage_with_cache(), cache_read_tokens_from_usage_openai, (600, 100, 300, 0)),
+        (
+            _usage(completion_tokens_details={"reasoning_tokens": 8}),
+            cache_read_tokens_from_usage_openai,
+            (0, 0, 1000, 8),
+        ),
+        (_deepseek_usage(), cache_read_tokens_from_usage_openai, (0, 0, 1000, 0)),
+        (_deepseek_usage(), cache_read_tokens_from_usage_deepseek, (600, 0, 400, 0)),
+        (_usage_with_cache(), cache_read_tokens_from_usage_deepseek, (0, 100, 900, 0)),
+    ],
+    ids=[
+        "openai_cache_details",
+        "openai_reasoning_details_only",
+        "openai_reader_without_details_objects",
+        "deepseek_reader_on_deepseek_counters",
+        "deepseek_reader_without_its_extra_field",
+    ],
+)
+def test_billing_partitions_prompt_tokens_by_the_cache_read_reader(
+    usage_raw: CompletionUsage,
+    cache_read_tokens_from_usage: Callable[[CompletionUsage], int],
+    expected_counters: tuple[int, int, int, int],
+) -> None:
+    """The uncached counter is prompt_tokens minus the cache-read and cache-write counters.
 
-
-def test_billing_subtracts_cache_from_prompt_tokens_and_prices() -> None:
-    """The uncached counter is prompt_tokens minus both cache counters, and the priced cost rides on it."""
-    usage = _billing(_completion(usage=_usage_with_cache())).usage
-    assert usage.input_tokens_cache_read == 600
-    assert usage.input_tokens_cache_write == 100
-    assert usage.input_tokens_cache_none == 300
-    assert usage.input_tokens_total == 1000
-    assert usage.cost_in_usd == pytest.approx(
-        (300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6
-    )
+    cache_read_tokens_from_usage prevents treating DeepSeek's cache hits as uncached tokens.
+    An absent details object reads as zero.
+    expected_counters lists the cache-read, cache-write, and uncached input counters, then reasoning.
+    """
+    usage = _provider_billing(
+        _completion(usage=usage_raw), cache_read_tokens_from_usage=cache_read_tokens_from_usage
+    ).billing.usage
+    assert (
+        usage.input_tokens_cache_read,
+        usage.input_tokens_cache_write,
+        usage.input_tokens_cache_none,
+        usage.output_tokens_reasoning,
+    ) == expected_counters
 
 
 def test_billing_carries_the_sdk_usage_object_itself() -> None:
@@ -253,38 +307,6 @@ def test_search_annotations_produce_unknown_provider_executed_tool_cost() -> Non
     assert math.isnan(usage.provider_executed_tool_cost_in_usd)
 
 
-def test_billing_reads_reasoning_tokens() -> None:
-    """output_tokens_reasoning reads completion_tokens_details.reasoning_tokens."""
-    usage = _billing(
-        _completion(
-            usage=CompletionUsage.model_validate({
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30,
-                "completion_tokens_details": {"reasoning_tokens": 8},
-            })
-        )
-    ).usage
-    assert usage.output_tokens_reasoning == 8
-
-
-def test_billing_reads_zero_cache_counters_where_the_details_objects_are_absent() -> None:
-    """Bare required counters partition as all-uncached input and no reasoning output."""
-    usage = _billing(
-        _completion(
-            usage=CompletionUsage.model_validate({
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30,
-            })
-        )
-    ).usage
-    assert usage.input_tokens_cache_read == 0
-    assert usage.input_tokens_cache_write == 0
-    assert usage.input_tokens_cache_none == 10
-    assert usage.output_tokens_reasoning == 0
-
-
 def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
     """A completion missing usage still stores the rates the tier that served it would have spent."""
     billing = _billing(_completion(usage=None))
@@ -295,58 +317,17 @@ def test_billing_without_usage_pins_the_priced_tiers_rates() -> None:
 def test_the_reported_tier_selects_the_table() -> None:
     """Priority rates price a priority response. "auto" and no tier both price at default."""
     pricing = OpenAIPricingTable(default=_DEFAULT_RATES, fast=_PRIORITY_RATES)
-    at_priority = _billing(
-        _completion(usage=_usage_with_cache(), service_tier="priority"), pricing
-    ).usage
-    at_default = _billing(
-        _completion(usage=_usage_with_cache(), service_tier="default"), pricing
-    ).usage
-    reporting_auto = _billing(
-        _completion(usage=_usage_with_cache(), service_tier="auto"), pricing
-    ).usage
-    reporting_none = _billing(_completion(usage=_usage_with_cache()), pricing).usage
-    assert at_priority.cost_in_usd == pytest.approx(2 * at_default.cost_in_usd)
-    assert reporting_auto.cost_in_usd == at_default.cost_in_usd
-    assert reporting_none.cost_in_usd == at_default.cost_in_usd
 
+    def cost_at(service_tier: str | None) -> float:
+        """Price the cached usage as served at service_tier."""
+        completion = _completion(usage=_usage_with_cache(), service_tier=service_tier)
+        return _billing(completion, pricing).usage.cost_in_usd
 
-def _deepseek_usage() -> CompletionUsage:
-    """Return usage as DeepSeek reports it: the cache partition in extra fields, no details objects."""
-    return CompletionUsage.model_validate({
-        "prompt_tokens": 1000,
-        "completion_tokens": 40,
-        "total_tokens": 1040,
-        "prompt_cache_hit_tokens": 600,
-        "prompt_cache_miss_tokens": 400,
-    })
-
-
-def test_the_deepseek_reader_prices_cache_hits_as_cache_reads() -> None:
-    """prompt_cache_hit_tokens becomes the cache-read counter and the miss remainder stays uncached.
-
-    cache_read_tokens_from_usage prevents treating cached tokens as uncached tokens.
-    """
-    billing = _billing_from_chat_completion(
-        _completion(usage=_deepseek_usage()),
-        pricing=_PRICING,
-        cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
-    ).billing
-    assert billing.usage.input_tokens_cache_read == 600
-    assert billing.usage.input_tokens_cache_write == 0
-    assert billing.usage.input_tokens_cache_none == 400
-    assert _billing(_completion(usage=_deepseek_usage())).usage.input_tokens_cache_read == 0
-
-
-def test_the_deepseek_reader_returns_zero_without_the_extra_field() -> None:
-    """The openai usage shape carries no prompt_cache_hit_tokens, so the reader reads zero."""
-    assert cache_read_tokens_from_usage_deepseek(_usage_with_cache()) == 0
-
-
-def _finished(completion: ChatCompletion) -> _FinishedTurn:
-    """Read the completion's first choice as a finished turn, failing the test where none exists."""
-    finished_turn = _finished_turn_or_unfinished(completion)
-    assert isinstance(finished_turn, _FinishedTurn)
-    return finished_turn
+    default_cost = cost_at("default")
+    assert default_cost == pytest.approx((300 * 2.5 + 600 * 1.25 + 100 * 3.125 + 40 * 10.0) / 1e6)
+    assert cost_at("priority") == pytest.approx(2 * default_cost)
+    assert cost_at("auto") == default_cost
+    assert cost_at(None) == default_cost
 
 
 @pytest.mark.parametrize(
@@ -393,7 +374,10 @@ def _finished(completion: ChatCompletion) -> _FinishedTurn:
 def test_stop_reason_mapping(
     build_completion: Callable[[], ChatCompletion], expected: StopReason, expected_output: str
 ) -> None:
-    """Check translated stop reasons alongside the preserved output."""
+    """Check translated stop reasons alongside the preserved output.
+
+    Under the text binding, a refusal's sentences are the output and the stop reason names the refusal.
+    """
     result = _assert_result(_text_bound().interpret(build_completion()))
     assert result.stop_reason == expected
     assert result.output == expected_output
@@ -412,7 +396,7 @@ def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> N
         ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
         TextPart(text="hey"),
         TextPart(text="but no more"),
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
+        _TOOL_CALL,
     )
 
 
@@ -424,34 +408,29 @@ def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (
-        RawPart(raw=_CUSTOM_TOOL_CALL_WIRE),
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-    )
+    assert assistant_message.turn == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
     }
 
 
-def test_a_function_call_becomes_a_raw_part_and_replays_unchanged() -> None:
-    """The function_call field lacks the id ToolCall requires."""
-    message = ChatCompletionMessage.model_validate({
-        "role": "assistant",
-        "function_call": _FUNCTION_CALL_WIRE,
-    })
-    assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),)
-    assert _assistant_message_param(assistant_message) == {
-        "role": "assistant",
-        "function_call": _FUNCTION_CALL_WIRE,
-    }
+@pytest.mark.parametrize(
+    "function_call",
+    [
+        _FUNCTION_CALL_WIRE,
+        {**_FUNCTION_CALL_WIRE, "type": "custom"},
+        {**_FUNCTION_CALL_WIRE, "type": "future"},
+    ],
+    ids=["plain", "extra_type_custom", "extra_type_future"],
+)
+def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
+    function_call: dict[str, object],
+) -> None:
+    """The function_call field lacks the id ToolCall requires.
 
-
-@pytest.mark.parametrize("extra_type", ["custom", "future"])
-def test_a_function_call_keeps_its_field_when_an_extra_type_is_present(extra_type: str) -> None:
-    """The function_call field identifies the replay position independently from its value."""
-    function_call = {**_FUNCTION_CALL_WIRE, "type": extra_type}
+    The function_call field identifies the replay position independently from its value.
+    """
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
         "function_call": function_call,
@@ -461,54 +440,6 @@ def test_a_function_call_keeps_its_field_when_an_extra_type_is_present(extra_typ
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "function_call": function_call,
-    }
-
-
-def test_build_request_rejects_two_deprecated_function_calls() -> None:
-    """One assistant message has one function_call field, so a second value cannot fit."""
-    bound = _adapter().bind_text(_binding())
-    request = bound.build_request([
-        AssistantMessage(
-            turn=(
-                RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
-                RawPart(raw={"function_call": {"name": "second_lookup", "arguments": "{}"}}),
-            )
-        )
-    ])
-    assert isinstance(request, InvalidRequest)
-    assert "more than one function_call" in request.reason
-
-
-def test_assistant_message_carries_the_refusal_text_and_replays_it() -> None:
-    """The refusal becomes a TextPart, so the refused turn replays as the model wrote it.
-
-    The refusal remains in the turn for replay.
-    """
-    assistant_message = _assistant_message_from(
-        ChatCompletionMessage.model_validate({"role": "assistant", "refusal": "I can't help"})
-    )
-    assert assistant_message.turn == (TextPart(text="I can't help"),)
-    assert _assistant_message_param(assistant_message) == {
-        "role": "assistant",
-        "content": "I can't help",
-    }
-
-
-def test_the_turn_replays_as_one_assistant_param_with_reasoning_merged_beside_content() -> None:
-    """Texts join into content. ToolCall values and ReasoningPart.raw keep their fields."""
-    assistant_message = AssistantMessage(
-        turn=(
-            ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
-            TextPart(text="he"),
-            TextPart(text="y"),
-            ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-        )
-    )
-    assert _assistant_message_param(assistant_message) == {
-        "role": "assistant",
-        "reasoning_content": "thought it over",
-        "content": "hey",
-        "tool_calls": [_TOOL_CALL_WIRE],
     }
 
 
@@ -524,31 +455,51 @@ def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
 
 
 def test_wire_messages_converts_each_message_kind() -> None:
-    """User, assistant, and tool messages each map to their message param."""
+    """User, assistant, and tool messages each map to their message param.
+
+    The assistant turn becomes one param whose texts join into content.
+    ToolCall values and ReasoningPart.raw keep their fields.
+    """
     wire = _wire_messages([
         UserMessage(content="q"),
         AssistantMessage(
             turn=(
-                TextPart(text="thinking"),
-                ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-            ),
+                ReasoningPart(
+                    raw={"reasoning_content": "thought it over"}, text="thought it over"
+                ),
+                TextPart(text="he"),
+                TextPart(text="y"),
+                _TOOL_CALL,
+            )
         ),
         ToolMessage(tool_call_id="call1", content="r"),
     ])
     assert wire == [
         {"role": "user", "content": "q"},
-        {"role": "assistant", "content": "thinking", "tool_calls": [_TOOL_CALL_WIRE]},
+        {
+            "role": "assistant",
+            "reasoning_content": "thought it over",
+            "content": "hey",
+            "tool_calls": [_TOOL_CALL_WIRE],
+        },
         {"role": "tool", "tool_call_id": "call1", "content": "r"},
     ]
 
 
-def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
-    """A marked part carries prompt_cache_breakpoint on its wire part. Unmarked siblings carry none."""
+def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
+    """Each content part maps to its wire part, and a marked part carries prompt_cache_breakpoint.
+
+    AudioPart.media_type "audio/wav" and "audio/mpeg" map to input_audio.format "wav" and "mp3".
+    """
+    marked = {"prompt_cache_breakpoint": {"mode": "explicit"}}
     wire = _wire_messages([
         UserMessage(
             content=(
                 TextPart(text="shared context", cache_breakpoint=True),
                 ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
+                ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
+                AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
+                AudioPart(data=b"mp3", media_type="audio/mpeg"),
                 TextPart(text="question"),
             )
         ),
@@ -561,19 +512,23 @@ def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
         {
             "role": "user",
             "content": [
+                {"type": "text", "text": "shared context", **marked},
                 {
-                    "type": "text",
-                    "text": "shared context",
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,cG5n", "detail": "auto"},
+                    **marked,
                 },
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,cG5n",
-                        "detail": "auto",
-                    },
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                    "image_url": {"url": "https://example.com/image.png", "detail": "auto"},
+                    **marked,
                 },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "d2F2", "format": "wav"},
+                    **marked,
+                },
+                {"type": "input_audio", "input_audio": {"data": "bXAz", "format": "mp3"}},
                 {"type": "text", "text": "question"},
             ],
         },
@@ -581,121 +536,130 @@ def test_wire_messages_marks_marked_user_and_tool_parts() -> None:
             "role": "tool",
             "tool_call_id": "c1",
             "content": [
-                {"type": "text", "text": "saw", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "text", "text": "saw", **marked},
                 {"type": "text", "text": "more"},
             ],
         },
     ]
 
 
-def test_wire_messages_maps_image_url_part_and_audio_part_in_user_message() -> None:
-    """UserMessage maps ImageUrlPart and supported AudioPart.media_type values."""
-    wire = _wire_messages([
-        UserMessage(
-            content=(
-                ImageUrlPart(url="https://example.com/image.png", cache_breakpoint=True),
-                AudioPart(data=b"wav", media_type="audio/wav", cache_breakpoint=True),
-                AudioPart(data=b"mp3", media_type="audio/mpeg"),
+@pytest.mark.parametrize(
+    ("messages", "reason_fragments"),
+    [
+        (
+            [
+                AssistantMessage(
+                    turn=(
+                        RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
+                        RawPart(raw={"function_call": {"name": "second", "arguments": "{}"}}),
+                    )
+                )
+            ],
+            ("more than one function_call",),
+        ),
+        (
+            [
+                AssistantMessage(
+                    turn=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
+                )
+            ],
+            ("no Chat Completions wire form",),
+        ),
+        (
+            [UserMessage(content=(AudioPart(data=b"audio", media_type="audio/ogg"),))],
+            ("AudioPart", "UserMessage", "audio/ogg"),
+        ),
+        *[
+            (
+                [ToolMessage(tool_call_id="c1", content=(part,))],
+                ("text-only", type(part).__name__, "ToolMessage"),
             )
-        )
-    ])
-    assert wire == [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://example.com/image.png",
-                        "detail": "auto",
-                    },
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
-                },
-                {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": "d2F2",
-                        "format": "wav",
-                    },
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
-                },
-                {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": "bXAz",
-                        "format": "mp3",
-                    },
-                },
-            ],
-        }
-    ]
-
-
-def test_build_request_rejects_audio_part_media_type_without_input_audio_format() -> None:
-    """AudioPart.media_type without an input_audio.format mapping returns InvalidRequest."""
-    request = (
-        _adapter()
-        .bind_text(_binding())
-        .build_request([UserMessage(content=(AudioPart(data=b"audio", media_type="audio/ogg"),))])
-    )
-    assert isinstance(request, InvalidRequest)
-    assert "AudioPart" in request.reason
-    assert "UserMessage" in request.reason
-    assert "audio/ogg" in request.reason
-
-
-def test_wire_tool_choice_passes_strings_through_and_names_specific_tools() -> None:
-    """The neutral strings pass through unchanged. SpecificToolChoice becomes the function form."""
-    assert _wire_tool_choice("auto") == "auto"
-    assert _wire_tool_choice("required") == "required"
-    assert _wire_tool_choice("none") == "none"
-    assert _wire_tool_choice(SpecificToolChoice(tool_name="x")) == {
-        "type": "function",
-        "function": {"name": "x"},
-    }
-
-
-@pytest.mark.parametrize("mode", ["auto", "required"])
-def test_wire_tool_choice_restricts_function_names_in_order(
-    mode: Literal["auto", "required"],
+            for part in (
+                ImagePart(data=b"png", media_type="image/png"),
+                ImageUrlPart(url="https://example.com/image.png"),
+                AudioPart(data=b"wav", media_type="audio/wav"),
+            )
+        ],
+    ],
+    ids=[
+        "two_function_calls",
+        "raw_part_without_wire_form",
+        "audio_part_media_type_without_input_audio_format",
+        "image_part_in_tool_message",
+        "image_url_part_in_tool_message",
+        "audio_part_in_tool_message",
+    ],
+)
+def test_build_request_reports_unsendable_messages_as_invalid_request(
+    messages: list[Message], reason_fragments: tuple[str, ...]
 ) -> None:
-    """AllowedToolsChoice maps to the Chat Completions allowed_tools form."""
-    assert _wire_tool_choice(AllowedToolsChoice(mode=mode, tool_names=("second", "first"))) == {
-        "type": "allowed_tools",
-        "allowed_tools": {
-            "mode": mode,
-            "tools": [
-                {"type": "function", "function": {"name": "second"}},
-                {"type": "function", "function": {"name": "first"}},
-            ],
-        },
-    }
+    """A message with no Chat Completions wire form returns InvalidRequest before sending.
+
+    One assistant message has one function_call field, and the tool message param's content is text-only.
+    """
+    request = _adapter().bind_text(_binding()).build_request(messages)
+    assert isinstance(request, InvalidRequest)
+    for reason_fragment in reason_fragments:
+        assert reason_fragment in request.reason
 
 
-def _adapter(*, supports_prompt_cache_options: bool = True) -> OpenAIChatCompletionsAdapter:
-    """Build an adapter over a keyless client, valid because no request is sent.
+@pytest.mark.parametrize(
+    ("tool_choice", "expected"),
+    [
+        ("required", "required"),
+        (SpecificToolChoice(tool_name="x"), {"type": "function", "function": {"name": "x"}}),
+        *[
+            (
+                AllowedToolsChoice(mode=mode, tool_names=("second", "first")),
+                {
+                    "type": "allowed_tools",
+                    "allowed_tools": {
+                        "mode": mode,
+                        "tools": [
+                            {"type": "function", "function": {"name": "second"}},
+                            {"type": "function", "function": {"name": "first"}},
+                        ],
+                    },
+                },
+            )
+            for mode in ("auto", "required")
+        ],
+    ],
+    ids=["string", "specific_tool", "allowed_tools_auto", "allowed_tools_required"],
+)
+def test_wire_tool_choice(tool_choice: ToolChoice, expected: object) -> None:
+    """Map the neutral tool choice to the Chat Completions tool_choice form.
+
+    Neutral strings pass through unchanged.
+    SpecificToolChoice becomes the function form.
+    AllowedToolsChoice becomes the allowed_tools form listing function names in order.
+    """
+    assert _wire_tool_choice(tool_choice) == expected
+
+
+def _adapter(
+    *,
+    client: AsyncOpenAI | None = None,
+    supports_prompt_cache_options: bool = True,
+    service_tier: OpenAIServiceTier | None = None,
+) -> OpenAIChatCompletionsAdapter:
+    """Build an adapter over a keyless client unless a test supplies one, valid because no request leaves.
 
     supports_prompt_cache_options=True sends the binding's cache setting.
     """
     return OpenAIChatCompletionsAdapter(
-        client=AsyncOpenAI(api_key="test"),
+        client=AsyncOpenAI(api_key="test") if client is None else client,
         model="m",
         pricing=_PRICING,
         provider_name="openai",
         supports_prompt_cache_options=supports_prompt_cache_options,
+        service_tier=service_tier,
     )
 
 
 def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
     """Fingerprint data includes constructor request settings and excludes billing settings."""
-    adapter = OpenAIChatCompletionsAdapter(
-        client=AsyncOpenAI(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="openai",
-        supports_prompt_cache_options=False,
-        service_tier="priority",
-    )
+    adapter = _adapter(supports_prompt_cache_options=False, service_tier="priority")
     assert adapter.config_fingerprint_data() == {
         "service_tier": "priority",
         "supports_prompt_cache_options": False,
@@ -766,58 +730,6 @@ def test_request_system_parts_become_one_system_message_of_marked_parts() -> Non
     ]
 
 
-def test_build_request_places_the_prefix_ahead_of_the_converted_messages() -> None:
-    """Every request's messages are the binding's prefix followed by this call's Sequence[Message]."""
-    bound = _adapter().bind_text(_binding(system_prompt="sys"))
-    request = bound.build_request([UserMessage(content="q")])
-    assert isinstance(request, _ChatCompletionsRequestParams)
-    assert request.messages == [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "q"},
-    ]
-
-
-@pytest.mark.parametrize(
-    "part",
-    [
-        ImagePart(data=b"png", media_type="image/png"),
-        ImageUrlPart(url="https://example.com/image.png"),
-        AudioPart(data=b"wav", media_type="audio/wav"),
-    ],
-)
-def test_build_request_reports_image_part_image_url_part_and_audio_part_in_tool_message(
-    part: ContentPart,
-) -> None:
-    """ImagePart, ImageUrlPart, and AudioPart return InvalidRequest before sending."""
-    bound = _adapter().bind_text(_binding())
-    request = bound.build_request([
-        ToolMessage(
-            tool_call_id="c1",
-            content=(TextPart(text="saw"), part),
-        )
-    ])
-    assert isinstance(request, InvalidRequest)
-    assert "text-only" in request.reason
-    assert type(part).__name__ in request.reason
-    assert "ToolMessage" in request.reason
-
-
-def test_build_request_reports_a_raw_part_in_a_turn_as_invalid_request() -> None:
-    """Unsupported RawPart.raw produces InvalidRequest before sending."""
-    bound = _adapter().bind_text(_binding())
-    request = bound.build_request([
-        UserMessage(content="q"),
-        AssistantMessage(
-            turn=(
-                RawPart(raw={"type": "server_tool_use", "name": "web_search"}),
-                TextPart(text="searching"),
-            )
-        ),
-    ])
-    assert isinstance(request, InvalidRequest)
-    assert "no Chat Completions wire form" in request.reason
-
-
 def test_request_maps_generation_fields_and_omits_the_unset() -> None:
     """Each set parameter lands on its wire field. Unset ones leave the omit sentinel."""
     fields_set = _adapter()._precompute_fields(
@@ -869,21 +781,13 @@ def test_allowed_tools_choice_keeps_complete_chat_completions_tool_definitions()
         ToolSchema(name="first", description="First.", args_schema={"type": "object"}),
         ToolSchema(name="second", description="Second.", args_schema={"type": "object"}),
     )
+    tool_choice = AllowedToolsChoice(mode="required", tool_names=("second",))
     precomputed = _adapter()._precompute_fields(
-        _binding(
-            tool_schemas=schemas,
-            tool_choice=AllowedToolsChoice(mode="required", tool_names=("second",)),
-        )
+        _binding(tool_schemas=schemas, tool_choice=tool_choice)
     )
     assert not isinstance(precomputed.tools, openai.Omit)
     assert [tool["function"]["name"] for tool in precomputed.tools] == ["first", "second"]
-    assert precomputed.tool_choice == {
-        "type": "allowed_tools",
-        "allowed_tools": {
-            "mode": "required",
-            "tools": [{"type": "function", "function": {"name": "second"}}],
-        },
-    }
+    assert precomputed.tool_choice == _wire_tool_choice(tool_choice)
 
 
 @pytest.mark.parametrize(
@@ -930,15 +834,8 @@ def test_disabling_automatic_cache_breakpoints_without_parameter_support_raises(
 def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
     """A stated service_tier lands on the request. None leaves the omit sentinel."""
     assert isinstance(_adapter()._precompute_fields(_binding()).service_tier, openai.Omit)
-    stated = OpenAIChatCompletionsAdapter(
-        client=AsyncOpenAI(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="openai",
-        supports_prompt_cache_options=True,
-        service_tier="flex",
-    )
-    assert stated._precompute_fields(_binding()).service_tier == "flex"
+    stated = _adapter(service_tier="flex")._precompute_fields(_binding())
+    assert stated.service_tier == "flex"
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
@@ -957,12 +854,9 @@ def test_adapter_pins_sdk_retries_off() -> None:
     assert _adapter().client.max_retries == 0
 
 
-def _text_bound() -> _BoundChatCompletionsText:
-    """Build a text-bound adapter over a keyless client. No request is sent."""
-    adapter = _adapter()
-    return _BoundChatCompletionsText(
-        adapter=adapter, precomputed_fields=adapter._precompute_fields(_binding())
-    )
+def _text_bound() -> BoundAdapter[str]:
+    """Bind a keyless adapter for text. No request is sent."""
+    return _adapter().bind_text(_binding())
 
 
 class _StructuredReport(BaseModel):
@@ -972,14 +866,9 @@ class _StructuredReport(BaseModel):
     celsius: int
 
 
-def _structured_bound() -> _BoundChatCompletionsStructured[_StructuredReport]:
-    """Build a structured-bound adapter over a keyless client. No request is sent."""
-    adapter = _adapter()
-    return _BoundChatCompletionsStructured(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding()),
-        response_format=_StructuredReport,
-    )
+def _structured_bound() -> BoundAdapter[_StructuredReport | None]:
+    """Bind a keyless adapter for _StructuredReport. No request is sent."""
+    return _adapter().bind_structured(_binding(), _StructuredReport)
 
 
 _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
@@ -1000,154 +889,65 @@ def _structured_completion(
     return _completion(usage=None, message=message, finish_reason=finish_reason)
 
 
-def _structured_parse(completion: ChatCompletion) -> ResponseOutcome[_StructuredReport | None]:
-    """Run the structured binding's parse over one completion's finished turn."""
-    return _structured_bound()._parsed_outcome(_finished(completion))
-
-
-def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
-    """The structured bound adapter validates the message's content into the response_format."""
-    interpreted = _assert_result(
-        _structured_bound().interpret(_structured_completion(_REPORT_JSON))
-    )
-    assert interpreted.output == _StructuredReport(city="Nairobi", celsius=25)
-
-
-def test_structured_output_may_inherit_no_output() -> None:
-    """AdapterResult distinguishes successful output from NoOutput."""
-
-    class ReportAlsoNoOutput(BaseModel, NoOutput):
-        assistant_message: AssistantMessage = AssistantMessage(turn=())
-        city: str
-        celsius: int
-
-    adapter = _adapter()
-    bound = _BoundChatCompletionsStructured(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(
-            _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
-        ),
-        response_format=ReportAlsoNoOutput,
-    )
-    outcome = bound.interpret(_structured_completion(_REPORT_JSON))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
-
-
-def test_structured_bind_reports_empty_turn_when_the_turn_carried_no_text() -> None:
-    """A stop-finished completion with no content and no tool call is EmptyTurn."""
-    assert isinstance(_structured_parse(_structured_completion(None)), EmptyTurn)
-
-
-def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
-    """A finished turn whose text the response_format rejects is SchemaViolation.
-
-    validation_error_json preserves the field, constraint, and rejected value.
-    """
-    outcome = _structured_parse(
-        _structured_completion('{"city": "Nairobi", "celsius": "SENTINEL"}')
-    )
-    assert outcome.kind == "schema_violation"
-    rejections = json.loads(outcome.validation_error_json)
-    assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
-    assert rejections[0]["input"] == "SENTINEL"
-
-
-def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
-    """A length-finished turn whose JSON stopped mid-object is the truncation, not a schema violation."""
-    outcome = _structured_parse(_structured_completion('{"city": "Nair', finish_reason="length"))
-    assert outcome.kind == "max_completion_tokens_exceeded"
-
-
-def test_structured_bind_reports_the_truncation_on_a_tool_call_cut_by_the_token_cap() -> None:
-    """A length-finished turn carrying tool calls is the truncation, never a dispatchable turn.
-
-    Incomplete tool arguments return UnfinishedTurn.
-    """
-    outcome = _structured_parse(
-        _structured_completion(None, finish_reason="length", tool_call=True)
-    )
-    assert outcome.kind == "max_completion_tokens_exceeded"
-
-
-def test_structured_bind_reports_refusal_on_a_refusal_beside_a_tool_call() -> None:
-    """A refusal arriving with a tool call is the model declining, not a dispatchable turn."""
-    outcome = _structured_parse(
-        _structured_completion(None, refusal="I can't help", tool_call=True)
-    )
-    assert outcome.kind == "refusal"
-
-
-def test_structured_bind_reports_empty_turn_and_preserves_a_custom_tool_call() -> None:
-    """EmptyTurn.assistant_message preserves a custom tool call langchaint cannot dispatch."""
-    completion = _completion(
-        usage=None,
-        message={"tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
-        finish_reason="tool_calls",
-    )
-    outcome = _structured_parse(completion)
-    assert outcome.kind == "empty_turn"
-    assert outcome.assistant_message.turn == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE),)
-
-
-def test_structured_bind_reports_a_tool_call_turn_as_none() -> None:
-    """A tool-call turn parses no instance and nothing went wrong, its prose text included."""
-    assert (
-        _assert_result(_structured_parse(_structured_completion(None, tool_call=True))).output
-        is None
-    )
-    prose_outcome = _structured_parse(
-        _structured_completion("let me look that up", tool_call=True)
-    )
-    assert _assert_result(prose_outcome).output is None
-
-
 def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
-    """Check parsed output and the extracted tool call on the same turn."""
+    """The message's content validates into the response_format beside the extracted tool call."""
     outcome = _assert_result(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
     )
     assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
-    assert outcome.assistant_message.tool_calls == (
-        ToolCall(id="call1", name="lookup", args_json='{"q": 1}'),
-    )
+    assert outcome.assistant_message.tool_calls == (_TOOL_CALL,)
 
 
-def test_structured_bind_reports_refusal_and_never_validates_the_refusal_text() -> None:
-    """A refusal is the model declining, so its sentences are never a candidate instance."""
-    outcome = _structured_parse(_structured_completion(None, refusal=_REPORT_JSON))
-    assert outcome.kind == "refusal"
-    assert outcome.assistant_message.turn == (TextPart(text=_REPORT_JSON),)
-
-
-def test_structured_bind_reports_refusal_on_a_content_filter_finish() -> None:
-    """A content_filter finish with no text is Refusal, not EmptyTurn."""
-    outcome = _structured_parse(_structured_completion(None, finish_reason="content_filter"))
-    assert outcome.kind == "refusal"
-
-
-def test_structured_request_replaces_the_omitted_response_format(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("completion", "expected_kind"),
+    [
+        (_structured_completion(None), "empty_turn"),
+        (
+            _completion(
+                usage=None,
+                message={"tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
+                finish_reason="tool_calls",
+            ),
+            "empty_turn",
+        ),
+        (
+            _structured_completion('{"city": "Nair', finish_reason="length"),
+            "max_completion_tokens_exceeded",
+        ),
+        (
+            _structured_completion(None, finish_reason="length", tool_call=True),
+            "max_completion_tokens_exceeded",
+        ),
+        (_structured_completion(None, refusal="I can't help", tool_call=True), "refusal"),
+        (_structured_completion(None, refusal=_REPORT_JSON), "refusal"),
+        (_structured_completion(None, finish_reason="content_filter"), "refusal"),
+        (_structured_completion(None, tool_call=True), "adapter_result"),
+        (_structured_completion("let me look that up", tool_call=True), "adapter_result"),
+    ],
+    ids=[
+        "no_text",
+        "custom_tool_call_only",
+        "length_cut_mid_json",
+        "length_cut_a_tool_call",
+        "refusal_beside_a_tool_call",
+        "refusal_text_that_would_validate",
+        "content_filter",
+        "tool_call",
+        "tool_call_beside_prose",
+    ],
+)
+def test_structured_bind_reports_why_a_turn_produced_no_instance(
+    completion: ChatCompletion, expected_kind: str
 ) -> None:
-    """Check the captured structured schema and text request omission."""
-    response_format = _kwarg_sent(monkeypatch, _structured_bound(), "response_format")
-    assert isinstance(response_format, dict)
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["strict"] is False
-    assert response_format["json_schema"]["schema"]["properties"]["city"]["type"] == "string"
-    assert response_format["json_schema"]["schema"]["properties"]["celsius"]["type"] == "integer"
-    required: list[str] = response_format["json_schema"]["schema"]["required"]
-    assert set(required) == {"city", "celsius"}
-    assert isinstance(_kwarg_sent(monkeypatch, _text_bound(), "response_format"), openai.Omit)
+    """Every outcome carries the converted turn, including tool calls langchaint cannot dispatch.
 
-
-def test_text_bind_reports_the_refusal_sentences_as_the_output() -> None:
-    """The refusal is the turn's text under the text binding, its condition named by the stop reason."""
-    result = _assert_result(
-        _text_bound().interpret(_structured_completion(None, refusal="I can't help"))
-    )
-    assert result.output == "I can't help"
-    assert result.stop_reason == "refusal"
+    A refusal is the model declining, so its sentences never enter validation.
+    A length finish is the truncation, never a dispatchable turn, even with tool calls.
+    A tool-call turn parses no instance and returns an AdapterResult whose output is None.
+    """
+    outcome = _structured_bound().interpret(completion)
+    assert outcome.kind == expected_kind
+    assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
 
 
 def test_a_completion_with_no_choices_is_unfinished_turn() -> None:
@@ -1238,7 +1038,7 @@ def _collected_items(replay: Sequence[ChatCompletionChunk | Exception]) -> list[
     async def scenario() -> list[StreamItem]:
         return [item async for item in _stream(replay).items()]
 
-    return asyncio.run(scenario())
+    return run_with_timeout(scenario())
 
 
 def _text_stream_chunks() -> list[ChatCompletionChunk]:
@@ -1268,7 +1068,7 @@ def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concate
         items = [item async for item in stream.items()]
         return items, await stream.final()
 
-    items, final = asyncio.run(scenario())
+    items, final = run_with_timeout(scenario())
     assert items == [
         ReasoningDelta(text="part a"),
         ReasoningDelta(text=" part b"),
@@ -1353,7 +1153,7 @@ def test_billing_reported_is_none_until_the_usage_chunk_arrives() -> None:
             pass
         return before, stream.billing_reported()
 
-    before, after = asyncio.run(scenario())
+    before, after = run_with_timeout(scenario())
     assert before is None
     assert after is not None
     assert after.billing.usage.input_tokens_total == 1000
@@ -1368,13 +1168,13 @@ def test_final_patches_the_tracked_usage_over_a_trailing_chunks_reset() -> None:
             pass
         return await stream.final()
 
-    assert asyncio.run(scenario()).usage == _usage_with_cache()
+    assert run_with_timeout(scenario()).usage == _usage_with_cache()
 
 
 def test_final_before_items_are_exhausted_raises() -> None:
     """final() without a drained stream has nothing assembled to return."""
     with pytest.raises(StreamProtocolError, match="items"):
-        _ = asyncio.run(_stream(_text_stream_chunks()).final())
+        _ = run_with_timeout(_stream(_text_stream_chunks()).final())
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
@@ -1383,36 +1183,30 @@ def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> No
     assert _stream([]).request_id() is None
 
 
-def _bare_api_error() -> openai.APIError:
-    """Build the bare APIError the SDK raises for a mid-stream SSE error payload."""
-    return openai.APIError(
-        "provider mid-stream error",
-        httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
-        body={"code": "server_error", "type": "insufficient_quota", "message": "boom"},
-    )
-
-
 def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_response() -> None:
     """The rewrap carries the 200 status and the error's code, so parse_openai verdicts it.
 
     server_error is a transient code, so the mid-stream failure retries rather than failing the item.
     """
-    replay = [_chunk(delta={"role": "assistant", "content": "he"}), _bare_api_error()]
+    bare_api_error = openai.APIError(
+        "provider mid-stream error",
+        httpx2.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        body={"code": "server_error", "type": "insufficient_quota", "message": "boom"},
+    )
+    replay = [_chunk(delta={"role": "assistant", "content": "he"}), bare_api_error]
     with pytest.raises(openai.APIStatusError) as raised:
         _ = _collected_items(replay)
     assert raised.value.status_code == 200
     assert raised.value.code == "server_error"
     assert "provider mid-stream error" in raised.value.message
-    assert isinstance(raised.value.__cause__, openai.APIError)
+    assert raised.value.__cause__ is bare_api_error
     assert _adapter().parse(raised.value) == RetryThisOne(retry_after=None)
 
 
 @pytest.mark.parametrize(
     "error",
     [
-        openai.APIConnectionError(
-            request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
-        ),
+        connection_error(),
         openai.APIResponseValidationError(
             response=httpx2.Response(
                 200, request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
@@ -1423,60 +1217,89 @@ def test_a_mid_stream_bare_api_error_rewraps_as_a_status_error_on_the_live_respo
     ids=["connection_error", "response_validation_error"],
 )
 def test_an_api_error_subclass_raised_mid_stream_propagates_untouched(error: Exception) -> None:
-    """Only the bare APIError is the SSE error payload. Every subclass keeps its own meaning."""
+    """Only the bare APIError is the SSE error payload. Every subclass keeps its own meaning.
+
+    APIResponseValidationError carries a 200 response like the rewrapped bare error, and still passes through.
+    """
     with pytest.raises(type(error)) as raised:
         _ = _collected_items([_chunk(delta={"role": "assistant"}), error])
     assert raised.value is error
 
 
-def _kwarg_sent[OutputT](
-    monkeypatch: pytest.MonkeyPatch, bound: _BoundChatCompletions[OutputT], key: str
+def _request_body_sent[OutputT](
+    bind: Callable[[OpenAIChatCompletionsAdapter], BoundAdapter[OutputT]],
 ) -> object:
-    """Open one stream through a fake create, capturing the request kwarg key it was passed."""
-    captured: list[object] = []
+    """Open one stream through an offline transport and return the JSON body the SDK sent."""
+    bodies: list[bytes] = []
 
-    async def fake_create(**request_kwargs: object) -> _FakeSDKStream:
-        captured.append(request_kwargs[key])
-        return _FakeSDKStream([])
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(request.content)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"})
 
-    monkeypatch.setattr(bound._adapter.client.chat.completions, "create", fake_create)
+    client = AsyncOpenAI(
+        api_key="offline",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+    bound = bind(_adapter(client=client))
     request = bound.build_request([UserMessage(content="q")])
     assert not isinstance(request, InvalidRequest)
-    _ = asyncio.run(bound.open_stream(request))
-    (kwarg,) = captured
-    return kwarg
+    _ = run_with_timeout(bound.open_stream(request))
+    (body,) = bodies
+    decoded_body: object = json.loads(body)
+    return decoded_body
 
 
-def test_the_request_sends_extra_body_by_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """open_stream passes the binding's extra_body to the SDK's extra_body parameter."""
-    adapter = _adapter()
+def test_the_text_request_streams_usage_and_sends_extra_body_by_reference() -> None:
+    """stream=True is the request path and stream_options is what produces the trailing usage.
+
+    The request carries the binding's extra_body as it is when sent, and a text binding sends no response_format.
+    """
     extra_body = {"safety_identifier": "user-7"}
-    text_bound = _BoundChatCompletionsText(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(extra_body=extra_body)),
-    )
-    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
+
+    def bind_then_edit_extra_body(adapter: OpenAIChatCompletionsAdapter) -> BoundAdapter[str]:
+        bound = adapter.bind_text(_binding(extra_body=extra_body))
+        extra_body["safety_identifier"] = "user-8"
+        return bound
+
+    assert _request_body_sent(bind_then_edit_extra_body) == {
+        "model": "m",
+        "messages": [{"role": "user", "content": "q"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "safety_identifier": "user-8",
+    }
 
 
-def test_every_request_streams_and_asks_for_the_usage_chunk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """stream=True is the request path and stream_options is what produces the trailing usage."""
-    assert _kwarg_sent(monkeypatch, _text_bound(), "stream") is True
-    assert _kwarg_sent(monkeypatch, _text_bound(), "stream_options") == {"include_usage": True}
+def test_structured_request_sends_the_non_strict_json_schema_response_format() -> None:
+    """The structured binding asks for the caller's model schema and validates the text itself."""
+    assert _request_body_sent(
+        lambda adapter: adapter.bind_structured(_binding(), _StructuredReport)
+    ) == {
+        "model": "m",
+        "messages": [{"role": "user", "content": "q"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "_StructuredReport",
+                "schema": _StructuredReport.model_json_schema(),
+                "strict": False,
+            },
+        },
+    }
 
 
 def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_field() -> None:
-    """as_json holds the binding's precomputed fields and this call's converted messages.
+    """as_json holds the binding's precomputed fields and this call's messages after the prefix.
 
     An unstated temperature is absent from the request.
     """
-    adapter = _adapter()
-    bound = _BoundChatCompletionsText(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(_binding(system_prompt="sys")),
+    request = (
+        _adapter()
+        .bind_text(_binding(system_prompt="sys"))
+        .build_request([UserMessage(content="hi")])
     )
-    request = bound.build_request([UserMessage(content="hi")])
     assert isinstance(request, _ChatCompletionsRequestParams)
     rendered = json.loads(request.as_json())
     assert rendered["messages"] == [
@@ -1524,13 +1347,12 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         Excess cache counters make the derived uncached counter negative.
         """
         return _completion(
-            usage=CompletionUsage.model_validate({
-                "prompt_tokens": 1000,
-                "completion_tokens": 40,
-                "total_tokens": 1040,
-                "prompt_tokens_details": {"cached_tokens": 900, "cache_write_tokens": 200},
-            })
+            usage=_usage(prompt_tokens_details={"cached_tokens": 900, "cache_write_tokens": 200})
         )
+
+    @override
+    def response_with_text(self, text: str) -> BaseModel:
+        return _structured_completion(text)
 
     @override
     def response_with_reasoning(self) -> BaseModel:

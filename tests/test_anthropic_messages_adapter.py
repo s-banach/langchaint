@@ -1,12 +1,10 @@
 """Test Anthropic Messages adapters with constructed SDK objects."""
 
-import asyncio
 import json
-import math
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
-from typing import TypeIs, override
+from typing import NamedTuple, TypeIs, override
 
 import anthropic
 import anthropic.types as at
@@ -24,7 +22,7 @@ from anthropic.lib.streaming import (
 )
 from anthropic.types import ContentBlockParam, MessageParam, ParsedMessage
 from anthropic.types.parsed_message import ParsedTextBlock
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel
 
 from langchaint import (
     LLM,
@@ -53,20 +51,12 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     Binding,
-    ContextWindowExceeded,
-    EmptyTurn,
     ErrorClassification,
     InvalidRequest,
-    MaxCompletionTokensExceeded,
-    NoOutput,
-    NoOutputOutcome,
     ProviderBilling,
-    Refusal,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
-    UnfinishedTurn,
-    _NotSendableError,
 )
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK_PRICING,
@@ -81,14 +71,14 @@ from langchaint.anthropic import (
 from langchaint.anthropic.messages_adapter import (
     _NO_ANTHROPIC_PROVIDER_TOOLS,
     PARSE_FALLTHROUGH_COUNTS,
+    CacheTTL,
     _AnthropicProviderTools,
     _AnthropicRequestParams,
     _AnthropicStream,
     _assistant_content_blocks,
     _assistant_message_from,
-    _BoundAnthropic,
     _BoundAnthropicStructured,
-    _BoundAnthropicText,
+    _extra_body_with_temperature,
     _wire_messages,
     _wire_tool_choice,
     parse_anthropic,
@@ -106,6 +96,7 @@ from langchaint.concurrency.shared_backoff import (
 )
 from langchaint.conformance import AdapterConformance
 from langchaint.tools import ToolSchema
+from tests.helpers import run_with_timeout
 
 
 def _billing_from_sdk_usage(
@@ -146,6 +137,12 @@ _PRIORITY_RATES = AnthropicRates(
 )
 """Twice the standard rates, so a tier-selection test reads as a doubling."""
 
+_MARK = {"type": "ephemeral"}
+"""The cache_control marker every 5-minute breakpoint writes."""
+
+_MARK_1H = {"type": "ephemeral", "ttl": "1h"}
+"""The cache_control marker every 1-hour breakpoint writes."""
+
 
 def _content_blocks(message: MessageParam) -> list[ContentBlockParam]:
     """Return one wire message's content blocks."""
@@ -161,6 +158,11 @@ def _content_blocks(message: MessageParam) -> list[ContentBlockParam]:
 def _is_content_block_param(value: object) -> TypeIs[ContentBlockParam]:
     """Distinguish request TypedDicts from response models."""
     return isinstance(value, dict)
+
+
+def _cache_marks(wire: Sequence[MessageParam]) -> list[list[object]]:
+    """Return each wire block's cache_control marker, None for an unmarked block, grouped by message."""
+    return [[block.get("cache_control") for block in _content_blocks(message)] for message in wire]
 
 
 def _block_list[BlockT](value: list[BlockT] | anthropic.Omit) -> list[BlockT]:
@@ -202,6 +204,78 @@ def _usage_with_cache_split() -> at.Usage:
     )
 
 
+def _adapter(
+    *,
+    client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle | None = None,
+    provider_name: str = "anthropic",
+    pricing: AnthropicPricingTable = _PRICING,
+    cache_ttl: CacheTTL = "5m",
+) -> AnthropicMessagesAdapter:
+    """Build an adapter over a keyless client unless a test supplies one, valid because no request leaves."""
+    return AnthropicMessagesAdapter(
+        client=AsyncAnthropic(api_key="test") if client is None else client,
+        model="m",
+        pricing=pricing,
+        provider_name=provider_name,
+        cache_ttl=cache_ttl,
+    )
+
+
+def _binding(
+    *,
+    system_prompt: str | tuple[TextPart, ...] | None,
+    tool_schemas: tuple[ToolSchema, ...],
+    automatic_cache_breakpoints: bool,
+    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
+    tool_choice: ToolChoice = "required",
+    extra_body: Mapping[str, object] | None = None,
+    temperature: float | None = None,
+) -> Binding:
+    """Assemble a binding with the fields these request tests vary."""
+    return Binding(
+        system_prompt=system_prompt,
+        tool_schemas=tool_schemas,
+        provider_executed_tools=provider_executed_tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=False,
+        max_completion_tokens=None,
+        reasoning_level="high",
+        temperature=temperature,
+        automatic_cache_breakpoints=automatic_cache_breakpoints,
+        extra_body=extra_body,
+    )
+
+
+_UNSET_BINDING = Binding(
+    system_prompt=None,
+    tool_schemas=(),
+    provider_executed_tools=(),
+    tool_choice="auto",
+    parallel_tool_calls=True,
+    max_completion_tokens=None,
+    reasoning_level=None,
+    temperature=None,
+    automatic_cache_breakpoints=False,
+)
+"""A binding that states no optional request field."""
+
+
+def _precomputed_with_provider_tools(*tool_types: str) -> _AnthropicProviderTools:
+    """Validate provider-executed tools of the given types under the default adapter."""
+    return (
+        _adapter()
+        ._precompute_fields(
+            _binding(
+                system_prompt=None,
+                tool_schemas=(),
+                provider_executed_tools=tuple({"type": tool_type} for tool_type in tool_types),
+                automatic_cache_breakpoints=False,
+            )
+        )
+        .provider_tools
+    )
+
+
 def test_billing_partitions_and_prices_complete_usage() -> None:
     """Expose one complete SDK usage object's neutral counters, costs, tier, and applied rates."""
     usage_raw = _usage_with_cache_split()
@@ -232,143 +306,86 @@ def test_an_unpriced_tier_keeps_its_counters_and_its_name() -> None:
     assert billing.usage.output_tokens == 50
 
 
-def test_billing_treats_none_cache_counts_as_zero() -> None:
-    """Absent cache counters normalize to zero, not None."""
-    usage = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING).usage
-    assert usage.input_tokens_cache_read == 0
-    assert usage.input_tokens_cache_write == 0
-    assert usage.input_tokens_cache_none == 7
+class _ToolCostCase(NamedTuple):
+    """One provider-executed tool configuration, the server-tool counters a response reports, and the cost."""
 
-
-def test_web_search_requests_add_the_cataloged_provider_executed_tool_cost() -> None:
-    """Anthropic's raw invocation count prices web search exactly."""
-    raw = at.Usage(
-        input_tokens=7,
-        output_tokens=3,
-        server_tool_use=at.ServerToolUsage(web_search_requests=2, web_fetch_requests=0),
-    )
-    usage = _billing_from_sdk_usage(raw, _PRICING).usage
-    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(0.02)
-    assert usage.cost_in_usd > usage.provider_executed_tool_cost_in_usd
-
-
-def test_anthropic_zero_fee_server_tools_preserve_zero_cost() -> None:
-    """Web fetch, tool search, and exempt code execution add no separate fee."""
-    provider_tools = (
-        _adapter()
-        ._precompute_fields(
-            _binding(
-                system_prompt="system",
-                tool_schemas=(),
-                provider_executed_tools=(
-                    {"type": "web_fetch_20260209"},
-                    {"type": "tool_search_tool_bm25"},
-                    {"type": "code_execution_20260120"},
-                ),
-                automatic_cache_breakpoints=False,
-            )
-        )
-        .provider_tools
-    )
-    server_tool_use = at.ServerToolUsage.model_validate({
-        "web_search_requests": 0,
-        "web_fetch_requests": 2,
-        "tool_search_requests": 3,
-        "code_execution_requests": 4,
-    })
-    usage_raw = at.Usage(
-        input_tokens=1,
-        output_tokens=1,
-        server_tool_use=server_tool_use,
-    )
-    usage = _billing_from_sdk_usage(usage_raw, _PRICING, provider_tools=provider_tools).usage
-    assert usage.provider_executed_tool_cost_in_usd == 0.0
+    provider_executed_tool_types: tuple[str, ...]
+    server_tool_counters: Mapping[str, int]
+    expected_cost_in_usd: float
+    billing_complete: bool = True
 
 
 @pytest.mark.parametrize(
-    "counter_name",
-    ["web_fetch_requests", "tool_search_requests", "code_execution_requests"],
+    "case",
+    [
+        pytest.param(
+            _ToolCostCase((), {"web_search_requests": 2}, 0.02),
+            id="web_search_at_the_cataloged_rate",
+        ),
+        pytest.param(
+            _ToolCostCase(
+                ("web_fetch_20260209", "tool_search_tool_bm25", "code_execution_20260120"),
+                {"web_fetch_requests": 2, "tool_search_requests": 3, "code_execution_requests": 4},
+                0.0,
+            ),
+            id="configured_zero_fee_tools",
+        ),
+        pytest.param(
+            _ToolCostCase((), {"web_fetch_requests": 1}, float("nan")),
+            id="unconfigured_web_fetch",
+        ),
+        pytest.param(
+            _ToolCostCase((), {"tool_search_requests": 1}, float("nan")),
+            id="unconfigured_tool_search",
+        ),
+        pytest.param(
+            _ToolCostCase((), {"code_execution_requests": 1}, float("nan")),
+            id="unconfigured_code_execution",
+        ),
+        pytest.param(
+            _ToolCostCase((), {"future_requests": 0}, 0.0),
+            id="unexpected_counter_at_zero",
+        ),
+        pytest.param(
+            _ToolCostCase((), {"future_requests": 2}, float("nan")),
+            id="unexpected_counter_fired",
+        ),
+        pytest.param(
+            _ToolCostCase(("web_search_20260318",), {}, float("nan"), billing_complete=False),
+            id="truncated_web_search_snapshot",
+        ),
+    ],
 )
-def test_unconfigured_anthropic_server_counter_produces_nan(counter_name: str) -> None:
-    """A nonzero unconfigured server-tool counter is unexpected billing evidence."""
-    server_tool_counters = {
-        "web_search_requests": 0,
-        "web_fetch_requests": 0,
-    }
-    server_tool_counters[counter_name] = 1
-    server_tool_use = at.ServerToolUsage.model_validate(server_tool_counters)
+def test_provider_executed_tool_cost(case: _ToolCostCase) -> None:
+    """Web search prices per invocation, and web fetch, tool search, and exempt code execution add no fee.
+
+    A nonzero counter no configured tool accounts for is an unpriced charge, so the cost is NaN.
+    A partial usage snapshot cannot prove the final web-search count, so the cost is NaN.
+    """
     usage_raw = at.Usage(
         input_tokens=1,
         output_tokens=1,
-        server_tool_use=server_tool_use,
+        server_tool_use=at.ServerToolUsage.model_validate({
+            "web_search_requests": 0,
+            "web_fetch_requests": 0,
+            **case.server_tool_counters,
+        }),
     )
-    cost = _billing_from_sdk_usage(usage_raw, _PRICING).usage.provider_executed_tool_cost_in_usd
-    assert math.isnan(cost)
-
-
-@pytest.mark.parametrize("unexpected_count", [0, 2])
-def test_unexpected_anthropic_server_counter_controls_nan(unexpected_count: int) -> None:
-    """Only a nonzero unexpected request counter proves an unpriced charge."""
-    server_tool_use = at.ServerToolUsage.model_validate({
-        "web_search_requests": 0,
-        "web_fetch_requests": 0,
-        "future_requests": unexpected_count,
-    })
-    usage_raw = at.Usage(
-        input_tokens=1,
-        output_tokens=1,
-        server_tool_use=server_tool_use,
-    )
-    cost = _billing_from_sdk_usage(usage_raw, _PRICING).usage.provider_executed_tool_cost_in_usd
-    if unexpected_count:
-        assert math.isnan(cost)
-    else:
-        assert cost == 0.0
-
-
-def test_truncated_anthropic_web_search_billing_produces_nan() -> None:
-    """A partial usage snapshot cannot prove the final web-search count."""
-    provider_tools = (
-        _adapter()
-        ._precompute_fields(
-            _binding(
-                system_prompt="system",
-                tool_schemas=(),
-                provider_executed_tools=({"type": "web_search_20260318"},),
-                automatic_cache_breakpoints=False,
-            )
-        )
-        .provider_tools
-    )
-    usage_raw = at.Usage(input_tokens=1, output_tokens=1)
     usage = _billing_from_sdk_usage(
         usage_raw,
         _PRICING,
-        provider_tools=provider_tools,
-        billing_complete=False,
+        provider_tools=_precomputed_with_provider_tools(*case.provider_executed_tool_types),
+        billing_complete=case.billing_complete,
     ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(
+        case.expected_cost_in_usd, nan_ok=True
+    )
 
 
 @pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
 def test_configured_anthropic_web_search_rate_must_be_usable(rate: float | None) -> None:
     """A configured search rejects an unusable caller rate before requests."""
-    pricing = AnthropicPricingTable(
-        standard=AnthropicRates(
-            input_cache_none_usd_per_million_tokens=3.0,
-            output_usd_per_million_tokens=15.0,
-            cache_read_usd_per_million_tokens=0.3,
-            cache_write_5m_usd_per_million_tokens=3.75,
-            cache_write_1h_usd_per_million_tokens=6.0,
-        ),
-        web_search_usd_per_invocation=rate,
-    )
-    adapter = AnthropicMessagesAdapter(
-        client=AsyncAnthropic(api_key="test"),
-        model="m",
-        pricing=pricing,
-        provider_name="anthropic",
-    )
+    adapter = _adapter(pricing=replace(_PRICING, web_search_usd_per_invocation=rate))
     with pytest.raises(ValueError, match="finite and nonnegative"):
         _ = adapter._precompute_fields(
             _binding(
@@ -409,22 +426,6 @@ def test_cost_without_cache_creation_prices_all_writes_at_five_minute_rate() -> 
     assert abs(cost - expected) < 1e-12
 
 
-def test_equal_write_rates_store_that_rate_as_the_write_price() -> None:
-    """With both TTLs priced alike the blend is that rate, so blending adds no artifact."""
-    equal_write_rates = AnthropicPricingTable(
-        standard=AnthropicRates(
-            input_cache_none_usd_per_million_tokens=3.0,
-            output_usd_per_million_tokens=15.0,
-            cache_read_usd_per_million_tokens=0.3,
-            cache_write_5m_usd_per_million_tokens=3.75,
-            cache_write_1h_usd_per_million_tokens=3.75,
-        ),
-        web_search_usd_per_invocation=0.01,
-    )
-    billing = _billing_from_sdk_usage(_usage_with_cache_split(), equal_write_rates)
-    assert billing.cache_write_usd_per_million_tokens == pytest.approx(3.75)
-
-
 def test_a_response_that_wrote_no_cache_stores_the_five_minute_write_rate() -> None:
     """With nothing written there is nothing to blend, so the write price is the default TTL's rate."""
     billing = _billing_from_sdk_usage(at.Usage(input_tokens=7, output_tokens=3), _PRICING)
@@ -462,10 +463,9 @@ def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
         )
         request = bound.build_request([UserMessage(content="q")])
         assert isinstance(request, _AnthropicRequestParams)
-        assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == {
-            "type": "ephemeral",
-            "ttl": "1h",
-        }
+        assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == (
+            _MARK_1H
+        )
 
 
 @pytest.mark.parametrize(
@@ -489,23 +489,12 @@ def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
     assert result.output == "partial text"
 
 
-def test_adapter_result_extracts_text_and_tool_use() -> None:
-    """Text blocks concatenate and tool_use blocks become ToolCalls with JSON args."""
-    message = at.Message(
-        id="msg_1",
-        content=[
-            at.TextBlock(type="text", text="hello "),
-            at.TextBlock(type="text", text="world"),
-            at.ToolUseBlock(
-                type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}
-            ),
-        ],
-        model="claude-sonnet-4-5",
-        role="assistant",
-        stop_reason="tool_use",
-        type="message",
-        usage=_usage_with_cache_split(),
-    )
+def test_text_output_concatenates_the_text_blocks() -> None:
+    """The text binding's output joins every text block, and tool_use passes as the stop reason."""
+    message = _message_with_content([
+        at.TextBlock(type="text", text="hello "),
+        at.TextBlock(type="text", text="world"),
+    ])
     result = (
         _adapter()
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
@@ -513,10 +502,6 @@ def test_adapter_result_extracts_text_and_tool_use() -> None:
     )
     assert result.kind == "adapter_result"
     assert result.output == "hello world"
-    assert result.assistant_message.text == "hello world"
-    tool_call = result.assistant_message.tool_calls[0]
-    assert tool_call.name == "get_weather"
-    assert json.loads(tool_call.args_json) == {"city": "Nairobi"}
     assert result.stop_reason == "tool_use"
 
 
@@ -537,121 +522,72 @@ def _message_with_content(
     )
 
 
-def test_reasoning_round_trips_verbatim_in_position() -> None:
-    """A thinking block round-trips verbatim and in its original position.
+def test_assistant_blocks_convert_to_parts_and_back() -> None:
+    """Each SDK block becomes one TurnPart in order, and each TurnPart converts back to its wire block.
 
-    Produce yields one ReasoningPart where the thinking block sat.
-    Consume re-emits the stored dict unchanged, in the same position, with one wire block per modeled block.
+    A server tool block becomes RawPart and replays without the SDK model's unset fields.
     """
-    message = _message_with_content([
-        at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
-        at.TextBlock(type="text", text="hello"),
-        at.ToolUseBlock(type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}),
-    ])
-    assistant_message = _assistant_message_from(message)
-    assert [type(part) for part in assistant_message.turn] == [
-        ReasoningPart,
-        TextPart,
-        ToolCall,
-    ]
-    reasoning_part = assistant_message.turn[0]
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.raw == {
-        "type": "thinking",
-        "thinking": "check first",
-        "signature": "sig-1",
+    thinking_raw = {"type": "thinking", "thinking": "check first", "signature": "sig-1"}
+    server_tool_raw = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "langchaint"},
     }
-    assert reasoning_part.text == "check first"
-    assert assistant_message.text == "hello"
-    assert assistant_message.tool_calls == (
-        ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
-    )
-    blocks = _assistant_content_blocks(assistant_message)
-    assert len(blocks) == len(message.content)
-    assert blocks[0] == reasoning_part.raw
-    assert blocks[1] == {"type": "text", "text": "hello"}
-    assert blocks[2] == {
-        "type": "tool_use",
-        "id": "tu_1",
-        "name": "get_weather",
-        "input": {"city": "Nairobi"},
-    }
-
-
-def test_empty_thinking_text_normalizes_to_none() -> None:
-    """A thinking block whose text is "" yields text None, the single text-free condition.
-
-    ReasoningPart.text uses None for missing reasoning across adapters.
-    """
-    message = _message_with_content([
-        at.ThinkingBlock(type="thinking", thinking="", signature="sig")
-    ])
-    reasoning_part = _assistant_message_from(message).turn[0]
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.text is None
-    assert reasoning_part.raw["thinking"] == ""
-
-
-def test_redacted_thinking_round_trips_routed_by_its_type_key() -> None:
-    """A redacted_thinking block round-trips as its own dump. The type key routes it on the wire.
-
-    ReasoningPart.text is None because the block has no readable text.
-    """
-    message = _message_with_content([
-        at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes")
-    ])
-    assistant_message = _assistant_message_from(message)
-    reasoning_part = assistant_message.turn[0]
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.text is None
-    assert _assistant_content_blocks(assistant_message) == [
-        {"type": "redacted_thinking", "data": "opaque-bytes"}
-    ]
-
-
-def test_a_server_tool_block_becomes_a_raw_part_and_replays_as_itself() -> None:
-    """A server tool block becomes RawPart and returns unchanged.
-
-    The billed raw block remains in the turn for replay.
-    """
     assistant_message = _assistant_message_from(
         _message_with_content([
+            at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
+            at.TextBlock(type="text", text="hello"),
+            at.ToolUseBlock(
+                type="tool_use", id="tu_1", name="get_weather", input={"city": "Nairobi"}
+            ),
             at.ServerToolUseBlock(
                 type="server_tool_use",
                 id="srvtoolu_1",
                 name="web_search",
                 input={"query": "langchaint"},
-            )
+            ),
         ])
     )
-    (raw_part,) = assistant_message.turn
-    assert raw_part.kind == "raw_part"
+    assert assistant_message.turn == (
+        ReasoningPart(raw=thinking_raw, text="check first"),
+        TextPart(text="hello"),
+        ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
+        RawPart(raw=server_tool_raw),
+    )
     assert _assistant_content_blocks(assistant_message) == [
-        {
-            "type": "server_tool_use",
-            "id": "srvtoolu_1",
-            "name": "web_search",
-            "input": {"query": "langchaint"},
-        }
+        thinking_raw,
+        {"type": "text", "text": "hello"},
+        {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Nairobi"}},
+        server_tool_raw,
     ]
 
 
-def test_produced_reasoning_parts_survive_the_message_json_round_trip() -> None:
-    """Produced ReasoningPart values re-validate equal from JSON.
+@pytest.mark.parametrize(
+    ("block", "expected_raw"),
+    [
+        pytest.param(
+            at.ThinkingBlock(type="thinking", thinking="", signature="sig"),
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            id="empty_thinking",
+        ),
+        pytest.param(
+            at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
+            {"type": "redacted_thinking", "data": "opaque-bytes"},
+            id="redacted_thinking",
+        ),
+    ],
+)
+def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
+    block: at.ContentBlock, expected_raw: dict[str, str]
+) -> None:
+    """Empty and redacted thinking have text None, the one text-free value across adapters.
 
-    Persistence serializes Sequence[Message] through TypeAdapter.
-    A changed raw payload causes API rejection.
-    The round trip must restore each ReasoningPart.raw exactly.
+    The dump replays unchanged, and its type key routes it on the wire.
     """
-    message = _message_with_content([
-        at.ThinkingBlock(type="thinking", thinking="check first", signature="sig-1"),
-        at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
-        at.TextBlock(type="text", text="hello"),
-    ])
-    messages_type_adapter: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
-    messages: tuple[Message, ...] = (_assistant_message_from(message),)
-    restored = messages_type_adapter.validate_json(messages_type_adapter.dump_json(messages))
-    assert restored == messages
+    assistant_message = _assistant_message_from(_message_with_content([block]))
+    assert assistant_message.turn == (ReasoningPart(raw=expected_raw, text=None),)
+    assert _assistant_content_blocks(assistant_message) == [expected_raw]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
@@ -665,76 +601,212 @@ def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
 
 
 def test_wire_messages_groups_consecutive_tool_results() -> None:
-    """Consecutive ToolMessages collapse into one user message of tool_result blocks."""
+    """Consecutive ToolMessages collapse into one user message of tool_result blocks.
+
+    The group goes out before the next user or assistant message, so each tool_use is answered next.
+    """
     messages = [
         UserMessage(content="hi"),
         AssistantMessage(
             turn=(
                 TextPart(text="checking"),
                 ToolCall(id="tu_1", name="t", args_json='{"a": 1}'),
+                ToolCall(id="tu_2", name="t", args_json='{"a": 2}'),
             ),
         ),
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
+        UserMessage(content="and then?"),
+        AssistantMessage(turn=(ToolCall(id="tu_3", name="t", args_json='{"a": 3}'),)),
+        ToolMessage(tool_call_id="tu_3", content="r3"),
+        AssistantMessage(turn=(TextPart(text="done"),)),
     ]
     wire = _wire_messages(
         messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
     )
-    assert [message["role"] for message in wire] == ["user", "assistant", "user"]
-    tool_results = _content_blocks(wire[2])
-    assert len(tool_results) == 2
-    assert tool_results[0]["type"] == "tool_result"
-    assert tool_results[1]["type"] == "tool_result"
-    assert tool_results[0].get("is_error") is False
-    assert tool_results[1].get("is_error") is True
-
-
-def test_wire_messages_marks_only_the_last_block_when_caching() -> None:
-    """The per-request breakpoint lands on the last block of the last message."""
-    messages = [
-        ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
-        ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
-    )
-    tool_results = _content_blocks(wire[0])
-    assert tool_results[-1]["type"] == "tool_result"
-    assert tool_results[-1].get("cache_control") == {"type": "ephemeral"}
-    assert "cache_control" not in tool_results[0]
-
-
-def test_wire_messages_writes_no_breakpoint_on_a_thinking_last_block() -> None:
-    """A Sequence[Message] ending on a thinking block writes no breakpoint that request.
-
-    The thinking wire params carry no cache_control key, so the marker has nowhere valid to go.
-    """
-    messages = [
-        AssistantMessage(
-            turn=(
-                TextPart(text="t"),
-                ReasoningPart(raw={"type": "thinking", "thinking": "x", "signature": "s"}),
-            )
+    assert [
+        (
+            message["role"],
+            [(block["type"], block.get("is_error")) for block in _content_blocks(message)],
         )
+        for message in wire
+    ] == [
+        ("user", [("text", None)]),
+        ("assistant", [("text", None), ("tool_use", None), ("tool_use", None)]),
+        ("user", [("tool_result", False), ("tool_result", True)]),
+        ("user", [("text", None)]),
+        ("assistant", [("tool_use", None)]),
+        ("user", [("tool_result", False)]),
+        ("assistant", [("text", None)]),
     ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
-    )
-    assert all("cache_control" not in block for block in _content_blocks(wire[0]))
 
 
-def test_wire_messages_writes_no_automatic_breakpoint_when_disabled() -> None:
-    """False writes no automatic `cache_control` marker."""
-    messages = [
-        UserMessage(content="hi"),
-        ToolMessage(tool_call_id="tu_1", content="r1"),
-    ]
+class _MarkCase(NamedTuple):
+    """One message sequence, the caching parameters it converts under, and the markers each block gets."""
+
+    messages: tuple[Message, ...]
+    message_mark_budget: int
+    expected_marks: list[list[object]]
+    automatic_cache_breakpoints: bool = False
+    cache_ttl: CacheTTL = "5m"
+
+
+def _marked_texts(count: int) -> tuple[TextPart, ...]:
+    """Return text parts that each set cache_breakpoint."""
+    return tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(count))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _MarkCase(
+                (
+                    ToolMessage(tool_call_id="tu_1", content="r1"),
+                    ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
+                ),
+                2,
+                [[None, _MARK]],
+                automatic_cache_breakpoints=True,
+            ),
+            id="automatic_marker_on_the_last_block_only",
+        ),
+        pytest.param(
+            _MarkCase(
+                (
+                    AssistantMessage(
+                        turn=(
+                            TextPart(text="t"),
+                            ReasoningPart(
+                                raw={"type": "thinking", "thinking": "x", "signature": "s"}
+                            ),
+                        )
+                    ),
+                ),
+                2,
+                [[None, None]],
+                automatic_cache_breakpoints=True,
+            ),
+            id="no_automatic_marker_on_a_thinking_last_block",
+        ),
+        pytest.param(
+            _MarkCase(
+                (UserMessage(content="hi"), ToolMessage(tool_call_id="tu_1", content="r1")),
+                4,
+                [[None], [None]],
+            ),
+            id="no_automatic_marker_when_disabled",
+        ),
+        pytest.param(
+            _MarkCase(
+                (
+                    UserMessage(
+                        content=(
+                            TextPart(text="shared context", cache_breakpoint=True),
+                            TextPart(text="question"),
+                        )
+                    ),
+                ),
+                4,
+                [[_MARK, None]],
+            ),
+            id="marked_user_text_part",
+        ),
+        pytest.param(
+            _MarkCase(
+                (
+                    UserMessage(
+                        content=(
+                            ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),
+                        )
+                    ),
+                ),
+                4,
+                [[_MARK]],
+            ),
+            id="marked_user_image_part",
+        ),
+        pytest.param(
+            _MarkCase(
+                (
+                    ToolMessage(
+                        tool_call_id="tu_1",
+                        content=(TextPart(text="a"), TextPart(text="b", cache_breakpoint=True)),
+                    ),
+                ),
+                4,
+                [[_MARK]],
+            ),
+            id="marked_last_tool_part_marks_its_tool_result",
+        ),
+        pytest.param(
+            _MarkCase(
+                (UserMessage(content=_marked_texts(5)),), 4, [[None, _MARK, _MARK, _MARK, _MARK]]
+            ),
+            id="budget_keeps_the_latest_marks",
+        ),
+        pytest.param(
+            _MarkCase(
+                (UserMessage(content=_marked_texts(3)), UserMessage(content="question")),
+                2,
+                [[None, _MARK, _MARK], [_MARK]],
+                automatic_cache_breakpoints=True,
+            ),
+            id="automatic_marker_beside_the_latest_marks",
+        ),
+        pytest.param(
+            _MarkCase(
+                (
+                    UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
+                    ToolMessage(
+                        tool_call_id="tu_1",
+                        content=(TextPart(text="mid", cache_breakpoint=True),),
+                    ),
+                    UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
+                ),
+                2,
+                [[None], [_MARK], [_MARK]],
+            ),
+            id="budget_counts_across_message_kinds",
+        ),
+        pytest.param(
+            _MarkCase(
+                (UserMessage(content=_marked_texts(1)),),
+                2,
+                [[_MARK]],
+                automatic_cache_breakpoints=True,
+            ),
+            id="explicit_and_automatic_marks_coincide",
+        ),
+        pytest.param(
+            _MarkCase((UserMessage(content=_marked_texts(1)),), 0, [[None]]),
+            id="zero_budget_writes_no_marks",
+        ),
+        pytest.param(
+            _MarkCase(
+                (UserMessage(content=_marked_texts(1)), UserMessage(content="question")),
+                2,
+                [[_MARK_1H], [_MARK_1H]],
+                automatic_cache_breakpoints=True,
+                cache_ttl="1h",
+            ),
+            id="one_hour_ttl",
+        ),
+    ],
+)
+def test_wire_messages_places_cache_markers(case: _MarkCase) -> None:
+    """The latest explicit marks within message_mark_budget and the automatic marker carry cache_control.
+
+    A user part marks its own block, and a ToolMessage's marked last part marks its tool_result block.
+    The automatic marker goes on the last block unless that block is thinking, which carries no cache_control.
+    """
     wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
+        case.messages,
+        automatic_cache_breakpoints=case.automatic_cache_breakpoints,
+        cache_ttl=case.cache_ttl,
+        message_mark_budget=case.message_mark_budget,
     )
-    assert all(
-        "cache_control" not in block for message in wire for block in _content_blocks(message)
-    )
+    assert _cache_marks(wire) == case.expected_marks
 
 
 def test_wire_messages_converts_tool_result_parts_to_text_and_image_blocks() -> None:
@@ -786,42 +858,85 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         "type": "image",
         "source": {"type": "url", "url": "https://example.com/image.png"},
     }
-    assert _content_blocks(wire[0]) == [
-        {**expected_unmarked_block, "cache_control": {"type": "ephemeral"}}
-    ]
+    assert _content_blocks(wire[0]) == [{**expected_unmarked_block, "cache_control": _MARK}]
     tool_result = _content_blocks(wire[1])[0]
     assert tool_result["type"] == "tool_result"
     assert tool_result.get("content") == [expected_unmarked_block]
-    assert tool_result.get("cache_control") == {"type": "ephemeral"}
+    assert tool_result.get("cache_control") == _MARK
 
 
 @pytest.mark.parametrize(
-    "message",
+    ("messages", "reason_fragment"),
     [
-        UserMessage(content=(AudioPart(data=b"wav", media_type="audio/wav"),)),
-        ToolMessage(
-            tool_call_id="tu_1",
-            content=(AudioPart(data=b"wav", media_type="audio/wav"),),
+        pytest.param(
+            (UserMessage(content=(AudioPart(data=b"wav", media_type="audio/wav"),)),),
+            "AudioPart inside UserMessage",
+            id="user_audio",
+        ),
+        pytest.param(
+            (
+                ToolMessage(
+                    tool_call_id="tu_1",
+                    content=(AudioPart(data=b"wav", media_type="audio/wav"),),
+                ),
+            ),
+            "AudioPart inside ToolMessage",
+            id="tool_audio",
+        ),
+        pytest.param(
+            (UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),)),),
+            "image/tiff",
+            id="user_image_media_type",
+        ),
+        pytest.param(
+            (
+                ToolMessage(
+                    tool_call_id="tu_1",
+                    content=(ImagePart(data=b"x", media_type="image/tiff"),),
+                ),
+            ),
+            "image/tiff",
+            id="tool_image_media_type",
+        ),
+        pytest.param(
+            (
+                ToolMessage(
+                    tool_call_id="tu_1",
+                    content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
+                ),
+            ),
+            "last part",
+            id="marked_non_last_tool_part",
+        ),
+        pytest.param(
+            (
+                AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
+                ToolMessage(tool_call_id="c1", content="ok"),
+            ),
+            "args_json",
+            id="unparseable_args_json",
+        ),
+        pytest.param(
+            (
+                UserMessage(content="q"),
+                AssistantMessage(turn=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
+            ),
+            "type key",
+            id="stored_payload_naming_no_type",
         ),
     ],
 )
-def test_build_request_reports_audio_part_as_invalid_request(message: Message) -> None:
-    """AnthropicMessagesAdapter returns InvalidRequest for AudioPart."""
-    request = _structured_bound().build_request([message])
+def test_build_request_reports_an_unsendable_sequence_as_invalid_request(
+    messages: tuple[Message, ...], reason_fragment: str
+) -> None:
+    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest variant.
+
+    Nothing is sent: the retry loop takes this answer before its first attempt.
+    A marked non-last ToolMessage part is rejected instead of silently moving the cache boundary.
+    """
+    request = _structured_bound().build_request(messages)
     assert isinstance(request, InvalidRequest)
-    assert "AudioPart" in request.reason
-    assert type(message).__name__ in request.reason
-
-
-def test_wire_messages_rejects_tool_result_image_with_unsupported_media_type() -> None:
-    """A tool_result image media type outside the accepted set is not sendable."""
-    messages = [
-        ToolMessage(tool_call_id="tu_1", content=(ImagePart(data=b"x", media_type="image/tiff"),))
-    ]
-    with pytest.raises(_NotSendableError, match="image/tiff"):
-        _ = _wire_messages(
-            messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-        )
+    assert reason_fragment in request.reason
 
 
 @pytest.mark.parametrize("parallel_tool_calls", [True, False])
@@ -858,16 +973,6 @@ def test_wire_tool_choice_none_forbids_calls_and_carries_no_parallel_flag(
     assert _wire_tool_choice("none", parallel_tool_calls=parallel_tool_calls) == {"type": "none"}
 
 
-def _adapter() -> AnthropicMessagesAdapter:
-    """Build an adapter over a keyless client, valid because no request is sent."""
-    return AnthropicMessagesAdapter(
-        client=AsyncAnthropic(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="anthropic",
-    )
-
-
 def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
     """Fingerprint data includes constructor request settings and excludes billing settings."""
     adapter = AnthropicMessagesAdapter(
@@ -889,38 +994,111 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
     }
 
 
-def _binding(
-    *,
-    system_prompt: str | tuple[TextPart, ...] | None,
-    tool_schemas: tuple[ToolSchema, ...],
-    automatic_cache_breakpoints: bool,
-    provider_executed_tools: tuple[Mapping[str, object], ...] = (),
-    tool_choice: ToolChoice = "required",
-    extra_body: Mapping[str, object] | None = None,
-    temperature: float | None = None,
-) -> Binding:
-    """Assemble a binding with the fields these request tests vary."""
-    return Binding(
-        system_prompt=system_prompt,
-        tool_schemas=tool_schemas,
-        provider_executed_tools=provider_executed_tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=False,
-        max_completion_tokens=None,
-        reasoning_level="high",
-        temperature=temperature,
-        automatic_cache_breakpoints=automatic_cache_breakpoints,
-        extra_body=extra_body,
-    )
+def test_unset_binding_fields_stay_at_the_omit_sentinel() -> None:
+    """An unstated optional field keeps the SDK's omit sentinel, which leaves the provider default."""
+    precomputed_fields = _adapter()._precompute_fields(_UNSET_BINDING)
+    for field_value in (
+        precomputed_fields.system,
+        precomputed_fields.tools,
+        precomputed_fields.tool_choice,
+        precomputed_fields.output_config,
+        precomputed_fields.thinking,
+        precomputed_fields.temperature,
+        precomputed_fields.service_tier,
+        precomputed_fields.inference_geo,
+        precomputed_fields.cache_control,
+    ):
+        assert isinstance(field_value, anthropic.Omit)
 
 
-def test_request_omits_tool_sentinels_without_tools() -> None:
-    """No tools leaves both tools and tool_choice at the omit sentinel."""
+def test_request_passes_reasoning_level_through() -> None:
+    """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
     precomputed_fields = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
+        replace(_UNSET_BINDING, reasoning_level="minimal")
     )
-    assert isinstance(precomputed_fields.tools, anthropic.Omit)
-    assert isinstance(precomputed_fields.tool_choice, anthropic.Omit)
+    assert precomputed_fields.output_config == {"effort": "minimal"}
+    assert precomputed_fields.thinking == {"type": "adaptive"}
+
+
+def test_open_stream_sends_the_built_request() -> None:
+    """The request body holds the adapter's settings, the binding's precomputed fields, and the messages.
+
+    A bound temperature travels in extra_body because the SDK stream takes it there.
+    """
+    sent_bodies: list[object] = []
+
+    def reject_after_recording(request: httpx2.Request) -> httpx2.Response:
+        """Record the request body, then end the call with a 400 so no stream is read."""
+        sent_bodies.append(json.loads(request.content))
+        return httpx2.Response(
+            400, json={"type": "error", "error": {"type": "invalid_request_error"}}
+        )
+
+    adapter = AnthropicMessagesAdapter(
+        client=AsyncAnthropic(
+            api_key="test",
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(reject_after_recording)),
+        ),
+        model="m",
+        pricing=_PRICING,
+        provider_name="anthropic",
+        cache_ttl="1h",
+        service_tier="standard_only",
+        inference_geo="us",
+    )
+    bound = adapter.bind_text(
+        _binding(
+            system_prompt="sys",
+            tool_schemas=(),
+            automatic_cache_breakpoints=True,
+            temperature=0.2,
+        )
+    )
+    request = bound.build_request([UserMessage(content="q")])
+    assert not isinstance(request, InvalidRequest)
+    with pytest.raises(anthropic.BadRequestError):
+        _ = run_with_timeout(bound.open_stream(request))
+    assert sent_bodies == [
+        {
+            "model": "m",
+            "max_tokens": 4096,
+            "system": [{"type": "text", "text": "sys", "cache_control": _MARK_1H}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+            "output_config": {"effort": "high"},
+            "thinking": {"type": "adaptive"},
+            "service_tier": "standard_only",
+            "inference_geo": "us",
+            "cache_control": _MARK_1H,
+            "temperature": 0.2,
+            "stream": True,
+        }
+    ]
+
+
+def test_extra_body_keeps_caller_fields_by_reference_beside_a_temperature() -> None:
+    """Without a temperature the caller's mapping is sent itself, and with one it is read through."""
+    caller_fields: dict[str, object] = {"top_k": 5}
+
+    def extra_body_bound_with(temperature: float | None) -> Mapping[str, object] | None:
+        return _extra_body_with_temperature(
+            _adapter()._precompute_fields(
+                _binding(
+                    system_prompt=None,
+                    tool_schemas=(),
+                    automatic_cache_breakpoints=True,
+                    extra_body=caller_fields,
+                    temperature=temperature,
+                )
+            )
+        )
+
+    assert extra_body_bound_with(None) is caller_fields
+    with_temperature = extra_body_bound_with(0.2)
+    assert with_temperature is not None
+    assert dict(with_temperature) == {"temperature": 0.2, "top_k": 5}
+    caller_fields["top_k"] = 6
+    caller_fields["temperature"] = 0.7
+    assert dict(with_temperature) == {"temperature": 0.2, "top_k": 6}
 
 
 def test_anthropic_rejects_allowed_tools_choice_at_text_bind() -> None:
@@ -954,7 +1132,7 @@ def test_provider_executed_tools_follow_function_tools_and_receive_automatic_cac
     tools = _block_list(precomputed.tools)
     assert tools[0].get("name") == "get_weather"
     assert tools[1].get("type") == "web_search_20250305"
-    assert tools[1].get("cache_control") == {"type": "ephemeral"}
+    assert tools[1].get("cache_control") == _MARK
     assert "cache_control" not in provider_tool
 
 
@@ -1020,55 +1198,35 @@ def test_supported_code_execution_requires_a_qualifying_web_tool(
     code_execution_type: str, web_tool_type: str
 ) -> None:
     """Every reviewed code-execution type is free beside each qualifying web family."""
-    precomputed = _adapter()._precompute_fields(
-        _binding(
-            system_prompt="system",
-            tool_schemas=(),
-            provider_executed_tools=(
-                {"type": web_tool_type},
-                {"type": code_execution_type},
-            ),
-            automatic_cache_breakpoints=False,
-        )
-    )
-    assert precomputed.provider_tools.code_execution_exempt
+    provider_tools = _precomputed_with_provider_tools(web_tool_type, code_execution_type)
+    assert provider_tools.code_execution_exempt
 
 
 @pytest.mark.parametrize(
-    "tool_type",
+    "provider_tool",
     [
-        "advisor_20260301",
-        "bash_20250124",
-        "code_execution_20250522",
-        "code_execution_20250825",
-        "computer_20250124",
-        "custom",
-        "mcp_toolset",
-        "memory_20250818",
-        "text_editor_20250124",
-        "text_editor_20250429",
-        "text_editor_20250728",
-        "unknown",
-    ],
-)
-def test_every_unlisted_anthropic_provider_type_is_rejected(tool_type: str) -> None:
-    """Messages rejects every reviewed client-executed or unaudited `type`."""
-    with pytest.raises(ValueError, match="supported string type"):
-        _ = _adapter()._precompute_fields(
-            _binding(
-                system_prompt="system",
-                tool_schemas=(),
-                provider_executed_tools=({"type": tool_type},),
-                automatic_cache_breakpoints=False,
-            )
+        {"type": tool_type}
+        for tool_type in (
+            "advisor_20260301",
+            "bash_20250124",
+            "code_execution_20250522",
+            "code_execution_20250825",
+            "computer_20250124",
+            "custom",
+            "mcp_toolset",
+            "memory_20250818",
+            "text_editor_20250124",
+            "text_editor_20250429",
+            "text_editor_20250728",
+            "unknown",
         )
-
-
-@pytest.mark.parametrize("provider_tool", [{}, {"type": 1}])
-def test_anthropic_provider_type_must_be_a_supported_string(
+    ]
+    + [{}, {"type": 1}],
+)
+def test_every_unlisted_anthropic_provider_type_is_rejected(
     provider_tool: Mapping[str, object],
 ) -> None:
-    """Missing and non-string `type` values fail before requests."""
+    """Messages rejects every reviewed client-executed or unaudited `type`, and a missing or non-string one."""
     with pytest.raises(ValueError, match="supported string type"):
         _ = _adapter()._precompute_fields(
             _binding(
@@ -1086,23 +1244,13 @@ def test_anthropic_provider_type_must_be_a_supported_string(
 def test_standalone_anthropic_code_execution_is_rejected(code_execution_type: str) -> None:
     """Standalone code execution lacks exact response billing evidence."""
     with pytest.raises(ValueError, match="qualifying web tool"):
-        _ = _adapter()._precompute_fields(
-            _binding(
-                system_prompt="system",
-                tool_schemas=(),
-                provider_executed_tools=({"type": code_execution_type},),
-                automatic_cache_breakpoints=False,
-            )
-        )
+        _ = _precomputed_with_provider_tools(code_execution_type)
 
 
 def test_anthropic_bedrock_rejects_provider_executed_tools() -> None:
     """Anthropic pricing does not establish Bedrock provider-tool billing."""
-    adapter = AnthropicMessagesAdapter(
-        client=AsyncAnthropicBedrock(aws_region="us-east-1"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="aws.bedrock",
+    adapter = _adapter(
+        client=AsyncAnthropicBedrock(aws_region="us-east-1"), provider_name="aws.bedrock"
     )
     with pytest.raises(ValueError, match="provider_name='anthropic'"):
         _ = adapter._precompute_fields(
@@ -1121,7 +1269,7 @@ def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
         {
             "type": "web_search_20250305",
             "name": f"web_search_{index}",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": _MARK,
         }
         for index in range(2)
     )
@@ -1136,101 +1284,29 @@ def test_provider_executed_cache_markers_reduce_the_message_budget() -> None:
     assert precomputed.message_mark_budget == 2
 
 
-def test_request_passes_reasoning_level_through() -> None:
-    """A value outside anthropic's own effort literal ("minimal") reaches the request unchanged."""
-    binding = Binding(
-        system_prompt=None,
-        tool_schemas=(),
-        provider_executed_tools=(),
-        tool_choice="auto",
-        parallel_tool_calls=True,
-        max_completion_tokens=None,
-        reasoning_level="minimal",
-        temperature=None,
-        automatic_cache_breakpoints=False,
-    )
-    precomputed_fields = _adapter()._precompute_fields(binding)
-    assert precomputed_fields.output_config == {"effort": "minimal"}
-    assert precomputed_fields.thinking == {"type": "adaptive"}
-
-
-def test_request_omits_thinking_and_output_config_without_reasoning_level() -> None:
-    """A None reasoning_level leaves both output_config and thinking at the omit sentinel."""
-    binding = Binding(
-        system_prompt=None,
-        tool_schemas=(),
-        provider_executed_tools=(),
-        tool_choice="auto",
-        parallel_tool_calls=True,
-        max_completion_tokens=None,
-        reasoning_level=None,
-        temperature=None,
-        automatic_cache_breakpoints=False,
-    )
-    precomputed_fields = _adapter()._precompute_fields(binding)
-    assert isinstance(precomputed_fields.output_config, anthropic.Omit)
-    assert isinstance(precomputed_fields.thinking, anthropic.Omit)
-
-
-def test_request_maps_temperature_and_omits_it_when_unset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A bound temperature enters extra_body. None leaves the omit sentinel."""
-    adapter = _adapter()
-    unset = adapter._precompute_fields(
-        _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
-    )
-    assert isinstance(unset.temperature, anthropic.Omit)
-    precomputed_fields = adapter._precompute_fields(
-        _binding(
-            system_prompt=None,
-            tool_schemas=(),
-            automatic_cache_breakpoints=False,
-            temperature=0.2,
-        )
-    )
-    assert precomputed_fields.temperature == 0.2
-    text_bound = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
-    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") == {"temperature": 0.2}
-
-
-def test_request_sends_service_tier_only_when_the_adapter_states_one() -> None:
-    """A stated service_tier lands on the request. None leaves the omit sentinel.
-
-    The sentinel omits an unstated tier from the request.
-    """
-    binding = _binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=False)
-    assert isinstance(_adapter()._precompute_fields(binding).service_tier, anthropic.Omit)
-    stated = AnthropicMessagesAdapter(
-        client=AsyncAnthropic(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="anthropic",
-        service_tier="standard_only",
-    )
-    assert stated._precompute_fields(binding).service_tier == "standard_only"
-
-
-def test_request_marks_the_system_block_for_automatic_cache_breakpoints() -> None:
-    """The system block follows `automatic_cache_breakpoints`."""
+def test_the_system_block_marker_follows_automatic_cache_breakpoints() -> None:
+    """The automatic system marker is one of the four request markers, as is the automatic message marker."""
     cached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    assert _block_list(cached.system)[0].get("cache_control") == {"type": "ephemeral"}
+    assert _block_list(cached.system)[0].get("cache_control") == _MARK
+    assert cached.message_mark_budget == 2
     uncached = _adapter()._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
     )
     assert "cache_control" not in _block_list(uncached.system)[0]
+    assert uncached.message_mark_budget == 4
 
 
 def test_request_marks_last_tool_only_without_a_system_prompt() -> None:
     """The prefix breakpoint sits on the last tool only when no system prompt follows."""
     schemas = _tool_schemas()
-    without_system = _adapter()._precompute_fields(
+    adapter = _adapter(cache_ttl="1h")
+    without_system = adapter._precompute_fields(
         _binding(system_prompt=None, tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
-    assert _block_list(without_system.tools)[-1].get("cache_control") == {"type": "ephemeral"}
-    with_system = _adapter()._precompute_fields(
+    assert _block_list(without_system.tools)[-1].get("cache_control") == _MARK_1H
+    with_system = adapter._precompute_fields(
         _binding(system_prompt="sys", tool_schemas=schemas, automatic_cache_breakpoints=True)
     )
     assert "cache_control" not in _block_list(with_system.tools)[-1]
@@ -1342,9 +1418,12 @@ def _thinking_block_stop_event(thinking: str, index: int) -> ParsedContentBlockS
     )
 
 
-def _streamed_reasoning(translated: Sequence[StreamItem]) -> str:
-    """Concatenate the reasoning deltas, as an application rendering them as flowing text would."""
-    return "".join(item.text for item in translated if isinstance(item, ReasoningDelta))
+_REDACTED_BLOCK_STOP_EVENT = ParsedContentBlockStopEvent(
+    type="content_block_stop",
+    index=1,
+    content_block=at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
+)
+"""The stop event closing a redacted thinking block at index 1."""
 
 
 def _collected_items(
@@ -1358,7 +1437,7 @@ def _collected_items(
         adapter_stream = _anthropic_stream(replay_events, snapshot)
         return [item async for item in adapter_stream.items()]
 
-    return asyncio.run(scenario())
+    return run_with_timeout(scenario())
 
 
 def test_stream_yields_bare_text_argument_fragments_and_one_complete_tool_call() -> None:
@@ -1418,89 +1497,93 @@ def test_a_server_tool_use_blocks_argument_fragments_yield_nothing() -> None:
     assert _collected_items([fragment], snapshot) == []
 
 
-def test_two_thinking_blocks_stream_separated_by_a_blank_line() -> None:
-    """A block boundary separates reasoning text with a blank line."""
-    translated = _collected_items([
-        _thinking_delta_event("First, water ", 0),
-        _thinking_delta_event("evaporates.", 0),
-        _thinking_block_stop_event("First, water evaporates.", 0),
-        _thinking_delta_event("Then it condenses.", 1),
-        _thinking_block_stop_event("Then it condenses.", 1),
-    ])
-    assert _streamed_reasoning(translated) == "First, water evaporates.\n\nThen it condenses."
+@pytest.mark.parametrize(
+    ("replay_events", "expected_items"),
+    [
+        pytest.param(
+            [
+                _thinking_delta_event("First, ", 0),
+                _thinking_delta_event("water evaporates.", 0),
+                _thinking_block_stop_event("First, water evaporates.", 0),
+                _thinking_delta_event("Then it ", 1),
+                _thinking_delta_event("condenses.", 1),
+                _thinking_block_stop_event("Then it condenses.", 1),
+            ],
+            [
+                ReasoningDelta(text="First, "),
+                ReasoningDelta(text="water evaporates."),
+                ReasoningDelta(text="\n\n"),
+                ReasoningDelta(text="Then it "),
+                ReasoningDelta(text="condenses."),
+            ],
+            id="blank_line_between_thinking_blocks",
+        ),
+        pytest.param(
+            [
+                _thinking_delta_event("thought it over", 0),
+                _thinking_block_stop_event("thought it over", 0),
+                _text_delta_event("hey", 1),
+            ],
+            [ReasoningDelta(text="thought it over"), "hey"],
+            id="no_separator_after_the_last_thinking_block",
+        ),
+        pytest.param(
+            [
+                _thinking_delta_event("", 0),
+                _thinking_block_stop_event("", 0),
+                _thinking_delta_event("thought it over", 1),
+            ],
+            [ReasoningDelta(text="thought it over")],
+            id="empty_delta_dropped_and_arms_no_separator",
+        ),
+        pytest.param(
+            [
+                _thinking_delta_event("First.", 0),
+                _thinking_block_stop_event("First.", 0),
+                _thinking_delta_event("", 1),
+                _thinking_delta_event("Then.", 1),
+            ],
+            [
+                ReasoningDelta(text="First."),
+                ReasoningDelta(text="\n\n"),
+                ReasoningDelta(text="Then."),
+            ],
+            id="empty_delta_keeps_the_pending_separator",
+        ),
+        pytest.param(
+            [
+                _thinking_delta_event("First.", 0),
+                _thinking_block_stop_event("First.", 0),
+                _REDACTED_BLOCK_STOP_EVENT,
+                _thinking_delta_event("Then.", 2),
+            ],
+            [
+                ReasoningDelta(text="First."),
+                ReasoningDelta(text="\n\n"),
+                ReasoningDelta(text="Then."),
+            ],
+            id="redacted_block_adds_no_text_or_separator",
+        ),
+        pytest.param(
+            [
+                _thinking_delta_event("", 0),
+                _thinking_block_stop_event("", 0),
+                _REDACTED_BLOCK_STOP_EVENT,
+                _thinking_delta_event("Then.", 2),
+            ],
+            [ReasoningDelta(text="Then.")],
+            id="redacted_block_after_a_text_free_block_adds_no_separator",
+        ),
+    ],
+)
+def test_thinking_streams_as_reasoning_deltas_separated_by_a_blank_line(
+    replay_events: list[ParsedMessageStreamEvent], expected_items: list[StreamItem]
+) -> None:
+    """A blank line separates thinking blocks that streamed text, placed before the next block's text.
 
-
-def test_a_block_stop_with_no_delta_after_it_streams_no_trailing_separator() -> None:
-    """The separator precedes the next thinking delta, so a last block contributes none.
-
-    Only a thinking delta consumes a pending separator.
+    Empty deltas and redacted blocks stream nothing, so they neither add nor consume a separator.
     """
-    translated = _collected_items([
-        _thinking_delta_event("thought it over", 0),
-        _thinking_block_stop_event("thought it over", 0),
-        _text_delta_event("hey", 1),
-    ])
-    assert translated == [ReasoningDelta(text="thought it over"), "hey"]
-
-
-def test_a_thinking_delta_carrying_no_characters_is_dropped_rather_than_streamed() -> None:
-    """An empty delta is not text: it yields no item and leaves the next block unseparated."""
-    translated = _collected_items([
-        _thinking_delta_event("", 0),
-        _thinking_block_stop_event("", 0),
-        _thinking_delta_event("thought it over", 1),
-    ])
-    assert translated == [ReasoningDelta(text="thought it over")]
-
-
-def test_an_empty_thinking_delta_keeps_the_separator_for_the_next_delta_with_text() -> None:
-    """A pending separator before a dropped delta remains before the next block's text."""
-    translated = _collected_items([
-        _thinking_delta_event("First.", 0),
-        _thinking_block_stop_event("First.", 0),
-        _thinking_delta_event("", 1),
-        _thinking_delta_event("Then.", 1),
-    ])
-    assert _streamed_reasoning(translated) == "First.\n\nThen."
-
-
-def test_a_redacted_thinking_block_streams_no_text_and_no_extra_blank_line() -> None:
-    """A redacted block yields no delta of its own and does not double the blank line around it."""
-    redacted_stop = ParsedContentBlockStopEvent(
-        type="content_block_stop",
-        index=1,
-        content_block=at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
-    )
-    translated = _collected_items([
-        _thinking_delta_event("First.", 0),
-        _thinking_block_stop_event("First.", 0),
-        redacted_stop,
-        _thinking_delta_event("Then.", 2),
-    ])
-    assert translated == [
-        ReasoningDelta(text="First."),
-        ReasoningDelta(text="\n\n"),
-        ReasoningDelta(text="Then."),
-    ]
-
-
-def test_a_redacted_block_after_a_thinking_block_with_no_text_arms_no_separator() -> None:
-    """A redacted block does not separate what its neighbors left unseparated.
-
-    An empty preceding block adds no separator before redacted reasoning.
-    """
-    redacted_stop = ParsedContentBlockStopEvent(
-        type="content_block_stop",
-        index=1,
-        content_block=at.RedactedThinkingBlock(type="redacted_thinking", data="opaque-bytes"),
-    )
-    translated = _collected_items([
-        _thinking_delta_event("", 0),
-        _thinking_block_stop_event("", 0),
-        redacted_stop,
-        _thinking_delta_event("Then.", 2),
-    ])
-    assert translated == [ReasoningDelta(text="Then.")]
+    assert _collected_items(replay_events) == expected_items
 
 
 class _StructuredReport(BaseModel):
@@ -1530,32 +1613,6 @@ _REPORT_JSON = '{"city": "Nairobi", "celsius": 25}'
 """Text that validates into _StructuredReport."""
 
 
-def _kwarg_sent[OutputT](
-    monkeypatch: pytest.MonkeyPatch, bound: _BoundAnthropic[OutputT], key: str
-) -> object:
-    """Open one stream through a fake, capturing the request kwarg key it was passed."""
-    captured: list[object] = []
-
-    class _FakeStreamManager:
-        async def __aenter__(self) -> _FakeSDKMessageStream:
-            return _FakeSDKMessageStream([], _message_snapshot("end_turn"))
-
-    def fake_stream(**request_kwargs: object) -> _FakeStreamManager:
-        captured.append(request_kwargs[key])
-        return _FakeStreamManager()
-
-    monkeypatch.setattr(bound._adapter.client.messages, "stream", fake_stream)
-
-    async def scenario() -> None:
-        request = bound.build_request([UserMessage(content="q")])
-        assert not isinstance(request, InvalidRequest)
-        await bound.open_stream(request)
-
-    asyncio.run(scenario())
-    (kwarg,) = captured
-    return kwarg
-
-
 @pytest.mark.parametrize(
     ("client", "uses_top_level_cache_control"),
     [
@@ -1566,23 +1623,19 @@ def _kwarg_sent[OutputT](
     ids=["anthropic", "bedrock_mantle", "bedrock_legacy"],
 )
 def test_automatic_cache_breakpoints_select_final_caching_by_client(
-    monkeypatch: pytest.MonkeyPatch,
     client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,
     *,
     uses_top_level_cache_control: bool,
 ) -> None:
     """Direct and Mantle clients use top-level caching, while legacy Bedrock marks the final block."""
-    adapter = AnthropicMessagesAdapter(
+    adapter = _adapter(
         client=client,
-        model="m",
-        pricing=_PRICING,
         provider_name=("anthropic" if isinstance(client, AsyncAnthropic) else "aws.bedrock"),
         cache_ttl="1h",
     )
-    precomputed_fields = adapter._precompute_fields(
+    bound = adapter.bind_text(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    bound = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
     request = bound.build_request([
         UserMessage(
             content=tuple(
@@ -1591,34 +1644,22 @@ def test_automatic_cache_breakpoints_select_final_caching_by_client(
         )
     ])
     assert isinstance(request, _AnthropicRequestParams)
-    blocks = _content_blocks(request.messages[-1])
-    assert ["cache_control" in block for block in blocks[:4]] == [False, False, True, True]
-    final_block = blocks[-1]
-    stream_cache_control = _kwarg_sent(monkeypatch, bound, "cache_control")
+    final_block_mark = None if uses_top_level_cache_control else _MARK_1H
+    assert _cache_marks(request.messages) == [[None, None, _MARK_1H, _MARK_1H, final_block_mark]]
     if uses_top_level_cache_control:
-        assert "cache_control" not in final_block
-        assert stream_cache_control == {"type": "ephemeral", "ttl": "1h"}
+        assert request.precomputed.cache_control == _MARK_1H
     else:
-        assert final_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
-        assert isinstance(stream_cache_control, anthropic.Omit)
+        assert isinstance(request.precomputed.cache_control, anthropic.Omit)
 
 
-def test_identity_reads_the_messages_own_id_and_served_model() -> None:
-    """Both values come off the message verbatim, neither from the id the binding sent.
-
-    A streamed message carries no request ID.
-    """
-    identity = _structured_bound().identity_from_raw(_message_with_content([]), request_id=None)
-    assert identity == ResponseIdentity(
-        model_served="claude-sonnet-5", response_id="msg_1", request_id=None
+def test_identity_reads_the_messages_own_id_and_served_model_beside_the_request_id() -> None:
+    """The message supplies its id and served model, and the AdapterStream supplies the request id."""
+    identity = _structured_bound().identity_from_raw(
+        _message_with_content([]), request_id="req_anthropic"
     )
-
-
-def test_identity_reads_the_adapter_stream_request_id() -> None:
-    """The AdapterStream request id reaches ResponseIdentity unchanged."""
-    message = _message_with_content([])
-    identity = _structured_bound().identity_from_raw(message, request_id="req_anthropic")
-    assert identity.request_id == "req_anthropic"
+    assert identity == ResponseIdentity(
+        model_served="claude-sonnet-5", response_id="msg_1", request_id="req_anthropic"
+    )
 
 
 def _structured_message(
@@ -1637,16 +1678,27 @@ def _structured_message(
     )
 
 
-def test_the_structured_request_sends_the_output_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Check the schema and effort captured by the SDK stream stub."""
-    output_config = _kwarg_sent(monkeypatch, _structured_bound(), "output_config")
-    assert isinstance(output_config, dict)
-    assert output_config["effort"] == "high"
-    assert output_config["format"]["type"] == "json_schema"
-    assert output_config["format"]["schema"]["properties"]["city"]["type"] == "string"
-    assert output_config["format"]["schema"]["properties"]["celsius"]["type"] == "integer"
-    required: list[str] = output_config["format"]["schema"]["required"]
-    assert set(required) == {"city", "celsius"}
+def test_the_structured_request_merges_the_schema_into_the_output_config() -> None:
+    """The response_format's JSON schema, as anthropic's SDK transforms it, joins the binding's effort."""
+    request = _structured_bound().build_request([UserMessage(content="q")])
+    assert isinstance(request, _AnthropicRequestParams)
+    assert request.precomputed.output_config == {
+        "effort": "high",
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "description": "The response_format the structured bind path parses into.",
+                "title": "_StructuredReport",
+                "properties": {
+                    "city": {"type": "string", "title": "City"},
+                    "celsius": {"type": "integer", "title": "Celsius"},
+                },
+                "additionalProperties": False,
+                "required": ["city", "celsius"],
+            },
+        },
+    }
 
 
 def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
@@ -1665,242 +1717,89 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         )
 
 
-def test_the_request_sends_extra_body_by_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """open_stream passes the binding's extra_body to the SDK's extra_body parameter."""
-    adapter = _adapter()
-    extra_body = {"top_k": 5}
-    text_bound = _BoundAnthropicText(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(
-            _binding(
-                system_prompt=None,
-                tool_schemas=(),
-                automatic_cache_breakpoints=True,
-                extra_body=extra_body,
-            )
-        ),
-    )
-    assert _kwarg_sent(monkeypatch, text_bound, "extra_body") is extra_body
-
-
-def test_temperature_keeps_caller_extra_body_fields_by_reference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A temperature combines with caller fields and retains their mapping by reference."""
-    adapter = _adapter()
-    caller_fields: dict[str, object] = {"top_k": 5}
-    text_bound = _BoundAnthropicText(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(
-            _binding(
-                system_prompt=None,
-                tool_schemas=(),
-                automatic_cache_breakpoints=True,
-                extra_body=caller_fields,
-                temperature=0.2,
-            )
-        ),
-    )
-    sent_extra_body = _kwarg_sent(monkeypatch, text_bound, "extra_body")
-    assert isinstance(sent_extra_body, Mapping)
-    assert dict(sent_extra_body) == {"temperature": 0.2, "top_k": 5}
-    caller_fields["top_k"] = 6
-    assert sent_extra_body["top_k"] == 6
-    caller_fields["temperature"] = 0.7
-    assert dict(sent_extra_body) == {"temperature": 0.2, "top_k": 6}
-
-
-def test_structured_bind_validates_the_turns_text_into_the_instance() -> None:
-    """The structured bound adapter validates the turn's text block into the response_format."""
-    outcome = _structured_parse(_structured_message(_REPORT_JSON))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
-
-
-def test_structured_output_may_inherit_no_output() -> None:
-    """AdapterResult distinguishes successful output from NoOutput."""
-
-    class ReportAlsoNoOutput(BaseModel, NoOutput):
-        assistant_message: AssistantMessage = AssistantMessage(turn=())
-        city: str
-        celsius: int
-
-    adapter = _adapter()
-    bound = _BoundAnthropicStructured(
-        adapter=adapter,
-        precomputed_fields=adapter._precompute_fields(
-            _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
-        ),
-        response_format=ReportAlsoNoOutput,
-    )
-    outcome = bound.interpret(_structured_message(_REPORT_JSON))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output == ReportAlsoNoOutput(city="Nairobi", celsius=25)
-
-
 @pytest.mark.parametrize(
-    ("stop_reason", "expected_outcome_type"),
+    ("text", "stop_reason", "expected_kind", "expected_output"),
     [
-        ("end_turn", EmptyTurn),
-        ("refusal", Refusal),
-        ("max_tokens", MaxCompletionTokensExceeded),
-        ("model_context_window_exceeded", ContextWindowExceeded),
-        (None, UnfinishedTurn),
-    ],
-    ids=[
-        "end_turn",
-        "refusal",
-        "max_tokens",
-        "model_context_window_exceeded",
-        "no_stop_reason",
+        pytest.param(
+            _REPORT_JSON,
+            "end_turn",
+            "adapter_result",
+            _StructuredReport(city="Nairobi", celsius=25),
+            id="valid_text",
+        ),
+        pytest.param(None, "end_turn", "empty_turn", None, id="end_turn_without_text"),
+        pytest.param(None, "refusal", "refusal", None, id="refusal"),
+        pytest.param(None, "max_tokens", "max_completion_tokens_exceeded", None, id="max_tokens"),
+        pytest.param(
+            '{"city": "Nair',
+            "max_tokens",
+            "max_completion_tokens_exceeded",
+            None,
+            id="text_cut_mid_json_at_max_tokens",
+        ),
+        pytest.param(
+            None,
+            "model_context_window_exceeded",
+            "context_window_exceeded",
+            None,
+            id="context_window_exceeded",
+        ),
+        pytest.param(None, None, "unfinished_turn", None, id="no_stop_reason"),
+        pytest.param(None, "pause_turn", "unfinished_turn", None, id="pause_turn"),
+        pytest.param(
+            "partial thought",
+            "pause_turn",
+            "unfinished_turn",
+            None,
+            id="pause_turn_ahead_of_schema_violation",
+        ),
+        pytest.param(None, "tool_use", "adapter_result", None, id="tool_use"),
+        pytest.param(
+            "let me look that up", "tool_use", "adapter_result", None, id="tool_use_with_prose"
+        ),
     ],
 )
-def test_structured_bind_reports_a_text_free_turn_by_its_stop_reason(
-    stop_reason: at.StopReason | None, expected_outcome_type: type[NoOutputOutcome]
+def test_structured_outcome_by_text_and_stop_reason(
+    text: str | None,
+    stop_reason: at.StopReason | None,
+    expected_kind: str,
+    expected_output: _StructuredReport | None,
 ) -> None:
-    """A turn with no text block parses no instance, so the stop reason is what names the outcome.
+    """Valid text validates into the instance, and otherwise the stop reason names the outcome.
 
-    A null stop reason is not a finished turn, so it is unfinished rather than empty.
+    A null stop reason or pause_turn is not a finished turn, so it is unfinished even when text failed validation.
+    A tool_use turn parses no instance and nothing went wrong, so its output is None even beside prose.
     """
-    outcome = _structured_parse(_structured_message(None, stop_reason=stop_reason))
-    assert isinstance(outcome, expected_outcome_type)
+    outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
+    assert outcome.kind == expected_kind
+    if outcome.kind == "adapter_result":
+        assert outcome.output == expected_output
 
 
-def test_structured_bind_reports_schema_violation_on_text_the_model_rejects() -> None:
-    """A finished turn whose text the response_format rejects is SchemaViolation.
-
-    validation_error_json preserves the field, constraint, and rejected value.
-    """
-    outcome = _structured_parse(_structured_message('{"city": "Nairobi", "celsius": "SENTINEL"}'))
-    assert outcome.kind == "schema_violation"
-    rejections = json.loads(outcome.validation_error_json)
-    assert [rejection["loc"] for rejection in rejections] == [["celsius"]]
-    assert rejections[0]["input"] == "SENTINEL"
-
-
-def test_structured_bind_reports_max_completion_tokens_exceeded_on_text_cut_mid_json() -> None:
-    """Truncated JSON at max_tokens returns MaxCompletionTokensExceeded."""
-    outcome = _structured_parse(_structured_message('{"city": "Nair', stop_reason="max_tokens"))
-    assert outcome.kind == "max_completion_tokens_exceeded"
-
-
-def test_structured_bind_reports_a_tool_use_turn_as_none() -> None:
-    """A tool_use turn parses no instance and nothing went wrong, so the output is None."""
-    outcome = _structured_parse(_structured_message(None, stop_reason="tool_use"))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output is None
-
-
-def test_structured_bind_reports_a_tool_use_turn_whose_text_is_not_the_instance_as_none() -> None:
-    """A tool_use turn whose text block is prose is the tool call, not a schema violation."""
-    outcome = _structured_parse(_structured_message("let me look that up", stop_reason="tool_use"))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output is None
-
-
-def test_structured_bind_reports_a_paused_turn_as_unfinished_naming_the_stop_reason() -> None:
-    """pause_turn is an unfinished turn, and the reason quotes anthropic's own word."""
+def test_an_unfinished_structured_turn_names_the_stop_reason() -> None:
+    """The reason quotes anthropic's own stop reason."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
     assert outcome.kind == "unfinished_turn"
     assert "pause_turn" in outcome.reason
 
 
-def test_structured_bind_reports_an_unfinished_turn_ahead_of_a_schema_violation() -> None:
-    """A paused turn whose text is not the instance is the pause, which langchaint cannot continue."""
-    outcome = _structured_parse(_structured_message("partial thought", stop_reason="pause_turn"))
-    assert outcome.kind == "unfinished_turn"
+def test_parse_anthropic_counts_each_fallthrough_and_no_listed_row() -> None:
+    """An unlisted status lands one tagged count, even when its error type picks the verdict.
 
-
-def _rate_limit_error(headers: dict[str, str]) -> anthropic.RateLimitError:
-    """Build the SDK's 429 exception around a constructed httpx2 response."""
-    response = httpx2.Response(
-        429,
-        headers=headers,
-        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
-    )
-    return anthropic.RateLimitError("rate limited", response=response, body=None)
-
-
-def test_parse_anthropic_reads_retry_after_from_the_headers_without_letting_it_pick() -> None:
-    """retry-after sets retry_after without changing the verdict type."""
-    assert parse_anthropic(_rate_limit_error({"Retry-After-MS": "1500"})) == PauseAll(
-        retry_after=1.5
-    )
-    assert parse_anthropic(_rate_limit_error({})) == PauseAll(retry_after=None)
-    bad_request = _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"})
-    assert parse_anthropic(bad_request) == DoNotRetry()
-
-
-def test_parse_anthropic_counts_a_fallthrough_and_a_listed_row_adds_nothing() -> None:
-    """An unlisted status lands one tagged count. A listed status leaves the counter alone."""
+    A listed status leaves the counter alone.
+    """
     before = dict(PARSE_FALLTHROUGH_COUNTS)
-    assert parse_anthropic(_status_error(anthropic.RateLimitError, 429)) == PauseAll(
-        retry_after=None
-    )
-    assert parse_anthropic(_status_error(anthropic.APIStatusError, 408)) == RetryThisOne(
-        retry_after=None
-    )
+    _ = parse_anthropic(_status_error(anthropic.RateLimitError, 429))
+    _ = parse_anthropic(_status_error(anthropic.APIStatusError, 408))
     assert dict(PARSE_FALLTHROUGH_COUNTS) == before
-    assert parse_anthropic(_status_error(anthropic.APIStatusError, 599)) == RetryThisOne(
-        retry_after=None
-    )
-    tag = "status=599 type=None"
-    assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
-
-
-def test_parse_anthropic_pauses_on_a_recognized_throttle_type_at_an_unlisted_status() -> None:
-    """A rate-limit or overload error type pauses the rate-limit quota whatever status carried it."""
-    overloaded = _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error")
-    assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
-
-
-def test_parse_anthropic_obeys_a_retry_directive_over_the_status_tables() -> None:
-    """x-should-retry overrides status-table retry decisions."""
-    final_500 = _status_error(anthropic.InternalServerError, 500, {"x-should-retry": "false"})
-    assert parse_anthropic(final_500) == DoNotRetry()
-    retryable_400 = _status_error(
-        anthropic.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
-    )
-    assert parse_anthropic(retryable_400) == RetryThisOne(retry_after=3.0)
-    retryable_429 = _status_error(
-        anthropic.RateLimitError, 429, {"x-should-retry": "true"}, "rate_limit_error"
-    )
-    assert parse_anthropic(retryable_429) == PauseAll(retry_after=None)
-
-
-def test_false_retry_directive_stops_request_and_pauses_rate_limit_quota() -> None:
-    """x-should-retry=false preserves a required SharedBackoff pause."""
-    throttled = _status_error(
-        anthropic.RateLimitError, 429, {"x-should-retry": "false", "retry-after": "7"}
-    )
-    assert parse_anthropic(throttled) == PauseAllDoNotRetry(retry_after=7.0)
-    overloaded = _status_error(
-        anthropic.APIStatusError, 418, {"x-should-retry": "false"}, "overloaded_error"
-    )
-    assert parse_anthropic(overloaded) == PauseAllDoNotRetry(retry_after=None)
-
-
-def test_parse_anthropic_ignores_a_retry_directive_on_the_streams_200_status() -> None:
-    """A mid-stream error ignores retry headers from status 200."""
-    overloaded = _status_error(
-        anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
-    )
-    assert parse_anthropic(overloaded) == PauseAll(retry_after=None)
-    rejected = _status_error(
-        anthropic.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_request_error"
-    )
-    assert parse_anthropic(rejected) == DoNotRetry()
-
-
-def test_parse_anthropic_retries_a_transient_type_at_the_streams_200_status() -> None:
-    """api_error and timeout_error retry by error type and count unlisted statuses."""
-    before = dict(PARSE_FALLTHROUGH_COUNTS)
-    for transient_type in ("api_error", "timeout_error"):
-        failed = _status_error(anthropic.APIStatusError, 200, error_type=transient_type)
-        assert parse_anthropic(failed) == RetryThisOne(retry_after=None)
-        tag = f"status=200 type={transient_type}"
+    for failure, tag in (
+        (_status_error(anthropic.APIStatusError, 599), "status=599 type=None"),
+        (
+            _status_error(anthropic.APIStatusError, 200, error_type="api_error"),
+            "status=200 type=api_error",
+        ),
+    ):
+        _ = parse_anthropic(failure)
         assert PARSE_FALLTHROUGH_COUNTS[tag] == before.get(tag, 0) + 1
 
 
@@ -1911,8 +1810,9 @@ def test_request_id_from_error_reads_the_sdk_errors_own_header_and_nothing_else(
     Missing headers return None.
     """
     adapter = _adapter()
-    assert adapter.request_id_from_error(_rate_limit_error({"request-id": "req_429"})) == "req_429"
-    assert adapter.request_id_from_error(_rate_limit_error({})) is None
+    with_header = _status_error(anthropic.RateLimitError, 429, {"request-id": "req_429"})
+    assert adapter.request_id_from_error(with_header) == "req_429"
+    assert adapter.request_id_from_error(_status_error(anthropic.RateLimitError, 429)) is None
     assert adapter.request_id_from_error(ValueError("boom")) is None
 
 
@@ -1974,8 +1874,11 @@ def test_bedrock_model_sends_the_id_verbatim_on_its_apis_client_class(
     assert adapter.client.max_retries == 0
 
 
-def test_bedrock_model_uses_its_bedrock_pricing_object() -> None:
-    """The Bedrock catalog remains independent from direct Anthropic pricing."""
+def test_exact_prefixed_catalog_entry_uses_its_own_bedrock_pricing_object() -> None:
+    """A verbatim catalog entry already states its regional rates, so no premium applies.
+
+    The Bedrock catalog remains independent from direct Anthropic pricing.
+    """
     adapter = _anthropic_adapter_of(
         AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
     )
@@ -2004,14 +1907,6 @@ def test_prefixed_bedrock_model_uses_the_unprefixed_pricing_object_when_disabled
         )
     )
     assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["anthropic.claude-sonnet-5"]
-
-
-def test_exact_prefixed_catalog_entry_ignores_the_premium() -> None:
-    """A verbatim catalog entry already states its regional rates."""
-    adapter = _anthropic_adapter_of(
-        AnthropicBedrock(aws_region="us-east-1").model("us.anthropic.claude-opus-4-6-v1")
-    )
-    assert adapter.pricing is ANTHROPIC_BEDROCK_PRICING["us.anthropic.claude-opus-4-6-v1"]
 
 
 def test_pricing_table_multiplied_scales_every_tier_and_keeps_modifiers() -> None:
@@ -2080,112 +1975,6 @@ def test_uncataloged_bedrock_model_requires_pricing() -> None:
         _ = bedrock.model("us.anthropic.claude-next")
 
 
-def test_wire_messages_marks_a_marked_user_part() -> None:
-    """A user part with cache_breakpoint carries the marker on its own block. Unmarked siblings carry none."""
-    messages = [
-        UserMessage(
-            content=(
-                TextPart(text="shared context", cache_breakpoint=True),
-                TextPart(text="question"),
-            )
-        ),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-    )
-    blocks = _content_blocks(wire[0])
-    assert blocks[0]["type"] == "text"
-    assert blocks[0].get("cache_control") == {"type": "ephemeral"}
-    assert "cache_control" not in blocks[1]
-
-
-def test_wire_messages_marks_a_marked_image_part() -> None:
-    """An image part with cache_breakpoint carries the marker on its image block."""
-    messages = [
-        UserMessage(
-            content=(ImagePart(data=b"png", media_type="image/png", cache_breakpoint=True),)
-        ),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-    )
-    image_block = _content_blocks(wire[0])[0]
-    assert image_block["type"] == "image"
-    assert image_block.get("cache_control") == {"type": "ephemeral"}
-
-
-def test_wire_messages_marks_the_tool_result_block_for_a_marked_last_tool_part() -> None:
-    """A marked last part of a ToolMessage marks the enclosing tool_result block, never a nested block."""
-    messages = [
-        ToolMessage(
-            tool_call_id="tu_1",
-            content=(TextPart(text="a"), TextPart(text="b", cache_breakpoint=True)),
-        )
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-    )
-    tool_result = _content_blocks(wire[0])[0]
-    assert tool_result["type"] == "tool_result"
-    assert tool_result.get("cache_control") == {"type": "ephemeral"}
-    assert tool_result.get("content") == [
-        {"type": "text", "text": "a"},
-        {"type": "text", "text": "b"},
-    ]
-
-
-def test_wire_messages_rejects_a_marked_non_last_tool_part() -> None:
-    """A marked part before the ToolMessage's last is rejected instead of silently moving the boundary."""
-    messages = [
-        ToolMessage(
-            tool_call_id="tu_1",
-            content=(TextPart(text="a", cache_breakpoint=True), TextPart(text="b")),
-        )
-    ]
-    with pytest.raises(_NotSendableError, match="last part"):
-        _ = _wire_messages(
-            messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-        )
-
-
-def test_build_request_reports_an_unsendable_sequence_as_invalid_request() -> None:
-    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest variant.
-
-    Nothing is sent: the retry loop takes this answer before its first attempt.
-    """
-    messages = [UserMessage(content=(ImagePart(data=b"x", media_type="image/tiff"),))]
-    outcome = _structured_bound().build_request(messages)
-    assert isinstance(outcome, InvalidRequest)
-    assert "image/tiff" in outcome.reason
-
-
-def test_build_request_reports_an_unparseable_args_json_as_invalid_request() -> None:
-    """Malformed replayed args_json returns InvalidRequest."""
-    messages = [
-        AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
-        ToolMessage(tool_call_id="c1", content="ok"),
-    ]
-    outcome = _structured_bound().build_request(messages)
-    assert isinstance(outcome, InvalidRequest)
-    assert "args_json" in outcome.reason
-
-
-def test_build_request_reports_a_stored_payload_naming_no_type_as_invalid_request() -> None:
-    """RawPart.raw without type produces no content block."""
-    adapter = _adapter()
-    precomputed_fields = adapter._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
-    )
-    bound_adapter = _BoundAnthropicText(adapter=adapter, precomputed_fields=precomputed_fields)
-    messages = [
-        UserMessage(content="q"),
-        AssistantMessage(turn=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
-    ]
-    outcome = bound_adapter.build_request(messages)
-    assert isinstance(outcome, InvalidRequest)
-    assert "type key" in outcome.reason
-
-
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
     """as_json holds the binding's precomputed fields and this call's converted messages.
 
@@ -2197,44 +1986,6 @@ def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_fiel
     assert rendered["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
     assert rendered["precomputed"]["model"] == "m"
     assert "temperature" not in rendered["precomputed"]
-
-
-def test_wire_messages_writes_only_the_latest_four_marks_without_automatic_cache_breakpoints() -> (
-    None
-):
-    """Five marks spend the 4-marker request budget on the latest four. The oldest goes unwritten."""
-    messages = [
-        UserMessage(
-            content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(5))
-        ),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
-    )
-    blocks = _content_blocks(wire[0])
-    assert "cache_control" not in blocks[0]
-    assert all(block["type"] == "text" for block in blocks)
-    assert all(block.get("cache_control") == {"type": "ephemeral"} for block in blocks[1:])
-
-
-def test_wire_messages_reserves_markers_for_automatic_cache_breakpoints() -> None:
-    """`automatic_cache_breakpoints=True` leaves room for the latest explicit marks."""
-    messages = [
-        UserMessage(
-            content=tuple(TextPart(text=f"m{index}", cache_breakpoint=True) for index in range(3))
-        ),
-        UserMessage(content="question"),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
-    )
-    marked_blocks = _content_blocks(wire[0])
-    assert "cache_control" not in marked_blocks[0]
-    assert all(block["type"] == "text" for block in marked_blocks)
-    assert all(block.get("cache_control") == {"type": "ephemeral"} for block in marked_blocks[1:])
-    last_block = _content_blocks(wire[1])[-1]
-    assert last_block["type"] == "text"
-    assert last_block.get("cache_control") == {"type": "ephemeral"}
 
 
 def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_marker() -> None:
@@ -2250,8 +2001,8 @@ def test_request_renders_system_parts_with_marks_and_the_automatic_last_block_ma
         )
     )
     assert precomputed_fields.system == [
-        {"type": "text", "text": "stable instructions", "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": "semi-stable context", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "stable instructions", "cache_control": _MARK},
+        {"type": "text", "text": "semi-stable context", "cache_control": _MARK},
     ]
     assert precomputed_fields.message_mark_budget == 1
 
@@ -2269,7 +2020,7 @@ def test_request_system_parts_without_automatic_cache_breakpoints_mark_only_mark
         )
     )
     assert precomputed_fields.system == [
-        {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "stable", "cache_control": _MARK},
         {"type": "text", "text": "volatile"},
     ]
     assert precomputed_fields.message_mark_budget == 3
@@ -2287,115 +2038,6 @@ def test_request_rejects_a_binding_whose_markers_exceed_the_request_limit() -> N
                 automatic_cache_breakpoints=True,
             )
         )
-
-
-def test_request_str_system_leaves_a_message_mark_budget_of_two() -> None:
-    """A str system prompt with `automatic_cache_breakpoints=True` leaves two message marks."""
-    precomputed_fields = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
-    )
-    assert precomputed_fields.message_mark_budget == 2
-    uncached = _adapter()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=False)
-    )
-    assert uncached.message_mark_budget == 4
-
-
-def test_wire_messages_budget_mixes_user_and_tool_result_marks_across_messages() -> None:
-    """The latest-N budget counts marks across message kinds in message order."""
-    messages = [
-        UserMessage(content=(TextPart(text="oldest", cache_breakpoint=True),)),
-        ToolMessage(tool_call_id="tu_1", content=(TextPart(text="mid", cache_breakpoint=True),)),
-        UserMessage(content=(TextPart(text="latest", cache_breakpoint=True),)),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=2
-    )
-    assert "cache_control" not in _content_blocks(wire[0])[0]
-    tool_result = _content_blocks(wire[1])[0]
-    assert tool_result["type"] == "tool_result"
-    assert tool_result.get("cache_control") == {"type": "ephemeral"}
-    latest_text = _content_blocks(wire[2])[0]
-    assert latest_text["type"] == "text"
-    assert latest_text.get("cache_control") == {"type": "ephemeral"}
-
-
-def test_wire_messages_explicit_mark_on_the_last_block_coexists_with_the_automatic_marker() -> (
-    None
-):
-    """An explicit mark on the last block and the automatic last-block marker write one identical marker."""
-    messages = [
-        UserMessage(content=(TextPart(text="q", cache_breakpoint=True),)),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=True, cache_ttl="5m", message_mark_budget=2
-    )
-    assert _content_blocks(wire[0]) == [
-        {"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}
-    ]
-
-
-def test_wire_messages_writes_no_marks_at_zero_budget() -> None:
-    """A zero budget leaves every mark unwritten instead of slicing the whole list."""
-    messages = [
-        UserMessage(content=(TextPart(text="m", cache_breakpoint=True),)),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=0
-    )
-    assert "cache_control" not in _content_blocks(wire[0])[0]
-
-
-def _adapter_1h() -> AnthropicMessagesAdapter:
-    """Build an adapter with the 1-hour cache TTL over a keyless client."""
-    return AnthropicMessagesAdapter(
-        client=AsyncAnthropic(api_key="test"),
-        model="m",
-        pricing=_PRICING,
-        provider_name="anthropic",
-        cache_ttl="1h",
-    )
-
-
-def test_request_1h_ttl_writes_the_ttl_on_system_marks() -> None:
-    """cache_ttl="1h" puts the explicit ttl key on the automatic system marker and flows into the request."""
-    precomputed_fields = _adapter_1h()._precompute_fields(
-        _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
-    )
-    assert _block_list(precomputed_fields.system)[0].get("cache_control") == {
-        "type": "ephemeral",
-        "ttl": "1h",
-    }
-
-
-def test_request_1h_ttl_writes_the_ttl_on_the_last_tool_mark() -> None:
-    """cache_ttl="1h" puts the explicit ttl key on the last-tool marker."""
-    precomputed_fields = _adapter_1h()._precompute_fields(
-        _binding(
-            system_prompt=None, tool_schemas=_tool_schemas(), automatic_cache_breakpoints=True
-        )
-    )
-    assert _block_list(precomputed_fields.tools)[-1].get("cache_control") == {
-        "type": "ephemeral",
-        "ttl": "1h",
-    }
-
-
-def test_wire_messages_1h_ttl_writes_the_ttl_on_message_and_automatic_marks() -> None:
-    """cache_ttl="1h" puts the explicit ttl key on cache_breakpoint marks and the automatic last-block marker."""
-    messages = [
-        UserMessage(content=(TextPart(text="context", cache_breakpoint=True),)),
-        UserMessage(content="question"),
-    ]
-    wire = _wire_messages(
-        messages, automatic_cache_breakpoints=True, cache_ttl="1h", message_mark_budget=2
-    )
-    first_block = _content_blocks(wire[0])[0]
-    assert first_block["type"] == "text"
-    assert first_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
-    last_block = _content_blocks(wire[1])[-1]
-    assert last_block["type"] == "text"
-    assert last_block.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_request_rejects_an_empty_tuple_system_prompt() -> None:
@@ -2419,7 +2061,7 @@ def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot
         await anext(items)
         return before, adapter_stream.billing_reported()
 
-    before, after = asyncio.run(scenario())
+    before, after = run_with_timeout(scenario())
     assert before is None
     assert after == _provider_billing_from_sdk_usage(
         at.Usage(input_tokens=1, output_tokens=1), _PRICING
@@ -2487,6 +2129,10 @@ class TestAnthropicMessagesConformance(AdapterConformance):
         return _turn_message(at.Usage(input_tokens=1, output_tokens=-1))
 
     @override
+    def response_with_text(self, text: str) -> BaseModel:
+        return _structured_message(text)
+
+    @override
     def response_with_reasoning(self) -> BaseModel:
         """Return a turn whose thinking block carries the unnamed key."""
         return _turn_message(_usage_with_cache_split())
@@ -2551,12 +2197,25 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def sdk_errors_and_verdicts(self) -> Mapping[Exception, Verdict]:
-        """Return Anthropic error verdict cases."""
+        """Return Anthropic error verdict cases.
+
+        A retry-after header fills retry_after without choosing the verdict.
+        A rate-limit or overload error type pauses the rate-limit quota at any status.
+        x-should-retry overrides the status tables, but x-should-retry=false keeps a required pause.
+        A mid-stream error carries status 200, whose retry headers do not apply.
+        """
         return {
             _status_error(
                 anthropic.RateLimitError, 429, {"retry-after": "7"}, "rate_limit_error"
             ): PauseAll(retry_after=7.0),
+            _status_error(anthropic.RateLimitError, 429, {"retry-after-ms": "1500"}): PauseAll(
+                retry_after=1.5
+            ),
+            _status_error(anthropic.BadRequestError, 400, {"retry-after": "7"}): DoNotRetry(),
             _status_error(anthropic.OverloadedError, 529, error_type="overloaded_error"): PauseAll(
+                retry_after=None
+            ),
+            _status_error(anthropic.APIStatusError, 418, error_type="overloaded_error"): PauseAll(
                 retry_after=None
             ),
             _status_error(
@@ -2587,9 +2246,37 @@ class TestAnthropicMessagesConformance(AdapterConformance):
             _status_error(anthropic.InternalServerError, 503): RetryThisOne(retry_after=None),
             _status_error(anthropic.APIStatusError, 451): DoNotRetry(),
             _status_error(anthropic.InternalServerError, 502): RetryThisOne(retry_after=None),
+            _status_error(anthropic.APIStatusError, 599): RetryThisOne(retry_after=None),
             _status_error(
-                anthropic.RateLimitError, 429, {"x-should-retry": "false"}, "rate_limit_error"
+                anthropic.InternalServerError, 500, {"x-should-retry": "false"}
+            ): DoNotRetry(),
+            _status_error(
+                anthropic.BadRequestError, 400, {"x-should-retry": "true", "retry-after": "3"}
+            ): RetryThisOne(retry_after=3.0),
+            _status_error(
+                anthropic.RateLimitError, 429, {"x-should-retry": "true"}, "rate_limit_error"
+            ): PauseAll(retry_after=None),
+            _status_error(
+                anthropic.RateLimitError,
+                429,
+                {"x-should-retry": "false", "retry-after": "7"},
+                "rate_limit_error",
+            ): PauseAllDoNotRetry(retry_after=7.0),
+            _status_error(
+                anthropic.APIStatusError, 418, {"x-should-retry": "false"}, "overloaded_error"
             ): PauseAllDoNotRetry(retry_after=None),
+            _status_error(
+                anthropic.APIStatusError, 200, {"x-should-retry": "false"}, "overloaded_error"
+            ): PauseAll(retry_after=None),
+            _status_error(
+                anthropic.APIStatusError, 200, {"x-should-retry": "true"}, "invalid_request_error"
+            ): DoNotRetry(),
+            _status_error(anthropic.APIStatusError, 200, error_type="api_error"): RetryThisOne(
+                retry_after=None
+            ),
+            _status_error(anthropic.APIStatusError, 200, error_type="timeout_error"): RetryThisOne(
+                retry_after=None
+            ),
             TransientError(
                 "throttled body", retry_after_seconds=3.0, is_rate_limit=True
             ): PauseAll(retry_after=3.0),

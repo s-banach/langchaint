@@ -3,17 +3,16 @@
 Tests cover Usage, stop reasons, reasoning, tool calls, streams, and errors.
 """
 
-import asyncio
 import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import override
+from typing import NamedTuple, override
 
 import httpx
 import pytest
 from google import genai
 from google.genai import errors, types
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
     AllowedToolsChoice,
@@ -24,6 +23,7 @@ from langchaint import (
     ImagePart,
     ImageUrlPart,
     Message,
+    RawPart,
     ReasoningDelta,
     ReasoningPart,
     SpecificToolChoice,
@@ -31,6 +31,7 @@ from langchaint import (
     TextPart,
     ToolCall,
     ToolMessage,
+    TurnPart,
     UserMessage,
 )
 from langchaint.adapter import (
@@ -38,9 +39,9 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     Binding,
+    BoundAdapter,
     ErrorClassification,
     InvalidRequest,
-    NoOutput,
     ProviderBilling,
     RequestParams,
     ToolChoice,
@@ -52,6 +53,7 @@ from langchaint.gemini import (
     GeminiGenerateContentAdapter,
     GeminiPricingTable,
     GeminiRates,
+    GeminiServiceTier,
     assembled_response,
 )
 from langchaint.gemini.generate_content_adapter import (
@@ -65,6 +67,7 @@ from langchaint.gemini.generate_content_adapter import (
     _GeminiStream,
 )
 from langchaint.tools import ToolSchema
+from tests.helpers import run_with_timeout
 
 
 def _billing_from_usage(
@@ -123,27 +126,26 @@ _LONG_PROMPT_TABLE = GeminiPricingTable(
 )
 """Every long rate is twice its base rate, so a test tells the two tiers apart by one factor."""
 
+_OFFLINE_CLIENT = genai.Client(api_key="offline", vertexai=False)
+"""The client every adapter here shares unless a test needs another, since each construction takes milliseconds."""
 
-def _adapter() -> GeminiGenerateContentAdapter:
-    """Build the adapter under test on an offline client."""
+
+def _adapter(
+    *,
+    client: genai.Client = _OFFLINE_CLIENT,
+    model: str = "gemini-3.5-flash",
+    pricing: Mapping[str, GeminiPricingTable] = _PRICING,
+    provider_name: str = "gcp.gemini",
+    service_tier: GeminiServiceTier | None = None,
+) -> GeminiGenerateContentAdapter:
+    """Build the adapter under test, offline unless client says otherwise."""
     return GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-3.5-flash",
-        pricing=_PRICING,
-        provider_name="gcp.gemini",
+        client=client,
+        model=model,
+        pricing=pricing,
+        provider_name=provider_name,
+        service_tier=service_tier,
     )
-
-
-def test_config_fingerprint_data_contains_only_stored_request_configuration() -> None:
-    """Fingerprint data includes constructor request settings and excludes billing settings."""
-    adapter = GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-3.5-flash",
-        pricing=_PRICING,
-        provider_name="gcp.gemini",
-        service_tier="priority",
-    )
-    assert adapter.config_fingerprint_data() == {"service_tier": "priority"}
 
 
 def _binding(
@@ -174,9 +176,11 @@ def _binding(
     )
 
 
-def _bound_config(binding: Binding) -> types.GenerateContentConfig:
+def _bound_config(
+    binding: Binding, adapter: GeminiGenerateContentAdapter | None = None
+) -> types.GenerateContentConfig:
     """Bind for text and read the config the binding produced."""
-    bound = _adapter().bind_text(binding)
+    bound = (adapter or _adapter()).bind_text(binding)
     request = bound.build_request([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
     return request.config
@@ -188,13 +192,6 @@ def _built_request(
     """Build a request that must be valid."""
     request = _adapter().bind_text(binding or _binding()).build_request(messages)
     assert isinstance(request, _GeminiRequestParams)
-    return request
-
-
-def _invalid_request(messages: Sequence[Message]) -> InvalidRequest:
-    """Build a request that must be invalid."""
-    request = _adapter().bind_text(_binding()).build_request(messages)
-    assert isinstance(request, InvalidRequest)
     return request
 
 
@@ -256,8 +253,9 @@ def _provider_call_parts(
     tool_call_id: str,
     tool_type: types.ToolType,
     queries: object,
+    tool_response_id: str | None = None,
 ) -> list[types.Part]:
-    """Build one matched server-side tool call and response pair."""
+    """Build one server-side tool call and its response, matched unless tool_response_id differs."""
     return [
         types.Part(
             tool_call=types.ToolCall(
@@ -268,12 +266,35 @@ def _provider_call_parts(
         ),
         types.Part(
             tool_response=types.ToolResponse(
-                id=tool_call_id,
+                id=tool_response_id or tool_call_id,
                 tool_type=tool_type,
                 response={},
             )
         ),
     ]
+
+
+def _search_candidates_response(
+    queries_per_candidate: Sequence[Sequence[str]],
+) -> types.GenerateContentResponse:
+    """Build one finished candidate per query list, each holding one Search call and response."""
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                content=types.Content(
+                    role="model",
+                    parts=_provider_call_parts(
+                        tool_call_id=f"search-{index}",
+                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                        queries=list(queries),
+                    ),
+                ),
+                finish_reason=types.FinishReason.STOP,
+            )
+            for index, queries in enumerate(queries_per_candidate)
+        ],
+        usage_metadata=_usage_metadata(),
+    )
 
 
 def _gemini_stream(chunks: Sequence[types.GenerateContentResponse]) -> _GeminiStream:
@@ -292,7 +313,7 @@ def _drained(stream: AdapterStream) -> list[StreamItem]:
     async def drain() -> list[StreamItem]:
         return [item async for item in stream.items()]
 
-    return asyncio.run(drain())
+    return run_with_timeout(drain())
 
 
 def _api_error(
@@ -327,57 +348,8 @@ class _Answer(BaseModel):
 # --- bind ---
 
 
-def test_every_request_suppresses_sdk_retries() -> None:
-    """Both bindings send retry_options attempts=1, so max_attempts counts every request."""
-    text_config = _bound_config(_binding())
-    structured = _adapter().bind_structured(_binding(), _Answer)
-    request = structured.build_request([UserMessage(content="hi")])
-    assert isinstance(request, _GeminiRequestParams)
-    for config in (text_config, request.config):
-        assert isinstance(config.http_options, types.HttpOptions)
-        assert config.http_options.retry_options == types.HttpRetryOptions(attempts=1)
-
-
-def test_system_prompt_forms() -> None:
-    """A str binds as-is. A parts tuple binds as one Content of text parts. None binds none."""
-    assert _bound_config(_binding()).system_instruction is None
-    assert _bound_config(_binding(system_prompt="be terse")).system_instruction == "be terse"
-    parts_config = _bound_config(_binding(system_prompt=(TextPart(text="a"), TextPart(text="b"))))
-    assert parts_config.system_instruction == types.Content(
-        parts=[types.Part(text="a"), types.Part(text="b")]
-    )
-
-
-def test_marked_system_part_raises_at_bind() -> None:
-    """cache_breakpoint has no Gemini wire form, so a marked system part is a bind defect."""
-    with pytest.raises(ValueError, match="cache_breakpoint"):
-        _ = _adapter().bind_text(
-            _binding(system_prompt=(TextPart(text="a", cache_breakpoint=True),))
-        )
-
-
-def test_empty_system_parts_tuple_raises_at_bind() -> None:
-    """An empty parts tuple can only come from a directly constructed Binding."""
-    with pytest.raises(ValueError, match="empty tuple"):
-        _ = _adapter().bind_text(_binding(system_prompt=()))
-
-
-def test_parallel_tool_calls_false_raises_at_bind() -> None:
-    """No wire form disables parallel function calls."""
-    with pytest.raises(ValueError, match="parallel_tool_calls"):
-        _ = _adapter().bind_text(_binding(parallel_tool_calls=False))
-
-
-def test_automatic_cache_breakpoints_values_build_identical_requests() -> None:
-    """Implicit caching has no wire form, so the parameter changes nothing."""
-    enabled = _built_request(
-        [UserMessage(content="hi")], _binding(automatic_cache_breakpoints=True)
-    )
-    disabled = _built_request(
-        [UserMessage(content="hi")], _binding(automatic_cache_breakpoints=False)
-    )
-    assert enabled.config == disabled.config
-    assert enabled.contents == disabled.contents
+_NO_SDK_RETRIES = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+"""The http_options every binding sends, so max_attempts counts every request."""
 
 
 def _echo_schema() -> ToolSchema:
@@ -388,23 +360,119 @@ def _echo_schema() -> ToolSchema:
     )
 
 
-def test_tool_schemas_become_function_declarations() -> None:
-    """One Tool holds every declaration, its schema passed as parameters_json_schema."""
-    config = _bound_config(_binding(tool_schemas=(_echo_schema(),)))
-    assert config.tools == [
-        types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name="echo",
-                    description="Echo the city back.",
-                    parameters_json_schema={
-                        "type": "object",
-                        "properties": {"city": {"type": "string"}},
-                    },
-                )
-            ]
+_ECHO_DECLARATION = types.FunctionDeclaration(
+    name="echo",
+    description="Echo the city back.",
+    parameters_json_schema={"type": "object", "properties": {"city": {"type": "string"}}},
+)
+
+_SUPPORTED_PROVIDER_TOOLS: tuple[Mapping[str, object], ...] = (
+    {"code_execution": {}},
+    {"file_search": {"file_search_store_names": ["fileSearchStores/one"]}},
+    {"google_maps": {}},
+    {"google_search": {}},
+    {"url_context": {}},
+    {"google_search": {}, "google_maps": {}},
+)
+"""Each reviewed Gemini provider field, and one mapping populating two of them."""
+
+
+class _ConfigCase(NamedTuple):
+    case_id: str
+    binding: Binding
+    config: types.GenerateContentConfig
+
+
+_CONFIG_CASES = [
+    _ConfigCase(
+        "unset_fields_send_nothing",
+        _binding(),
+        types.GenerateContentConfig(http_options=_NO_SDK_RETRIES),
+    ),
+    # Implicit caching has no wire form, so the parameter changes nothing.
+    _ConfigCase(
+        "automatic_cache_breakpoints_has_no_wire_form",
+        _binding(automatic_cache_breakpoints=True),
+        types.GenerateContentConfig(http_options=_NO_SDK_RETRIES),
+    ),
+    _ConfigCase(
+        "system_prompt_text",
+        _binding(system_prompt="be terse"),
+        types.GenerateContentConfig(system_instruction="be terse", http_options=_NO_SDK_RETRIES),
+    ),
+    _ConfigCase(
+        "system_prompt_parts",
+        _binding(system_prompt=(TextPart(text="a"), TextPart(text="b"))),
+        types.GenerateContentConfig(
+            system_instruction=types.Content(parts=[types.Part(text="a"), types.Part(text="b")]),
+            http_options=_NO_SDK_RETRIES,
+        ),
+    ),
+    _ConfigCase(
+        "max_completion_tokens_and_temperature",
+        _binding(max_completion_tokens=64, temperature=0.5),
+        types.GenerateContentConfig(
+            temperature=0.5, max_output_tokens=64, http_options=_NO_SDK_RETRIES
+        ),
+    ),
+    _ConfigCase(
+        "reasoning_level",
+        _binding(reasoning_level="HIGH"),
+        types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.HIGH, include_thoughts=True
+            ),
+            http_options=_NO_SDK_RETRIES,
+        ),
+    ),
+    # Unmapped wire fields stay reachable as per-request HttpOptions.extra_body.
+    _ConfigCase(
+        "extra_body",
+        _binding(extra_body={"cachedContent": "caches/abc", "generationConfig": {"topK": 5}}),
+        types.GenerateContentConfig(
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1),
+                extra_body={"cachedContent": "caches/abc", "generationConfig": {"topK": 5}},
+            )
+        ),
+    ),
+    # Function declarations precede provider-executed tools, and mode VALIDATED keeps both usable.
+    _ConfigCase(
+        "function_declarations_precede_provider_tools",
+        _binding(tool_schemas=(_echo_schema(),), provider_executed_tools=({"google_search": {}},)),
+        types.GenerateContentConfig(
+            tools=[
+                types.Tool(function_declarations=[_ECHO_DECLARATION]),
+                types.Tool(google_search=types.GoogleSearch()),
+            ],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=types.FunctionCallingConfigMode.VALIDATED
+                ),
+                include_server_side_tool_invocations=True,
+            ),
+            http_options=_NO_SDK_RETRIES,
+        ),
+    ),
+    *(
+        _ConfigCase(
+            f"provider_tool_{'_'.join(provider_tool)}",
+            _binding(provider_executed_tools=(provider_tool,)),
+            types.GenerateContentConfig(
+                tools=[types.Tool.model_validate(provider_tool)],
+                tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
+                http_options=_NO_SDK_RETRIES,
+            ),
         )
-    ]
+        for provider_tool in _SUPPORTED_PROVIDER_TOOLS
+    ),
+]
+
+
+@pytest.mark.parametrize("case", _CONFIG_CASES, ids=[case.case_id for case in _CONFIG_CASES])
+def test_binding_fields_build_the_config(case: _ConfigCase) -> None:
+    """Each binding field lands on its GenerateContentConfig field, and an unset field sends nothing."""
+    assert _bound_config(case.binding) == case.config
 
 
 @pytest.mark.parametrize(
@@ -420,17 +488,17 @@ def test_tool_schemas_become_function_declarations() -> None:
             ),
         ),
         (
-            AllowedToolsChoice(mode="auto", tool_names=("echo",)),
+            AllowedToolsChoice(mode="auto", tool_names=("lookup",)),
             types.FunctionCallingConfig(
                 mode=types.FunctionCallingConfigMode.VALIDATED,
-                allowed_function_names=["echo"],
+                allowed_function_names=["lookup"],
             ),
         ),
         (
-            AllowedToolsChoice(mode="required", tool_names=("echo",)),
+            AllowedToolsChoice(mode="required", tool_names=("lookup",)),
             types.FunctionCallingConfig(
                 mode=types.FunctionCallingConfigMode.ANY,
-                allowed_function_names=["echo"],
+                allowed_function_names=["lookup"],
             ),
         ),
     ],
@@ -438,230 +506,193 @@ def test_tool_schemas_become_function_declarations() -> None:
 def test_tool_choice_mapping(
     tool_choice: ToolChoice, expected: types.FunctionCallingConfig
 ) -> None:
-    """Neutral "required" is mode ANY. A specific choice is ANY narrowed to the one name."""
-    config = _bound_config(_binding(tool_schemas=(_echo_schema(),), tool_choice=tool_choice))
-    assert config.tool_config == types.ToolConfig(function_calling_config=expected)
+    """Neutral "required" is mode ANY. A specific choice is ANY narrowed to the one name.
 
-
-def test_allowed_tools_choice_keeps_complete_gemini_function_declarations() -> None:
-    """AllowedToolsChoice changes ToolConfig without removing function_declarations."""
+    One Tool holds every declaration whatever the choice, its schema passed as parameters_json_schema.
+    """
     lookup_schema = ToolSchema(
         name="lookup",
         description="Look up the city.",
         args_schema={"type": "object", "properties": {}},
     )
     config = _bound_config(
-        _binding(
-            tool_schemas=(_echo_schema(), lookup_schema),
-            tool_choice=AllowedToolsChoice(mode="auto", tool_names=("lookup",)),
+        _binding(tool_schemas=(_echo_schema(), lookup_schema), tool_choice=tool_choice)
+    )
+    assert config.tools == [
+        types.Tool(
+            function_declarations=[
+                _ECHO_DECLARATION,
+                types.FunctionDeclaration(
+                    name="lookup",
+                    description="Look up the city.",
+                    parameters_json_schema={"type": "object", "properties": {}},
+                ),
+            ]
         )
-    )
-    assert config.tools is not None
-    assert isinstance(config.tools[0], types.Tool)
-    declarations = config.tools[0].function_declarations
-    assert declarations is not None
-    assert [declaration.name for declaration in declarations] == ["echo", "lookup"]
-    assert config.tool_config == types.ToolConfig(
-        function_calling_config=types.FunctionCallingConfig(
-            mode=types.FunctionCallingConfigMode.VALIDATED,
-            allowed_function_names=["lookup"],
-        )
-    )
+    ]
+    assert config.tool_config == types.ToolConfig(function_calling_config=expected)
 
 
-def test_no_tools_binds_no_tool_config() -> None:
-    """Without tool_schemas, neither tools nor tool_config is sent."""
-    config = _bound_config(_binding())
-    assert config.tools is None
-    assert config.tool_config is None
-
-
-def test_provider_executed_tools_reach_gemini_tools() -> None:
-    """Gemini validates provider-executed mappings through GenerateContentConfig."""
-    config = _bound_config(_binding(provider_executed_tools=({"google_search": {}},)))
-    assert config.tools is not None
-    assert isinstance(config.tools[0], types.Tool)
-    assert config.tools[0].google_search is not None
-    assert config.tool_config == types.ToolConfig(include_server_side_tool_invocations=True)
-
-
-def test_provider_executed_tools_follow_function_tools_in_gemini() -> None:
-    """Gemini places function declarations before provider-executed tools."""
-    config = _bound_config(
-        _binding(
-            tool_schemas=(_echo_schema(),),
-            provider_executed_tools=({"google_search": {}},),
-        )
-    )
-    assert config.tools is not None
-    assert isinstance(config.tools[0], types.Tool)
-    assert config.tools[0].function_declarations is not None
-    assert isinstance(config.tools[1], types.Tool)
-    assert config.tools[1].google_search is not None
-    assert config.tool_config == types.ToolConfig(
-        function_calling_config=types.FunctionCallingConfig(
-            mode=types.FunctionCallingConfigMode.VALIDATED
-        ),
-        include_server_side_tool_invocations=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("provider_tool", "field_name"),
-    [
-        ({"code_execution": {}}, "code_execution"),
-        ({"file_search": {"file_search_store_names": ["fileSearchStores/one"]}}, "file_search"),
-        ({"google_maps": {}}, "google_maps"),
-        ({"google_search": {}}, "google_search"),
-        ({"url_context": {}}, "url_context"),
-    ],
-)
-def test_every_supported_gemini_provider_field_binds(
-    provider_tool: Mapping[str, object], field_name: str
-) -> None:
-    """Each reviewed Gemini provider field survives `types.Tool` normalization."""
-    config = _bound_config(_binding(provider_executed_tools=(provider_tool,)))
-    assert config.tools is not None
-    assert getattr(config.tools[0], field_name) is not None
-
-
-def test_one_gemini_mapping_can_populate_search_and_maps() -> None:
-    """Validation inspects every populated `types.Tool` field."""
-    config = _bound_config(
-        _binding(provider_executed_tools=({"google_search": {}, "google_maps": {}},))
-    )
-    assert config.tools is not None
-    assert isinstance(config.tools[0], types.Tool)
-    assert config.tools[0].google_search is not None
-    assert config.tools[0].google_maps is not None
-
-
-@pytest.mark.parametrize(
-    "provider_tool",
-    [
-        {},
-        {"computer_use": {}},
-        {"enterprise_web_search": {}},
-        {"exa_ai_search": {}},
-        {"function_declarations": []},
-        {"google_search_retrieval": {}},
-        {"mcp_servers": []},
-        {"parallel_ai_search": {}},
-        {"retrieval": {}},
-    ],
-)
-def test_every_unsupported_gemini_provider_field_is_rejected(
-    provider_tool: Mapping[str, object],
-) -> None:
-    """Every installed `types.Tool` field outside the reviewed set is rejected."""
-    with pytest.raises(ValueError, match=r"unsupported|validation"):
-        _ = _bound_config(_binding(provider_executed_tools=(provider_tool,)))
-
-
-def test_gemini_image_search_is_rejected() -> None:
-    """Google Search image results have separate unimplemented billing."""
-    with pytest.raises(ValueError, match="image search"):
-        _ = _bound_config(
-            _binding(
-                provider_executed_tools=(
-                    {"google_search": {"search_types": {"image_search": {}}}},
-                )
-            )
-        )
-
-
-def test_gemini_provider_tools_reject_non_gemini_3_models() -> None:
-    """Deprecated Gemini 2.5 models have no provider-executed tool path."""
-    adapter = GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-2.5-flash",
-        pricing=_PRICING,
-        provider_name="gcp.gemini",
-    )
-    with pytest.raises(ValueError, match="Gemini 3"):
-        _ = adapter.bind_text(_binding(provider_executed_tools=({"google_search": {}},)))
-
-
-def test_gemini_vertex_rejects_provider_tools() -> None:
-    """Vertex bindings reject provider-executed tools before requests."""
-    adapter = GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=True),
-        model="gemini-3.5-flash",
-        pricing=_PRICING,
-        provider_name="gcp.vertex_ai",
-    )
-    with pytest.raises(ValueError, match="Gemini Developer API"):
-        _ = adapter.bind_text(_binding(provider_executed_tools=({"google_search": {}},)))
-
-
-@pytest.mark.parametrize("provider_field", ["google_search", "google_maps"])
-@pytest.mark.parametrize("rate", [None, True, float("nan"), float("inf"), -0.01])
-def test_configured_gemini_charged_tool_requires_usable_pricing(
+def _pricing_with_query_rate(
     provider_field: str, rate: float | None
-) -> None:
-    """Every supplied pricing table must price each configured charged tool."""
-    pricing = {
+) -> dict[str, GeminiPricingTable]:
+    """Price provider_field's queries at rate and every other charged tool at a usable rate."""
+    return {
         "ON_DEMAND": GeminiPricingTable(
             rates=_ON_DEMAND_RATES,
             google_search_usd_per_query=(rate if provider_field == "google_search" else 0.014),
             google_maps_usd_per_query=(rate if provider_field == "google_maps" else 0.014),
         )
     }
-    adapter = GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-3.5-flash",
-        pricing=pricing,
-        provider_name="gcp.gemini",
-    )
-    with pytest.raises(ValueError, match=r"unavailable|finite and nonnegative"):
-        _ = adapter.bind_text(_binding(provider_executed_tools=({provider_field: {}},)))
 
 
-def test_provider_executed_tools_reject_non_auto_tool_choice() -> None:
-    """Gemini ToolConfig cannot select provider-executed tools."""
-    with pytest.raises(ValueError, match="tool_choice='auto'"):
-        _ = _bound_config(
-            _binding(
-                provider_executed_tools=({"google_search": {}},),
-                tool_choice="required",
-            )
+_UNSUPPORTED_PROVIDER_TOOLS: tuple[Mapping[str, object], ...] = (
+    {},
+    {"computer_use": {}},
+    {"enterprise_web_search": {}},
+    {"exa_ai_search": {}},
+    {"function_declarations": []},
+    {"google_search_retrieval": {}},
+    {"mcp_servers": []},
+    {"parallel_ai_search": {}},
+    {"retrieval": {}},
+)
+"""Every installed `types.Tool` field outside the reviewed set, and a mapping populating none."""
+
+_COLLIDING_EXTRA_BODIES: tuple[Mapping[str, object], ...] = (
+    {"contents": []},
+    {"systemInstruction": {"parts": []}},
+    {"systeminstruction": {"parts": []}},
+    {"SYSTEM_INSTRUCTION": {"parts": []}},
+    {"tool_config": {}},
+    {"serviceTier": "flex"},
+    {"generationConfig": {"temperature": 0.1}},
+    {"generation_config": {"maxOutputTokens": 5}},
+    {"generationconfig": {"temperature": 9.9}},
+    {"generationConfig": {"response_json_schema": {}}},
+    {"generationConfig": {"MAXOUTPUTTOKENS": 5}},
+)
+"""extra_body keys the adapter populates, in the spellings and casings the wire accepts."""
+
+_NON_STRING_KEY_GENERATION_CONFIG: dict[object, object] = {1: "value", "temperature": 0.1}
+
+
+class _BindDefect(NamedTuple):
+    case_id: str
+    binding: Binding
+    match: str
+    adapter: GeminiGenerateContentAdapter = _adapter()
+
+
+_BIND_DEFECTS = [
+    # cache_breakpoint has no Gemini wire form.
+    _BindDefect(
+        "system_prompt_cache_breakpoint",
+        _binding(system_prompt=(TextPart(text="a", cache_breakpoint=True),)),
+        "cache_breakpoint",
+    ),
+    # An empty parts tuple can only come from a directly constructed Binding.
+    _BindDefect("empty_system_prompt_parts", _binding(system_prompt=()), "empty tuple"),
+    # No wire form disables parallel function calls.
+    _BindDefect(
+        "parallel_tool_calls_false", _binding(parallel_tool_calls=False), "parallel_tool_calls"
+    ),
+    # A value the Gemini SDK would change does not reach the request.
+    _BindDefect(
+        "reasoning_level_the_sdk_normalizes",
+        _binding(reasoning_level="high"),
+        "normalizes it to 'HIGH'",
+    ),
+    # Gemini ToolConfig cannot select or restrict provider-executed tools.
+    _BindDefect(
+        "provider_tools_with_required_choice",
+        _binding(provider_executed_tools=({"google_search": {}},), tool_choice="required"),
+        "tool_choice='auto'",
+    ),
+    _BindDefect(
+        "provider_tools_with_allowed_tools_choice",
+        _binding(
+            tool_schemas=(_echo_schema(),),
+            provider_executed_tools=({"google_search": {}},),
+            tool_choice=AllowedToolsChoice(mode="auto", tool_names=("echo",)),
+        ),
+        "tool_choice='auto'",
+    ),
+    # Google Search image results have separate unimplemented billing.
+    _BindDefect(
+        "google_search_image_search",
+        _binding(
+            provider_executed_tools=({"google_search": {"search_types": {"image_search": {}}}},)
+        ),
+        "image search",
+    ),
+    # Every installed `types.Tool` field outside the reviewed set is rejected.
+    *(
+        _BindDefect(
+            f"unsupported_provider_tool_{'_'.join(provider_tool) or 'empty'}",
+            _binding(provider_executed_tools=(provider_tool,)),
+            "unsupported|validation",
         )
-
-
-def test_provider_executed_tools_reject_allowed_tools_choice() -> None:
-    """allowed_function_names cannot restrict Gemini provider-executed tools."""
-    with pytest.raises(ValueError, match="tool_choice='auto'"):
-        _ = _bound_config(
-            _binding(
-                tool_schemas=(_echo_schema(),),
-                provider_executed_tools=({"google_search": {}},),
-                tool_choice=AllowedToolsChoice(mode="auto", tool_names=("echo",)),
-            )
+        for provider_tool in _UNSUPPORTED_PROVIDER_TOOLS
+    ),
+    # Deprecated Gemini 2.5 models have no provider-executed tool path.
+    _BindDefect(
+        "provider_tools_on_gemini_2_5",
+        _binding(provider_executed_tools=({"google_search": {}},)),
+        "Gemini 3",
+        _adapter(model="gemini-2.5-flash"),
+    ),
+    _BindDefect(
+        "provider_tools_on_vertex_ai",
+        _binding(provider_executed_tools=({"google_search": {}},)),
+        "Gemini Developer API",
+        _adapter(
+            client=genai.Client(api_key="offline", vertexai=True), provider_name="gcp.vertex_ai"
+        ),
+    ),
+    # Every supplied pricing table must price each configured charged tool.
+    *(
+        _BindDefect(
+            f"{provider_field}_rate_{rate}",
+            _binding(provider_executed_tools=({provider_field: {}},)),
+            "unavailable|finite and nonnegative",
+            _adapter(pricing=_pricing_with_query_rate(provider_field, rate)),
         )
+        for provider_field in ("google_search", "google_maps")
+        for rate in (None, True, float("nan"), float("inf"), -0.01)
+    ),
+    # Binding rejects extra_body keys that duplicate adapter fields.
+    *(
+        _BindDefect(
+            f"colliding_extra_body_{extra_body!r}",
+            _binding(extra_body=extra_body),
+            "collide",
+        )
+        for extra_body in _COLLIDING_EXTRA_BODIES
+    ),
+    # A non-object generationConfig, None included, would replace the adapter's own wholesale.
+    _BindDefect(
+        "generation_config_not_an_object",
+        _binding(extra_body={"generationConfig": "junk"}),
+        "object",
+    ),
+    _BindDefect(
+        "generation_config_none", _binding(extra_body={"generationConfig": None}), "object"
+    ),
+    # Invalid `generationConfig` keys fail before collision detection.
+    _BindDefect(
+        "generation_config_non_string_key",
+        _binding(extra_body={"generationConfig": _NON_STRING_KEY_GENERATION_CONFIG}),
+        "only string keys",
+    ),
+]
 
 
-def test_binding_maps_to_generation_fields() -> None:
-    """The binding fields land as temperature and max_output_tokens. None omits either."""
-    config = _bound_config(_binding(max_completion_tokens=64, temperature=0.5))
-    assert config.temperature == 0.5
-    assert config.max_output_tokens == 64
-    defaulted = _bound_config(_binding())
-    assert defaulted.temperature is None
-    assert defaulted.max_output_tokens is None
-
-
-def test_reasoning_level_maps_to_thinking_level() -> None:
-    """The exact provider value reaches thinking_level with include_thoughts True."""
-    config = _bound_config(_binding(reasoning_level="HIGH"))
-    assert config.thinking_config == types.ThinkingConfig(
-        thinking_level=types.ThinkingLevel.HIGH, include_thoughts=True
-    )
-
-
-def test_reasoning_level_rejects_sdk_normalization() -> None:
-    """A value the Gemini SDK would change does not reach the request."""
-    with pytest.raises(ValueError, match="normalizes it to 'HIGH'"):
-        _ = _bound_config(_binding(reasoning_level="high"))
+@pytest.mark.parametrize("defect", _BIND_DEFECTS, ids=[defect.case_id for defect in _BIND_DEFECTS])
+def test_an_unsendable_binding_raises_at_bind(defect: _BindDefect) -> None:
+    """A binding without a Gemini wire form fails before any request is built."""
+    with pytest.raises(ValueError, match=defect.match):
+        _ = defect.adapter.bind_text(defect.binding)
 
 
 def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
@@ -675,76 +706,28 @@ def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
 
 
 def test_structured_bind_sends_the_response_schema() -> None:
-    """The structured binding sends response_json_schema with the JSON mime type. text sends neither."""
-    structured = _adapter().bind_structured(_binding(), _Answer)
-    request = structured.build_request([UserMessage(content="hi")])
-    assert isinstance(request, _GeminiRequestParams)
-    assert request.config.response_mime_type == "application/json"
-    assert request.config.response_json_schema == TypeAdapter(_Answer).json_schema()
-    text_config = _bound_config(_binding())
-    assert text_config.response_mime_type is None
-    assert text_config.response_json_schema is None
-
-
-def test_service_tier_lands_on_the_config() -> None:
-    """The adapter's service_tier is sent on every request. None sends nothing."""
-    adapter = GeminiGenerateContentAdapter(
-        client=genai.Client(api_key="offline", vertexai=False),
-        model="gemini-3.5-flash",
-        pricing=_PRICING,
-        provider_name="gcp.gemini",
-        service_tier="flex",
+    """The structured binding sends response_json_schema with the JSON mime type."""
+    request = (
+        _adapter().bind_structured(_binding(), _Answer).build_request([UserMessage(content="hi")])
     )
-    request = adapter.bind_text(_binding()).build_request([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
-    assert request.config.service_tier == types.ServiceTier.FLEX
-    assert _bound_config(_binding()).service_tier is None
+    assert request.config == types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_json_schema=TypeAdapter(_Answer).json_schema(),
+        http_options=_NO_SDK_RETRIES,
+    )
 
 
-@pytest.mark.parametrize(
-    "extra_body",
-    [
-        {"contents": []},
-        {"systemInstruction": {"parts": []}},
-        {"systeminstruction": {"parts": []}},
-        {"SYSTEM_INSTRUCTION": {"parts": []}},
-        {"tool_config": {}},
-        {"serviceTier": "flex"},
-        {"generationConfig": {"temperature": 0.1}},
-        {"generation_config": {"maxOutputTokens": 5}},
-        {"generationconfig": {"temperature": 9.9}},
-        {"generationConfig": {"response_json_schema": {}}},
-        {"generationConfig": {"MAXOUTPUTTOKENS": 5}},
-    ],
-)
-def test_extra_body_keys_the_adapter_populates_are_refused(
-    extra_body: Mapping[str, object],
-) -> None:
-    """Binding rejects extra_body keys that duplicate adapter fields."""
-    with pytest.raises(ValueError, match="collide"):
-        _ = _adapter().bind_text(_binding(extra_body=extra_body))
+def test_service_tier_is_sent_and_fingerprinted() -> None:
+    """The adapter's service_tier is sent on every request and is the only fingerprinted setting.
 
-
-@pytest.mark.parametrize("not_an_object", ["junk", None])
-def test_extra_body_generation_config_must_be_an_object(not_an_object: object) -> None:
-    """A non-object generationConfig, None included, would replace the adapter's own wholesale."""
-    with pytest.raises(ValueError, match="object"):
-        _ = _adapter().bind_text(_binding(extra_body={"generationConfig": not_an_object}))
-
-
-def test_extra_body_generation_config_rejects_a_non_string_key() -> None:
-    """Invalid `generationConfig` keys fail before collision detection."""
-    generation_config: dict[object, object] = {1: "value", "temperature": 0.1}
-    with pytest.raises(ValueError, match="only string keys"):
-        _ = _adapter().bind_text(_binding(extra_body={"generationConfig": generation_config}))
-
-
-def test_extra_body_passes_unpopulated_keys_through() -> None:
-    """Unmapped wire fields stay reachable, delivered as per-request HttpOptions.extra_body."""
-    extra_body = {"cachedContent": "caches/abc", "generationConfig": {"topK": 5}}
-    config = _bound_config(_binding(extra_body=extra_body))
-    assert isinstance(config.http_options, types.HttpOptions)
-    assert config.http_options.extra_body == extra_body
+    Pricing is billing configuration, so the fingerprint excludes it.
+    """
+    adapter = _adapter(service_tier="flex")
+    assert adapter.config_fingerprint_data() == {"service_tier": "flex"}
+    assert _bound_config(_binding(), adapter) == types.GenerateContentConfig(
+        service_tier=types.ServiceTier.FLEX, http_options=_NO_SDK_RETRIES
+    )
 
 
 # --- build_request ---
@@ -851,79 +834,82 @@ def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
     ]
 
 
-def test_unmatched_tool_call_id_is_invalid() -> None:
-    """The wire requires the function name, recoverable only from the call the id answers."""
-    invalid = _invalid_request([ToolMessage(tool_call_id="ghost", content="r")])
-    assert "ghost" in invalid.reason
+def _marked_part_messages(
+    part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
+) -> tuple[Message, ...]:
+    """Carry one marked ContentPart in a message of message_class."""
+    if message_class is UserMessage:
+        return (UserMessage(content=(part,)),)
+    return (
+        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
+        ToolMessage(tool_call_id="c", content=(part,)),
+    )
 
 
-def test_unparseable_args_json_is_invalid() -> None:
-    """The wire field holds the parsed arguments object, so text that is not JSON has nowhere to go."""
-    invalid = _invalid_request([
-        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{not json"),))
-    ])
-    assert "args_json" in invalid.reason
+class _InvalidMessages(NamedTuple):
+    case_id: str
+    messages: tuple[Message, ...]
+    reason_fragments: tuple[str, ...]
 
 
-def test_non_object_args_json_is_invalid() -> None:
-    """JSON that is not an object has no FunctionCall.args form."""
-    invalid = _invalid_request([
-        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="[1]"),))
-    ])
-    assert "JSON object" in invalid.reason
+_INVALID_MESSAGES = [
+    # The wire requires the function name, recoverable only from the call the id answers.
+    _InvalidMessages(
+        "tool_message_without_its_call",
+        (ToolMessage(tool_call_id="ghost", content="r"),),
+        ("ghost",),
+    ),
+    # The wire field holds the parsed arguments object, so text that is not JSON has nowhere to go.
+    _InvalidMessages(
+        "tool_call_args_not_json",
+        (AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{not json"),)),),
+        ("args_json",),
+    ),
+    _InvalidMessages(
+        "tool_call_args_not_an_object",
+        (AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="[1]"),)),),
+        ("JSON object",),
+    ),
+    # A foreign ReasoningPart.raw cannot restore a Gemini Part.
+    _InvalidMessages(
+        "foreign_reasoning_part",
+        (
+            AssistantMessage(
+                turn=(
+                    ReasoningPart(
+                        raw={"type": "thinking", "thinking": "x", "signature": "s"}, text="x"
+                    ),
+                )
+            ),
+        ),
+        ("ReasoningPart",),
+    ),
+    # cache_breakpoint has no Gemini wire form in UserMessage or ToolMessage.
+    *(
+        _InvalidMessages(
+            f"{type(part).__name__}_cache_breakpoint_in_{message_class.__name__}",
+            _marked_part_messages(part, message_class),
+            ("cache_breakpoint", type(part).__name__, message_class.__name__),
+        )
+        for part, message_class in (
+            (TextPart(text="a", cache_breakpoint=True), UserMessage),
+            (TextPart(text="a", cache_breakpoint=True), ToolMessage),
+            (ImageUrlPart(url="gs://bucket/image.png", cache_breakpoint=True), UserMessage),
+            (AudioPart(data=b"WAV", media_type="audio/wav", cache_breakpoint=True), UserMessage),
+        )
+    ),
+]
 
 
 @pytest.mark.parametrize(
-    ("part", "message_class"),
-    [
-        (TextPart(text="a", cache_breakpoint=True), UserMessage),
-        (TextPart(text="a", cache_breakpoint=True), ToolMessage),
-        (
-            ImageUrlPart(
-                url="gs://bucket/image.png",
-                cache_breakpoint=True,
-            ),
-            UserMessage,
-        ),
-        (
-            AudioPart(
-                data=b"WAV",
-                media_type="audio/wav",
-                cache_breakpoint=True,
-            ),
-            UserMessage,
-        ),
-    ],
+    "case", _INVALID_MESSAGES, ids=[case.case_id for case in _INVALID_MESSAGES]
 )
-def test_cache_breakpoint_on_content_part_is_invalid(
-    part: ContentPart, message_class: type[UserMessage] | type[ToolMessage]
-) -> None:
-    """cache_breakpoint has no Gemini wire form in UserMessage or ToolMessage."""
-    if message_class is UserMessage:
-        messages: Sequence[Message] = [UserMessage(content=(part,))]
-    else:
-        messages = [
-            AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
-            ToolMessage(tool_call_id="c", content=(part,)),
-        ]
-    invalid = _invalid_request(messages)
-    assert "cache_breakpoint" in invalid.reason
-    assert type(part).__name__ in invalid.reason
-    assert message_class.__name__ in invalid.reason
-
-
-def test_a_cross_provider_reasoning_part_is_invalid() -> None:
-    """A foreign ReasoningPart fails when ReasoningPart.raw cannot restore a Gemini Part."""
-    invalid = _invalid_request([
-        AssistantMessage(
-            turn=(
-                ReasoningPart(
-                    raw={"type": "thinking", "thinking": "x", "signature": "s"}, text="x"
-                ),
-            )
-        )
-    ])
-    assert "ReasoningPart" in invalid.reason
+def test_unsendable_messages_build_an_invalid_request(case: _InvalidMessages) -> None:
+    """Messages without a Gemini wire form become InvalidRequest naming what cannot be sent."""
+    invalid = _adapter().bind_text(_binding()).build_request(case.messages)
+    assert isinstance(invalid, InvalidRequest)
+    for fragment in case.reason_fragments:
+        assert fragment in invalid.reason
 
 
 def test_empty_assistant_text_is_skipped_on_replay() -> None:
@@ -942,92 +928,64 @@ def _interpreted_turn(response: types.GenerateContentResponse) -> AssistantMessa
     return outcome.assistant_message
 
 
-def test_a_signed_function_call_yields_a_reasoning_part_and_call() -> None:
-    """ReasoningPart.raw preserves the signature. ToolCall remains dispatchable."""
-    original = types.Part(
-        thought_signature=b"\x00\x01sig",
-        function_call=types.FunctionCall(name="f", args={"x": 1}),
-    )
-    turn = _interpreted_turn(_response([original]))
-    reasoning_part, tool_call = turn.turn
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.raw == original.model_dump(mode="json", exclude_none=True)
-    assert tool_call == ToolCall(id="f", name="f", args_json='{"x": 1}')
+def _dump(part: types.Part) -> dict[str, JsonValue]:
+    """Dump a Part as the adapter stores it in ReasoningPart.raw and RawPart.raw."""
+    return part.model_dump(mode="json", exclude_none=True)
+
+
+_SIGNED_CALL = types.Part(
+    thought_signature=b"\x00\x01sig", function_call=types.FunctionCall(name="f", args={"x": 1})
+)
+# The signature is not valid UTF-8, so only a byte-preserving encoding in ReasoningPart.raw replays it.
+_SIGNED_ANSWER = types.Part(text="final answer", thought_signature=b"\x00\xffsig")
+_THOUGHT = types.Part(thought=True, text="thinking...")
+_EMPTY_TEXT_BESIDE_CODE = types.Part(
+    text="",
+    executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON),
+)
+
+
+class _ReadTurn(NamedTuple):
+    case_id: str
+    wire_parts: tuple[types.Part, ...]
+    turn: tuple[TurnPart, ...]
+
+
+_READ_TURNS = [
+    # ReasoningPart.raw preserves the signature bytes. ToolCall remains dispatchable.
+    _ReadTurn(
+        "signed_function_call",
+        (_SIGNED_CALL,),
+        (ReasoningPart(raw=_dump(_SIGNED_CALL)), ToolCall(id="f", name="f", args_json='{"x": 1}')),
+    ),
+    # Non-thought text carrying a signature stays readable as answer text.
+    _ReadTurn(
+        "signed_answer_text",
+        (_SIGNED_ANSWER,),
+        (ReasoningPart(raw=_dump(_SIGNED_ANSWER)), TextPart(text="final answer")),
+    ),
+    # Thought text reaches ReasoningPart.text and stays outside the answer text.
+    _ReadTurn(
+        "thought_text",
+        (_THOUGHT, types.Part(text="answer")),
+        (ReasoningPart(raw=_dump(_THOUGHT), text="thinking..."), TextPart(text="answer")),
+    ),
+    # Reading empty text as present rather than as non-empty would drop the whole part.
+    _ReadTurn(
+        "empty_text_beside_code",
+        (_EMPTY_TEXT_BESIDE_CODE,),
+        (RawPart(raw=_dump(_EMPTY_TEXT_BESIDE_CODE)),),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", _READ_TURNS, ids=[case.case_id for case in _READ_TURNS])
+def test_candidate_parts_read_into_the_turn_and_replay_as_themselves(case: _ReadTurn) -> None:
+    """Each wire part becomes its turn parts, and the turn replays the original wire parts."""
+    turn = _interpreted_turn(_response(case.wire_parts))
+    assert turn.turn == case.turn
     request = _built_request([UserMessage(content="go"), turn])
-    model_parts = request.contents[1].parts
-    assert model_parts == [original]
-
-
-def test_signed_answer_text_yields_a_reasoning_part_and_text_part() -> None:
-    """Non-thought text carrying a signature stays readable as answer text and replays signed."""
-    original = types.Part(text="final answer", thought_signature=b"sig")
-    turn = _interpreted_turn(_response([original]))
-    reasoning_part, text_part = turn.turn
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.text is None
-    assert text_part == TextPart(text="final answer")
-    assert turn.text == "final answer"
-    request = _built_request([UserMessage(content="go"), turn])
-    assert request.contents[1].parts == [original]
-
-
-def test_a_thought_part_replays_byte_identical() -> None:
-    """The signature bytes survive the JSON round trip through ReasoningPart.raw."""
-    original = types.Part(thought=True, text="reasoning", thought_signature=b"\x00\xffsig")
-    turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
-    request = _built_request([UserMessage(content="go"), turn])
-    model_parts = request.contents[1].parts
-    assert model_parts is not None
-    assert model_parts[0] == original
-    assert model_parts[0].thought_signature == b"\x00\xffsig"
-
-
-def test_an_executable_code_part_becomes_a_raw_part_and_replays_as_itself() -> None:
-    """An executable_code Part becomes RawPart and returns unchanged.
-
-    The billed raw part remains in the turn for replay.
-    """
-    original = types.Part(
-        executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
-    )
-    turn = _interpreted_turn(_response([original, types.Part(text="answer")]))
-    raw_part, text_part = turn.turn
-    assert raw_part.kind == "raw_part"
-    assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
-    assert text_part == TextPart(text="answer")
-    request = _built_request([UserMessage(content="go"), turn])
-    assert request.contents[1].parts == [original, types.Part(text="answer")]
-
-
-def test_an_empty_text_beside_a_payload_still_becomes_a_raw_part() -> None:
-    """A Part with empty text and executable_code becomes RawPart.
-
-    Reading that field as present rather than as non-empty drops the whole part.
-    """
-    original = types.Part(
-        text="",
-        executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON),
-    )
-    turn = _interpreted_turn(_response([original]))
-    (raw_part,) = turn.turn
-    assert raw_part.kind == "raw_part"
-    assert raw_part.raw == original.model_dump(mode="json", exclude_none=True)
-    request = _built_request([UserMessage(content="go"), turn])
-    assert request.contents[1].parts == [original]
-
-
-def test_thought_text_is_reasoning_part_text_and_not_output() -> None:
-    """Thought text reaches ReasoningPart.text and stays outside output."""
-    turn = _interpreted_turn(
-        _response([
-            types.Part(thought=True, text="thinking..."),
-            types.Part(text="answer"),
-        ])
-    )
-    reasoning_part = turn.turn[0]
-    assert reasoning_part.kind == "reasoning_part"
-    assert reasoning_part.text == "thinking..."
-    assert turn.text == "answer"
+    assert request.contents[1].parts == list(case.wire_parts)
 
 
 # --- as_json ---
@@ -1131,19 +1089,6 @@ def test_structured_binding_outcomes() -> None:
     assert "LANGUAGE" in unfinished.reason
 
 
-def test_structured_output_may_inherit_no_output() -> None:
-    """AdapterResult distinguishes successful output from NoOutput."""
-
-    class ReportAlsoNoOutput(BaseModel, NoOutput):
-        assistant_message: AssistantMessage = AssistantMessage(turn=())
-        value: int
-
-    bound = _adapter().bind_structured(_binding(), ReportAlsoNoOutput)
-    outcome = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert outcome.kind == "adapter_result"
-    assert outcome.output == ReportAlsoNoOutput(value=3)
-
-
 def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
     """Only non-thought text is the candidate instance."""
     bound = _adapter().bind_structured(_binding(), _Answer)
@@ -1191,185 +1136,147 @@ def test_the_usage_partition() -> None:
     assert billing.service_tier == "ON_DEMAND"
 
 
-def test_search_queries_deduplicate_across_candidates_and_ignore_empty_strings() -> None:
-    """Gemini bills unique nonempty Search queries across the complete response."""
-    first_candidate = types.Candidate(
-        content=types.Content(
-            role="model",
-            parts=_provider_call_parts(
-                tool_call_id="search-1",
-                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                queries=["first", "", "second"],
-            ),
-        ),
-        finish_reason=types.FinishReason.STOP,
+def _search_call(queries: object) -> list[types.Part]:
+    """Build one matched Google Search call and response pair."""
+    return _provider_call_parts(
+        tool_call_id="search-1", tool_type=types.ToolType.GOOGLE_SEARCH_WEB, queries=queries
     )
-    second_candidate = types.Candidate(
-        content=types.Content(
-            role="model",
-            parts=_provider_call_parts(
-                tool_call_id="search-2",
-                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                queries=["second", "third"],
-            ),
-        ),
-        finish_reason=types.FinishReason.STOP,
-    )
-    response = types.GenerateContentResponse(
-        candidates=[first_candidate, second_candidate],
-        usage_metadata=_usage_metadata(),
-        model_version="gemini-3.5-flash",
-        response_id="response-1",
-    )
-    usage = _billing_from_response(
-        response, _PRICING, configured_fields=frozenset({"google_search"})
-    ).usage
-    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(3 * 0.014)
 
 
-def test_mixed_search_and_maps_calls_use_separate_counting_rules() -> None:
-    """Search deduplicates queries while Maps counts every returned query entry."""
-    pricing = {
-        "ON_DEMAND": GeminiPricingTable(
-            rates=_ON_DEMAND_RATES,
-            google_search_usd_per_query=0.01,
-            google_maps_usd_per_query=0.02,
-        )
-    }
-    parts = [
-        *_provider_call_parts(
-            tool_call_id="search-1",
-            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-            queries=["same", "same", "different"],
-        ),
-        *_provider_call_parts(
-            tool_call_id="maps-1",
-            tool_type=types.ToolType.GOOGLE_MAPS,
-            queries=["same", "same", "different"],
-        ),
-    ]
-    usage = _billing_from_response(
-        _response(parts, usage_metadata=_usage_metadata()),
-        pricing,
-        configured_fields=frozenset({"google_search", "google_maps"}),
-    ).usage
-    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(2 * 0.01 + 3 * 0.02)
+class _ToolCost(NamedTuple):
+    case_id: str
+    response: types.GenerateContentResponse
+    configured_fields: frozenset[str]
+    cost_in_usd: float
+    pricing: Mapping[str, GeminiPricingTable] = _PRICING
+    billing_complete: bool = True
 
 
-def test_free_gemini_provider_tools_add_no_separate_fee() -> None:
-    """Code execution, URL context, and file search add no separate fee."""
-    parts = [
-        types.Part(
-            executable_code=types.ExecutableCode(
-                code="print(1)",
-                language=types.Language.PYTHON,
-            )
-        ),
-        *_provider_call_parts(
-            tool_call_id="url-1",
-            tool_type=types.ToolType.URL_CONTEXT,
-            queries=[],
-        ),
-        *_provider_call_parts(
-            tool_call_id="file-1",
-            tool_type=types.ToolType.FILE_SEARCH,
-            queries=[],
-        ),
-    ]
-    usage = _billing_from_response(
-        _response(parts, usage_metadata=_usage_metadata()),
-        _PRICING,
-        configured_fields=frozenset({"code_execution", "url_context", "file_search"}),
-    ).usage
-    assert usage.provider_executed_tool_cost_in_usd == 0.0
-
-
-def test_gemini_charged_tool_at_an_unpriced_tier_produces_nan() -> None:
-    """A charged query uses `_UNPRICED` for an unknown served tier."""
-    response = _response(
-        _provider_call_parts(
-            tool_call_id="search-1",
-            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-            queries=["query"],
-        ),
-        usage_metadata=_usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT),
-    )
-    usage = _billing_from_response(
-        response,
-        _PRICING,
-        configured_fields=frozenset({"google_search"}),
-    ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
-
-
-@pytest.mark.parametrize(
-    ("tool_type", "queries"),
-    [
-        (types.ToolType.GOOGLE_SEARCH_WEB, ["valid", 1]),
-        (types.ToolType.GOOGLE_SEARCH_WEB, "valid"),
-        (types.ToolType.GOOGLE_MAPS, [""]),
-        (types.ToolType.GOOGLE_MAPS, ["valid", 1]),
-    ],
-)
-def test_malformed_gemini_query_evidence_produces_nan(
-    tool_type: types.ToolType, queries: object
-) -> None:
-    """Unexpected query shapes cannot produce an exact provider-executed cost."""
-    field = "google_search" if tool_type == types.ToolType.GOOGLE_SEARCH_WEB else "google_maps"
-    usage = _billing_from_response(
+_TOOL_COSTS = [
+    # Gemini bills unique nonempty Search queries across the complete response.
+    _ToolCost(
+        "search_counts_unique_nonempty_queries",
+        _search_candidates_response([["first", "", "second"], ["second", "third"]]),
+        frozenset({"google_search"}),
+        3 * 0.014,
+    ),
+    # Search deduplicates queries while Maps counts every returned query entry.
+    _ToolCost(
+        "search_deduplicates_and_maps_counts_every_query",
         _response(
-            _provider_call_parts(tool_call_id="call-1", tool_type=tool_type, queries=queries),
+            [
+                *_search_call(["same", "same", "different"]),
+                *_provider_call_parts(
+                    tool_call_id="maps-1",
+                    tool_type=types.ToolType.GOOGLE_MAPS,
+                    queries=["same", "same", "different"],
+                ),
+            ],
             usage_metadata=_usage_metadata(),
         ),
-        _PRICING,
-        configured_fields=frozenset({field}),
-    ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
-
-
-def test_incomplete_gemini_tool_pair_produces_nan() -> None:
-    """A server call without its matching response is incomplete billing evidence."""
-    part = types.Part(
-        tool_call=types.ToolCall(
-            id="search-1",
-            tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-            args={"queries": ["query"]},
+        frozenset({"google_search", "google_maps"}),
+        2 * 0.01 + 3 * 0.02,
+        {
+            "ON_DEMAND": GeminiPricingTable(
+                rates=_ON_DEMAND_RATES,
+                google_search_usd_per_query=0.01,
+                google_maps_usd_per_query=0.02,
+            )
+        },
+    ),
+    # Code execution, URL context, and file search add no separate fee.
+    _ToolCost(
+        "free_provider_tools",
+        _response(
+            [
+                types.Part(
+                    executable_code=types.ExecutableCode(
+                        code="print(1)", language=types.Language.PYTHON
+                    )
+                ),
+                *_provider_call_parts(
+                    tool_call_id="url-1", tool_type=types.ToolType.URL_CONTEXT, queries=[]
+                ),
+                *_provider_call_parts(
+                    tool_call_id="file-1", tool_type=types.ToolType.FILE_SEARCH, queries=[]
+                ),
+            ],
+            usage_metadata=_usage_metadata(),
+        ),
+        frozenset({"code_execution", "url_context", "file_search"}),
+        0.0,
+    ),
+    # A charged query at a served tier no table prices costs NaN.
+    _ToolCost(
+        "unpriced_tier",
+        _response(
+            _search_call(["query"]),
+            usage_metadata=_usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT),
+        ),
+        frozenset({"google_search"}),
+        float("nan"),
+    ),
+    # Unexpected query shapes cannot produce an exact provider-executed cost.
+    *(
+        _ToolCost(
+            f"unexpected_{field}_queries_{queries!r}",
+            _response(
+                _provider_call_parts(tool_call_id="call-1", tool_type=tool_type, queries=queries),
+                usage_metadata=_usage_metadata(),
+            ),
+            frozenset({field}),
+            float("nan"),
         )
-    )
-    usage = _billing_from_response(
-        _response([part], usage_metadata=_usage_metadata()),
-        _PRICING,
-        configured_fields=frozenset({"google_search"}),
-    ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
-
-
-def test_mismatched_gemini_tool_pair_produces_nan() -> None:
-    """Server call and response identifiers and tool types must both match."""
-    parts = _provider_call_parts(
-        tool_call_id="search-1",
-        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-        queries=["query"],
-    )
-    assert parts[1].tool_response is not None
-    parts[1].tool_response.id = "search-2"
-    usage = _billing_from_response(
-        _response(parts, usage_metadata=_usage_metadata()),
-        _PRICING,
-        configured_fields=frozenset({"google_search"}),
-    ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
-
-
-def test_truncated_gemini_search_billing_produces_nan() -> None:
-    """A partial response cannot prove the final Search query count."""
-    usage = _billing_from_response(
+        for tool_type, field, queries in (
+            (types.ToolType.GOOGLE_SEARCH_WEB, "google_search", ["valid", 1]),
+            (types.ToolType.GOOGLE_SEARCH_WEB, "google_search", "valid"),
+            (types.ToolType.GOOGLE_MAPS, "google_maps", [""]),
+            (types.ToolType.GOOGLE_MAPS, "google_maps", ["valid", 1]),
+        )
+    ),
+    # A server call without its matching response is incomplete billing evidence.
+    _ToolCost(
+        "call_without_response",
+        _response(_search_call(["query"])[:1], usage_metadata=_usage_metadata()),
+        frozenset({"google_search"}),
+        float("nan"),
+    ),
+    # Server call and response identifiers must match.
+    _ToolCost(
+        "mismatched_call_and_response_ids",
+        _response(
+            _provider_call_parts(
+                tool_call_id="search-1",
+                tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
+                queries=["query"],
+                tool_response_id="search-2",
+            ),
+            usage_metadata=_usage_metadata(),
+        ),
+        frozenset({"google_search"}),
+        float("nan"),
+    ),
+    # A partial response cannot prove the final Search query count.
+    _ToolCost(
+        "partial_response",
         _response([], usage_metadata=_usage_metadata()),
-        _PRICING,
-        configured_fields=frozenset({"google_search"}),
+        frozenset({"google_search"}),
+        float("nan"),
         billing_complete=False,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", _TOOL_COSTS, ids=[case.case_id for case in _TOOL_COSTS])
+def test_provider_executed_tool_cost(case: _ToolCost) -> None:
+    """Search and Maps queries cost their per-query rate, and evidence that cannot prove a count costs NaN."""
+    usage = _billing_from_response(
+        case.response,
+        case.pricing,
+        configured_fields=case.configured_fields,
+        billing_complete=case.billing_complete,
     ).usage
-    assert math.isnan(usage.provider_executed_tool_cost_in_usd)
+    assert usage.provider_executed_tool_cost_in_usd == pytest.approx(case.cost_in_usd, nan_ok=True)
 
 
 def test_the_long_prompt_threshold_reprices_every_category() -> None:
@@ -1489,7 +1396,10 @@ def test_traffic_type_selects_the_table() -> None:
 
 
 def test_items_translate_parts_with_reasoning_separators() -> None:
-    """Thought text streams as deltas. Each part boundary emits a separator. Answer text streams bare."""
+    """Thought text streams as deltas. Each part boundary emits a separator. Answer text streams bare.
+
+    A signature ends a part across chunks, and a following entry of one chunk's list ends it within one.
+    """
     items = _drained(
         _gemini_stream([
             _response([types.Part(thought=True, text="think a")], finish_reason=None),
@@ -1497,7 +1407,13 @@ def test_items_translate_parts_with_reasoning_separators() -> None:
                 [types.Part(thought=True, text=" more", thought_signature=b"s1")],
                 finish_reason=None,
             ),
-            _response([types.Part(thought=True, text="part two")], finish_reason=None),
+            _response(
+                [
+                    types.Part(thought=True, text="part two"),
+                    types.Part(thought=True, text="three"),
+                ],
+                finish_reason=None,
+            ),
             _response(
                 [
                     types.Part(text="answer"),
@@ -1512,25 +1428,10 @@ def test_items_translate_parts_with_reasoning_separators() -> None:
         ReasoningDelta(text=" more"),
         ReasoningDelta(text=REASONING_PART_SEPARATOR),
         ReasoningDelta(text="part two"),
+        ReasoningDelta(text=REASONING_PART_SEPARATOR),
+        ReasoningDelta(text="three"),
         "answer",
         ToolCall(id="c1", name="f", args_json='{"x": 1}'),
-    ]
-
-
-def test_two_thought_parts_in_one_chunk_are_separated() -> None:
-    """Parts arriving as separate entries of one chunk's list are distinct parts."""
-    items = _drained(
-        _gemini_stream([
-            _response(
-                [types.Part(thought=True, text="one"), types.Part(thought=True, text="two")],
-                finish_reason=types.FinishReason.STOP,
-            )
-        ])
-    )
-    assert items == [
-        ReasoningDelta(text="one"),
-        ReasoningDelta(text=REASONING_PART_SEPARATOR),
-        ReasoningDelta(text="two"),
     ]
 
 
@@ -1582,7 +1483,7 @@ def test_a_blocked_prompt_stream_ends_cleanly_and_interprets_as_refusal() -> Non
     async def final() -> types.GenerateContentResponse:
         return await stream.final()
 
-    outcome = _adapter().bind_text(_binding()).interpret(asyncio.run(final()))
+    outcome = _adapter().bind_text(_binding()).interpret(run_with_timeout(final()))
     assert outcome.kind == "refusal"
 
 
@@ -1604,7 +1505,7 @@ def test_billing_reported_follows_usage_arrival() -> None:
         _ = [item async for item in items]
         return before, stream.billing_reported()
 
-    before, after = asyncio.run(scenario())
+    before, after = run_with_timeout(scenario())
     assert before is None
     assert after is not None
     assert after.billing.usage.output_tokens == 60
@@ -1625,15 +1526,7 @@ def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
             pricing=_PRICING,
             provider_tool_fields=frozenset({"google_search"}),
             first_chunk=_response(
-                [
-                    *_provider_call_parts(
-                        tool_call_id="search-1",
-                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                        queries=["query"],
-                    ),
-                    types.Part(text="partial"),
-                ],
-                finish_reason=None,
+                [*_search_call(["query"]), types.Part(text="partial")], finish_reason=None
             ),
         )
         items = stream.items()
@@ -1642,43 +1535,16 @@ def test_cutoff_gemini_provider_tool_billing_is_nan() -> None:
         await stream.close()
         return billing
 
-    billing = asyncio.run(scenario())
+    billing = run_with_timeout(scenario())
     assert billing is not None
     assert math.isnan(billing.billing.usage.provider_executed_tool_cost_in_usd)
 
 
 def test_stream_billing_collects_every_candidate_provider_query() -> None:
     """Stream billing collects Search queries from every candidate."""
-    response = types.GenerateContentResponse(
-        candidates=[
-            types.Candidate(
-                content=types.Content(
-                    role="model",
-                    parts=_provider_call_parts(
-                        tool_call_id="search-1",
-                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                        queries=["first"],
-                    ),
-                ),
-                finish_reason=types.FinishReason.STOP,
-            ),
-            types.Candidate(
-                content=types.Content(
-                    role="model",
-                    parts=_provider_call_parts(
-                        tool_call_id="search-2",
-                        tool_type=types.ToolType.GOOGLE_SEARCH_WEB,
-                        queries=["second"],
-                    ),
-                ),
-                finish_reason=types.FinishReason.STOP,
-            ),
-        ],
-        usage_metadata=_usage_metadata(),
-    )
 
     async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
-        yield response
+        yield _search_candidates_response([["first"], ["second"]])
 
     async def scenario() -> ProviderBilling | None:
         stream = _GeminiStream(
@@ -1689,7 +1555,7 @@ def test_stream_billing_collects_every_candidate_provider_query() -> None:
         _ = [item async for item in stream.items()]
         return stream.billing_reported()
 
-    billing = asyncio.run(scenario())
+    billing = run_with_timeout(scenario())
     assert billing is not None
     assert billing.billing.usage.provider_executed_tool_cost_in_usd == pytest.approx(0.028)
 
@@ -1711,52 +1577,66 @@ def test_close_closes_the_sdk_iterator() -> None:
         _ = await anext(items)
         await stream.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert closed
 
 
-def test_open_stream_performs_the_connection_io(monkeypatch: pytest.MonkeyPatch) -> None:
-    """open_stream pulls and preserves the first chunk."""
-    adapter = _adapter()
-    bound = adapter.bind_text(_binding())
-    request = bound.build_request([UserMessage(content="hi")])
-    assert isinstance(request, _GeminiRequestParams)
+def _bound_over(http_client: httpx.AsyncClient) -> BoundAdapter[str]:
+    """Bind for text over a client whose HTTP requests go to http_client."""
+    client = genai.Client(
+        api_key="offline",
+        vertexai=False,
+        http_options=types.HttpOptions(httpx_async_client=http_client),
+    )
+    return _adapter(client=client).bind_text(_binding())
 
-    async def failing_sdk_stream(
-        *, model: str, contents: object, config: object
-    ) -> AsyncIterator[types.GenerateContentResponse]:
-        assert (model, contents, config) == (request.model, request.contents, request.config)
 
-        async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
-            raise httpx.ConnectError("no route")
-            yield _response([])  # Unreachable. The yield makes chunks an async generator.
+_TWO_CHUNK_SSE_BODY = (
+    b'data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "he"}]}}]}\r\n\r\n'
+    b'data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "y"}]},'
+    b' "finishReason": "STOP"}]}\r\n\r\n'
+)
+"""A streamGenerateContent server-sent-event body of two chunks, the second finishing the turn."""
 
-        return chunks()
 
-    async def working_sdk_stream(
-        *, model: str, contents: object, config: object
-    ) -> AsyncIterator[types.GenerateContentResponse]:
-        assert (model, contents, config) == (request.model, request.contents, request.config)
+def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
+    """open_stream sends the built request to its model and pulls the first chunk.
 
-        async def chunks() -> AsyncIterator[types.GenerateContentResponse]:
-            yield _response([types.Part(text="he")], finish_reason=None)
-            yield _response([types.Part(text="y")])
+    A connection failure therefore raises from open_stream, and the stream still yields the pulled chunk first.
+    """
+    request = _built_request([UserMessage(content="hi")], _binding(temperature=0.5))
+    sent: list[tuple[str, object]] = []
 
-        return chunks()
+    def refuse(http_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=http_request)
 
-    async def scenario() -> list[StreamItem]:
-        monkeypatch.setattr(
-            adapter.client.aio.models, "generate_content_stream", failing_sdk_stream
+    def serve(http_request: httpx.Request) -> httpx.Response:
+        sent.append((http_request.url.path, json.loads(http_request.content)))
+        return httpx.Response(
+            200, content=_TWO_CHUNK_SSE_BODY, headers={"content-type": "text/event-stream"}
         )
-        with pytest.raises(httpx.ConnectError):
-            _ = await bound.open_stream(request)
-        monkeypatch.setattr(
-            adapter.client.aio.models, "generate_content_stream", working_sdk_stream
-        )
-        stream = await bound.open_stream(request)
-        return [item async for item in stream.items()]
 
-    assert asyncio.run(scenario()) == ["he", "y"]
+    async def open_refused() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(refuse)) as http_client:
+            with pytest.raises(httpx.ConnectError):
+                _ = await _bound_over(http_client).open_stream(request)
+
+    async def served_items() -> list[StreamItem]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as http_client:
+            stream = await _bound_over(http_client).open_stream(request)
+            return [item async for item in stream.items()]
+
+    run_with_timeout(open_refused())
+    assert run_with_timeout(served_items()) == ["he", "y"]
+    assert sent == [
+        (
+            "/v1beta/models/gemini-3.5-flash:streamGenerateContent",
+            {
+                "contents": [{"parts": [{"text": "hi"}], "role": "user"}],
+                "generationConfig": {"temperature": 0.5},
+            },
+        )
+    ]
 
 
 # --- conformance ---
@@ -1814,6 +1694,10 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
         return _reasoning_turn_response(
             _usage_metadata(prompt_token_count=100, cached_content_token_count=200)
         )
+
+    @override
+    def response_with_text(self, text: str) -> BaseModel:
+        return _response([types.Part(text=text)])
 
     @override
     def response_with_reasoning(self) -> BaseModel:

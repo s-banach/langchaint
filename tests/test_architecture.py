@@ -1,14 +1,19 @@
 """Verify dependency rules against temporary source files without importing them."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
-from scripts.check_architecture import check_architecture
+from scripts.check_architecture import LoadTimeExclusion, check_architecture
 
 
-def _check_dependencies(tmp_path: Path, files: Mapping[str, str]) -> int:
+def _check_dependencies(
+    tmp_path: Path,
+    files: Mapping[str, str],
+    *,
+    load_time_exclusions: Sequence[LoadTimeExclusion] = (),
+) -> int:
     package = tmp_path / "src" / "langchaint"
     package.mkdir(parents=True)
     _ = (package / "__init__.py").write_text("")
@@ -20,7 +25,7 @@ def _check_dependencies(tmp_path: Path, files: Mapping[str, str]) -> int:
                 break
             (directory / "__init__.py").touch()
         _ = path.write_text(source)
-    return check_architecture(project_root=tmp_path)
+    return check_architecture(project_root=tmp_path, load_time_exclusions=load_time_exclusions)
 
 
 @pytest.mark.parametrize(
@@ -187,3 +192,89 @@ def test_architecture_ignores_external_imports(
     )
     output = capsys.readouterr()
     assert result == 0, output.out + output.err
+
+
+_NEW_A_EXCLUDES_NUMPY = (LoadTimeExclusion(entry="langchaint.new_a", excluded=("numpy",)),)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"new_a.py": "import numpy\n"},
+        {"new_a.py": "from numpy.linalg import norm\n"},
+        {"new_a.py": "import langchaint.new_b\n", "new_b.py": "import numpy\n"},
+        {
+            "new_a.py": "import langchaint.generation.b\n",
+            "generation/__init__.py": "import numpy\n",
+            "generation/b.py": "",
+        },
+        {"new_a.py": "try:\n    import numpy\nexcept ImportError:\n    pass\n"},
+        {"new_a.py": "class Holder:\n    import numpy\n"},
+        {
+            "new_a.py": "from langchaint.new_b import Deferred\n",
+            "new_b.py": "def __getattr__(name):\n    import numpy\n    return numpy\n",
+        },
+        {
+            "new_a.py": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    pass\nelse:\n    import numpy\n"
+        },
+    ],
+    ids=[
+        "direct",
+        "submodule",
+        "indirect",
+        "parent-package",
+        "try",
+        "class-body",
+        "module-getattr",
+        "type-checking-else",
+    ],
+)
+def test_architecture_rejects_excluded_modules_loaded_at_import(
+    tmp_path: Path, files: Mapping[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reject an excluded module that importing the entry module loads through any chain of top-level imports."""
+    result = _check_dependencies(tmp_path, files, load_time_exclusions=_NEW_A_EXCLUDES_NUMPY)
+    output = capsys.readouterr()
+    assert result != 0, output.out + output.err
+    assert "Excluded load-time import: importing langchaint.new_a loads numpy" in output.err
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"new_a.py": "def load():\n    import numpy\n"},
+        {"new_a.py": "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import numpy\n"},
+        {"new_a.py": "import typing\nif typing.TYPE_CHECKING:\n    import numpy\n"},
+        {"new_a.py": "def load():\n    import langchaint.new_b\n", "new_b.py": "import numpy\n"},
+        {"new_a.py": "", "new_b.py": "import langchaint.new_a\nimport numpy\n"},
+        {
+            "new_a.py": "import langchaint.new_b\n",
+            "new_b.py": "def __getattr__(name):\n    import numpy\n    return numpy\n",
+        },
+    ],
+    ids=[
+        "function-local",
+        "type-checking",
+        "typing-type-checking",
+        "deferred-internal",
+        "importer-of-entry",
+        "module-getattr-unused",
+    ],
+)
+def test_architecture_accepts_excluded_modules_not_loaded_at_import(
+    tmp_path: Path, files: Mapping[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Accept excluded modules that only deferred code or other modules import."""
+    result = _check_dependencies(tmp_path, files, load_time_exclusions=_NEW_A_EXCLUDES_NUMPY)
+    output = capsys.readouterr()
+    assert result == 0, output.out + output.err
+
+
+def test_architecture_rejects_an_unknown_load_time_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Fail visibly when an exclusion names an entry module that does not exist."""
+    result = _check_dependencies(tmp_path, {}, load_time_exclusions=_NEW_A_EXCLUDES_NUMPY)
+    output = capsys.readouterr()
+    assert result != 0
+    assert "Unknown load-time entry: langchaint.new_a" in output.err

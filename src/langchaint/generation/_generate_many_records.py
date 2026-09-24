@@ -16,11 +16,6 @@ from pydantic import ConfigDict, Field, TypeAdapter, ValidationError, model_vali
 from langchaint.common.checked_copy import CheckedCopyModel
 from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
-from langchaint.generation.errors import (
-    AuthErrorRecord,
-    RetriesExhaustedErrorRecord,
-    TimedOutErrorRecord,
-)
 from langchaint.generation.response import CallResultRecord
 
 _RESUME_FORMAT_VERSION = 1
@@ -129,6 +124,21 @@ def claim_resume_path(resolved_resume_path: Path) -> Generator[None]:
             _CLAIMED_RESUME_PATHS.remove(resolved_resume_path)
 
 
+def _regenerates[OutputT](result_record: CallResultRecord[OutputT] | None) -> bool:
+    """Report whether a resumed call generates this entry again.
+
+    An entry without a record was never generated.
+    Retry exhaustion, a timeout, and an auth failure can end differently when a later call sends the same request.
+    """
+    if result_record is None:
+        return True
+    match result_record.kind:
+        case "retries_exhausted_error" | "timed_out_error" | "auth_error":
+            return True
+        case _:
+            return False
+
+
 class ResumeState[OutputT]:
     """Hold one validated document while generated records replace pending entries."""
 
@@ -143,13 +153,7 @@ class ResumeState[OutputT]:
         self._document = document
         self._document_adapter = document_adapter
         self._pending_index_set = {
-            index
-            for index, item in enumerate(document.items)
-            if item.result_record is None
-            or isinstance(
-                item.result_record,
-                (RetriesExhaustedErrorRecord, TimedOutErrorRecord, AuthErrorRecord),
-            )
+            index for index, item in enumerate(document.items) if _regenerates(item.result_record)
         }
 
     def pending_indices(self) -> tuple[int, ...]:

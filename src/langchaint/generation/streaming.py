@@ -27,22 +27,25 @@ from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import Message
 from langchaint.concurrency.shared_backoff import (
     Admission,
-    PauseAll,
     PrivateBackoff,
-    RetryThisOne,
     SharedBackoff,
     Verdict,
 )
+from langchaint.failure_step import (
+    _failure_step,
+    _FailureStep,
+    _RetryStep,
+    _transient_error_for_step,
+)
 from langchaint.generation.call import _CallLedger
 from langchaint.generation.errors import (
-    _PROVIDER_ANSWERED_CLASSIFICATIONS,
     AbandonedCallErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
     RetriesExhaustedErrorRecord,
     RetryUnavailableErrorRecord,
     TimedOutErrorRecord,
-    _terminal_error_record,
+    _terminal_generation_error,
 )
 from langchaint.generation.response import (
     CallResult,
@@ -118,7 +121,8 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         """
         self._adapter_stream: AdapterStream | None = None
         self._items: AsyncIterator[StreamItem] | None = None
-        self._ledger = _CallLedger(model=adapter.model, provider_name=adapter.provider_name)
+        self._ledger: _CallLedger
+        """Built by `__aenter__`, which starts the call."""
         self._admission: Admission | None = None
         self._ended_at_monotonic_seconds: float | None = None
         self._conclusion: GenerateResult[OutputT] | Exception | None = None
@@ -144,7 +148,9 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         self._state = "open"
         self._deadline = asyncio.timeout(self._timeout_seconds)
         await self._deadline.__aenter__()
-        self._ledger.start_call()
+        self._ledger = _CallLedger(
+            model=self._adapter.model, provider_name=self._adapter.provider_name
+        )
         try:
             await self._open_stream_with_retries()
         except BaseException as exc:
@@ -269,46 +275,18 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         finally:
             _ = await self._exit_admission(None)
 
-    def _transient_error(
-        self, exc: Exception, message: str, verdict: Verdict | None
-    ) -> TransientError:
-        """Wrap one attempt failure as the TransientError its attempt record carries.
+    def _step_after_failure(self, exc: Exception, verdict: Verdict | None) -> _FailureStep:
+        """Note the failed attempt's request id and decide how the call continues."""
+        request_id = self._adapter.request_id_from_error(exc)
+        if request_id is None and self._adapter_stream is not None:
+            request_id = self._adapter_stream.request_id()
+        self._ledger.note_request_id(request_id)
+        return _failure_step(exc, verdict=verdict, classify=self._adapter.classify)
 
-        Return an existing `TransientError` unchanged.
-        This preserves its `retry_after_seconds`, `is_rate_limit`, and message.
-        """
-        if isinstance(exc, TransientError):
-            return exc
-        match verdict:
-            case PauseAll(retry_after=retry_after):
-                wrapped = TransientError(
-                    message, retry_after_seconds=retry_after, is_rate_limit=True
-                )
-            case RetryThisOne(retry_after=retry_after):
-                wrapped = TransientError(message, retry_after_seconds=retry_after)
-            case _:
-                wrapped = TransientError(message)
-        wrapped.__cause__ = exc
-        return wrapped
+    async def _backoff_or_exhaust(self, exc: Exception, step: _RetryStep) -> None:
+        """Wait before the next open attempt, as `step` asks.
 
-    def _record_transient_error(
-        self, wrapped: TransientError, billing: ProviderBilling | None = None
-    ) -> None:
-        """Record one transient failure as an attempt.
-
-        The `admitted()` block already recorded the failure's verdict.
-        A rate limit pauses every request using this `SharedBackoff`.
-        This stream may still lack a safe retry.
-        `billing` is the provider-reported attempt billing.
-        """
-        self._ledger.record(error=wrapped, assistant_message=None, billing=billing)
-
-    async def _backoff_or_exhaust(self, exc: Exception, verdict: Verdict | None) -> None:
-        """Wait before the next open attempt, as the failure's verdict asks.
-
-        `PauseAll` relies on the next `admitted()` wait.
-        Every other failure waits for `PrivateBackoff`.
-        `RetryThisOne.retry_after` sets that wait's floor.
+        `_RetryAfterSharedPause` relies on the next `admitted()` wait.
 
         Raises:
             GenerationError: the recorded failure spent the last attempt.
@@ -319,55 +297,8 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 request=self._request,
                 provider_attempts=self._ledger.provider_attempts,
             ) from exc
-        match verdict:
-            case PauseAll():
-                return
-            case RetryThisOne(retry_after=retry_after):
-                await asyncio.sleep(self._private_backoff.next_wait(retry_after))
-            case _:
-                await asyncio.sleep(self._private_backoff.next_wait(None))
-
-    def _terminal_error_or_none(
-        self,
-        exc: Exception,
-        *,
-        verdict: Verdict | None,
-        stream_billing: ProviderBilling | None,
-    ) -> GenerationError | None:
-        """Map one attempt failure to its terminal error.
-
-        Record `stream_billing` when the stream reached the provider.
-        """
-        request_id = self._adapter.request_id_from_error(exc)
-        if request_id is None and self._adapter_stream is not None:
-            request_id = self._adapter_stream.request_id()
-        self._ledger.note_request_id(request_id)
-        if verdict is not None:
-            if verdict.kind not in ("do_not_retry", "pause_all_do_not_retry"):
-                return None
-        elif isinstance(exc, TransientError) or self._adapter.classify(exc) == "transient":
-            return None
-        # `PauseAllDoNotRetry` becomes `declared_final` without `classify()`.
-        # A provider directive states this request will not succeed.
-        # `GenerationError` names that outcome.
-        # `classify()` could otherwise return `invalid_request` for status 429.
-        classification = (
-            "declared_final"
-            if verdict is not None and verdict.kind == "pause_all_do_not_retry"
-            else self._adapter.classify(exc)
-        )
-        if (
-            classification in _PROVIDER_ANSWERED_CLASSIFICATIONS
-            or self._adapter_stream is not None
-        ):
-            self._ledger.record(error=None, assistant_message=None, billing=stream_billing)
-        return GenerationError(
-            record=_terminal_error_record(
-                classification, reason=str(exc), call=self._ledger.freeze()
-            ),
-            request=self._request,
-            provider_attempts=self._ledger.provider_attempts,
-        )
+        if step.kind == "retry_after_private_wait":
+            await asyncio.sleep(self._private_backoff.next_wait(step.retry_after))
 
     def __aiter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
         """Return `self` because the handle is its own iterator."""
@@ -403,12 +334,20 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             try:
                 opened = await self._bound_adapter.open_stream(request)
             except Exception as exc:
-                verdict = await self._exit_admission(exc)
-                terminal = self._terminal_error_or_none(exc, verdict=verdict, stream_billing=None)
-                if terminal is not None:
-                    raise terminal from exc
-                self._record_transient_error(self._transient_error(exc, str(exc), verdict))
-                await self._backoff_or_exhaust(exc, verdict)
+                step = self._step_after_failure(exc, await self._exit_admission(exc))
+                if step.kind == "terminal":
+                    raise _terminal_generation_error(
+                        step,
+                        reason=str(exc),
+                        ledger=self._ledger,
+                        billing=None,
+                        request=request,
+                        stream_opened=self._adapter_stream is not None,
+                    ) from exc
+                self._ledger.record(
+                    error=_transient_error_for_step(exc, str(exc), step), assistant_message=None
+                )
+                await self._backoff_or_exhaust(exc, step)
                 continue
             except BaseException:
                 # `CancelledError` is a `BaseException` that the clause above does not catch.
@@ -467,17 +406,22 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             raise
         except Exception as exc:
             stream_billing = self._billing_reported()
-            verdict = await self._exit_admission(exc)
-            terminal = self._terminal_error_or_none(
-                exc, verdict=verdict, stream_billing=stream_billing
-            )
-            if terminal is not None:
+            step = self._step_after_failure(exc, await self._exit_admission(exc))
+            if step.kind == "terminal":
+                terminal = _terminal_generation_error(
+                    step,
+                    reason=str(exc),
+                    ledger=self._ledger,
+                    billing=stream_billing,
+                    request=self._request,
+                    stream_opened=self._adapter_stream is not None,
+                )
                 await self._close_adapter_stream()
                 raise terminal from exc
-            wrapped = self._transient_error(
-                exc, f"open stream failed during iteration: {exc}", verdict
+            wrapped = _transient_error_for_step(
+                exc, f"open stream failed during iteration: {exc}", step
             )
-            self._record_transient_error(wrapped, stream_billing)
+            self._ledger.record(error=wrapped, assistant_message=None, billing=stream_billing)
             await self._close_adapter_stream()
             raise GenerationError(
                 record=RetryUnavailableErrorRecord(call=self._ledger.freeze()),

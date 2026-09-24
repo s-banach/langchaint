@@ -13,6 +13,7 @@ import pytest
 import tiktoken
 from openai import AsyncOpenAI
 
+import langchaint
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.concurrency.shared_backoff import PrivateBackoff
 from langchaint.openai import OpenAI
@@ -20,6 +21,7 @@ from langchaint.openai.embedding_adapter import (
     _OpenAIEmbeddingAdapter,
     _partition_inputs_sync,
 )
+from tests.helpers import run_with_timeout
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> AsyncOpenAI:
@@ -75,7 +77,7 @@ def test_third_generation_models_accept_dimension_boundaries(
     openai = OpenAI(client=client)
     embedding_model = openai.embedding_model(model, dimension=dimension)
     assert embedding_model.dimension == dimension
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 @pytest.mark.parametrize(
@@ -98,7 +100,7 @@ def test_third_generation_models_reject_invalid_dimensions(
     openai = OpenAI(client=client)
     with pytest.raises(ValueError, match="dimension"):
         _ = openai.embedding_model(model, dimension=dimension)
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 def test_embedding_model_defaults_and_ada_dimension() -> None:
@@ -108,7 +110,7 @@ def test_embedding_model_defaults_and_ada_dimension() -> None:
     assert openai.embedding_model("text-embedding-3-small").dimension == 1536
     assert openai.embedding_model("text-embedding-3-large").dimension == 3072
     assert openai.embedding_model("text-embedding-ada-002").dimension == 1536
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 def test_embedding_model_performs_no_tokenizer_loading(
@@ -124,7 +126,7 @@ def test_embedding_model_performs_no_tokenizer_loading(
     monkeypatch.setattr(tiktoken, "get_encoding", reject_loading)
     model = openai.embedding_model("text-embedding-3-small")
     assert model.dimension == 1536
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -135,7 +137,29 @@ def test_embedding_model_names_missing_tiktoken(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setitem(sys.modules, "tiktoken", None)
     with pytest.raises(ModuleNotFoundError, match=r"langchaint\[openai-embedding\]"):
         _ = openai.embedding_model("text-embedding-3-small")
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
+
+
+def test_embedding_apis_name_the_install_for_missing_numpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Name each supported install when numpy is unavailable."""
+    client = _client(lambda _request: _response([[1.0]]))
+    openai = OpenAI(client=client)
+    monkeypatch.delitem(sys.modules, "langchaint.embedding", raising=False)
+    monkeypatch.delitem(sys.modules, "langchaint.openai.embedding_adapter", raising=False)
+    monkeypatch.setitem(sys.modules, "numpy", None)
+    with pytest.raises(
+        ModuleNotFoundError,
+        match=r"^langchaint embeddings require the numpy package; install numpy\.$",
+    ):
+        _ = langchaint.EmbeddingModel
+    with pytest.raises(
+        ModuleNotFoundError,
+        match=r"^OpenAI embeddings require numpy and tiktoken; install langchaint\[openai-embedding\]\.$",
+    ):
+        _ = openai.embedding_model("text-embedding-3-small")
+    run_with_timeout(client.close())
 
 
 def test_request_maps_inputs_model_dimension_and_encoding() -> None:
@@ -157,7 +181,7 @@ def test_request_maps_inputs_model_dimension_and_encoding() -> None:
         _ = await adapter.embed_batch(("first", "second"), task="clustering")
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert request_bodies == [
         {
             "input": ["first", "second"],
@@ -183,7 +207,7 @@ def test_ada_request_omits_dimensions() -> None:
         _ = await model.embed(["text"], task="classification")
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert "dimensions" not in request_bodies[0]
     assert request_bodies[0]["encoding_format"] == "float"
 
@@ -202,7 +226,7 @@ def test_response_indexes_restore_order_and_output_storage_invariants() -> None:
         await client.close()
         return vectors
 
-    vectors = asyncio.run(scenario())
+    vectors = run_with_timeout(scenario())
     np.testing.assert_allclose(vectors, [[0.0, 1.0], [0.6, 0.8]])
     assert vectors.dtype == np.float32
     assert vectors.flags.c_contiguous
@@ -234,7 +258,7 @@ def test_response_rejects_invalid_indexes(indexes: list[int]) -> None:
             _ = await adapter.embed_batch(("first", "second"), task="clustering")
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 @pytest.mark.parametrize(
@@ -267,7 +291,7 @@ def test_response_rejects_invalid_data_shapes(data: object) -> None:
             _ = await adapter.embed_batch(("text",), task="clustering")
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_partition_splits_at_input_count_limit() -> None:
@@ -296,7 +320,7 @@ def test_partition_uses_cl100k_base(monkeypatch: pytest.MonkeyPatch) -> None:
         assert batches == (("text",),)
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert encoding_names == ["cl100k_base"]
 
 
@@ -355,7 +379,7 @@ def test_empty_input_string_fails_before_sdk_request() -> None:
             _ = await model.embed(["valid", ""], task="retrieval_document")
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert request_count == 0
 
 
@@ -390,7 +414,7 @@ def test_transport_failure_retries_the_failed_batch(
         assert vectors.tolist() == [[1.0]]
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
     assert request_count == 2
 
 
@@ -440,4 +464,4 @@ def test_partition_cancellation_waits_for_token_counting(
             _ = await embedding_task
         await client.close()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())

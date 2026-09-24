@@ -39,7 +39,7 @@ from langchaint.span_parsing import (
 )
 from langchaint.tools import JSONSchemaTool, ToolManager, ToolSchema
 from scripts import refresh_semconv_genai
-from tests.test_bound_llm import _FakeAdapter
+from tests.fake_adapter import FakeAdapter
 
 SEMCONV_DIRECTORY = pathlib.Path(__file__).parent / "semconv_genai"
 _VALID_AND_INVALID_VALUE_BY_OTEL_TYPE: dict[str, tuple[JsonValue, JsonValue]] = {
@@ -563,7 +563,7 @@ def test_leading_system_message_supplies_the_binding_system_prompt(
     if empty_system_instructions:
         attributes["gen_ai.system_instructions"] = list[JsonValue]()
     parsed = parse_otel(_chat_span(attributes))
-    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
     assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
     assert generation_input_from_otel(parsed) == (
         UserMessage(content=(TextPart(text="Question"),)),
@@ -585,7 +585,7 @@ def test_rejects_combined_system_instructions_and_system_message() -> None:
     with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
         _ = generation_input_from_otel(parsed)
     with pytest.raises(OtelToLangchaintConversionError, match="both provide the system prompt"):
-        _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+        _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
 @pytest.mark.parametrize(
@@ -621,7 +621,7 @@ def test_rejects_system_message_position_and_cardinality(
     with pytest.raises(OtelToLangchaintConversionError, match=error_match):
         _ = generation_input_from_otel(parsed)
     with pytest.raises(OtelToLangchaintConversionError, match=error_match):
-        _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+        _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
 @pytest.mark.parametrize(
@@ -726,7 +726,7 @@ def test_reconstructs_provider_neutral_binding_fields() -> None:
             "gen_ai.request.temperature": 0.25,
         })
     )
-    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
     assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
     assert bound_llm.binding.max_completion_tokens == 200
     assert bound_llm.binding.reasoning_level == "high"
@@ -739,7 +739,7 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _chat_span({"gen_ai.provider.name": "other", "gen_ai.request.model": "fake-model"})
     )
     with pytest.raises(ValueError, match="provider_name"):
-        _ = reconstruct_bound_llm(parsed, llm=LLM(_FakeAdapter()))
+        _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
 def test_reconstructs_text_response_record_and_synthetic_fields() -> None:
@@ -1036,7 +1036,7 @@ def test_reconstruction_reads_each_tool_schema_once(*, use_tool_manager: bool) -
     tool = _CountingTool()
     tools = ToolManager([tool]) if use_tool_manager else [tool]
     span = _successful_chat_span({"gen_ai.tool.definitions": [_captured_tool_definition()]})
-    bound_llm = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+    bound_llm = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()), tools=tools)
     if isinstance(tools, ToolManager):
         assert bound_llm.tool_manager is tools
     assert bound_llm.binding.tool_schemas == (
@@ -1072,7 +1072,7 @@ def test_reconstruction_rejects_tool_schema_mismatch(
             ]
         })
     with pytest.raises(OtelToLangchaintConversionError, match="differs"):
-        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+        _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()), tools=tools)
 
 
 def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
@@ -1084,7 +1084,7 @@ def test_reconstruction_rejects_duplicate_captured_tool_names() -> None:
         ]
     })
     with pytest.raises(OtelToLangchaintConversionError, match="duplicate"):
-        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=None)
+        _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()), tools=None)
 
 
 @pytest.mark.parametrize(
@@ -1110,10 +1110,10 @@ def test_reconstruction_applies_tool_definition_presence_contract(
     elif definitions == []:
         span = span.model_copy(update={"tool_definitions": ()})
     if accepted:
-        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+        _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()), tools=tools)
     else:
         with pytest.raises(OtelToLangchaintConversionError, match="differs"):
-            _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()), tools=tools)
+            _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()), tools=tools)
 
 
 def test_reconstruction_binds_structured_response_model() -> None:
@@ -1121,7 +1121,7 @@ def test_reconstruction_binds_structured_response_model() -> None:
     span = _successful_chat_span({"gen_ai.output.type": "json"})
     bound_llm = reconstruct_bound_llm(
         span,
-        llm=LLM(_FakeAdapter()),
+        llm=LLM(FakeAdapter()),
         response_format=_StructuredResponse,
     )
     assert_type(bound_llm, BoundLLM[_StructuredResponse, None])
@@ -1143,7 +1143,7 @@ def test_reconstruction_rejects_response_format_mismatch(
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = reconstruct_bound_llm(
             span,
-            llm=LLM(_FakeAdapter()),
+            llm=LLM(FakeAdapter()),
             response_format=response_format,
         )
 
@@ -1153,4 +1153,4 @@ def test_reconstruction_rejects_unsupported_output_type(output_type: str) -> Non
     """Binding reconstruction rejects unsupported output types."""
     span = _successful_chat_span({"gen_ai.output.type": output_type})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = reconstruct_bound_llm(span, llm=LLM(_FakeAdapter()))
+        _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()))

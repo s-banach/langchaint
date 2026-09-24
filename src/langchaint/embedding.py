@@ -24,13 +24,14 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import ErrorClassification
-from langchaint.common.exceptions import EmbeddingOutputError
+from langchaint.common.exceptions import EmbeddingOutputError, ParserContractError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
 )
+from langchaint.failure_step import _failure_step
 
 type EmbeddingTask = Literal[
     "retrieval_document",
@@ -85,7 +86,7 @@ class _EmbeddingAdapter(Protocol):
         ...
 
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify an exception outside `failure_types`."""
+        """Classify a failure that reached no verdict or a `DoNotRetry` verdict."""
         ...
 
 
@@ -163,9 +164,13 @@ class EmbeddingModel:
     ) -> Float2D:
         """Run one request batch through its retry budget.
 
+        `_failure_step` decides whether a failed attempt retries.
+        A failure outside the `SharedBackoff.failure_types` reaches no verdict, so `classify` decides it.
+
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
-            Exception: A provider request failed terminally.
+            ParserContractError: `SharedBackoff.parse` violates its contract.
+            Exception: A provider request failed terminally or spent the last attempt.
         """
         private_backoff = PrivateBackoff(self._shared_backoff)
         attempt_index = 0
@@ -175,23 +180,19 @@ class EmbeddingModel:
             try:
                 async with admission:
                     return await self._adapter.embed_batch(inputs, task=task)
-            except self._adapter.failure_types:
-                verdict = admission.verdict
-                if verdict is not None and verdict.kind in (
-                    "do_not_retry",
-                    "pause_all_do_not_retry",
-                ):
-                    raise
-                if attempt_index == self.max_attempts:
-                    raise
-                if verdict is not None and verdict.kind == "retry_this_one":
-                    await asyncio.sleep(private_backoff.next_wait(verdict.retry_after))
+            except ParserContractError:
+                raise
             except Exception as error:
-                if self._adapter.classify(error) != "transient":
+                # The block's exit set a verdict only when `error` is one of `failure_types`.
+                step = _failure_step(
+                    error,
+                    verdict=admission.verdict,
+                    classify=self._adapter.classify,
+                )
+                if step.kind == "terminal" or attempt_index == self.max_attempts:
                     raise
-                if attempt_index == self.max_attempts:
-                    raise
-                await asyncio.sleep(private_backoff.next_wait(None))
+                if step.kind == "retry_after_private_wait":
+                    await asyncio.sleep(private_backoff.next_wait(step.retry_after))
 
     async def embed(
         self,
@@ -212,7 +213,8 @@ class EmbeddingModel:
             ValueError: An input cannot form a provider request.
             EmbeddingOutputError: A successful response contains invalid vectors.
             asyncio.CancelledError: The caller cancelled this operation.
-            Exception: A provider request failed terminally.
+            ParserContractError: `SharedBackoff.parse` violates its contract.
+            Exception: A provider request failed terminally or spent the last attempt.
         """
         if isinstance(inputs, str):
             raise TypeError("inputs is a bare str; wrap one input in a list")

@@ -76,12 +76,13 @@ Callers stop retrying this request for either verdict.
 """
 
 
-def _random_up_to(ceiling: float) -> float:
-    """Draw a wait greater than zero and no larger than ceiling.
+def _random_up_to(ceiling: float, draw: float) -> float:
+    """Map `draw` from `[0, 1)` to a wait greater than zero and no larger than ceiling.
 
-    `1 - random.random()` lies in `(0, 1]`, so the pause is never zero.
+    Callers pass `random.random()` as `draw`.
+    `1 - draw` lies in `(0, 1]`, so the wait is never zero.
     """
-    return ceiling * (1.0 - random.random())
+    return ceiling * (1.0 - draw)
 
 
 def _validated_positive_float(name: str, value: float) -> float:
@@ -533,7 +534,7 @@ class SharedBackoff:
         """
         if verdict.retry_after is not None:
             return verdict.retry_after
-        return _random_up_to(self._wait_ceiling)
+        return _random_up_to(self._wait_ceiling, random.random())
 
     def _set_wait_ceiling(self, now: float, previous_pause_end: float) -> None:
         """Set _wait_ceiling from activity since previous_pause_end.
@@ -586,7 +587,7 @@ class PrivateBackoff:
         `retry_after` raises that wait when present.
         The normalized `retry_after` is capped at `longest_wait_seconds`.
         """
-        wait = _random_up_to(self._ceiling)
+        wait = _random_up_to(self._ceiling, random.random())
         if retry_after is not None:
             wait = max(wait, retry_after)
         self._ceiling = min(self._ceiling * self._wait_multiplier, self._longest_wait_seconds)

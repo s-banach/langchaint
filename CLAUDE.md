@@ -145,6 +145,7 @@ Document every public parameter and cross-provider difference.
 - `concurrency/shared_backoff.py`: request admission for one rate-limit quota.
 - `common/exceptions.py`: basic shared exceptions without langchaint imports.
 - `generation/errors.py`: normalized generation error records and live generation failures.
+- `failure_step.py`: the retry decision after a failed attempt, shared by generation and embedding.
 - `generation/response.py`: generation results and normalized result records.
 - `generation/tables.py`: tabular call and attempt views.
 - `generation/call.py`: attempt records, immutable call history, and retry accounting.

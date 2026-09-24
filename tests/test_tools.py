@@ -30,6 +30,7 @@ from langchaint import (
     tool,
 )
 from langchaint.tools import _details_from_pydantic, render_invalid_tool_args, render_unknown_tool
+from tests.helpers import run_with_timeout
 
 if TYPE_CHECKING:
     from jsonschema.protocols import Validator
@@ -124,7 +125,7 @@ def test_tool_decorator_infers_metadata_and_preserves_types() -> None:
     )
     assert _decorated_echo.args_model is _EchoArgs
     assert _decorated_record_echo.name == "record_echo"
-    outcome = asyncio.run(
+    outcome = run_with_timeout(
         _decorated_record_echo.dispatch(
             ToolCall(id="call_decorated", name="record_echo", args_json='{"text":"tide"}')
         )
@@ -179,14 +180,14 @@ def test_tool_decorator_rejects_a_callable_instance() -> None:
 
 def test_validate_and_run_returns_the_function_result() -> None:
     """Valid args_json reaches the function as the validated model."""
-    result = asyncio.run(_echo_tool().validate_and_run('{"text": "tide"}'))
+    result = run_with_timeout(_echo_tool().validate_and_run('{"text": "tide"}'))
     assert result == "tide"
 
 
 def test_invalid_tool_args_holds_the_validation_error() -> None:
     """InvalidToolArgsError preserves ValidationError and readable text."""
     with pytest.raises(InvalidToolArgsError) as caught:
-        _ = asyncio.run(_echo_tool().validate_and_run('{"wrong": "key"}'))
+        _ = run_with_timeout(_echo_tool().validate_and_run('{"wrong": "key"}'))
     error = caught.value
     assert isinstance(error.validation_error, ValidationError)
     assert any("text" in entry["loc"] for entry in error.validation_error.errors())
@@ -244,7 +245,7 @@ def test_render_invalid_tool_args_rejects_empty_details() -> None:
 def test_dispatch_wraps_success_in_a_tool_message() -> None:
     """A valid call comes back as a DispatchHandled non-error ToolMessage with the call id."""
     call = ToolCall(id="call1", name="echo", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
+    result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     assert result.kind == "handled"
     assert result.tool_message.tool_call_id == "call1"
     assert result.tool_message.content == "tide"
@@ -269,7 +270,7 @@ def test_dispatch_carries_content_parts_into_tool_message_content() -> None:
         function=_content_parts_function,
     )
     call = ToolCall(id="call1", name="render", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
+    result = run_with_timeout(ToolManager([tool]).dispatch(call))
     assert result.kind == "handled"
     assert result.tool_message.content == (
         TextPart(text="tide"),
@@ -284,7 +285,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
     """PydanticTool renders and stores converted validation details."""
     args_json = '{"wrong": "key"}'
     call = ToolCall(id="call1", name="echo", args_json=args_json)
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
+    result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     match result:
         case DispatchInvalidToolArgs():
             assert result.tool_message.is_error is True
@@ -302,7 +303,7 @@ def test_dispatch_delegates_invalid_args_content_to_the_renderer() -> None:
 def test_dispatch_returns_unknown_tool_variant_for_off_list_name() -> None:
     """An unknown tool name returns DispatchUnknownTool."""
     call = ToolCall(id="call1", name="missing", args_json="{}")
-    result = asyncio.run(ToolManager([_echo_tool()]).dispatch(call))
+    result = run_with_timeout(ToolManager([_echo_tool()]).dispatch(call))
     assert result.kind == "unknown_tool"
     assert result.called_name == "missing"
     assert result.tool_message.tool_call_id == "call1"
@@ -330,7 +331,7 @@ def test_function_validation_error_propagates_as_a_defect() -> None:
     )
     call = ToolCall(id="call1", name="broken", args_json='{"text": "tide"}')
     with pytest.raises(ValidationError):
-        _ = asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = run_with_timeout(ToolManager([tool]).dispatch(call))
 
 
 def test_dispatch_carries_a_returned_is_error_result() -> None:
@@ -349,7 +350,7 @@ def test_dispatch_carries_a_returned_is_error_result() -> None:
         function=_returned_error_function,
     )
     call = ToolCall(id="call1", name="picky", args_json='{"text": "tide"}')
-    result = asyncio.run(ToolManager([tool]).dispatch(call))
+    result = run_with_timeout(ToolManager([tool]).dispatch(call))
     assert result.kind == "handled"
     assert result.tool_message.is_error is True
     assert result.tool_message.content == "cannot echo 'tide': try a shorter value"
@@ -383,7 +384,7 @@ def test_dispatch_preserves_mapping_app_data_identity() -> None:
         args_model=_EchoArgs,
         function=_mapping_function,
     )
-    mapping_result = asyncio.run(
+    mapping_result = run_with_timeout(
         ToolManager([mapping_tool]).dispatch(
             ToolCall(id="call2", name="mapping", args_json='{"text": "tide"}')
         )
@@ -420,7 +421,7 @@ def test_plain_function_exception_propagates_as_a_defect() -> None:
     )
     call = ToolCall(id="call1", name="failing", args_json='{"text": "tide"}')
     with pytest.raises(RuntimeError, match="function broke on tide"):
-        _ = asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = run_with_timeout(ToolManager([tool]).dispatch(call))
 
 
 def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> None:
@@ -446,9 +447,9 @@ def test_a_function_raised_invalid_tool_args_error_propagates_as_a_defect() -> N
     )
     call = ToolCall(id="call1", name="nested", args_json='{"text": "tide"}')
     with pytest.raises(InvalidToolArgsError):
-        _ = asyncio.run(tool.dispatch(call))
+        _ = run_with_timeout(tool.dispatch(call))
     with pytest.raises(InvalidToolArgsError):
-        _ = asyncio.run(ToolManager([tool]).dispatch(call))
+        _ = run_with_timeout(ToolManager([tool]).dispatch(call))
 
 
 def test_duplicate_tool_names_are_rejected() -> None:
@@ -483,7 +484,7 @@ def test_schema_tool_schema_passes_the_raw_json_schema_through_unchanged() -> No
 def test_schema_tool_dispatch_returns_invalid_args_for_schema_violations() -> None:
     """Schema violations return converted jsonschema errors."""
     call = ToolCall(id="call1", name="weather", args_json='{"town": "Oslo"}')
-    result = asyncio.run(_weather_tool().dispatch(call))
+    result = run_with_timeout(_weather_tool().dispatch(call))
     assert result.kind == "invalid_tool_args"
     assert result.tool_message.is_error is True
     assert result.details == (
@@ -519,7 +520,7 @@ def test_schema_tool_valid_args_run_the_function() -> None:
     """Arguments satisfying args_schema reach the function: validation passed, a DispatchHandled."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
-    result = asyncio.run(
+    result = run_with_timeout(
         tool.dispatch(ToolCall(id="c1", name="weather", args_json='{"city": "Oslo"}'))
     )
     assert result.kind == "handled"
@@ -538,7 +539,9 @@ def test_schema_tool_rejects_bad_args_locally_without_running_the_function(args_
     """Bad JSONSchemaTool arguments return DispatchInvalidToolArgs without execution."""
     calls: list[str] = []
     tool = _recording_weather_tool(calls)
-    result = asyncio.run(tool.dispatch(ToolCall(id="c1", name="weather", args_json=args_json)))
+    result = run_with_timeout(
+        tool.dispatch(ToolCall(id="c1", name="weather", args_json=args_json))
+    )
     assert result.kind == "invalid_tool_args"
     assert result.tool_message.tool_call_id == "c1"
     assert result.tool_message.is_error is True
@@ -556,7 +559,9 @@ def test_schema_tool_malformed_schema_raises_from_dispatch_as_a_defect() -> None
         function=_weather_function,
     )
     with pytest.raises(UnknownType):
-        _ = asyncio.run(tool.dispatch(ToolCall(id="c1", name="bad", args_json='{"city": "Oslo"}')))
+        _ = run_with_timeout(
+            tool.dispatch(ToolCall(id="c1", name="bad", args_json='{"city": "Oslo"}'))
+        )
 
 
 def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
@@ -580,7 +585,7 @@ def test_schema_tool_dispatch_carries_a_mapping_app_data_through() -> None:
         function=_mcp_function,
     )
     call = ToolCall(id="call1", name="weather", args_json='{"city": "Oslo"}')
-    result = asyncio.run(tool.dispatch(call))
+    result = run_with_timeout(tool.dispatch(call))
     assert result.kind == "handled"
     assert result.tool_message.content == "weather for Oslo"
     raw: Mapping[str, object] | None = result.app_data
@@ -596,10 +601,10 @@ def test_tool_manager_holds_a_mix_of_tool_and_schema_tool() -> None:
     names = {schema.name for schema in manager.schemas()}
     assert names == {"echo", "weather"}
 
-    echo_result = asyncio.run(
+    echo_result = run_with_timeout(
         manager.dispatch(ToolCall(id="c1", name="echo", args_json='{"text": "hi"}'))
     )
-    weather_result = asyncio.run(
+    weather_result = run_with_timeout(
         manager.dispatch(ToolCall(id="c2", name="weather", args_json='{"city": "Oslo"}'))
     )
     assert echo_result.kind == "handled"
@@ -660,7 +665,7 @@ def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
         ]
         return await asyncio.wait_for(manager.dispatch_many(tool_calls), timeout=5)
 
-    outcomes = asyncio.run(_run())
+    outcomes = run_with_timeout(_run())
     assert [outcome.tool_message.tool_call_id for outcome in outcomes] == ["c1", "c2"]
     assert [outcome.tool_message.content for outcome in outcomes] == ["waited a", "set b"]
 
@@ -672,7 +677,7 @@ def test_dispatch_many_returns_every_variant_in_call_order() -> None:
         ToolCall(id="c2", name="echo", args_json='{"wrong": "key"}'),
         ToolCall(id="c3", name="missing", args_json="{}"),
     ]
-    outcomes = asyncio.run(ToolManager([_echo_tool()]).dispatch_many(tool_calls))
+    outcomes = run_with_timeout(ToolManager([_echo_tool()]).dispatch_many(tool_calls))
     assert [type(outcome) for outcome in outcomes] == [
         DispatchHandled,
         DispatchInvalidToolArgs,
@@ -683,7 +688,7 @@ def test_dispatch_many_returns_every_variant_in_call_order() -> None:
 
 def test_dispatch_many_of_no_calls_returns_empty() -> None:
     """An empty tool_calls returns an empty outcome tuple."""
-    assert asyncio.run(ToolManager([_echo_tool()]).dispatch_many([])) == ()
+    assert run_with_timeout(ToolManager([_echo_tool()]).dispatch_many([])) == ()
 
 
 def _running_echo_tool(ran_texts: list[str]) -> PydanticTool[_EchoArgs]:
@@ -714,7 +719,7 @@ def test_dispatch_many_returns_a_precomputed_message_at_the_call_index() -> None
     ]
     ran_texts: list[str] = []
     manager = ToolManager([_running_echo_tool(ran_texts)])
-    outcomes = asyncio.run(
+    outcomes = run_with_timeout(
         manager.dispatch_many(
             tool_calls,
             precomputed=lambda tool_call: supplied_message if tool_call.id == "c2" else None,
@@ -745,7 +750,7 @@ def test_dispatch_many_precomputed_id_mismatch_raises_before_any_dispatch() -> N
         return ToolMessage(tool_call_id="other-id", content="skipped")
 
     with pytest.raises(ValueError, match=r"'c2'.*'other-id'"):
-        _ = asyncio.run(manager.dispatch_many(tool_calls, precomputed=_mismatched))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls, precomputed=_mismatched))
     assert ran_texts == []
 
 
@@ -762,7 +767,7 @@ def test_dispatch_many_precomputed_raising_propagates_before_any_dispatch() -> N
         raise RuntimeError(f"broken precomputed on {tool_call.id}")
 
     with pytest.raises(RuntimeError, match="broken precomputed on c1"):
-        _ = asyncio.run(manager.dispatch_many(tool_calls, precomputed=_broken))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls, precomputed=_broken))
     assert ran_texts == []
 
 
@@ -778,7 +783,7 @@ def test_dispatch_many_group_includes_precomputed_outcomes() -> None:
     ]
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        _ = asyncio.run(
+        _ = run_with_timeout(
             manager.dispatch_many(
                 tool_calls,
                 precomputed=lambda tool_call: supplied_message if tool_call.id == "c1" else None,
@@ -818,7 +823,7 @@ def test_dispatch_many_raises_the_group_after_siblings_settle() -> None:
     ]
     manager = ToolManager([_raiser_tool(), spender])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        _ = asyncio.run(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls))
     group = caught.value
     assert [str(error) for error in group.exceptions] == ["broke on a"]
     assert len(group.completed_outcomes) == 1
@@ -838,7 +843,7 @@ def test_dispatch_many_collects_every_defect_in_call_order() -> None:
     ]
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     with pytest.raises(DispatchExceptionGroup) as caught:
-        _ = asyncio.run(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls))
     group = caught.value
     assert [str(error) for error in group.exceptions] == ["broke on a", "broke on b"]
     assert [outcome.tool_message.tool_call_id for outcome in group.completed_outcomes] == ["c2"]
@@ -856,7 +861,7 @@ def test_dispatch_exception_group_except_star_subgroup_keeps_completed_outcomes(
     manager = ToolManager([_raiser_tool(), _echo_tool()])
     subgroups: list[ExceptionGroup[RuntimeError]] = []
     try:
-        _ = asyncio.run(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls))
     except* RuntimeError as subgroup:
         subgroups.append(subgroup)
     assert len(subgroups) == 1
@@ -890,7 +895,7 @@ def test_dispatch_many_re_raises_a_sibling_cancelled_error_bare() -> None:
         ToolCall(id="c2", name="echo", args_json='{"text": "ok"}'),
     ]
     with pytest.raises(asyncio.CancelledError):
-        _ = asyncio.run(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls))
 
 
 def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
@@ -923,7 +928,7 @@ def test_dispatch_many_chains_defects_onto_a_bare_base_exception() -> None:
         ToolCall(id="c3", name="echo", args_json='{"text": "ok"}'),
     ]
     with pytest.raises(asyncio.CancelledError) as caught:
-        _ = asyncio.run(manager.dispatch_many(tool_calls))
+        _ = run_with_timeout(manager.dispatch_many(tool_calls))
     cause = caught.value.__cause__
     assert isinstance(cause, DispatchExceptionGroup)
     assert [str(error) for error in cause.exceptions] == ["broke on a"]
@@ -960,7 +965,7 @@ def test_dispatch_many_cancellation_settles_siblings_then_propagates() -> None:
             await dispatch_task
         assert sorted(unwound) == ["a", "b"]
 
-    asyncio.run(_run())
+    run_with_timeout(_run())
 
 
 class _CapturedAnswer(BaseModel):
@@ -1007,7 +1012,7 @@ def test_capture_returns_the_validated_instance_beside_its_acknowledgement(
 ) -> None:
     """A valid CaptureTool call returns typed output and acknowledgement."""
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
-    outcome = asyncio.run(build_tool().capture(call))
+    outcome = run_with_timeout(build_tool().capture(call))
     assert outcome.kind == "captured"
     assert outcome.captured.answer == "tide"
     assert outcome.tool_message.tool_call_id == "call1"
@@ -1023,7 +1028,7 @@ def test_capture_invalid_args_delegates_to_the_shared_renderer() -> None:
     """
     args_json = '{"wrong": "key"}'
     call = ToolCall(id="call1", name="final_response", args_json=args_json)
-    outcome = asyncio.run(_answer_capture_tool().capture(call))
+    outcome = run_with_timeout(_answer_capture_tool().capture(call))
     assert outcome.kind == "invalid_tool_args"
     assert outcome.tool_message.is_error is True
     assert outcome.tool_message.tool_call_id == "call1"
@@ -1038,7 +1043,7 @@ def test_capture_malformed_and_non_object_json_return_the_invalid_args_variant()
     """Malformed and non-object JSON return DispatchInvalidToolArgs."""
     for args_json in ("not json", '"scalar"'):
         call = ToolCall(id="call1", name="final_response", args_json=args_json)
-        outcome = asyncio.run(_answer_capture_tool().capture(call))
+        outcome = run_with_timeout(_answer_capture_tool().capture(call))
         assert outcome.kind == "invalid_tool_args"
         assert outcome.tool_message.is_error is True
         assert "invalid arguments for final_response" in outcome.tool_message.content
@@ -1050,7 +1055,7 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
     manager = ToolManager([_echo_tool(), _answer_capture_tool()])
     assert manager.schemas() == (_echo_tool().schema(), _answer_capture_tool().schema())
     call = ToolCall(id="call1", name="final_response", args_json='{"answer": "tide"}')
-    result = asyncio.run(manager.dispatch(call))
+    result = run_with_timeout(manager.dispatch(call))
     assert result.kind == "handled"
     assert result.tool_message.content == "Answer received"
     assert result.tool_message.is_error is False
@@ -1060,7 +1065,7 @@ def test_capture_tool_dispatch_erases_the_capture_onto_app_data() -> None:
 def test_capture_tool_dispatch_returns_invalid_args_variant_for_invalid_args() -> None:
     """A manager-routed invalid call comes back as the same DispatchInvalidToolArgs capture returns."""
     call = ToolCall(id="call1", name="final_response", args_json='{"wrong": "key"}')
-    result = asyncio.run(ToolManager([_answer_capture_tool()]).dispatch(call))
+    result = run_with_timeout(ToolManager([_answer_capture_tool()]).dispatch(call))
     assert result.kind == "invalid_tool_args"
     assert result.tool_message.is_error is True
     assert "invalid arguments for final_response" in result.tool_message.content

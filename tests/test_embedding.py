@@ -1,8 +1,9 @@
 """Cover provider-neutral embedding execution and output invariants."""
 
 import asyncio
+import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import ClassVar
 
 import numpy as np
@@ -13,6 +14,7 @@ from langchaint.adapter import ErrorClassification
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.shared_backoff import DoNotRetry, RetryThisOne, SharedBackoff, Verdict
 from langchaint.embedding import EmbeddingTask, _validated_embeddings
+from tests.helpers import run_with_timeout
 
 
 class _ProviderError(Exception):
@@ -130,16 +132,19 @@ class _PartitioningEmbeddingAdapter:
         return "unknown_exception"
 
 
-def _shared_backoff(*, retry_provider_failures: bool = True) -> SharedBackoff:
+def _shared_backoff(
+    *,
+    parse: Callable[[Exception], Verdict] = _retry_provider_failure,
+    failure_types: tuple[type[Exception], ...] = (_ProviderError,),
+    longest_wait_seconds: float = 0.001,
+) -> SharedBackoff:
     return SharedBackoff(
-        parse=_retry_provider_failure if retry_provider_failures else _reject_provider_failure,
-        failure_types=(_ProviderError,),
+        parse=parse,
+        failure_types=failure_types,
         max_concurrent_requests=2,
         max_request_starts_per_second=100_000.0,
         minimum_wait_ceiling_seconds=0.001,
-        longest_wait_seconds=0.001,
-        wait_multiplier=2.0,
-        quiet_seconds_per_decay_step=60.0,
+        longest_wait_seconds=longest_wait_seconds,
     )
 
 
@@ -147,11 +152,15 @@ def _model(
     adapter: _StubEmbeddingAdapter,
     *,
     max_attempts: int = 3,
-    retry_provider_failures: bool = True,
+    parse: Callable[[Exception], Verdict] = _retry_provider_failure,
+    failure_types: tuple[type[Exception], ...] = (_ProviderError,),
+    longest_wait_seconds: float = 0.001,
 ) -> EmbeddingModel:
     return EmbeddingModel(
         adapter=adapter,
-        shared_backoff=_shared_backoff(retry_provider_failures=retry_provider_failures),
+        shared_backoff=_shared_backoff(
+            parse=parse, failure_types=failure_types, longest_wait_seconds=longest_wait_seconds
+        ),
         max_attempts=max_attempts,
     )
 
@@ -160,7 +169,7 @@ def test_embed_returns_normalized_owned_float32_rows() -> None:
     """Output preserves row order and owns writable normalized storage."""
     adapter = _StubEmbeddingAdapter([np.array([[3.0, 4.0], [0.0, 2.0]], dtype=np.float32)])
 
-    vectors = asyncio.run(_model(adapter).embed(["first", "second"], task="clustering"))
+    vectors = run_with_timeout(_model(adapter).embed(["first", "second"], task="clustering"))
 
     assert vectors.dtype == np.float32
     assert vectors.shape == (2, 2)
@@ -177,7 +186,7 @@ def test_empty_input_returns_without_adapter_work() -> None:
     """Empty input returns the required empty matrix immediately."""
     adapter = _StubEmbeddingAdapter([])
 
-    vectors = asyncio.run(_model(adapter).embed([], task="retrieval_document"))
+    vectors = run_with_timeout(_model(adapter).embed([], task="retrieval_document"))
 
     assert vectors.shape == (0, 2)
     assert vectors.dtype == np.float32
@@ -218,27 +227,50 @@ def test_output_validation_rejects_invalid_matrices(
     "failure",
     [_ProviderError("provider"), _TransportError("transport")],
 )
-def test_transient_failures_retry_and_return_vectors(
-    monkeypatch: pytest.MonkeyPatch,
-    failure: Exception,
-) -> None:
-    """Parsed and transport failures retry only their request batch."""
+def test_transient_failures_retry_and_return_vectors(failure: Exception) -> None:
+    """A RetryThisOne verdict and a transport failure classified transient both retry.
+
+    `classify` calls `_ProviderError` unknown_exception, so only its verdict can make it retry.
+    """
     adapter = _StubEmbeddingAdapter([
         failure,
         np.array([[1.0, 0.0]], dtype=np.float32),
     ])
-    waits: list[float] = []
 
-    async def record_sleep(wait_seconds: float) -> None:
-        waits.append(wait_seconds)
-
-    monkeypatch.setattr("langchaint.embedding.asyncio.sleep", record_sleep)
-
-    vectors = asyncio.run(_model(adapter).embed(["one"], task="classification"))
+    vectors = run_with_timeout(_model(adapter).embed(["one"], task="classification"))
 
     np.testing.assert_array_equal(vectors, [[1.0, 0.0]])
     assert adapter.embed_calls == 2
-    assert len(waits) == 1
+
+
+def test_a_retry_this_one_retry_after_sets_the_minimum_private_wait() -> None:
+    """The verdict's retry_after reaches `PrivateBackoff.next_wait` as the wait's minimum.
+
+    The private ceiling starts at 0.001 seconds, and request starts are 0.00001 seconds apart.
+    So only retry_after can make the retry wait 0.02 seconds.
+    """
+    adapter = _StubEmbeddingAdapter([_ProviderError("slow"), np.array([[1.0, 0.0]], np.float32)])
+    model = _model(
+        adapter, parse=lambda _failure: RetryThisOne(retry_after=0.02), longest_wait_seconds=1.0
+    )
+    started_at = time.monotonic()
+    _ = run_with_timeout(model.embed(["one"], task="classification"))
+    assert time.monotonic() - started_at >= 0.02
+    assert adapter.embed_calls == 2
+
+
+def test_a_failure_the_shared_backoff_does_not_parse_is_decided_by_classify() -> None:
+    """An adapter failure type outside the `SharedBackoff.failure_types` reaches no verdict.
+
+    `classify` calls it unknown_exception, so the batch fails without a retry.
+    """
+    failure = _ProviderError("unparsed")
+    adapter = _StubEmbeddingAdapter([failure, np.array([[1.0, 0.0]], dtype=np.float32)])
+    model = _model(adapter, failure_types=(KeyError,))
+    with pytest.raises(_ProviderError) as caught:
+        _ = run_with_timeout(model.embed(["one"], task="classification"))
+    assert caught.value is failure
+    assert adapter.embed_calls == 1
 
 
 def test_terminal_provider_failure_propagates_unchanged() -> None:
@@ -248,13 +280,13 @@ def test_terminal_provider_failure_propagates_unchanged() -> None:
 
     async def scenario() -> None:
         with pytest.raises(_ProviderError, match="provider text") as caught:
-            _ = await _model(adapter, retry_provider_failures=False).embed(
+            _ = await _model(adapter, parse=_reject_provider_failure).embed(
                 ["one"],
                 task="classification",
             )
         assert caught.value is failure
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_exhausted_transport_failure_propagates_unchanged() -> None:
@@ -271,7 +303,7 @@ def test_exhausted_transport_failure_propagates_unchanged() -> None:
             )
         assert caught.value is final
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
@@ -295,12 +327,10 @@ def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
         vectors = await embed_task
         np.testing.assert_array_equal(vectors, [[1.0, 0.0], [0.0, 1.0]])
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
-def test_retrying_one_request_batch_does_not_repeat_its_sibling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_retrying_one_request_batch_does_not_repeat_its_sibling() -> None:
     """Only the failed request batch consumes another attempt."""
 
     async def scenario() -> None:
@@ -315,13 +345,8 @@ def test_retrying_one_request_batch_does_not_repeat_its_sibling(
             shared_backoff=_shared_backoff(),
             max_attempts=2,
         )
-
-        async def skip_sleep(_wait_seconds: float) -> None:
-            """Skip the private retry wait."""
-
-        monkeypatch.setattr("langchaint.embedding.asyncio.sleep", skip_sleep)
         vectors = await model.embed(["first", "second"], task="retrieval_document")
         np.testing.assert_array_equal(vectors, [[1.0, 0.0], [0.0, 1.0]])
         assert adapter.attempts == {"first": 2, "second": 1}
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())

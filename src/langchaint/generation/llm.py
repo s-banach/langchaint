@@ -23,16 +23,12 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.billing.pricing import ProviderBilling
-from langchaint.common.exceptions import ParserContractError, StreamProtocolError, TransientError
+from langchaint.common.exceptions import ParserContractError, TransientError
 from langchaint.common.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
-from langchaint.concurrency.shared_backoff import (
-    Admission,
-    PrivateBackoff,
-    SharedBackoff,
-    Verdict,
-)
+from langchaint.concurrency.shared_backoff import PrivateBackoff, SharedBackoff, Verdict
+from langchaint.failure_step import _failure_step, _transient_error_for_step
 from langchaint.generation._config_fingerprint import (
     bound_llm_config_fingerprint,
     capture_response_format_fingerprint_data,
@@ -45,14 +41,13 @@ from langchaint.generation._generate_many_records import (
 )
 from langchaint.generation.call import _CallLedger
 from langchaint.generation.errors import (
-    _PROVIDER_ANSWERED_CLASSIFICATIONS,
     EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
     InvalidRequestErrorRecord,
     RetriesExhaustedErrorRecord,
     TimedOutErrorRecord,
-    _terminal_error_record,
+    _terminal_generation_error,
 )
 from langchaint.generation.response import (
     CallResult,
@@ -817,97 +812,48 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             max_attempts=new_max_attempts,
         )
 
-    def _terminal_error(
-        self,
-        exc: Exception,
-        *,
-        verdict: Verdict | None,
-        ledger: _CallLedger,
-        request: RequestParams,
-        observations: _StreamObservations,
-    ) -> GenerationError:
-        """Convert a terminal verdict or `classify` result to `GenerationError`."""
-        classification = (
-            "declared_final"
-            if verdict is not None and verdict.kind == "pause_all_do_not_retry"
-            else self.adapter.classify(exc)
-        )
-        if classification in _PROVIDER_ANSWERED_CLASSIFICATIONS or observations.opened:
-            ledger.record(error=None, assistant_message=None, billing=observations.billing)
-        return GenerationError(
-            record=_terminal_error_record(classification, reason=str(exc), call=ledger.freeze()),
-            request=request,
-            provider_attempts=ledger.provider_attempts,
-        )
-
     def _request_id_for_failure(
         self, exc: Exception, observations: _StreamObservations
     ) -> str | None:
         request_id = self.adapter.request_id_from_error(exc)
         return request_id if request_id is not None else observations.request_id
 
-    async def _pace_after_verdict(
+    async def _settle_failed_attempt(
         self,
         exc: Exception,
         *,
-        admission: Admission,
+        verdict: Verdict | None,
         private_backoff: PrivateBackoff,
         assistant_message: AssistantMessage | None,
         ledger: _CallLedger,
         request: RequestParams,
         observations: _StreamObservations,
     ) -> None:
-        """Record a verdicted attempt and apply its retry delay.
+        """Record a failed attempt and wait before the next one, as `_failure_step` decides.
+
+        The wait happens only while attempts remain.
 
         Raises:
-            GenerationError: A terminal verdict stops this request.
+            GenerationError: `_failure_step` decides the failure is terminal.
         """
         ledger.note_request_id(self._request_id_for_failure(exc, observations))
-        verdict = admission.verdict
-        if verdict is None or verdict.kind in ("do_not_retry", "pause_all_do_not_retry"):
-            raise self._terminal_error(
-                exc,
-                verdict=verdict,
+        step = _failure_step(exc, verdict=verdict, classify=self.adapter.classify)
+        if step.kind == "terminal":
+            raise _terminal_generation_error(
+                step,
+                reason=str(exc),
                 ledger=ledger,
+                billing=observations.billing,
                 request=request,
-                observations=observations,
+                stream_opened=observations.opened,
             ) from exc
-        if isinstance(exc, TransientError):
-            error = exc
-        else:
-            error = TransientError(
-                str(exc),
-                retry_after_seconds=verdict.retry_after,
-                is_rate_limit=verdict.kind == "pause_all",
-            )
-            error.__cause__ = exc
         ledger.record(
-            error=error, assistant_message=assistant_message, billing=observations.billing
+            error=_transient_error_for_step(exc, str(exc), step),
+            assistant_message=assistant_message,
+            billing=observations.billing,
         )
-        if verdict.kind == "retry_this_one" and ledger.attempts < self.max_attempts:
-            await asyncio.sleep(private_backoff.next_wait(verdict.retry_after))
-
-    async def _pace_after_transport_failure(
-        self,
-        exc: Exception,
-        *,
-        private_backoff: PrivateBackoff,
-        ledger: _CallLedger,
-        request: RequestParams,
-        observations: _StreamObservations,
-    ) -> GenerationError | None:
-        """Retry a transient transport failure or return its terminal error."""
-        ledger.note_request_id(self._request_id_for_failure(exc, observations))
-        if not isinstance(exc, StreamProtocolError) and self.adapter.classify(exc) != "transient":
-            return self._terminal_error(
-                exc, verdict=None, ledger=ledger, request=request, observations=observations
-            )
-        error = TransientError(str(exc))
-        error.__cause__ = exc
-        ledger.record(error=error, assistant_message=None, billing=observations.billing)
-        if ledger.attempts < self.max_attempts:
-            await asyncio.sleep(private_backoff.next_wait(None))
-        return None
+        if step.kind == "retry_after_private_wait" and ledger.attempts < self.max_attempts:
+            await asyncio.sleep(private_backoff.next_wait(step.retry_after))
 
     def _staged_interpretation(
         self, raw: BaseModel, *, request_id: str | None, ledger: _CallLedger
@@ -942,7 +888,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 `deadline` expires.
             ParserContractError: `Adapter.parse` violates its contract.
         """
-        ledger.start_call()
         timeout_scope = deadline.scope
         try:
             async with timeout_scope:
@@ -969,6 +914,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         """
         request = self._request_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
+        last_failure: Exception | None = None
         while ledger.attempts < self.max_attempts:
             deadline.suspend_until_admitted()
             admission = self.shared_backoff.admitted()
@@ -1014,26 +960,18 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                         )
             except ParserContractError:
                 raise
-            except self.shared_backoff.failure_types as exc:
-                await self._pace_after_verdict(
+            except Exception as exc:  # noqa: BLE001 (_settle_failed_attempt raises every terminal failure)
+                last_failure = exc
+                # The block's exit set a verdict only when `exc` is one of `failure_types`.
+                await self._settle_failed_attempt(
                     exc,
-                    admission=admission,
+                    verdict=admission.verdict,
                     private_backoff=private_backoff,
                     assistant_message=assistant_message,
                     ledger=ledger,
                     request=request,
                     observations=observations,
                 )
-            except Exception as exc:
-                terminal = await self._pace_after_transport_failure(
-                    exc,
-                    private_backoff=private_backoff,
-                    ledger=ledger,
-                    request=request,
-                    observations=observations,
-                )
-                if terminal is not None:
-                    raise terminal from exc
             else:
                 ledger.record(error=None, assistant_message=outcome.assistant_message)
                 result = _call_result_from_response_outcome(
@@ -1050,7 +988,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             record=RetriesExhaustedErrorRecord(call=ledger.freeze()),
             request=request,
             provider_attempts=ledger.provider_attempts,
-        )
+        ) from last_failure
 
     def _request_for_messages(
         self, messages: Sequence[Message], *, ledger: _CallLedger

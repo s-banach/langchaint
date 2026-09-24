@@ -543,10 +543,42 @@ def test_to_tables_emits_one_row_for_a_cut_off_attempt() -> None:
     assert tables.attempts[0]["cost_in_usd"] == _USAGE.cost_in_usd
 
 
+class _TickingClock:
+    """A `time` stand-in whose `monotonic` returns 0.0, 1.0, 2.0, ... on successive calls."""
+
+    def __init__(self) -> None:
+        self._ticks = 0
+
+    def monotonic(self) -> float:
+        """Return the number of earlier calls as seconds."""
+        seconds = float(self._ticks)
+        self._ticks += 1
+        return seconds
+
+
+def test_the_ledger_stamps_the_first_item_and_not_a_later_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`seconds_to_first_item` measures the first `stamp_first_item`, and later stamps leave it unchanged.
+
+    The clock ticks on every read: 0.0 builds the ledger, 1.0 starts the attempt, 2.0 stamps the first item.
+    A second stamp reads no time, so the record ends at 3.0.
+    """
+    monkeypatch.setattr("langchaint.generation.call.time", _TickingClock())
+    ledger = _CallLedger(model="model", provider_name="provider")
+    ledger.start_attempt()
+    ledger.stamp_first_item()
+    ledger.stamp_first_item()
+    ledger.record(error=None, assistant_message=None)
+    (record,) = ledger.freeze().attempt_records
+    assert record.kind == "settled"
+    assert record.seconds_to_first_item == 1.0
+    assert record.elapsed_seconds == 2.0
+
+
 def test_abandoned_call_error_appends_one_cut_off_request_with_live_usage() -> None:
     """A live timeout aligns its cut-off record with provider usage."""
     ledger = _CallLedger(model="model", provider_name="provider")
-    ledger.start_call()
     ledger.start_attempt()
     provider_billing = ProviderBilling(billing=_BILLING, usage_raw=ProviderUsage(billed_units=23))
     failure = _abandoned_call_error(TimedOutErrorRecord, ledger, provider_billing)
@@ -569,7 +601,6 @@ def test_interrupted_error_record_accepts_a_transient_prefix_without_a_cut_off(
 def test_interruption_after_a_staged_response_records_no_cut_off_request() -> None:
     """A staged provider response settles before an interrupted call freezes."""
     ledger = _CallLedger(model="model", provider_name="provider")
-    ledger.start_call()
     ledger.start_attempt()
     raw = StubRaw()
     provider_billing = ProviderBilling(billing=_BILLING, usage_raw=None)

@@ -146,7 +146,7 @@ def _parse_cohere_bedrock(failure: Exception) -> Verdict:
 
 
 def _classify_cohere_bedrock(error: Exception) -> ErrorClassification:
-    """Classify errors outside `_parse_cohere_bedrock` terminal verdicts."""
+    """Classify a failure that reached no verdict or a `DoNotRetry` verdict from `_parse_cohere_bedrock`."""
     if isinstance(error, BotocoreConnectionError | HTTPClientError):
         return "transient"
     return "unknown_exception"
@@ -377,7 +377,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:
-        """Classify an exception outside `failure_types`."""
+        """Classify a failure that reached no verdict or a `DoNotRetry` verdict."""
         return _classify_cohere_bedrock(error)
 
 

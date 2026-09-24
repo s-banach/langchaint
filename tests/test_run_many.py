@@ -8,6 +8,7 @@ from functools import partial
 import pytest
 
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
+from tests.helpers import run_with_timeout
 
 
 class _RunManyFailure(BaseException):
@@ -42,7 +43,7 @@ def test_run_many_validates_max_pending_before_running_run_ones() -> None:
                 )
         assert not called
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
@@ -63,7 +64,7 @@ def test_run_many_accepts_an_int_subclass_that_is_not_bool() -> None:
         run_ones = tuple(partial(run_one, input_value) for input_value in (1, 2))
         assert await run_many(run_ones, max_pending=Concurrency.LOW) == [1, 2]
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_run_many_empty_run_ones_start_no_task() -> None:
@@ -73,7 +74,7 @@ def test_run_many_empty_run_ones_start_no_task() -> None:
         """Run an empty run_ones sequence."""
         assert await run_many([], max_pending=2) == []
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_run_many_snapshots_run_ones_before_starting_tasks() -> None:
@@ -90,7 +91,7 @@ def test_run_many_snapshots_run_ones_before_starting_tasks() -> None:
         run_ones = [partial(run_one, input_value) for input_value in range(3)]
         assert await run_many(run_ones, max_pending=1) == [0, 1, 2]
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> None:
@@ -141,7 +142,7 @@ def test_run_many_bounds_pending_refills_and_preserves_order_and_context() -> No
         finally:
             context_value.reset(caller_token)
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_run_ones() -> None:
@@ -177,7 +178,7 @@ def test_run_many_cancellation_settles_started_tasks_and_skips_unstarted_run_one
         assert started_inputs == [0, 1]
         assert sorted(settled_inputs) == [0, 1]
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_run_many_repeated_cancellation_still_settles_started_tasks() -> None:
@@ -219,7 +220,7 @@ def test_run_many_repeated_cancellation_still_settles_started_tasks() -> None:
             await batch_task
         assert run_one_settled.is_set()
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_run_many_base_exception_settles_sibling_and_skips_unstarted_run_one() -> None:
@@ -256,7 +257,7 @@ def test_run_many_base_exception_settles_sibling_and_skips_unstarted_run_one() -
         assert started_inputs == [0, 1]
         assert sorted(settled_inputs) == [0, 1]
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_run_many_selects_the_lowest_run_one_failure_from_one_wait() -> None:
@@ -277,4 +278,4 @@ def test_run_many_selects_the_lowest_run_one_failure_from_one_wait() -> None:
         with pytest.raises(_RunManyFailure, match=r"^0$"):
             _ = await run_many(run_ones, max_pending=3)
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())

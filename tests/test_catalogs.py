@@ -3,7 +3,6 @@
 These tests cover identifiers, pricing objects, overrides, and client routing.
 """
 
-import asyncio
 import pathlib
 from collections.abc import Callable
 
@@ -47,6 +46,7 @@ from langchaint.openai import (
     OpenAIResponsesAdapter,
 )
 from langchaint.openai.embedding_adapter import _OpenAIEmbeddingAdapter
+from tests.helpers import run_with_timeout
 
 _ARBITRARY_RATES = OpenAIRates(
     input_cache_none_usd_per_million_tokens=1.0,
@@ -442,7 +442,7 @@ def test_bedrock_http_client_survives_the_retry_suppression_copy(
     assert adapter.client is not client
     assert adapter.client.max_retries == 0
     assert adapter.client._client is http_client
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 def test_bedrock_rejects_client_and_http_client_together() -> None:
@@ -658,7 +658,7 @@ def test_openai_rejects_a_client_reaching_another_provider(
         _ = OpenAI(client=client).model("gpt-5.6-terra", regional_processing=False)
     with pytest.raises(ValueError, match="contradicts the client"):
         _ = OpenAI(client=client).embedding_model("text-embedding-3-small")
-    asyncio.run(client.close())
+    run_with_timeout(client.close())
 
 
 def test_deepseek_model_rejects_a_bedrock_client() -> None:

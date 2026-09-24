@@ -2,17 +2,16 @@
 
 _SchemaValidatingSpanProcessor validates payload attributes against tests/semconv_genai.
 The tests inspect recorded span names, kinds, statuses, attributes, events, and parents.
+Tests of the pure content renderers call them directly.
 """
 
 import asyncio
-import base64
 import functools
 import json
 import logging
 import pathlib
-import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import assert_type, override
+from typing import Literal, NamedTuple, assert_type, override
 
 import jsonschema
 import pytest
@@ -55,12 +54,8 @@ from langchaint import (
     UserMessage,
     to_tables,
 )
-from langchaint.adapter import (
-    AdapterResult,
-    InvalidRequest,
-    Refusal,
-    UnfinishedTurn,
-)
+from langchaint.adapter import AdapterResult, InvalidRequest, Refusal
+from langchaint.common.messages import StopReason
 from langchaint.span_parsing import generation_input_from_otel, parse_otel
 from langchaint.tracing import (
     AttributeMapper,
@@ -70,20 +65,27 @@ from langchaint.tracing import (
     TracedLLM,
     TracedStreamHandle,
     TracedToolManager,
+    _input_content_attributes,
+    _output_content_attributes,
+    _record_every_part,
+    _tool_call_arguments,
+    gen_ai_attributes,
 )
 from scripts import refresh_semconv_genai
-from tests.test_bound_llm import (
-    _MAX_COMPLETION_TOKENS_EXCEEDED,
-    _REFUSAL,
-    _REJECTED_TURN,
-    _USAGE,
-    _billed,
-    _FakeAdapter,
-    _FakeStream,
-    _fast_shared_backoff,
-    _HangsAfterFirstItemStream,
-    _ScriptedResponse,
+from tests.fake_adapter import (
+    MAX_COMPLETION_TOKENS_EXCEEDED,
+    REFUSAL,
+    REJECTED_TURN,
+    USAGE,
+    FakeAdapter,
+    FakeStream,
+    HangsAfterFirstItemStream,
+    ScriptedResponse,
+    assert_the_first_open_runs_alone,
+    billed,
+    fast_shared_backoff,
 )
+from tests.helpers import run_with_timeout, time_out_when
 
 _SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
 
@@ -164,9 +166,68 @@ def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
     return tracer_provider.get_tracer("test"), exporter
 
 
+def _traced(
+    adapter: FakeAdapter,
+    *,
+    capture_message_content: bool = False,
+    attribute_mapper: AttributeMapper = gen_ai_attributes,
+    extra_attributes: SpanAttributes | None = None,
+    max_concurrent_requests: int = 8,
+) -> tuple[TracedLLM, InMemorySpanExporter]:
+    """Wrap `adapter` in a `TracedLLM` whose spans reach a schema-validating in-memory exporter.
+
+    `max_concurrent_requests=1` serializes a batch, so its item spans end in input order.
+    """
+    tracer, exporter = _in_memory_tracer()
+    llm = LLM(
+        adapter,
+        shared_backoff=fast_shared_backoff(max_concurrent_requests=max_concurrent_requests),
+    )
+    traced = TracedLLM(
+        llm,
+        capture_message_content=capture_message_content,
+        attribute_mapper=attribute_mapper,
+        extra_attributes=extra_attributes,
+        tracer=tracer,
+    )
+    return traced, exporter
+
+
+type _CallPath = Literal["generate", "stream"]
+
+
+async def _generate_through[ToolManagerT: ToolManager | None](
+    path: _CallPath, bound_llm: TracedBoundLLM[str, ToolManagerT]
+) -> Response[str]:
+    """Run one call through `generate_one`, or through `stream_one` drained before its `final()`.
+
+    Raises:
+        GenerationError: the call ends in a terminal failure.
+    """
+    if path == "generate":
+        return await bound_llm.generate_one("hi")
+    async with bound_llm.stream_one("hi") as handle:
+        _ = [item async for item in handle]
+        return await handle.final()
+
+
 def _attribute(span: ReadableSpan, key: str) -> object:
     """Read one attribute off a finished span, None where the span carries no such key."""
     return (span.attributes or {}).get(key)
+
+
+def _json_attribute(span: ReadableSpan, key: str) -> object:
+    """Read one JSON content attribute off a finished span as Python data."""
+    value = _attribute(span, key)
+    assert isinstance(value, str)
+    parsed: object = json.loads(value)
+    return parsed
+
+
+def _captured(exporter: InMemorySpanExporter, key: str) -> object:
+    """Read one JSON content attribute off the only finished span as Python data."""
+    (span,) = exporter.get_finished_spans()
+    return _json_attribute(span, key)
 
 
 class _RaisingSpanProcessor(SpanProcessor):
@@ -203,7 +264,9 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
         """Drive each span-owning entry point under a tracer whose span end raises."""
         tracer = _raising_processor_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
+            LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff()),
+            tracer=tracer,
+            capture_message_content=False,
         )
         bound = traced.bind()
 
@@ -224,7 +287,7 @@ def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None
         )
         assert outcome.kind == "handled"
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 class _IsRecordingRaisesSpan(NonRecordingSpan):
@@ -257,19 +320,19 @@ def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -
 
     async def scenario() -> None:
         """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
-        adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
+        adapter = FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
         traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
+            LLM(adapter, shared_backoff=fast_shared_backoff()),
             tracer=_IsRecordingRaisesTracer(),
             capture_message_content=True,
         )
         with pytest.raises(GenerationError):
             await traced.bind().generate_one("hi")
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
-class _MidFailStream(_FakeStream):
+class _MidFailStream(FakeStream):
     """A stream that yields one item, then raises so the failure lands mid-iteration."""
 
     @override
@@ -287,16 +350,18 @@ class _MidFailStream(_FakeStream):
 
 
 def test_generate_one_success_produces_one_fully_attributed_span() -> None:
-    """A success emits one CLIENT span named "chat {model}", OK status, and every gen_ai attribute."""
+    """A success emits one CLIENT span named "chat {model}", OK status, and every gen_ai attribute.
+
+    Capture is off, so the bound system prompt and tools leave no content attribute on the span.
+    """
 
     async def scenario() -> None:
         """Drive one generate_one to success and inspect the single finished span."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
-        )
-        response = await traced.bind().generate_one("hi")
-        assert response.output == "hi"
+        traced, exporter = _traced(FakeAdapter(echo=True))
+        bound = traced.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
+        result = await bound.generate_one("hi")
+        assert result.kind == "response"
+        assert result.output == "hi"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
         assert span.kind == SpanKind.CLIENT
@@ -309,117 +374,121 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
             "gen_ai.request.model": "fake-model",
             "gen_ai.response.model": "fake-model-served",
             "gen_ai.response.finish_reasons": ("stop",),
-            "gen_ai.usage.input_tokens": _USAGE.input_tokens_total,
-            "gen_ai.usage.output_tokens": _USAGE.output_tokens,
-            "gen_ai.usage.reasoning.output_tokens": _USAGE.output_tokens_reasoning,
-            "gen_ai.usage.cache_read.input_tokens": _USAGE.input_tokens_cache_read,
-            "gen_ai.usage.cache_creation.input_tokens": _USAGE.input_tokens_cache_write,
+            "gen_ai.usage.input_tokens": USAGE.input_tokens_total,
+            "gen_ai.usage.output_tokens": USAGE.output_tokens,
+            "gen_ai.usage.reasoning.output_tokens": USAGE.output_tokens_reasoning,
+            "gen_ai.usage.cache_read.input_tokens": USAGE.input_tokens_cache_read,
+            "gen_ai.usage.cache_creation.input_tokens": USAGE.input_tokens_cache_write,
             "langchaint.attempts": 1,
             "langchaint.cost_in_usd": 0.0,
         }
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
-def test_generate_one_refusal_span_has_error_status_and_real_tokens() -> None:
-    """A GenerationError yields an error span carrying the 200's real token counts and cost."""
+class _TerminalCase(NamedTuple):
+    """One call that ends in GenerationError, and what its span must record."""
 
-    async def scenario() -> None:
-        """Drive one generate_one whose attempt reports Refusal, then inspect the error span."""
-        adapter = _FakeAdapter(scripted_attempts=[_billed(_REFUSAL)])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        with pytest.raises(GenerationError):
-            await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.response.finish_reasons"] == ("refusal",)
-        assert span.attributes["langchaint.cost_in_usd"] == 0.25
-        assert span.attributes["gen_ai.usage.output_tokens"] == _USAGE.output_tokens
-
-    asyncio.run(scenario())
+    adapter: Callable[[], FakeAdapter]
+    error_type: str
+    status_description: str | None
+    finish_reasons: tuple[str, ...] | None
+    """The finish reasons of the 200 that ended the call, or None where no attempt reached a 200."""
+    attempts: int
+    attempt_failed_events: int
 
 
-def test_generate_one_truncation_span_has_error_status_and_real_tokens() -> None:
-    """A GenerationError yields an error span with the 200's tokens and max_tokens finish."""
+@pytest.mark.parametrize(
+    "case",
+    [
+        _TerminalCase(
+            adapter=lambda: FakeAdapter(stream=FakeStream(outcome=REFUSAL)),
+            error_type="refusal_error",
+            status_description=None,
+            finish_reasons=("refusal",),
+            attempts=1,
+            attempt_failed_events=0,
+        ),
+        _TerminalCase(
+            adapter=lambda: FakeAdapter(stream=FakeStream(outcome=MAX_COMPLETION_TOKENS_EXCEEDED)),
+            error_type="max_completion_tokens_exceeded_error",
+            status_description=None,
+            finish_reasons=("length",),
+            attempts=1,
+            attempt_failed_events=0,
+        ),
+        _TerminalCase(
+            adapter=lambda: FakeAdapter(
+                scripted_attempts=[TransientError("connection reset")] * 2
+            ),
+            error_type="retries_exhausted_error",
+            status_description="attempt 1: connection reset\nattempt 2: connection reset",
+            finish_reasons=None,
+            attempts=2,
+            attempt_failed_events=2,
+        ),
+        _TerminalCase(
+            adapter=lambda: FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")]),
+            error_type="invalid_request_error",
+            status_description="misconfigured",
+            finish_reasons=None,
+            attempts=0,
+            attempt_failed_events=0,
+        ),
+    ],
+    ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "invalid_request"],
+)
+@pytest.mark.parametrize("path", ["generate", "stream"])
+def test_a_generation_error_ends_the_span_with_error_status_and_the_calls_attributes(
+    path: _CallPath, case: _TerminalCase
+) -> None:
+    """A GenerationError ends the span with error status, error.type, and the call's billing.
 
-    async def scenario() -> None:
-        """Drive one generate_one whose attempt reports MaxCompletionTokensExceeded, then inspect the error span."""
-        adapter = _FakeAdapter(scripted_attempts=[_billed(_MAX_COMPLETION_TOKENS_EXCEEDED)])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        with pytest.raises(GenerationError):
-            await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.response.finish_reasons"] == ("length",)
-        assert span.attributes["langchaint.cost_in_usd"] == 0.25
-
-    asyncio.run(scenario())
-
-
-def test_generate_one_retries_exhausted_span_has_error_status_and_zero_tokens() -> None:
-    """A retries-exhausted failure over transport errors bills zero, so the usage attributes are zero."""
-
-    async def scenario() -> None:
-        """Exhaust the budget on transport failures and inspect the error span."""
-        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        with pytest.raises(GenerationError):
-            await traced.bind(max_attempts=2).generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.usage.input_tokens"] == 0
-        assert span.attributes["gen_ai.usage.output_tokens"] == 0
-        assert span.attributes["langchaint.cost_in_usd"] == 0.0
-        # A retries-exhausted failure has no completed turn, so no finish reason is set.
-        assert "gen_ai.response.finish_reasons" not in span.attributes
-        # No attempt received a response, so no provider ever named the model that served one.
-        assert "gen_ai.response.model" not in span.attributes
-
-    asyncio.run(scenario())
-
-
-def test_generate_one_rejection_span_uses_kind_for_error_type() -> None:
-    """A rejected request records kind in error.type."""
+    A 200 that ended the call contributes its real tokens, cost, finish reason, and turn.
+    A call that reached no 200 records zero usage and no finish reason, response model, or output.
+    The input attributes set at span start stay on the span.
+    """
 
     async def scenario() -> None:
-        """Drive one generate_one whose build_request reports InvalidRequest, then read its span."""
-        adapter = _FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        """Drive the call under capture and inspect the error span."""
+        traced, exporter = _traced(case.adapter(), capture_message_content=True)
         with pytest.raises(GenerationError):
-            await traced.bind().generate_one("hi")
+            await _generate_through(path, traced.bind(system_prompt="be brief", max_attempts=2))
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
-        assert span.status.description == "misconfigured"
+        assert span.status.description == case.status_description
         assert span.attributes is not None
-        assert span.attributes["error.type"] == "invalid_request_error"
-        # Nothing was sent, so the usage attributes are the zeros of a call that never billed.
-        assert span.attributes["langchaint.cost_in_usd"] == 0.0
-        assert "gen_ai.response.finish_reasons" not in span.attributes
+        assert span.attributes["error.type"] == case.error_type
+        assert span.attributes["langchaint.attempts"] == case.attempts
+        assert [event.name for event in span.events] == [
+            "langchaint.attempt_failed"
+        ] * case.attempt_failed_events
+        assert _json_attribute(span, "gen_ai.input.messages") == [
+            {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
+        ]
+        assert _json_attribute(span, "gen_ai.system_instructions") == [
+            {"type": "text", "content": "be brief"}
+        ]
+        reached_a_200 = case.finish_reasons is not None
+        assert span.attributes["langchaint.cost_in_usd"] == (0.25 if reached_a_200 else 0.0)
+        assert span.attributes["gen_ai.usage.input_tokens"] == (
+            USAGE.input_tokens_total if reached_a_200 else 0
+        )
+        assert span.attributes["gen_ai.usage.output_tokens"] == (
+            USAGE.output_tokens if reached_a_200 else 0
+        )
+        assert _attribute(span, "gen_ai.response.finish_reasons") == case.finish_reasons
+        assert ("gen_ai.response.model" in span.attributes) is reached_a_200
+        if case.finish_reasons is None:
+            assert "gen_ai.output.messages" not in span.attributes
+        else:
+            output_messages = _json_attribute(span, "gen_ai.output.messages")
+            assert isinstance(output_messages, list)
+            assert [message["finish_reason"] for message in output_messages] == list(
+                case.finish_reasons
+            )
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None:
@@ -427,20 +496,16 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
 
     async def scenario() -> None:
         """Time out a traced call whose open hangs, then read the span."""
-        adapter = _FakeAdapter(hang_from_open=1)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        adapter = FakeAdapter(hang_from_open=1)
+        traced, exporter = _traced(adapter)
         with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
-                await traced.bind().generate_one("hi")
+            await time_out_when(
+                traced.bind().generate_one("hi"), adapter.bound_adapters[0].hang_reached.is_set
+            )
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> None:
@@ -451,26 +516,22 @@ def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> 
 
     async def scenario() -> None:
         """Time out an entry whose open never returns, then read the traced handle and the span."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(hang_from_open=1), shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        adapter = FakeAdapter(hang_from_open=1)
+        traced, exporter = _traced(adapter)
         handle = traced.bind().stream_one("hi")
 
         async def enter_and_leave() -> None:
-            """Enter the handle whose open never returns. The wait_for below cancels this."""
+            """Enter the handle whose open never returns. time_out_when below cancels this."""
             async with handle:
                 pass
 
         with pytest.raises(TimeoutError):
-            await asyncio.wait_for(enter_and_leave(), timeout=0.02)
+            await time_out_when(enter_and_leave(), adapter.bound_adapters[0].hang_reached.is_set)
         assert handle.abandoned is not None
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 async def _drain_by_iterating(handle: TracedStreamHandle[str]) -> None:
@@ -492,16 +553,8 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
 
     async def scenario() -> None:
         """Drain a stream that stalls after its first item, under a deadline it outlasts."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(stream=_HangsAfterFirstItemStream()),
-                shared_backoff=_fast_shared_backoff(),
-            ),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        handle = traced.bind().stream_one("hi", timeout_seconds=0.05)
+        traced, exporter = _traced(FakeAdapter(stream=HangsAfterFirstItemStream()))
+        handle = traced.bind().stream_one("hi", timeout_seconds=0.02)
 
         with pytest.raises(GenerationError):
             async with handle:
@@ -513,32 +566,26 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         assert span.attributes is not None
         assert span.attributes[error_semconv.ERROR_TYPE] == "timed_out_error"
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
-    """A cancellation reaching a traced batch ends each started item's span, with no status set.
-
-    Batch cancellation ends each started item span.
-    """
+    """A cancellation reaching a traced batch ends each started item's span, with no status set."""
 
     async def scenario() -> None:
         """Time out a traced batch whose opens hang, then read the spans."""
-        adapter = _FakeAdapter(hang_from_open=1)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        adapter = FakeAdapter(hang_from_open=1)
+        traced, exporter = _traced(adapter)
         with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
-                await traced.bind().generate_many(["a", "b"])
+            await time_out_when(
+                traced.bind().generate_many(["a", "b"]),
+                lambda: adapter.bound_adapters[0].open_count == 2,
+            )
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
         assert all(span.status.status_code == StatusCode.UNSET for span in spans)
 
-    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    run_with_timeout(scenario())
 
 
 def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
@@ -546,13 +593,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
 
     async def scenario() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
-        adapter = _FakeAdapter(scripted_attempts=[TransientError("boom")])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        traced, exporter = _traced(FakeAdapter(scripted_attempts=[TransientError("boom")]))
         response = await traced.bind().generate_one("hi")
         assert response.attempts == 2
         (span,) = exporter.get_finished_spans()
@@ -561,7 +602,7 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
         assert event.attributes is not None
         assert event.attributes["error_text"] == "boom"
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> None:
@@ -569,17 +610,8 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
-        adapter = _FakeAdapter(
-            echo=True,
-            scripted_attempts=[_billed(_REFUSAL)],
-        )
-        shared_backoff = _fast_shared_backoff(max_concurrent_requests=1)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=shared_backoff),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        adapter = FakeAdapter(echo=True, scripted_attempts=[billed(REFUSAL)])
+        traced, exporter = _traced(adapter, max_concurrent_requests=1)
         results = await traced.bind().generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
@@ -600,7 +632,47 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         assert _attribute(refused, "error.type") == "refusal_error"
         assert all(span.status.status_code == StatusCode.OK for span in succeeded)
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
+
+
+def test_generate_many_maps_and_captures_each_item_from_its_own_result() -> None:
+    """Each item's span carries that item's mapped result and generation_input, never the batch's."""
+
+    async def scenario() -> None:
+        """Run a serialized two-item batch under a recording mapper and capture."""
+        mapped_outputs: list[object] = []
+
+        def _mapper(result: CallResult[object]) -> SpanAttributes:
+            """Record the result mapped and emit it as an attribute."""
+            output = result.output if result.kind == "response" else None
+            mapped_outputs.append(output)
+            return {"custom.mapped_output": str(output)}
+
+        traced, exporter = _traced(
+            FakeAdapter(echo=True),
+            capture_message_content=True,
+            attribute_mapper=_mapper,
+            max_concurrent_requests=1,
+        )
+        results = await traced.bind().generate_many(["a", "b"])
+        assert [result.output for result in results if result.kind == "response"] == ["a", "b"]
+        assert mapped_outputs == ["a", "b"]
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        for span, content in zip(spans, ["a", "b"], strict=True):
+            assert _attribute(span, "custom.mapped_output") == content
+            assert _json_attribute(span, "gen_ai.input.messages") == [
+                {"role": "user", "parts": [{"type": "text", "content": content}]}
+            ]
+            assert _json_attribute(span, "gen_ai.output.messages") == [
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "content": content}],
+                    "finish_reason": "stop",
+                }
+            ]
+
+    run_with_timeout(scenario())
 
 
 def test_generate_many_records_traces_generated_items_and_skips_reused_items(
@@ -610,13 +682,8 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
 
     async def scenario() -> None:
         """Persist two samples, reorder them around one new sample, and inspect the span count."""
-        adapter = _FakeAdapter(echo=True)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        adapter = FakeAdapter(echo=True)
+        traced, exporter = _traced(adapter)
         bound = traced.bind()
         resume_path = tmp_path / "records.json"
         first = await bound.generate_many_records(
@@ -638,19 +705,22 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
         assert all(span.kind == SpanKind.CLIENT for span in spans)
         assert adapter.bound_adapters[0].open_count == 3
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -> None:
-    """A stream iterated to exhaustion then final() ends exactly one span carrying time_to_first_chunk."""
+    """A drained stream ends exactly one span carrying time_to_first_chunk.
+
+    A second final() returns the same Response and ends no second span.
+    """
 
     async def scenario() -> None:
-        """Iterate the stream fully, call final(), and inspect the single finished span."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        """Iterate the stream fully, call final() twice, and inspect the single finished span."""
+        traced, exporter = _traced(FakeAdapter())
         async with traced.bind().stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
+            assert await stream.final() is response
         assert "".join(texts) == "ok"
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
@@ -664,23 +734,7 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
         assert time_to_first_chunk >= 0.0
         assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)
 
-    asyncio.run(scenario())
-
-
-def test_stream_final_is_idempotent_and_ends_the_span_once() -> None:
-    """A second final() returns the same Response and does not end a second span."""
-
-    async def scenario() -> None:
-        """Call final() twice on one drained stream and count the spans."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
-        async with traced.bind().stream_one("hi") as stream:
-            first = await stream.final()
-            second = await stream.final()
-        assert first is second
-        assert len(exporter.get_finished_spans()) == 1
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_stream_abandoned_in_context_ends_its_span() -> None:
@@ -688,15 +742,14 @@ def test_stream_abandoned_in_context_ends_its_span() -> None:
 
     async def scenario() -> None:
         """Break out after one item and confirm one span ended without error status."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        traced, exporter = _traced(FakeAdapter())
         async with traced.bind().stream_one("hi") as stream:
             async for _item in stream:
                 break
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_stream_entered_but_never_iterated_emits_a_span() -> None:
@@ -707,8 +760,7 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
 
     async def scenario() -> None:
         """Enter and leave the context without driving the stream."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        traced, exporter = _traced(FakeAdapter())
         async with traced.bind().stream_one("hi"):
             pass
         (span,) = exporter.get_finished_spans()
@@ -716,7 +768,7 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
         assert span.attributes is not None
         assert "gen_ai.response.time_to_first_chunk" not in span.attributes
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
@@ -730,8 +782,7 @@ def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
 
     async def scenario() -> None:
         """Drain a stream, leave the block, then pull one more item."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        traced, exporter = _traced(FakeAdapter())
         handle = traced.bind().stream_one("hi")
         async with handle:
             _ = [item async for item in handle]
@@ -745,7 +796,7 @@ def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
@@ -753,8 +804,7 @@ def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
 
     async def scenario() -> None:
         """Drain a stream, leave the block, then enter the same handle again."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        traced, exporter = _traced(FakeAdapter())
         handle = traced.bind().stream_one("hi")
         async with handle:
             _ = [item async for item in handle]
@@ -765,7 +815,7 @@ def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_stream_never_entered_emits_no_span() -> None:
@@ -773,12 +823,11 @@ def test_stream_never_entered_emits_no_span() -> None:
 
     async def scenario() -> None:
         """Build a handle and drop it."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=False)
+        traced, exporter = _traced(FakeAdapter())
         _handle = traced.bind().stream_one("hi")
         assert exporter.get_finished_spans() == ()
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
@@ -792,12 +841,8 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
 
     async def scenario() -> None:
         """Iterate a mid-failing stream and confirm the error span."""
-        adapter = _FakeAdapter(stream=_MidFailStream(), classify_result="transient")
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
+        traced, exporter = _traced(
+            FakeAdapter(stream=_MidFailStream(), classify_result="transient")
         )
         with pytest.raises(GenerationError):
             await _drain(traced)
@@ -807,61 +852,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
         assert span.attributes["error.type"] == "retry_unavailable_error"
         assert [event.name for event in span.events] == ["langchaint.attempt_failed"]
 
-    asyncio.run(scenario())
-
-
-def test_stream_open_exhausting_retries_ends_its_span_with_the_calls_attributes() -> None:
-    """Retries exhausted while opening ends the span the way a failure read from final() does.
-
-    __aenter__ GenerationError records error.type and call attributes.
-    """
-
-    async def scenario() -> None:
-        """Enter a stream whose every open fails, and inspect the span it left."""
-        adapter = _FakeAdapter(scripted_attempts=[TransientError("connection reset")] * 4)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        with pytest.raises(GenerationError):
-            async with traced.bind(max_attempts=2).stream_one("hi"):
-                pass
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert span.attributes is not None
-        assert span.attributes["error.type"] == "retries_exhausted_error"
-        assert span.status.description == (
-            "attempt 1: connection reset\nattempt 2: connection reset"
-        )
-        assert span.attributes["langchaint.attempts"] == 2
-        assert [event.name for event in span.events] == ["langchaint.attempt_failed"] * 2
-
-    asyncio.run(scenario())
-
-
-def test_stream_final_refusal_ends_the_span_with_error_status() -> None:
-    """A structured refusal detected in the stream's final() ends the span with error status and tokens."""
-
-    async def scenario() -> None:
-        """Drain a stream whose final() reports Refusal and inspect the error span."""
-        adapter = _FakeAdapter(stream=_FakeStream(outcome=_REFUSAL))
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        async with traced.bind().stream_one("hi") as stream:
-            with pytest.raises(GenerationError):
-                await stream.final()
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.ERROR
-        assert span.attributes is not None
-        assert span.attributes["langchaint.cost_in_usd"] == 0.25
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 class _Answer(BaseModel):
@@ -884,12 +875,7 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
 
     async def scenario() -> None:
         """Run the selected call and inspect its request attributes."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)),
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        traced, exporter = _traced(FakeAdapter(echo=True))
         bound = traced.bind(
             response_format=response_format,
             max_completion_tokens=123,
@@ -920,50 +906,7 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
         assert {key: span.attributes[key] for key in expected} == expected
         assert ("gen_ai.request.stream" in span.attributes) is stream
 
-    asyncio.run(scenario())
-
-
-def test_bind_stays_traced_and_shares_the_mapper() -> None:
-    """The replacement object stays traced and uses the same custom mapper."""
-
-    async def scenario() -> None:
-        """Generate and stream on a replacement object under a key-recording mapper."""
-        keys_seen: list[frozenset[str]] = []
-
-        def _mapper(_result: CallResult[object]) -> SpanAttributes:
-            """Record its own key set and emit exactly one attribute."""
-            keys_seen.append(frozenset({"custom.mapped"}))
-            return {"custom.mapped": True}
-
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
-        assert_type(replacement_bound, TracedBoundLLM[str])
-        await replacement_bound.generate_one("hi")
-        async with replacement_bound.stream_one("hi") as stream:
-            async for _item in stream:
-                pass
-            await stream.final()
-        generate_span, stream_span = exporter.get_finished_spans()
-        # gen_ai.operation.name is the wrapper's required attribute, outside the mapper's control.
-        assert generate_span.attributes == {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.output.type": "text",
-            "gen_ai.provider.name": "fake",
-            "gen_ai.request.model": "fake-model",
-            "custom.mapped": True,
-        }
-        assert stream_span.attributes is not None
-        # The stream span also carries the wrapper-owned time_to_first_chunk plus the mapped one.
-        assert stream_span.attributes["custom.mapped"] is True
-        assert keys_seen == [frozenset({"custom.mapped"}), frozenset({"custom.mapped"})]
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_initial_and_replacement_bind_forward_binding_options() -> None:
@@ -971,7 +914,7 @@ def test_traced_initial_and_replacement_bind_forward_binding_options() -> None:
     extra_body = {"safety_identifier": "user-7"}
     provider_tool = {"type": "web_search"}
     traced = TracedLLM(
-        LLM(_FakeAdapter(automatic_cache_breakpoints_default=False)),
+        LLM(FakeAdapter(automatic_cache_breakpoints_default=False)),
         capture_message_content=False,
     )
     assert traced.bind().max_attempts == 3
@@ -1027,42 +970,11 @@ def test_traced_initial_and_replacement_bind_forward_binding_options() -> None:
     assert cleared.binding.provider_executed_tools == ()
 
 
-def test_custom_attribute_mapper_replaces_default_result_attributes() -> None:
-    """A custom attribute_mapper replaces default result attributes."""
-
-    async def scenario() -> None:
-        """Generate under a two-key mapper and inspect the wrapper and mapper attributes."""
-
-        def _mapper(result: CallResult[object]) -> SpanAttributes:
-            """Emit two fixed attributes drawn from the result."""
-            return {"custom.model": result.model, "custom.attempts": result.attempts}
-
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes == {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.output.type": "text",
-            "gen_ai.provider.name": "fake",
-            "gen_ai.request.model": "fake-model",
-            "custom.model": "fake-model",
-            "custom.attempts": 1,
-        }
-
-    asyncio.run(scenario())
-
-
 def test_mapper_not_invoked_on_a_non_recording_span() -> None:
     """A custom attribute_mapper never fires when the tracer's spans are non-recording."""
 
     async def scenario() -> None:
-        """Generate under a TracerProvider-less tracer and assert the mapper never ran."""
+        """Generate under a no-op tracer and assert the mapper never ran."""
         calls: list[int] = []
 
         def _mapper(_result: CallResult[object]) -> SpanAttributes:
@@ -1070,10 +982,9 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
             calls.append(1)
             return {}
 
-        # No global SDK provider is configured, so get_tracer yields non-recording spans.
-        tracer = trace.get_tracer("no-sdk")
+        tracer = trace.NoOpTracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter()),
+            LLM(FakeAdapter()),
             attribute_mapper=_mapper,
             tracer=tracer,
             capture_message_content=False,
@@ -1082,111 +993,35 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         assert response.output == "ok"
         assert calls == []
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
+def _raising_mapper(_result: CallResult[object]) -> SpanAttributes:
+    """Raise to simulate a buggy user mapper.
+
+    Raises:
+        RuntimeError: always.
+    """
+    raise RuntimeError("mapper bug")
+
+
+@pytest.mark.parametrize("path", ["generate", "stream"])
 def test_raising_mapper_is_caught_and_the_result_survives(
-    caplog: pytest.LogCaptureFixture,
+    path: _CallPath, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A raising mapper is logged, generate_one still returns its Response, and the span still ends."""
+    """A raising mapper is logged, the call still returns its Response, and the span still ends."""
 
     async def scenario() -> None:
-        """Generate under a mapper that raises and confirm the result and span survive."""
-
-        def _mapper(_result: CallResult[object]) -> SpanAttributes:
-            """Raise to simulate a buggy user mapper.
-
-            Raises:
-                RuntimeError: always.
-            """
-            raise RuntimeError("mapper bug")
-
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
-        )
+        """Run the call under a mapper that raises and confirm the result and span survive."""
+        traced, exporter = _traced(FakeAdapter(), attribute_mapper=_raising_mapper)
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await traced.bind().generate_one("hi")
+            response = await _generate_through(path, traced.bind())
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
         assert any("mapper" in record.message for record in caplog.records)
 
-    asyncio.run(scenario())
-
-
-def test_generate_many_invokes_the_mapper_once_per_item() -> None:
-    """Map each item's span from that item's result once."""
-
-    async def scenario() -> None:
-        """Run a two-item batch under a counting mapper and read what each item's span carries."""
-        mapped_outputs: list[object] = []
-
-        def _mapper(result: CallResult[object]) -> SpanAttributes:
-            """Record the result mapped and emit it as an attribute."""
-            output = result.output if result.kind == "response" else None
-            mapped_outputs.append(output)
-            return {"custom.mapped_output": str(output)}
-
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(echo=True),
-                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
-            ),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        results = await traced.bind().generate_many([
-            [UserMessage(content="a")],
-            [UserMessage(content="b")],
-        ])
-        first, second = results
-        assert first.kind == "response"
-        assert first.output == "a"
-        assert second.kind == "response"
-        assert second.output == "b"
-        assert mapped_outputs == ["a", "b"]
-        spans = exporter.get_finished_spans()
-        assert [_attribute(span, "custom.mapped_output") for span in spans] == ["a", "b"]
-
-    asyncio.run(scenario())
-
-
-def test_raising_mapper_in_final_still_returns_the_response() -> None:
-    """A raising mapper in the stream's final() still returns the assembled Response."""
-
-    async def scenario() -> None:
-        """Drain a stream under a raising mapper and read final()."""
-
-        def _mapper(_result: CallResult[object]) -> SpanAttributes:
-            """Raise on every call.
-
-            Raises:
-                RuntimeError: always.
-            """
-            raise RuntimeError("mapper bug")
-
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        async with traced.bind().stream_one("hi") as stream:
-            async for _item in stream:
-                pass
-            response = await stream.final()
-        assert response.output == "ok"
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.OK
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def _bind_overload_pin() -> None:
@@ -1195,11 +1030,12 @@ def _bind_overload_pin() -> None:
     pyrefly type-checks this module, so a break in the overload split surfaces as a type error here.
     Not a test: assert_type is a runtime no-op, so pytest could only ever report it as passing.
     """
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
     structured = traced.bind(response_format=_Answer)
     assert_type(structured, TracedBoundLLM[_Answer])
     text = traced.bind()
     assert_type(text, TracedBoundLLM[str])
+    assert_type(text.bind(system_prompt="s"), TracedBoundLLM[str])
     text_with_tools = traced.bind(tools=[_echo_tool()])
     assert_type(text_with_tools, TracedBoundLLM[str, ToolManager])
     structured_with_tools = traced.bind(
@@ -1222,7 +1058,7 @@ def _bind_overload_pin() -> None:
 
 async def _generate_many_records_overload_pin() -> None:
     """Pin `TracedBoundLLM.generate_many_records` output types for text and structured bindings."""
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
     text_records = await traced.bind().generate_many_records(
         ["hi"], resume_path=pathlib.Path("records.json")
     )
@@ -1261,63 +1097,57 @@ def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> Spa
     return mapper(response)
 
 
-def test_extra_attributes_ride_on_generate_spans_and_mapper_wins_collisions() -> None:
-    """extra_attributes land at span start on generate spans. A mapper key of the same name wins."""
+def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
+    """A custom mapper replaces the default result attributes on generate, stream, and batch item spans.
+
+    A replacement binding keeps the mapper and extra_attributes.
+    A mapper key of the same name as an extra wins at completion.
+    The wrapper-owned gen_ai.operation.name wins at span start.
+    """
 
     async def scenario() -> None:
-        """Generate under extra_attributes plus a colliding mapper key and inspect the span."""
+        """Generate, stream, and batch on a replacement binding, then read every span."""
+        mapped_models: list[str] = []
 
-        def _mapper(_result: CallResult[object]) -> SpanAttributes:
-            """Emit one attribute colliding with an extra_attributes key."""
-            return {"shared.key": "mapped"}
+        def _mapper(result: CallResult[object]) -> SpanAttributes:
+            """Record the call and emit one attribute from the result and one colliding with an extra."""
+            mapped_models.append(result.model)
+            return {"custom.model": result.model, "shared.key": "mapped"}
 
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)),
+        traced, exporter = _traced(
+            FakeAdapter(echo=True),
             attribute_mapper=_mapper,
-            extra_attributes={"gen_ai.agent.name": "agent_a", "shared.key": "extra"},
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.agent.name"] == "agent_a"
-        assert span.attributes["shared.key"] == "mapped"
-
-    asyncio.run(scenario())
-
-
-def test_extra_attributes_survive_bind_and_reach_stream_and_batch_item_spans() -> None:
-    """extra_attributes pass through bind and land on the stream span and each batch item's span."""
-
-    async def scenario() -> None:
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(echo=True),
-                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
-            ),
-            extra_attributes={"gen_ai.agent.name": "agent_a"},
-            tracer=tracer,
-            capture_message_content=False,
+            extra_attributes={
+                "gen_ai.agent.name": "agent_a",
+                "shared.key": "extra",
+                "gen_ai.operation.name": "not-the-operation",
+            },
         )
         replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
-        async with replacement_bound.stream_one("hi") as stream:
-            await stream.final()
-        await replacement_bound.generate_many([
-            [UserMessage(content="a")],
-            [UserMessage(content="b")],
-        ])
+        for path in ("generate", "stream"):
+            await _generate_through(path, replacement_bound)
+        await replacement_bound.generate_many(["a", "b"])
         spans = exporter.get_finished_spans()
-        # One stream span plus one per batch item.
-        assert len(spans) == 3
-        assert all(
-            span.attributes is not None and span.attributes["gen_ai.agent.name"] == "agent_a"
-            for span in spans
-        )
+        # One generate span, one stream span, and one span per batch item.
+        assert len(spans) == 4
+        assert mapped_models == ["fake-model"] * 4
+        # The wrapper sets the request attributes at span start, outside the mapper's control.
+        assert spans[0].attributes == {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.output.type": "text",
+            "gen_ai.provider.name": "fake",
+            "gen_ai.request.model": "fake-model",
+            "gen_ai.agent.name": "agent_a",
+            "custom.model": "fake-model",
+            "shared.key": "mapped",
+        }
+        for span in spans:
+            assert _attribute(span, "gen_ai.agent.name") == "agent_a"
+            assert _attribute(span, "custom.model") == "fake-model"
+            assert _attribute(span, "shared.key") == "mapped"
+            assert _attribute(span, "gen_ai.operation.name") == "chat"
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 class _EchoToolArgs(BaseModel):
@@ -1428,7 +1258,10 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     expected_outcome_type: type[DispatchOutcome],
     expected_error_type: str | None,
 ) -> None:
-    """Each dispatch emits one execute_tool span classified by its outcome."""
+    """Each dispatch emits one execute_tool span classified by its outcome.
+
+    Capture is off, so the exact attribute set shows that no arguments or result are recorded.
+    """
     expected_attributes: dict[str, object] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_call.name,
@@ -1454,7 +1287,7 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
         assert span.attributes is not None
         assert dict(span.attributes) == expected_attributes
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_tool_manager_function_exception_marks_the_span_error_and_propagates() -> None:
@@ -1477,7 +1310,7 @@ def test_traced_tool_manager_function_exception_marks_the_span_error_and_propaga
         # A raising function is classified by its exception class, the one open-ended error.type value.
         assert span.attributes["error.type"] == "RuntimeError"
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
@@ -1502,7 +1335,7 @@ def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
         }
         assert call_ids == {"call1", "call2"}
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
@@ -1535,12 +1368,12 @@ def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
         assert inner_span.parent is not None
         assert inner_span.parent.span_id == dispatch_span.context.span_id
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_traced_initial_and_replacement_bind_preserve_tool_manager() -> None:
     """`TracedLLM.bind` and `TracedBoundLLM.bind` preserve `tools=ToolManager(...)`."""
-    traced = TracedLLM(LLM(_FakeAdapter()), capture_message_content=False)
+    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
     bound_tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
     bound = traced.bind(tools=bound_tool_manager)
     assert bound.tool_manager is bound_tool_manager
@@ -1553,12 +1386,10 @@ def test_traced_bind_sequences_construct_traced_tool_managers() -> None:
     """`TracedLLM.bind` and `TracedBoundLLM.bind` construct `TracedToolManager` from sequences."""
 
     async def scenario() -> None:
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            tracer=tracer,
-            extra_attributes={"gen_ai.agent.name": "agent_a"},
+        traced, exporter = _traced(
+            FakeAdapter(),
             capture_message_content=True,
+            extra_attributes={"gen_ai.agent.name": "agent_a"},
         )
         bound = traced.bind(tools=[_echo_tool()])
         replacement_bound = bound.bind(tools=[_echo_tool()])
@@ -1579,7 +1410,7 @@ def test_traced_bind_sequences_construct_traced_tool_managers() -> None:
             assert "gen_ai.tool.call.arguments" in span.attributes
             assert "gen_ai.tool.call.result" in span.attributes
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 @pytest.mark.parametrize(
@@ -1610,50 +1441,29 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
         assert span.attributes["gen_ai.agent.name"] == "agent_a"
         assert span.attributes[colliding_key] == expected_value
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_generate_many_passes_warm_cache_through() -> None:
     """warm_cache reaches BoundLLM.generate_many: the warming item never overlaps a sibling."""
 
     async def scenario() -> None:
-        """Run a three-item batch on a slow fake with a wide concurrency bound and read the recorded peak."""
-        adapter = _FakeAdapter(echo=True, open_seconds=0.01)
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff(max_concurrent_requests=8)),
-            tracer=tracer,
-            capture_message_content=False,
+        """Hold the first open at a barrier and check that no sibling opens meanwhile."""
+        opens_pair_up = asyncio.Barrier(2)
+        adapter = FakeAdapter(echo=True, open_barrier=opens_pair_up)
+        traced, exporter = _traced(adapter)
+        task = asyncio.create_task(
+            traced.bind().generate_many(
+                [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
+            )
         )
-        results = await traced.bind().generate_many(
-            [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
-        )
+        await assert_the_first_open_runs_alone(adapter, opens_pair_up)
+        results = await task
         assert all(result.kind == "response" for result in results)
-        assert adapter.bound_adapters[0].peak_in_flight == 2
         # The warming item is traced like every other item, so three items are three spans.
         assert len(exporter.get_finished_spans()) == 3
 
-    asyncio.run(scenario())
-
-
-def test_extra_attributes_cannot_displace_the_operation_name() -> None:
-    """A required attribute set at span start wins over an application constant of the same key."""
-
-    async def scenario() -> None:
-        """Generate under extra_attributes claiming the operation name key."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            tracer=tracer,
-            capture_message_content=False,
-            extra_attributes={"gen_ai.operation.name": "not-the-operation"},
-        )
-        await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert span.attributes["gen_ai.operation.name"] == "chat"
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_vendored_payload_schemas_match_the_schema_mapping() -> None:
@@ -1661,91 +1471,6 @@ def test_vendored_payload_schemas_match_the_schema_mapping() -> None:
     vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
     assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
     assert vendored == set(_PAYLOAD_SCHEMA_FILES.values())
-
-
-def test_refresh_creates_a_populated_source_checkout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """git clone populates SOURCE_CHECKOUT before the cleanliness check."""
-    source_checkout = tmp_path / "semantic-conventions-genai-source"
-    resolved_sha = "a" * 40
-    commands: list[list[str]] = []
-
-    def fake_run(
-        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
-    ) -> str:
-        assert working_directory in (refresh_semconv_genai.ROOT, source_checkout)
-        commands.append(command)
-        if command[:2] == ["git", "clone"]:
-            assert "--no-checkout" not in command
-            source_checkout.joinpath(".git").mkdir(parents=True)
-            return ""
-        if command == ["git", "remote", "get-url", "origin"]:
-            return refresh_semconv_genai.SOURCE_URL
-        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
-            return ""
-        if command == ["git", "rev-parse", "HEAD"]:
-            return resolved_sha
-        raise AssertionError(f"unexpected command: {command!r}")
-
-    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
-    monkeypatch.setattr(refresh_semconv_genai, "_run", fake_run)
-    refresh_semconv_genai._prepare_source_checkout(resolved_sha)
-    assert commands[0][:2] == ["git", "clone"]
-
-
-def test_refresh_uses_the_workflow_prepared_source_commit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """PREPARED_SOURCE_REF prevents a second resolution of main."""
-    source_checkout = tmp_path / "semantic-conventions-genai-source"
-    source_checkout.joinpath(".git").mkdir(parents=True)
-    resolved_sha = "a" * 40
-
-    def fake_run(
-        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
-    ) -> str:
-        assert command == [
-            "git",
-            "rev-parse",
-            "--verify",
-            refresh_semconv_genai.PREPARED_SOURCE_REF,
-        ]
-        assert working_directory == source_checkout
-        return resolved_sha
-
-    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
-    monkeypatch.setattr(refresh_semconv_genai, "_run", fake_run)
-    assert refresh_semconv_genai._resolved_source_sha() == resolved_sha
-
-
-def test_refresh_resolves_main_without_a_prepared_source_commit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A missing PREPARED_SOURCE_REF makes a local refresh resolve main."""
-    source_checkout = tmp_path / "semantic-conventions-genai-source"
-    source_checkout.joinpath(".git").mkdir(parents=True)
-    resolved_sha = "a" * 40
-
-    def missing_prepared_ref(
-        command: list[str], *, working_directory: pathlib.Path = refresh_semconv_genai.ROOT
-    ) -> str:
-        assert command == [
-            "git",
-            "rev-parse",
-            "--verify",
-            refresh_semconv_genai.PREPARED_SOURCE_REF,
-        ]
-        assert working_directory == source_checkout
-        raise subprocess.CalledProcessError(1, command)
-
-    def resolved_main_sha() -> str:
-        return resolved_sha
-
-    monkeypatch.setattr(refresh_semconv_genai, "SOURCE_CHECKOUT", source_checkout)
-    monkeypatch.setattr(refresh_semconv_genai, "_run", missing_prepared_ref)
-    monkeypatch.setattr(refresh_semconv_genai, "_resolved_main_sha", resolved_main_sha)
-    assert refresh_semconv_genai._resolved_source_sha() == resolved_sha
 
 
 def test_refresh_accepts_a_structured_attribute_name_array(tmp_path: pathlib.Path) -> None:
@@ -1820,77 +1545,16 @@ def test_refresh_removes_an_obsolete_file_and_rewrites_source_doc(
     assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
 
 
-_REASONING_ONLY_OUTCOME = AdapterResult(
-    output="",
-    assistant_message=AssistantMessage(turn=(ReasoningPart(raw={"signature": "opaque"}),)),
-    stop_reason="end_turn",
-)
-_EMPTY_TEXT_TURN_OUTCOME = AdapterResult(
-    output="",
-    assistant_message=AssistantMessage(
-        turn=(
-            ReasoningPart(raw={"signature": "opaque"}, text=""),
-            TextPart(text=""),
-        )
-    ),
-    stop_reason="end_turn",
-)
-_REASONING_WITH_TEXT_OUTCOME = AdapterResult(
-    output="answer",
-    assistant_message=AssistantMessage(
-        turn=(
-            ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
-            TextPart(text="answer"),
-        )
-    ),
-    stop_reason="end_turn",
-)
-
-
-def _captured(exporter: InMemorySpanExporter, key: str) -> object:
-    """Read one span's JSON content attribute back as Python data."""
-    (span,) = exporter.get_finished_spans()
-    assert span.attributes is not None
-    value = span.attributes[key]
-    assert isinstance(value, str)
-    parsed: object = json.loads(value)
-    return parsed
-
-
-def test_capture_off_leaves_every_content_key_off_the_span() -> None:
-    """capture_message_content=False omits content attributes with populated sources."""
-
-    async def scenario() -> None:
-        """Generate with populated content sources and capture disabled."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter(echo=True)), tracer=tracer, capture_message_content=False
-        )
-        bound = traced.bind(
-            system_prompt="be brief",
-            tools=ToolManager([_echo_tool()]),
-        )
-        await bound.generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert not {
-            "gen_ai.system_instructions",
-            "gen_ai.tool.definitions",
-            "gen_ai.input.messages",
-            "gen_ai.output.messages",
-        } & set(span.attributes)
-
-    asyncio.run(scenario())
-
-
 def test_capture_on_records_all_four_content_attributes_in_convention_shape() -> None:
-    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant turn."""
+    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant turn.
+
+    Capture carries over to a replacement binding.
+    """
 
     async def scenario() -> None:
         """Generate over a Sequence[Message] carrying every message role and inspect the shapes."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(
+        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
+        bound = traced.bind(system_prompt="replaced").bind(
             system_prompt="be brief",
             tools=ToolManager([_echo_tool()]),
         )
@@ -1943,22 +1607,7 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
             }
         ]
 
-    asyncio.run(scenario())
-
-
-def test_a_str_generation_input_is_captured_as_one_user_message() -> None:
-    """The bare-str GenerationInput form renders as the one user message it means."""
-
-    async def scenario() -> None:
-        """Generate from a str GenerationInput and read the input messages back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind().generate_one("hi")
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
-        ]
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 _MULTIMODAL_USER_MESSAGE = UserMessage(
@@ -2003,8 +1652,7 @@ def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> N
 
     async def scenario() -> None:
         """Generate over the multimodal message and read the recorded parts back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
+        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
         await traced.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
         captured_parts = _captured_user_parts(exporter)
         schema_definitions = _payload_schema("gen-ai-input-messages.json")["$defs"]
@@ -2028,8 +1676,7 @@ def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> N
         for uri_part in uri_parts:
             image_uri_part_validator.validate(uri_part)
         (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        input_messages_json = span.attributes["gen_ai.input.messages"]
+        input_messages_json = _attribute(span, "gen_ai.input.messages")
         assert isinstance(input_messages_json, str)
         parsed = parse_otel({
             "gen_ai.operation.name": "chat",
@@ -2037,7 +1684,7 @@ def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> N
         })
         assert generation_input_from_otel(parsed) == (_MULTIMODAL_USER_MESSAGE,)
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
@@ -2048,7 +1695,7 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
         tracer, exporter = _in_memory_tracer()
         content_filter: ContentFilter = _drop_binary
         traced = TracedLLM(
-            LLM(_FakeAdapter()),
+            LLM(FakeAdapter()),
             tracer=tracer,
             capture_message_content=True,
             content_filter=content_filter,
@@ -2060,13 +1707,8 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
             "uri",
             "uri",
         ]
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        input_messages_json = str(span.attributes["gen_ai.input.messages"])
-        assert base64.b64encode(b"\x89PNGsecret").decode("ascii") not in input_messages_json
-        assert base64.b64encode(b"WAVsecret").decode("ascii") not in input_messages_json
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 _MARKER = "SECRET-MARKER"
@@ -2106,15 +1748,15 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         )
         traced = TracedLLM(
             LLM(
-                _FakeAdapter(
+                FakeAdapter(
                     scripted_attempts=[
-                        _ScriptedResponse(
+                        ScriptedResponse(
                             outcome=AdapterResult(
                                 output="answer",
                                 assistant_message=scripted_turn,
                                 stop_reason="end_turn",
                             ),
-                            usage=_USAGE,
+                            usage=USAGE,
                         )
                     ]
                 )
@@ -2148,7 +1790,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
                     assert _MARKER not in str(value), f"{span.name}: {key} leaks {_MARKER}"
         assert recorded_content_keys == set(_PAYLOAD_SCHEMA_FILES)
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def _drop_system_instructions(
@@ -2158,50 +1800,80 @@ def _drop_system_instructions(
     return None if name == "gen_ai.system_instructions" else part
 
 
-def test_a_system_prompt_whose_every_part_filters_away_omits_gen_ai_system_instructions() -> None:
-    """A system prompt with no parts left to record omits the key instead of recording an empty array."""
+@pytest.mark.parametrize(
+    ("system_prompt", "content_filter", "expected_instructions"),
+    [
+        (None, _record_every_part, None),
+        (
+            [TextPart(text="be brief"), TextPart(text="cite sources")],
+            _record_every_part,
+            [{"type": "text", "content": "be brief"}, {"type": "text", "content": "cite sources"}],
+        ),
+        ("rules", _drop_system_instructions, None),
+    ],
+    ids=["absent", "one_element_per_part", "every_part_filtered_away"],
+)
+def test_system_instructions_render_one_element_per_part_and_omit_an_empty_array(
+    system_prompt: str | list[TextPart] | None,
+    content_filter: ContentFilter,
+    expected_instructions: object,
+) -> None:
+    """A system prompt with no parts left to record omits its key, while the input messages stay."""
+    binding = LLM(FakeAdapter()).bind(system_prompt=system_prompt).binding
+    attributes = _input_content_attributes(binding, "hi", content_filter=content_filter)
+    instructions = attributes.get("gen_ai.system_instructions")
+    assert (None if instructions is None else json.loads(str(instructions))) == (
+        expected_instructions
+    )
+    assert "gen_ai.tool.definitions" not in attributes
+    assert "gen_ai.input.messages" in attributes
 
-    async def scenario() -> None:
-        """Generate under the bound prompt and read the span back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(_FakeAdapter()),
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=_drop_system_instructions,
-        )
-        await traced.bind(system_prompt="rules").generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.system_instructions" not in span.attributes
-        assert "gen_ai.input.messages" in span.attributes
 
-    asyncio.run(scenario())
+def _raise_on_input_messages(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
+    """Raise on every input-message part and keep every other part.
+
+    Raises:
+        RuntimeError: `name` is gen_ai.input.messages.
+    """
+    if name == "gen_ai.input.messages":
+        raise RuntimeError("filter defect")
+    return part
 
 
-def test_a_filter_that_raises_on_an_input_part_omits_the_three_input_attributes(
+@pytest.mark.parametrize(
+    ("content_filter", "build_tool", "logged_error_text"),
+    [
+        (_raise_on_input_messages, _echo_tool, "filter defect"),
+        (_record_every_part, _unserializable_schema_tool, "is not JSON serializable"),
+    ],
+    ids=["raising_filter", "unserializable_tool_schema"],
+)
+@pytest.mark.parametrize("path", ["generate", "stream"])
+def test_a_failure_building_input_content_omits_the_three_input_attributes(
+    path: _CallPath,
+    content_filter: ContentFilter,
+    build_tool: Callable[[], PydanticTool[_EchoToolArgs] | JSONSchemaTool],
+    logged_error_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The three input keys build as one dict, so one raise drops all three and the call proceeds."""
+    """The three input keys build as one dict, so one failure drops all three and the call proceeds.
 
-    def raise_on_input_messages(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
-        if name == "gen_ai.input.messages":
-            raise RuntimeError("filter defect")
-        return part
+    The failure is logged with its exception, and the output content, usage, and stream timing still reach the span.
+    """
 
     async def scenario() -> None:
-        """Generate under the raising filter, then read the span and the log."""
+        """Run the call with input content that cannot be built, then read the span and the log."""
         tracer, exporter = _in_memory_tracer()
         traced = TracedLLM(
-            LLM(_FakeAdapter()),
+            LLM(FakeAdapter()),
             tracer=tracer,
             capture_message_content=True,
-            content_filter=raise_on_input_messages,
+            content_filter=content_filter,
         )
-        bound = traced.bind(system_prompt="rules", tools=ToolManager([_echo_tool()]))
+        bound = traced.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await bound.generate_one("hi")
-        assert response.output == "ok"
+            result = await _generate_through(path, bound)
+        assert result.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert not {
@@ -2209,11 +1881,19 @@ def test_a_filter_that_raises_on_an_input_part_omits_the_three_input_attributes(
             "gen_ai.tool.definitions",
             "gen_ai.input.messages",
         } & set(span.attributes)
-        assert "gen_ai.output.messages" in span.attributes
+        assert _json_attribute(span, "gen_ai.output.messages") == [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "ok"}],
+                "finish_reason": "stop",
+            }
+        ]
+        assert "gen_ai.usage.output_tokens" in span.attributes
+        assert ("gen_ai.response.time_to_first_chunk" in span.attributes) is (path == "stream")
         assert "content capture raised" in caplog.text
-        assert "filter defect" in caplog.text
+        assert logged_error_text in caplog.text
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
@@ -2245,372 +1925,137 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
         assert "content capture raised" in caplog.text
         assert "returned TextPart for ToolCall" in caplog.text
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 @pytest.mark.parametrize(
-    "outcome",
-    [_REASONING_ONLY_OUTCOME, _EMPTY_TEXT_TURN_OUTCOME],
-    ids=["text_free_reasoning_alone", "empty_text_on_every_part"],
+    ("turn", "stop_reason", "expected_parts", "expected_finish_reason"),
+    [
+        ((ReasoningPart(raw={"signature": "opaque"}),), "end_turn", [], "stop"),
+        (
+            (ReasoningPart(raw={"signature": "opaque"}, text=""), TextPart(text="")),
+            "end_turn",
+            [],
+            "stop",
+        ),
+        (
+            (
+                ReasoningPart(raw={"signature": "opaque"}, text="thought it over"),
+                TextPart(text="answer"),
+            ),
+            "end_turn",
+            [
+                {"type": "reasoning", "content": "thought it over"},
+                {"type": "text", "content": "answer"},
+            ],
+            "stop",
+        ),
+        (
+            REJECTED_TURN.turn,
+            None,
+            [{"type": "text", "content": "what the rejected 200 carried"}],
+            "error",
+        ),
+    ],
+    ids=[
+        "text_free_reasoning_alone",
+        "empty_text_on_every_part",
+        "reasoning_text",
+        "no_stop_reason",
+    ],
 )
-def test_a_turn_carrying_no_readable_text_emits_its_message_with_an_empty_parts_array(
-    outcome: AdapterResult[str],
+def test_output_messages_render_readable_text_and_never_the_reasoning_payload(
+    turn: tuple[TurnPart, ...],
+    stop_reason: StopReason | None,
+    expected_parts: list[object],
+    expected_finish_reason: str,
 ) -> None:
-    """A turn without readable text records empty output parts."""
+    """A turn renders its readable text in order, ReasoningPart.raw never, and "error" for no stop reason.
 
-    async def scenario() -> None:
-        """Generate the turn and read the output messages back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(scripted_attempts=[_ScriptedResponse(outcome=outcome, usage=_USAGE)])
-            ),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        await traced.bind().generate_one("hi")
-        assert _captured(exporter, "gen_ai.output.messages") == [
-            {"role": "assistant", "parts": [], "finish_reason": "stop"}
-        ]
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "opaque" not in str(span.attributes["gen_ai.output.messages"])
-
-    asyncio.run(scenario())
+    A turn without readable text still renders its message, with an empty parts array.
+    """
+    attributes = _output_content_attributes(turn, stop_reason)
+    output_messages = str(attributes["gen_ai.output.messages"])
+    assert json.loads(output_messages) == [
+        {"role": "assistant", "parts": expected_parts, "finish_reason": expected_finish_reason}
+    ]
+    assert "opaque" not in output_messages
 
 
-def test_reasoning_text_becomes_a_reasoning_part_without_its_payload() -> None:
-    """ReasoningPart.text emits as the convention's reasoning part.
+@pytest.mark.parametrize(
+    ("tool_call", "expected_arguments"),
+    [
+        (
+            ToolCall(id="call1", name="echo", args_json='{"text":"hi",   "n":1}'),
+            {"text": "hi", "n": 1},
+        ),
+        (ToolCall(id="call1", name="missing", args_json="{}"), {}),
+        (ToolCall(id="call1", name="echo", args_json="not json at all"), "not json at all"),
+    ],
+    ids=["handled", "unknown_tool", "invalid_tool_args"],
+)
+def test_tool_span_captures_arguments_and_result_under_capture(
+    tool_call: ToolCall, expected_arguments: object
+) -> None:
+    """A dispatch span records the parsed arguments and the tool_message as a tool_call_response part.
 
-    ReasoningPart.raw stays off the span when ReasoningPart.text is present.
-    The span receives the readable copy without the signature.
+    Argument text that does not parse is recorded unchanged as a JSON string.
+    The result is recorded on the variants where no tool ran, too.
     """
 
     async def scenario() -> None:
-        """Generate a texted ReasoningPart and TextPart, then read both messages."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(
-                    scripted_attempts=[
-                        _ScriptedResponse(outcome=_REASONING_WITH_TEXT_OUTCOME, usage=_USAGE)
-                    ]
-                )
-            ),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        await traced.bind().generate_one("hi")
-        assert _captured(exporter, "gen_ai.output.messages") == [
-            {
-                "role": "assistant",
-                "parts": [
-                    {"type": "reasoning", "content": "thought it over"},
-                    {"type": "text", "content": "answer"},
-                ],
-                "finish_reason": "stop",
-            }
-        ]
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "opaque" not in str(span.attributes["gen_ai.output.messages"])
-
-    asyncio.run(scenario())
-
-
-def test_an_absent_system_prompt_omits_its_key_while_capture_stays_on() -> None:
-    """No bound system prompt omits gen_ai.system_instructions. The GenerationInput is still captured.
-
-    The captured input messages are what separates this from the capture-off case.
-    """
-
-    async def scenario() -> None:
-        """Generate under a binding with no system prompt and no tools."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind().generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.system_instructions" not in span.attributes
-        assert "gen_ai.tool.definitions" not in span.attributes
-        assert "gen_ai.input.messages" in span.attributes
-
-    asyncio.run(scenario())
-
-
-def test_system_prompt_parts_become_one_instruction_element_each() -> None:
-    """A parts-form system prompt emits one text element per part."""
-
-    async def scenario() -> None:
-        """Bind a two-part system prompt and read the instructions back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(
-            system_prompt=[TextPart(text="be brief"), TextPart(text="cite sources")],
-        )
-        await bound.generate_one("hi")
-        assert _captured(exporter, "gen_ai.system_instructions") == [
-            {"type": "text", "content": "be brief"},
-            {"type": "text", "content": "cite sources"},
-        ]
-
-    asyncio.run(scenario())
-
-
-def test_the_error_path_captures_input_and_the_turn_the_failure_carried() -> None:
-    """A failed call keeps the input attributes set at span start and emits the turn it recorded."""
-
-    async def scenario() -> None:
-        """Drive a refusal under capture and inspect the error span."""
-        adapter = _FakeAdapter(scripted_attempts=[_billed(_REFUSAL)])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        with pytest.raises(GenerationError):
-            await traced.bind(system_prompt="be brief").generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.input.messages" in span.attributes
-        assert "gen_ai.system_instructions" in span.attributes
-        assert span.attributes["error.type"] == "refusal_error"
-        (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
-        assert message["role"] == "assistant"
-        assert message["finish_reason"] == "refusal"
-
-    asyncio.run(scenario())
-
-
-def test_a_failure_that_produced_no_turn_emits_no_output_messages() -> None:
-    """The output key is omitted when no attempt reached a 200, there being no turn to record."""
-
-    async def scenario() -> None:
-        """Exhaust the retry budget on transport failures and inspect the error span."""
-        adapter = _FakeAdapter(scripted_attempts=[TransientError("e1"), TransientError("e2")])
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        with pytest.raises(GenerationError):
-            await traced.bind(max_attempts=2).generate_one("hi")
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.input.messages" in span.attributes
-        assert "gen_ai.output.messages" not in span.attributes
-
-    asyncio.run(scenario())
-
-
-def test_generate_many_captures_each_items_own_generation_input_under_capture() -> None:
-    """Each item's span carries that item's generation_input, not the batch's, which has no single one."""
-
-    async def scenario() -> None:
-        """Run a two-item batch under capture and read the content off each item's span."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(
-                _FakeAdapter(echo=True),
-                shared_backoff=_fast_shared_backoff(max_concurrent_requests=1),
-            ),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        await traced.bind().generate_many(["a", "b"])
-        first, second = exporter.get_finished_spans()
-        for span, content in ((first, "a"), (second, "b")):
-            input_messages = _attribute(span, "gen_ai.input.messages")
-            output_messages = _attribute(span, "gen_ai.output.messages")
-            assert isinstance(input_messages, str)
-            assert isinstance(output_messages, str)
-            assert json.loads(input_messages) == [
-                {"role": "user", "parts": [{"type": "text", "content": content}]}
-            ]
-            assert json.loads(output_messages) == [
-                {
-                    "role": "assistant",
-                    "parts": [{"type": "text", "content": content}],
-                    "finish_reason": "stop",
-                }
-            ]
-
-    asyncio.run(scenario())
-
-
-def test_content_that_cannot_be_serialized_is_logged_and_never_reaches_the_caller(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A JSONSchemaTool args_schema json.dumps cannot serialize leaves the call and its result intact.
-
-    The tracing wrapper catches serialization errors.
-    The three input keys build as one dict, so the failure drops all three rather than a subset.
-    """
-
-    async def scenario() -> None:
-        """Generate under capture with the unserializable tool bound, then read the span and the log."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(
-            tools=ToolManager([_unserializable_schema_tool()]),
-        )
-        with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await bound.generate_one("hi")
-        assert response.output == "ok"
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert not {
-            "gen_ai.system_instructions",
-            "gen_ai.tool.definitions",
-            "gen_ai.input.messages",
-        } & set(span.attributes)
-        assert "gen_ai.output.messages" in span.attributes
-        assert "gen_ai.usage.output_tokens" in span.attributes
-        assert "content capture raised" in caplog.text
-
-    asyncio.run(scenario())
-
-
-def test_unserializable_content_leaves_the_stream_and_its_span_intact(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Unserializable input content preserves the stream and span."""
-
-    async def scenario() -> None:
-        """Stream to completion with the unserializable tool bound, then read the span and the log."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(
-            tools=ToolManager([_unserializable_schema_tool()]),
-        )
-        with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            async with bound.stream_one("hi") as stream:
-                _ = [item async for item in stream]
-                response = await stream.final()
-        assert response.output == "ok"
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.input.messages" not in span.attributes
-        assert "gen_ai.output.messages" in span.attributes
-        assert "gen_ai.response.time_to_first_chunk" in span.attributes
-        assert "content capture raised" in caplog.text
-
-    asyncio.run(scenario())
-
-
-def test_stream_span_records_input_and_output_content() -> None:
-    """Check recorded input, system instructions, and output after stream completion."""
-
-    async def scenario() -> None:
-        """Drive a stream to completion under capture and read both sides back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind(system_prompt="be brief")
-        async with bound.stream_one("hi") as stream:
-            _ = [item async for item in stream]
-            await stream.final()
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
-        ]
-        assert _captured(exporter, "gen_ai.system_instructions") == [
-            {"type": "text", "content": "be brief"}
-        ]
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.output.messages" in span.attributes
-
-    asyncio.run(scenario())
-
-
-def test_capture_survives_bind_and_reaches_the_replacement_binding() -> None:
-    """A replacement object retains capture_message_content."""
-
-    async def scenario() -> None:
-        """Replace a captured binding and confirm the new one still captures."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
-        await replacement_bound.generate_one("hi")
-        assert _captured(exporter, "gen_ai.system_instructions") == [
-            {"type": "text", "content": "s2"}
-        ]
-
-    asyncio.run(scenario())
-
-
-def test_tool_span_captures_arguments_and_result_under_capture() -> None:
-    """A dispatch span records the arguments as an object and the tool_message as a tool_call_response part."""
-
-    async def scenario() -> None:
-        """Dispatch one valid call under capture and read both content keys."""
+        """Dispatch one call under capture and read both content keys."""
         tracer, exporter = _in_memory_tracer()
         tool_manager = TracedToolManager(
             [_echo_tool()], tracer=tracer, capture_message_content=True
         )
-        await tool_manager.dispatch(
-            ToolCall(id="call1", name="echo", args_json='{"text":"hi",   "n":1}')
-        )
-        assert _captured(exporter, "gen_ai.tool.call.arguments") == {"text": "hi", "n": 1}
+        outcome = await tool_manager.dispatch(tool_call)
+        assert isinstance(outcome.tool_message.content, str)
+        assert _captured(exporter, "gen_ai.tool.call.arguments") == expected_arguments
         assert _captured(exporter, "gen_ai.tool.call.result") == {
             "type": "tool_call_response",
             "id": "call1",
-            "is_error": False,
-            "response": [{"type": "text", "content": "hi"}],
+            "is_error": outcome.tool_message.is_error,
+            "response": [{"type": "text", "content": outcome.tool_message.content}],
         }
 
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 @pytest.mark.parametrize(
-    "args_json",
-    ['{"n": 1e400}', '{"n": Infinity}', '{"n": -Infinity}', '{"n": NaN}'],
+    ("args_json", "expected"),
+    [
+        ('{"text": "x"}', {"text": "x"}),
+        ('{"n": 1.5, "big": 1e300}', {"n": 1.5, "big": 1e300}),
+        ("[1, 2]", [1, 2]),
+        ('"bare"', "bare"),
+        ("7", 7),
+        ("null", None),
+        ("not json at all", "not json at all"),
+        ("{oops", "{oops"),
+        ('{"n": 1e400}', '{"n": 1e400}'),
+        ('{"n": Infinity}', '{"n": Infinity}'),
+        ('{"n": -Infinity}', '{"n": -Infinity}'),
+        ('{"n": NaN}', '{"n": NaN}'),
+    ],
 )
-def test_tool_span_arguments_fall_back_when_the_parse_cannot_re_serialize_as_json(
-    args_json: str,
+def test_tool_call_arguments_parse_any_json_value_and_keep_other_text_unchanged(
+    args_json: str, expected: object
 ) -> None:
-    """Non-finite argument values fall back to args_json."""
+    """Parse argument text to the JSON value it holds, and keep text that is not standard JSON as the text.
 
-    async def scenario() -> None:
-        """Dispatch a call carrying the number and read the attribute back."""
-        tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=True
-        )
-        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json=args_json))
-        assert _captured(exporter, "gen_ai.tool.call.arguments") == args_json
-
-    asyncio.run(scenario())
-
-
-def test_tool_span_arguments_fall_back_to_the_raw_text_when_the_json_does_not_parse() -> None:
-    """Malformed args_json is preserved as a JSON string."""
-
-    async def scenario() -> None:
-        """Dispatch a call whose argument text is not JSON and read the attribute back."""
-        tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=True
-        )
-        outcome = await tool_manager.dispatch(
-            ToolCall(id="call1", name="echo", args_json="not json at all")
-        )
-        assert outcome.kind == "invalid_tool_args"
-        assert _captured(exporter, "gen_ai.tool.call.arguments") == "not json at all"
-
-    asyncio.run(scenario())
+    A non-finite number is not standard JSON, so it keeps the text rather than parse to a float.
+    """
+    assert _tool_call_arguments(args_json) == expected
 
 
 def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> None:
-    """Input tool calls preserve parsed objects and malformed text."""
+    """Input tool calls record parsed objects and malformed text in a payload the schema accepts."""
 
     async def scenario() -> None:
         """Generate over a turn holding one parseable and one unparseable tool call."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        bound = traced.bind()
-        await bound.generate_one([
+        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
+        await traced.bind().generate_one([
             AssistantMessage(
                 turn=(
                     ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
@@ -2633,111 +2078,7 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
             }
         ]
 
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize(
-    ("args_json", "expected"),
-    [("[1, 2]", [1, 2]), ('"bare"', "bare"), ("7", 7), ("null", None)],
-)
-def test_a_non_object_argument_value_still_nests_as_the_value_it_parses_to(
-    args_json: str, expected: object
-) -> None:
-    """Input tool calls preserve parsed non-object values."""
-
-    async def scenario() -> None:
-        """Generate over a turn whose tool call carries a non-object argument value."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind().generate_one([
-            AssistantMessage(turn=(ToolCall(id="call1", name="echo", args_json=args_json),))
-        ])
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {
-                "role": "assistant",
-                "parts": [
-                    {"type": "tool_call", "id": "call1", "name": "echo", "arguments": expected}
-                ],
-            }
-        ]
-
-    asyncio.run(scenario())
-
-
-def test_an_ordinary_float_argument_survives_the_parse() -> None:
-    """A finite float remains numeric in traced tool arguments."""
-
-    async def scenario() -> None:
-        """Generate over a turn whose tool call carries a finite float and read the arguments back."""
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(LLM(_FakeAdapter()), tracer=tracer, capture_message_content=True)
-        await traced.bind().generate_one([
-            AssistantMessage(
-                turn=(ToolCall(id="call1", name="echo", args_json='{"n": 1.5, "big": 1e300}'),)
-            )
-        ])
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {
-                "role": "assistant",
-                "parts": [
-                    {
-                        "type": "tool_call",
-                        "id": "call1",
-                        "name": "echo",
-                        "arguments": {"n": 1.5, "big": 1e300},
-                    }
-                ],
-            }
-        ]
-
-    asyncio.run(scenario())
-
-
-def test_tool_span_capture_off_omits_both_content_keys() -> None:
-    """capture_message_content False leaves the arguments and result off the dispatch span."""
-
-    async def scenario() -> None:
-        """Dispatch one valid call with capture off and confirm neither key is present."""
-        tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=False
-        )
-        await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "hi"}'))
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        assert "gen_ai.tool.call.arguments" not in span.attributes
-        assert "gen_ai.tool.call.result" not in span.attributes
-
-    asyncio.run(scenario())
-
-
-def test_tool_span_captures_the_result_on_both_variants_where_no_tool_ran() -> None:
-    """Tool failure spans record the model-facing result and error.type."""
-
-    async def scenario() -> None:
-        """Dispatch an off-list name and an invalid-argument call under capture, checking each span."""
-        for call, expected_error_type in (
-            (ToolCall(id="call1", name="missing", args_json="{}"), "unknown_tool"),
-            (ToolCall(id="call2", name="echo", args_json='{"wrong": 1}'), "invalid_tool_args"),
-        ):
-            tracer, exporter = _in_memory_tracer()
-            expected = await ToolManager([_echo_tool()]).dispatch(call)
-            assert isinstance(expected.tool_message.content, str)
-            tool_manager = TracedToolManager(
-                [_echo_tool()], tracer=tracer, capture_message_content=True
-            )
-            await tool_manager.dispatch(call)
-            (span,) = exporter.get_finished_spans()
-            assert span.attributes is not None
-            assert span.attributes["error.type"] == expected_error_type
-            assert _captured(exporter, "gen_ai.tool.call.result") == {
-                "type": "tool_call_response",
-                "id": call.id,
-                "is_error": expected.tool_message.is_error,
-                "response": [{"type": "text", "content": expected.tool_message.content}],
-            }
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())
 
 
 _CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"
@@ -2753,18 +2094,13 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
 
     async def scenario() -> None:
         """Fail two attempts and inspect content channels."""
-        adapter = _FakeAdapter(
+        adapter = FakeAdapter(
             scripted_attempts=[
                 TransientError("the first attempt failed"),
-                _billed(Refusal(assistant_message=turn)),
+                billed(Refusal(assistant_message=turn)),
             ]
         )
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=capture_message_content,
-        )
+        traced, exporter = _traced(adapter, capture_message_content=capture_message_content)
         with pytest.raises(GenerationError) as raised:
             await traced.bind(max_attempts=3).generate_one("hi")
 
@@ -2786,31 +2122,4 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
             assert not any(_CONTENT_SENTINEL in str(value) for value in event.attributes.values())
         assert _CONTENT_SENTINEL not in str(span.status.description)
 
-    asyncio.run(scenario())
-
-
-def test_a_turn_whose_result_states_no_stop_reason_reports_the_error_finish_reason() -> None:
-    """A failed turn without stop_reason records finish_reason="error"."""
-
-    async def scenario() -> None:
-        """Capture an unfinished turn's finish_reason."""
-        adapter = _FakeAdapter(
-            scripted_attempts=[
-                _billed(UnfinishedTurn(assistant_message=_REJECTED_TURN, reason="in_progress"))
-            ]
-        )
-        tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=_fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=True,
-        )
-        with pytest.raises(GenerationError) as raised:
-            await traced.bind().generate_one("hi")
-        assert raised.value.stop_reason is None
-        (span,) = exporter.get_finished_spans()
-        assert span.attributes is not None
-        (message,) = json.loads(str(span.attributes["gen_ai.output.messages"]))
-        assert message["finish_reason"] == "error"
-
-    asyncio.run(scenario())
+    run_with_timeout(scenario())

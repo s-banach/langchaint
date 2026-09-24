@@ -1,14 +1,17 @@
 name: Refresh pricing metadata
 
+# The refresh never commits.
+# It opens one issue when LiteLLM rates differ from the committed generated pricing modules or LiteLLM lists new models, and closes the issue when neither holds.
+# Only the generated modules count as a rate change, because the vendored snapshot also changes when LiteLLM edits fields that set no price.
+
 on:
   workflow_dispatch:
   schedule:
     - cron: "23 9 1 * *"
 
 permissions:
-  contents: write
+  contents: read
   issues: write
-  pull-requests: write
 
 concurrency:
   group: refresh-pricing-metadata
@@ -26,67 +29,41 @@ jobs:
           prune-cache: true
       - name: Refresh pricing metadata
         run: uv run python -m scripts.update_pricing_metadata > "$RUNNER_TEMP/untracked-model-keys.txt"
-      - name: Report untracked models
-        id: report
-        continue-on-error: true
+      - name: Report needed pricing updates
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_TITLE: New LiteLLM models to price or ignore
+          ISSUE_TITLE: Update pricing metadata
         run: |
-          issue=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --limit 100 --json number,title | jq -r --arg title "$ISSUE_TITLE" 'map(select(.title == $title))[0].number // empty')
-          if [ ! -s "$RUNNER_TEMP/untracked-model-keys.txt" ]; then
+          git diff -- src/langchaint/openai/_generated_pricing.py src/langchaint/anthropic/_generated_pricing.py > "$RUNNER_TEMP/rate-changes.diff"
+          # Each gh call runs without a pipe, so a gh failure fails the step instead of reading as "no issue" or "fingerprint changed".
+          issue=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --limit 100 --json number,title --jq "map(select(.title == \"$ISSUE_TITLE\"))[0].number // empty")
+          if [ ! -s "$RUNNER_TEMP/rate-changes.diff" ] && [ ! -s "$RUNNER_TEMP/untracked-model-keys.txt" ]; then
             if [ -n "$issue" ]; then
-              gh issue close "$issue" --comment "No OpenAI or Anthropic direct-API text model in LiteLLM remains unpriced and unignored."
+              gh issue close "$issue" --comment "The committed pricing metadata matches LiteLLM, and no OpenAI or Anthropic direct-API text model remains unpriced and unignored."
             fi
             exit 0
           fi
-          sed 's/.*/- `&`/' "$RUNNER_TEMP/untracked-model-keys.txt" > "$RUNNER_TEMP/untracked-model-list.md"
-          cat .github/untracked-models-issue-body.md "$RUNNER_TEMP/untracked-model-list.md" > "$RUNNER_TEMP/untracked-models-issue.md"
+          # The fingerprint covers only the rate diff and the model list, so a template edit does not count as a change.
+          fingerprint=$(cat "$RUNNER_TEMP/rate-changes.diff" "$RUNNER_TEMP/untracked-model-keys.txt" | sha256sum | cut -d' ' -f1)
+          body="$RUNNER_TEMP/pricing-update-issue.md"
+          cp .github/pricing-update-issue-body.md "$body"
+          if [ -s "$RUNNER_TEMP/rate-changes.diff" ]; then
+            printf '\n## Changed rates\n\n```diff\n' >> "$body"
+            cat "$RUNNER_TEMP/rate-changes.diff" >> "$body"
+            printf '```\n' >> "$body"
+          fi
+          if [ -s "$RUNNER_TEMP/untracked-model-keys.txt" ]; then
+            printf '\n## New models\n\n' >> "$body"
+            sed 's/.*/- `&`/' "$RUNNER_TEMP/untracked-model-keys.txt" >> "$body"
+          fi
+          printf '\n<!-- fingerprint: %s -->\n' "$fingerprint" >> "$body"
           if [ -z "$issue" ]; then
-            gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/untracked-models-issue.md"
+            gh issue create --title "$ISSUE_TITLE" --body-file "$body"
             exit 0
           fi
-          # Compare only the model lines, so a template edit or CRLF line endings do not count as a change.
-          body=$(gh issue view "$issue" --json body --jq .body)
-          listed_models=$(printf '%s\n' "$body" | tr -d '\r' | { grep '^- `' || true; })
-          if [ "$listed_models" != "$(cat "$RUNNER_TEMP/untracked-model-list.md")" ]; then
+          current_body=$(gh issue view "$issue" --json body --jq .body)
+          if [[ "$current_body" != *"<!-- fingerprint: $fingerprint -->"* ]]; then
             # Comment before editing, so a failed comment is retried on the next run.
-            gh issue comment "$issue" --body "The list of untracked models changed."
-            gh issue edit "$issue" --body-file "$RUNNER_TEMP/untracked-models-issue.md"
+            gh issue comment "$issue" --body "The listed rate changes or new models changed."
+            gh issue edit "$issue" --body-file "$body"
           fi
-      - name: Detect pricing changes
-        id: changes
-        run: |
-          if git diff --quiet -- scripts/pricing/litellm-pricing-snapshot.json src/langchaint/openai/_generated_pricing.py src/langchaint/anthropic/_generated_pricing.py; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Run CI
-        id: ci
-        if: steps.changes.outputs.changed == 'true'
-        continue-on-error: true
-        run: bash scripts/CI.sh
-      - name: Create refresh pull request
-        if: steps.changes.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: pricing-metadata-refresh-${{ github.run_id }}
-          CI_OUTCOME: ${{ steps.ci.outcome }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
-          git add scripts/pricing/litellm-pricing-snapshot.json
-          git add src/langchaint/openai/_generated_pricing.py
-          git add src/langchaint/anthropic/_generated_pricing.py
-          git commit -m "Refresh pricing metadata"
-          git push --set-upstream origin "$BRANCH"
-          gh pr create --title "Refresh pricing metadata" --body-file .github/pricing-refresh-body.md
-          gh pr comment "$BRANCH" --body "scripts/CI.sh outcome: $CI_OUTCOME"
-      - name: Report CI failure
-        if: steps.changes.outputs.changed == 'true' && steps.ci.outcome == 'failure'
-        run: exit 1
-      - name: Report untracked-model issue failure
-        if: steps.report.outcome == 'failure'
-        run: exit 1

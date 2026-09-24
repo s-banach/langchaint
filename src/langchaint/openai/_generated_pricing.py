@@ -13,6 +13,9 @@ type OpenAIModelName = Literal[
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
 ]
 
 _GPT_5_6_SOL = OpenAIPricingTable(
@@ -102,9 +105,99 @@ _GPT_5_6_LUNA = OpenAIPricingTable(
     file_search_usd_per_invocation=0.0025,
 )
 
+_GPT_6_SOL = OpenAIPricingTable(
+    default=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=2,
+        output_usd_per_million_tokens=10,
+        cache_read_usd_per_million_tokens=0.2,
+        cache_write_usd_per_million_tokens=2.5,
+    ),
+    flex=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=5,
+        cache_read_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=1.25,
+    ),
+    fast=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=4,
+        output_usd_per_million_tokens=20,
+        cache_read_usd_per_million_tokens=0.4,
+        cache_write_usd_per_million_tokens=5,
+    ),
+    long_context=OpenAILongContextPricing(
+        input_tokens_above=272000,
+        input_multiplier=2.0,
+        output_multiplier=1.5,
+    ),
+    regional_processing_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
+)
+
+_GPT_6_LUNA = OpenAIPricingTable(
+    default=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=0.1,
+        output_usd_per_million_tokens=0.5,
+        cache_read_usd_per_million_tokens=0.01,
+        cache_write_usd_per_million_tokens=0.125,
+    ),
+    flex=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=0.05,
+        output_usd_per_million_tokens=0.25,
+        cache_read_usd_per_million_tokens=0.005,
+        cache_write_usd_per_million_tokens=0.0625,
+    ),
+    fast=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=0.2,
+        output_usd_per_million_tokens=1,
+        cache_read_usd_per_million_tokens=0.02,
+        cache_write_usd_per_million_tokens=0.25,
+    ),
+    long_context=OpenAILongContextPricing(
+        input_tokens_above=272000,
+        input_multiplier=2.0,
+        output_multiplier=1.5,
+    ),
+    regional_processing_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
+)
+
+_GPT_6_ASTRA = OpenAIPricingTable(
+    default=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=10,
+        output_usd_per_million_tokens=50,
+        cache_read_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=12.5,
+    ),
+    flex=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=5,
+        output_usd_per_million_tokens=25,
+        cache_read_usd_per_million_tokens=0.5,
+        cache_write_usd_per_million_tokens=6.25,
+    ),
+    fast=OpenAIRates(
+        input_cache_none_usd_per_million_tokens=20,
+        output_usd_per_million_tokens=100,
+        cache_read_usd_per_million_tokens=2,
+        cache_write_usd_per_million_tokens=25,
+    ),
+    long_context=OpenAILongContextPricing(
+        input_tokens_above=272000,
+        input_multiplier=2.0,
+        output_multiplier=1.5,
+    ),
+    regional_processing_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+    file_search_usd_per_invocation=0.0025,
+)
+
 OPENAI_PRICING: dict[OpenAIModelName, OpenAIPricingTable] = {
     "gpt-5.6": _GPT_5_6_SOL,
     "gpt-5.6-sol": _GPT_5_6_SOL,
     "gpt-5.6-terra": _GPT_5_6_TERRA,
     "gpt-5.6-luna": _GPT_5_6_LUNA,
+    "gpt-6-sol": _GPT_6_SOL,
+    "gpt-6-luna": _GPT_6_LUNA,
+    "gpt-6-astra": _GPT_6_ASTRA,
 }

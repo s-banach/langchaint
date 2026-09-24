@@ -41,22 +41,31 @@ OPENAI_LITELLM_KEYS = {
     "gpt-5.6-sol": "gpt-5.6-sol",
     "gpt-5.6-terra": "gpt-5.6-terra",
     "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-6-sol": "gpt-6-sol",
+    "gpt-6-luna": "gpt-6-luna",
+    "gpt-6-astra": "gpt-6-astra",
 }
 OPENAI_ALIASES = {"gpt-5.6": "gpt-5.6-sol"}
 ANTHROPIC_LITELLM_KEYS = {
+    "claude-fable-5-1": "claude-fable-5-1",
     "claude-fable-5": "claude-fable-5",
+    "claude-opus-5-5": "claude-opus-5-5",
     "claude-opus-5": "claude-opus-5",
     "claude-sonnet-5": "claude-sonnet-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 }
 ANTHROPIC_ALIASES = {"claude-haiku-4-5": "claude-haiku-4-5-20251001"}
 ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
+    "claude-fable-5-1",
     "claude-fable-5",
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-sonnet-5",
 })
 ANTHROPIC_BEDROCK_LITELLM_KEYS = {
+    "anthropic.claude-fable-5-1": "anthropic.claude-fable-5-1",
     "anthropic.claude-fable-5": "anthropic.claude-fable-5",
+    "anthropic.claude-opus-5-5": "anthropic.claude-opus-5-5",
     "anthropic.claude-opus-5": "anthropic.claude-opus-5",
     "anthropic.claude-opus-4-8": "anthropic.claude-opus-4-8",
     "anthropic.claude-opus-4-7": "anthropic.claude-opus-4-7",
@@ -309,6 +318,15 @@ def _positive(rate: float | None) -> float:
     return rate
 
 
+def _decimal_ratio(rate: float | None, base_rate: float | None) -> float:
+    """Divide two listed positive rates in decimal, so `7.5e-05 / 5e-05` renders as `1.5`.
+
+    Raises:
+        ValueError: A rate is unlisted or zero.
+    """
+    return float(Decimal(str(_positive(rate))) / Decimal(str(_positive(base_rate))))
+
+
 def _million_rate(rate: float | None, multiplier: float = 1.0) -> str:
     """Render one per-token rate per million tokens.
 
@@ -348,8 +366,8 @@ def _long_context(entry: _LiteLLMEntry, *, indent: str) -> list[str]:
             unlisted or zero.
     """
     fields = entry.long_context_fields()
-    input_multiplier = _positive(fields.input_cache_none) / _positive(entry.input_cost_per_token)
-    output_multiplier = _positive(fields.output) / _positive(entry.output_cost_per_token)
+    input_multiplier = _decimal_ratio(fields.input_cache_none, entry.input_cost_per_token)
+    output_multiplier = _decimal_ratio(fields.output, entry.output_cost_per_token)
     return [
         f"{indent}long_context=OpenAILongContextPricing(",
         f"{indent}    input_tokens_above={fields.input_tokens_above},",

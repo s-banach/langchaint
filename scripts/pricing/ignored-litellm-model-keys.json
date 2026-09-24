@@ -1,5 +1,7 @@
 [
   "chat-latest",
+  "claude-mythos-5",
+  "claude-mythos-5-1",
   "claude-mythos-preview",
   "claude-opus-4-5",
   "claude-opus-4-5-20251101",
@@ -92,6 +94,7 @@
   "gpt-5.5-cyber",
   "gpt-5.5-pro",
   "gpt-5.5-pro-2026-04-23",
+  "gpt-5.6-cyber",
   "gpt-audio",
   "gpt-audio-1.5",
   "gpt-audio-2025-08-28",

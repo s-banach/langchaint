@@ -16,8 +16,12 @@ from langchaint.openai.shared import (
 )
 from scripts.update_pricing_metadata import (
     _LITELLM_FILE,
+    ANTHROPIC_ALIASES,
+    ANTHROPIC_LITELLM_KEYS,
     ANTHROPIC_OUTPUT_PATH,
     METADATA_PATH,
+    OPENAI_ALIASES,
+    OPENAI_LITELLM_KEYS,
     OPENAI_OUTPUT_PATH,
     SNAPSHOT_PATH,
     _anthropic_module,
@@ -190,18 +194,23 @@ def test_vendored_inputs_reproduce_generated_modules() -> None:
 def test_untracked_model_keys_report_only_new_direct_api_text_models() -> None:
     """Detection skips generated, aliased, ignored, non-text, and non-direct-API entries."""
     raw_entries = _LITELLM_FILE.validate_python({
-        "gpt-6-sol": {"litellm_provider": "openai", "mode": "responses"},
-        "claude-opus-5-5": {"litellm_provider": "anthropic", "mode": "chat"},
-        "gpt-5.6-sol": {"litellm_provider": "openai", "mode": "chat"},
-        "gpt-5.6": {"litellm_provider": "openai", "mode": "chat"},
-        "gpt-4o": {"litellm_provider": "openai", "mode": "chat"},
-        "gpt-6-image": {"litellm_provider": "openai", "mode": "image_generation"},
-        "azure/gpt-6-sol": {"litellm_provider": "azure", "mode": "chat"},
+        "untracked-openai-responses-model": {"litellm_provider": "openai", "mode": "responses"},
+        "untracked-anthropic-chat-model": {"litellm_provider": "anthropic", "mode": "chat"},
+        next(iter(OPENAI_LITELLM_KEYS.values())): {"litellm_provider": "openai", "mode": "chat"},
+        next(iter(OPENAI_ALIASES)): {"litellm_provider": "openai", "mode": "chat"},
+        next(iter(ANTHROPIC_LITELLM_KEYS.values())): {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+        },
+        next(iter(ANTHROPIC_ALIASES)): {"litellm_provider": "anthropic", "mode": "chat"},
+        "ignored-openai-chat-model": {"litellm_provider": "openai", "mode": "chat"},
+        "untracked-openai-image-model": {"litellm_provider": "openai", "mode": "image_generation"},
+        "azure/untracked-chat-model": {"litellm_provider": "azure", "mode": "chat"},
         "sample_spec": {"litellm_provider": "one of https://docs.litellm.ai/docs/providers"},
     })
-    assert _untracked_model_keys(raw_entries, frozenset({"gpt-4o"})) == [
-        "claude-opus-5-5",
-        "gpt-6-sol",
+    assert _untracked_model_keys(raw_entries, frozenset({"ignored-openai-chat-model"})) == [
+        "untracked-anthropic-chat-model",
+        "untracked-openai-responses-model",
     ]
 
 

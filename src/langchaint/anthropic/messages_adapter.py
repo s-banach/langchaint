@@ -29,6 +29,15 @@ Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, re
 Top-level `cache_control`, system marks, and automatic marks reduce `message_mark_budget`.
 Binding fails with `ValueError` when its marks exceed the limit.
 The adapter marks only the latest message parts that fit `message_mark_budget`.
+Keeping only the latest marks rarely costs a cache hit, because the latest marked prefix includes the earlier ones.
+An older mark matters only when the latest mark finds nothing in the cache.
+That happens when this conversation's entries have expired but a shared prefix is still cached.
+
+To find a cache entry from an earlier request, each mark checks its own block and at most 19 blocks before it.
+On the Claude API, consecutive `tool_use` blocks count as one block, and so do consecutive `tool_result` blocks.
+A request that adds 20 or more blocks misses the previous request's cache unless one of the first 19 is marked.
+Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching, read 2026-09-24.
+
 Top-level `cache_control` and each marker use `cache_ttl`.
 The default `"5m"` omits the API-default `ttl` key.
 `"1h"` sends `ttl="1h"` and uses `cache_write_1h_usd_per_million_tokens`.

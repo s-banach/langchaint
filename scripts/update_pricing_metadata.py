@@ -91,11 +91,11 @@ _LONG_CONTEXT_RATE_FIELD = re.compile(
     r"|cache_creation_input_token_cost)_above_(?P<thousands>\d+)k_tokens(?:_(?P<tier>[a-z]+))?"
 )
 """A LiteLLM long-context rate field, such as `output_cost_per_token_above_272k_tokens_flex`."""
-OPENAI_RENDERED_TIERS = frozenset({"flex", "priority", "ultrafast"})
+OPENAI_RENDERED_TIERS: frozenset[str] = frozenset({"flex", "priority", "ultrafast"})
 """LiteLLM tiers the OpenAI tables render besides the default tier."""
-OPENAI_KNOWN_TIERS = frozenset({*OPENAI_RENDERED_TIERS, "batches"})
+OPENAI_KNOWN_TIERS: frozenset[str] = frozenset({*OPENAI_RENDERED_TIERS, "batches"})
 """`OPENAI_RENDERED_TIERS` plus `batches`, which no langchaint OpenAI adapter sends."""
-ANTHROPIC_KNOWN_TIERS = frozenset({"batches"})
+ANTHROPIC_KNOWN_TIERS: frozenset[str] = frozenset({"batches"})
 """LiteLLM tiers the Anthropic tables render; Bedrock tables omit batch rates."""
 
 

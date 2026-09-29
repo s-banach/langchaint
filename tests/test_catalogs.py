@@ -16,6 +16,8 @@ from pydantic import TypeAdapter
 from langchaint import LLM, JsonValue
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
+    ANTHROPIC_BEDROCK,
+    ANTHROPIC_BEDROCK_PRICING,
     ANTHROPIC_PRICING,
     Anthropic,
     AnthropicBedrock,
@@ -117,6 +119,11 @@ def test_anthropic_model_wires_model_and_pricing() -> None:
     assert isinstance(adapter, AnthropicMessagesAdapter)
     assert adapter.model == model
     assert adapter.pricing is ANTHROPIC_PRICING[model]
+
+
+def test_every_cataloged_bedrock_model_has_routing() -> None:
+    """Every `ANTHROPIC_BEDROCK_PRICING` identifier resolves a client without a passed `client`."""
+    assert ANTHROPIC_BEDROCK_PRICING.keys() <= ANTHROPIC_BEDROCK.keys()
 
 
 def test_gemini_model_wires_model_and_pricing() -> None:

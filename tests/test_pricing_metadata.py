@@ -21,6 +21,7 @@ from scripts.update_pricing_metadata import (
     ANTHROPIC_OUTPUT_PATH,
     METADATA_PATH,
     OPENAI_ALIASES,
+    OPENAI_KNOWN_TIERS,
     OPENAI_LITELLM_KEYS,
     OPENAI_OUTPUT_PATH,
     SNAPSHOT_PATH,
@@ -28,6 +29,7 @@ from scripts.update_pricing_metadata import (
     _LiteLLMEntry,
     _million_rate,
     _openai_module,
+    _openai_rates,
     _ProviderMetadata,
     _selected_entries,
     _snapshot_json,
@@ -35,7 +37,7 @@ from scripts.update_pricing_metadata import (
 )
 
 
-def _openai_rates() -> OpenAIRates:
+def _sample_openai_rates() -> OpenAIRates:
     return OpenAIRates(
         input_cache_none_usd_per_million_tokens=10.0,
         output_usd_per_million_tokens=20.0,
@@ -46,9 +48,9 @@ def _openai_rates() -> OpenAIRates:
 
 def _openai_table() -> OpenAIPricingTable:
     return OpenAIPricingTable(
-        default=_openai_rates(),
-        flex=_openai_rates().multiplied(input_multiplier=0.5, output_multiplier=0.5),
-        fast=_openai_rates().multiplied(input_multiplier=2.0, output_multiplier=2.0),
+        default=_sample_openai_rates(),
+        flex=_sample_openai_rates().multiplied(input_multiplier=0.5, output_multiplier=0.5),
+        fast=_sample_openai_rates().multiplied(input_multiplier=2.0, output_multiplier=2.0),
         long_context=OpenAILongContextPricing(
             input_tokens_above=272_000,
             input_multiplier=2.0,
@@ -91,8 +93,8 @@ def test_openai_modifiers_compose_after_service_tier_selection() -> None:
 
 def test_openai_ultrafast_rates_are_selected() -> None:
     """Keep pricing coverage independent of the installed openai SDK types."""
-    ultrafast = _openai_rates().multiplied(input_multiplier=3.0, output_multiplier=3.0)
-    rates = OpenAIPricingTable(default=_openai_rates(), ultrafast=ultrafast).rates_for(
+    ultrafast = _sample_openai_rates().multiplied(input_multiplier=3.0, output_multiplier=3.0)
+    rates = OpenAIPricingTable(default=_sample_openai_rates(), ultrafast=ultrafast).rates_for(
         service_tier="ultrafast",
         input_tokens_total=1,
         regional_processing=False,
@@ -105,7 +107,7 @@ def test_openai_missing_optional_tier_rates_produce_nan(
     service_tier: OpenAIResponsesServiceTier,
 ) -> None:
     """Missing optional tier rates produce NaN."""
-    rates = OpenAIPricingTable(default=_openai_rates()).rates_for(
+    rates = OpenAIPricingTable(default=_sample_openai_rates()).rates_for(
         service_tier=service_tier,
         input_tokens_total=1,
         regional_processing=False,
@@ -115,7 +117,7 @@ def test_openai_missing_optional_tier_rates_produce_nan(
 
 def test_openai_missing_regional_rates_produce_nan() -> None:
     """Missing regional rates produce NaN."""
-    regional = OpenAIPricingTable(default=_openai_rates()).rates_for(
+    regional = OpenAIPricingTable(default=_sample_openai_rates()).rates_for(
         service_tier="default",
         input_tokens_total=1,
         regional_processing=True,
@@ -172,7 +174,7 @@ def test_regional_multipliers_must_be_positive_and_finite(value: float) -> None:
     """Both provider tables validate regional multipliers."""
     with pytest.raises(ValueError, match="regional_processing_multiplier"):
         _ = OpenAIPricingTable(
-            default=_openai_rates(),
+            default=_sample_openai_rates(),
             regional_processing_multiplier=value,
         )
     with pytest.raises(ValueError, match="inference_geo_us_multiplier"):
@@ -217,4 +219,97 @@ def test_untracked_model_keys_report_only_new_direct_api_text_models() -> None:
 def test_litellm_rates_accept_zero() -> None:
     """LiteLLM rates accept free pricing categories."""
     entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", "input_cost_per_token": 0})
-    assert _million_rate(entry.input_cost_per_token) == "0"
+    assert _million_rate(entry.openai_rate_fields("default").input_cache_none) == "0"
+
+
+def test_anthropic_batch_rates_follow_listed_batch_rates() -> None:
+    """Listed batch rates are used, and the 1-hour write takes the 5-minute write's discount."""
+    entry = _LiteLLMEntry.model_validate({
+        "litellm_provider": "anthropic",
+        "cache_creation_input_token_cost": 2.5e-06,
+        "cache_creation_input_token_cost_above_1hr": 4e-06,
+        "input_cost_per_token_batches": 1.2e-06,
+        "output_cost_per_token_batches": 6e-06,
+        "cache_read_input_token_cost_batches": 1.2e-07,
+        "cache_creation_input_token_cost_batches": 1.5e-06,
+    })
+    batch = entry.anthropic_batch_rate_fields()
+    assert [_million_rate(rate) for rate in batch] == ["1.2", "6", "0.12", "1.5", "2.4"]
+
+
+def test_rates_for_an_unknown_tier_are_rejected() -> None:
+    """A tier the generated tables do not render fails the refresh instead of pricing as NaN."""
+    entry = _LiteLLMEntry.model_validate({
+        "litellm_provider": "openai",
+        "input_cost_per_token_above_272k_tokens_scale": 1e-05,
+    })
+    with pytest.raises(ValueError, match=r"unknown pricing tiers \['scale'\]"):
+        entry.require_known_tiers(OPENAI_KNOWN_TIERS)
+
+
+def test_partially_listed_tier_is_rejected() -> None:
+    """A tier with some rates unlisted fails the refresh instead of pricing as NaN."""
+    fields = _LiteLLMEntry.model_validate({
+        "litellm_provider": "openai",
+        "input_cost_per_token_flex": 1e-06,
+    }).openai_rate_fields("flex")
+    with pytest.raises(ValueError, match="unlisted"):
+        _ = _openai_rates(fields, field_name="flex", indent="")
+
+
+def test_tier_long_context_rates_must_follow_the_default_multipliers() -> None:
+    """A tier whose long-context markup differs from the default tier's fails the refresh."""
+    entry = _LiteLLMEntry.model_validate({
+        "litellm_provider": "openai",
+        "input_cost_per_token": 1e-06,
+        "output_cost_per_token": 2e-06,
+        "input_cost_per_token_above_272k_tokens": 2e-06,
+        "output_cost_per_token_above_272k_tokens": 3e-06,
+        "input_cost_per_token_flex": 5e-07,
+        "input_cost_per_token_above_272k_tokens_flex": 1.5e-06,
+    })
+    with pytest.raises(ValueError, match="input_cost_per_token_above_272k_tokens_flex"):
+        entry.require_shared_long_context()
+
+
+@pytest.mark.parametrize(
+    "prices",
+    [
+        {"search_context_size_low": 0.01},
+        {
+            "search_context_size_low": 0.01,
+            "search_context_size_medium": 0.01,
+            "search_context_size_high": 0.02,
+        },
+    ],
+)
+def test_web_search_price_requires_one_price_for_every_context_size(
+    prices: dict[str, float],
+) -> None:
+    """A partially listed or size-dependent price cannot fill the table's single price."""
+    entry = _LiteLLMEntry.model_validate({
+        "litellm_provider": "anthropic",
+        "search_context_cost_per_query": prices,
+    })
+    with pytest.raises(ValueError, match="web search prices"):
+        _ = entry.web_search_usd_per_invocation()
+
+
+@pytest.mark.parametrize(
+    "multipliers",
+    [
+        {},
+        {"regional_processing_uplift_multiplier_us": 1.1},
+        {
+            "regional_processing_uplift_multiplier_us": 1.1,
+            "regional_processing_uplift_multiplier_eu": 1.2,
+        },
+    ],
+)
+def test_openai_regional_multiplier_requires_one_listed_value(
+    multipliers: dict[str, float],
+) -> None:
+    """An unlisted or region-dependent multiplier cannot fill the table's single multiplier."""
+    entry = _LiteLLMEntry.model_validate({"litellm_provider": "openai", **multipliers})
+    with pytest.raises(ValueError, match="regional processing multipliers"):
+        _ = entry.regional_processing_multiplier()

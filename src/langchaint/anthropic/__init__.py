@@ -17,12 +17,13 @@ Pass `client=AsyncAnthropic(http_client=...)` for custom first-party transports.
 
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
-Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
-Tool and modifier price source: https://platform.claude.com/docs/en/about-claude/pricing.
-Cache reads cost 0.1 times base input.
+Token, Batch API, and web-search price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+`inference_geo` price source: https://platform.claude.com/docs/en/manage-claude/data-residency.
+Cache reads cost 0.1 times base input, except 0.05 times on Claude Opus 5.5 and 0.025 times on Claude Fable 5.1.
 Five-minute cache writes cost 1.25 times base input.
 One-hour cache writes cost twice base input.
 `ANTHROPIC_PRICING` web-search rates are public list-price estimates.
+A cataloged model without a web-search rate requires `pricing` to bind the web search tool.
 `Anthropic.model(pricing=...)` replaces cataloged estimates.
 `AnthropicBedrock.model(pricing=...)` accepts caller rates.
 """
@@ -65,10 +66,13 @@ _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items(
 
 type AnthropicBedrockModelName = (
     Literal[
+        "anthropic.claude-fable-5-1",
         "anthropic.claude-fable-5",
+        "anthropic.claude-opus-5-5",
         "anthropic.claude-opus-5",
         "anthropic.claude-opus-4-8",
         "anthropic.claude-opus-4-7",
+        "anthropic.claude-sonnet-5-5",
         "anthropic.claude-sonnet-5",
         "anthropic.claude-haiku-4-5",
         "us.anthropic.claude-opus-4-6-v1",
@@ -115,10 +119,13 @@ class BedrockRouting:
 
 
 ANTHROPIC_BEDROCK: dict[AnthropicBedrockModelName, BedrockRouting] = {
+    "anthropic.claude-fable-5-1": BedrockRouting(api="mantle"),
     "anthropic.claude-fable-5": BedrockRouting(api="mantle"),
+    "anthropic.claude-opus-5-5": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-5": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-4-8": BedrockRouting(api="mantle"),
     "anthropic.claude-opus-4-7": BedrockRouting(api="mantle"),
+    "anthropic.claude-sonnet-5-5": BedrockRouting(api="mantle"),
     "anthropic.claude-sonnet-5": BedrockRouting(api="mantle"),
     "anthropic.claude-haiku-4-5": BedrockRouting(api="mantle"),
     "us.anthropic.claude-opus-4-6-v1": BedrockRouting(api="legacy"),

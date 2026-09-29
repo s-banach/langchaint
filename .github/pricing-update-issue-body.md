@@ -2,7 +2,7 @@ The monthly pricing refresh found LiteLLM pricing data that langchaint's committ
 
 1. For each model under **New models**, either price it or add it to `scripts/pricing/ignored-litellm-model-keys.json`. To price a model, edit `scripts/update_pricing_metadata.py`:
    - Add an OpenAI model to `OPENAI_LITELLM_KEYS`.
-   - Add an Anthropic model to `ANTHROPIC_LITELLM_KEYS`, to `ANTHROPIC_INFERENCE_GEO_MODELS` when the Anthropic data-residency page applies US-only pricing to it, and its Bedrock key to `ANTHROPIC_BEDROCK_LITELLM_KEYS` when LiteLLM lists one.
+   - Add an Anthropic model to `ANTHROPIC_LITELLM_KEYS`, to `ANTHROPIC_INFERENCE_GEO_MODELS` when the Anthropic data-residency page applies US-only pricing to it, and its Bedrock key to `ANTHROPIC_BEDROCK_LITELLM_KEYS` when LiteLLM lists one. Add that Bedrock key to `AnthropicBedrockModelName` and `ANTHROPIC_BEDROCK` in `src/langchaint/anthropic/__init__.py`, with `BedrockRouting(api="mantle")` when the Anthropic "Claude in Amazon Bedrock" page lists it.
    - Add an alias to `OPENAI_ALIASES` or `ANTHROPIC_ALIASES` when LiteLLM lists the alias key.
 2. Run `uv run python -m scripts.update_pricing_metadata`.
 3. Check the regenerated rates against the provider documentation:

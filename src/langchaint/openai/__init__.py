@@ -14,8 +14,8 @@ Missing optional rates produce NaN token costs.
 Token prices use USD per one million tokens.
 Web-search prices use USD per invocation.
 File-search prices use USD per invocation.
-Token price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
-Tool and regional price source: https://developers.openai.com/api/docs/pricing.
+Token, web-search, and regional-processing price source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json.
+File-search price source: https://developers.openai.com/api/docs/pricing.
 Embedding batching parameters come from the OpenAI embeddings guide.
 Source: https://developers.openai.com/api/docs/guides/embeddings.
 Cataloged embedding model dimensions come from the OpenAI model catalog.

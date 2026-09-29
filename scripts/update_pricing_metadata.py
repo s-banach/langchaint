@@ -7,7 +7,7 @@ from datetime import date
 from decimal import Decimal
 from itertools import chain
 from pathlib import Path
-from typing import Annotated, Literal, NamedTuple
+from typing import Annotated, Literal, NamedTuple, overload
 from urllib.request import Request, urlopen
 
 from pydantic import (
@@ -41,6 +41,7 @@ OPENAI_LITELLM_KEYS = {
     "gpt-5.6-sol": "gpt-5.6-sol",
     "gpt-5.6-terra": "gpt-5.6-terra",
     "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-6.1-sol": "gpt-6.1-sol",
     "gpt-6-sol": "gpt-6-sol",
     "gpt-6-luna": "gpt-6-luna",
     "gpt-6-astra": "gpt-6-astra",
@@ -51,6 +52,7 @@ ANTHROPIC_LITELLM_KEYS = {
     "claude-fable-5": "claude-fable-5",
     "claude-opus-5-5": "claude-opus-5-5",
     "claude-opus-5": "claude-opus-5",
+    "claude-sonnet-5-5": "claude-sonnet-5-5",
     "claude-sonnet-5": "claude-sonnet-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
 }
@@ -60,6 +62,7 @@ ANTHROPIC_INFERENCE_GEO_MODELS: frozenset[str] = frozenset({
     "claude-fable-5",
     "claude-opus-5-5",
     "claude-opus-5",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
 })
 ANTHROPIC_BEDROCK_LITELLM_KEYS = {
@@ -69,6 +72,7 @@ ANTHROPIC_BEDROCK_LITELLM_KEYS = {
     "anthropic.claude-opus-5": "anthropic.claude-opus-5",
     "anthropic.claude-opus-4-8": "anthropic.claude-opus-4-8",
     "anthropic.claude-opus-4-7": "anthropic.claude-opus-4-7",
+    "anthropic.claude-sonnet-5-5": "anthropic.claude-sonnet-5-5",
     "anthropic.claude-sonnet-5": "anthropic.claude-sonnet-5",
     "anthropic.claude-haiku-4-5": "anthropic.claude-haiku-4-5-20251001-v1:0",
     "us.anthropic.claude-opus-4-6-v1": "us.anthropic.claude-opus-4-6-v1",
@@ -77,46 +81,92 @@ ANTHROPIC_BEDROCK_LITELLM_KEYS = {
 BEDROCK_CROSS_REGION_PREFIXES = ("us", "eu", "au", "jp", "apac", "global", "us-gov")
 """Bedrock cross-region inference profile prefixes whose LiteLLM entries are kept when present."""
 _LONG_CONTEXT_INPUT_FIELD = re.compile(r"input_cost_per_token_above_(\d+)k_tokens")
+_TIER_RATE_FIELD = re.compile(
+    r"(?:input_cost_per_token|output_cost_per_token|cache_read_input_token_cost"
+    r"|cache_creation_input_token_cost)(?:_above_\d+k_tokens)?_(?P<tier>[a-z]+)"
+)
+"""A LiteLLM rate field of one pricing tier, such as `input_cost_per_token_flex`."""
+_LONG_CONTEXT_RATE_FIELD = re.compile(
+    r"(?P<rate>input_cost_per_token|output_cost_per_token|cache_read_input_token_cost"
+    r"|cache_creation_input_token_cost)_above_(?P<thousands>\d+)k_tokens(?:_(?P<tier>[a-z]+))?"
+)
+"""A LiteLLM long-context rate field, such as `output_cost_per_token_above_272k_tokens_flex`."""
+OPENAI_RENDERED_TIERS = frozenset({"flex", "priority", "ultrafast"})
+"""LiteLLM tiers the OpenAI tables render besides the default tier."""
+OPENAI_KNOWN_TIERS = frozenset({*OPENAI_RENDERED_TIERS, "batches"})
+"""`OPENAI_RENDERED_TIERS` plus `batches`, which no langchaint OpenAI adapter sends."""
+ANTHROPIC_KNOWN_TIERS = frozenset({"batches"})
+"""LiteLLM tiers the Anthropic tables render; Bedrock tables omit batch rates."""
 
 
 _Rate = Annotated[StrictInt | StrictFloat, Field(ge=0, allow_inf_nan=False)]
 """A finite nonnegative per-token rate; `int` survives so the snapshot reproduces the upstream value."""
 _RATE_ADAPTER = TypeAdapter[int | float](_Rate)
+_Multiplier = Annotated[StrictInt | StrictFloat, Field(gt=0, allow_inf_nan=False)]
+"""A finite positive price multiplier."""
+
+
+@overload
+def _decimal(rate: float) -> Decimal: ...
+@overload
+def _decimal(rate: float | None) -> Decimal | None: ...
+def _decimal(rate: float | None) -> Decimal | None:
+    """Return the shortest decimal that parses to `rate`, `None` when the rate is unlisted.
+
+    This equals the literal LiteLLM wrote whenever that literal has at most 15 significant digits,
+    as every rate does; `Decimal(rate)` would expand the float's binary approximation instead.
+    """
+    return None if rate is None else Decimal(str(rate))
 
 
 class _AnthropicRateFields(NamedTuple):
     """The five Anthropic token rates of one LiteLLM entry, `None` where the entry lists none."""
 
-    input_cache_none: float | None
-    output: float | None
-    cache_read: float | None
-    cache_write_5m: float | None
-    cache_write_1h: float | None
+    input_cache_none: Decimal | None
+    output: Decimal | None
+    cache_read: Decimal | None
+    cache_write_5m: Decimal | None
+    cache_write_1h: Decimal | None
 
 
 class _OpenAIRateFields(NamedTuple):
     """The four OpenAI token rates of one service tier, `None` where the entry lists none."""
 
-    input_cache_none: float | None
-    output: float | None
-    cache_read: float | None
-    cache_write: float | None
+    input_cache_none: Decimal | None
+    output: Decimal | None
+    cache_read: Decimal | None
+    cache_write: Decimal | None
 
 
 class _LongContextFields(NamedTuple):
     """The OpenAI long-context threshold and the rates above it."""
 
     input_tokens_above: int
-    input_cache_none: float
-    output: float
+    input_cache_none: Decimal
+    output: Decimal
+
+
+class _SearchContextCost(BaseModel):
+    """LiteLLM's web search prices per call, one per search context size.
+
+    Validation rejects a listed price that is not a finite nonnegative number.
+    Unknown fields are kept so the snapshot reproduces the upstream entry, which is why this model
+    does not inherit `CheckedCopyModel`.
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    search_context_size_low: _Rate | None = None
+    search_context_size_medium: _Rate | None = None
+    search_context_size_high: _Rate | None = None
 
 
 class _LiteLLMEntry(BaseModel):
     """One selected LiteLLM model entry.
 
-    Validation rejects a listed rate that is not a finite nonnegative number before any module
-    renders it.
-    A rate that is absent or `null` upstream is unlisted.
+    Validation rejects a listed rate that is not a finite nonnegative number, and a listed
+    multiplier that is not finite and positive, before any module renders it.
+    A value that is absent or `null` upstream is unlisted.
     Unknown fields are kept so the snapshot reproduces the upstream entry, which is why this model
     does not inherit `CheckedCopyModel`.
     """
@@ -137,42 +187,140 @@ class _LiteLLMEntry(BaseModel):
     output_cost_per_token_priority: _Rate | None = None
     cache_read_input_token_cost_priority: _Rate | None = None
     cache_creation_input_token_cost_priority: _Rate | None = None
+    input_cost_per_token_ultrafast: _Rate | None = None
+    output_cost_per_token_ultrafast: _Rate | None = None
+    cache_read_input_token_cost_ultrafast: _Rate | None = None
+    cache_creation_input_token_cost_ultrafast: _Rate | None = None
+    input_cost_per_token_batches: _Rate | None = None
+    output_cost_per_token_batches: _Rate | None = None
+    cache_read_input_token_cost_batches: _Rate | None = None
+    cache_creation_input_token_cost_batches: _Rate | None = None
+    regional_processing_uplift_multiplier_us: _Multiplier | None = None
+    regional_processing_uplift_multiplier_eu: _Multiplier | None = None
+    search_context_cost_per_query: _SearchContextCost | None = None
+
+    def require_known_tiers(self, known_tiers: frozenset[str]) -> None:
+        """Reject rates for a pricing tier that the generated table would silently drop.
+
+        Raises:
+            ValueError: The entry lists a rate for a tier outside `known_tiers`.
+        """
+        listed_tiers = {
+            match.group("tier")
+            for field in self.model_dump(exclude_none=True)
+            if (match := _TIER_RATE_FIELD.fullmatch(field)) is not None
+        }
+        if unknown_tiers := listed_tiers - known_tiers:
+            raise ValueError(
+                f"LiteLLM lists rates for unknown pricing tiers {sorted(unknown_tiers)}"
+            )
+
+    def web_search_usd_per_invocation(self) -> float | None:
+        """Return the web search price per call, `None` when LiteLLM lists none.
+
+        LiteLLM lists one price per search context size, and each pricing table holds one price.
+
+        Raises:
+            ValueError: The prices are listed for only some search context sizes, or differ.
+        """
+        cost = self.search_context_cost_per_query
+        if cost is None:
+            return None
+        prices = {
+            cost.search_context_size_low,
+            cost.search_context_size_medium,
+            cost.search_context_size_high,
+        }
+        if len(prices) != 1:
+            raise ValueError("web search prices are partially listed or differ by context size")
+        (price,) = prices
+        return price
 
     def anthropic_rate_fields(self) -> _AnthropicRateFields:
         """Collect the Anthropic token rates without requiring any of them."""
         return _AnthropicRateFields(
-            input_cache_none=self.input_cost_per_token,
-            output=self.output_cost_per_token,
-            cache_read=self.cache_read_input_token_cost,
-            cache_write_5m=self.cache_creation_input_token_cost,
-            cache_write_1h=self.cache_creation_input_token_cost_above_1hr,
+            input_cache_none=_decimal(self.input_cost_per_token),
+            output=_decimal(self.output_cost_per_token),
+            cache_read=_decimal(self.cache_read_input_token_cost),
+            cache_write_5m=_decimal(self.cache_creation_input_token_cost),
+            cache_write_1h=_decimal(self.cache_creation_input_token_cost_above_1hr),
         )
 
+    def anthropic_batch_rate_fields(self) -> _AnthropicRateFields:
+        """Collect the Anthropic Batch API token rates without requiring any of them.
+
+        LiteLLM lists no batch rate for the 1-hour cache write.
+        Anthropic's pricing page (https://platform.claude.com/docs/en/about-claude/pricing) states
+        that the cache-write multipliers stack with the Batch API discount, so the 1-hour cache
+        write rate is scaled by the ratio of the 5-minute cache write's batch rate to its standard
+        rate.
+
+        Raises:
+            ValueError: The 1-hour and batch 5-minute cache-write rates are listed, but the
+                standard 5-minute cache-write rate is unlisted or zero.
+        """
+        standard = self.anthropic_rate_fields()
+        batch_cache_write_5m = _decimal(self.cache_creation_input_token_cost_batches)
+        batch_cache_write_1h = (
+            None
+            if standard.cache_write_1h is None or batch_cache_write_5m is None
+            else standard.cache_write_1h
+            * batch_cache_write_5m
+            / _positive(standard.cache_write_5m)
+        )
+        return _AnthropicRateFields(
+            input_cache_none=_decimal(self.input_cost_per_token_batches),
+            output=_decimal(self.output_cost_per_token_batches),
+            cache_read=_decimal(self.cache_read_input_token_cost_batches),
+            cache_write_5m=batch_cache_write_5m,
+            cache_write_1h=batch_cache_write_1h,
+        )
+
+    def regional_processing_multiplier(self) -> float:
+        """Return the OpenAI token-price multiplier for regional processing endpoints.
+
+        LiteLLM lists one multiplier per region, and `OpenAIPricingTable` holds one for all regions.
+
+        Raises:
+            ValueError: A regional multiplier is unlisted, or the US and EU multipliers differ.
+        """
+        multiplier = self.regional_processing_uplift_multiplier_us
+        if multiplier is None or multiplier != self.regional_processing_uplift_multiplier_eu:
+            raise ValueError("OpenAI regional processing multipliers are unlisted or differ")
+        return multiplier
+
     def openai_rate_fields(
-        self, tier: Literal["default", "flex", "priority"]
+        self, tier: Literal["default", "flex", "priority", "ultrafast"]
     ) -> _OpenAIRateFields:
         """Collect the OpenAI token rates of one tier without requiring any of them."""
         match tier:
             case "default":
                 return _OpenAIRateFields(
-                    input_cache_none=self.input_cost_per_token,
-                    output=self.output_cost_per_token,
-                    cache_read=self.cache_read_input_token_cost,
-                    cache_write=self.cache_creation_input_token_cost,
+                    input_cache_none=_decimal(self.input_cost_per_token),
+                    output=_decimal(self.output_cost_per_token),
+                    cache_read=_decimal(self.cache_read_input_token_cost),
+                    cache_write=_decimal(self.cache_creation_input_token_cost),
                 )
             case "flex":
                 return _OpenAIRateFields(
-                    input_cache_none=self.input_cost_per_token_flex,
-                    output=self.output_cost_per_token_flex,
-                    cache_read=self.cache_read_input_token_cost_flex,
-                    cache_write=self.cache_creation_input_token_cost_flex,
+                    input_cache_none=_decimal(self.input_cost_per_token_flex),
+                    output=_decimal(self.output_cost_per_token_flex),
+                    cache_read=_decimal(self.cache_read_input_token_cost_flex),
+                    cache_write=_decimal(self.cache_creation_input_token_cost_flex),
                 )
             case "priority":
                 return _OpenAIRateFields(
-                    input_cache_none=self.input_cost_per_token_priority,
-                    output=self.output_cost_per_token_priority,
-                    cache_read=self.cache_read_input_token_cost_priority,
-                    cache_write=self.cache_creation_input_token_cost_priority,
+                    input_cache_none=_decimal(self.input_cost_per_token_priority),
+                    output=_decimal(self.output_cost_per_token_priority),
+                    cache_read=_decimal(self.cache_read_input_token_cost_priority),
+                    cache_write=_decimal(self.cache_creation_input_token_cost_priority),
+                )
+            case "ultrafast":
+                return _OpenAIRateFields(
+                    input_cache_none=_decimal(self.input_cost_per_token_ultrafast),
+                    output=_decimal(self.output_cost_per_token_ultrafast),
+                    cache_read=_decimal(self.cache_read_input_token_cost_ultrafast),
+                    cache_write=_decimal(self.cache_creation_input_token_cost_ultrafast),
                 )
 
     def long_context_fields(self) -> _LongContextFields:
@@ -194,11 +342,52 @@ class _LiteLLMEntry(BaseModel):
         thousands = match.group(1)
         return _LongContextFields(
             input_tokens_above=int(thousands) * 1_000,
-            input_cache_none=_RATE_ADAPTER.validate_python(extra_fields[match.group(0)]),
-            output=_RATE_ADAPTER.validate_python(
-                extra_fields.get(f"output_cost_per_token_above_{thousands}k_tokens")
+            input_cache_none=_decimal(_RATE_ADAPTER.validate_python(extra_fields[match.group(0)])),
+            output=_decimal(
+                _RATE_ADAPTER.validate_python(
+                    extra_fields.get(f"output_cost_per_token_above_{thousands}k_tokens")
+                )
             ),
         )
+
+    def require_shared_long_context(self) -> None:
+        """Require each rendered tier's long-context rates to follow the default tier's multipliers.
+
+        `OpenAIPricingTable.rates_for` applies one long-context threshold to every tier, one input
+        multiplier to the input, cache-read, and cache-write rates, and one output multiplier to the
+        output rate.
+        Rates are compared by cross-multiplication, so the check is exact in decimal.
+
+        Raises:
+            ValueError: A rendered tier lists a long-context rate at another threshold, without its
+                base rate, or at another multiplier.
+        """
+        long_context = self.long_context_fields()
+        default = self.openai_rate_fields("default")
+        fields = self.model_dump(exclude_none=True)
+        for field, value in fields.items():
+            match = _LONG_CONTEXT_RATE_FIELD.fullmatch(field)
+            if match is None or match.group("tier") not in {None, *OPENAI_RENDERED_TIERS}:
+                continue
+            rate, tier = match.group("rate"), match.group("tier")
+            base_field = rate if tier is None else f"{rate}_{tier}"
+            base_value = fields.get(base_field)
+            if base_value is None:
+                raise ValueError(f"LiteLLM lists {field} without {base_field}")
+            base = _decimal(_RATE_ADAPTER.validate_python(base_value))
+            above = _decimal(_RATE_ADAPTER.validate_python(value))
+            default_base, default_above = (
+                (_positive(default.output), long_context.output)
+                if rate == "output_cost_per_token"
+                else (_positive(default.input_cache_none), long_context.input_cache_none)
+            )
+            threshold = int(match.group("thousands")) * 1_000
+            if threshold != long_context.input_tokens_above or (
+                above * default_base != base * default_above
+            ):
+                raise ValueError(
+                    f"LiteLLM {field} does not follow the shared long-context pricing"
+                )
 
 
 class _MetadataValue(CheckedCopyModel):
@@ -223,27 +412,23 @@ class _MetadataRate(_MetadataValue):
 class _MetadataMultiplier(_MetadataValue):
     """One provider-documented multiplier; validation rejects a value that is not finite and positive."""
 
-    value: Annotated[StrictInt | StrictFloat, Field(gt=0, allow_inf_nan=False)]
+    value: _Multiplier
 
 
 class _AnthropicMetadata(CheckedCopyModel):
-    """Anthropic-documented values that LiteLLM does not list."""
+    """Anthropic-documented values that LiteLLM omits for some priced models."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    batch_multiplier: _MetadataMultiplier
     inference_geo_us_multiplier: _MetadataMultiplier
-    web_search_usd_per_invocation: _MetadataRate
 
 
 class _OpenAIMetadata(CheckedCopyModel):
-    """OpenAI-documented values that LiteLLM does not list."""
+    """OpenAI-documented tool prices that LiteLLM lists outside the model entry."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     file_search_usd_per_invocation: _MetadataRate
-    regional_processing_multiplier: _MetadataMultiplier
-    web_search_usd_per_invocation: _MetadataRate
 
 
 class _ProviderMetadata(CheckedCopyModel):
@@ -307,7 +492,7 @@ def _download(url: str) -> bytes:
     return content
 
 
-def _positive(rate: float | None) -> float:
+def _positive(rate: Decimal | None) -> Decimal:
     """Require a listed positive rate.
 
     Raises:
@@ -318,16 +503,16 @@ def _positive(rate: float | None) -> float:
     return rate
 
 
-def _decimal_ratio(rate: float | None, base_rate: float | None) -> float:
+def _decimal_ratio(rate: Decimal | None, base_rate: Decimal | None) -> float:
     """Divide two listed positive rates in decimal, so `7.5e-05 / 5e-05` renders as `1.5`.
 
     Raises:
         ValueError: A rate is unlisted or zero.
     """
-    return float(Decimal(str(_positive(rate))) / Decimal(str(_positive(base_rate))))
+    return float(_positive(rate) / _positive(base_rate))
 
 
-def _million_rate(rate: float | None, multiplier: float = 1.0) -> str:
+def _million_rate(rate: Decimal | None) -> str:
     """Render one per-token rate per million tokens.
 
     Raises:
@@ -335,8 +520,7 @@ def _million_rate(rate: float | None, multiplier: float = 1.0) -> str:
     """
     if rate is None:
         raise ValueError("a required rate is unlisted")
-    decimal_value = Decimal(str(rate)) * Decimal(1_000_000) * Decimal(str(multiplier))
-    return format(decimal_value.normalize(), "f")
+    return format((rate * 1_000_000).normalize(), "f")
 
 
 def _openai_rates(
@@ -345,8 +529,12 @@ def _openai_rates(
     field_name: str,
     indent: str,
 ) -> list[str]:
-    """Render one OpenAI rate category, or nothing when any of its rates is unlisted."""
-    if None in fields:
+    """Render one OpenAI rate category, or nothing when the entry lists none of its rates.
+
+    Raises:
+        ValueError: The entry lists only some of the category's rates.
+    """
+    if all(rate is None for rate in fields):
         return []
     return [
         f"{indent}{field_name}=OpenAIRates(",
@@ -362,12 +550,14 @@ def _long_context(entry: _LiteLLMEntry, *, indent: str) -> list[str]:
     """Render OpenAI long-context pricing.
 
     Raises:
-        ValueError: Long-context fields are missing, invalid, or ambiguous, or a base rate is
-            unlisted or zero.
+        ValueError: Long-context fields are missing, invalid, or ambiguous, a base rate is
+            unlisted or zero, or a tier's long-context rates follow other multipliers.
     """
+    entry.require_shared_long_context()
     fields = entry.long_context_fields()
-    input_multiplier = _decimal_ratio(fields.input_cache_none, entry.input_cost_per_token)
-    output_multiplier = _decimal_ratio(fields.output, entry.output_cost_per_token)
+    default_fields = entry.openai_rate_fields("default")
+    input_multiplier = _decimal_ratio(fields.input_cache_none, default_fields.input_cache_none)
+    output_multiplier = _decimal_ratio(fields.output, default_fields.output)
     return [
         f"{indent}long_context=OpenAILongContextPricing(",
         f"{indent}    input_tokens_above={fields.input_tokens_above},",
@@ -390,6 +580,7 @@ def _openai_table(
     Raises:
         ValueError: Pricing data or provider metadata is invalid.
     """
+    entry.require_known_tiers(OPENAI_KNOWN_TIERS)
     default_fields = entry.openai_rate_fields("default")
     if None in default_fields:
         raise ValueError("OpenAI default rates are missing")
@@ -400,9 +591,12 @@ def _openai_table(
         *_openai_rates(default_fields, field_name="default", indent=inner),
         *_openai_rates(entry.openai_rate_fields("flex"), field_name="flex", indent=inner),
         *_openai_rates(entry.openai_rate_fields("priority"), field_name="fast", indent=inner),
+        *_openai_rates(
+            entry.openai_rate_fields("ultrafast"), field_name="ultrafast", indent=inner
+        ),
         *_long_context(entry, indent=inner),
-        f"{inner}regional_processing_multiplier={metadata.openai.regional_processing_multiplier.value!r},",
-        f"{inner}web_search_usd_per_invocation={metadata.openai.web_search_usd_per_invocation.value!r},",
+        f"{inner}regional_processing_multiplier={entry.regional_processing_multiplier()!r},",
+        f"{inner}web_search_usd_per_invocation={entry.web_search_usd_per_invocation()!r},",
         f"{inner}file_search_usd_per_invocation={metadata.openai.file_search_usd_per_invocation.value!r},",
         closing,
     ]
@@ -413,7 +607,6 @@ def _anthropic_rates(
     *,
     field_name: str,
     indent: str,
-    multiplier: float = 1.0,
 ) -> list[str]:
     """Render one Anthropic rate category.
 
@@ -422,11 +615,11 @@ def _anthropic_rates(
     """
     return [
         f"{indent}{field_name}=AnthropicRates(",
-        f"{indent}    input_cache_none_usd_per_million_tokens={_million_rate(fields.input_cache_none, multiplier)},",
-        f"{indent}    output_usd_per_million_tokens={_million_rate(fields.output, multiplier)},",
-        f"{indent}    cache_read_usd_per_million_tokens={_million_rate(fields.cache_read, multiplier)},",
-        f"{indent}    cache_write_5m_usd_per_million_tokens={_million_rate(fields.cache_write_5m, multiplier)},",
-        f"{indent}    cache_write_1h_usd_per_million_tokens={_million_rate(fields.cache_write_1h, multiplier)},",
+        f"{indent}    input_cache_none_usd_per_million_tokens={_million_rate(fields.input_cache_none)},",
+        f"{indent}    output_usd_per_million_tokens={_million_rate(fields.output)},",
+        f"{indent}    cache_read_usd_per_million_tokens={_million_rate(fields.cache_read)},",
+        f"{indent}    cache_write_5m_usd_per_million_tokens={_million_rate(fields.cache_write_5m)},",
+        f"{indent}    cache_write_1h_usd_per_million_tokens={_million_rate(fields.cache_write_1h)},",
         f"{indent}),",
     ]
 
@@ -446,15 +639,10 @@ def _anthropic_table(
     Raises:
         ValueError: Pricing data or provider metadata is invalid.
     """
-    fields = entry.anthropic_rate_fields()
+    entry.require_known_tiers(ANTHROPIC_KNOWN_TIERS)
     inner = f"{indent}    "
     batch = (
-        _anthropic_rates(
-            fields,
-            field_name="batch",
-            indent=inner,
-            multiplier=metadata.anthropic.batch_multiplier.value,
-        )
+        _anthropic_rates(entry.anthropic_batch_rate_fields(), field_name="batch", indent=inner)
         if direct
         else []
     )
@@ -464,10 +652,10 @@ def _anthropic_table(
     closing = f"{indent})," if trailing_comma else f"{indent})"
     return [
         f"{indent}{prefix}AnthropicPricingTable(",
-        *_anthropic_rates(fields, field_name="standard", indent=inner),
+        *_anthropic_rates(entry.anthropic_rate_fields(), field_name="standard", indent=inner),
         *batch,
         f"{inner}inference_geo_us_multiplier={regional_multiplier!r},",
-        f"{inner}web_search_usd_per_invocation={metadata.anthropic.web_search_usd_per_invocation.value!r},",
+        f"{inner}web_search_usd_per_invocation={entry.web_search_usd_per_invocation()!r},",
         closing,
     ]
 
@@ -638,7 +826,7 @@ def _rate_ratios(prefixed: _LiteLLMEntry, base: _LiteLLMEntry) -> Iterator[Decim
         prefixed.anthropic_rate_fields(), base.anthropic_rate_fields(), strict=True
     ):
         if prefixed_rate is not None:
-            yield Decimal(str(prefixed_rate)) / Decimal(str(_positive(base_rate)))
+            yield prefixed_rate / _positive(base_rate)
 
 
 def _expected_providers(key: str) -> frozenset[str]:

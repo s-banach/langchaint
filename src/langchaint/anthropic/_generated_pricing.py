@@ -12,6 +12,7 @@ type AnthropicModelName = Literal[
     "claude-fable-5",
     "claude-opus-5-5",
     "claude-opus-5",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5",
@@ -93,6 +94,25 @@ _CLAUDE_OPUS_5 = AnthropicPricingTable(
     web_search_usd_per_invocation=0.01,
 )
 
+_CLAUDE_SONNET_5_5 = AnthropicPricingTable(
+    standard=AnthropicRates(
+        input_cache_none_usd_per_million_tokens=2,
+        output_usd_per_million_tokens=10,
+        cache_read_usd_per_million_tokens=0.2,
+        cache_write_5m_usd_per_million_tokens=2.5,
+        cache_write_1h_usd_per_million_tokens=4,
+    ),
+    batch=AnthropicRates(
+        input_cache_none_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=5,
+        cache_read_usd_per_million_tokens=0.1,
+        cache_write_5m_usd_per_million_tokens=1.25,
+        cache_write_1h_usd_per_million_tokens=2,
+    ),
+    inference_geo_us_multiplier=1.1,
+    web_search_usd_per_invocation=0.01,
+)
+
 _CLAUDE_SONNET_5 = AnthropicPricingTable(
     standard=AnthropicRates(
         input_cache_none_usd_per_million_tokens=2,
@@ -128,7 +148,7 @@ _CLAUDE_HAIKU_4_5_20251001 = AnthropicPricingTable(
         cache_write_1h_usd_per_million_tokens=1,
     ),
     inference_geo_us_multiplier=None,
-    web_search_usd_per_invocation=0.01,
+    web_search_usd_per_invocation=None,
 )
 
 ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
@@ -136,6 +156,7 @@ ANTHROPIC_PRICING: dict[AnthropicModelName, AnthropicPricingTable] = {
     "claude-fable-5": _CLAUDE_FABLE_5,
     "claude-opus-5-5": _CLAUDE_OPUS_5_5,
     "claude-opus-5": _CLAUDE_OPUS_5,
+    "claude-sonnet-5-5": _CLAUDE_SONNET_5_5,
     "claude-sonnet-5": _CLAUDE_SONNET_5,
     "claude-haiku-4-5-20251001": _CLAUDE_HAIKU_4_5_20251001,
     "claude-haiku-4-5": _CLAUDE_HAIKU_4_5_20251001,
@@ -208,6 +229,17 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
         inference_geo_us_multiplier=None,
         web_search_usd_per_invocation=0.01,
     ),
+    "anthropic.claude-sonnet-5-5": AnthropicPricingTable(
+        standard=AnthropicRates(
+            input_cache_none_usd_per_million_tokens=2,
+            output_usd_per_million_tokens=10,
+            cache_read_usd_per_million_tokens=0.2,
+            cache_write_5m_usd_per_million_tokens=2.5,
+            cache_write_1h_usd_per_million_tokens=4,
+        ),
+        inference_geo_us_multiplier=None,
+        web_search_usd_per_invocation=0.01,
+    ),
     "anthropic.claude-sonnet-5": AnthropicPricingTable(
         standard=AnthropicRates(
             input_cache_none_usd_per_million_tokens=2,
@@ -228,7 +260,7 @@ ANTHROPIC_BEDROCK_PRICING: dict[str, AnthropicPricingTable] = {
             cache_write_1h_usd_per_million_tokens=2,
         ),
         inference_geo_us_multiplier=None,
-        web_search_usd_per_invocation=0.01,
+        web_search_usd_per_invocation=None,
     ),
     "us.anthropic.claude-opus-4-6-v1": AnthropicPricingTable(
         standard=AnthropicRates(

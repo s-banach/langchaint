@@ -24,7 +24,6 @@ from langchaint.common.exceptions import (
     EmbeddingOutputError,
     GaveUpWaiting,
     ParserContractError,
-    StreamProtocolError,
     TransientError,
 )
 from langchaint.common.messages import (
@@ -223,7 +222,6 @@ __all__ = [
     "StopReason",
     "StreamHandle",
     "StreamItem",
-    "StreamProtocolError",
     "Tables",
     "TextPart",
     "TimedOutErrorRecord",

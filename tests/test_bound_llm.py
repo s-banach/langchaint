@@ -42,7 +42,6 @@ from langchaint import (
     SharedBackoff,
     StopReason,
     StreamItem,
-    StreamProtocolError,
     TextPart,
     ToolCall,
     ToolCallTurn,
@@ -69,6 +68,7 @@ from langchaint.adapter import (
     ResponseIdentity,
     ResponseOutcome,
     SchemaViolation,
+    StreamProtocolError,
     UnfinishedTurn,
 )
 from langchaint.common.observed_operation import ObservedOperation
@@ -2292,18 +2292,13 @@ def test_a_block_left_before_the_conclusion_sets_abandoned_with_the_first_item_t
 
 
 @pytest.mark.parametrize(
-    ("stream", "classify_result", "raised", "abandons"),
+    ("stream", "classify_result"),
     [
-        (FakeStream(outcome=REFUSAL), "unknown_exception", GenerationError, False),
-        (
-            FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY),
-            "unknown_exception",
-            GenerationError,
-            False,
-        ),
-        (_FailsAfterFirstItemStream(), "transient", GenerationError, False),
-        (_UnnamedItemErrorStream(), "unknown_exception", GenerationError, False),
-        (_ProtocolErrorStream(), "unknown_exception", StreamProtocolError, True),
+        (FakeStream(outcome=REFUSAL), "unknown_exception"),
+        (FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY), "unknown_exception"),
+        (_FailsAfterFirstItemStream(), "transient"),
+        (_UnnamedItemErrorStream(), "unknown_exception"),
+        (_ProtocolErrorStream(), "unknown_exception"),
     ],
     ids=[
         "refusal",
@@ -2313,17 +2308,10 @@ def test_a_block_left_before_the_conclusion_sets_abandoned_with_the_first_item_t
         "protocol_error",
     ],
 )
-def test_a_stream_cancelled_after_final_raised_sets_abandoned_only_for_an_unaccounted_call(
-    stream: FakeStream,
-    classify_result: ErrorClassification,
-    raised: type[Exception],
-    *,
-    abandons: bool,
+def test_a_stream_cancelled_after_final_raised_sets_no_abandoned(
+    stream: FakeStream, classify_result: ErrorClassification
 ) -> None:
-    """A GenerationError concludes the call, so a later cancellation sets no abandoned.
-
-    StreamProtocolError carries no model, attempt records, or usage, so a later cancellation still records the call.
-    """
+    """A GenerationError concludes the call, so a later cancellation sets no abandoned."""
 
     async def scenario() -> None:
         """Absorb the error from final() inside the block, then hang into the caller's deadline."""
@@ -2337,14 +2325,14 @@ def test_a_stream_cancelled_after_final_raised_sets_abandoned_only_for_an_unacco
         async def consume() -> None:
             """Let final() raise, then hang. time_out_when below cancels this inside the block."""
             async with handle:
-                with pytest.raises(raised):
+                with pytest.raises(GenerationError):
                     await handle.final()
                 hang_reached.set()
                 await asyncio.Event().wait()
 
         with pytest.raises(TimeoutError):
             await time_out_when(consume(), hang_reached.is_set)
-        assert (handle.abandoned is not None) == abandons
+        assert handle.abandoned is None
 
     run_with_timeout(scenario())
 
@@ -3003,7 +2991,7 @@ def test_stream_final_is_idempotent() -> None:
     [
         (FakeStream(outcome=REFUSAL), GenerationError),
         (FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY), GenerationError),
-        (_ProtocolErrorStream(), StreamProtocolError),
+        (_ProtocolErrorStream(), GenerationError),
         (_FinalRaisesStream(), RuntimeError),
     ],
     ids=["refusal", "provider_failed_transiently", "protocol_error", "adapter_stream_final"],
@@ -3074,17 +3062,23 @@ def test_backoff_sleep_does_not_hold_the_permit() -> None:
     run_with_timeout(scenario())
 
 
-def test_stream_protocol_error_releases_the_permit() -> None:
-    """A StreamProtocolError from items() returns the permit and closes the stream."""
+def test_stream_protocol_error_raises_retry_unavailable_and_releases_the_permit() -> None:
+    """A StreamProtocolError from items() raises a GenerationError with the reported usage.
+
+    The handle returns the permit and closes the stream.
+    """
 
     async def scenario() -> None:
         """Drive final() into the protocol error, then re-admit inside the still-open block."""
         stream = _ProtocolErrorStream()
+        stream._usage_reported = USAGE_STREAM
         shared_backoff = fast_shared_backoff(max_concurrent_requests=1)
         bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(StreamProtocolError):
+            with pytest.raises(GenerationError) as raised:
                 await handle.final()
+            assert raised.value.record.kind == "retry_unavailable_error"
+            assert raised.value.usage == USAGE_STREAM
             assert stream.closed is True
             async with shared_backoff.admitted(budget=1.0):
                 pass

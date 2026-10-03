@@ -23,7 +23,7 @@ from langchaint.adapter import (
     StreamItem,
 )
 from langchaint.billing.pricing import ProviderBilling
-from langchaint.common.exceptions import StreamProtocolError, TransientError
+from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import Message
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import (
@@ -125,7 +125,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         """The account of a call that no result or `GenerationError` records, or `None`.
 
         Leaving the block before the conclusion, an exception raised inside it, and cancellation each set this value.
-        A `StreamProtocolError` or `ParserContractError` conclusion records no billing.
+        A `ParserContractError` conclusion records no billing.
         Leaving the block after one therefore also sets this value.
         It holds the billing and first-item time of the request the exit cut off.
         Cancellation sets it before the caller receives `asyncio.CancelledError`.
@@ -410,10 +410,10 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
 
         Raises:
             GenerationError: The open stream fails transiently.
+                The event stream violates its event contract, such as ending without a terminal event.
                 The adapter classifies an item error as an invalid request.
                 The provider declares an item error terminal.
                 The adapter cannot classify an item exception.
-            StreamProtocolError: The event stream ends without a terminal event.
             ParserContractError: `Adapter.parse` violates its contract.
             StopAsyncIteration: The stream is exhausted.
             RuntimeError: The handle is unopened or finished.
@@ -449,9 +449,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             if self._ended_at_monotonic_seconds is None:
                 self._ended_at_monotonic_seconds = time.monotonic()
             _ = await self._exit_admission(None)
-            raise
-        except StreamProtocolError:
-            await self._close_adapter_stream()
             raise
         except Exception as exc:
             stream_billing = self._billing_reported()
@@ -494,10 +491,10 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         A response with no output becomes a terminal `GenerationError`.
 
         Raises:
-            StreamProtocolError: The event stream ends without a terminal event.
             GenerationError: The adapter or provider reports a terminal failure.
                 The assembled response reports a terminal result.
                 The open stream fails transiently.
+                The event stream violates its event contract, such as ending without a terminal event.
                 The adapter cannot classify an item exception.
             ParserContractError: `Adapter.parse` violates its contract.
             RuntimeError: The handle is unopened or finished without a stored conclusion.

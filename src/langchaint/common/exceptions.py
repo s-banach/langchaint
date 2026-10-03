@@ -35,7 +35,8 @@ class StreamProtocolError(Exception):
 
     A stream that ends without a terminal result raises this error.
     A missing Messages API stop reason or Responses API terminal response raises this error.
-    A `StreamHandle` that ends without an adapter stream raises this error.
+    `StreamHandle` reports this error from `AdapterStream.items()` as a `retry_unavailable_error` `GenerationError`.
+    `generate_one` retries this error as a transient failure.
     `AdapterStream.final()` may raise this error before `AdapterStream.items()` is exhausted.
     """
 

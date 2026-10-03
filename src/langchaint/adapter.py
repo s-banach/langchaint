@@ -13,6 +13,7 @@ from typing import ClassVar, Literal, NamedTuple
 from pydantic import BaseModel
 
 from langchaint.billing.pricing import ProviderBilling as ProviderBilling  # noqa: PLC0414
+from langchaint.common.exceptions import StreamProtocolError as StreamProtocolError  # noqa: PLC0414
 from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import AssistantMessage, Message, StopReason, TextPart, ToolCall
 from langchaint.concurrency.shared_backoff import (
@@ -608,6 +609,9 @@ class AdapterStream(ABC):
 
         Yields:
             Stream items; SDK events langchaint does not model are dropped.
+
+        Raises:
+            StreamProtocolError: The stream violates its event contract, such as ending without a terminal event.
         """
         ...
 

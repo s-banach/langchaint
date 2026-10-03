@@ -47,13 +47,3 @@ class GaveUpWaiting(Exception):  # noqa: N818
     The admission holds no permit or queue position and records no request.
     A new attempt joins the same queue behind the same pause.
     """
-
-
-class ParserContractError(Exception):
-    """A `SharedBackoff` parse function raised.
-
-    This error identifies a defect in `parse` instead of a provider classification.
-    `__cause__` holds the exception from `parse`.
-    The provider failure passed to `parse` remains as exception context.
-    `SharedBackoff` records no request outcome for this error.
-    """

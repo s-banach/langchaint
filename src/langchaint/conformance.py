@@ -369,7 +369,6 @@ class AdapterConformance(ABC):
         """Every listed failure takes its stated verdict, and an unlisted one still gets one.
 
         `parse` must return a verdict for every input without raising.
-        `SharedBackoff` converts a raise into `ParserContractError`.
         """
         adapter = self.make_adapter()
         for failure, verdict in self.sdk_errors_and_verdicts().items():

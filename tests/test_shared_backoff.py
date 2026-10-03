@@ -4,11 +4,10 @@ import asyncio
 import math
 import time
 from collections.abc import Callable
-from typing import Literal
 
 import pytest
 
-from langchaint.common.exceptions import GaveUpWaiting, ParserContractError
+from langchaint.common.exceptions import GaveUpWaiting
 from langchaint.concurrency.shared_backoff import (
     _NEVER,
     Admission,
@@ -42,7 +41,6 @@ def _shared_backoff(
     wait_multiplier: float = 2.0,
     quiet_seconds_per_decay_step: float = 60.0,
     max_request_starts_per_second: float = 200.0,
-    on_parse_error: Literal["raise", "retry_this_one"] = "raise",
 ) -> SharedBackoff:
     """Build a SharedBackoff with test-friendly defaults, overridable per test."""
     return SharedBackoff(
@@ -54,7 +52,6 @@ def _shared_backoff(
         wait_multiplier=wait_multiplier,
         quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
         max_request_starts_per_second=max_request_starts_per_second,
-        on_parse_error=on_parse_error,
     )
 
 
@@ -282,46 +279,6 @@ def test_a_non_pausing_verdict_changes_no_shared_state(verdict: Verdict) -> None
         admission = await _fail_one_attempt(shared_backoff)
         assert admission.verdict == verdict
         assert shared_backoff._pause_until == _NEVER
-
-    run_with_timeout(scenario())
-
-
-# --- the parse contract ---
-
-
-def test_a_raising_parse_raises_parser_contract_error_with_the_full_chain() -> None:
-    """The chain reads ParserContractError, then the parse defect, then the provider failure."""
-
-    def parse(_failure: Exception) -> Verdict:
-        raise RuntimeError("parse bug")
-
-    async def scenario() -> None:
-        shared_backoff = _shared_backoff(parse=parse)
-        admission = shared_backoff.admitted()
-        with pytest.raises(ParserContractError) as caught:
-            await _raise_in_block(admission, ProviderFailure("429"))
-        defect = caught.value.__cause__
-        assert isinstance(defect, RuntimeError)
-        assert isinstance(defect.__context__, ProviderFailure)
-        assert admission.verdict is None
-        assert shared_backoff.event_counts["parser_contract_error"] == 1
-        assert _all_permits_free(shared_backoff)
-        assert shared_backoff._pause_until == _NEVER
-
-    run_with_timeout(scenario())
-
-
-def test_the_retry_this_one_fallback_corrects_a_parse_defect() -> None:
-    """Under the fallback the defect becomes RetryThisOne, counted, and the failure propagates."""
-
-    def parse(_failure: Exception) -> Verdict:
-        raise RuntimeError("parse bug")
-
-    async def scenario() -> None:
-        shared_backoff = _shared_backoff(parse=parse, on_parse_error="retry_this_one")
-        admission = await _fail_one_attempt(shared_backoff)
-        assert admission.verdict == RetryThisOne(retry_after=None)
-        assert shared_backoff.event_counts["parse_raised"] == 1
 
     run_with_timeout(scenario())
 

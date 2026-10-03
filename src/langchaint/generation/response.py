@@ -22,6 +22,7 @@ from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
     ContextWindowExceededErrorRecord,
     EmptyTurnErrorRecord,
+    EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
     MaxCompletionTokensExceededErrorRecord,
@@ -324,4 +325,18 @@ def _timed_out_error(
     call, provider_attempts = ledger.freeze_with_cut_off(billing_in_flight)
     return GenerationError(
         record=TimedOutErrorRecord(call=call), request=None, provider_attempts=provider_attempts
+    )
+
+
+def _escaped_error(ledger: _CallLedger, escaped: Exception) -> GenerationError:
+    """Build the failure for an `Exception` that escaped failure handling, with one normalized cut-off request.
+
+    The cut-off request carries the billing noted on `ledger` for the request in flight.
+    The caller sets `escaped` as the cause.
+    """
+    call, provider_attempts = ledger.freeze_with_cut_off()
+    return GenerationError(
+        record=EscapedExceptionErrorRecord(error_text=str(escaped), call=call),
+        request=None,
+        provider_attempts=provider_attempts,
     )

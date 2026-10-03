@@ -32,7 +32,6 @@ from langchaint import (
     GenerationErrorKind,
     GenerationErrorRecord,
     Message,
-    ParserContractError,
     PauseAllDoNotRetry,
     PydanticTool,
     Response,
@@ -51,7 +50,6 @@ from langchaint import (
     TransientErrorRecord,
     Usage,
     UserMessage,
-    Verdict,
 )
 from langchaint.adapter import (
     AdapterResult,
@@ -113,11 +111,6 @@ def _settled_attempt_records(
     settled = tuple(record for record in records if record.kind == "settled")
     assert len(settled) == len(records)
     return settled
-
-
-def _parse_raises(_failure: Exception) -> Verdict:
-    """Violate the parse contract on every failure, standing in for a buggy provider parse."""
-    raise RuntimeError("parse defect")
 
 
 def _outputs(
@@ -357,24 +350,29 @@ def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_recor
     run_with_timeout(scenario())
 
 
-def test_stream_final_records_the_response_before_interpreting_it() -> None:
-    """Interpret failure preserves the assembled response and Billing."""
+def test_a_stream_interpret_failure_raises_a_generation_error_with_the_response() -> None:
+    """An interpret failure becomes the call's GenerationError with the assembled response and Billing.
+
+    The GenerationError records the call, so leaving the block sets no abandoned.
+    """
 
     async def scenario() -> None:
-        """Call final() on a stream whose interpret raises, then freeze the ledger it left."""
+        """Call final() on a stream whose interpret raises."""
         stream = FakeStream()
         bound_llm = LLM(
             _InterpretRaisesAdapter(stream=stream), shared_backoff=fast_shared_backoff()
         ).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(RuntimeError, match="interpretation failed"):
+            with pytest.raises(GenerationError, match="interpretation failed") as raised:
                 await handle.final()
-            (record,) = _settled_attempt_records(handle._ledger.freeze().attempt_records)
-            (provider_attempt,) = handle._ledger.provider_attempts
+        assert raised.value.record.kind == "unknown_exception_error"
+        (record,) = _settled_attempt_records(raised.value.attempt_records)
+        (provider_attempt,) = raised.value.provider_attempts
         assert provider_attempt.raw is stream.raw
         assert record.usage == USAGE_STREAM
         assert record.assistant_message is None
         assert record.error is None
+        assert handle.abandoned is None
 
     run_with_timeout(scenario())
 
@@ -2030,8 +2028,8 @@ def test_a_defect_becomes_one_items_failure_and_leaves_the_batch_complete() -> N
         assert isinstance(failure.__cause__, RuntimeError)
         assert failure.error_text == "classify defect"
         assert failure.request is None
-        # The attempt was in flight when the defect escaped, so no attempt is settled.
-        assert failure.call.attempt_records == ()
+        # The attempt was in flight when the defect escaped, so the record cuts it off.
+        assert [attempt.kind for attempt in failure.call.attempt_records] == ["cut_off"]
 
     run_with_timeout(scenario())
 
@@ -2050,37 +2048,67 @@ def test_generate_one_raises_a_defect_as_a_generation_error() -> None:
     run_with_timeout(scenario())
 
 
-def test_a_parse_contract_violation_surfaces_as_langchaints_defect_not_a_provider_outcome() -> (
-    None
-):
-    """generate_one raises GenerationError whose error is the ParserContractError.
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        _ClassifyRaisesAdapter(scripted_attempts=[ValueError("defect")]),
+        _ClassifyRaisesAdapter(stream=_FailsAfterFirstItemStream()),
+    ],
+    ids=["open", "mid_stream"],
+)
+def test_stream_one_raises_a_defect_as_a_generation_error(adapter: FakeAdapter) -> None:
+    """A defect that escapes failure handling becomes `escaped_exception_error`, as in `generate_one`.
 
-    A parse contract violation must bypass the transport-failure path.
-    `classify` would produce `UnknownExceptionErrorRecord` on that path.
+    The GenerationError concludes the call, so leaving the block sets no abandoned.
     """
 
     async def scenario() -> None:
-        """Fail the one attempt with a TransientError whose parse raises."""
-        adapter = FakeAdapter(scripted_attempts=[TransientError("boom")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff(parse=_parse_raises)).bind()
+        """Let classify raise while placing a failure, at the open or mid-stream."""
+        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
+        handle = bound_llm.stream_one([UserMessage(content="hi")])
         with pytest.raises(GenerationError) as raised:
-            await bound_llm.generate_one([UserMessage(content="a")])
+            async with handle:
+                await handle.final()
         assert raised.value.record.kind == "escaped_exception_error"
-        assert isinstance(raised.value.__cause__, ParserContractError)
+        assert str(raised.value) == "classify defect"
+        assert handle.abandoned is None
 
     run_with_timeout(scenario())
 
 
-def test_a_parse_contract_violation_on_a_stream_open_reaches_the_caller() -> None:
-    """Entering stream_one raises the ParserContractError itself. No stream-path frame wraps it."""
+def test_an_escaped_defect_keeps_the_billing_of_the_request_it_cut_off() -> None:
+    """The escaped_exception_error records the cut-off request with the billing the stream reported."""
 
     async def scenario() -> None:
-        """Fail the one open with a TransientError whose parse raises."""
-        adapter = FakeAdapter(scripted_attempts=[TransientError("boom")])
-        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff(parse=_parse_raises)).bind()
-        with pytest.raises(ParserContractError):
-            async with bound_llm.stream_one([UserMessage(content="hi")]):
-                pass
+        """Report billing, fail mid-stream, and let classify raise."""
+        stream = _FailsAfterFirstItemStream()
+        stream._usage_reported = USAGE
+        bound_llm = LLM(
+            _ClassifyRaisesAdapter(stream=stream), shared_backoff=fast_shared_backoff()
+        ).bind()
+        with pytest.raises(GenerationError) as raised:
+            async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+                await handle.final()
+        assert raised.value.record.kind == "escaped_exception_error"
+        (cut_off,) = raised.value.attempt_records
+        assert cut_off.kind == "cut_off"
+        assert raised.value.record.usage == USAGE
+
+    run_with_timeout(scenario())
+
+
+def test_iterating_after_a_failed_final_raises_the_finished_error() -> None:
+    """A final() that settles an assembly failure finishes the handle, so iteration raises RuntimeError."""
+
+    async def scenario() -> None:
+        bound_llm = LLM(
+            FakeAdapter(stream=_FinalRaisesStream()), shared_backoff=fast_shared_backoff()
+        ).bind()
+        async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
+            with pytest.raises(GenerationError):
+                await handle.final()
+            with pytest.raises(RuntimeError, match="stream is finished"):
+                await anext(handle)
 
     run_with_timeout(scenario())
 
@@ -2987,28 +3015,26 @@ def test_stream_final_is_idempotent() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stream", "expected_error"),
+    "stream",
     [
-        (FakeStream(outcome=REFUSAL), GenerationError),
-        (FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY), GenerationError),
-        (_ProtocolErrorStream(), GenerationError),
-        (_FinalRaisesStream(), RuntimeError),
+        FakeStream(outcome=REFUSAL),
+        FakeStream(outcome=_PROVIDER_FAILED_TRANSIENTLY),
+        _ProtocolErrorStream(),
+        _FinalRaisesStream(),
     ],
     ids=["refusal", "provider_failed_transiently", "protocol_error", "adapter_stream_final"],
 )
-def test_stream_final_replays_every_error_that_concluded_the_call(
-    stream: FakeStream, expected_error: type[Exception]
-) -> None:
+def test_stream_final_replays_every_error_that_concluded_the_call(stream: FakeStream) -> None:
     """Repeated final raises the stored error without another attempt or adapter-stream assembly."""
 
     async def scenario() -> None:
         """Call final() twice on a stream whose call cannot end in a Response."""
         bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
-            with pytest.raises(expected_error) as first:
+            with pytest.raises(GenerationError) as first:
                 await handle.final()
             records_after_first = handle._ledger.attempt_records
-            with pytest.raises(expected_error) as second:
+            with pytest.raises(GenerationError) as second:
                 await handle.final()
             assert handle._ledger.attempt_records == records_after_first
         assert second.value is first.value

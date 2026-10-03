@@ -31,6 +31,7 @@ from langchaint.concurrency.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
     Verdict,
+    _exit_admission,
 )
 from langchaint.failure_step import (
     _failure_step,
@@ -52,6 +53,7 @@ from langchaint.generation.response import (
     Response,
     ToolCallTurn,
     _call_result_from_response_outcome,
+    _escaped_error,
     _timed_out_error,
 )
 
@@ -125,8 +127,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         """The account of a call that no result or `GenerationError` records, or `None`.
 
         Leaving the block before the conclusion, an exception raised inside it, and cancellation each set this value.
-        A `ParserContractError` conclusion records no billing.
-        Leaving the block after one therefore also sets this value.
         It holds the billing and first-item time of the request the exit cut off.
         Cancellation sets it before the caller receives `asyncio.CancelledError`.
         A success or `GenerationError` leaves this value as `None`.
@@ -138,8 +138,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         """Built by `__aenter__`, which starts the call."""
         self._admission: Admission | None = None
         self._ended_at_monotonic_seconds: float | None = None
-        self._conclusion: GenerateResult[OutputT] | Exception | None = None
-        self._conclusion_carried_the_call = False
+        self._conclusion: CallResult[OutputT] | None = None
         self._state: _State = "unopened"
         self._request: RequestParams | None = None
 
@@ -153,17 +152,21 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 The adapter cannot classify the open failure.
                 The open attempts consume `max_attempts`.
                 `timeout_seconds` expires before the request opens.
+                An `Exception` escapes failure handling.
             RuntimeError: This handle was already entered.
-            ParserContractError: the adapter's parse violated its contract on a failed open.
         """
         if self._state != "unopened":
             raise RuntimeError(_ALREADY_ENTERED_MESSAGE)
         self._operation = self._generation_started()
         try:
             await self._open()
-        except Exception as exc:
-            self._end_operation(exc)
+        except GenerationError as failure:
+            self._end_operation(failure)
             raise
+        except Exception as escaped:
+            failure = _escaped_error(self._ledger, escaped)
+            self._end_operation(failure)
+            raise failure from escaped
         except BaseException:
             self._end_operation(None)
             raise
@@ -175,11 +178,11 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         Raises what `__aenter__` documents.
         """
         self._state = "open"
-        self._deadline = asyncio.timeout(self._timeout_seconds)
-        await self._deadline.__aenter__()
         self._ledger = _CallLedger(
             model=self._adapter.model, provider_name=self._adapter.provider_name
         )
+        self._deadline = asyncio.timeout(self._timeout_seconds)
+        await self._deadline.__aenter__()
         try:
             await self._open_stream_with_retries()
         except BaseException as exc:
@@ -188,7 +191,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             # An open deadline would retain a timer that could cancel this task after this operation.
             # Record abandonment here because no other frame sees cancellation during the open.
             self._state = "finished"
-            await self._exit_admission(None)
+            _ = self._exit_admission(None)
             billing_in_flight = self._billing_reported()
             if await self._close_deadline(exc):
                 raise _timed_out_error(self._ledger, billing_in_flight) from None
@@ -220,9 +223,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         finally:
             self._end_operation(None)
 
-    def _end_operation(
-        self, conclusion: GenerateResult[OutputT] | AbandonedCallRecord | Exception | None
-    ) -> None:
+    def _end_operation(self, conclusion: CallResult[OutputT] | AbandonedCallRecord | None) -> None:
         """Give the observer the call's conclusion, when there is one, and end the operation once."""
         operation, self._operation = self._operation, None
         if operation is None:
@@ -276,33 +277,25 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         return self._adapter_stream.billing_reported()
 
     def _abandon(self, billing_in_flight: ProviderBilling | None) -> None:
-        """Set `abandoned` and conclude the operation with it, when no conclusion already accounts for the call.
+        """Set `abandoned` and conclude the operation with it, when the call has no conclusion.
 
         Include billing reported by the interrupted attempt.
         """
-        if self._conclusion_carried_the_call:
+        if self._conclusion is not None:
             return
         call, _ = self._ledger.freeze_with_cut_off(billing_in_flight)
         self.abandoned = AbandonedCallRecord(call=call)
         self._end_operation(self.abandoned)
 
-    async def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
+    def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
         """Exit the held admission and return its `Verdict`.
 
         Repeated calls return `None`.
-
-        Raises:
-            ParserContractError: `Adapter.parse` violates its contract.
         """
         if self._admission is None:
             return None
         admission, self._admission = self._admission, None
-        _ = await admission.__aexit__(
-            type(exc) if exc is not None else None,
-            exc,
-            exc.__traceback__ if exc is not None else None,
-        )
-        return admission.verdict
+        return _exit_admission(admission, exc)
 
     async def _close_adapter_stream(self) -> None:
         """Close the provider connection and release admission.
@@ -321,7 +314,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                     ),
                 )
         finally:
-            _ = await self._exit_admission(None)
+            _ = self._exit_admission(None)
 
     def _step_after_failure(self, exc: Exception, verdict: Verdict | None) -> _FailureStep:
         """Note the failed attempt's request id and decide how the call continues."""
@@ -363,7 +356,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 The provider declares the open failure terminal.
                 The adapter cannot classify the open failure.
                 Open failures consume `max_attempts`.
-            ParserContractError: `Adapter.parse` violates its contract.
         """
         built = self._bound_adapter.build_request(self._messages)
         if isinstance(built, InvalidRequest):
@@ -382,7 +374,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             try:
                 opened = await self._bound_adapter.open_stream(request)
             except Exception as exc:
-                step = self._step_after_failure(exc, await self._exit_admission(exc))
+                step = self._step_after_failure(exc, self._exit_admission(exc))
                 if step.kind == "terminal":
                     raise _terminal_generation_error(
                         step,
@@ -400,7 +392,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             except BaseException:
                 # `CancelledError` is a `BaseException` that the clause above does not catch.
                 # Exit here to return the permit at the same point on each failing path.
-                _ = await self._exit_admission(None)
+                _ = self._exit_admission(None)
                 raise
             self._adapter_stream = opened
             self._items = self._adapter_stream.items()
@@ -414,7 +406,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 The adapter classifies an item error as an invalid request.
                 The provider declares an item error terminal.
                 The adapter cannot classify an item exception.
-            ParserContractError: `Adapter.parse` violates its contract.
+                An `Exception` escapes failure handling.
             StopAsyncIteration: The stream is exhausted.
             RuntimeError: The handle is unopened or finished.
         """
@@ -428,14 +420,19 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             raise
         except BaseException as exc:
             self._state = "finished"
-            if self._conclusion is None and isinstance(exc, Exception):
-                # Cancellation destroys the frames that could observe the call.
-                # `abandoned` records that condition.
-                self._conclusion = exc
-                self._conclusion_carried_the_call = isinstance(exc, GenerationError)
-                self._end_operation(exc)
-                await self._close_deadline(exc)
-            raise
+            if self._conclusion is not None or not isinstance(exc, Exception):
+                # A stored conclusion already records the call.
+                # Cancellation destroys the frames that could observe the call, so `abandoned` records it.
+                raise
+            failure = (
+                exc if isinstance(exc, GenerationError) else _escaped_error(self._ledger, exc)
+            )
+            self._conclusion = failure
+            self._end_operation(failure)
+            await self._close_deadline(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
 
     async def _next_item(self) -> StreamItem:
         """Pull the next item without retrying the request.
@@ -448,37 +445,51 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         except StopAsyncIteration:
             if self._ended_at_monotonic_seconds is None:
                 self._ended_at_monotonic_seconds = time.monotonic()
-            _ = await self._exit_admission(None)
+            _ = self._exit_admission(None)
             raise
-        except Exception as exc:
-            stream_billing = self._billing_reported()
-            step = self._step_after_failure(exc, await self._exit_admission(exc))
-            if step.kind == "terminal":
-                terminal = _terminal_generation_error(
-                    step,
-                    reason=str(exc),
-                    ledger=self._ledger,
-                    billing=stream_billing,
-                    request=self._request,
-                    stream_opened=self._adapter_stream is not None,
-                )
-                await self._close_adapter_stream()
-                raise terminal from exc
-            wrapped = _transient_error_for_step(
-                exc, f"open stream failed during iteration: {exc}", step
-            )
-            self._ledger.record(error=wrapped, assistant_message=None, billing=stream_billing)
-            await self._close_adapter_stream()
-            raise GenerationError(
-                record=RetryUnavailableErrorRecord(call=self._ledger.freeze()),
-                request=self._request,
-                provider_attempts=self._ledger.provider_attempts,
-            ) from wrapped
+        except Exception as exc:  # noqa: BLE001 (every failure of an open stream settles its attempt)
+            raise await self._error_after_stream_failure(exc, stage="iteration")  # noqa: B904 (the returned error already holds its cause)
         except BaseException:
-            _ = await self._exit_admission(None)
+            _ = self._exit_admission(None)
             raise
         self._ledger.stamp_first_item()
         return item
+
+    async def _error_after_stream_failure(
+        self, exc: Exception, *, stage: Literal["iteration", "assembly"]
+    ) -> GenerationError:
+        """Settle the open stream's failed attempt and build the call's error with its cause set.
+
+        An open stream cannot retry, so a transient failure ends the call as `retry_unavailable_error`.
+        `stage` names the stream step that failed in the transient error text.
+        """
+        self._state = "finished"
+        stream_billing = self._billing_reported()
+        self._ledger.note_billing_in_flight(stream_billing)
+        step = self._step_after_failure(exc, self._exit_admission(exc))
+        if step.kind == "terminal":
+            error = _terminal_generation_error(
+                step,
+                reason=str(exc),
+                ledger=self._ledger,
+                billing=stream_billing,
+                request=self._request,
+                stream_opened=self._adapter_stream is not None,
+            )
+            error.__cause__ = exc
+        else:
+            wrapped = _transient_error_for_step(
+                exc, f"open stream failed during {stage}: {exc}", step
+            )
+            self._ledger.record(error=wrapped, assistant_message=None, billing=stream_billing)
+            error = GenerationError(
+                record=RetryUnavailableErrorRecord(call=self._ledger.freeze()),
+                request=self._request,
+                provider_attempts=self._ledger.provider_attempts,
+            )
+            error.__cause__ = wrapped
+        await self._close_adapter_stream()
+        return error
 
     @overload
     async def final(self: "StreamHandle[OutputT, Never]") -> Response[OutputT]: ...
@@ -496,7 +507,8 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 The open stream fails transiently.
                 The event stream violates its event contract, such as ending without a terminal event.
                 The adapter cannot classify an item exception.
-            ParserContractError: `Adapter.parse` violates its contract.
+                The adapter fails to assemble or interpret the drained stream.
+                An `Exception` escapes failure handling.
             RuntimeError: The handle is unopened or finished without a stored conclusion.
         """
         if self._conclusion is None:
@@ -514,32 +526,41 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 else self._ended_at_monotonic_seconds
             )
             try:
-                raw = await adapter_stream.final()
-                self._ledger.stage_response(
-                    raw=raw,
-                    billing=self._bound_adapter.billing_from_raw(raw),
-                    identity=self._bound_adapter.identity_from_raw(
-                        raw, request_id=adapter_stream.request_id()
-                    ),
+                self._conclusion = await self._assembled_conclusion(
+                    adapter_stream, ended_at_monotonic_seconds=ended_at_monotonic_seconds
                 )
-                self._conclusion = self._conclude(
-                    self._bound_adapter.interpret(raw),
-                    ended_at_monotonic_seconds=ended_at_monotonic_seconds,
-                )
-            except BaseException as exc:
-                # Keep interpretation inside the `try` because `_conclude` records before returning.
-                # A raise after that record could let a second call record the attempt again.
-                if isinstance(exc, Exception):
-                    self._conclusion = exc
-                    self._end_operation(exc)
-                    await self._close_deadline(exc)
-                raise
-            self._conclusion_carried_the_call = True
+            except Exception as escaped:  # noqa: BLE001 (an escaped Exception becomes the stored escaped_exception_error)
+                # Store every conclusion, because `_conclude` records the attempt before it can raise.
+                # A second `final()` call would otherwise record the attempt again.
+                escaped_error = _escaped_error(self._ledger, escaped)
+                escaped_error.__cause__ = escaped
+                self._conclusion = escaped_error
             self._end_operation(self._conclusion)
             await self._close_deadline(None)
         if isinstance(self._conclusion, (Response, ToolCallTurn)):
             return self._conclusion
         raise self._conclusion
+
+    async def _assembled_conclusion(
+        self, adapter_stream: AdapterStream, *, ended_at_monotonic_seconds: float
+    ) -> CallResult[OutputT]:
+        """Assemble and interpret the drained stream's response, and build the call's conclusion.
+
+        A failure to assemble or interpret settles the attempt like a failure during iteration.
+        """
+        try:
+            raw = await adapter_stream.final()
+            self._ledger.stage_response(
+                raw=raw,
+                billing=self._bound_adapter.billing_from_raw(raw),
+                identity=self._bound_adapter.identity_from_raw(
+                    raw, request_id=adapter_stream.request_id()
+                ),
+            )
+            outcome = self._bound_adapter.interpret(raw)
+        except Exception as exc:  # noqa: BLE001 (an assembly failure settles the attempt like an iteration failure)
+            return await self._error_after_stream_failure(exc, stage="assembly")
+        return self._conclude(outcome, ended_at_monotonic_seconds=ended_at_monotonic_seconds)
 
     def _conclude(
         self,

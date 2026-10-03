@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Literal
 
-from langchaint.common.exceptions import GaveUpWaiting, ParserContractError
+from langchaint.common.exceptions import GaveUpWaiting
 
 _logger = logging.getLogger("langchaint.shared_backoff")
 
@@ -154,20 +154,26 @@ class Admission:
     ) -> Literal[False]:
         """Parse and record a provider failure before releasing the permit.
 
-        The permit returns even when parsing raises.
-
         Raises:
-            ParserContractError: `parse` violates its contract and `on_parse_error="raise"`.
             BaseException: The admitted block raises it.
         """
-        try:
-            if isinstance(exc_value, self._shared_backoff.failure_types):
-                verdict = self._shared_backoff._checked_parse(exc_value)  # noqa: SLF001 (same-module machinery)
-                self.verdict = verdict
-                self._shared_backoff._record(verdict)  # noqa: SLF001 (same-module machinery)
-        finally:
-            self._shared_backoff._release_permit()  # noqa: SLF001 (same-module machinery)
+        _ = _exit_admission(self, exc_value)
         return False
+
+
+def _exit_admission(admission: Admission, failure: BaseException | None) -> Verdict | None:
+    """Parse and record `failure` before returning the admission's permit, and return `admission.verdict`.
+
+    `Admission.__aexit__` passes the block's exception.
+    `StreamHandle` calls this directly because its admission spans several of its methods.
+    """
+    shared_backoff = admission._shared_backoff  # noqa: SLF001 (same-module machinery)
+    if isinstance(failure, shared_backoff.failure_types):
+        verdict = shared_backoff._normalized(shared_backoff.parse(failure))  # noqa: SLF001 (same-module machinery)
+        admission.verdict = verdict
+        shared_backoff._record(verdict)  # noqa: SLF001 (same-module machinery)
+    shared_backoff._release_permit()  # noqa: SLF001 (same-module machinery)
+    return admission.verdict
 
 
 class SharedBackoff:
@@ -178,7 +184,7 @@ class SharedBackoff:
     Use `PrivateBackoff` between `RetryThisOne` attempts.
     """
 
-    def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests, on_parse_error)
+    def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests)
         self,
         *,
         parse: Callable[[Exception], Verdict],
@@ -189,7 +195,6 @@ class SharedBackoff:
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
         max_request_starts_per_second: float = 50.0,
-        on_parse_error: Literal["raise", "retry_this_one"] = "raise",
     ) -> None:
         """Validate configuration. Initialize an unpaused `SharedBackoff`.
 
@@ -198,7 +203,7 @@ class SharedBackoff:
         `longest_wait_seconds` caps generated waits and `retry_after`.
 
         Args:
-            parse: The provider failure parser.
+            parse: The provider failure parser, which returns a verdict for every input without raising.
             failure_types: The exception types that `parse` accepts.
             max_concurrent_requests: The request concurrency limit, or `None`.
             minimum_wait_ceiling_seconds: The minimum private wait ceiling in seconds.
@@ -206,7 +211,6 @@ class SharedBackoff:
             wait_multiplier: The factor that grows or shrinks the wait ceiling.
             quiet_seconds_per_decay_step: The quiet interval that shrinks the wait ceiling once.
             max_request_starts_per_second: The request-start rate limit.
-            on_parse_error: The action when `parse` raises.
 
         Raises:
             ValueError: A numeric setting is boolean, non-finite, or non-positive.
@@ -267,7 +271,6 @@ class SharedBackoff:
         self.parse: Callable[[Exception], Verdict] = parse
         self.failure_types: tuple[type[Exception], ...] = failure_types
         self._max_concurrent_requests = max_concurrent_requests
-        self.on_parse_error: Literal["raise", "retry_this_one"] = on_parse_error
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
         """Quiet steps after which the ceiling has reached the floor, whatever it started at.
 
@@ -301,8 +304,7 @@ class SharedBackoff:
         """How often each noteworthy entry or exit event occurred, by tag.
 
         The correction tags are `"retry_after_invalid"` and `"retry_after_over_cap"`.
-        `on_parse_error="retry_this_one"` also permits the `"parse_raised"` correction tag.
-        The failure tags are `"gave_up_waiting"` and `"parser_contract_error"`.
+        The failure tag is `"gave_up_waiting"`.
         """
 
     @property
@@ -413,33 +415,6 @@ class SharedBackoff:
             self._pause_until - self._pause_started_at,
             len(self._queue),
         )
-
-    def _checked_parse(self, failure: Exception) -> Verdict:
-        """Call parse, handle raised exceptions, and normalize the verdict.
-
-        Raises:
-            ParserContractError: parse raised and on_parse_error is "raise".
-        """
-        try:
-            result = self.parse(failure)
-        except Exception as defect:  # noqa: BLE001 (parse is caller code; any Exception it raises is the defect handled here)
-            return self._parse_error_outcome(defect)
-        return self._normalized(result)
-
-    def _parse_error_outcome(self, defect: Exception) -> RetryThisOne:
-        """Apply on_parse_error to an exception raised by parse.
-
-        Raises:
-            ParserContractError: on_parse_error is "raise".
-        """
-        description = "parse raised instead of returning a verdict"
-        if self.on_parse_error == "raise":
-            self.event_counts["parser_contract_error"] += 1
-            _logger.error("parse violated its contract: %s", description)
-            raise ParserContractError(description) from defect
-        self.event_counts["parse_raised"] += 1
-        _logger.warning("corrected a parse contract violation to RetryThisOne: %s", description)
-        return RetryThisOne(retry_after=None)
 
     def _normalized(self, verdict: Verdict) -> Verdict:
         """Return the verdict with retry_after validated and capped at longest_wait_seconds.

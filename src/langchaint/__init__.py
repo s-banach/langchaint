@@ -23,7 +23,6 @@ from langchaint.billing.usage import ZERO_USAGE, Usage
 from langchaint.common.exceptions import (
     EmbeddingOutputError,
     GaveUpWaiting,
-    ParserContractError,
     TransientError,
 )
 from langchaint.common.messages import (
@@ -198,7 +197,6 @@ __all__ = [
     "MaxCompletionTokensExceededErrorRecord",
     "Message",
     "MessageContent",
-    "ParserContractError",
     "PauseAll",
     "PauseAllDoNotRetry",
     "PrivateBackoff",

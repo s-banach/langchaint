@@ -24,7 +24,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from langchaint.adapter import ErrorClassification
-from langchaint.common.exceptions import EmbeddingOutputError, ParserContractError
+from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
@@ -169,7 +169,6 @@ class EmbeddingModel:
 
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
-            ParserContractError: `SharedBackoff.parse` violates its contract.
             Exception: A provider request failed terminally or spent the last attempt.
         """
         private_backoff = PrivateBackoff(self._shared_backoff)
@@ -180,8 +179,6 @@ class EmbeddingModel:
             try:
                 async with admission:
                     return await self._adapter.embed_batch(inputs, task=task)
-            except ParserContractError:
-                raise
             except Exception as error:
                 # The block's exit set a verdict only when `error` is one of `failure_types`.
                 step = _failure_step(
@@ -213,7 +210,6 @@ class EmbeddingModel:
             ValueError: An input cannot form a provider request.
             EmbeddingOutputError: A successful response contains invalid vectors.
             asyncio.CancelledError: The caller cancelled this operation.
-            ParserContractError: `SharedBackoff.parse` violates its contract.
             Exception: A provider request failed terminally or spent the last attempt.
         """
         if isinstance(inputs, str):

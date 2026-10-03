@@ -23,7 +23,7 @@ from langchaint.adapter import (
     ToolChoice,
 )
 from langchaint.billing.pricing import ProviderBilling
-from langchaint.common.exceptions import ParserContractError, TransientError
+from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import AssistantMessage, Message, TextPart, UserMessage
 from langchaint.common.observed_operation import (
     UNOBSERVED_OPERATION,
@@ -46,7 +46,6 @@ from langchaint.generation._generate_many_records import (
 )
 from langchaint.generation.call import AbandonedCallRecord, _CallLedger
 from langchaint.generation.errors import (
-    EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
     InvalidRequestErrorRecord,
@@ -62,6 +61,7 @@ from langchaint.generation.response import (
     ResponseRecord,
     ToolCallTurn,
     _call_result_from_response_outcome,
+    _escaped_error,
     _result_record,
     _timed_out_error,
 )
@@ -839,7 +839,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                 The completed response reports a terminal result.
                 Transient failures consume `max_attempts`.
                 `deadline` expires.
-            ParserContractError: `Adapter.parse` violates its contract.
         """
         timeout_scope = deadline.scope
         try:
@@ -861,7 +860,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
         Raises:
             GenerationError: The call reaches a terminal failure.
-            ParserContractError: `Adapter.parse` violates its contract.
         """
         request = self._request_for_messages(messages, ledger=ledger)
         private_backoff = PrivateBackoff(self.shared_backoff)
@@ -909,8 +907,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                         raise TransientError(  # noqa: TRY301 (the admitted() block's exit is the parser, so the raise must sit inside it)
                             outcome.reason, is_rate_limit=outcome.is_rate_limit
                         )
-            except ParserContractError:
-                raise
             except Exception as exc:  # noqa: BLE001 (_settle_failed_attempt raises every terminal failure)
                 last_failure = exc
                 # The block's exit set a verdict only when `exc` is one of `failure_types`.
@@ -1036,11 +1032,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         except GenerationError:
             raise
         except Exception as escaped:
-            raise GenerationError(
-                record=EscapedExceptionErrorRecord(error_text=str(escaped), call=ledger.freeze()),
-                request=None,
-                provider_attempts=ledger.provider_attempts,
-            ) from escaped
+            raise _escaped_error(ledger, escaped) from escaped
 
     def _generation_started(
         self, messages: Sequence[Message], *, stream: bool

@@ -117,4 +117,5 @@ def start_observed_operation[OutcomeT](
     """
     with _logging_failures("starting the operation"):
         return _GuardedOperation(start())
+    # Reached when `start` raises, because `_logging_failures` suppresses the exception.
     return UNOBSERVED_OPERATION

@@ -1802,7 +1802,7 @@ def test_output_messages_render_readable_text_and_never_the_reasoning_payload(
 
     A turn without readable text still renders its message, with an empty parts array.
     """
-    attributes = _output_content_attributes(turn, stop_reason)
+    attributes = _output_content_attributes(turn, stop_reason, _record_every_part)
     output_messages = str(attributes["gen_ai.output.messages"])
     assert json.loads(output_messages) == [
         {"role": "assistant", "parts": expected_parts, "finish_reason": expected_finish_reason}

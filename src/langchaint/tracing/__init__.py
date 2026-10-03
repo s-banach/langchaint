@@ -60,11 +60,12 @@ import base64
 import importlib.metadata
 import json
 import logging
-import math
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, NoReturn, overload
+from typing import Literal, overload
+
+from pydantic import TypeAdapter, ValidationError
 
 try:
     from opentelemetry import context, trace
@@ -79,6 +80,7 @@ except ModuleNotFoundError as exc:
 from langchaint.adapter import Binding
 from langchaint.common.messages import (
     ContentPart,
+    JsonValue,
     Message,
     StopReason,
     TextPart,
@@ -162,28 +164,7 @@ def _filtered_part(
     )
 
 
-def _filtered_content(
-    content: str | tuple[ContentPart, ...], content_filter: ContentFilter, attribute_name: str
-) -> tuple[ContentPart, ...]:
-    """Pass each `ContentPart` through the filter, with a str as one `TextPart`.
-
-    A bound system prompt is a str or a tuple of `TextPart`, so it passes through this function too.
-    """
-    content_parts: tuple[ContentPart, ...] = (
-        (TextPart(text=content),) if isinstance(content, str) else content
-    )
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in content_parts)
-    return tuple(part for part in kept if part is not None)
-
-
-def _filtered_turn(
-    turn: tuple[TurnPart, ...], content_filter: ContentFilter, attribute_name: str
-) -> tuple[TurnPart, ...]:
-    """Pass each `TurnPart` through the filter."""
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in turn)
-    return tuple(part for part in kept if part is not None)
-
-
+_JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _PACKAGE_VERSION = importlib.metadata.version("langchaint")
 _CHAT_OPERATION = "chat"
 """The GenAI operation value for a chat completion."""
@@ -208,38 +189,31 @@ def _guarding_telemetry_failures(what: str) -> Generator[None]:
         _logger.warning("%s raised; this span's telemetry is incomplete", what, exc_info=True)
 
 
-def _is_recording(span: Span) -> bool:
-    """Read whether the span records, treating an Exception as not recording.
-
-    An Exception returns False so telemetry cannot replace a result or active exception.
-    """
-    try:
-        return span.is_recording()
-    except Exception:
-        _logger.warning(
-            "reading whether the span records raised; treating it as not recording", exc_info=True
-        )
-        return False
-
-
 def _set_ok_status(span: Span) -> None:
     """Mark one span successful, without letting the call reach the caller."""
     with _guarding_telemetry_failures("setting the span status"):
         span.set_status(Status(StatusCode.OK))
 
 
-def _set_span_attribute(span: Span, key: str, value: SpanAttributeValue) -> None:
-    """Set one attribute on a recording span, without letting the call reach the caller."""
-    with _guarding_telemetry_failures(f"setting {key}"):
-        if _is_recording(span):
-            span.set_attribute(key, value)
-
-
 def _set_span_attributes(span: Span, attributes: SpanAttributes) -> None:
-    """Set a mapping of attributes on a recording span, without letting the call reach the caller."""
+    """Set a mapping of attributes, without letting the call reach the caller.
+
+    A non-recording span ignores them, as the OTel API specifies.
+    """
     with _guarding_telemetry_failures("setting the span attributes"):
-        if attributes and _is_recording(span):
-            span.set_attributes(attributes)
+        span.set_attributes(attributes)
+
+
+def _set_built_attributes(span: Span, what: str, build: Callable[[], SpanAttributes]) -> None:
+    """Set the attributes `build` returns on a recording span, logging an Exception from either step.
+
+    `build` runs only for a recording span, so an application without a TracerProvider pays nothing for it.
+    `what` names the step in the log message.
+    Existing span attributes remain when `build` raises.
+    """
+    with _guarding_telemetry_failures(what):
+        if span.is_recording():
+            span.set_attributes(build())
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -363,64 +337,35 @@ def _content_part(part: ContentPart) -> dict[str, object]:
             return _blob_part("audio", part.media_type, part.data)
 
 
-def _content_parts(content: tuple[ContentPart, ...]) -> list[dict[str, object]]:
-    """Render content parts as the convention's parts array.
+def _recorded_content(
+    content: str | tuple[ContentPart, ...], content_filter: ContentFilter, attribute_name: str
+) -> list[dict[str, object]]:
+    """Filter content parts and render the kept ones as the convention's parts array.
 
-    gen_ai.system_instructions uses the same rendering because its items share the text part shape.
+    A str is filtered as one `TextPart`.
+    A bound system prompt is a str or a tuple of `TextPart`, so it renders here too.
+    gen_ai.system_instructions items share the text part shape.
     """
-    return [_content_part(part) for part in content]
+    content_parts: tuple[ContentPart, ...] = (
+        (TextPart(text=content),) if isinstance(content, str) else content
+    )
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in content_parts)
+    return [_content_part(part) for part in kept if part is not None]
 
 
-def _finite_float(number_text: str) -> float:
-    """Parse a JSON number, rejecting one that overflows the float range.
-
-    `json.dumps` writes a non-finite float as the bare token Infinity or NaN.
-    Those tokens are not JSON, so this function rejects them.
-
-    Raises:
-        ValueError: the text parses to a non-finite float (1e400 overflows to inf).
-            _tool_call_arguments catches this type to reach its raw-text fallback.
-    """
-    value = float(number_text)
-    if not math.isfinite(value):
-        raise ValueError(f"JSON number is not finite as a float: {number_text}")
-    return value
-
-
-def _reject_non_json_constant(token: str) -> NoReturn:
-    """Reject the Infinity, -Infinity, and NaN literals json.loads accepts as an extension.
-
-    They are not JSON, and json.dumps writes them straight back out, so they are a parse failure here.
-
-    Raises:
-        ValueError: `json.loads` passes one of those three literals.
-            _tool_call_arguments catches this type to reach its raw-text fallback.
-    """
-    raise ValueError(f"not a JSON constant: {token}")
-
-
-def _tool_call_arguments(args_json: str) -> object:
-    """Deserialize a tool call's argument JSON, falling back to the raw text when it does not parse.
+def _tool_call_arguments(args_json: str) -> JsonValue:
+    """Deserialize a tool call's argument JSON, falling back to the raw text when it is not standard JSON.
 
     The convention requests best-effort deserialization of serialized arguments.
     Any JSON value is returned.
-    Unparseable text is returned unchanged so DispatchInvalidToolArgs remains visible.
-
-    The two parse hooks narrow json.loads to what json.dumps can write back as JSON.
-    RFC 8259 excludes Infinity and NaN.
-    The hooks route them to raw text so nested attributes remain valid JSON.
-    Routing these to the raw-text fallback keeps every emitted payload standard JSON.
-
-    Only ValueError is caught, the parse failure this fallback is for.
-    RecursionError propagates to the telemetry guard.
+    Text that does not validate as a `JsonValue` is returned unchanged, so DispatchInvalidToolArgs remains visible.
+    That includes Infinity, NaN, and a number such as 1e400 that overflows to a non-finite float.
+    RFC 8259 excludes those values, so the fallback keeps every emitted payload standard JSON.
     """
     try:
-        parsed: object = json.loads(
-            args_json, parse_float=_finite_float, parse_constant=_reject_non_json_constant
-        )
-    except ValueError:
+        return _JSON_VALUE_ADAPTER.validate_json(args_json)
+    except ValidationError:
         return args_json
-    return parsed
 
 
 def _turn_part(part: TurnPart) -> dict[str, object] | None:
@@ -446,12 +391,15 @@ def _turn_part(part: TurnPart) -> dict[str, object] | None:
             return None
 
 
-def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
-    """Render an assistant turn as the convention's parts array, in emission order.
+def _recorded_turn(
+    turn: tuple[TurnPart, ...], content_filter: ContentFilter, attribute_name: str
+) -> list[dict[str, object]]:
+    """Filter an assistant turn and render the kept parts as the convention's parts array, in emission order.
 
-    A turn whose every part renders as None renders as an empty parts array, not as a missing message.
+    A turn whose every part is omitted or renders as None renders as an empty parts array, not as a missing message.
     """
-    rendered = (_turn_part(part) for part in turn)
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in turn)
+    rendered = (_turn_part(part) for part in kept if part is not None)
     return [part for part in rendered if part is not None]
 
 
@@ -463,15 +411,13 @@ def _input_message(message: Message, content_filter: ContentFilter) -> dict[str,
     attribute_name = "gen_ai.input.messages"
     match message.kind:
         case "user":
-            parts = _content_parts(
-                _filtered_content(message.content, content_filter, attribute_name)
-            )
+            parts = _recorded_content(message.content, content_filter, attribute_name)
             return {"role": "user", "parts": parts}
         case "tool":
             parts = [_tool_call_response_part(message, content_filter, attribute_name)]
             return {"role": "tool", "parts": parts}
         case "assistant":
-            parts = _turn_parts(_filtered_turn(message.turn, content_filter, attribute_name))
+            parts = _recorded_turn(message.turn, content_filter, attribute_name)
             return {"role": "assistant", "parts": parts}
 
 
@@ -488,9 +434,7 @@ def _tool_call_response_part(
         "type": "tool_call_response",
         "id": message.tool_call_id,
         "is_error": message.is_error,
-        "response": _content_parts(
-            _filtered_content(message.content, content_filter, attribute_name)
-        ),
+        "response": _recorded_content(message.content, content_filter, attribute_name),
     }
 
 
@@ -525,8 +469,8 @@ def _input_content_attributes(
     """
     attributes: dict[str, SpanAttributeValue] = {}
     if binding.system_prompt is not None:
-        system_instructions = _content_parts(
-            _filtered_content(binding.system_prompt, content_filter, "gen_ai.system_instructions")
+        system_instructions = _recorded_content(
+            binding.system_prompt, content_filter, "gen_ai.system_instructions"
         )
         if system_instructions:
             attributes["gen_ai.system_instructions"] = json.dumps(system_instructions)
@@ -539,9 +483,10 @@ def _input_content_attributes(
 
 
 def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]:
-    """Map stored request configuration onto standard OTel attributes."""
+    """Map the operation and stored request configuration onto standard OTel attributes."""
     binding = start.binding
     attributes: dict[str, SpanAttributeValue] = {
+        "gen_ai.operation.name": _CHAT_OPERATION,
         "gen_ai.provider.name": start.provider_name,
         "gen_ai.request.model": start.model,
         "gen_ai.output.type": "text" if start.response_format is None else "json",
@@ -558,18 +503,18 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
 
 
 def _output_content_attributes(
-    turn: tuple[TurnPart, ...], stop_reason: StopReason | None
+    turn: tuple[TurnPart, ...], stop_reason: StopReason | None, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
     """Build gen_ai.output.messages from one assistant turn.
 
     One function for the success and the failure paths, so one turn renders the same whichever reported it.
-    One key contains one message for one turn. A missing stop_reason uses the required "error" enum member.
+    One key contains one message for one turn.
     """
     return {
         "gen_ai.output.messages": json.dumps([
             {
                 "role": "assistant",
-                "parts": _turn_parts(turn),
+                "parts": _recorded_turn(turn, content_filter, "gen_ai.output.messages"),
                 "finish_reason": (
                     _NO_COMPLETED_TURN_FINISH_REASON
                     if stop_reason is None
@@ -588,19 +533,15 @@ def _apply_output_content[OutputT](
     GenerationError carries the last produced turn. The key is omitted when no attempt produced a turn.
     Per-attempt detail stays on the langchaint.attempt_failed events, which carry no content.
     """
-    if not span_config.capture_message_content:
-        return
     assistant_message = result.assistant_message
     if assistant_message is None:
         return
     stop_reason = result.stop_reason
     _apply_content_attributes(
         span,
-        lambda: _output_content_attributes(
-            _filtered_turn(
-                assistant_message.turn, span_config.content_filter, "gen_ai.output.messages"
-            ),
-            stop_reason,
+        span_config,
+        lambda content_filter: _output_content_attributes(
+            assistant_message.turn, stop_reason, content_filter
         ),
     )
 
@@ -627,52 +568,33 @@ def _apply_result_attributes[OutputT](
     result: CallResult[OutputT] | AbandonedCallRecord,
     attribute_mapper: AttributeMapper,
 ) -> None:
-    """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
+    """Set the langchaint.attempt_failed events and the mapper's attributes on a recording span.
 
-    A non-recording span skips the mapper because an `AttributeMapper` may be expensive.
-    A mapper exception is caught and logged at warning level.
-    `langchaint.attempt_failed` events are added before the mapper runs.
-    Existing span attributes remain when the mapper raises.
-    Events and mapper attributes use separate guards.
+    A non-recording span skips both, because an `AttributeMapper` may be expensive.
+    The events are added before the mapper runs.
+    Events and mapper attributes use separate guards, so a mapper that raises keeps the events.
     An error whose str() raises can leave the events partial.
     """
-    if not _is_recording(span):
-        return
-    try:
-        _record_attempt_failed_events(span, result)
-    except Exception:
-        _logger.warning("attempt_failed events raised; leaving span events partial", exc_info=True)
-    try:
-        attributes = attribute_mapper(result)
-    except Exception:
-        _logger.warning("attribute_mapper raised; leaving span attributes partial", exc_info=True)
-        return
-    with _guarding_telemetry_failures("setting the mapper's attributes"):
-        span.set_attributes(attributes)
+    with _guarding_telemetry_failures("adding the langchaint.attempt_failed events"):
+        if span.is_recording():
+            _record_attempt_failed_events(span, result)
+    _set_built_attributes(span, "attribute_mapper", lambda: attribute_mapper(result))
 
 
-def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -> None:
-    """Set built content attributes on a recording span, catching a failure to build them.
+def _apply_content_attributes(
+    span: Span, span_config: _SpanConfig, build: Callable[[ContentFilter], SpanAttributes]
+) -> None:
+    """Set the content attributes `build` returns, when capture is on and the span is recording.
 
+    `build` receives the observer's content filter.
     The content keys are JSON strings, and some of what they serialize is arbitrary application data:
     An application supplies `JSONSchemaTool.args_schema` values verbatim.
     `json.dumps` can reject one of those values.
     A `ContentFilter` can raise or return a part of another kind.
-    A build Exception is logged and does not propagate. Existing span attributes remain.
-    Building inside the is_recording guard is why the input messages are serialized here rather than earlier:
-    an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
+    A build Exception is logged and does not propagate.
     """
-    if not _is_recording(span):
-        return
-    try:
-        attributes = build()
-    except Exception:
-        _logger.warning(
-            "content capture raised; leaving span content attributes partial", exc_info=True
-        )
-        return
-    with _guarding_telemetry_failures("setting the content attributes"):
-        span.set_attributes(attributes)
+    if span_config.capture_message_content:
+        _set_built_attributes(span, "content capture", lambda: build(span_config.content_filter))
 
 
 def _set_error_status(span: Span, error_type: str, description: str) -> None:
@@ -680,7 +602,7 @@ def _set_error_status(span: Span, error_type: str, description: str) -> None:
 
     An empty description sets a status without a description.
     """
-    _set_span_attribute(span, "error.type", error_type)
+    _set_span_attributes(span, {"error.type": error_type})
     with _guarding_telemetry_failures("setting the error status"):
         span.set_status(Status(StatusCode.ERROR, description or None))
 
@@ -714,20 +636,8 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
     match outcome.kind:
         case "handled":
             return "tool_error" if outcome.tool_message.is_error else None
-        case "invalid_tool_args":
-            return "invalid_tool_args"
-        case "unknown_tool":
-            return "unknown_tool"
-
-
-@contextmanager
-def _span_made_current(span: Span) -> Generator[None]:
-    """Make `span` the current span for the block."""
-    token = context.attach(trace.set_span_in_context(span))
-    try:
-        yield
-    finally:
-        context.detach(token)
+        case "invalid_tool_args" | "unknown_tool":
+            return outcome.kind
 
 
 class _SpanOperation:
@@ -738,9 +648,14 @@ class _SpanOperation:
         self._span = span
         self._span_config = span_config
 
-    def current(self) -> AbstractContextManager[None]:
+    @contextmanager
+    def current(self) -> Generator[None]:
         """Make the span current for the block."""
-        return _span_made_current(self._span)
+        token = context.attach(trace.set_span_in_context(self._span))
+        try:
+            yield
+        finally:
+            context.detach(token)
 
     def end(self) -> None:
         """End the span."""
@@ -776,18 +691,17 @@ class _DispatchSpan(_SpanOperation):
         if isinstance(outcome, Exception):
             _record_tool_exception(self._span, outcome)
             return
-        if self._span_config.capture_message_content:
-            content_filter = self._span_config.content_filter
-            _apply_content_attributes(
-                self._span,
-                lambda: {
-                    "gen_ai.tool.call.result": json.dumps(
-                        _tool_call_response_part(
-                            outcome.tool_message, content_filter, "gen_ai.tool.call.result"
-                        )
+        _apply_content_attributes(
+            self._span,
+            self._span_config,
+            lambda content_filter: {
+                "gen_ai.tool.call.result": json.dumps(
+                    _tool_call_response_part(
+                        outcome.tool_message, content_filter, "gen_ai.tool.call.result"
                     )
-                },
-            )
+                )
+            },
+        )
         error_type = _dispatch_error_type(outcome)
         if error_type is None:
             _set_ok_status(self._span)
@@ -882,15 +796,14 @@ class OtelObserver:
             f"{_CHAT_OPERATION} {start.model}", kind=SpanKind.CLIENT
         )
         _set_span_attributes(span, span_config.extra_attributes)
-        _set_span_attribute(span, "gen_ai.operation.name", _CHAT_OPERATION)
         _set_span_attributes(span, _request_attributes(start))
-        if span_config.capture_message_content:
-            _apply_content_attributes(
-                span,
-                lambda: _input_content_attributes(
-                    start.binding, start.messages, content_filter=span_config.content_filter
-                ),
-            )
+        _apply_content_attributes(
+            span,
+            span_config,
+            lambda content_filter: _input_content_attributes(
+                start.binding, start.messages, content_filter=content_filter
+            ),
+        )
         return _GenerationSpan(span, span_config)
 
     def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
@@ -928,10 +841,11 @@ class OtelObserver:
                 "gen_ai.tool.call.id": call.id,
             },
         )
-        if span_config.capture_message_content:
-            _apply_content_attributes(
-                span, lambda: _tool_call_arguments_attribute(call, span_config.content_filter)
-            )
+        _apply_content_attributes(
+            span,
+            span_config,
+            lambda content_filter: _tool_call_arguments_attribute(call, content_filter),
+        )
         return _DispatchSpan(span, span_config)
 
 

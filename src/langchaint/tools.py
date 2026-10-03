@@ -464,7 +464,7 @@ type ToolSequence = Sequence[Tool[BaseModel | Mapping[str, object] | None]]
 class DispatchObserver(Protocol):
     """Follows each tool dispatch of a `ToolManager`."""
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
         """Start following one dispatch of `call`.
 
         The returned handle receives the `DispatchOutcome`, or the exception the tool function raised.

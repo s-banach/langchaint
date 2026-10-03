@@ -1,11 +1,10 @@
 """Test tracing with fake adapters and an in-memory exporter.
 
-_SchemaValidatingSpanProcessor validates payload attributes against tests/semconv_genai.
+ValidatingSpanExporter validates attribute keys and payload attributes against tests/semconv_genai.
 The tests inspect recorded span names, kinds, statuses, attributes, events, and parents.
 Tests of the pure content renderers call them directly.
 """
 
-import functools
 import json
 import logging
 import pathlib
@@ -18,9 +17,8 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.semconv.attributes import error_attributes as error_semconv
 from opentelemetry.trace import NonRecordingSpan, SpanKind, StatusCode
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
     LLM,
@@ -81,84 +79,29 @@ from tests.fake_adapter import (
     billed,
     fast_shared_backoff,
 )
-from tests.helpers import run_with_timeout, time_out_when
+from tests.helpers import (
+    LANGCHAINT_KEYS,
+    SEMCONV_GENAI_DIR,
+    ValidatingSpanExporter,
+    payload_schema,
+    run_with_timeout,
+    time_out_when,
+)
 
-_SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
-
-_PAYLOAD_SCHEMA_FILES: Mapping[str, str] = refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES
-"""Map each structured payload attribute to its vendored schema."""
-
-_UNVALIDATED_PAYLOAD_ATTRIBUTES = frozenset({"gen_ai.tool.call.arguments"})
-"""Skip schema validation for malformed tool-call argument text.
-
-The schema accepts objects, while DispatchInvalidToolArgs preserves non-object text.
-_validate_payload_attributes still validates this attribute when it contains an object.
-"""
-
-
-@functools.cache
-def _payload_schema(file: str) -> Mapping[str, object]:
-    """Load and cache one vendored schema.
-
-    Raises:
-        OSError: the vendored file could not be read.
-        json.JSONDecodeError: the file does not hold JSON.
-        AssertionError: the file contains a non-object JSON value.
-    """
-    schema = json.loads((_SEMCONV_GENAI_DIR / file).read_text())
-    assert isinstance(schema, dict), f"{file} does not hold a JSON object"
-    return schema
-
-
-def _validate_payload_attributes(span: ReadableSpan) -> None:
-    """Validate one span's structured payload attributes.
-
-    Each payload is a JSON string.
-    _UNVALIDATED_PAYLOAD_ATTRIBUTES skips non-object tool arguments.
-    Exact-equality assertions test fields that the schemas leave optional.
-
-    Raises:
-        AssertionError: A payload does not conform, is not a JSON string, or does not parse.
-    """
-    for key, value in (span.attributes or {}).items():
-        file = _PAYLOAD_SCHEMA_FILES.get(key)
-        if file is None:
-            continue
-        assert isinstance(value, str), f"{span.name}: {key} is not a JSON string"
-        try:
-            payload = json.loads(value)
-        except json.JSONDecodeError as error:
-            raise AssertionError(f"{span.name}: {key} is not JSON: {error}") from error
-        if key in _UNVALIDATED_PAYLOAD_ATTRIBUTES and not isinstance(payload, dict):
-            continue
-        try:
-            jsonschema.Draft202012Validator(_payload_schema(file)).validate(payload)
-        except jsonschema.ValidationError as error:
-            raise AssertionError(
-                f"{span.name}: {key} violates {file}. "
-                f"Path {list(error.absolute_path)}: {error.message}"
-            ) from error
-
-
-class _SchemaValidatingSpanProcessor(SimpleSpanProcessor):
-    """Validate payload attributes before exporting each span."""
-
-    @override
-    def on_end(self, span: ReadableSpan) -> None:
-        """Validate and export the ending span.
-
-        Raises:
-            AssertionError: the span carries a payload that does not conform to its schema.
-        """
-        _validate_payload_attributes(span)
-        super().on_end(span)
+_APPLICATION_KEYS = frozenset({
+    "custom.agent",
+    "custom.mapped_output",
+    "custom.model",
+    "shared.key",
+})
+"""The keys this module's mappers and `extra_attributes` set as an application would."""
 
 
 def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
-    """Build a schema-validating in-memory tracer."""
-    exporter = InMemorySpanExporter()
+    """Build an in-memory tracer whose exporter validates the spans a test reads."""
+    exporter = ValidatingSpanExporter(application_keys=_APPLICATION_KEYS)
     tracer_provider = TracerProvider()
-    tracer_provider.add_span_processor(_SchemaValidatingSpanProcessor(exporter))
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     return tracer_provider.get_tracer("test"), exporter
 
 
@@ -352,7 +295,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
             "gen_ai.usage.output_tokens": USAGE.output_tokens,
             "gen_ai.usage.reasoning.output_tokens": USAGE.output_tokens_reasoning,
             "gen_ai.usage.cache_read.input_tokens": USAGE.input_tokens_cache_read,
-            "gen_ai.usage.cache_creation.input_tokens": USAGE.input_tokens_cache_write,
+            "gen_ai.usage.cache_write.input_tokens": USAGE.input_tokens_cache_write,
             "langchaint.attempts": 1,
             "langchaint.cost_in_usd": 0.0,
         }
@@ -586,7 +529,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description is None
         assert span.attributes is not None
-        assert span.attributes[error_semconv.ERROR_TYPE] == "timed_out_error"
+        assert span.attributes["error.type"] == "timed_out_error"
         assert "gen_ai.response.time_to_first_chunk" in span.attributes
 
     run_with_timeout(scenario())
@@ -912,6 +855,39 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
     run_with_timeout(scenario())
 
 
+@pytest.mark.parametrize("path", ["generate", "stream"])
+def test_span_parsing_reads_every_convention_attribute_a_chat_span_writes(path: _CallPath) -> None:
+    """`parse_otel` reads each key of a captured chat span into a field, except the langchaint keys.
+
+    The usage counters read back unchanged.
+    """
+
+    async def scenario() -> None:
+        """Run one fully configured call and parse its span's exported attributes."""
+        llm, exporter = _traced(FakeAdapter(echo=True), capture_message_content=True)
+        bound = llm.bind(
+            system_prompt="be brief",
+            tools=[_echo_tool()],
+            max_completion_tokens=123,
+            reasoning_level="high",
+            temperature=0.25,
+        )
+        _ = await _generate_through(path, bound)
+        (span,) = exporter.get_finished_spans()
+        exported = TypeAdapter(dict[str, JsonValue]).validate_json(
+            json.dumps(dict(span.attributes or {}))
+        )
+        parsed = parse_otel(exported)
+        assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
+        assert parsed.usage_input_tokens == USAGE.input_tokens_total
+        assert parsed.usage_output_tokens == USAGE.output_tokens
+        assert parsed.usage_reasoning_output_tokens == USAGE.output_tokens_reasoning
+        assert parsed.usage_cache_read_input_tokens == USAGE.input_tokens_cache_read
+        assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
+
+    run_with_timeout(scenario())
+
+
 def test_mapper_not_invoked_on_a_non_recording_span() -> None:
     """A custom attribute_mapper never fires when the tracer's spans are non-recording."""
 
@@ -995,7 +971,7 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
             FakeAdapter(echo=True),
             attribute_mapper=_mapper,
             extra_attributes={
-                "gen_ai.agent.name": "agent_a",
+                "custom.agent": "agent_a",
                 "shared.key": "extra",
                 "gen_ai.operation.name": "not-the-operation",
             },
@@ -1014,12 +990,12 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
             "gen_ai.output.type": "text",
             "gen_ai.provider.name": "fake",
             "gen_ai.request.model": "fake-model",
-            "gen_ai.agent.name": "agent_a",
+            "custom.agent": "agent_a",
             "custom.model": "fake-model",
             "shared.key": "mapped",
         }
         for span in spans:
-            assert _attribute(span, "gen_ai.agent.name") == "agent_a"
+            assert _attribute(span, "custom.agent") == "agent_a"
             assert _attribute(span, "custom.model") == "fake-model"
             assert _attribute(span, "shared.key") == "mapped"
             assert _attribute(span, "gen_ai.operation.name") == "chat"
@@ -1324,9 +1300,9 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
 
 def test_vendored_payload_schemas_match_the_schema_mapping() -> None:
     """Compare vendored schema filenames with the configured mapping."""
-    vendored = {path.name for path in _SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
+    vendored = {path.name for path in SEMCONV_GENAI_DIR.glob("gen-ai-*.json")}
     assert vendored, "no vendored schemas found, so this assertion would pass vacuously"
-    assert vendored == set(_PAYLOAD_SCHEMA_FILES.values())
+    assert vendored == set(refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES.values())
 
 
 def test_refresh_accepts_a_structured_attribute_name_array(tmp_path: pathlib.Path) -> None:
@@ -1356,8 +1332,8 @@ def _stage_refresh_directories(
     runtime = tmp_path / "runtime"
     for directory in (staged, destination, runtime):
         directory.mkdir()
-    _ = (staged / refresh_semconv_genai.GENERATED_ATTRIBUTES_FILE).write_text("{}")
-    _ = (destination / refresh_semconv_genai.GENERATED_ATTRIBUTES_FILE).write_text("{}")
+    _ = (staged / refresh_semconv_genai.CHAT_SPAN_ATTRIBUTES_FILE).write_text("{}")
+    _ = (destination / refresh_semconv_genai.CHAT_SPAN_ATTRIBUTES_FILE).write_text("{}")
     _ = (staged / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE).write_text("[]")
     _ = (runtime / refresh_semconv_genai.RUNTIME_STRUCTURED_ATTRIBUTES_FILE).write_text("[]")
     _ = (staged / "SOURCE.md").write_text("Resolved commit SHA: `new`.\n")
@@ -1511,7 +1487,7 @@ def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> N
         llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
         await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
         captured_parts = _captured_user_parts(exporter)
-        schema_definitions = _payload_schema("gen-ai-input-messages.json")["$defs"]
+        schema_definitions = payload_schema("gen-ai-input-messages.json")["$defs"]
         blob_parts = _parts_of_type(captured_parts, "blob")
         assert len(blob_parts) == 2
         blob_part_validator = jsonschema.Draft202012Validator({
@@ -1635,10 +1611,10 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         for span in exporter.get_finished_spans():
             assert span.attributes is not None
             for key, value in span.attributes.items():
-                if key in _PAYLOAD_SCHEMA_FILES:
+                if key in refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES:
                     recorded_content_keys.add(key)
                     assert _MARKER not in str(value), f"{span.name}: {key} leaks {_MARKER}"
-        assert recorded_content_keys == set(_PAYLOAD_SCHEMA_FILES)
+        assert recorded_content_keys == set(refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES)
 
     run_with_timeout(scenario())
 

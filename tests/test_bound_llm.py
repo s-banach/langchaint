@@ -27,7 +27,6 @@ from langchaint import (
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
-    GenerateResult,
     GenerationError,
     GenerationErrorKind,
     GenerationErrorRecord,
@@ -2596,12 +2595,12 @@ class _RecordingObserver:
 
     def generation_started(
         self, start: GenerationStart
-    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
         """Record the start and return an operation that records into the same list."""
         self.calls.append(f"generation_started {start.model}")
         return _RecordingOperation(self.calls)
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
         """Record the start and return an operation that records into the same list."""
         self.calls.append(f"dispatch_started {call.name}")
         return _RecordingOperation(self.calls)
@@ -2664,7 +2663,7 @@ class _RaisingObserver:
 
     def generation_started(
         self, start: GenerationStart
-    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
         """Start a raising operation for the call.
 
         Raises:
@@ -2672,7 +2671,7 @@ class _RaisingObserver:
         """
         return self._started(start.model)
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
         """Start a raising operation for the dispatch.
 
         Raises:

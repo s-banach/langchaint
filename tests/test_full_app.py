@@ -39,7 +39,7 @@ from langchaint import ZERO_USAGE, DispatchExceptionGroup, ToolCall, tool
 from langchaint.tracing import OtelObserver
 from tests.full_app_support.scenarios import build_scripts
 from tests.full_app_support.scripted_adapter import Turn, build_llm, call
-from tests.helpers import run_with_timeout
+from tests.helpers import ValidatingSpanExporter, run_with_timeout
 
 
 def _discard(event: Event) -> None:
@@ -170,7 +170,7 @@ def test_a_tools_progress_lands_in_the_on_event_of_the_run_that_dispatched_it() 
 
 def test_application_span_groups_generation_and_tool_spans() -> None:
     """Run the application under an OpenTelemetry span and inspect its children."""
-    exporter = InMemorySpanExporter()
+    exporter = ValidatingSpanExporter()
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = tracer_provider.get_tracer("full_app.test")

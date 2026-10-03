@@ -50,11 +50,6 @@ A mapper may set only attribute names and values.
 A mapper cannot change the span name, kind, or status.
 Telemetry failures, including mapper and content filter failures, are logged and never propagate.
 
-Attribute names except `gen_ai.request.reasoning.level` match opentelemetry-semantic-conventions 0.64b0.
-`gen_ai.request.reasoning.level` comes from the OpenTelemetry semantic-conventions-genai repository.
-`GenAiOperationNameValues.CHAT` and `.EXECUTE_TOOL` define the operation values.
-Tool identity uses `gen_ai.tool.name` and `gen_ai.tool.call.id`.
-Reasoning usage uses `gen_ai.usage.reasoning.output_tokens`.
 Readable reasoning uses `ReasoningPart` in content payloads.
 Content payloads follow the convention's JSON schemas.
 `gen_ai.tool.call.arguments` may carry a JSON value other than an object.
@@ -83,7 +78,6 @@ except ModuleNotFoundError as exc:
 
 from langchaint.adapter import Binding
 from langchaint.common.messages import (
-    AssistantMessage,
     ContentPart,
     Message,
     StopReason,
@@ -91,13 +85,12 @@ from langchaint.common.messages import (
     ToolCall,
     ToolMessage,
     TurnPart,
-    UserMessage,
 )
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.generation.call import AbandonedCallRecord
 from langchaint.generation.errors import GenerationError
 from langchaint.generation.observer import GenerationStart
-from langchaint.generation.response import CallResult, GenerateResult
+from langchaint.generation.response import CallResult
 from langchaint.tools import DispatchOutcome, ToolSchema
 
 type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
@@ -191,42 +184,12 @@ def _filtered_turn(
     return tuple(part for part in kept if part is not None)
 
 
-def _filtered_tool_message(
-    message: ToolMessage, content_filter: ContentFilter, attribute_name: str
-) -> ToolMessage:
-    """Copy the message with its content filtered; `tool_call_id` and `is_error` never reach the filter."""
-    return ToolMessage(
-        tool_call_id=message.tool_call_id,
-        content=_filtered_content(message.content, content_filter, attribute_name),
-        is_error=message.is_error,
-    )
-
-
-def _filtered_message(message: Message, content_filter: ContentFilter) -> Message:
-    """Copy one input message with its parts filtered under gen_ai.input.messages."""
-    attribute_name = "gen_ai.input.messages"
-    if message.kind == "user":
-        return UserMessage(
-            content=_filtered_content(message.content, content_filter, attribute_name)
-        )
-    if message.kind == "tool":
-        return _filtered_tool_message(message, content_filter, attribute_name)
-    return AssistantMessage(turn=_filtered_turn(message.turn, content_filter, attribute_name))
-
-
-def _filtered_messages(
-    messages: Sequence[Message], content_filter: ContentFilter
-) -> tuple[Message, ...]:
-    """Copy the input messages with every part filtered."""
-    return tuple(_filtered_message(message, content_filter) for message in messages)
-
-
 _PACKAGE_VERSION = importlib.metadata.version("langchaint")
 _CHAT_OPERATION = "chat"
-"""The GenAI operation value for a chat completion (GenAiOperationNameValues.CHAT)."""
+"""The GenAI operation value for a chat completion."""
 
 _EXECUTE_TOOL_OPERATION = "execute_tool"
-"""The GenAI operation value for a tool execution (GenAiOperationNameValues.EXECUTE_TOOL)."""
+"""The GenAI operation value for a tool execution."""
 
 _logger = logging.getLogger("langchaint.tracing")
 
@@ -335,7 +298,7 @@ def gen_ai_attributes[OutputT](
     The langchaint.* prefix is used only when the GenAI convention has no corresponding key.
     This applies to langchaint.attempts and langchaint.cost_in_usd.
     gen_ai.usage.input_tokens is Usage.input_tokens_total.
-    The cache-read and cache-creation attributes are parts of that total.
+    The cache-read and cache-write attributes are parts of that total.
     No cache_none counter is emitted because it is derived.
     gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
     gen_ai.response.model is the last attempt's model_served and is omitted when unavailable.
@@ -358,7 +321,7 @@ def gen_ai_attributes[OutputT](
         "gen_ai.usage.output_tokens": usage.output_tokens,
         "gen_ai.usage.reasoning.output_tokens": usage.output_tokens_reasoning,
         "gen_ai.usage.cache_read.input_tokens": usage.input_tokens_cache_read,
-        "gen_ai.usage.cache_creation.input_tokens": usage.input_tokens_cache_write,
+        "gen_ai.usage.cache_write.input_tokens": usage.input_tokens_cache_write,
         "langchaint.attempts": result.attempts,
         "langchaint.cost_in_usd": usage.cost_in_usd,
     }
@@ -381,36 +344,31 @@ def _blob_part(modality: str, media_type: str, data: bytes) -> dict[str, object]
     }
 
 
-def _content_parts(content: str | tuple[ContentPart, ...]) -> list[dict[str, object]]:
-    """Render a MessageContent as the convention's parts array.
+def _content_part(part: ContentPart) -> dict[str, object]:
+    """Render one ContentPart as the convention's part object.
 
-    A str becomes one text part.
     ImagePart and AudioPart become BlobPart objects carrying their bytes.
     ImageUrlPart becomes an image uri part with its optional media_type as mime_type.
-    gen_ai.system_instructions uses the same rendering because its items share the text part shape.
     `cache_breakpoint` is omitted because the convention has no corresponding field.
     """
-    if isinstance(content, str):
-        return [{"type": "text", "content": content}]
-    parts: list[dict[str, object]] = []
-    for part in content:
-        match part.kind:
-            case "text":
-                parts.append({"type": "text", "content": part.text})
-            case "image":
-                parts.append(_blob_part("image", part.media_type, part.data))
-            case "image_url":
-                image_uri: dict[str, object] = {
-                    "type": "uri",
-                    "modality": "image",
-                    "uri": part.url,
-                }
-                if part.media_type is not None:
-                    image_uri["mime_type"] = part.media_type
-                parts.append(image_uri)
-            case "audio":
-                parts.append(_blob_part("audio", part.media_type, part.data))
-    return parts
+    match part.kind:
+        case "text":
+            return {"type": "text", "content": part.text}
+        case "image":
+            return _blob_part("image", part.media_type, part.data)
+        case "image_url":
+            mime_type = {} if part.media_type is None else {"mime_type": part.media_type}
+            return {"type": "uri", "modality": "image", "uri": part.url, **mime_type}
+        case "audio":
+            return _blob_part("audio", part.media_type, part.data)
+
+
+def _content_parts(content: tuple[ContentPart, ...]) -> list[dict[str, object]]:
+    """Render content parts as the convention's parts array.
+
+    gen_ai.system_instructions uses the same rendering because its items share the text part shape.
+    """
+    return [_content_part(part) for part in content]
 
 
 def _finite_float(number_text: str) -> float:
@@ -465,59 +423,74 @@ def _tool_call_arguments(args_json: str) -> object:
     return parsed
 
 
+def _turn_part(part: TurnPart) -> dict[str, object] | None:
+    """Render one TurnPart as the convention's part object, or None when it records nothing.
+
+    ReasoningPart and TextPart emit their text, and render as None when it is empty.
+    ReasoningPart.raw is opaque and is never emitted.
+    A RawPart renders as None because it has no text.
+    """
+    match part.kind:
+        case "reasoning_part":
+            return {"type": "reasoning", "content": part.text} if part.text else None
+        case "text":
+            return {"type": "text", "content": part.text} if part.text else None
+        case "tool_call":
+            return {
+                "type": "tool_call",
+                "id": part.id,
+                "name": part.name,
+                "arguments": _tool_call_arguments(part.args_json),
+            }
+        case "raw_part":
+            return None
+
+
 def _turn_parts(turn: tuple[TurnPart, ...]) -> list[dict[str, object]]:
     """Render an assistant turn as the convention's parts array, in emission order.
 
-    ReasoningPart and TextPart emit their text.
-    Text-free parts emit nothing.
-    ReasoningPart.raw is opaque and is never emitted.
-    A RawPart renders as nothing because it has no text.
-    A turn holding only text-free parts therefore renders as an empty parts array, not as a missing message.
+    A turn whose every part renders as None renders as an empty parts array, not as a missing message.
     """
-    parts: list[dict[str, object]] = []
-    for part in turn:
-        match part.kind:
-            case "reasoning_part":
-                if part.text:
-                    parts.append({"type": "reasoning", "content": part.text})
-            case "text":
-                if part.text:
-                    parts.append({"type": "text", "content": part.text})
-            case "tool_call":
-                parts.append({
-                    "type": "tool_call",
-                    "id": part.id,
-                    "name": part.name,
-                    "arguments": _tool_call_arguments(part.args_json),
-                })
-            case "raw_part":
-                pass
-    return parts
+    rendered = (_turn_part(part) for part in turn)
+    return [part for part in rendered if part is not None]
 
 
-def _message(message: Message) -> dict[str, object]:
-    """Render one Message as the convention's {role, parts} shape.
+def _input_message(message: Message, content_filter: ContentFilter) -> dict[str, object]:
+    """Render one input Message as the convention's {role, parts} shape, with every part filtered.
 
     A `ToolMessage` becomes a tool_call_response part inside a tool-role message.
     """
-    if message.kind == "user":
-        return {"role": "user", "parts": _content_parts(message.content)}
-    if message.kind == "tool":
-        return {"role": "tool", "parts": [_tool_call_response_part(message)]}
-    return {"role": "assistant", "parts": _turn_parts(message.turn)}
+    attribute_name = "gen_ai.input.messages"
+    match message.kind:
+        case "user":
+            parts = _content_parts(
+                _filtered_content(message.content, content_filter, attribute_name)
+            )
+            return {"role": "user", "parts": parts}
+        case "tool":
+            parts = [_tool_call_response_part(message, content_filter, attribute_name)]
+            return {"role": "tool", "parts": parts}
+        case "assistant":
+            parts = _turn_parts(_filtered_turn(message.turn, content_filter, attribute_name))
+            return {"role": "assistant", "parts": parts}
 
 
-def _tool_call_response_part(message: ToolMessage) -> dict[str, object]:
-    """Render one ToolMessage as the convention's tool_call_response part.
+def _tool_call_response_part(
+    message: ToolMessage, content_filter: ContentFilter, attribute_name: str
+) -> dict[str, object]:
+    """Render one ToolMessage as the convention's tool_call_response part, with its content filtered.
 
     One tool result reaches a backend under this one shape from both spans that report it:
     inside gen_ai.input.messages on a generate span, and as gen_ai.tool.call.result on a tool span.
+    `tool_call_id` and `is_error` never reach the filter.
     """
     return {
         "type": "tool_call_response",
         "id": message.tool_call_id,
         "is_error": message.is_error,
-        "response": _content_parts(message.content),
+        "response": _content_parts(
+            _filtered_content(message.content, content_filter, attribute_name)
+        ),
     }
 
 
@@ -559,9 +532,7 @@ def _input_content_attributes(
             attributes["gen_ai.system_instructions"] = json.dumps(system_instructions)
     if binding.tool_schemas:
         attributes["gen_ai.tool.definitions"] = json.dumps(_tool_definitions(binding.tool_schemas))
-    input_messages = [
-        _message(message) for message in _filtered_messages(messages, content_filter)
-    ]
+    input_messages = [_input_message(message, content_filter) for message in messages]
     if input_messages:
         attributes["gen_ai.input.messages"] = json.dumps(input_messages)
     return attributes
@@ -658,8 +629,6 @@ def _apply_result_attributes[OutputT](
 ) -> None:
     """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
 
-    Success, `GenerationError`, and `AbandonedCallRecord` values carry the shared `CallResult` fields.
-    Other exceptions do not carry those fields.
     A non-recording span skips the mapper because an `AttributeMapper` may be expensive.
     A mapper exception is caught and logged at warning level.
     `langchaint.attempt_failed` events are added before the mapper runs.
@@ -706,29 +675,24 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
         span.set_attributes(attributes)
 
 
-def _set_generation_error_status(span: Span, error: GenerationError) -> None:
-    """Set error.type and error status from a terminal GenerationError."""
-    _set_span_attribute(span, "error.type", error.kind)
+def _set_error_status(span: Span, error_type: str, description: str) -> None:
+    """Set error.type and error status, without letting the calls reach the caller.
+
+    An empty description sets a status without a description.
+    """
+    _set_span_attribute(span, "error.type", error_type)
     with _guarding_telemetry_failures("setting the error status"):
-        status = (
-            Status(StatusCode.ERROR, error.error_text)
-            if error.error_text
-            else Status(StatusCode.ERROR)
-        )
-        span.set_status(status)
+        span.set_status(Status(StatusCode.ERROR, description or None))
 
 
-def _record_other_exception(span: Span, exc: Exception) -> None:
-    """Record the exception as a span event, set error.type from its class, and set error status.
+def _record_tool_exception(span: Span, exc: Exception) -> None:
+    """Record the tool function's exception as a span event, set error.type from its class, and set error status.
 
     error.type uses the exception class name for low-cardinality grouping.
-    Sets no shared-field attributes: this records the exception itself, not a call's result.
     """
     with _guarding_telemetry_failures("recording the exception"):
         span.record_exception(exc)
-    _set_span_attribute(span, "error.type", type(exc).__name__)
-    with _guarding_telemetry_failures("setting the error status"):
-        span.set_status(Status(StatusCode.ERROR, str(exc)))
+    _set_error_status(span, type(exc).__name__, str(exc))
 
 
 def _tool_call_arguments_attribute(
@@ -745,7 +709,7 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
     """Classify a dispatch outcome for error.type, or None where the call succeeded.
 
     error.type values "invalid_tool_args" and "unknown_tool" mean the tool function never ran.
-    A raising tool function is classified by _record_other_exception with its exception class name instead.
+    A raising tool function is classified by _record_tool_exception with its exception class name instead.
     """
     match outcome.kind:
         case "handled":
@@ -786,27 +750,18 @@ class _SpanOperation:
 class _GenerationSpan(_SpanOperation):
     """The CLIENT chat span of one generation call."""
 
-    def conclude(self, outcome: GenerateResult[object] | AbandonedCallRecord | Exception) -> None:
-        """Attribute the span from the call's result, `abandoned` record, `GenerationError`, or other exception.
+    def conclude(self, outcome: CallResult[object] | AbandonedCallRecord) -> None:
+        """Set the span's result attributes, output content, and status from the call's outcome.
 
-        Each value except another exception carries the call result attributes and the output content.
+        A success sets OK status, and a `GenerationError` sets error status and error.type.
         An `AbandonedCallRecord` leaves the status unset, because the application's code ended the stream.
-        Another exception is recorded as a span event.
         """
+        _apply_result_attributes(self._span, outcome, self._span_config.attribute_mapper)
+        _apply_output_content(self._span, outcome, self._span_config)
         if isinstance(outcome, GenerationError):
-            self._record_call_result(outcome)
-            _set_generation_error_status(self._span, outcome)
-        elif isinstance(outcome, Exception):
-            _record_other_exception(self._span, outcome)
-        elif isinstance(outcome, AbandonedCallRecord):
-            self._record_call_result(outcome)
-        else:
-            self._record_call_result(outcome)
+            _set_error_status(self._span, outcome.kind, outcome.error_text)
+        elif outcome.kind != "abandoned_call":
             _set_ok_status(self._span)
-
-    def _record_call_result(self, result: CallResult[object] | AbandonedCallRecord) -> None:
-        _apply_result_attributes(self._span, result, self._span_config.attribute_mapper)
-        _apply_output_content(self._span, result, self._span_config)
 
 
 class _DispatchSpan(_SpanOperation):
@@ -819,11 +774,8 @@ class _DispatchSpan(_SpanOperation):
         With capture on, `gen_ai.tool.call.result` records the outcome's `ToolMessage`.
         """
         if isinstance(outcome, Exception):
-            _record_other_exception(self._span, outcome)
+            _record_tool_exception(self._span, outcome)
             return
-        error_type = _dispatch_error_type(outcome)
-        if error_type is not None:
-            _set_span_attribute(self._span, "error.type", error_type)
         if self._span_config.capture_message_content:
             content_filter = self._span_config.content_filter
             _apply_content_attributes(
@@ -831,18 +783,16 @@ class _DispatchSpan(_SpanOperation):
                 lambda: {
                     "gen_ai.tool.call.result": json.dumps(
                         _tool_call_response_part(
-                            _filtered_tool_message(
-                                outcome.tool_message, content_filter, "gen_ai.tool.call.result"
-                            )
+                            outcome.tool_message, content_filter, "gen_ai.tool.call.result"
                         )
                     )
                 },
             )
+        error_type = _dispatch_error_type(outcome)
         if error_type is None:
             _set_ok_status(self._span)
         else:
-            with _guarding_telemetry_failures("setting the error status"):
-                self._span.set_status(Status(StatusCode.ERROR, error_type))
+            _set_error_status(self._span, error_type, error_type)
 
 
 class OtelObserver:
@@ -920,7 +870,7 @@ class OtelObserver:
 
     def generation_started(
         self, start: GenerationStart
-    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
         """Open the CLIENT chat span and set its start attributes.
 
         The span is named "chat {start.model}".
@@ -943,7 +893,7 @@ class OtelObserver:
             )
         return _GenerationSpan(span, span_config)
 
-    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome | Exception]:
         """Open the INTERNAL execute_tool span and set its identity attributes.
 
         The span name is "execute_tool {call.name}".

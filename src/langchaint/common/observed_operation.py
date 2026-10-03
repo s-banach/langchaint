@@ -27,8 +27,8 @@ class ObservedOperation[OutcomeT](Protocol):
         """
         ...
 
-    def conclude(self, outcome: OutcomeT | Exception) -> None:
-        """Receive the operation's result, or the exception that ended it."""
+    def conclude(self, outcome: OutcomeT) -> None:
+        """Receive the operation's outcome."""
         ...
 
     def end(self) -> None:
@@ -97,7 +97,7 @@ class _GuardedOperation[OutcomeT]:
         """Enter the delegate's context, logging its failures."""
         return _guarded_context(self._operation.current)
 
-    def conclude(self, outcome: OutcomeT | Exception) -> None:
+    def conclude(self, outcome: OutcomeT) -> None:
         """Pass the outcome to the delegate, logging its failure."""
         with _logging_failures("concluding the operation"):
             self._operation.conclude(outcome)

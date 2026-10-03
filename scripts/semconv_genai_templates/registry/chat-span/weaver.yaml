@@ -1,5 +1,5 @@
 templates:
-  - template: chat-span-attributes.json.j2
+  - template: json.j2
     filter: >-
       def normalized_attribute($condition): {
         name: .key,
@@ -75,7 +75,17 @@ templates:
       }
     application_mode: single
     file_name: chat-span-attributes.json
-  - template: structured-attributes.json.j2
+  - template: json.j2
+    filter: >-
+      [
+        .registry.spans[]
+        | select(.type == "gen_ai.execute_tool.internal")
+        | .attributes[].key
+      ]
+      | sort
+    application_mode: single
+    file_name: execute-tool-span-attribute-names.json
+  - template: json.j2
     filter: >-
       .registry.attributes
       | map(

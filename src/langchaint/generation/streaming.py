@@ -49,7 +49,6 @@ from langchaint.generation.errors import (
 )
 from langchaint.generation.response import (
     CallResult,
-    GenerateResult,
     Response,
     ToolCallTurn,
     _call_result_from_response_outcome,
@@ -103,7 +102,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         timeout_seconds: float | None,
         splits_tool_call_turns: bool,
         generation_started: Callable[
-            [], ObservedOperation[GenerateResult[object] | AbandonedCallRecord]
+            [], ObservedOperation[CallResult[object] | AbandonedCallRecord]
         ],
     ) -> None:
         """Store the request.
@@ -111,9 +110,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         `generation_started` starts following the call when the handle is entered.
         """
         self._generation_started = generation_started
-        self._operation: ObservedOperation[GenerateResult[object] | AbandonedCallRecord] | None = (
-            None
-        )
+        self._operation: ObservedOperation[CallResult[object] | AbandonedCallRecord] | None = None
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages

@@ -5,14 +5,21 @@ Fake adapters and streams that a second module needs land in tests/fake_adapter.
 """
 
 import asyncio
+import functools
 import importlib
+import json
+import pathlib
 import pkgutil
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from types import ModuleType
+from typing import override
 
 import httpx2
+import jsonschema
 import openai
-from pydantic import BaseModel
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import BaseModel, TypeAdapter
 
 import langchaint
 from langchaint import (
@@ -34,6 +41,7 @@ from langchaint.concurrency.shared_backoff import (
     RetryThisOne,
     Verdict,
 )
+from scripts import refresh_semconv_genai
 
 
 class StubRaw(BaseModel):
@@ -284,3 +292,164 @@ def openai_sdk_errors_and_verdicts() -> Mapping[Exception, Verdict]:
         ),
         TransientError("failed body"): RetryThisOne(retry_after=None),
     }
+
+
+SEMCONV_GENAI_DIR = pathlib.Path(__file__).parent / "semconv_genai"
+"""The vendored GenAI semantic-convention data that `scripts/refresh_semconv_genai.py` writes."""
+
+_UNVALIDATED_PAYLOAD_ATTRIBUTES = frozenset({"gen_ai.tool.call.arguments"})
+"""Skip schema validation for malformed tool-call argument text.
+
+The schema accepts objects, while DispatchInvalidToolArgs preserves non-object text.
+_validate_payload_attributes still validates this attribute when it contains an object.
+"""
+
+
+@functools.cache
+def payload_schema(file: str) -> Mapping[str, object]:
+    """Load and cache one vendored schema.
+
+    Raises:
+        OSError: the vendored file could not be read.
+        json.JSONDecodeError: the file does not hold JSON.
+        AssertionError: the file contains a non-object JSON value.
+    """
+    schema = json.loads((SEMCONV_GENAI_DIR / file).read_text())
+    assert isinstance(schema, dict), f"{file} does not hold a JSON object"
+    return schema
+
+
+def _validate_payload_attributes(span: ReadableSpan) -> None:
+    """Validate one span's structured payload attributes.
+
+    Each payload is a JSON string.
+    _UNVALIDATED_PAYLOAD_ATTRIBUTES skips non-object tool arguments.
+    Exact-equality assertions test fields that the schemas leave optional.
+
+    Raises:
+        AssertionError: A payload does not conform, is not a JSON string, or does not parse.
+    """
+    for key, value in (span.attributes or {}).items():
+        file = refresh_semconv_genai.ATTRIBUTE_SCHEMA_FILES.get(key)
+        if file is None:
+            continue
+        assert isinstance(value, str), f"{span.name}: {key} is not a JSON string"
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise AssertionError(f"{span.name}: {key} is not JSON: {error}") from error
+        if key in _UNVALIDATED_PAYLOAD_ATTRIBUTES and not isinstance(payload, dict):
+            continue
+        try:
+            jsonschema.Draft202012Validator(payload_schema(file)).validate(payload)
+        except jsonschema.ValidationError as error:
+            raise AssertionError(
+                f"{span.name}: {key} violates {file}. "
+                f"Path {list(error.absolute_path)}: {error.message}"
+            ) from error
+
+
+class _DeclaredAttribute(BaseModel):
+    """One attribute entry of the vendored chat span declaration."""
+
+    name: str
+    allowed_values: tuple[str, ...] | None
+
+
+class _ChatSpanDeclaration(BaseModel):
+    """The vendored chat span declaration's attributes, without its provider refinements."""
+
+    attributes: tuple[_DeclaredAttribute, ...]
+
+
+LANGCHAINT_KEYS = frozenset({"langchaint.attempts", "langchaint.cost_in_usd"})
+"""The keys langchaint writes on a chat span for values the convention has no attribute for."""
+
+
+@functools.cache
+def _chat_span_declaration() -> _ChatSpanDeclaration:
+    """Read the vendored chat span declaration.
+
+    Raises:
+        pydantic.ValidationError: the file does not hold the declaration's shape.
+    """
+    return _ChatSpanDeclaration.model_validate_json(
+        (SEMCONV_GENAI_DIR / refresh_semconv_genai.CHAT_SPAN_ATTRIBUTES_FILE).read_text()
+    )
+
+
+@functools.cache
+def _declared_keys_by_operation() -> Mapping[str, frozenset[str]]:
+    """Map each traced gen_ai.operation.name value to the keys its spans may carry, apart from application keys.
+
+    Chat spans may carry the vendored chat span attribute names and the langchaint keys.
+    Tool spans may carry the vendored execute_tool span attribute names.
+
+    Raises:
+        pydantic.ValidationError: a vendored file does not hold its expected shape.
+        AssertionError: a traced operation value is not a vendored gen_ai.operation.name value.
+    """
+    chat_names = frozenset(attribute.name for attribute in _chat_span_declaration().attributes)
+    execute_tool_names = TypeAdapter(frozenset[str]).validate_json(
+        (
+            SEMCONV_GENAI_DIR / refresh_semconv_genai.EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE
+        ).read_text()
+    )
+    declared = {"chat": chat_names | LANGCHAINT_KEYS, "execute_tool": execute_tool_names}
+    (operation_attribute,) = (
+        attribute
+        for attribute in _chat_span_declaration().attributes
+        if attribute.name == "gen_ai.operation.name"
+    )
+    assert operation_attribute.allowed_values is not None
+    assert declared.keys() <= set(operation_attribute.allowed_values)
+    return declared
+
+
+def _validate_attribute_keys(span: ReadableSpan, application_keys: frozenset[str]) -> None:
+    """Check one span's operation value and keys against the vendored convention.
+
+    A span may also carry any of `application_keys`.
+    A span without gen_ai.operation.name is one a test started itself, so it is not checked.
+    OTel 1.45.0 allows the operation value to be a string, bool, int, float, bytes, sequence, or mapping.
+
+    Raises:
+        AssertionError: the operation value is not a string that langchaint traces.
+        AssertionError: the span carries a key that its operation's span does not declare.
+    """
+    attributes = span.attributes or {}
+    declared_keys_by_operation = _declared_keys_by_operation()
+    match attributes.get("gen_ai.operation.name"):
+        case None:
+            return
+        case str() as operation if operation in declared_keys_by_operation:
+            declared_keys = declared_keys_by_operation[operation]
+        case operation:
+            raise AssertionError(f"{span.name}: langchaint does not trace operation {operation!r}")
+    undeclared = set(attributes) - declared_keys - application_keys
+    assert not undeclared, f"{span.name}: undeclared keys {sorted(undeclared)}"
+
+
+class ValidatingSpanExporter(InMemorySpanExporter):
+    """An in-memory exporter that validates attribute keys and payload attributes of the spans a test reads.
+
+    An exception raised while a span ends never reaches the test, because `_GuardedOperation.end` logs it.
+    """
+
+    def __init__(self, *, application_keys: frozenset[str] = frozenset()) -> None:
+        """Accept `application_keys` on every span, as the keys a test's mapper or `extra_attributes` sets."""
+        super().__init__()
+        self._application_keys = application_keys
+
+    @override
+    def get_finished_spans(self) -> tuple[ReadableSpan, ...]:
+        """Validate and return the finished spans.
+
+        Raises:
+            AssertionError: a span carries an undeclared key or a payload that does not conform to its schema.
+        """
+        spans = super().get_finished_spans()
+        for span in spans:
+            _validate_attribute_keys(span, self._application_keys)
+            _validate_payload_attributes(span)
+        return spans

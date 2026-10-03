@@ -21,7 +21,8 @@ DESTINATION = ROOT / "tests" / "semconv_genai"
 RUNTIME_DESTINATION = ROOT / "src" / "langchaint"
 SOURCE_DOC = DESTINATION / "SOURCE.md"
 TEMPLATES = ROOT / "scripts" / "semconv_genai_templates"
-GENERATED_ATTRIBUTES_FILE = "chat-span-attributes.json"
+CHAT_SPAN_ATTRIBUTES_FILE = "chat-span-attributes.json"
+EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE = "execute-tool-span-attribute-names.json"
 RUNTIME_STRUCTURED_ATTRIBUTES_FILE = "_semconv_genai_structured_attributes.json"
 WEAVER_TARGET = "chat-span"
 OBSOLETE_FILES = {"provider-name-values.json"}
@@ -153,7 +154,8 @@ License: Apache-2.0.
 The resolved commit SHA is the upstream commit resolved by the last refresh that changed the committed data.
 A refresh that produces identical data leaves this file unchanged.
 
-`{GENERATED_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+`{CHAT_SPAN_ATTRIBUTES_FILE}` is generated from the resolved `gen_ai.inference.client` span and its provider refinements in `model/gen-ai/spans.yaml` and `model/gen-ai/registry.yaml`.
+`{EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE}` lists the attribute names of the resolved `gen_ai.execute_tool.internal` span.
 `src/langchaint/{RUNTIME_STRUCTURED_ATTRIBUTES_FILE}` is generated from attributes that declare `annotations.type.json_schema` in the resolved registry.
 Weaver also resolves the core registry dependency declared by `model/manifest.yaml`.
 
@@ -186,15 +188,16 @@ def _generate_staged_files(
         str(SOURCE_MODEL_DIRECTORY),
         "--v2",
     ])
-    generated_attributes = generated_directory / GENERATED_ATTRIBUTES_FILE
-    _validate_json_file(generated_attributes)
-    _ = shutil.copyfile(generated_attributes, staged_directory / GENERATED_ATTRIBUTES_FILE)
-    generated_structured_attributes = generated_directory / RUNTIME_STRUCTURED_ATTRIBUTES_FILE
-    _validate_json_file(generated_structured_attributes, expected_shape="string_array")
-    _ = shutil.copyfile(
-        generated_structured_attributes,
-        staged_directory / RUNTIME_STRUCTURED_ATTRIBUTES_FILE,
-    )
+    generated_shapes: dict[str, Literal["object", "string_array"]] = {
+        CHAT_SPAN_ATTRIBUTES_FILE: "object",
+        EXECUTE_TOOL_SPAN_ATTRIBUTE_NAMES_FILE: "string_array",
+        RUNTIME_STRUCTURED_ATTRIBUTES_FILE: "string_array",
+    }
+    for generated_file, expected_shape in generated_shapes.items():
+        _validate_json_file(generated_directory / generated_file, expected_shape=expected_shape)
+        _ = shutil.copyfile(
+            generated_directory / generated_file, staged_directory / generated_file
+        )
     for schema_file in sorted(ATTRIBUTE_SCHEMA_FILES.values()):
         source_path = SOURCE_MODEL_DIRECTORY / "gen-ai" / schema_file
         _validate_json_file(source_path)

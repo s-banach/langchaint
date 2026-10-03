@@ -13,7 +13,7 @@ from langchaint.adapter import Binding
 from langchaint.common.messages import Message
 from langchaint.common.observed_operation import ObservedOperation
 from langchaint.generation.call import AbandonedCallRecord
-from langchaint.generation.response import GenerateResult
+from langchaint.generation.response import CallResult
 from langchaint.tools import DispatchObserver
 
 
@@ -38,7 +38,7 @@ class Observer(DispatchObserver, Protocol):
 
     def generation_started(
         self, start: GenerationStart
-    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
         """Start following one generation call.
 
         `generate_one` and each generated `generate_many` or `generate_many_records` item start one call.

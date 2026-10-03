@@ -1036,7 +1036,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     def _generation_started(
         self, messages: Sequence[Message], *, stream: bool
-    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
         """Start following one call with the observer, or return a handle that records nothing.
 
         The returned handle logs the observer's failures, so none reaches the caller.

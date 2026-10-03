@@ -11,7 +11,7 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Literal, Protocol, Self, TypeIs, override
 
 import jsonschema.exceptions
@@ -20,6 +20,11 @@ import jsonschema.validators
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint.common.messages import MessageContent, ToolCall, ToolMessage
+from langchaint.common.observed_operation import (
+    UNOBSERVED_OPERATION,
+    ObservedOperation,
+    start_observed_operation,
+)
 from langchaint.common.sequence_not_str import SequenceNotStr
 
 
@@ -456,6 +461,19 @@ class Tool[AppDataT](Protocol):
 type ToolSequence = Sequence[Tool[BaseModel | Mapping[str, object] | None]]
 
 
+class DispatchObserver(Protocol):
+    """Follows each tool dispatch of a `ToolManager`."""
+
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+        """Start following one dispatch of `call`.
+
+        The returned handle receives the `DispatchOutcome`, or the exception the tool function raised.
+        langchaint logs an exception this method raises and dispatches the call unobserved.
+        `dispatch` enters `current()` around the tool function, so work the function starts nests under the dispatch.
+        """
+        ...
+
+
 def render_invalid_tool_args(tool_name: str, details: Sequence[InvalidToolArgsDetail]) -> str:
     """Build the model-facing content for an argument-validation failure.
 
@@ -555,11 +573,15 @@ def _handled_outcome[AppDataT](
 class ToolManager:
     """Index tools by name and route calls to them."""
 
-    def __init__(self, tools: ToolSequence) -> None:
+    def __init__(self, tools: ToolSequence, *, observer: DispatchObserver | None = None) -> None:
         """Index the tools by name.
+
+        `LLM.bind` passes the backend's observer to a `ToolManager` it builds from a tool sequence.
+        A `ToolManager` the application builds receives only the `observer` passed here.
 
         Args:
             tools: The tools to index.
+            observer: The observer that follows each dispatch, or `None` to follow none.
 
         Raises:
             ValueError: Two tools share a name.
@@ -569,6 +591,7 @@ class ToolManager:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name}")
             self._tools[tool.name] = tool
+        self._observer = observer
 
     def schemas(self) -> tuple[ToolSchema, ...]:
         """Convert every indexed tool to its provider-neutral schema."""
@@ -577,8 +600,34 @@ class ToolManager:
     async def dispatch(self, call: ToolCall) -> DispatchOutcome:
         """Dispatch `call` or return `DispatchUnknownTool`.
 
+        The observer follows the dispatch and is current while the tool function runs.
+        An observer failure is logged and never reaches the caller.
+
         Args:
             call: The tool call to dispatch.
+
+        Raises:
+            BaseException: The matched tool raises it.
+        """
+        operation = (
+            UNOBSERVED_OPERATION
+            if self._observer is None
+            else start_observed_operation(partial(self._observer.dispatch_started, call))
+        )
+        try:
+            with operation.current():
+                outcome = await self._dispatch_unobserved(call)
+        except Exception as exc:
+            operation.conclude(exc)
+            raise
+        else:
+            operation.conclude(outcome)
+            return outcome
+        finally:
+            operation.end()
+
+    async def _dispatch_unobserved(self, call: ToolCall) -> DispatchOutcome:
+        """Run the matched tool, or return `DispatchUnknownTool`.
 
         Raises:
             BaseException: The matched tool raises it.

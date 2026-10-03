@@ -14,6 +14,7 @@ from langchaint.generation.call import (
     TransientErrorRecord,
     _CallLedger,
     _CallResultRecordBase,
+    _require_abandoned_shape,
     _require_completed_model_turn,
     _settled_attempts,
 )
@@ -29,21 +30,6 @@ class _GenerationErrorRecordBase(_CallResultRecordBase):
 
     Validation rejects unknown fields.
     """
-
-    @property
-    def attempt_records(
-        self,
-    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
-        """Return the call's normalized attempt records."""
-        return self.call.attempt_records
-
-    @property
-    def assistant_message(self) -> AssistantMessage | None:
-        """Return the last recorded assistant message."""
-        for attempt in reversed(self.call.attempt_records):
-            if attempt.kind == "settled" and attempt.assistant_message is not None:
-                return attempt.assistant_message
-        return None
 
     stop_reason: ClassVar[StopReason | None] = None
 
@@ -112,22 +98,6 @@ def _require_terminal_provider_result(call: CallRecord, *, permit_empty: bool) -
         raise ValueError("the final attempt must be error-free")
     if final.assistant_message is not None:
         raise ValueError("the final provider result must not contain an assistant message")
-
-
-def _require_abandoned_shape(call: CallRecord) -> None:
-    settled = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
-    final_is_cut_off = bool(call.attempt_records) and call.attempt_records[-1].kind == "cut_off"
-    if final_is_cut_off:
-        settled_prefix = settled
-    elif settled and settled[-1].error is None:
-        final = settled[-1]
-        if final.assistant_message is not None:
-            raise ValueError("the final settled request must be a terminal provider result")
-        settled_prefix = settled[:-1]
-    else:
-        settled_prefix = settled
-    if any(attempt.error is None for attempt in settled_prefix):
-        raise ValueError("settled attempts before the terminal request must contain errors")
 
 
 class RetriesExhaustedErrorRecord(_GenerationErrorRecordBase):
@@ -307,21 +277,6 @@ class EscapedExceptionErrorRecord(_GenerationErrorRecordBase):
     kind: Literal["escaped_exception_error"] = "escaped_exception_error"
 
 
-class AbandonedCallErrorRecord(_GenerationErrorRecordBase):
-    """A call ended before its result reached the caller.
-
-    Validation rejects unknown fields.
-    """
-
-    error_text: str = ""
-    kind: Literal["abandoned_call_error"] = "abandoned_call_error"
-
-    @model_validator(mode="after")
-    def _validate_abandoned_shape(self) -> Self:
-        _require_abandoned_shape(self.call)
-        return self
-
-
 class TimedOutErrorRecord(_GenerationErrorRecordBase):
     """A langchaint deadline expired before the call returned.
 
@@ -352,7 +307,6 @@ type GenerationErrorKind = Literal[
     "provider_declared_final_error",
     "unknown_exception_error",
     "escaped_exception_error",
-    "abandoned_call_error",
     "timed_out_error",
 ]
 
@@ -372,7 +326,6 @@ type GenerationErrorRecord = Annotated[
     | ProviderDeclaredFinalErrorRecord
     | UnknownExceptionErrorRecord
     | EscapedExceptionErrorRecord
-    | AbandonedCallErrorRecord
     | TimedOutErrorRecord,
     Field(discriminator="kind"),
 ]
@@ -392,7 +345,6 @@ _GENERATION_ERROR_RECORD_CLASSES = (
     ProviderDeclaredFinalErrorRecord,
     UnknownExceptionErrorRecord,
     EscapedExceptionErrorRecord,
-    AbandonedCallErrorRecord,
     TimedOutErrorRecord,
 )
 

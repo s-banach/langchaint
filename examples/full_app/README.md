@@ -31,7 +31,7 @@ For example, the first specialist uses `root/research_climate/specialist#0`.
 ## Required configuration
 
 `AgentConfig.automatic_cache_breakpoints` has no default and passes unchanged to each binding.
-`App.capture_message_content` has no default and passes unchanged to each tracing wrapper.
+`OtelObserver(capture_message_content=...)` has no default, so `run_live_task_stream.py` states it when it constructs `OpenAI`.
 
 `AgentConfig.generate_one_timeout_seconds` becomes `generate_one(timeout_seconds=...)`.
 That deadline includes admission, retries, and provider work.
@@ -97,7 +97,7 @@ Other sub-agent failures become parent-readable tool errors, so the parent can f
 
 ## Tracing
 
-`TracedLLM` and `TracedToolManager` create generation and tool spans.
+The `OtelObserver` passed to `OpenAI` creates generation spans and the tool spans of every tool manager `bind` builds.
 A delegated run's generation and tool spans become children of its `delegate` tool span.
 
 `capture_message_content` controls message content on generated spans.

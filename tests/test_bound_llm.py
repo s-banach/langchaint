@@ -2,9 +2,11 @@
 
 import asyncio
 import functools
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Literal, assert_type, override
 
@@ -14,6 +16,7 @@ from pydantic import BaseModel, TypeAdapter
 from langchaint import (
     LLM,
     ZERO_USAGE,
+    AbandonedCallRecord,
     AllowedToolsChoice,
     AssistantMessage,
     BoundLLM,
@@ -23,6 +26,8 @@ from langchaint import (
     CutOffAttemptRecord,
     DispatchHandled,
     DispatchInvalidToolArgs,
+    DispatchOutcome,
+    GenerateResult,
     GenerationError,
     GenerationErrorKind,
     GenerationErrorRecord,
@@ -66,8 +71,10 @@ from langchaint.adapter import (
     SchemaViolation,
     UnfinishedTurn,
 )
+from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import _NEVER
 from langchaint.generation.llm import WorkingTimeDeadline, _run_many_with_warm_cache
+from langchaint.generation.observer import GenerationStart
 from langchaint.generation.streaming import StreamHandle
 from tests.fake_adapter import (
     FAKE_TOOL_CALL,
@@ -2231,25 +2238,55 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
     run_with_timeout(scenario())
 
 
-def test_a_stream_completed_or_left_early_sets_no_abandoned() -> None:
-    """final() completing, or a consumer leaving the block voluntarily, leaves abandoned None.
-
-    Voluntary exit after `Response` creates no `AbandonedCallErrorRecord`.
-    """
+def test_a_completed_stream_sets_no_abandoned() -> None:
+    """The `Response` from final() records the call, so leaving the block afterwards adds nothing."""
 
     async def scenario() -> None:
-        """Consume one stream to final(), leave a second before its first item."""
+        """Consume one stream to final() and leave the block."""
         bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
         completed = bound_llm.stream_one([UserMessage(content="hi")])
         async with completed:
             await completed.final()
-        second_adapter = FakeAdapter(stream=_HangingStream())
-        second_bound_llm = LLM(second_adapter, shared_backoff=fast_shared_backoff()).bind()
-        left_early = second_bound_llm.stream_one([UserMessage(content="hi")])
-        async with left_early:
-            pass
         assert completed.abandoned is None
-        assert left_early.abandoned is None
+
+    run_with_timeout(scenario())
+
+
+@pytest.mark.parametrize(
+    "block_exit", ["before_first_item", "after_first_item", "application_exception"]
+)
+def test_a_block_left_before_the_conclusion_sets_abandoned_with_the_first_item_time(
+    block_exit: Literal["before_first_item", "after_first_item", "application_exception"],
+) -> None:
+    """Every early exit records the cut-off request, with its first-item time once an item arrived."""
+
+    async def leave(handle: StreamHandle[str]) -> None:
+        """Leave the block as `block_exit` names.
+
+        Raises:
+            ValueError: `block_exit` is "application_exception".
+        """
+        async with handle:
+            if block_exit == "before_first_item":
+                return
+            _ = await anext(handle)
+            if block_exit == "application_exception":
+                raise ValueError("application failure")
+
+    async def scenario() -> None:
+        """Leave one stream's block early, then read its abandoned record."""
+        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind()
+        handle = bound_llm.stream_one("hi")
+        if block_exit == "application_exception":
+            with pytest.raises(ValueError, match="application failure"):
+                await leave(handle)
+        else:
+            await leave(handle)
+        abandoned = handle.abandoned
+        assert abandoned is not None
+        (cut_off,) = abandoned.attempt_records
+        assert cut_off.kind == "cut_off"
+        assert (cut_off.seconds_to_first_item is not None) == (block_exit != "before_first_item")
 
     run_with_timeout(scenario())
 
@@ -2514,6 +2551,162 @@ def test_stream_handle_raises_on_a_second_entry() -> None:
         assert adapter.bound_adapters[0].open_count == 1
 
     run_with_timeout(scenario())
+
+
+class _RecordingOperation:
+    """An `ObservedOperation` that appends each call it receives to a shared list."""
+
+    def __init__(self, calls: list[str]) -> None:
+        self._calls = calls
+
+    def current(self) -> AbstractContextManager[None]:
+        """Return a context that changes nothing."""
+        return nullcontext()
+
+    def conclude(self, outcome: object) -> None:
+        """Record the conclusion by its class name."""
+        self._calls.append(f"conclude {type(outcome).__name__}")
+
+    def end(self) -> None:
+        """Record the end."""
+        self._calls.append("end")
+
+
+class _RecordingObserver:
+    """An `Observer` that records every call langchaint makes to it and to its operations."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def generation_started(
+        self, start: GenerationStart
+    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+        """Record the start and return an operation that records into the same list."""
+        self.calls.append(f"generation_started {start.model}")
+        return _RecordingOperation(self.calls)
+
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+        """Record the start and return an operation that records into the same list."""
+        self.calls.append(f"dispatch_started {call.name}")
+        return _RecordingOperation(self.calls)
+
+
+def test_a_stream_reports_one_conclusion_and_one_end_despite_later_misuse() -> None:
+    """Pulling an item after the block and re-entering the handle report nothing more to the observer."""
+
+    async def scenario() -> None:
+        """Drain a stream, leave the block, misuse the handle twice, then read the observer's record."""
+        observer = _RecordingObserver()
+        llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff(), observer=observer)
+        handle = llm.bind().stream_one("hi")
+        async with handle:
+            _ = [item async for item in handle]
+            await handle.final()
+        with pytest.raises(RuntimeError, match="finished"):
+            await anext(handle)
+        with pytest.raises(RuntimeError, match="already entered"):
+            async with handle:
+                pass
+        assert observer.calls == ["generation_started fake-model", "conclude Response", "end"]
+
+    run_with_timeout(scenario())
+
+
+class _RaisingOperation:
+    """An `ObservedOperation` whose every method raises."""
+
+    def current(self) -> AbstractContextManager[None]:
+        """Raise instead of returning a context.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("observer current boom")
+
+    def conclude(self, outcome: object) -> None:
+        """Raise instead of recording the outcome.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError(f"observer conclude boom for {type(outcome).__name__}")
+
+    def end(self) -> None:
+        """Raise instead of ending.
+
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("observer end boom")
+
+
+class _RaisingObserver:
+    """An `Observer` that raises from its start methods, or returns operations whose every method raises."""
+
+    def __init__(self, *, raise_at_start: bool) -> None:
+        self._raise_at_start = raise_at_start
+
+    def generation_started(
+        self, start: GenerationStart
+    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+        """Start a raising operation for the call.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        return self._started(start.model)
+
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+        """Start a raising operation for the dispatch.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        return self._started(call.name)
+
+    def _started(self, name: str) -> _RaisingOperation:
+        """Raise, or return an operation whose every method raises.
+
+        Raises:
+            RuntimeError: `raise_at_start` is set.
+        """
+        if self._raise_at_start:
+            raise RuntimeError(f"observer start boom for {name}")
+        return _RaisingOperation()
+
+
+@pytest.mark.parametrize("raise_at_start", [True, False], ids=["start", "operation"])
+def test_an_observer_that_raises_never_changes_what_a_call_returns_or_raises(
+    *, raise_at_start: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """langchaint logs every observer failure, and each entry point behaves as it does unobserved."""
+
+    async def scenario() -> None:
+        """Drive every observed entry point under the raising observer."""
+        observer = _RaisingObserver(raise_at_start=raise_at_start)
+        bound_llm = LLM(
+            FakeAdapter(echo=True), shared_backoff=fast_shared_backoff(), observer=observer
+        ).bind()
+        failing_bound_llm = LLM(
+            FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")]),
+            shared_backoff=fast_shared_backoff(),
+            observer=observer,
+        ).bind()
+        assert (await bound_llm.generate_one("hi")).output == "hi"
+        results = await bound_llm.generate_many(["a", "b"])
+        assert [result.output for result in results if result.kind == "response"] == ["a", "b"]
+        async with bound_llm.stream_one("hi") as stream:
+            assert (await stream.final()).output == "hi"
+        with pytest.raises(GenerationError):
+            await failing_bound_llm.generate_one("hi")
+        outcome = await ToolManager([], observer=observer).dispatch(
+            ToolCall(id="call1", name="missing", args_json="{}")
+        )
+        assert outcome.kind == "unknown_tool"
+        assert "the observer raised" in caplog.text
+
+    with caplog.at_level(logging.WARNING, logger="langchaint.common.observed_operation"):
+        run_with_timeout(scenario())
 
 
 def test_stream_passes_items_through_and_assembles_final() -> None:

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from langchaint.billing.pricing import Billing
 from langchaint.generation.call import (
+    AbandonedCallRecord,
     AttemptProviderData,
     CutOffAttemptRecord,
     SettledAttemptRecord,
@@ -18,6 +19,7 @@ from langchaint.generation.response import (
     Response,
     ToolCallTurn,
     _result_record,
+    _SuccessRecordBase,
 )
 
 type RowValue = str | int | float | bool | None
@@ -98,7 +100,7 @@ def _attempt_row(
     if attempt.kind == "cut_off":
         return common | {
             "elapsed_seconds": None,
-            "seconds_to_first_item": None,
+            "seconds_to_first_item": attempt.seconds_to_first_item,
             "model_served": None,
             "response_id": None,
             "request_id": None,
@@ -121,9 +123,13 @@ def _attempt_row(
 def to_tables[OutputT](
     results: CallResult[OutputT]
     | CallResultRecord[OutputT]
-    | Iterable[CallResult[OutputT] | CallResultRecord[OutputT]],
+    | AbandonedCallRecord
+    | Iterable[CallResult[OutputT] | CallResultRecord[OutputT] | AbandonedCallRecord],
 ) -> Tables:
-    """Flatten live or normalized results into calls and attempts tables."""
+    """Flatten live or normalized results into calls and attempts tables.
+
+    An `AbandonedCallRecord` row has neither `output` nor `error_text`, and no kept attempt.
+    """
     values = (
         list(results)
         if isinstance(results, Iterable) and not isinstance(results, BaseModel)
@@ -132,7 +138,7 @@ def to_tables[OutputT](
     calls: list[dict[str, RowValue]] = []
     attempts: list[dict[str, RowValue]] = []
     for call_id, value in enumerate(values):
-        record = _result_record(value)
+        record = value if isinstance(value, AbandonedCallRecord) else _result_record(value)
         live_error = value if isinstance(value, GenerationError) else None
         live_success = value if isinstance(value, (Response, ToolCallTurn)) else None
         provider_attempts = (
@@ -143,6 +149,7 @@ def to_tables[OutputT](
             else ()
         )
         is_error = isinstance(record, _GenerationErrorRecordBase)
+        is_success = isinstance(record, _SuccessRecordBase)
         calls.append({
             "call_id": call_id,
             "model": record.model,
@@ -154,9 +161,9 @@ def to_tables[OutputT](
             "request_json": None
             if live_error is None or live_error.request is None
             else live_error.request.as_json(),
-            "output": None if is_error else _output_cell(record.output),
+            "output": _output_cell(record.output) if is_success else None,
         })
-        kept_index = None if is_error else len(record.attempt_records) - 1
+        kept_index = len(record.attempt_records) - 1 if is_success else None
         for attempt_index, attempt in enumerate(record.attempt_records):
             attempts.append(
                 _attempt_row(

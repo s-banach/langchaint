@@ -40,6 +40,7 @@ from langchaint.adapter import (
     ResponseIdentity,
     verdict_from_transient_error,
 )
+from langchaint.generation.observer import Observer
 
 
 class FakeRaw(BaseModel):
@@ -290,8 +291,8 @@ def call(name: str, args_json: str) -> ToolCall:
     return ToolCall(id=f"call-{next(_CALL_IDS)}", name=name, args_json=args_json)
 
 
-def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
-    """Build an LLM with ScriptedAdapter and fast request pacing."""
+def build_llm(scripts: dict[str, list[Turn]], *, observer: Observer | None = None) -> LLM:
+    """Build an LLM with ScriptedAdapter, fast request pacing, and `observer`."""
     adapter = ScriptedAdapter(scripts)
     return LLM(
         adapter,
@@ -303,4 +304,5 @@ def build_llm(scripts: dict[str, list[Turn]]) -> LLM:
             minimum_wait_ceiling_seconds=0.001,
             longest_wait_seconds=0.01,
         ),
+        observer=observer,
     )

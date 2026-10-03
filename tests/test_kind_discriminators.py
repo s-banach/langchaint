@@ -7,7 +7,6 @@ Each partial match requires a non-exhaustive-match suppression.
 from typing import assert_type
 
 from langchaint import (
-    AbandonedCallErrorRecord,
     AuthErrorRecord,
     ContentPart,
     ContextWindowExceededErrorRecord,
@@ -217,9 +216,6 @@ def _by_generation_error_record_kind(  # noqa: PLR0911 (each discriminator requi
         case "escaped_exception_error":
             assert_type(record, EscapedExceptionErrorRecord)
             return record.error_text
-        case "abandoned_call_error":
-            assert_type(record, AbandonedCallErrorRecord)
-            return record.attempts
         case "timed_out_error":
             assert_type(record, TimedOutErrorRecord)
             return record.attempts

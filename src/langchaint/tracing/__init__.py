@@ -3,16 +3,24 @@
 Importing this subpackage requires `opentelemetry-api`.
 Applications configure the OTel SDK.
 
-`TracedBoundLLM` opens one CLIENT span for each generation call.
+Pass one `OtelObserver` to a backend constructor, as in `OpenAI(observer=OtelObserver(...))`.
+Every `LLM`, binding, and stream that backend creates is then traced, and the application's code is otherwise unchanged.
+A `ToolManager` that `bind` builds from a tool sequence traces its dispatches.
+A `ToolManager` the application builds traces its dispatches when built with `observer=`.
+
+Each generation call opens one CLIENT span.
 `generate_many` opens one span per started input.
 `generate_many_records` opens one span per input that requires generation.
 Restored records open no span.
-`TracedStreamHandle` keeps one CLIENT span open for the stream.
-`TracedToolManager.dispatch` opens one INTERNAL `execute_tool` span.
+A stream opens one CLIENT span when its handle is entered.
+Each tool dispatch opens one INTERNAL `execute_tool` span.
 `ToolManager.dispatch_many` uses `dispatch` and gets one span per tool call.
 `precomputed` opens no span because it executes no tool.
+A generation span is current during its retry loop, and a dispatch span is current while the tool function runs.
+Spans started there, such as HTTP client spans, nest under them.
+A stream span is never current, because the application's code runs between stream items.
 
-Each traced class requires `capture_message_content` because prompt recording is a privacy choice.
+`OtelObserver` requires `capture_message_content` because prompt recording is a privacy choice.
 `capture_message_content=True` records every content part unchanged, including image and audio bytes.
 `content_filter` decides per part what each content attribute records.
 `gen_ai.tool.definitions` is not filtered because a tool schema is not a message part.
@@ -27,18 +35,20 @@ They report provider, request model, response model, finish reasons, token usage
 They report the standard attributes for each set request field.
 They report `gen_ai.output.type` for every call.
 With capture enabled, they report system instructions, tool definitions, input messages, and output messages.
-Stream spans also report `gen_ai.request.stream=True` and `gen_ai.response.time_to_first_chunk`.
+Stream spans also report `gen_ai.request.stream=True`.
+A stream span reports `gen_ai.response.time_to_first_chunk` once an item arrives, including for a stream left early.
+A stream span whose block exits before the conclusion reports its usage and cost.
+Its status stays unset, because the call did not fail.
 Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
 
 `langchaint.*` names attempts and cost because the convention has no matching keys.
 Each failed attempt adds `langchaint.attempt_failed` with `error_text` and `elapsed_seconds`.
 
-Each traced operation starts and ends its span exactly once.
-`TracedStreamHandle` closes failed or abandoned streams.
+Each span starts and ends exactly once, including for failed, cancelled, and abandoned streams.
 A mapper may set only attribute names and values.
 A mapper cannot change the span name, kind, or status.
-Mapper failures are logged and never propagate.
+Telemetry failures, including mapper and content filter failures, are logged and never propagate.
 
 Attribute names except `gen_ai.request.reasoning.level` match opentelemetry-semantic-conventions 0.64b0.
 `gen_ai.request.reasoning.level` comes from the OpenTelemetry semantic-conventions-genai repository.
@@ -56,18 +66,13 @@ import importlib.metadata
 import json
 import logging
 import math
-import time
-from collections.abc import Callable, Coroutine, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from types import TracebackType
-from typing import Any, Literal, Never, NoReturn, overload, override
-
-from pydantic import BaseModel
+from typing import Literal, NoReturn, overload
 
 try:
-    from opentelemetry import trace
+    from opentelemetry import context, trace
     from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 except ModuleNotFoundError as exc:
     if exc.name is not None and not exc.name.startswith("opentelemetry"):
@@ -76,7 +81,7 @@ except ModuleNotFoundError as exc:
         "langchaint's tracing subpackage requires opentelemetry-api; install langchaint[tracing]."
     ) from exc
 
-from langchaint.adapter import Adapter, Binding, StreamItem, ToolChoice
+from langchaint.adapter import Binding
 from langchaint.common.messages import (
     AssistantMessage,
     ContentPart,
@@ -88,38 +93,12 @@ from langchaint.common.messages import (
     TurnPart,
     UserMessage,
 )
-from langchaint.common.sequence_not_str import SequenceNotStr
-from langchaint.concurrency.shared_backoff import SharedBackoff
-from langchaint.generation.errors import (
-    AbandonedCallErrorRecord,
-    GenerationError,
-    GenerationErrorRecord,
-)
-from langchaint.generation.llm import (
-    LLM,
-    UNCHANGED,
-    BoundLLM,
-    Deadline,
-    GenerationInput,
-    Unchanged,
-    WallClockDeadline,
-    _generate_many,
-)
-from langchaint.generation.response import (
-    CallResult,
-    CallResultRecord,
-    GenerateResult,
-    Response,
-    ResponseRecord,
-    ToolCallTurn,
-)
-from langchaint.generation.streaming import StreamHandle
-from langchaint.tools import (
-    DispatchOutcome,
-    ToolManager,
-    ToolSchema,
-    ToolSequence,
-)
+from langchaint.common.observed_operation import ObservedOperation
+from langchaint.generation.call import AbandonedCallRecord
+from langchaint.generation.errors import GenerationError
+from langchaint.generation.observer import GenerationStart
+from langchaint.generation.response import CallResult, GenerateResult
+from langchaint.tools import DispatchOutcome, ToolSchema
 
 type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
 """One span attribute's value."""
@@ -127,13 +106,14 @@ type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
 type SpanAttributes = Mapping[str, SpanAttributeValue]
 """A span's attributes, keyed by name."""
 
-type AttributeMapper = Callable[[CallResult[object]], SpanAttributes]
-"""Maps one generate result to its span attributes.
+type AttributeMapper = Callable[[CallResult[object] | AbandonedCallRecord], SpanAttributes]
+"""Maps one generate result, or a stream's `abandoned` record, to its span attributes.
 
-The mapper reads the fields shared by each `CallResult` variant.
-No mapper receives `GenerationInput`, so `gen_ai_attributes` cannot put a prompt on a span.
+The mapper reads the fields shared by each `CallResult` variant and `AbandonedCallRecord`.
+No mapper receives the call's input messages, so `gen_ai_attributes` cannot put a prompt on a span.
 A custom mapper can reach `CallResult.raw`, which holds the SDK response by reference.
-`capture_message_content` controls prompt capture because the wrapper receives `GenerationInput` as a method argument.
+`AbandonedCallRecord` has no `raw`, because no response completed.
+`capture_message_content` controls prompt capture because `OtelObserver` receives the input messages at call start.
 """
 
 type ContentFilter = Callable[[str, ContentPart | TurnPart], ContentPart | TurnPart | None]
@@ -235,14 +215,9 @@ def _filtered_message(message: Message, content_filter: ContentFilter) -> Messag
 
 
 def _filtered_messages(
-    generation_input: GenerationInput, content_filter: ContentFilter
+    messages: Sequence[Message], content_filter: ContentFilter
 ) -> tuple[Message, ...]:
-    """Copy the generation input with every part filtered, with a bare str as one user message."""
-    messages = (
-        (UserMessage(content=generation_input),)
-        if isinstance(generation_input, str)
-        else generation_input
-    )
+    """Copy the input messages with every part filtered."""
     return tuple(_filtered_message(message, content_filter) for message in messages)
 
 
@@ -284,30 +259,6 @@ def _is_recording(span: Span) -> bool:
         return False
 
 
-def _start_span(tracer: Tracer, name: str, *, kind: SpanKind) -> Span:
-    """Start one span, returning a non-recording span when the tracer itself raises.
-
-    INVALID_SPAN lets the traced call continue without telemetry.
-    """
-    try:
-        return tracer.start_span(name, kind=kind)
-    except Exception:
-        _logger.warning(
-            "starting the %s span raised; this call runs untraced", name, exc_info=True
-        )
-        return trace.INVALID_SPAN
-
-
-def _end_span(span: Span) -> None:
-    """End one span, without letting the end reach the caller.
-
-    opentelemetry-sdk 1.43.0 Span.end does not guard SpanProcessor.on_end.
-    This guard preserves the result or active exception.
-    """
-    with _guarding_telemetry_failures("ending the span"):
-        span.end()
-
-
 def _set_ok_status(span: Span) -> None:
     """Mark one span successful, without letting the call reach the caller."""
     with _guarding_telemetry_failures("setting the span status"):
@@ -335,30 +286,6 @@ class _SpanConfig:
     extra_attributes: SpanAttributes
     capture_message_content: bool
     content_filter: ContentFilter
-
-
-def _resolve_traced_tool_manager(
-    tools: ToolManager | ToolSequence | None,
-    *,
-    span_config: _SpanConfig,
-) -> ToolManager | None:
-    """Raise `ValueError` when a `tools` sequence contains duplicate names."""
-    if isinstance(tools, ToolManager) or tools is None:
-        return tools
-    if span_config.capture_message_content:
-        return TracedToolManager(
-            tools,
-            tracer=span_config.tracer,
-            extra_attributes=span_config.extra_attributes,
-            capture_message_content=True,
-            content_filter=span_config.content_filter,
-        )
-    return TracedToolManager(
-        tools,
-        tracer=span_config.tracer,
-        extra_attributes=span_config.extra_attributes,
-        capture_message_content=False,
-    )
 
 
 _CONVENTION_FINISH_REASONS: Mapping[StopReason, str] = {
@@ -393,7 +320,9 @@ def _finish_reason(stop_reason: StopReason) -> str:
     return _CONVENTION_FINISH_REASONS.get(stop_reason, stop_reason)
 
 
-def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
+def gen_ai_attributes[OutputT](
+    result: CallResult[OutputT] | AbandonedCallRecord,
+) -> SpanAttributes:
     """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
 
     `result` supplies the response identity, usage, stop reason, and attempt records.
@@ -402,7 +331,7 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     Extension keys must use the application's namespace because langchaint.* is reserved.
     `extra_attributes` sets a constant on every span.
     Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
-    This function reads only the fields shared by every `CallResult` variant.
+    This function reads only the fields shared by every `CallResult` variant and `AbandonedCallRecord`.
     The langchaint.* prefix is used only when the GenAI convention has no corresponding key.
     This applies to langchaint.attempts and langchaint.cost_in_usd.
     gen_ai.usage.input_tokens is Usage.input_tokens_total.
@@ -410,6 +339,8 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     No cache_none counter is emitted because it is derived.
     gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
     gen_ai.response.model is the last attempt's model_served and is omitted when unavailable.
+    gen_ai.response.time_to_first_chunk is the last attempt's seconds_to_first_item, settled or cut off.
+    That value runs from sending the request to the first stream item, so only a stream has it.
     The usage and cost attributes are the call's paid totals across every attempt.
     `result.usage` has that scope.
     `langchaint.attempt_failed` span events retain per-attempt detail.
@@ -417,10 +348,8 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
     usage = result.usage
     records = result.attempt_records
     final_record = records[-1] if records else None
-    model_served = (
-        final_record.model_served
-        if final_record is not None and final_record.kind == "settled"
-        else None
+    final_settled_record = (
+        final_record if final_record is not None and final_record.kind == "settled" else None
     )
     attributes: dict[str, SpanAttributeValue] = {
         "gen_ai.provider.name": result.provider_name,
@@ -433,8 +362,10 @@ def gen_ai_attributes[OutputT](result: CallResult[OutputT]) -> SpanAttributes:
         "langchaint.attempts": result.attempts,
         "langchaint.cost_in_usd": usage.cost_in_usd,
     }
-    if model_served is not None:
-        attributes["gen_ai.response.model"] = model_served
+    if final_settled_record is not None and final_settled_record.model_served is not None:
+        attributes["gen_ai.response.model"] = final_settled_record.model_served
+    if final_record is not None and final_record.seconds_to_first_item is not None:
+        attributes["gen_ai.response.time_to_first_chunk"] = final_record.seconds_to_first_item
     if result.stop_reason is not None:
         attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
     return attributes
@@ -608,7 +539,7 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
 
 
 def _input_content_attributes(
-    binding: Binding, generation_input: GenerationInput, *, content_filter: ContentFilter
+    binding: Binding, messages: Sequence[Message], *, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
     """Build the input-side content attributes for one call, each a JSON string.
 
@@ -629,25 +560,20 @@ def _input_content_attributes(
     if binding.tool_schemas:
         attributes["gen_ai.tool.definitions"] = json.dumps(_tool_definitions(binding.tool_schemas))
     input_messages = [
-        _message(message) for message in _filtered_messages(generation_input, content_filter)
+        _message(message) for message in _filtered_messages(messages, content_filter)
     ]
     if input_messages:
         attributes["gen_ai.input.messages"] = json.dumps(input_messages)
     return attributes
 
 
-def _request_attributes(
-    *,
-    adapter: Adapter,
-    binding: Binding,
-    response_format_is_set: bool,
-    stream: bool,
-) -> dict[str, SpanAttributeValue]:
+def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]:
     """Map stored request configuration onto standard OTel attributes."""
+    binding = start.binding
     attributes: dict[str, SpanAttributeValue] = {
-        "gen_ai.provider.name": adapter.provider_name,
-        "gen_ai.request.model": adapter.model,
-        "gen_ai.output.type": "json" if response_format_is_set else "text",
+        "gen_ai.provider.name": start.provider_name,
+        "gen_ai.request.model": start.model,
+        "gen_ai.output.type": "text" if start.response_format is None else "json",
     }
     if binding.max_completion_tokens is not None:
         attributes["gen_ai.request.max_tokens"] = binding.max_completion_tokens
@@ -655,7 +581,7 @@ def _request_attributes(
         attributes["gen_ai.request.reasoning.level"] = binding.reasoning_level
     if binding.temperature is not None:
         attributes["gen_ai.request.temperature"] = binding.temperature
-    if stream:
+    if start.stream:
         attributes["gen_ai.request.stream"] = True
     return attributes
 
@@ -684,7 +610,7 @@ def _output_content_attributes(
 
 
 def _apply_output_content[OutputT](
-    span: Span, result: CallResult[OutputT], span_config: _SpanConfig
+    span: Span, result: CallResult[OutputT] | AbandonedCallRecord, span_config: _SpanConfig
 ) -> None:
     """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
 
@@ -708,7 +634,9 @@ def _apply_output_content[OutputT](
     )
 
 
-def _record_attempt_failed_events[OutputT](span: Span, result: CallResult[OutputT]) -> None:
+def _record_attempt_failed_events[OutputT](
+    span: Span, result: CallResult[OutputT] | AbandonedCallRecord
+) -> None:
     """Add one langchaint.attempt_failed event per failed attempt in the result's records.
 
     Each event carries the attempt's error text and its own `elapsed_seconds`.
@@ -725,12 +653,12 @@ def _record_attempt_failed_events[OutputT](span: Span, result: CallResult[Output
 
 def _apply_result_attributes[OutputT](
     span: Span,
-    result: CallResult[OutputT],
+    result: CallResult[OutputT] | AbandonedCallRecord,
     attribute_mapper: AttributeMapper,
 ) -> None:
     """Set the mapper's attributes and the langchaint.attempt_failed events on a recording span.
 
-    Success and `GenerationError` values carry the shared `CallResult` fields.
+    Success, `GenerationError`, and `AbandonedCallRecord` values carry the shared `CallResult` fields.
     Other exceptions do not carry those fields.
     A non-recording span skips the mapper because an `AttributeMapper` may be expensive.
     A mapper exception is caught and logged at warning level.
@@ -762,7 +690,7 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
     `json.dumps` can reject one of those values.
     A `ContentFilter` can raise or return a part of another kind.
     A build Exception is logged and does not propagate. Existing span attributes remain.
-    Building inside the is_recording guard is why the GenerationInput is serialized here rather than earlier:
+    Building inside the is_recording guard is why the input messages are serialized here rather than earlier:
     an application with no configured TracerProvider gets non-recording no-op spans and pays nothing.
     """
     if not _is_recording(span):
@@ -776,16 +704,6 @@ def _apply_content_attributes(span: Span, build: Callable[[], SpanAttributes]) -
         return
     with _guarding_telemetry_failures("setting the content attributes"):
         span.set_attributes(attributes)
-
-
-def _apply_operation_name(span: Span, operation_name: str) -> None:
-    """Set gen_ai.operation.name on a just-started span.
-
-    The convention requires this attribute on every span kind this module opens.
-    The function applies this attribute after extra_attributes at span start.
-    An application constant cannot replace it.
-    """
-    _set_span_attribute(span, "gen_ai.operation.name", operation_name)
 
 
 def _set_generation_error_status(span: Span, error: GenerationError) -> None:
@@ -813,1032 +731,6 @@ def _record_other_exception(span: Span, exc: Exception) -> None:
         span.set_status(Status(StatusCode.ERROR, str(exc)))
 
 
-def _record_stream_conclusion(span: Span, exc: Exception, span_config: _SpanConfig) -> None:
-    """Record the exception that concluded a stream, attributing the span by what it is.
-
-    A `GenerationError` carries the call result attributes, content, and status.
-    The span records any other exception.
-    The open, item pull, and final() use the same recording rule.
-    """
-    if isinstance(exc, GenerationError):
-        _apply_result_attributes(span, exc, span_config.attribute_mapper)
-        _apply_output_content(span, exc, span_config)
-        _set_generation_error_status(span, exc)
-        return
-    _record_other_exception(span, exc)
-
-
-class TracedLLM:
-    """Wraps an LLM so every binding it produces is traced.
-
-    The OTel SDK configures whether tracing records and where it sends spans.
-    An application without an SDK configuration gets non-recording no-op spans.
-    """
-
-    @overload
-    def __init__(
-        self,
-        llm: LLM,
-        *,
-        capture_message_content: Literal[True],
-        content_filter: ContentFilter | None = None,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
-        extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        llm: LLM,
-        *,
-        capture_message_content: bool,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
-        extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
-    ) -> None: ...
-    def __init__(
-        self,
-        llm: LLM,
-        *,
-        capture_message_content: bool,
-        content_filter: ContentFilter | None = None,
-        attribute_mapper: AttributeMapper = gen_ai_attributes,
-        extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
-    ) -> None:
-        """Resolve the tracer once, at construction.
-
-        `llm` is the wrapped `LLM`.
-        `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant turns.
-        `content_filter` decides per part what those attributes record.
-        The overloads accept `content_filter` only with `capture_message_content=True`.
-        `content_filter=None` records every part unchanged, including image and audio bytes.
-        A filter that keeps everything except inline bytes:
-
-            def drop_binary(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
-                return None if part.kind in ("image", "audio") else part
-
-        Both values pass unchanged to every binding, replacement object, and stream handle.
-        `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
-        `attribute_mapper` passes unchanged to every binding.
-        It defaults to `gen_ai_attributes`.
-        `extra_attributes` applies at the start of every span.
-        `extra_attributes=None` supplies no extra attributes.
-        Request attributes replace matching `extra_attributes` keys at span start.
-        A key the mapper also emits resolves to the mapper's value, set at completion.
-        """
-        self._llm = llm
-        self._span_config = _SpanConfig(
-            tracer=(
-                tracer
-                if tracer is not None
-                else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
-            ),
-            attribute_mapper=attribute_mapper,
-            extra_attributes=extra_attributes if extra_attributes is not None else {},
-            capture_message_content=capture_message_content,
-            content_filter=content_filter if content_filter is not None else _record_every_part,
-        )
-
-    @property
-    def adapter(self) -> Adapter:
-        """The wrapped LLM's adapter, so an app never reaches for a private field."""
-        return self._llm.adapter
-
-    @property
-    def shared_backoff(self) -> SharedBackoff:
-        """The wrapped `LLM.shared_backoff` for applications sharing a rate-limit quota."""
-        return self._llm.shared_backoff
-
-    @overload
-    def bind[ModelT: BaseModel](
-        self,
-        *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[ModelT],
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
-        tool_choice: ToolChoice = ...,
-        parallel_tool_calls: bool = ...,
-        extra_body: Mapping[str, object] | None = ...,
-        max_attempts: int = ...,
-        automatic_cache_breakpoints: bool | None = ...,
-    ) -> "TracedBoundLLM[ModelT, ToolManager]": ...
-    @overload
-    def bind[ModelT: BaseModel](
-        self,
-        *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: None = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: type[ModelT],
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
-        tool_choice: ToolChoice = ...,
-        parallel_tool_calls: bool = ...,
-        extra_body: Mapping[str, object] | None = ...,
-        max_attempts: int = ...,
-        automatic_cache_breakpoints: bool | None = ...,
-    ) -> "TracedBoundLLM[ModelT, None]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: None = ...,
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
-        tool_choice: ToolChoice = ...,
-        parallel_tool_calls: bool = ...,
-        extra_body: Mapping[str, object] | None = ...,
-        max_attempts: int = ...,
-        automatic_cache_breakpoints: bool | None = ...,
-    ) -> "TracedBoundLLM[str, ToolManager]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        system_prompt: str | Sequence[TextPart] | None = ...,
-        tools: None = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] = ...,
-        response_format: None = ...,
-        max_completion_tokens: int | None = ...,
-        reasoning_level: str | None = ...,
-        temperature: float | None = ...,
-        tool_choice: ToolChoice = ...,
-        parallel_tool_calls: bool = ...,
-        extra_body: Mapping[str, object] | None = ...,
-        max_attempts: int = ...,
-        automatic_cache_breakpoints: bool | None = ...,
-    ) -> "TracedBoundLLM[str, None]": ...
-    def bind(  # noqa: PLR0913 (mirrors LLM.bind, which states every binding choice)
-        self,
-        *,
-        system_prompt: str | Sequence[TextPart] | None = None,
-        tools: ToolManager | ToolSequence | None = None,
-        provider_executed_tools: Sequence[Mapping[str, object]] = (),
-        response_format: type[BaseModel] | None = None,
-        max_completion_tokens: int | None = None,
-        reasoning_level: str | None = None,
-        temperature: float | None = None,
-        tool_choice: ToolChoice = "auto",
-        parallel_tool_calls: bool = True,
-        extra_body: Mapping[str, object] | None = None,
-        max_attempts: int = 3,
-        automatic_cache_breakpoints: bool | None = None,
-    ) -> "TracedBoundLLM[Any, Any]":
-        """Mirror LLM.bind and wrap its BoundLLM in a TracedBoundLLM carrying this tracer and mapper.
-
-        Binding fields pass through to `LLM.bind`.
-        `tool_choice`, `parallel_tool_calls`, `extra_body`, and `automatic_cache_breakpoints` pass through.
-        A `tools` sequence constructs `TracedToolManager`.
-        `tools=ToolManager(...)` binds that `ToolManager` unchanged.
-        `max_attempts` counts requests sent including the first.
-        `max_attempts=1` disables retries.
-
-        Raises:
-            ValueError: A `tools` sequence contains duplicate names.
-                Also raised when the wrapped `LLM.bind` rejects the binding.
-                `GeminiGenerateContentAdapter` rejects a `reasoning_level` that the Gemini SDK normalizes.
-            TypeError: The wrapped `LLM.bind` rejects `tool_choice`.
-            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
-            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
-        """
-        tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
-        return TracedBoundLLM(
-            bound_llm=self._llm.bind(
-                system_prompt=system_prompt,
-                tools=tools,
-                provider_executed_tools=provider_executed_tools,
-                response_format=response_format,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_level=reasoning_level,
-                temperature=temperature,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                extra_body=extra_body,
-                max_attempts=max_attempts,
-                automatic_cache_breakpoints=automatic_cache_breakpoints,
-            ),
-            span_config=self._span_config,
-        )
-
-
-class TracedBoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
-    """Wraps a BoundLLM so every generate call opens a span.
-
-    Each outbound call opens one CLIENT span. generate_many opens one per item.
-    The wrapper owns the GenAI span name, kind, and status.
-    A custom mapper changes only attributes.
-    There is no langchaint.elapsed_seconds attribute:
-    The span duration covers request admission, backoff, and completion.
-    """
-
-    def __init__(
-        self, *, bound_llm: BoundLLM[OutputT, ToolManagerT], span_config: _SpanConfig
-    ) -> None:
-        """Store the wrapped `BoundLLM` and `_SpanConfig`.
-
-        Compute the span name once.
-
-        `span_config` is the originating `TracedLLM._span_config` object.
-        """
-        self._bound_llm = bound_llm
-        self._span_config = span_config
-        self._span_name = f"{_CHAT_OPERATION} {bound_llm.adapter.model}"
-
-    def _apply_input_content(self, span: Span, generation_input: GenerationInput) -> None:
-        """Set the input-side content attributes on a just-started span, when capture is on and it is recording.
-
-        The attributes are set at span start and remain on raised paths.
-        """
-        if self._span_config.capture_message_content:
-            _apply_content_attributes(
-                span,
-                lambda: _input_content_attributes(
-                    self._bound_llm.binding,
-                    generation_input,
-                    content_filter=self._span_config.content_filter,
-                ),
-            )
-
-    @property
-    def adapter(self) -> Adapter:
-        """The wrapped BoundLLM's adapter."""
-        return self._bound_llm.adapter
-
-    @property
-    def binding(self) -> Binding:
-        """The wrapped BoundLLM's frozen binding."""
-        return self._bound_llm.binding
-
-    @property
-    def response_format(self) -> type[OutputT] | None:
-        """The wrapped BoundLLM's response_format."""
-        return self._bound_llm.response_format
-
-    @property
-    def tool_manager(self) -> ToolManagerT:
-        """The wrapped BoundLLM's ToolManager, or None where none was bound."""
-        return self._bound_llm.tool_manager
-
-    @property
-    def shared_backoff(self) -> SharedBackoff:
-        """The wrapped BoundLLM's SharedBackoff."""
-        return self._bound_llm.shared_backoff
-
-    @property
-    def max_attempts(self) -> int:
-        """max_attempts counts requests sent including the first."""
-        return self._bound_llm.max_attempts
-
-    def config_fingerprint(self) -> str:
-        """Return the wrapped `BoundLLM.config_fingerprint`."""
-        return self._bound_llm.config_fingerprint()
-
-    @overload
-    def bind[NewModelT: BaseModel](
-        self,
-        *,
-        response_format: type[NewModelT],
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, ToolManager]": ...
-    @overload
-    def bind[NewModelT: BaseModel](
-        self,
-        *,
-        response_format: type[NewModelT],
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, None]": ...
-    @overload
-    def bind[NewModelT: BaseModel](
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: type[NewModelT],
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[NewModelT, ToolManagerT]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        response_format: None,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, ToolManager]": ...
-    @overload
-    def bind(
-        self,
-        *,
-        response_format: None,
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, None]": ...
-    @overload
-    def bind(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: None,
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[str, ToolManagerT]": ...
-    @overload
-    def bind(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: ToolManager | ToolSequence,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, ToolManager]": ...
-    @overload
-    def bind(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: None,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, None]": ...
-    @overload
-    def bind(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        *,
-        response_format: Unchanged = ...,
-        tools: Unchanged = ...,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = ...,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = ...,
-        tool_choice: ToolChoice | Unchanged = ...,
-        parallel_tool_calls: bool | Unchanged = ...,
-        max_completion_tokens: int | None | Unchanged = ...,
-        reasoning_level: str | None | Unchanged = ...,
-        temperature: float | None | Unchanged = ...,
-        extra_body: Mapping[str, object] | None | Unchanged = ...,
-        max_attempts: int | Unchanged = ...,
-        automatic_cache_breakpoints: bool | None | Unchanged = ...,
-    ) -> "TracedBoundLLM[OutputT, ToolManagerT]": ...
-    def bind(  # noqa: PLR0913 (mirrors BoundLLM.bind)
-        self,
-        *,
-        response_format: type[BaseModel] | None | Unchanged = UNCHANGED,
-        system_prompt: str | Sequence[TextPart] | None | Unchanged = UNCHANGED,
-        tools: ToolManager | ToolSequence | None | Unchanged = UNCHANGED,
-        provider_executed_tools: Sequence[Mapping[str, object]] | Unchanged = UNCHANGED,
-        tool_choice: ToolChoice | Unchanged = UNCHANGED,
-        parallel_tool_calls: bool | Unchanged = UNCHANGED,
-        max_completion_tokens: int | None | Unchanged = UNCHANGED,
-        reasoning_level: str | None | Unchanged = UNCHANGED,
-        temperature: float | None | Unchanged = UNCHANGED,
-        extra_body: Mapping[str, object] | None | Unchanged = UNCHANGED,
-        max_attempts: int | Unchanged = UNCHANGED,
-        automatic_cache_breakpoints: bool | None | Unchanged = UNCHANGED,
-    ) -> "TracedBoundLLM[Any, Any]":
-        """Return a traced wrapper around a replacement `BoundLLM`.
-
-        This preserves `_SpanConfig`.
-        `response_format`, `provider_executed_tools`, `system_prompt`, and `tool_choice` pass through.
-        Request fields, `extra_body`, and `max_attempts` pass through.
-        `automatic_cache_breakpoints` passes through.
-        A `tools` sequence constructs a replacement `TracedToolManager`.
-        `tools=ToolManager(...)` binds that replacement unchanged.
-        Omitting `tools` preserves the bound `ToolManager`.
-        Passing `tools=None` removes the bound `ToolManager`.
-
-        Raises:
-            ValueError: A `tools` sequence contains duplicate names.
-                Also raised when the wrapped `BoundLLM.bind` rejects the binding.
-                `GeminiGenerateContentAdapter` rejects a `reasoning_level` that the Gemini SDK normalizes.
-            TypeError: The wrapped `BoundLLM.bind` rejects `tool_choice`.
-            pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
-            pydantic.PydanticUserError: `response_format` or a tool's `args_model` is not fully defined.
-        """
-        if not isinstance(tools, Unchanged):
-            tools = _resolve_traced_tool_manager(tools, span_config=self._span_config)
-        return TracedBoundLLM(
-            bound_llm=self._bound_llm.bind(
-                response_format=response_format,
-                system_prompt=system_prompt,
-                tools=tools,
-                provider_executed_tools=provider_executed_tools,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_level=reasoning_level,
-                temperature=temperature,
-                extra_body=extra_body,
-                max_attempts=max_attempts,
-                automatic_cache_breakpoints=automatic_cache_breakpoints,
-            ),
-            span_config=self._span_config,
-        )
-
-    @overload
-    async def generate_one(
-        self: "TracedBoundLLM[str, ToolManagerT]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> Response[str]: ...
-    @overload
-    async def generate_one(
-        self: "TracedBoundLLM[OutputT, ToolManager]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> GenerateResult[OutputT]: ...
-    @overload
-    async def generate_one(
-        self: "TracedBoundLLM[OutputT, None]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> Response[OutputT]: ...
-    async def generate_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> GenerateResult[Any]:
-        """Open a span around the whole generate_one call, delegate, attribute, and end the span.
-
-        The overloads mirror BoundLLM.generate_one's, so output is typed per binding.
-        `generation_input` passes to `BoundLLM.generate_one` unchanged.
-        `timeout_seconds` sets the wall-clock deadline.
-
-        Raises:
-            GenerationError: generate_one produced a terminal per-item error. The span is attributed and closed first.
-            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
-        """
-        return await self._generate_one_any_binding(
-            generation_input, deadline=WallClockDeadline(timeout_seconds)
-        )
-
-    async def _generate_one_any_binding(
-        self, generation_input: GenerationInput, *, deadline: Deadline
-    ) -> GenerateResult[Any]:
-        """Run one call under a chat span of its own.
-
-        This unoverloaded entry point supports generic bindings.
-        generate_many uses it for one span per item.
-        deadline passes through unchanged.
-
-        Raises:
-            GenerationError: the call failed. The span is attributed and closed first.
-            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
-        """
-        return await self._under_chat_span(
-            generation_input,
-            self._bound_llm._generate_one_any_binding(  # noqa: SLF001
-                generation_input, deadline=deadline
-            ),
-        )
-
-    async def _under_chat_span(
-        self, generation_input: GenerationInput, call: Coroutine[Any, Any, GenerateResult[Any]]
-    ) -> GenerateResult[Any]:
-        """Await one call inside a CLIENT chat span, attributing the span from however it ends.
-
-        The span brackets the same interval as elapsed_seconds (permit waits and backoff included).
-        capture_message_content records input at span start and records the result's turn at completion.
-
-        Raises:
-            GenerationError: whatever the call failed with, the span attributed and closed first.
-            Exception: anything else the call raised, recorded on the span before it re-raises.
-            asyncio.CancelledError: an outer scope cancelled the call. The span ends without status.
-        """
-        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
-        try:
-            _set_span_attributes(span, self._span_config.extra_attributes)
-            _apply_operation_name(span, _CHAT_OPERATION)
-            _set_span_attributes(
-                span,
-                _request_attributes(
-                    adapter=self._bound_llm.adapter,
-                    binding=self._bound_llm.binding,
-                    response_format_is_set=self._bound_llm.response_format is not None,
-                    stream=False,
-                ),
-            )
-            self._apply_input_content(span, generation_input)
-            try:
-                result = await call
-            except GenerationError as exc:
-                _apply_result_attributes(span, exc, self._span_config.attribute_mapper)
-                _apply_output_content(span, exc, self._span_config)
-                _set_generation_error_status(span, exc)
-                raise
-            except Exception as exc:
-                _record_other_exception(span, exc)
-                raise
-            _apply_result_attributes(span, result, self._span_config.attribute_mapper)
-            _apply_output_content(span, result, self._span_config)
-            _set_ok_status(span)
-            return result
-        finally:
-            _end_span(span)
-
-    @overload
-    async def generate_many(
-        self: "TracedBoundLLM[str, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[Response[str] | GenerationError]: ...
-    @overload
-    async def generate_many(
-        self: "TracedBoundLLM[OutputT, ToolManager]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[CallResult[OutputT]]: ...
-    @overload
-    async def generate_many(
-        self: "TracedBoundLLM[OutputT, None]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[Response[OutputT] | GenerationError]: ...
-    @overload
-    async def generate_many(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]]: ...
-    async def generate_many(
-        self,
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = False,
-        max_working_seconds_per_item: float | None = None,
-        # `list` invariance requires `Any` to share one implementation across these overloads.
-    ) -> list[Any]:
-        """Order-aligned batch, traced as one chat span per started item and nothing else.
-
-        The overloads mirror BoundLLM.generate_many's, so each result's output is typed per binding.
-
-        `_generate_many` coordinates inputs and invokes `_generate_one_any_binding` for each started item.
-
-        Raises:
-            asyncio.CancelledError: an outer scope cancelled the batch. Each started span ended.
-            BaseException: an item raised a non-Exception BaseException.
-                Started items are cancelled and awaited before it propagates.
-        """
-        # `_generate_one_any_binding` accepts each overloaded `response_format`.
-        return await _generate_many(
-            generation_inputs,
-            max_concurrent_requests=self.shared_backoff.max_concurrent_requests,
-            warm_cache=warm_cache,
-            generate_item=self._generate_one_any_binding,
-            max_working_seconds_per_item=max_working_seconds_per_item,
-        )
-
-    @overload
-    async def generate_many_records(
-        self: "TracedBoundLLM[str, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[ResponseRecord[str] | GenerationErrorRecord]: ...
-    @overload
-    async def generate_many_records(
-        self: "TracedBoundLLM[OutputT, ToolManager]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[CallResultRecord[OutputT]]: ...
-    @overload
-    async def generate_many_records(
-        self: "TracedBoundLLM[OutputT, None]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord]: ...
-    @overload
-    async def generate_many_records(
-        self: "TracedBoundLLM[OutputT, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> (
-        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]
-    ): ...
-    async def generate_many_records(
-        self,
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = None,
-        warm_cache: bool = False,
-        max_working_seconds_per_item: float | None = None,
-    ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]:
-        """Restore normalized records and trace each item that requires generation.
-
-        Reused records open no spans.
-        The arguments and resume behavior match `BoundLLM.generate_many_records`.
-        The returned list follows `generation_inputs` order.
-        Separate processes must not use the same `resume_path` concurrently.
-
-        Args:
-            generation_inputs: The input-aligned text or message values.
-            resume_path: The JSON file whose parent directory already exists.
-            sample_ids: Stable unique strings aligned with `generation_inputs`, or `None` for position identity.
-            warm_cache: Whether to finish the first input requiring generation before starting the remaining inputs.
-            max_working_seconds_per_item: The per-item working-time budget, or `None`.
-
-        Raises:
-            ValueError: `sample_ids` has the wrong length or contains a duplicate.
-            ValueError: `resume_path` contains malformed data or an unsupported format.
-            ValueError: A generated result record cannot be serialized as resume JSON.
-            RuntimeError: Another call in this process is using `resume_path`.
-            TypeError: The binding or an input has no deterministic fingerprint encoding.
-            OSError: The resume file cannot be read, written, or replaced.
-            asyncio.CancelledError: The caller cancels the batch after started items settle.
-            BaseException: An item raises a non-`Exception` value after started items settle.
-        """
-        return await self._bound_llm._generate_many_records_any_binding(  # noqa: SLF001
-            generation_inputs,
-            resume_path=resume_path,
-            sample_ids=sample_ids,
-            warm_cache=warm_cache,
-            generate_item=self._generate_one_any_binding,
-            max_working_seconds_per_item=max_working_seconds_per_item,
-        )
-
-    @overload
-    def stream_one(
-        self: "TracedBoundLLM[str, ToolManagerT]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> "TracedStreamHandle[str]": ...
-    @overload
-    def stream_one(
-        self: "TracedBoundLLM[OutputT, ToolManager]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> "TracedStreamHandle[OutputT, ToolCallTurn[OutputT]]": ...
-    @overload
-    def stream_one(
-        self: "TracedBoundLLM[OutputT, None]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> "TracedStreamHandle[OutputT]": ...
-    def stream_one(
-        self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
-    ) -> "TracedStreamHandle[Any, Any]":
-        """Wrap the BoundLLM's StreamHandle in a TracedStreamHandle.
-
-        This function performs no I/O and opens no span.
-
-        The overloads mirror BoundLLM.stream_one's, so final()'s result is typed per binding.
-        `generation_input` and `timeout_seconds` pass to `BoundLLM.stream_one` unchanged.
-
-        The span and request open when the handle is entered.
-        The binding and the generation_input are passed down rather than rendered here:
-        The handle uses them to build input attributes when the span starts.
-        Rendering here would serialize generation_input for non-recording spans.
-        The cost is that the handle holds the generation_input for the stream's whole life.
-        """
-        return TracedStreamHandle(
-            # `_generate_one_any_binding` accepts each overloaded `response_format`.
-            stream_handle=self._bound_llm._stream_one_any_binding(  # noqa: SLF001
-                generation_input, timeout_seconds=timeout_seconds
-            ),
-            span_config=self._span_config,
-            span_name=self._span_name,
-            adapter=self._bound_llm.adapter,
-            binding=self._bound_llm.binding,
-            response_format_is_set=self._bound_llm.response_format is not None,
-            generation_input=generation_input,
-        )
-
-
-class TracedStreamHandle[OutputT, ToolTurnT = Never]:
-    """Wraps a StreamHandle, owning one span across the stream's life.
-
-    Items pass through by reference.
-    The span opens at `__aenter__`.
-    The first item records `gen_ai.response.time_to_first_chunk`.
-    The span ends exactly once.
-    `capture_message_content` records the input content attributes when the span starts.
-    A terminal result that carries a turn records `gen_ai.output.messages`.
-    """
-
-    def __init__(
-        self,
-        *,
-        stream_handle: StreamHandle[OutputT, ToolTurnT],
-        span_config: _SpanConfig,
-        span_name: str,
-        adapter: Adapter,
-        binding: Binding,
-        response_format_is_set: bool,
-        generation_input: GenerationInput,
-    ) -> None:
-        """Store the wrapped handle and span configuration without starting the span.
-
-        `span_config` is the binding's unchanged `_SpanConfig`.
-        `binding` and `generation_input` build input attributes when the span starts.
-        """
-        self._stream_handle = stream_handle
-        self._span_config = span_config
-        self._span_name = span_name
-        self._adapter = adapter
-        self._binding = binding
-        self._response_format_is_set = response_format_is_set
-        self._generation_input = generation_input
-        self._span: Span | None = None
-        self._span_started_at_monotonic_seconds: float | None = None
-        self._span_ended = False
-        self._first_item_seen = False
-
-    @property
-    def abandoned(self) -> AbandonedCallErrorRecord | None:
-        """The wrapped handle's account of this call where a cancellation cut it off, None otherwise.
-
-        StreamHandle.abandoned says when it is set.
-        """
-        return self._stream_handle.abandoned
-
-    def _start_span_once(self) -> Span:
-        """Start this handle's one span, recording its start time for gen_ai.response.time_to_first_chunk.
-
-        Called by __aenter__ alone, which raises on a second entry, so this runs at most once per handle.
-        stream_one opens no span and does no I/O. Building here lets _apply_content_attributes skip non-recording spans.
-        """
-        span = _start_span(self._span_config.tracer, self._span_name, kind=SpanKind.CLIENT)
-        self._span = span
-        _set_span_attributes(span, self._span_config.extra_attributes)
-        _apply_operation_name(span, _CHAT_OPERATION)
-        _set_span_attributes(
-            span,
-            _request_attributes(
-                adapter=self._adapter,
-                binding=self._binding,
-                response_format_is_set=self._response_format_is_set,
-                stream=True,
-            ),
-        )
-        if self._span_config.capture_message_content:
-            _apply_content_attributes(
-                span,
-                lambda: _input_content_attributes(
-                    self._binding,
-                    self._generation_input,
-                    content_filter=self._span_config.content_filter,
-                ),
-            )
-        self._span_started_at_monotonic_seconds = time.monotonic()
-        return span
-
-    def _end_span_once(self) -> None:
-        if self._span is not None and not self._span_ended:
-            _end_span(self._span)
-            self._span_ended = True
-
-    def _mark_first_item(self, span: Span) -> None:
-        """Record the gen_ai.response.time_to_first_chunk attribute on the first item's arrival, once.
-
-        The value is the monotonic seconds from the span's start (__aenter__) to the first item.
-        The convention defines this key as measured from request issuance.
-        The value includes admission waits and backoff because the span starts before request issuance.
-        A stream drained by final() without iteration carries no such attribute.
-        """
-        if self._first_item_seen:
-            return
-        self._first_item_seen = True
-        if self._span_started_at_monotonic_seconds is not None:
-            _set_span_attribute(
-                span,
-                "gen_ai.response.time_to_first_chunk",
-                time.monotonic() - self._span_started_at_monotonic_seconds,
-            )
-
-    def __aiter__(self) -> "TracedStreamHandle[OutputT, ToolTurnT]":
-        """Return `self` as the iterator."""
-        return self
-
-    async def __anext__(self) -> StreamItem:
-        """Delegate to the inner handle, observing the first item and any failure.
-
-        `StopAsyncIteration` leaves the span open for `final()`.
-        Cancellation passes through so __aexit__ can distinguish timeout_seconds from outer cancellation.
-
-        Raises:
-            GenerationError: The open stream fails transiently.
-                The adapter classifies an item error as an invalid request.
-                The provider declares an item error terminal.
-                The adapter cannot classify an item exception.
-            StreamProtocolError: The event stream ends without a terminal event.
-            ParserContractError: `Adapter.parse` violates its contract.
-            StopAsyncIteration: The inner stream is exhausted.
-            RuntimeError: The handle is unopened or finished.
-            asyncio.CancelledError: The caller cancels iteration.
-        """
-        if self._span is None or self._span_ended:
-            # The inner handle reports calls before entry or after span closure.
-            return await self._stream_handle.__anext__()
-        span = self._span
-        try:
-            item = await self._stream_handle.__anext__()
-        except StopAsyncIteration:
-            raise
-        except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config)
-            self._end_span_once()
-            raise
-        self._mark_first_item(span)
-        return item
-
-    async def __aenter__(self) -> "TracedStreamHandle[OutputT, ToolTurnT]":
-        """Start the span, then open the inner handle's request.
-
-        The span starts first so a failing open is recorded on it rather than escaping untraced.
-        __aexit__ does not run when __aenter__ raises, so the span is ended here on that path.
-        A second entry raises before the span is touched, so it cannot mark the first stream's span failed.
-
-        Raises:
-            GenerationError: The adapter rejects the request.
-                The provider declares the open failure terminal.
-                The adapter cannot classify the open failure.
-                The open attempts consume the retry budget.
-                `timeout_seconds` expires before the request opens.
-            RuntimeError: This handle was already entered.
-            ParserContractError: `Adapter.parse` violates its contract.
-            asyncio.CancelledError: The caller cancels entry.
-        """
-        if self._span is not None:
-            raise RuntimeError("stream already entered: call stream_one again for a new one")
-        span = self._start_span_once()
-        try:
-            await self._stream_handle.__aenter__()
-        except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config)
-            self._end_span_once()
-            raise
-        except BaseException:
-            self._end_span_once()
-            raise
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        """Close the inner handle, then end the span if it is still open.
-
-        A span already ended by a mid-iteration failure or by final() is left alone.
-        An active Exception is recorded before the span ends.
-
-        __aexit__ distinguishes timeout_seconds from outer cancellation.
-        A timeout becomes GenerationError with terminal result attributes.
-        Outer cancellation ends the span without status.
-        """
-        try:
-            await self._stream_handle.__aexit__(exc_type, exc, traceback)
-        except GenerationError as conclusion:
-            if self._span is not None and not self._span_ended:
-                _record_stream_conclusion(self._span, conclusion, self._span_config)
-            raise
-        finally:
-            if self._span is not None and not self._span_ended:
-                if isinstance(exc, Exception):
-                    _record_other_exception(self._span, exc)
-                self._end_span_once()
-
-    @overload
-    async def final(self: "TracedStreamHandle[OutputT, Never]") -> Response[OutputT]: ...
-    @overload
-    async def final(self) -> "Response[OutputT] | ToolCallTurn[OutputT]": ...
-    async def final(self) -> Response[OutputT] | ToolCallTurn[OutputT]:
-        """Drain the inner stream, attribute the span from the result, and end the span.
-
-        The span ends once. After it ends, this delegates to the cached inner final() result.
-
-        Raises:
-            StreamProtocolError: The event stream ends without a terminal event.
-            GenerationError: The adapter or provider reports a terminal failure.
-                The assembled response reports a terminal result.
-                The open stream fails transiently.
-                The adapter cannot classify an item exception.
-            ParserContractError: `Adapter.parse` violates its contract.
-            RuntimeError: The handle is unopened or finished without a stored conclusion.
-            asyncio.CancelledError: The caller cancels finalization.
-        """
-        if self._span is None or self._span_ended:
-            # Calls before entry and calls after closure do not change the span.
-            return await self._stream_handle.final()
-        span = self._span
-        try:
-            result = await self._stream_handle.final()
-        except Exception as exc:
-            _record_stream_conclusion(span, exc, self._span_config)
-            self._end_span_once()
-            raise
-        _apply_result_attributes(span, result, self._span_config.attribute_mapper)
-        _apply_output_content(span, result, self._span_config)
-        _set_ok_status(span)
-        self._end_span_once()
-        return result
-
-
 def _tool_call_arguments_attribute(
     call: ToolCall, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
@@ -1864,163 +756,239 @@ def _dispatch_error_type(outcome: DispatchOutcome) -> str | None:
             return "unknown_tool"
 
 
-class TracedToolManager(ToolManager):
-    """A ToolManager whose every dispatch opens one execute_tool span.
+@contextmanager
+def _span_made_current(span: Span) -> Generator[None]:
+    """Make `span` the current span for the block."""
+    token = context.attach(trace.set_span_in_context(span))
+    try:
+        yield
+    finally:
+        context.detach(token)
 
-    `ToolManager.dispatch_many` calls `self.dispatch`.
-    Concurrent dispatch spans are siblings because asyncio.gather copies each task's context.
-    The span name is "execute_tool {call.name}".
-    SpanKind.INTERNAL represents in-process dispatch.
-    The identity attributes gen_ai.operation.name, gen_ai.tool.name, and gen_ai.tool.call.id are set at span start.
-    The outcome selects the span status and error.type:
 
-    | dispatch result                     | status | error.type              |
-    | ----------------------------------- | ------ | ----------------------- |
-    | DispatchHandled, is_error False     | OK     | absent                  |
-    | DispatchHandled, is_error True      | ERROR  | tool_error              |
-    | DispatchInvalidToolArgs             | ERROR  | invalid_tool_args       |
-    | DispatchUnknownTool                 | ERROR  | unknown_tool            |
-    | the tool function raised            | ERROR  | the exception class name|
+class _SpanOperation:
+    """The span of one observed operation."""
 
-    invalid_tool_args and unknown_tool mean that the tool function never ran.
+    def __init__(self, span: Span, span_config: _SpanConfig) -> None:
+        """Hold the started span and the observer's configuration."""
+        self._span = span
+        self._span_config = span_config
 
-    capture_message_content records gen_ai.tool.call.arguments at span start and gen_ai.tool.call.result at completion.
-    content_filter sees the `ToolCall` under gen_ai.tool.call.arguments.
-    It sees each result part under gen_ai.tool.call.result.
-    gen_ai.tool.call.arguments uses best-effort JSON deserialization.
-    Unparseable text is preserved as a quoted JSON string.
-    gen_ai.tool.call.result records each `DispatchOutcome`, including correction messages.
-    `extra_attributes` supplies application constants.
+    def current(self) -> AbstractContextManager[None]:
+        """Make the span current for the block."""
+        return _span_made_current(self._span)
+
+    def end(self) -> None:
+        """End the span."""
+        self._span.end()
+
+
+class _GenerationSpan(_SpanOperation):
+    """The CLIENT chat span of one generation call."""
+
+    def conclude(self, outcome: GenerateResult[object] | AbandonedCallRecord | Exception) -> None:
+        """Attribute the span from the call's result, `abandoned` record, `GenerationError`, or other exception.
+
+        Each value except another exception carries the call result attributes and the output content.
+        An `AbandonedCallRecord` leaves the status unset, because the application's code ended the stream.
+        Another exception is recorded as a span event.
+        """
+        if isinstance(outcome, GenerationError):
+            self._record_call_result(outcome)
+            _set_generation_error_status(self._span, outcome)
+        elif isinstance(outcome, Exception):
+            _record_other_exception(self._span, outcome)
+        elif isinstance(outcome, AbandonedCallRecord):
+            self._record_call_result(outcome)
+        else:
+            self._record_call_result(outcome)
+            _set_ok_status(self._span)
+
+    def _record_call_result(self, result: CallResult[object] | AbandonedCallRecord) -> None:
+        _apply_result_attributes(self._span, result, self._span_config.attribute_mapper)
+        _apply_output_content(self._span, result, self._span_config)
+
+
+class _DispatchSpan(_SpanOperation):
+    """The INTERNAL execute_tool span of one tool dispatch."""
+
+    def conclude(self, outcome: DispatchOutcome | Exception) -> None:
+        """Attribute the span from the dispatch outcome, or record the tool function's exception.
+
+        The outcome selects the span status and error.type, as `OtelObserver.dispatch_started` lists.
+        With capture on, `gen_ai.tool.call.result` records the outcome's `ToolMessage`.
+        """
+        if isinstance(outcome, Exception):
+            _record_other_exception(self._span, outcome)
+            return
+        error_type = _dispatch_error_type(outcome)
+        if error_type is not None:
+            _set_span_attribute(self._span, "error.type", error_type)
+        if self._span_config.capture_message_content:
+            content_filter = self._span_config.content_filter
+            _apply_content_attributes(
+                self._span,
+                lambda: {
+                    "gen_ai.tool.call.result": json.dumps(
+                        _tool_call_response_part(
+                            _filtered_tool_message(
+                                outcome.tool_message, content_filter, "gen_ai.tool.call.result"
+                            )
+                        )
+                    )
+                },
+            )
+        if error_type is None:
+            _set_ok_status(self._span)
+        else:
+            with _guarding_telemetry_failures("setting the error status"):
+                self._span.set_status(Status(StatusCode.ERROR, error_type))
+
+
+class OtelObserver:
+    """Trace generation calls and tool dispatches with OTel spans.
+
+    Pass one instance to a backend constructor, `LLM(observer=...)`, or `ToolManager(observer=...)`.
+    The OTel SDK configures whether tracing records and where it sends spans.
+    An application without an SDK configuration gets non-recording no-op spans.
+    This class owns each span's name, kind, and status.
+    A custom mapper changes only attributes.
+    There is no langchaint.elapsed_seconds attribute:
+    The span duration covers request admission, backoff, and completion.
     """
 
     @overload
     def __init__(
         self,
-        tools: ToolSequence,
         *,
         capture_message_content: Literal[True],
         content_filter: ContentFilter | None = None,
-        tracer: Tracer | None = None,
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
+        tracer: Tracer | None = None,
     ) -> None: ...
     @overload
     def __init__(
         self,
-        tools: ToolSequence,
         *,
         capture_message_content: bool,
-        tracer: Tracer | None = None,
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
+        tracer: Tracer | None = None,
     ) -> None: ...
     def __init__(
         self,
-        tools: ToolSequence,
         *,
         capture_message_content: bool,
         content_filter: ContentFilter | None = None,
-        tracer: Tracer | None = None,
+        attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
-        """Index the tools (ToolManager.__init__) and resolve the span pieces once.
+        """Resolve the tracer once, at construction.
 
-        `tools` supplies the indexed tool definitions.
         `capture_message_content` has no default because content capture affects privacy.
-        `content_filter` decides per part what the two content attributes record.
+        `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant turns.
+        It also records tool arguments and tool results.
+        `content_filter` decides per part what those attributes record.
         The overloads accept `content_filter` only with `capture_message_content=True`.
-        `content_filter=None` records every part unchanged.
-        `tracer=None` resolves the langchaint tracer.
-        `extra_attributes=None` sets no constant dispatch attributes.
-        Dispatch attributes override colliding `extra_attributes` keys.
+        `content_filter=None` records every part unchanged, including image and audio bytes.
+        A filter that keeps everything except inline bytes:
 
-        Raises:
-            ValueError: two tools share a name.
+            def drop_binary(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+                return None if part.kind in ("image", "audio") else part
+
+        `attribute_mapper` sets the completion attributes of each chat span.
+        It defaults to `gen_ai_attributes`.
+        `extra_attributes` applies at the start of every span.
+        `extra_attributes=None` supplies no extra attributes.
+        Request and dispatch identity attributes replace matching `extra_attributes` keys at span start.
+        A key the mapper also emits resolves to the mapper's value, set at completion.
+        `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
         """
-        super().__init__(tools)
-        self._tracer = (
-            tracer
-            if tracer is not None
-            else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
-        )
-        self._extra_attributes: SpanAttributes = (
-            extra_attributes if extra_attributes is not None else {}
-        )
-        self._capture_message_content = capture_message_content
-        self._content_filter: ContentFilter = (
-            content_filter if content_filter is not None else _record_every_part
+        self._span_config = _SpanConfig(
+            tracer=(
+                tracer
+                if tracer is not None
+                else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
+            ),
+            attribute_mapper=attribute_mapper,
+            extra_attributes=extra_attributes if extra_attributes is not None else {},
+            capture_message_content=capture_message_content,
+            content_filter=content_filter if content_filter is not None else _record_every_part,
         )
 
-    @override
-    async def dispatch(self, call: ToolCall) -> DispatchOutcome:
-        """Open one execute_tool span around ToolManager.dispatch and attribute it from the outcome.
+    def generation_started(
+        self, start: GenerationStart
+    ) -> ObservedOperation[GenerateResult[object] | AbandonedCallRecord]:
+        """Open the CLIENT chat span and set its start attributes.
 
-        `call` passes to `ToolManager.dispatch` unchanged.
-        The span is current while the base dispatch runs, so a span the tool function starts nests under it.
-
-        Raises:
-            Exception: A tool function raises after the span records the exception and error status.
-            BaseException: A tool function raises a value outside `Exception` after the span ends.
+        The span is named "chat {start.model}".
+        With capture on, the input content attributes are set at span start and remain on failed spans.
+        They are built only for a recording span, so an application without a TracerProvider serializes nothing.
         """
-        span = _start_span(
-            self._tracer,
-            f"{_EXECUTE_TOOL_OPERATION} {call.name}",
-            kind=SpanKind.INTERNAL,
+        span_config = self._span_config
+        span = span_config.tracer.start_span(
+            f"{_CHAT_OPERATION} {start.model}", kind=SpanKind.CLIENT
         )
-        with trace.use_span(
-            span, end_on_exit=False, record_exception=False, set_status_on_exception=False
-        ):
-            try:
-                _set_span_attributes(span, self._extra_attributes)
-                with _guarding_telemetry_failures("setting the tool identity attributes"):
-                    if _is_recording(span):
-                        span.set_attributes({
-                            "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
-                            "gen_ai.tool.name": call.name,
-                            "gen_ai.tool.call.id": call.id,
-                        })
-                if self._capture_message_content:
-                    _apply_content_attributes(
-                        span, lambda: _tool_call_arguments_attribute(call, self._content_filter)
-                    )
-                try:
-                    outcome = await super().dispatch(call)
-                except Exception as exc:
-                    _record_other_exception(span, exc)
-                    raise
-                error_type = _dispatch_error_type(outcome)
-                if error_type is not None:
-                    _set_span_attribute(span, "error.type", error_type)
-                if self._capture_message_content:
-                    _apply_content_attributes(
-                        span,
-                        lambda: {
-                            "gen_ai.tool.call.result": json.dumps(
-                                _tool_call_response_part(
-                                    _filtered_tool_message(
-                                        outcome.tool_message,
-                                        self._content_filter,
-                                        "gen_ai.tool.call.result",
-                                    )
-                                )
-                            )
-                        },
-                    )
-                if error_type is None:
-                    _set_ok_status(span)
-                else:
-                    with _guarding_telemetry_failures("setting the error status"):
-                        span.set_status(Status(StatusCode.ERROR, error_type))
-                return outcome
-            finally:
-                _end_span(span)
+        _set_span_attributes(span, span_config.extra_attributes)
+        _set_span_attribute(span, "gen_ai.operation.name", _CHAT_OPERATION)
+        _set_span_attributes(span, _request_attributes(start))
+        if span_config.capture_message_content:
+            _apply_content_attributes(
+                span,
+                lambda: _input_content_attributes(
+                    start.binding, start.messages, content_filter=span_config.content_filter
+                ),
+            )
+        return _GenerationSpan(span, span_config)
+
+    def dispatch_started(self, call: ToolCall) -> ObservedOperation[DispatchOutcome]:
+        """Open the INTERNAL execute_tool span and set its identity attributes.
+
+        The span name is "execute_tool {call.name}".
+        The identity attributes gen_ai.operation.name, gen_ai.tool.name, and gen_ai.tool.call.id are set at span start.
+        With capture on, gen_ai.tool.call.arguments is set at span start.
+        `content_filter` sees the `ToolCall` under gen_ai.tool.call.arguments.
+        It sees each result part under gen_ai.tool.call.result.
+        gen_ai.tool.call.arguments uses best-effort JSON deserialization.
+        Unparseable text is preserved as a quoted JSON string.
+        The outcome selects the span status and error.type:
+
+        | dispatch result                     | status | error.type              |
+        | ----------------------------------- | ------ | ----------------------- |
+        | DispatchHandled, is_error False     | OK     | absent                  |
+        | DispatchHandled, is_error True      | ERROR  | tool_error              |
+        | DispatchInvalidToolArgs             | ERROR  | invalid_tool_args       |
+        | DispatchUnknownTool                 | ERROR  | unknown_tool            |
+        | the tool function raised            | ERROR  | the exception class name|
+
+        invalid_tool_args and unknown_tool mean that the tool function never ran.
+        """
+        span_config = self._span_config
+        span = span_config.tracer.start_span(
+            f"{_EXECUTE_TOOL_OPERATION} {call.name}", kind=SpanKind.INTERNAL
+        )
+        _set_span_attributes(span, span_config.extra_attributes)
+        _set_span_attributes(
+            span,
+            {
+                "gen_ai.operation.name": _EXECUTE_TOOL_OPERATION,
+                "gen_ai.tool.name": call.name,
+                "gen_ai.tool.call.id": call.id,
+            },
+        )
+        if span_config.capture_message_content:
+            _apply_content_attributes(
+                span, lambda: _tool_call_arguments_attribute(call, span_config.content_filter)
+            )
+        return _DispatchSpan(span, span_config)
 
 
 __all__ = [
     "AttributeMapper",
     "ContentFilter",
+    "OtelObserver",
     "SpanAttributes",
-    "TracedBoundLLM",
-    "TracedLLM",
-    "TracedStreamHandle",
-    "TracedToolManager",
     "gen_ai_attributes",
 ]

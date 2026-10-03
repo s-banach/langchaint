@@ -10,7 +10,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint import (
     ZERO_USAGE,
-    AbandonedCallErrorRecord,
+    AbandonedCallRecord,
     AssistantMessage,
     AttemptProviderData,
     AuthErrorRecord,
@@ -47,7 +47,7 @@ from langchaint import (
 )
 from langchaint.adapter import ProviderBilling, RequestParams, ResponseIdentity
 from langchaint.generation.call import _CallLedger, _less_than_or_ulp_close
-from langchaint.generation.response import _abandoned_call_error, _success_variant
+from langchaint.generation.response import _success_variant, _timed_out_error
 from tests.helpers import StubRaw
 
 
@@ -419,7 +419,6 @@ def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKi
             "escaped_exception_error",
             "escaped",
         ),
-        (AbandonedCallErrorRecord(call=cut_off), "abandoned_call_error", ""),
         (TimedOutErrorRecord(call=cut_off), "timed_out_error", ""),
     ]
 
@@ -576,12 +575,12 @@ def test_the_ledger_stamps_the_first_item_and_not_a_later_one(
     assert record.elapsed_seconds == 2.0
 
 
-def test_abandoned_call_error_appends_one_cut_off_request_with_live_usage() -> None:
+def test_timed_out_error_appends_one_cut_off_request_with_live_usage() -> None:
     """A live timeout aligns its cut-off record with provider usage."""
     ledger = _CallLedger(model="model", provider_name="provider")
     ledger.start_attempt()
     provider_billing = ProviderBilling(billing=_BILLING, usage_raw=ProviderUsage(billed_units=23))
-    failure = _abandoned_call_error(TimedOutErrorRecord, ledger, provider_billing)
+    failure = _timed_out_error(ledger, provider_billing)
     assert failure.record.kind == "timed_out_error"
     assert len(failure.attempt_records) == 1
     assert failure.attempt_records[0].kind == "cut_off"
@@ -589,9 +588,9 @@ def test_abandoned_call_error_appends_one_cut_off_request_with_live_usage() -> N
     assert failure.usage == _USAGE
 
 
-@pytest.mark.parametrize("record_class", [AbandonedCallErrorRecord, TimedOutErrorRecord])
-def test_interrupted_error_record_accepts_a_transient_prefix_without_a_cut_off(
-    record_class: type[AbandonedCallErrorRecord] | type[TimedOutErrorRecord],
+@pytest.mark.parametrize("record_class", [AbandonedCallRecord, TimedOutErrorRecord])
+def test_an_interrupted_call_record_accepts_a_transient_prefix_without_a_cut_off(
+    record_class: type[AbandonedCallRecord] | type[TimedOutErrorRecord],
 ) -> None:
     """An interruption during retry backoff retains its transient settled attempt."""
     record = record_class(call=_failed_call())
@@ -611,7 +610,7 @@ def test_interruption_after_a_staged_response_records_no_cut_off_request() -> No
             model_served="served", response_id="response", request_id="request"
         ),
     )
-    failure = _abandoned_call_error(TimedOutErrorRecord, ledger)
+    failure = _timed_out_error(ledger)
     assert len(failure.attempt_records) == 1
     assert failure.attempt_records[0].kind == "settled"
     assert failure.provider_attempts[0].raw is raw

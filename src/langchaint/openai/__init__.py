@@ -60,6 +60,7 @@ from langchaint.openai.shared import (
 
 if TYPE_CHECKING:
     from langchaint.embedding import EmbeddingModel
+    from langchaint.generation.observer import Observer
 
 type OpenAIEmbeddingModelName = Literal[
     "text-embedding-3-small",
@@ -96,7 +97,7 @@ The set stays independent from pricing because parameter availability can change
 class OpenAI:
     """Create `LLM` and `EmbeddingModel` values for OpenAI."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         client: AsyncOpenAI | None = None,
@@ -106,6 +107,7 @@ class OpenAI:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `OpenAI` without sending a request.
 
@@ -117,11 +119,14 @@ class OpenAI:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             openai.OpenAIError: `client` is absent and OpenAI credentials are unavailable.
             ValueError: A `SharedBackoff` setting is invalid.
         """
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIResponsesAdapter.failure_types,
@@ -217,7 +222,7 @@ class OpenAI:
             reasoning_summary=reasoning_summary,
             service_tier=service_tier,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
     @overload
     def embedding_model(
@@ -308,7 +313,7 @@ class OpenAI:
 class OpenAIBedrock:
     """Create `LLM` values for OpenAI models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         aws_region: str | None = None,
@@ -319,6 +324,7 @@ class OpenAIBedrock:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `OpenAIBedrock` without sending a request.
 
@@ -329,6 +335,8 @@ class OpenAIBedrock:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: `client` and `aws_region` are both provided.
@@ -337,6 +345,7 @@ class OpenAIBedrock:
         """
         if client is not None and aws_region is not None:
             raise ValueError("Pass at most one of client= or aws_region=")
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIResponsesAdapter.failure_types,
@@ -380,7 +389,7 @@ class OpenAIBedrock:
             supports_prompt_cache_options=supports_prompt_cache_options,
             reasoning_summary=reasoning_summary,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
 
 __all__ = [

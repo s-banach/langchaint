@@ -33,8 +33,7 @@ from langchaint.common.messages import (
     messages_to_json,
 )
 from langchaint.concurrency.shared_backoff import Verdict
-from langchaint.generation.call import CallRecord, SettledAttemptRecord
-from langchaint.generation.errors import AbandonedCallErrorRecord
+from langchaint.generation.call import AbandonedCallRecord, CallRecord, SettledAttemptRecord
 from langchaint.generation.tables import RowValue, to_tables
 
 _PLAIN_TEXT_BINDING = Binding(
@@ -450,9 +449,9 @@ class AdapterConformance(ABC):
                 assert _costs_agree(_row_number(row, column), expected)
 
 
-def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallErrorRecord:
+def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallRecord:
     """Wrap one Billing in a result carrier, to reach to_tables with a single attempts row."""
-    return AbandonedCallErrorRecord(
+    return AbandonedCallRecord(
         call=CallRecord(
             model=adapter.model,
             provider_name=adapter.provider_name,

@@ -5,18 +5,17 @@ The tests inspect recorded span names, kinds, statuses, attributes, events, and 
 Tests of the pure content renderers call them directly.
 """
 
-import asyncio
 import functools
 import json
 import logging
 import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Literal, NamedTuple, assert_type, override
+from typing import ClassVar, Literal, NamedTuple, override
 
 import jsonschema
 import pytest
 from opentelemetry import trace
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv.attributes import error_attributes as error_semconv
@@ -25,24 +24,24 @@ from pydantic import BaseModel
 
 from langchaint import (
     LLM,
+    AbandonedCallRecord,
     AssistantMessage,
     AudioPart,
+    BoundLLM,
     CallResult,
-    CallResultRecord,
     ContentPart,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
     GenerationError,
-    GenerationErrorRecord,
     ImagePart,
     ImageUrlPart,
     JSONSchemaTool,
     PydanticTool,
     ReasoningPart,
     Response,
-    ResponseRecord,
+    StreamHandle,
     StreamItem,
     TextPart,
     ToolCall,
@@ -54,17 +53,14 @@ from langchaint import (
     UserMessage,
     to_tables,
 )
-from langchaint.adapter import AdapterResult, InvalidRequest, Refusal
+from langchaint.adapter import AdapterResult, AdapterStream, InvalidRequest, Refusal, RequestParams
 from langchaint.common.messages import StopReason
 from langchaint.span_parsing import generation_input_from_otel, parse_otel
 from langchaint.tracing import (
     AttributeMapper,
     ContentFilter,
+    OtelObserver,
     SpanAttributes,
-    TracedBoundLLM,
-    TracedLLM,
-    TracedStreamHandle,
-    TracedToolManager,
     _input_content_attributes,
     _output_content_attributes,
     _record_every_part,
@@ -78,10 +74,10 @@ from tests.fake_adapter import (
     REJECTED_TURN,
     USAGE,
     FakeAdapter,
+    FakeBoundAdapter,
     FakeStream,
     HangsAfterFirstItemStream,
     ScriptedResponse,
-    assert_the_first_open_runs_alone,
     billed,
     fast_shared_backoff,
 )
@@ -173,8 +169,8 @@ def _traced(
     attribute_mapper: AttributeMapper = gen_ai_attributes,
     extra_attributes: SpanAttributes | None = None,
     max_concurrent_requests: int = 8,
-) -> tuple[TracedLLM, InMemorySpanExporter]:
-    """Wrap `adapter` in a `TracedLLM` whose spans reach a schema-validating in-memory exporter.
+) -> tuple[LLM, InMemorySpanExporter]:
+    """Build an `LLM` over `adapter` whose `OtelObserver` spans reach a schema-validating in-memory exporter.
 
     `max_concurrent_requests=1` serializes a batch, so its item spans end in input order.
     """
@@ -182,22 +178,21 @@ def _traced(
     llm = LLM(
         adapter,
         shared_backoff=fast_shared_backoff(max_concurrent_requests=max_concurrent_requests),
+        observer=OtelObserver(
+            capture_message_content=capture_message_content,
+            attribute_mapper=attribute_mapper,
+            extra_attributes=extra_attributes,
+            tracer=tracer,
+        ),
     )
-    traced = TracedLLM(
-        llm,
-        capture_message_content=capture_message_content,
-        attribute_mapper=attribute_mapper,
-        extra_attributes=extra_attributes,
-        tracer=tracer,
-    )
-    return traced, exporter
+    return llm, exporter
 
 
 type _CallPath = Literal["generate", "stream"]
 
 
 async def _generate_through[ToolManagerT: ToolManager | None](
-    path: _CallPath, bound_llm: TracedBoundLLM[str, ToolManagerT]
+    path: _CallPath, bound_llm: BoundLLM[str, ToolManagerT]
 ) -> Response[str]:
     """Run one call through `generate_one`, or through `stream_one` drained before its `final()`.
 
@@ -230,68 +225,8 @@ def _captured(exporter: InMemorySpanExporter, key: str) -> object:
     return _json_attribute(span, key)
 
 
-class _RaisingSpanProcessor(SpanProcessor):
-    """A SpanProcessor whose on_end raises.
-
-    Span.end calls on_end with no guard of its own, so this raise reaches whatever ended the span.
-    on_end raises observably before SimpleSpanProcessor catches exporter failures.
-    """
-
-    @override
-    def on_end(self, span: ReadableSpan) -> None:
-        """Raise instead of exporting.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError("span processor boom")
-
-
-def _raising_processor_tracer() -> trace.Tracer:
-    """Build a recording tracer whose every span end raises out of its processor."""
-    tracer_provider = TracerProvider()
-    tracer_provider.add_span_processor(_RaisingSpanProcessor())
-    return tracer_provider.get_tracer("test")
-
-
-def test_a_span_processor_that_raises_on_end_does_not_destroy_a_result() -> None:
-    """A broken SpanProcessor costs the telemetry, never the result the call returned.
-
-    Each span-owning entry point suppresses SpanProcessor failures.
-    """
-
-    async def scenario() -> None:
-        """Drive each span-owning entry point under a tracer whose span end raises."""
-        tracer = _raising_processor_tracer()
-        traced = TracedLLM(
-            LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff()),
-            tracer=tracer,
-            capture_message_content=False,
-        )
-        bound = traced.bind()
-
-        assert (await bound.generate_one("hi")).output == "hi"
-        (row,) = await bound.generate_many(["hi"])
-        assert row.kind == "response"
-        assert row.output == "hi"
-
-        async with bound.stream_one("hi") as stream:
-            items = [item async for item in stream if isinstance(item, str)]
-            assert (await stream.final()).output == "".join(items)
-
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=False
-        )
-        outcome = await tool_manager.dispatch(
-            ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
-        )
-        assert outcome.kind == "handled"
-
-    run_with_timeout(scenario())
-
-
-class _IsRecordingRaisesSpan(NonRecordingSpan):
-    """A span whose is_recording raises, standing in for a third-party Span implementation."""
+class _RaisingSpan(NonRecordingSpan):
+    """A span whose is_recording and end raise, standing in for a broken Span implementation."""
 
     def __init__(self) -> None:
         super().__init__(trace.INVALID_SPAN_CONTEXT)
@@ -305,29 +240,68 @@ class _IsRecordingRaisesSpan(NonRecordingSpan):
         """
         raise RuntimeError("is_recording boom")
 
+    @override
+    def end(self, end_time: int | None = None) -> None:
+        """Raise instead of ending.
 
-class _IsRecordingRaisesTracer(trace.NoOpTracer):
-    """A tracer handing out spans whose is_recording raises."""
+        Raises:
+            RuntimeError: always.
+        """
+        raise RuntimeError("end boom")
+
+
+class _RaisingSpanTracer(trace.NoOpTracer):
+    """A tracer handing out spans whose is_recording and end raise."""
 
     @override
     def start_span(self, name: str, *_args: object, **_kwargs: object) -> trace.Span:
-        """Return the span whose is_recording raises, ignoring every span argument."""
-        return _IsRecordingRaisesSpan()
+        """Return the raising span, ignoring every span argument."""
+        return _RaisingSpan()
 
 
-def test_a_span_whose_is_recording_raises_does_not_displace_the_call_s_error() -> None:
+def test_a_span_that_raises_does_not_destroy_a_result() -> None:
+    """A broken span costs the telemetry, never the result the call returned.
+
+    Each span-owning entry point suppresses span failures.
+    """
+
+    async def scenario() -> None:
+        """Drive each span-owning entry point under a tracer whose spans raise."""
+        observer = OtelObserver(tracer=_RaisingSpanTracer(), capture_message_content=False)
+        llm = LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff(), observer=observer)
+        bound = llm.bind()
+
+        assert (await bound.generate_one("hi")).output == "hi"
+        (row,) = await bound.generate_many(["hi"])
+        assert row.kind == "response"
+        assert row.output == "hi"
+
+        async with bound.stream_one("hi") as stream:
+            items = [item async for item in stream if isinstance(item, str)]
+            assert (await stream.final()).output == "".join(items)
+
+        tool_manager = ToolManager([_echo_tool()], observer=observer)
+        outcome = await tool_manager.dispatch(
+            ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
+        )
+        assert outcome.kind == "handled"
+
+    run_with_timeout(scenario())
+
+
+def test_a_span_that_raises_does_not_displace_the_call_s_error() -> None:
     """A broken span cannot replace GenerationError."""
 
     async def scenario() -> None:
-        """Drive one failing generate_one under a tracer whose spans raise from is_recording."""
+        """Drive one failing generate_one under a tracer whose spans raise."""
         adapter = FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
-        traced = TracedLLM(
-            LLM(adapter, shared_backoff=fast_shared_backoff()),
-            tracer=_IsRecordingRaisesTracer(),
-            capture_message_content=True,
+        llm = LLM(
+            adapter,
+            shared_backoff=fast_shared_backoff(),
+            observer=OtelObserver(tracer=_RaisingSpanTracer(), capture_message_content=True),
         )
         with pytest.raises(GenerationError):
-            await traced.bind().generate_one("hi")
+            await llm.bind().generate_one("hi")
 
     run_with_timeout(scenario())
 
@@ -357,8 +331,8 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
 
     async def scenario() -> None:
         """Drive one generate_one to success and inspect the single finished span."""
-        traced, exporter = _traced(FakeAdapter(echo=True))
-        bound = traced.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
+        llm, exporter = _traced(FakeAdapter(echo=True))
+        bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
         result = await bound.generate_one("hi")
         assert result.kind == "response"
         assert result.output == "hi"
@@ -382,6 +356,58 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
             "langchaint.attempts": 1,
             "langchaint.cost_in_usd": 0.0,
         }
+
+    run_with_timeout(scenario())
+
+
+class _CurrentSpanRecordingBoundAdapter(FakeBoundAdapter):
+    """A fake bound adapter that records the current span at each open_stream call."""
+
+    def __init__(self, adapter: FakeAdapter) -> None:
+        """Start with no recorded span."""
+        super().__init__(adapter)
+        self.spans_current_at_open: list[trace.Span] = []
+
+    @override
+    async def open_stream(self, request: RequestParams) -> AdapterStream:
+        """Record the current span, then open as FakeBoundAdapter does.
+
+        Raises:
+            Exception: whatever FakeBoundAdapter.open_stream raises.
+        """
+        self.spans_current_at_open.append(trace.get_current_span())
+        return await super().open_stream(request)
+
+
+class _CurrentSpanRecordingAdapter(FakeAdapter):
+    """A fake adapter whose bound adapters record the current span at each open."""
+
+    _bound_adapter_class: ClassVar[type[FakeBoundAdapter]] = _CurrentSpanRecordingBoundAdapter
+
+
+@pytest.mark.parametrize("path", ["generate", "stream"])
+def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
+    path: _CallPath,
+) -> None:
+    """generate_one makes its chat span current, so spans that adapter and SDK code starts nest under it.
+
+    A stream leaves the caller's span current, because the caller's code runs between its items.
+    """
+
+    async def scenario() -> None:
+        """Run the call and compare the span current at open with the finished chat span."""
+        adapter = _CurrentSpanRecordingAdapter()
+        llm, exporter = _traced(adapter)
+        await _generate_through(path, llm.bind())
+        (bound_adapter,) = adapter.bound_adapters
+        assert isinstance(bound_adapter, _CurrentSpanRecordingBoundAdapter)
+        (span_current_at_open,) = bound_adapter.spans_current_at_open
+        (chat_span,) = exporter.get_finished_spans()
+        assert chat_span.context is not None
+        if path == "generate":
+            assert span_current_at_open.get_span_context() == chat_span.context
+        else:
+            assert span_current_at_open is trace.INVALID_SPAN
 
     run_with_timeout(scenario())
 
@@ -451,9 +477,9 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_calls_attrib
 
     async def scenario() -> None:
         """Drive the call under capture and inspect the error span."""
-        traced, exporter = _traced(case.adapter(), capture_message_content=True)
+        llm, exporter = _traced(case.adapter(), capture_message_content=True)
         with pytest.raises(GenerationError):
-            await _generate_through(path, traced.bind(system_prompt="be brief", max_attempts=2))
+            await _generate_through(path, llm.bind(system_prompt="be brief", max_attempts=2))
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == case.status_description
@@ -497,10 +523,10 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
     async def scenario() -> None:
         """Time out a traced call whose open hangs, then read the span."""
         adapter = FakeAdapter(hang_from_open=1)
-        traced, exporter = _traced(adapter)
+        llm, exporter = _traced(adapter)
         with pytest.raises(TimeoutError):
             await time_out_when(
-                traced.bind().generate_one("hi"), adapter.bound_adapters[0].hang_reached.is_set
+                llm.bind().generate_one("hi"), adapter.bound_adapters[0].hang_reached.is_set
             )
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
@@ -508,17 +534,14 @@ def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None
     run_with_timeout(scenario())
 
 
-def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> None:
-    """The traced handle surfaces the wrapped handle's abandoned, the only account of a cut-off stream.
-
-    TracedLLM preserves the source LLM's async context manager.
-    """
+def test_a_cancelled_stream_entry_ends_the_span_with_its_status_unset() -> None:
+    """A cancellation during __aenter__ ends the span and sets no status: nothing decided the call."""
 
     async def scenario() -> None:
-        """Time out an entry whose open never returns, then read the traced handle and the span."""
+        """Time out an entry whose open never returns, then read the span."""
         adapter = FakeAdapter(hang_from_open=1)
-        traced, exporter = _traced(adapter)
-        handle = traced.bind().stream_one("hi")
+        llm, exporter = _traced(adapter)
+        handle = llm.bind().stream_one("hi")
 
         async def enter_and_leave() -> None:
             """Enter the handle whose open never returns. time_out_when below cancels this."""
@@ -527,34 +550,33 @@ def test_a_cancelled_traced_stream_reads_its_abandoned_through_the_wrapper() -> 
 
         with pytest.raises(TimeoutError):
             await time_out_when(enter_and_leave(), adapter.bound_adapters[0].hang_reached.is_set)
-        assert handle.abandoned is not None
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
 
     run_with_timeout(scenario())
 
 
-async def _drain_by_iterating(handle: TracedStreamHandle[str]) -> None:
+async def _drain_by_iterating(handle: StreamHandle[str]) -> None:
     """Consume the stream item by item, never calling final()."""
     async for _ in handle:
         pass
 
 
-async def _drain_by_final(handle: TracedStreamHandle[str]) -> None:
+async def _drain_by_final(handle: StreamHandle[str]) -> None:
     """Ask final() for the Response, never iterating."""
     await handle.final()
 
 
 @pytest.mark.parametrize("drain", [_drain_by_iterating, _drain_by_final])
 def test_a_traced_streams_expired_deadline_takes_error_status(
-    drain: Callable[[TracedStreamHandle[str]], Awaitable[None]],
+    drain: Callable[[StreamHandle[str]], Awaitable[None]],
 ) -> None:
     """Stream deadlines record GenerationError for each drain method."""
 
     async def scenario() -> None:
         """Drain a stream that stalls after its first item, under a deadline it outlasts."""
-        traced, exporter = _traced(FakeAdapter(stream=HangsAfterFirstItemStream()))
-        handle = traced.bind().stream_one("hi", timeout_seconds=0.02)
+        llm, exporter = _traced(FakeAdapter(stream=HangsAfterFirstItemStream()))
+        handle = llm.bind().stream_one("hi", timeout_seconds=0.02)
 
         with pytest.raises(GenerationError):
             async with handle:
@@ -565,6 +587,7 @@ def test_a_traced_streams_expired_deadline_takes_error_status(
         assert span.status.description is None
         assert span.attributes is not None
         assert span.attributes[error_semconv.ERROR_TYPE] == "timed_out_error"
+        assert "gen_ai.response.time_to_first_chunk" in span.attributes
 
     run_with_timeout(scenario())
 
@@ -575,10 +598,10 @@ def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
     async def scenario() -> None:
         """Time out a traced batch whose opens hang, then read the spans."""
         adapter = FakeAdapter(hang_from_open=1)
-        traced, exporter = _traced(adapter)
+        llm, exporter = _traced(adapter)
         with pytest.raises(TimeoutError):
             await time_out_when(
-                traced.bind().generate_many(["a", "b"]),
+                llm.bind().generate_many(["a", "b"]),
                 lambda: adapter.bound_adapters[0].open_count == 2,
             )
         spans = exporter.get_finished_spans()
@@ -593,8 +616,8 @@ def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
 
     async def scenario() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
-        traced, exporter = _traced(FakeAdapter(scripted_attempts=[TransientError("boom")]))
-        response = await traced.bind().generate_one("hi")
+        llm, exporter = _traced(FakeAdapter(scripted_attempts=[TransientError("boom")]))
+        response = await llm.bind().generate_one("hi")
         assert response.attempts == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
@@ -611,8 +634,8 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
         adapter = FakeAdapter(echo=True, scripted_attempts=[billed(REFUSAL)])
-        traced, exporter = _traced(adapter, max_concurrent_requests=1)
-        results = await traced.bind().generate_many([
+        llm, exporter = _traced(adapter, max_concurrent_requests=1)
+        results = await llm.bind().generate_many([
             [UserMessage(content="a")],
             [UserMessage(content="b")],
             [UserMessage(content="c")],
@@ -642,19 +665,19 @@ def test_generate_many_maps_and_captures_each_item_from_its_own_result() -> None
         """Run a serialized two-item batch under a recording mapper and capture."""
         mapped_outputs: list[object] = []
 
-        def _mapper(result: CallResult[object]) -> SpanAttributes:
+        def _mapper(result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
             """Record the result mapped and emit it as an attribute."""
             output = result.output if result.kind == "response" else None
             mapped_outputs.append(output)
             return {"custom.mapped_output": str(output)}
 
-        traced, exporter = _traced(
+        llm, exporter = _traced(
             FakeAdapter(echo=True),
             capture_message_content=True,
             attribute_mapper=_mapper,
             max_concurrent_requests=1,
         )
-        results = await traced.bind().generate_many(["a", "b"])
+        results = await llm.bind().generate_many(["a", "b"])
         assert [result.output for result in results if result.kind == "response"] == ["a", "b"]
         assert mapped_outputs == ["a", "b"]
         spans = exporter.get_finished_spans()
@@ -683,8 +706,8 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
     async def scenario() -> None:
         """Persist two samples, reorder them around one new sample, and inspect the span count."""
         adapter = FakeAdapter(echo=True)
-        traced, exporter = _traced(adapter)
-        bound = traced.bind()
+        llm, exporter = _traced(adapter)
+        bound = llm.bind()
         resume_path = tmp_path / "records.json"
         first = await bound.generate_many_records(
             ["a", "b"],
@@ -716,8 +739,8 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
 
     async def scenario() -> None:
         """Iterate the stream fully, call final() twice, and inspect the single finished span."""
-        traced, exporter = _traced(FakeAdapter())
-        async with traced.bind().stream_one("hi") as stream:
+        llm, exporter = _traced(FakeAdapter())
+        async with llm.bind().stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
             response = await stream.final()
             assert await stream.final() is response
@@ -737,17 +760,46 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
     run_with_timeout(scenario())
 
 
-def test_stream_abandoned_in_context_ends_its_span() -> None:
-    """A stream partially iterated then abandoned inside async with ends its span in __aexit__."""
+@pytest.mark.parametrize("block_exit", ["break", "another_calls_generation_error"])
+def test_a_stream_block_left_after_its_first_item_reports_the_stream_call_with_status_unset(
+    block_exit: Literal["break", "another_calls_generation_error"],
+) -> None:
+    """Leaving the block early is no failure of the stream's call, which still reports its first chunk.
+
+    A GenerationError from another call that escapes the block belongs to the application.
+    The stream span reports its own call, never the other call's status or error.type.
+    """
 
     async def scenario() -> None:
-        """Break out after one item and confirm one span ended without error status."""
-        traced, exporter = _traced(FakeAdapter())
-        async with traced.bind().stream_one("hi") as stream:
-            async for _item in stream:
-                break
+        """Pull one item, leave the block as `block_exit` names, then read the stream span."""
+        llm, exporter = _traced(FakeAdapter())
+        other_llm = LLM(
+            FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")]),
+            shared_backoff=fast_shared_backoff(),
+        )
+
+        async def leave_after_the_first_item() -> None:
+            """Pull one item, then leave the block.
+
+            Raises:
+                GenerationError: `block_exit` runs the other call, whose request is invalid.
+            """
+            async with llm.bind().stream_one("hi") as stream:
+                _ = await anext(stream)
+                if block_exit == "another_calls_generation_error":
+                    await other_llm.bind().generate_one("hi")
+
+        if block_exit == "another_calls_generation_error":
+            with pytest.raises(GenerationError):
+                await leave_after_the_first_item()
+        else:
+            await leave_after_the_first_item()
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
+        assert span.attributes is not None
+        assert "error.type" not in span.attributes
+        assert span.attributes["langchaint.attempts"] == 1
+        assert "gen_ai.response.time_to_first_chunk" in span.attributes
 
     run_with_timeout(scenario())
 
@@ -760,8 +812,8 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
 
     async def scenario() -> None:
         """Enter and leave the context without driving the stream."""
-        traced, exporter = _traced(FakeAdapter())
-        async with traced.bind().stream_one("hi"):
+        llm, exporter = _traced(FakeAdapter())
+        async with llm.bind().stream_one("hi"):
             pass
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.UNSET
@@ -771,60 +823,13 @@ def test_stream_entered_but_never_iterated_emits_a_span() -> None:
     run_with_timeout(scenario())
 
 
-def test_traced_stream_iterated_after_the_block_touches_no_ended_span(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Iterating after the block raises from the inner handle without writing to the closed span.
-
-    Recording RuntimeError on the ended span would make the OTel SDK log a warning.
-    The test rejects that warning for an ordinary caller mistake.
-    """
-
-    async def scenario() -> None:
-        """Drain a stream, leave the block, then pull one more item."""
-        traced, exporter = _traced(FakeAdapter())
-        handle = traced.bind().stream_one("hi")
-        async with handle:
-            _ = [item async for item in handle]
-            await handle.final()
-        with (
-            caplog.at_level(logging.WARNING, logger="opentelemetry.sdk.trace"),
-            pytest.raises(RuntimeError, match="finished"),
-        ):
-            await anext(handle)
-        assert "ended span" not in caplog.text
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.OK
-
-    run_with_timeout(scenario())
-
-
-def test_traced_stream_second_entry_leaves_the_first_span_intact() -> None:
-    """Re-entering a traced handle raises without marking the completed stream's span failed."""
-
-    async def scenario() -> None:
-        """Drain a stream, leave the block, then enter the same handle again."""
-        traced, exporter = _traced(FakeAdapter())
-        handle = traced.bind().stream_one("hi")
-        async with handle:
-            _ = [item async for item in handle]
-            await handle.final()
-        with pytest.raises(RuntimeError, match="already entered"):
-            async with handle:
-                pass
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.OK
-
-    run_with_timeout(scenario())
-
-
 def test_stream_never_entered_emits_no_span() -> None:
     """stream_one does no I/O, so a handle abandoned without entering emits no span."""
 
     async def scenario() -> None:
         """Build a handle and drop it."""
-        traced, exporter = _traced(FakeAdapter())
-        _handle = traced.bind().stream_one("hi")
+        llm, exporter = _traced(FakeAdapter())
+        _handle = llm.bind().stream_one("hi")
         assert exporter.get_finished_spans() == ()
 
     run_with_timeout(scenario())
@@ -833,19 +838,17 @@ def test_stream_never_entered_emits_no_span() -> None:
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
     """A stream failure records GenerationError and attempt_failed."""
 
-    async def _drain(traced: TracedLLM) -> None:
+    async def _drain(llm: LLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
-        async with traced.bind().stream_one("hi") as stream:
+        async with llm.bind().stream_one("hi") as stream:
             async for _item in stream:
                 pass
 
     async def scenario() -> None:
         """Iterate a mid-failing stream and confirm the error span."""
-        traced, exporter = _traced(
-            FakeAdapter(stream=_MidFailStream(), classify_result="transient")
-        )
+        llm, exporter = _traced(FakeAdapter(stream=_MidFailStream(), classify_result="transient"))
         with pytest.raises(GenerationError):
-            await _drain(traced)
+            await _drain(llm)
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
@@ -875,8 +878,8 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
 
     async def scenario() -> None:
         """Run the selected call and inspect its request attributes."""
-        traced, exporter = _traced(FakeAdapter(echo=True))
-        bound = traced.bind(
+        llm, exporter = _traced(FakeAdapter(echo=True))
+        bound = llm.bind(
             response_format=response_format,
             max_completion_tokens=123,
             reasoning_level="high",
@@ -909,67 +912,6 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
     run_with_timeout(scenario())
 
 
-def test_traced_initial_and_replacement_bind_forward_binding_options() -> None:
-    """Forward binding options through initial, omitted, replacement, and clearing values."""
-    extra_body = {"safety_identifier": "user-7"}
-    provider_tool = {"type": "web_search"}
-    traced = TracedLLM(
-        LLM(FakeAdapter(automatic_cache_breakpoints_default=False)),
-        capture_message_content=False,
-    )
-    assert traced.bind().max_attempts == 3
-    bound = traced.bind(
-        extra_body=extra_body,
-        provider_executed_tools=[provider_tool],
-        automatic_cache_breakpoints=True,
-        max_completion_tokens=100,
-        reasoning_level="HIGH",
-        temperature=0.2,
-        max_attempts=2,
-    )
-    assert bound.binding.extra_body is extra_body
-    assert bound.binding.provider_executed_tools == (provider_tool,)
-    assert bound.binding.provider_executed_tools[0] is provider_tool
-    assert bound.binding.automatic_cache_breakpoints is True
-    assert bound.binding.max_completion_tokens == 100
-    assert bound.binding.reasoning_level == "HIGH"
-    assert bound.binding.temperature == 0.2
-    assert bound.max_attempts == 2
-
-    kept = bound.bind()
-    assert kept.binding.extra_body is extra_body
-    assert kept.binding.provider_executed_tools[0] is provider_tool
-    assert kept.binding.automatic_cache_breakpoints is True
-    assert kept.binding.max_completion_tokens == 100
-    assert kept.binding.reasoning_level == "HIGH"
-    assert kept.binding.temperature == 0.2
-    assert kept.max_attempts == 2
-
-    replacement = {"safety_identifier": "user-8"}
-    replacement_tool = {"type": "file_search"}
-    replaced = bound.bind(
-        extra_body=replacement,
-        provider_executed_tools=[replacement_tool],
-        automatic_cache_breakpoints=None,
-        max_completion_tokens=None,
-        reasoning_level="LOW",
-        temperature=0.8,
-        max_attempts=4,
-    )
-    assert replaced.binding.extra_body is replacement
-    assert replaced.binding.provider_executed_tools == (replacement_tool,)
-    assert replaced.binding.provider_executed_tools[0] is replacement_tool
-    assert replaced.binding.automatic_cache_breakpoints is False
-    assert replaced.binding.max_completion_tokens is None
-    assert replaced.binding.reasoning_level == "LOW"
-    assert replaced.binding.temperature == 0.8
-    assert replaced.max_attempts == 4
-
-    cleared = bound.bind(extra_body=None, provider_executed_tools=())
-    assert cleared.binding.extra_body is None
-    assert cleared.binding.provider_executed_tools == ()
-
-
 def test_mapper_not_invoked_on_a_non_recording_span() -> None:
     """A custom attribute_mapper never fires when the tracer's spans are non-recording."""
 
@@ -977,26 +919,26 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         """Generate under a no-op tracer and assert the mapper never ran."""
         calls: list[int] = []
 
-        def _mapper(_result: CallResult[object]) -> SpanAttributes:
+        def _mapper(_result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
             """Count each invocation."""
             calls.append(1)
             return {}
 
         tracer = trace.NoOpTracer()
-        traced = TracedLLM(
-            LLM(FakeAdapter()),
-            attribute_mapper=_mapper,
-            tracer=tracer,
-            capture_message_content=False,
+        llm = LLM(
+            FakeAdapter(),
+            observer=OtelObserver(
+                attribute_mapper=_mapper, tracer=tracer, capture_message_content=False
+            ),
         )
-        response = await traced.bind().generate_one("hi")
+        response = await llm.bind().generate_one("hi")
         assert response.output == "ok"
         assert calls == []
 
     run_with_timeout(scenario())
 
 
-def _raising_mapper(_result: CallResult[object]) -> SpanAttributes:
+def _raising_mapper(_result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
     """Raise to simulate a buggy user mapper.
 
     Raises:
@@ -1013,80 +955,15 @@ def test_raising_mapper_is_caught_and_the_result_survives(
 
     async def scenario() -> None:
         """Run the call under a mapper that raises and confirm the result and span survive."""
-        traced, exporter = _traced(FakeAdapter(), attribute_mapper=_raising_mapper)
+        llm, exporter = _traced(FakeAdapter(), attribute_mapper=_raising_mapper)
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
-            response = await _generate_through(path, traced.bind())
+            response = await _generate_through(path, llm.bind())
         assert response.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.OK
         assert any("mapper" in record.message for record in caplog.records)
 
     run_with_timeout(scenario())
-
-
-def _bind_overload_pin() -> None:
-    """Pin that the bind overloads mirror LLM.bind: a model gives TracedBoundLLM[Model], absent gives [str].
-
-    pyrefly type-checks this module, so a break in the overload split surfaces as a type error here.
-    Not a test: assert_type is a runtime no-op, so pytest could only ever report it as passing.
-    """
-    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
-    structured = traced.bind(response_format=_Answer)
-    assert_type(structured, TracedBoundLLM[_Answer])
-    text = traced.bind()
-    assert_type(text, TracedBoundLLM[str])
-    assert_type(text.bind(system_prompt="s"), TracedBoundLLM[str])
-    text_with_tools = traced.bind(tools=[_echo_tool()])
-    assert_type(text_with_tools, TracedBoundLLM[str, ToolManager])
-    structured_with_tools = traced.bind(
-        response_format=_Answer,
-        tools=[_echo_tool()],
-    )
-    assert_type(structured_with_tools, TracedBoundLLM[_Answer, ToolManager])
-    tool_manager = ToolManager([])
-    assert_type(
-        traced.bind(tools=tool_manager),
-        TracedBoundLLM[str, ToolManager],
-    )
-    assert_type(
-        structured.bind(tools=[_echo_tool()]),
-        TracedBoundLLM[_Answer, ToolManager],
-    )
-    assert_type(structured.bind(tools=tool_manager), TracedBoundLLM[_Answer, ToolManager])
-    assert_type(structured_with_tools.bind(tools=None), TracedBoundLLM[_Answer])
-
-
-async def _generate_many_records_overload_pin() -> None:
-    """Pin `TracedBoundLLM.generate_many_records` output types for text and structured bindings."""
-    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
-    text_records = await traced.bind().generate_many_records(
-        ["hi"], resume_path=pathlib.Path("records.json")
-    )
-    structured_records = await traced.bind(response_format=_Answer).generate_many_records(
-        ["hi"], resume_path=pathlib.Path("records.json")
-    )
-    structured_tool_records = await traced.bind(
-        response_format=_Answer, tools=[_echo_tool()]
-    ).generate_many_records(["hi"], resume_path=pathlib.Path("records.json"))
-    assert_type(text_records, list[ResponseRecord[str] | GenerationErrorRecord])
-    assert_type(
-        structured_records,
-        list[ResponseRecord[_Answer] | GenerationErrorRecord],
-    )
-    assert_type(structured_tool_records, list[CallResultRecord[_Answer]])
-
-
-async def _generic_batch_overload_pin[OutputT: str | BaseModel, ToolManagerT: ToolManager | None](
-    bound_llm: TracedBoundLLM[OutputT, ToolManagerT],
-) -> None:
-    assert_type(
-        await bound_llm.generate_many(["hi"]),
-        list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]],
-    )
-    assert_type(
-        await bound_llm.generate_many_records(["hi"], resume_path=pathlib.Path("records.json")),
-        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]],
-    )
 
 
 def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:
@@ -1102,19 +979,19 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
 
     A replacement binding keeps the mapper and extra_attributes.
     A mapper key of the same name as an extra wins at completion.
-    The wrapper-owned gen_ai.operation.name wins at span start.
+    The observer-owned gen_ai.operation.name wins at span start.
     """
 
     async def scenario() -> None:
         """Generate, stream, and batch on a replacement binding, then read every span."""
         mapped_models: list[str] = []
 
-        def _mapper(result: CallResult[object]) -> SpanAttributes:
+        def _mapper(result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
             """Record the call and emit one attribute from the result and one colliding with an extra."""
             mapped_models.append(result.model)
             return {"custom.model": result.model, "shared.key": "mapped"}
 
-        traced, exporter = _traced(
+        llm, exporter = _traced(
             FakeAdapter(echo=True),
             attribute_mapper=_mapper,
             extra_attributes={
@@ -1123,7 +1000,7 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
                 "gen_ai.operation.name": "not-the-operation",
             },
         )
-        replacement_bound = traced.bind(system_prompt="s").bind(system_prompt="s2")
+        replacement_bound = llm.bind(system_prompt="s").bind(system_prompt="s2")
         for path in ("generate", "stream"):
             await _generate_through(path, replacement_bound)
         await replacement_bound.generate_many(["a", "b"])
@@ -1131,7 +1008,7 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
         # One generate span, one stream span, and one span per batch item.
         assert len(spans) == 4
         assert mapped_models == ["fake-model"] * 4
-        # The wrapper sets the request attributes at span start, outside the mapper's control.
+        # The observer sets the request attributes at span start, outside the mapper's control.
         assert spans[0].attributes == {
             "gen_ai.operation.name": "chat",
             "gen_ai.output.type": "text",
@@ -1151,7 +1028,7 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
 
 
 class _EchoToolArgs(BaseModel):
-    """Arguments of the echo tool the TracedToolManager tests dispatch."""
+    """Arguments of the echo tool the dispatch span tests dispatch."""
 
     text: str
 
@@ -1252,7 +1129,7 @@ def _erring_tool() -> PydanticTool[_EchoToolArgs]:
     ],
     ids=["handled", "function_authored_failure", "invalid_tool_args", "unknown_tool"],
 )
-def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
+def test_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     build_tool: Callable[[], PydanticTool[_EchoToolArgs]],
     tool_call: ToolCall,
     expected_outcome_type: type[DispatchOutcome],
@@ -1273,8 +1150,9 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     async def scenario() -> None:
         """Dispatch the call and inspect the single finished span."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [build_tool()], tracer=tracer, capture_message_content=False
+        tool_manager = ToolManager(
+            [build_tool()],
+            observer=OtelObserver(tracer=tracer, capture_message_content=False),
         )
         outcome = await tool_manager.dispatch(tool_call)
         assert isinstance(outcome, expected_outcome_type)
@@ -1290,14 +1168,15 @@ def test_traced_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
     run_with_timeout(scenario())
 
 
-def test_traced_tool_manager_function_exception_marks_the_span_error_and_propagates() -> None:
+def test_tool_manager_function_exception_marks_the_span_error_and_propagates() -> None:
     """A tool-function defect records the exception, sets error status, and propagates."""
 
     async def scenario() -> None:
         """Dispatch a call whose function raises and inspect the error span."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_raising_tool()], tracer=tracer, capture_message_content=False
+        tool_manager = ToolManager(
+            [_raising_tool()],
+            observer=OtelObserver(tracer=tracer, capture_message_content=False),
         )
         with pytest.raises(RuntimeError, match="tool bug"):
             await tool_manager.dispatch(
@@ -1313,14 +1192,15 @@ def test_traced_tool_manager_function_exception_marks_the_span_error_and_propaga
     run_with_timeout(scenario())
 
 
-def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
+def test_tool_manager_dispatch_many_spans_every_call() -> None:
     """dispatch_many inherits per-call spans: two calls yield two execute_tool spans, outcomes ordered."""
 
     async def scenario() -> None:
         """Dispatch two calls concurrently and read both spans."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=False
+        tool_manager = ToolManager(
+            [_echo_tool()],
+            observer=OtelObserver(tracer=tracer, capture_message_content=False),
         )
         outcomes = await tool_manager.dispatch_many([
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}'),
@@ -1338,7 +1218,7 @@ def test_traced_tool_manager_dispatch_many_spans_every_call() -> None:
     run_with_timeout(scenario())
 
 
-def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
+def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
     """The dispatch span is current while the function runs: a span the function starts nests under it."""
 
     async def scenario() -> None:
@@ -1356,7 +1236,9 @@ def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
             args_model=_EchoToolArgs,
             function=nesting_tool_function,
         )
-        tool_manager = TracedToolManager([tool], tracer=tracer, capture_message_content=False)
+        tool_manager = ToolManager(
+            [tool], observer=OtelObserver(tracer=tracer, capture_message_content=False)
+        )
         await tool_manager.dispatch(
             ToolCall(id="call1", name="nesting", args_json='{"text": "x"}')
         )
@@ -1371,36 +1253,30 @@ def test_traced_tool_manager_span_is_current_inside_the_tool_function() -> None:
     run_with_timeout(scenario())
 
 
-def test_traced_initial_and_replacement_bind_preserve_tool_manager() -> None:
-    """`TracedLLM.bind` and `TracedBoundLLM.bind` preserve `tools=ToolManager(...)`."""
-    traced = TracedLLM(LLM(FakeAdapter()), capture_message_content=False)
-    bound_tool_manager = TracedToolManager([_echo_tool()], capture_message_content=False)
-    bound = traced.bind(tools=bound_tool_manager)
-    assert bound.tool_manager is bound_tool_manager
-    replacement_tool_manager = ToolManager([_echo_tool()])
-    replacement_bound = bound.bind(tools=replacement_tool_manager)
-    assert replacement_bound.tool_manager is replacement_tool_manager
+def test_bind_gives_the_observer_to_tool_managers_it_builds_from_sequences() -> None:
+    """`LLM.bind` and `BoundLLM.bind` pass the observer to a `ToolManager` built from a tool sequence.
 
-
-def test_traced_bind_sequences_construct_traced_tool_managers() -> None:
-    """`TracedLLM.bind` and `TracedBoundLLM.bind` construct `TracedToolManager` from sequences."""
+    A `ToolManager` the application built keeps its own observer, here none.
+    """
 
     async def scenario() -> None:
-        traced, exporter = _traced(
+        """Dispatch through two managers bind built and one the application built, then count spans."""
+        llm, exporter = _traced(
             FakeAdapter(),
             capture_message_content=True,
             extra_attributes={"gen_ai.agent.name": "agent_a"},
         )
-        bound = traced.bind(tools=[_echo_tool()])
+        bound = llm.bind(tools=[_echo_tool()])
         replacement_bound = bound.bind(tools=[_echo_tool()])
-        assert isinstance(bound.tool_manager, TracedToolManager)
-        assert isinstance(replacement_bound.tool_manager, TracedToolManager)
-        assert replacement_bound.tool_manager is not bound.tool_manager
+        unobserved_bound = bound.bind(tools=ToolManager([_echo_tool()]))
         await bound.tool_manager.dispatch(
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}')
         )
         await replacement_bound.tool_manager.dispatch(
             ToolCall(id="call2", name="echo", args_json='{"text": "b"}')
+        )
+        await unobserved_bound.tool_manager.dispatch(
+            ToolCall(id="call3", name="echo", args_json='{"text": "c"}')
         )
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
@@ -1429,39 +1305,19 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
     async def scenario() -> None:
         """Dispatch under extra_attributes claiming the key, and inspect the span."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
+        tool_manager = ToolManager(
             [_echo_tool()],
-            tracer=tracer,
-            extra_attributes={"gen_ai.agent.name": "agent_a", colliding_key: "spoofed"},
-            capture_message_content=False,
+            observer=OtelObserver(
+                tracer=tracer,
+                extra_attributes={"gen_ai.agent.name": "agent_a", colliding_key: "spoofed"},
+                capture_message_content=False,
+            ),
         )
         await tool_manager.dispatch(ToolCall(id="call1", name="echo", args_json='{"text": "a"}'))
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
         assert span.attributes["gen_ai.agent.name"] == "agent_a"
         assert span.attributes[colliding_key] == expected_value
-
-    run_with_timeout(scenario())
-
-
-def test_generate_many_passes_warm_cache_through() -> None:
-    """warm_cache reaches BoundLLM.generate_many: the warming item never overlaps a sibling."""
-
-    async def scenario() -> None:
-        """Hold the first open at a barrier and check that no sibling opens meanwhile."""
-        opens_pair_up = asyncio.Barrier(2)
-        adapter = FakeAdapter(echo=True, open_barrier=opens_pair_up)
-        traced, exporter = _traced(adapter)
-        task = asyncio.create_task(
-            traced.bind().generate_many(
-                [[UserMessage(content=str(index))] for index in range(3)], warm_cache=True
-            )
-        )
-        await assert_the_first_open_runs_alone(adapter, opens_pair_up)
-        results = await task
-        assert all(result.kind == "response" for result in results)
-        # The warming item is traced like every other item, so three items are three spans.
-        assert len(exporter.get_finished_spans()) == 3
 
     run_with_timeout(scenario())
 
@@ -1553,8 +1409,8 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
 
     async def scenario() -> None:
         """Generate over a Sequence[Message] carrying every message role and inspect the shapes."""
-        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        bound = traced.bind(system_prompt="replaced").bind(
+        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
+        bound = llm.bind(system_prompt="replaced").bind(
             system_prompt="be brief",
             tools=ToolManager([_echo_tool()]),
         )
@@ -1623,7 +1479,7 @@ _MULTIMODAL_USER_MESSAGE = UserMessage(
 
 
 def _drop_binary(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
-    """Keep every part except inline bytes, the filter the TracedLLM docstring shows."""
+    """Keep every part except inline bytes, the filter the OtelObserver docstring shows."""
     return None if part.kind in ("image", "audio") else part
 
 
@@ -1652,8 +1508,8 @@ def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> N
 
     async def scenario() -> None:
         """Generate over the multimodal message and read the recorded parts back."""
-        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        await traced.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
+        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
+        await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
         captured_parts = _captured_user_parts(exporter)
         schema_definitions = _payload_schema("gen-ai-input-messages.json")["$defs"]
         blob_parts = _parts_of_type(captured_parts, "blob")
@@ -1694,13 +1550,13 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
         """Generate over the multimodal message under _drop_binary and read the recorded parts back."""
         tracer, exporter = _in_memory_tracer()
         content_filter: ContentFilter = _drop_binary
-        traced = TracedLLM(
-            LLM(FakeAdapter()),
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=content_filter,
+        llm = LLM(
+            FakeAdapter(),
+            observer=OtelObserver(
+                tracer=tracer, capture_message_content=True, content_filter=content_filter
+            ),
         )
-        await traced.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
+        await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
         captured_parts = _captured_user_parts(exporter)
         assert [part.get("type") for part in captured_parts if isinstance(part, dict)] == [
             "text",
@@ -1746,38 +1602,32 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
                 TextPart(text=f"answer {_MARKER}"),
             )
         )
-        traced = TracedLLM(
-            LLM(
-                FakeAdapter(
-                    scripted_attempts=[
-                        ScriptedResponse(
-                            outcome=AdapterResult(
-                                output="answer",
-                                assistant_message=scripted_turn,
-                                stop_reason="end_turn",
-                            ),
-                            usage=USAGE,
-                        )
-                    ]
-                )
-            ),
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=_scrub_marker,
+        observer = OtelObserver(
+            tracer=tracer, capture_message_content=True, content_filter=_scrub_marker
         )
-        bound = traced.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
+        llm = LLM(
+            FakeAdapter(
+                scripted_attempts=[
+                    ScriptedResponse(
+                        outcome=AdapterResult(
+                            output="answer",
+                            assistant_message=scripted_turn,
+                            stop_reason="end_turn",
+                        ),
+                        usage=USAGE,
+                    )
+                ]
+            ),
+            observer=observer,
+        )
+        bound = llm.bind(system_prompt=f"rules {_MARKER}", tools=ToolManager([_echo_tool()]))
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
         await bound.generate_one([
             UserMessage(content=f"question {_MARKER}"),
             AssistantMessage(turn=(tool_call,)),
             ToolMessage(tool_call_id="call1", content=f"echoed {_MARKER}"),
         ])
-        tool_manager = TracedToolManager(
-            [_echo_tool()],
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=_scrub_marker,
-        )
+        tool_manager = ToolManager([_echo_tool()], observer=observer)
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             await tool_manager.dispatch(tool_call)
         assert "content capture raised" not in caplog.text
@@ -1820,7 +1670,9 @@ def test_system_instructions_render_one_element_per_part_and_omit_an_empty_array
 ) -> None:
     """A system prompt with no parts left to record omits its key, while the input messages stay."""
     binding = LLM(FakeAdapter()).bind(system_prompt=system_prompt).binding
-    attributes = _input_content_attributes(binding, "hi", content_filter=content_filter)
+    attributes = _input_content_attributes(
+        binding, [UserMessage(content="hi")], content_filter=content_filter
+    )
     instructions = attributes.get("gen_ai.system_instructions")
     assert (None if instructions is None else json.loads(str(instructions))) == (
         expected_instructions
@@ -1864,13 +1716,13 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
     async def scenario() -> None:
         """Run the call with input content that cannot be built, then read the span and the log."""
         tracer, exporter = _in_memory_tracer()
-        traced = TracedLLM(
-            LLM(FakeAdapter()),
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=content_filter,
+        llm = LLM(
+            FakeAdapter(),
+            observer=OtelObserver(
+                tracer=tracer, capture_message_content=True, content_filter=content_filter
+            ),
         )
-        bound = traced.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
+        bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             result = await _generate_through(path, bound)
         assert result.output == "ok"
@@ -1907,11 +1759,11 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
     async def scenario() -> None:
         """Dispatch under the mismatching filter, then read the span and the log."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
+        tool_manager = ToolManager(
             [_echo_tool()],
-            tracer=tracer,
-            capture_message_content=True,
-            content_filter=text_for_tool_call,
+            observer=OtelObserver(
+                tracer=tracer, capture_message_content=True, content_filter=text_for_tool_call
+            ),
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             outcome = await tool_manager.dispatch(
@@ -2006,8 +1858,8 @@ def test_tool_span_captures_arguments_and_result_under_capture(
     async def scenario() -> None:
         """Dispatch one call under capture and read both content keys."""
         tracer, exporter = _in_memory_tracer()
-        tool_manager = TracedToolManager(
-            [_echo_tool()], tracer=tracer, capture_message_content=True
+        tool_manager = ToolManager(
+            [_echo_tool()], observer=OtelObserver(tracer=tracer, capture_message_content=True)
         )
         outcome = await tool_manager.dispatch(tool_call)
         assert isinstance(outcome.tool_message.content, str)
@@ -2054,8 +1906,8 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
 
     async def scenario() -> None:
         """Generate over a turn holding one parseable and one unparseable tool call."""
-        traced, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        await traced.bind().generate_one([
+        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
+        await llm.bind().generate_one([
             AssistantMessage(
                 turn=(
                     ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
@@ -2100,9 +1952,9 @@ def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
                 billed(Refusal(assistant_message=turn)),
             ]
         )
-        traced, exporter = _traced(adapter, capture_message_content=capture_message_content)
+        llm, exporter = _traced(adapter, capture_message_content=capture_message_content)
         with pytest.raises(GenerationError) as raised:
-            await traced.bind(max_attempts=3).generate_one("hi")
+            await llm.bind(max_attempts=3).generate_one("hi")
 
         error = raised.value
         assert error.attempts == 2

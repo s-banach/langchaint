@@ -33,12 +33,12 @@ from events import (
     describe_error,
     gui_emitter_var,
 )
-from opentelemetry.trace import Tracer
 from tools import CritiqueVerdict, DelegateArgs, build_critique_tool, search_tool
 
 from langchaint import (
     LLM,
     ZERO_USAGE,
+    BoundLLM,
     DispatchExceptionGroup,
     DispatchManyOutcome,
     GenerationError,
@@ -54,7 +54,6 @@ from langchaint import (
     UserMessage,
     tool,
 )
-from langchaint.tracing import TracedBoundLLM, TracedLLM
 
 
 @dataclass(frozen=True)
@@ -211,7 +210,7 @@ class ReActAgent(AgentRun):
         config: AgentConfig,
         registry: dict[str, AgentRun],
         on_event: Callable[[Event], None],
-        bound: TracedBoundLLM[str, ToolManager],
+        bound: BoundLLM[str, ToolManager],
         prompt: str,
     ) -> None:
         """Store the loop state."""
@@ -221,7 +220,7 @@ class ReActAgent(AgentRun):
             registry=registry,
             on_event=on_event,
         )
-        self.bound: TracedBoundLLM[str, ToolManager] = bound
+        self.bound: BoundLLM[str, ToolManager] = bound
         self.prompt: str = prompt
         self.turn_number: int = 0
         self.tool_calls_made: int = 0
@@ -421,7 +420,7 @@ def _tools_for(
 
 def build_delegate_tool(
     *,
-    llm: TracedLLM,
+    llm: LLM,
     parent_path: str,
     sub_config: AgentConfig,
     registry: dict[str, AgentRun],
@@ -491,15 +490,13 @@ class App:
         *,
         llm: LLM,
         configs: Mapping[str, AgentConfig],
-        tracer: Tracer,
         on_event: Callable[[Event], None],
-        capture_message_content: bool,
     ) -> None:
-        """Store agent config and wrap llm for tracing.
+        """Store agent config.
 
-        capture_message_content configures each traced LLM and ToolManager.
+        The observer of llm follows every generation call and every tool dispatch of a tool manager bind builds.
         """
-        self._llm = TracedLLM(llm, capture_message_content=capture_message_content, tracer=tracer)
+        self._llm = llm
         self._configs = configs
         self._on_event = on_event
         self._runs: dict[str, AgentRun] = {}

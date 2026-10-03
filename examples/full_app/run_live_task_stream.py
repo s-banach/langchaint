@@ -4,11 +4,11 @@ import asyncio
 
 from config import build_configs
 from events import Event
-from opentelemetry import trace
 from render import render
 from task_stream import App
 
 from langchaint.openai import OpenAI
+from langchaint.tracing import OtelObserver
 
 MODEL = "gpt-5.6-terra"
 APP_TIMEOUT_SECONDS = 120.0
@@ -28,13 +28,11 @@ async def main() -> None:
         ExceptionGroup: A concurrent tool function raises.
         asyncio.CancelledError: The caller cancels the app.
     """
-    openai = OpenAI()
+    openai = OpenAI(observer=OtelObserver(capture_message_content=False))
     app = App(
         llm=openai.model(MODEL),
         configs=build_configs(),
-        tracer=trace.get_tracer("examples.full_app.live"),
         on_event=print_event,
-        capture_message_content=False,
     )
     async with asyncio.timeout(APP_TIMEOUT_SECONDS):
         await app.run()

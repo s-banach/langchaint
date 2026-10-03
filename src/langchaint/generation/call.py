@@ -3,7 +3,7 @@
 import math
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple, override
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, NamedTuple, override
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -11,7 +11,7 @@ from langchaint.adapter import ResponseIdentity
 from langchaint.billing.pricing import Billing, ProviderBilling
 from langchaint.billing.usage import ZERO_USAGE, Usage
 from langchaint.common.checked_copy import CheckedCopyModel
-from langchaint.common.messages import AssistantMessage
+from langchaint.common.messages import AssistantMessage, StopReason
 
 if TYPE_CHECKING:
     from langchaint.common.exceptions import TransientError
@@ -81,9 +81,14 @@ class SettledAttemptRecord(AttemptRecord):
 
 
 class CutOffAttemptRecord(AttemptRecord):
-    """One request whose ending langchaint did not observe."""
+    """One request whose ending langchaint did not observe.
+
+    `seconds_to_first_item` is `None` when no streamed item arrived before the cut-off.
+    Its default keeps records saved without it valid.
+    """
 
     started_after_seconds: _NonnegativeFiniteFloat
+    seconds_to_first_item: _NonnegativeFiniteFloat | None = None
     billing: Billing | None
     kind: Literal["cut_off"] = "cut_off"
 
@@ -168,6 +173,54 @@ class _CallResultRecordBase(CheckedCopyModel):
     def elapsed_seconds(self) -> float:
         """Return the complete call duration."""
         return self.call.elapsed_seconds
+
+    @property
+    def attempt_records(
+        self,
+    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
+        """Return the call's normalized attempt records."""
+        return self.call.attempt_records
+
+    @property
+    def assistant_message(self) -> AssistantMessage | None:
+        """Return the last recorded assistant message."""
+        for attempt in reversed(self.call.attempt_records):
+            if attempt.kind == "settled" and attempt.assistant_message is not None:
+                return attempt.assistant_message
+        return None
+
+
+def _require_abandoned_shape(call: CallRecord) -> None:
+    settled = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
+    final_is_cut_off = bool(call.attempt_records) and call.attempt_records[-1].kind == "cut_off"
+    if final_is_cut_off:
+        settled_prefix = settled
+    elif settled and settled[-1].error is None:
+        final = settled[-1]
+        if final.assistant_message is not None:
+            raise ValueError("the final settled request must be a terminal provider result")
+        settled_prefix = settled[:-1]
+    else:
+        settled_prefix = settled
+    if any(attempt.error is None for attempt in settled_prefix):
+        raise ValueError("settled attempts before the terminal request must contain errors")
+
+
+class AbandonedCallRecord(_CallResultRecordBase):
+    """A stream call whose block exited before a result or `GenerationError` recorded it.
+
+    The application ended the stream, so the call did not fail.
+    The record keeps the billing and first-item time of the request the exit cut off.
+    Validation rejects unknown fields.
+    """
+
+    stop_reason: ClassVar[StopReason | None] = None
+    kind: Literal["abandoned_call"] = "abandoned_call"
+
+    @model_validator(mode="after")
+    def _validate_abandoned_shape(self) -> "AbandonedCallRecord":
+        _require_abandoned_shape(self.call)
+        return self
 
 
 def _settled_attempts(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
@@ -365,6 +418,7 @@ class _CallLedger:
         ended_at_monotonic_seconds = time.monotonic()
         cut_off_in_flight = self._attempt_in_flight and self._staged_response is None
         attempt_started_at_monotonic_seconds = self._attempt_started_at_monotonic_seconds
+        first_item_at_monotonic_seconds = self._first_item_at_monotonic_seconds
         call = self.freeze_ending_at(ended_at_monotonic_seconds)
         provider_attempts = self.provider_attempts
         if not cut_off_in_flight:
@@ -373,6 +427,11 @@ class _CallLedger:
         cut_off = CutOffAttemptRecord(
             started_after_seconds=attempt_started_at_monotonic_seconds
             - self._started_at_monotonic_seconds,
+            seconds_to_first_item=(
+                None
+                if first_item_at_monotonic_seconds is None
+                else first_item_at_monotonic_seconds - attempt_started_at_monotonic_seconds
+            ),
             billing=None if provider_billing is None else provider_billing.billing,
         )
         return (

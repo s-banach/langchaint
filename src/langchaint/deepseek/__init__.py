@@ -30,6 +30,7 @@ from openai.types.completion_usage import CompletionUsage
 
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
+from langchaint.generation.observer import Observer
 from langchaint.openai.chat_completions_adapter import OpenAIChatCompletionsAdapter
 from langchaint.openai.shared import (
     OpenAIPricingTable,
@@ -84,7 +85,7 @@ def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
 class DeepSeek:
     """Create `LLM` values for DeepSeek."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         client: AsyncOpenAI | None = None,
@@ -94,6 +95,7 @@ class DeepSeek:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `DeepSeek` without sending a request.
 
@@ -104,11 +106,14 @@ class DeepSeek:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: `client` is absent and `DEEPSEEK_API_KEY` is unset.
                 Also raised when a `SharedBackoff` setting is invalid.
         """
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_openai,
             failure_types=OpenAIChatCompletionsAdapter.failure_types,
@@ -179,7 +184,7 @@ class DeepSeek:
             supports_prompt_cache_options=False,
             cache_read_tokens_from_usage=cache_read_tokens_from_usage_deepseek,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
 
 __all__ = [

@@ -46,6 +46,7 @@ from langchaint.gemini.generate_content_adapter import (
     parse_gemini,
 )
 from langchaint.generation.llm import LLM
+from langchaint.generation.observer import Observer
 
 type GeminiModelName = Literal[
     "gemini-3.6-flash",
@@ -119,7 +120,7 @@ _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 class Gemini:
     """Create `LLM` values for Gemini."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         client: genai.Client | None = None,
@@ -129,6 +130,7 @@ class Gemini:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `Gemini` without sending a request.
 
@@ -140,11 +142,14 @@ class Gemini:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: `client` is absent and no API key is available.
                 Also raised when a `SharedBackoff` setting is invalid.
         """
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_gemini,
             failure_types=GeminiGenerateContentAdapter.failure_types,
@@ -210,7 +215,7 @@ class Gemini:
             provider_name="gcp.gemini",
             service_tier=service_tier,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
 
 __all__ = [

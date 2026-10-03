@@ -1,7 +1,7 @@
 """Live generation results and normalized result records."""
 
 from dataclasses import dataclass
-from typing import Annotated, Generic, Literal, Self, TypeVar
+from typing import Annotated, Generic, Literal, Self, TypeVar, override
 
 from pydantic import BaseModel, Field, SerializeAsAny, model_validator
 
@@ -20,7 +20,6 @@ from langchaint.generation.call import (
 )
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
-    AbandonedCallErrorRecord,
     ContextWindowExceededErrorRecord,
     EmptyTurnErrorRecord,
     GenerationError,
@@ -53,6 +52,7 @@ class _SuccessRecordBase(_CallResultRecordBase):
         return self
 
     @property
+    @override
     def attempt_records(
         self,
     ) -> tuple[SettledAttemptRecord, ...]:
@@ -60,6 +60,7 @@ class _SuccessRecordBase(_CallResultRecordBase):
         return _settled_attempts(self.call)
 
     @property
+    @override
     def assistant_message(self) -> AssistantMessage:
         """Return the successful attempt's assistant message."""
         final = self.call.attempt_records[-1]
@@ -316,13 +317,11 @@ def _call_result_from_response_outcome[OutputT](
     )
 
 
-def _abandoned_call_error(
-    record_class: type[AbandonedCallErrorRecord] | type[TimedOutErrorRecord],
-    ledger: _CallLedger,
-    billing_in_flight: ProviderBilling | None = None,
+def _timed_out_error(
+    ledger: _CallLedger, billing_in_flight: ProviderBilling | None = None
 ) -> GenerationError:
-    """Build a live interrupted failure with one normalized cut-off request."""
+    """Build the expired deadline's failure with one normalized cut-off request."""
     call, provider_attempts = ledger.freeze_with_cut_off(billing_in_flight)
     return GenerationError(
-        record=record_class(call=call), request=None, provider_attempts=provider_attempts
+        record=TimedOutErrorRecord(call=call), request=None, provider_attempts=provider_attempts
     )

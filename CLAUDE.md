@@ -125,6 +125,8 @@ Document every public parameter and cross-provider difference.
 ## Tracing
 
 - Keep OTel tracing in a guarded-import subpackage outside top-level `__all__`.
+- Connect tracing to the core only through the SDK-free `Observer`, so application code is the same with or without tracing.
+- A backend constructor passes its `observer` to every `LLM` it creates, and `LLM(observer=...)` and `ToolManager(observer=...)` accept one directly.
 - Use OTel SDK configuration to enable, disable, and route tracing.
 - Never make a span measure an event boundary that did not occur.
 - Limit an attribute mapper's output to attribute names and values.
@@ -150,6 +152,8 @@ Document every public parameter and cross-provider difference.
 - `generation/tables.py`: tabular call and attempt views.
 - `generation/call.py`: attempt records, immutable call history, and retry accounting.
 - `generation/streaming.py`: the stream handle.
+- `generation/observer.py`: the protocol that follows every generation call and tool dispatch.
+- `common/observed_operation.py`: the handle an observer returns for one operation and the guard that logs observer failures, without langchaint imports.
 - `tools.py`: tool forms, dispatch, dispatch outcomes, and tool exceptions.
 - `common/messages.py`: provider-neutral messages, content parts, and JSON round trips.
 - `billing/usage.py`: token accounting and per-category costs.
@@ -158,7 +162,7 @@ Document every public parameter and cross-provider difference.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: backend subpackages that require their SDKs.
 - `concurrency/run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
 - `common/sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
-- `tracing/`: the optional OTel subpackage.
+- `tracing/`: the optional OTel subpackage and its `OtelObserver`.
 - `span_parsing.py`: OTel chat span parsing and conversion without OpenTelemetry dependencies.
 
 ## Checks

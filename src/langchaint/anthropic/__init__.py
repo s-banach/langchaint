@@ -59,6 +59,7 @@ from langchaint.anthropic.messages_adapter import (
 )
 from langchaint.concurrency.shared_backoff import SharedBackoff
 from langchaint.generation.llm import LLM
+from langchaint.generation.observer import Observer
 
 _PRICING_BY_MODEL_ID = dict[str, AnthropicPricingTable](ANTHROPIC_PRICING.items())
 """`ANTHROPIC_PRICING` with `str` keys for runtime model lookup."""
@@ -144,7 +145,7 @@ _BEDROCK_CLIENT_CLASS: dict[
 class Anthropic:
     """Create `LLM` values for Anthropic."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         client: AsyncAnthropic | None = None,
@@ -154,6 +155,7 @@ class Anthropic:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `Anthropic` without sending a request.
 
@@ -165,10 +167,13 @@ class Anthropic:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: A `SharedBackoff` setting is invalid.
         """
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_anthropic,
             failure_types=AnthropicMessagesAdapter.failure_types,
@@ -248,13 +253,13 @@ class Anthropic:
             service_tier=service_tier,
             inference_geo=inference_geo,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
 
 class AnthropicBedrock:
     """Create `LLM` values for Anthropic models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
+    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
         self,
         *,
         aws_region: str | None = None,
@@ -267,6 +272,7 @@ class AnthropicBedrock:
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
         quiet_seconds_per_decay_step: float = 60.0,
+        observer: Observer | None = None,
     ) -> None:
         """Build `AnthropicBedrock` without sending a request.
 
@@ -279,6 +285,8 @@ class AnthropicBedrock:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer=None` follows none.
 
         Raises:
             ValueError: `client` accompanies `aws_region` or `http_client`.
@@ -288,6 +296,7 @@ class AnthropicBedrock:
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None and http_client is not None:
             raise ValueError("Pass at most one of client= or http_client=")
+        self._observer = observer
         self._shared_backoff = SharedBackoff(
             parse=parse_anthropic,
             failure_types=AnthropicMessagesAdapter.failure_types,
@@ -343,7 +352,7 @@ class AnthropicBedrock:
             default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         )
-        return LLM(adapter, shared_backoff=self._shared_backoff)
+        return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)
 
     def _client_for(
         self, routing: BedrockRouting | None, model: str

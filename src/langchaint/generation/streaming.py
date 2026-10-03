@@ -9,7 +9,7 @@ One `SharedBackoff.admitted` block spans the open stream's lifetime.
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from types import TracebackType
 from typing import Literal, Never, overload
 
@@ -25,6 +25,7 @@ from langchaint.adapter import (
 from langchaint.billing.pricing import ProviderBilling
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import Message
+from langchaint.common.observed_operation import ObservedOperation
 from langchaint.concurrency.shared_backoff import (
     Admission,
     PrivateBackoff,
@@ -37,14 +38,12 @@ from langchaint.failure_step import (
     _RetryStep,
     _transient_error_for_step,
 )
-from langchaint.generation.call import _CallLedger
+from langchaint.generation.call import AbandonedCallRecord, _CallLedger
 from langchaint.generation.errors import (
-    AbandonedCallErrorRecord,
     GenerationError,
     InvalidRequestErrorRecord,
     RetriesExhaustedErrorRecord,
     RetryUnavailableErrorRecord,
-    TimedOutErrorRecord,
     _terminal_generation_error,
 )
 from langchaint.generation.response import (
@@ -52,8 +51,8 @@ from langchaint.generation.response import (
     GenerateResult,
     Response,
     ToolCallTurn,
-    _abandoned_call_error,
     _call_result_from_response_outcome,
+    _timed_out_error,
 )
 
 type _State = Literal["unopened", "open", "finished"]
@@ -91,7 +90,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
     An open-stream transient failure raises `GenerationError`.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 (stores each piece of the request)
         self,
         *,
         adapter: Adapter,
@@ -101,8 +100,18 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         max_attempts: int,
         timeout_seconds: float | None,
         splits_tool_call_turns: bool,
+        generation_started: Callable[
+            [], ObservedOperation[GenerateResult[object] | AbandonedCallRecord]
+        ],
     ) -> None:
-        """Store the request."""
+        """Store the request.
+
+        `generation_started` starts following the call when the handle is entered.
+        """
+        self._generation_started = generation_started
+        self._operation: ObservedOperation[GenerateResult[object] | AbandonedCallRecord] | None = (
+            None
+        )
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages
@@ -112,10 +121,14 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         self._timeout_seconds = timeout_seconds
         self._splits_tool_call_turns = splits_tool_call_turns
         self._deadline: asyncio.Timeout | None = None
-        self.abandoned: AbandonedCallErrorRecord | None = None
-        """The interrupted call account, or `None`.
+        self.abandoned: AbandonedCallRecord | None = None
+        """The account of a call that no result or `GenerationError` records, or `None`.
 
-        Cancellation sets this value before the caller receives `asyncio.CancelledError`.
+        Leaving the block before the conclusion, an exception raised inside it, and cancellation each set this value.
+        A `StreamProtocolError` or `ParserContractError` conclusion records no billing.
+        Leaving the block after one therefore also sets this value.
+        It holds the billing and first-item time of the request the exit cut off.
+        Cancellation sets it before the caller receives `asyncio.CancelledError`.
         A success or `GenerationError` leaves this value as `None`.
         An expired `timeout_seconds` raises `GenerationError` and leaves this value as `None`.
         """
@@ -145,6 +158,22 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
         """
         if self._state != "unopened":
             raise RuntimeError(_ALREADY_ENTERED_MESSAGE)
+        self._operation = self._generation_started()
+        try:
+            await self._open()
+        except Exception as exc:
+            self._end_operation(exc)
+            raise
+        except BaseException:
+            self._end_operation(None)
+            raise
+        return self
+
+    async def _open(self) -> None:
+        """Open the request under the deadline.
+
+        Raises what `__aenter__` documents.
+        """
         self._state = "open"
         self._deadline = asyncio.timeout(self._timeout_seconds)
         await self._deadline.__aenter__()
@@ -162,11 +191,10 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             await self._exit_admission(None)
             billing_in_flight = self._billing_reported()
             if await self._close_deadline(exc):
-                raise self._timed_out_error(billing_in_flight) from None
+                raise _timed_out_error(self._ledger, billing_in_flight) from None
             if isinstance(exc, asyncio.CancelledError):
-                self._set_abandoned(billing_in_flight)
+                self._abandon(billing_in_flight)
             raise
-        return self
 
     async def __aexit__(
         self,
@@ -176,26 +204,49 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
     ) -> None:
         """Close the deadline, connection, and admission.
 
-        Cancellation sets `abandoned` unless a result already records the call.
+        Leaving the block sets `abandoned` unless a conclusion already records the call.
         An expired `timeout_seconds` raises `GenerationError` instead.
+        A call without a conclusion concludes with the expiry's `GenerationError` or with `abandoned`.
 
         Raises:
             GenerationError: `timeout_seconds` expires before the block finishes.
             BaseException: Closing the adapter stream raises a non-`Exception` value.
         """
+        try:
+            await self._close(exc)
+        except GenerationError as timed_out:
+            self._end_operation(timed_out)
+            raise
+        finally:
+            self._end_operation(None)
+
+    def _end_operation(
+        self, conclusion: GenerateResult[OutputT] | AbandonedCallRecord | Exception | None
+    ) -> None:
+        """Give the observer the call's conclusion, when there is one, and end the operation once."""
+        operation, self._operation = self._operation, None
+        if operation is None:
+            return
+        if conclusion is not None:
+            operation.conclude(conclusion)
+        operation.end()
+
+    async def _close(self, exc: BaseException | None) -> None:
+        """Close the deadline, connection, and admission after the block ends with `exc`.
+
+        Raises what `__aexit__` documents.
+        """
         self._state = "finished"
         # Read before the close, which drops the stream that reports it.
-        billing_in_flight = (
-            self._billing_reported() if isinstance(exc, asyncio.CancelledError) else None
-        )
+        billing_in_flight = self._billing_reported()
         timed_out = await self._close_deadline(exc)
         try:
             await self._close_adapter_stream()
         finally:
-            if isinstance(exc, asyncio.CancelledError) and not timed_out:
-                self._set_abandoned(billing_in_flight)
+            if not timed_out:
+                self._abandon(billing_in_flight)
         if timed_out:
-            raise self._timed_out_error(billing_in_flight) from None
+            raise _timed_out_error(self._ledger, billing_in_flight) from None
 
     async def _close_deadline(self, exc: BaseException | None) -> bool:
         """Close the deadline and return whether it caused the current cancellation.
@@ -215,10 +266,6 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             return True
         return False
 
-    def _timed_out_error(self, billing_in_flight: ProviderBilling | None) -> GenerationError:
-        """Freeze the ledger into this call's deadline account."""
-        return _abandoned_call_error(TimedOutErrorRecord, self._ledger, billing_in_flight)
-
     def _billing_reported(self) -> ProviderBilling | None:
         """Ask the open stream what the provider has reported, or None where it reported nothing.
 
@@ -228,15 +275,16 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
             return None
         return self._adapter_stream.billing_reported()
 
-    def _set_abandoned(self, billing_in_flight: ProviderBilling | None) -> None:
-        """Set `abandoned` when no conclusion already accounts for the call.
+    def _abandon(self, billing_in_flight: ProviderBilling | None) -> None:
+        """Set `abandoned` and conclude the operation with it, when no conclusion already accounts for the call.
 
         Include billing reported by the interrupted attempt.
         """
         if self._conclusion_carried_the_call:
             return
         call, _ = self._ledger.freeze_with_cut_off(billing_in_flight)
-        self.abandoned = AbandonedCallErrorRecord(call=call)
+        self.abandoned = AbandonedCallRecord(call=call)
+        self._end_operation(self.abandoned)
 
     async def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
         """Exit the held admission and return its `Verdict`.
@@ -385,6 +433,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 # `abandoned` records that condition.
                 self._conclusion = exc
                 self._conclusion_carried_the_call = isinstance(exc, GenerationError)
+                self._end_operation(exc)
                 await self._close_deadline(exc)
             raise
 
@@ -485,9 +534,11 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
                 # A raise after that record could let a second call record the attempt again.
                 if isinstance(exc, Exception):
                     self._conclusion = exc
+                    self._end_operation(exc)
                     await self._close_deadline(exc)
                 raise
             self._conclusion_carried_the_call = True
+            self._end_operation(self._conclusion)
             await self._close_deadline(None)
         if isinstance(self._conclusion, (Response, ToolCallTurn)):
             return self._conclusion

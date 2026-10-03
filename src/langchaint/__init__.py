@@ -59,6 +59,7 @@ from langchaint.concurrency.shared_backoff import (
     Verdict,
 )
 from langchaint.generation.call import (
+    AbandonedCallRecord,
     AttemptProviderData,
     AttemptRecord,
     CallRecord,
@@ -67,7 +68,6 @@ from langchaint.generation.call import (
     TransientErrorRecord,
 )
 from langchaint.generation.errors import (
-    AbandonedCallErrorRecord,
     AuthErrorRecord,
     ContextWindowExceededErrorRecord,
     EmptyTurnErrorRecord,
@@ -151,7 +151,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "LLM",
     "ZERO_USAGE",
-    "AbandonedCallErrorRecord",
+    "AbandonedCallRecord",
     "Admission",
     "AllowedToolsChoice",
     "AssistantMessage",

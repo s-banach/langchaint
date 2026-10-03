@@ -36,7 +36,7 @@ from task_stream import (
 )
 
 from langchaint import ZERO_USAGE, DispatchExceptionGroup, ToolCall, tool
-from langchaint.tracing import TracedLLM
+from langchaint.tracing import OtelObserver
 from tests.full_app_support.scenarios import build_scripts
 from tests.full_app_support.scripted_adapter import Turn, build_llm, call
 from tests.helpers import run_with_timeout
@@ -85,13 +85,10 @@ def _build_app(
         climate_started, energy_started = second_calls_started
         scripts[configs["research_climate"].system_prompt][1].started = climate_started
         scripts[configs["research_energy"].system_prompt][1].started = energy_started
-    return App(
-        llm=build_llm(scripts),
-        configs=configs,
-        tracer=tracer_provider.get_tracer("full_app.test"),
-        on_event=on_event,
-        capture_message_content=False,
+    observer = OtelObserver(
+        capture_message_content=False, tracer=tracer_provider.get_tracer("full_app.test")
     )
+    return App(llm=build_llm(scripts, observer=observer), configs=configs, on_event=on_event)
 
 
 async def _expire_after_second_calls_start(
@@ -287,14 +284,9 @@ def test_delegate_propagates_a_tool_function_defect(monkeypatch: pytest.MonkeyPa
         raise RuntimeError(f"search defect for {args.query}")
 
     monkeypatch.setattr(task_stream, "search_tool", broken_search)
-    tracer = TracerProvider().get_tracer("full_app.test")
     registry: dict[str, AgentRun] = {}
     specialist_prompt = "Answer the question."
-    llm = TracedLLM(
-        build_llm({specialist_prompt: [Turn(tool_calls=(call("search", '{"query": "q"}'),))]}),
-        capture_message_content=False,
-        tracer=tracer,
-    )
+    llm = build_llm({specialist_prompt: [Turn(tool_calls=(call("search", '{"query": "q"}'),))]})
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",
@@ -406,15 +398,10 @@ def test_a_failed_sub_agent_becomes_a_tool_message_and_the_parent_still_answers(
 
 def test_each_delegate_call_registers_a_fresh_spawn_indexed_run() -> None:
     """Each delegate call registers a distinct spawn-indexed run."""
-    tracer = TracerProvider().get_tracer("full_app.test")
     registry: dict[str, AgentRun] = {}
     # The shared script provides one turn to each spawn.
     specialist_prompt = "Answer the question."
-    llm = TracedLLM(
-        build_llm({specialist_prompt: [Turn(text="first"), Turn(text="second")]}),
-        capture_message_content=False,
-        tracer=tracer,
-    )
+    llm = build_llm({specialist_prompt: [Turn(text="first"), Turn(text="second")]})
     delegate_tool = build_delegate_tool(
         llm=llm,
         parent_path="root/parent",

@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from langchaint import Message, UserMessage, tool
 from langchaint.openai import OpenAI
-from langchaint.tracing import TracedLLM
+from langchaint.tracing import OtelObserver
 
 
 class WeatherArgs(BaseModel):
@@ -34,13 +34,8 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
     tracer = tracer_provider.get_tracer("langchaint.example")
 
-    openai = OpenAI()
-    traced = TracedLLM(
-        openai.model("gpt-5.6-terra"),
-        capture_message_content=False,
-        tracer=tracer,
-    )
-    bound = traced.bind(
+    openai = OpenAI(observer=OtelObserver(capture_message_content=False, tracer=tracer))
+    bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Use tools when needed.",
         tools=[get_weather],
     )

@@ -1,6 +1,6 @@
 """Test provider-neutral adapter helpers.
 
-retry_after_seconds_from_headers tests header precedence and units.
+retry_after_seconds_from_headers tests header precedence, units, and HTTP dates that email.utils cannot convert.
 request_json and narrowed_request tests use local request values.
 """
 
@@ -37,6 +37,9 @@ from langchaint.adapter import (
         ({"retry-after-ms": "0"}, None),
         ({"retry-after-ms": "soon"}, None),
         ({"retry-after-ms": "0", "retry-after": "soon"}, None),
+        ({"retry-after": "Mon, 01 Jan 99999 00:00:00 GMT"}, None),
+        ({"retry-after": "Mon, 01 Jan 99999999999999999999 00:00:00 GMT"}, None),
+        ({"retry-after": "Mon, 01 Jan 2026 00:00:00 -" + "9" * 400 + " GMT"}, None),
     ],
     ids=[
         "no_headers",
@@ -54,6 +57,9 @@ from langchaint.adapter import (
         "zero_milliseconds_alone",
         "unparseable_milliseconds_alone",
         "unusable_milliseconds_then_unparseable_seconds",
+        "http_date_year_past_9999",
+        "http_date_year_past_c_long",
+        "http_date_offset_past_float",
     ],
 )
 def test_retry_after_seconds_from_headers(

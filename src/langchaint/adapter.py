@@ -57,6 +57,7 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
     `retry-after-ms` contains milliseconds.
     `retry-after` contains seconds or a GMT HTTP date.
     Return `None` when neither header contains a positive delay.
+    Never raises, so a parse function can call it on any provider headers.
 
     Args:
         headers: The provider response headers.
@@ -83,12 +84,21 @@ def retry_after_seconds_from_headers(headers: Mapping[str, str]) -> float | None
 
 
 def _retry_after_seconds_from_http_date(retry_after_header: str) -> float | None:
+    """Return the seconds until a GMT HTTP date, or None for a past or unconvertible date.
+
+    On Python 3.14, `email.utils.mktime_tz` raises `ValueError` for a year outside 1..9999.
+    It raises `OverflowError` for a year above 2**31 - 1.
+    A numeric field with hundreds of digits gives an integer whose difference with `time.time()` raises `OverflowError`.
+    """
     if not retry_after_header.endswith("GMT"):
         return None
     parsed = email.utils.parsedate_tz(retry_after_header)
     if parsed is None:
         return None
-    retry_after_seconds = email.utils.mktime_tz(parsed) - time.time()
+    try:
+        retry_after_seconds = email.utils.mktime_tz(parsed) - time.time()
+    except (OverflowError, ValueError):
+        return None
     if retry_after_seconds > 0:
         return retry_after_seconds
     return None

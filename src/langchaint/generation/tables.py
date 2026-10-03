@@ -18,7 +18,6 @@ from langchaint.generation.response import (
     CallResultRecord,
     Response,
     ToolCallTurn,
-    _result_record,
     _SuccessRecordBase,
 )
 
@@ -138,16 +137,13 @@ def to_tables[OutputT](
     calls: list[dict[str, RowValue]] = []
     attempts: list[dict[str, RowValue]] = []
     for call_id, value in enumerate(values):
-        record = value if isinstance(value, AbandonedCallRecord) else _result_record(value)
+        if isinstance(value, (Response, ToolCallTurn, GenerationError)):
+            record = value.record
+            provider_attempts = value.provider_attempts
+        else:
+            record = value
+            provider_attempts = ()
         live_error = value if isinstance(value, GenerationError) else None
-        live_success = value if isinstance(value, (Response, ToolCallTurn)) else None
-        provider_attempts = (
-            live_error.provider_attempts
-            if live_error is not None
-            else live_success.provider_attempts
-            if live_success is not None
-            else ()
-        )
         is_error = isinstance(record, _GenerationErrorRecordBase)
         is_success = isinstance(record, _SuccessRecordBase)
         calls.append({

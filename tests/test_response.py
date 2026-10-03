@@ -526,6 +526,13 @@ def test_to_tables_reads_live_only_request_and_provider_usage() -> None:
     assert live_tables.attempts[0]["usage_raw_json"] == '{"billed_units":17}'
     assert normalized_tables.attempts[0]["usage_raw_json"] is None
     assert live_tables.attempts[0]["started_after_seconds"] == 0.0
+    response = Response(
+        record=ResponseRecord(
+            output=Report(value=5), call=_completed_turn_call(), stop_reason="end_turn"
+        ),
+        provider_attempts=_provider_attempts(),
+    )
+    assert to_tables(response).attempts[0]["usage_raw_json"] == '{"billed_units":17}'
 
 
 def test_to_tables_emits_one_row_for_a_cut_off_attempt() -> None:
@@ -540,6 +547,13 @@ def test_to_tables_emits_one_row_for_a_cut_off_attempt() -> None:
     assert tables.attempts[0]["elapsed_seconds"] is None
     assert tables.attempts[0]["seconds_to_first_item"] is None
     assert tables.attempts[0]["cost_in_usd"] == _USAGE.cost_in_usd
+
+
+def test_to_tables_writes_an_abandoned_call_without_output_error_text_or_kept_attempt() -> None:
+    """An abandoned call row has neither output nor error_text, and no kept attempt."""
+    tables = to_tables(AbandonedCallRecord(call=_failed_call()))
+    assert (tables.calls[0]["output"], tables.calls[0]["error_text"]) == (None, None)
+    assert [attempt["kept"] for attempt in tables.attempts] == [False]
 
 
 class _TickingClock:

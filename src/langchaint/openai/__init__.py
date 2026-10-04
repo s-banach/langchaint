@@ -97,7 +97,7 @@ The set stays independent from pricing because parameter availability can change
 class OpenAI:
     """Create `LLM` and `EmbeddingModel` values for OpenAI."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         client: AsyncOpenAI | None = None,
@@ -313,7 +313,7 @@ class OpenAI:
 class OpenAIBedrock:
     """Create `LLM` values for OpenAI models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         aws_region: str | None = None,

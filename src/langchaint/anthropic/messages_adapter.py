@@ -247,7 +247,7 @@ class AnthropicRates:
     cache_write_5m_usd_per_million_tokens: float
     cache_write_1h_usd_per_million_tokens: float
 
-    def price(  # noqa: PLR0913 (anthropic splits the cache-write counter that other providers report as one)
+    def price(
         self,
         *,
         service_tier: str,
@@ -1132,7 +1132,7 @@ class AnthropicMessagesAdapter(Adapter):
     The caller states `provider_name` for other clients.
     """
 
-    def __init__(  # noqa: PLR0913 (each request and billing parameter remains explicit)
+    def __init__(
         self,
         *,
         client: AsyncAnthropic | AsyncAnthropicBedrock | AsyncAnthropicBedrockMantle,

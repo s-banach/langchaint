@@ -697,7 +697,7 @@ class OpenAIResponsesAdapter(_OpenAIGenerationAdapterBase):
     provider_name_by_client_class distinguishes the client classes.
     """
 
-    def __init__(  # noqa: PLR0913 (each request and billing parameter remains explicit)
+    def __init__(
         self,
         *,
         client: AsyncOpenAI,

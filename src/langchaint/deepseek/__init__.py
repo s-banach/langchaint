@@ -85,7 +85,7 @@ def cache_read_tokens_from_usage_deepseek(usage: CompletionUsage) -> int:
 class DeepSeek:
     """Create `LLM` values for DeepSeek."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         client: AsyncOpenAI | None = None,

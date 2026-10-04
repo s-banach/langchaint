@@ -135,6 +135,7 @@ lint.select = [
     "N",
     "F",
     "PL",
+    "too-many-positional-arguments",
     "UP",
     "FURB",
     "RUF",
@@ -201,6 +202,7 @@ lint.ignore = [
     "suppressible-exception",
     "magic-value-comparison",
     "raise-vanilla-args",
+    "too-many-arguments",
     # The `bind` signatures write `X | None | Unchanged` to keep the sentinel
     # adjacent to its `= UNCHANGED` default; obeying the rule would bury it.
     "none-not-at-end-of-union",
@@ -208,7 +210,6 @@ lint.ignore = [
 
 lint.pycodestyle.max-doc-length = 120
 lint.flake8-tidy-imports.ban-relative-imports = "all"
-lint.pylint.max-args = 7
 
 # The retry loops match ResponseOutcome one case per variant, so these three counts track the union's
 # size rather than any nesting.
@@ -218,7 +219,7 @@ lint.pylint.max-returns = 10
 lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
-lint.per-file-ignores."tests/*" = ["private-member-access", "too-many-arguments"]
+lint.per-file-ignores."tests/*" = ["private-member-access"]
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
 

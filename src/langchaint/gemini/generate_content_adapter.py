@@ -313,7 +313,7 @@ class GeminiPricingTable:
             ),
         )
 
-    def price(  # noqa: PLR0913 (each normalized category arrives separately)
+    def price(
         self,
         *,
         service_tier: str,

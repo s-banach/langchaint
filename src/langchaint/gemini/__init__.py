@@ -120,7 +120,7 @@ _PRICING_BY_MODEL_ID = dict[str, GeminiPricingTable](GEMINI_PRICING.items())
 class Gemini:
     """Create `LLM` values for Gemini."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         client: genai.Client | None = None,

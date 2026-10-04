@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Literal
 
-from langchaint.common.exceptions import GaveUpWaiting
+from langchaint.common.exceptions import GaveUpWaitingError
 
 _logger = logging.getLogger("langchaint.shared_backoff")
 
@@ -131,7 +131,7 @@ class Admission:
         Cancellation during entry removes the request from the queue and returns any acquired permit.
 
         Raises:
-            GaveUpWaiting: `budget` expired before admission.
+            GaveUpWaitingError: `budget` expired before admission.
         """
         try:
             async with asyncio.timeout(self._budget_seconds):
@@ -141,7 +141,7 @@ class Admission:
             _logger.info(
                 "gave up waiting for admission after a budget of %s seconds", self._budget_seconds
             )
-            raise GaveUpWaiting(
+            raise GaveUpWaitingError(
                 f"gave up waiting for admission after a budget of {self._budget_seconds} seconds"
             ) from None
         return self
@@ -184,7 +184,7 @@ class SharedBackoff:
     Use `PrivateBackoff` between `RetryThisOne` attempts.
     """
 
-    def __init__(  # noqa: PLR0913 (the settings table travels whole: five numeric settings plus parse, failure_types, max_concurrent_requests)
+    def __init__(
         self,
         *,
         parse: Callable[[Exception], Verdict],

@@ -384,7 +384,7 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
 class CohereBedrock:
     """Create `EmbeddingModel` values for Cohere models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter remains explicit)
+    def __init__(
         self,
         *,
         aws_region: str | None = None,

@@ -194,7 +194,7 @@ async def _run_many_with_warm_cache[OutputT](
     return [first_result, *remaining_results]
 
 
-def _build_binding(  # noqa: PLR0913 (every parameter becomes one Binding field)
+def _build_binding(
     *,
     system_prompt: str | Sequence[TextPart] | None,
     tool_schemas: tuple[ToolSchema, ...],
@@ -353,7 +353,7 @@ class LLM:
         max_attempts: int = ...,
         automatic_cache_breakpoints: bool | None = ...,
     ) -> "BoundLLM[str, None]": ...
-    def bind(  # noqa: PLR0913 (the binding states every choice: prompt, tools, format, params, caching, extra_body)
+    def bind(
         self,
         *,
         system_prompt: str | Sequence[TextPart] | None = None,
@@ -439,7 +439,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
-    def __init__(  # noqa: PLR0913 (stores each frozen piece of the binding)
+    def __init__(
         self,
         *,
         adapter: Adapter,
@@ -672,7 +672,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         max_attempts: int | Unchanged = ...,
         automatic_cache_breakpoints: bool | None | Unchanged = ...,
     ) -> "BoundLLM[OutputT, ToolManagerT]": ...
-    def bind(  # noqa: PLR0913 (each binding field can be replaced independently)
+    def bind(
         self,
         *,
         response_format: type[BaseModel] | None | Unchanged = UNCHANGED,

@@ -145,7 +145,7 @@ _BEDROCK_CLIENT_CLASS: dict[
 class Anthropic:
     """Create `LLM` values for Anthropic."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         client: AsyncAnthropic | None = None,
@@ -259,7 +259,7 @@ class Anthropic:
 class AnthropicBedrock:
     """Create `LLM` values for Anthropic models on Bedrock."""
 
-    def __init__(  # noqa: PLR0913 (each SharedBackoff parameter and the observer remain explicit)
+    def __init__(
         self,
         *,
         aws_region: str | None = None,

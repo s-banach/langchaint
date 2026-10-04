@@ -74,7 +74,7 @@ def build_critique_tool() -> PydanticTool[CritiqueArgs, CritiqueVerdict]:
     pending_rejections = [_FIRST_VERDICT]
 
     @tool(description="Critique a draft; return approval or a revision instruction.")
-    async def critique(args: CritiqueArgs) -> ToolOutputExplicit[CritiqueVerdict]:  # noqa: ARG001  # the first verdict does not inspect the draft
+    async def critique(_args: CritiqueArgs) -> ToolOutputExplicit[CritiqueVerdict]:
         """Return the next verdict through app_data."""
         if pending_rejections:
             return ToolOutputExplicit(

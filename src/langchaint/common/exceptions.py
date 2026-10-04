@@ -41,7 +41,7 @@ class StreamProtocolError(Exception):
     """
 
 
-class GaveUpWaiting(Exception):  # noqa: N818
+class GaveUpWaitingError(Exception):
     """A budget expired before `SharedBackoff.admitted()` admitted the request.
 
     The admission holds no permit or queue position and records no request.

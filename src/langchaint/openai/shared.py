@@ -138,7 +138,7 @@ class OpenAIRates:
     cache_read_usd_per_million_tokens: float
     cache_write_usd_per_million_tokens: float
 
-    def price(  # noqa: PLR0913 (each normalized category arrives separately)
+    def price(
         self,
         *,
         service_tier: str,

@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import pytest
 
-from langchaint.common.exceptions import GaveUpWaiting
+from langchaint.common.exceptions import GaveUpWaitingError
 from langchaint.concurrency.shared_backoff import (
     _NEVER,
     Admission,
@@ -23,7 +23,7 @@ from langchaint.concurrency.shared_backoff import (
 from tests.helpers import run_with_timeout, yield_until
 
 
-class ProviderFailure(Exception):  # noqa: N818 (named for what it is, a raised provider failure)
+class ProviderError(Exception):
     """The failure type the tests raise inside admitted() blocks."""
 
 
@@ -45,7 +45,7 @@ def _shared_backoff(
     """Build a SharedBackoff with test-friendly defaults, overridable per test."""
     return SharedBackoff(
         parse=parse,
-        failure_types=(ProviderFailure,),
+        failure_types=(ProviderError,),
         max_concurrent_requests=max_concurrent_requests,
         minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
         longest_wait_seconds=longest_wait_seconds,
@@ -73,13 +73,13 @@ async def _enter_empty_block(admission: Admission) -> None:
 
 
 async def _fail_one_attempt(shared_backoff: SharedBackoff) -> Admission:
-    """Run one attempt that raises ProviderFailure, and return its Admission.
+    """Run one attempt that raises ProviderError, and return its Admission.
 
     Asserts the exit re-raised the provider failure to the caller.
     """
     admission = shared_backoff.admitted()
-    with pytest.raises(ProviderFailure):
-        await _raise_in_block(admission, ProviderFailure("boom"))
+    with pytest.raises(ProviderError):
+        await _raise_in_block(admission, ProviderError("boom"))
     return admission
 
 
@@ -126,7 +126,7 @@ def test_constructor_rejects_invalid_numeric_settings() -> None:
             with pytest.raises(ValueError, match=name):
                 _ = SharedBackoff(
                     parse=_retry_verdict,
-                    failure_types=(ProviderFailure,),
+                    failure_types=(ProviderError,),
                     max_concurrent_requests=1,
                     minimum_wait_ceiling_seconds=settings["minimum_wait_ceiling_seconds"],
                     longest_wait_seconds=settings["longest_wait_seconds"],
@@ -363,10 +363,10 @@ def test_recording_happens_before_the_permit_is_released() -> None:
             async with shared_backoff.admitted():
                 first_entered.set()
                 await yield_until(lambda: len(shared_backoff._queue) == 1)
-                raise ProviderFailure("429")
+                raise ProviderError("429")
 
         async def failing_request() -> None:
-            with pytest.raises(ProviderFailure):
+            with pytest.raises(ProviderError):
                 await fail_after_signalling()
 
         async def waiting_request() -> float:
@@ -457,7 +457,7 @@ def test_a_budget_expiring_in_the_queue_leaves_nothing_held() -> None:
     async def scenario() -> None:
         shared_backoff = _shared_backoff()
         shared_backoff._record(PauseAll(retry_after=0.5))
-        with pytest.raises(GaveUpWaiting):
+        with pytest.raises(GaveUpWaitingError):
             await _enter_empty_block(shared_backoff.admitted(budget=0.005))
         assert len(shared_backoff._queue) == 0
         assert shared_backoff.event_counts["gave_up_waiting"] == 1
@@ -479,7 +479,7 @@ def test_a_budget_expiring_while_every_permit_is_held_takes_no_permit() -> None:
 
         holding = asyncio.create_task(holder())
         await yield_until(lambda: shared_backoff._permits_held == 1)
-        with pytest.raises(GaveUpWaiting):
+        with pytest.raises(GaveUpWaitingError):
             await _enter_empty_block(shared_backoff.admitted(budget=0.005))
         assert len(shared_backoff._queue) == 0
         release_holder.set()

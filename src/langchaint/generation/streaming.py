@@ -91,7 +91,7 @@ class StreamHandle[OutputT, ToolTurnT = Never]:
     An open-stream transient failure raises `GenerationError`.
     """
 
-    def __init__(  # noqa: PLR0913 (stores each piece of the request)
+    def __init__(
         self,
         *,
         adapter: Adapter,

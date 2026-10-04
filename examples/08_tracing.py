@@ -1,4 +1,8 @@
-"""Export traced generation and tool-dispatch spans to standard output."""
+"""Print OTel spans for a tool loop.
+
+Besides OTel SDK configuration, tracing changes only the backend construction.
+The tool loop is the same code an untraced application runs.
+"""
 
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
@@ -21,8 +25,8 @@ async def get_weather(args: WeatherArgs) -> str:
     return f"It is 18C and clear in {args.city}."
 
 
-async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
-    """Trace generation and dispatch until the model returns text.
+async def print_tool_loop_spans(prompt: str, max_turns: int = 10) -> str:
+    """Run a tool loop and print one span per generation call and per tool dispatch.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.
@@ -32,9 +36,10 @@ async def traced_tool_loop(prompt: str, max_turns: int = 10) -> str:
     """
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
-    tracer = tracer_provider.get_tracer("langchaint.example")
 
-    openai = OpenAI(observer=OtelObserver(capture_message_content=False, tracer=tracer))
+    openai = OpenAI(
+        observer=OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
+    )
     bound = openai.model("gpt-5.6-terra").bind(
         system_prompt="Use tools when needed.",
         tools=[get_weather],

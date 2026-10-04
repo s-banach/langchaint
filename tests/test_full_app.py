@@ -85,9 +85,7 @@ def _build_app(
         climate_started, energy_started = second_calls_started
         scripts[configs["research_climate"].system_prompt][1].started = climate_started
         scripts[configs["research_energy"].system_prompt][1].started = energy_started
-    observer = OtelObserver(
-        capture_message_content=False, tracer=tracer_provider.get_tracer("full_app.test")
-    )
+    observer = OtelObserver(capture_message_content=False, tracer_provider=tracer_provider)
     return App(llm=build_llm(scripts, observer=observer), configs=configs, on_event=on_event)
 
 

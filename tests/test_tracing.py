@@ -97,12 +97,12 @@ _APPLICATION_KEYS = frozenset({
 """The keys this module's mappers and `extra_attributes` set as an application would."""
 
 
-def _in_memory_tracer() -> tuple[trace.Tracer, InMemorySpanExporter]:
-    """Build an in-memory tracer whose exporter validates the spans a test reads."""
+def _in_memory_tracer_provider() -> tuple[TracerProvider, InMemorySpanExporter]:
+    """Build a tracer provider whose in-memory exporter validates the spans a test reads."""
     exporter = ValidatingSpanExporter(application_keys=_APPLICATION_KEYS)
     tracer_provider = TracerProvider()
     tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
-    return tracer_provider.get_tracer("test"), exporter
+    return tracer_provider, exporter
 
 
 def _traced(
@@ -117,7 +117,7 @@ def _traced(
 
     `max_concurrent_requests=1` serializes a batch, so its item spans end in input order.
     """
-    tracer, exporter = _in_memory_tracer()
+    tracer_provider, exporter = _in_memory_tracer_provider()
     llm = LLM(
         adapter,
         shared_backoff=fast_shared_backoff(max_concurrent_requests=max_concurrent_requests),
@@ -125,7 +125,7 @@ def _traced(
             capture_message_content=capture_message_content,
             attribute_mapper=attribute_mapper,
             extra_attributes=extra_attributes,
-            tracer=tracer,
+            tracer_provider=tracer_provider,
         ),
     )
     return llm, exporter
@@ -780,11 +780,13 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
             calls.append(1)
             return {}
 
-        tracer = trace.NoOpTracer()
+        tracer_provider = trace.NoOpTracerProvider()
         llm = LLM(
             FakeAdapter(),
             observer=OtelObserver(
-                attribute_mapper=_mapper, tracer=tracer, capture_message_content=False
+                attribute_mapper=_mapper,
+                tracer_provider=tracer_provider,
+                capture_message_content=False,
             ),
         )
         response = await llm.bind().generate_one("hi")
@@ -1005,10 +1007,10 @@ def test_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
 
     async def scenario() -> None:
         """Dispatch the call and inspect the single finished span."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
             [build_tool()],
-            observer=OtelObserver(tracer=tracer, capture_message_content=False),
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=False),
         )
         outcome = await tool_manager.dispatch(tool_call)
         assert isinstance(outcome, expected_outcome_type)
@@ -1029,10 +1031,10 @@ def test_tool_manager_function_exception_marks_the_span_error_and_propagates() -
 
     async def scenario() -> None:
         """Dispatch a call whose function raises and inspect the error span."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
             [_raising_tool()],
-            observer=OtelObserver(tracer=tracer, capture_message_content=False),
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=False),
         )
         with pytest.raises(RuntimeError, match="tool bug"):
             await tool_manager.dispatch(
@@ -1053,10 +1055,10 @@ def test_tool_manager_dispatch_many_spans_every_call() -> None:
 
     async def scenario() -> None:
         """Dispatch two calls concurrently and read both spans."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
             [_echo_tool()],
-            observer=OtelObserver(tracer=tracer, capture_message_content=False),
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=False),
         )
         outcomes = await tool_manager.dispatch_many([
             ToolCall(id="call1", name="echo", args_json='{"text": "a"}'),
@@ -1079,11 +1081,11 @@ def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
 
     async def scenario() -> None:
         """Dispatch a tool whose function opens its own span and assert the parentage."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
 
         async def nesting_tool_function(args: _EchoToolArgs) -> str:
-            """Open one inner span on the same tracer and return the text."""
-            with tracer.start_as_current_span("inner"):
+            """Open one inner span on the same tracer provider and return the text."""
+            with tracer_provider.get_tracer("test").start_as_current_span("inner"):
                 return args.text
 
         tool = PydanticTool(
@@ -1093,7 +1095,8 @@ def test_tool_manager_span_is_current_inside_the_tool_function() -> None:
             function=nesting_tool_function,
         )
         tool_manager = ToolManager(
-            [tool], observer=OtelObserver(tracer=tracer, capture_message_content=False)
+            [tool],
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=False),
         )
         await tool_manager.dispatch(
             ToolCall(id="call1", name="nesting", args_json='{"text": "x"}')
@@ -1160,11 +1163,11 @@ def test_extra_attributes_ride_on_a_dispatch_span_without_displacing_its_identit
 
     async def scenario() -> None:
         """Dispatch under extra_attributes claiming the key, and inspect the span."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
             [_echo_tool()],
             observer=OtelObserver(
-                tracer=tracer,
+                tracer_provider=tracer_provider,
                 extra_attributes={"gen_ai.agent.name": "agent_a", colliding_key: "spoofed"},
                 capture_message_content=False,
             ),
@@ -1404,12 +1407,14 @@ def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:
 
     async def scenario() -> None:
         """Generate over the multimodal message under _drop_binary and read the recorded parts back."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         content_filter: ContentFilter = _drop_binary
         llm = LLM(
             FakeAdapter(),
             observer=OtelObserver(
-                tracer=tracer, capture_message_content=True, content_filter=content_filter
+                tracer_provider=tracer_provider,
+                capture_message_content=True,
+                content_filter=content_filter,
             ),
         )
         await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
@@ -1451,7 +1456,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
 
     async def scenario() -> None:
         """Generate and dispatch under _scrub_marker, then scan every content attribute on both spans."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         scripted_turn = AssistantMessage(
             turn=(
                 ReasoningPart(raw={"signature": "opaque"}, text=f"thinking {_MARKER}"),
@@ -1459,7 +1464,9 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
             )
         )
         observer = OtelObserver(
-            tracer=tracer, capture_message_content=True, content_filter=_scrub_marker
+            tracer_provider=tracer_provider,
+            capture_message_content=True,
+            content_filter=_scrub_marker,
         )
         llm = LLM(
             FakeAdapter(
@@ -1571,11 +1578,13 @@ def test_a_failure_building_input_content_omits_the_three_input_attributes(
 
     async def scenario() -> None:
         """Run the call with input content that cannot be built, then read the span and the log."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         llm = LLM(
             FakeAdapter(),
             observer=OtelObserver(
-                tracer=tracer, capture_message_content=True, content_filter=content_filter
+                tracer_provider=tracer_provider,
+                capture_message_content=True,
+                content_filter=content_filter,
             ),
         )
         bound = llm.bind(system_prompt="rules", tools=ToolManager([build_tool()]))
@@ -1614,11 +1623,13 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
 
     async def scenario() -> None:
         """Dispatch under the mismatching filter, then read the span and the log."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
             [_echo_tool()],
             observer=OtelObserver(
-                tracer=tracer, capture_message_content=True, content_filter=text_for_tool_call
+                tracer_provider=tracer_provider,
+                capture_message_content=True,
+                content_filter=text_for_tool_call,
             ),
         )
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
@@ -1713,9 +1724,10 @@ def test_tool_span_captures_arguments_and_result_under_capture(
 
     async def scenario() -> None:
         """Dispatch one call under capture and read both content keys."""
-        tracer, exporter = _in_memory_tracer()
+        tracer_provider, exporter = _in_memory_tracer_provider()
         tool_manager = ToolManager(
-            [_echo_tool()], observer=OtelObserver(tracer=tracer, capture_message_content=True)
+            [_echo_tool()],
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=True),
         )
         outcome = await tool_manager.dispatch(tool_call)
         assert isinstance(outcome.tool_message.content, str)

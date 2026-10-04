@@ -492,10 +492,7 @@ class App:
         configs: Mapping[str, AgentConfig],
         on_event: Callable[[Event], None],
     ) -> None:
-        """Store agent config.
-
-        The observer of llm follows every generation call and every tool dispatch of a tool manager bind builds.
-        """
+        """`configs` maps each graph node name, including `specialist`, to its `AgentConfig`."""
         self._llm = llm
         self._configs = configs
         self._on_event = on_event

@@ -37,7 +37,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `InMemoryRateLimiter` | `max_concurrent_requests` and `max_request_starts_per_second` |
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
-| callbacks and LangSmith | `langchaint.tracing` with OTel |
+| callbacks and LangSmith | `OpenAI(observer=OtelObserver(...))` |
 | `temperature=` | `temperature=` |
 | unmatched provider fields | `extra_body={...}` |
 | `SystemMessage` | `system_prompt=` on `bind` |

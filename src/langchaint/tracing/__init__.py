@@ -69,7 +69,7 @@ from pydantic import TypeAdapter, ValidationError
 
 try:
     from opentelemetry import context, trace
-    from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
+    from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer, TracerProvider
 except ModuleNotFoundError as exc:
     if exc.name is not None and not exc.name.startswith("opentelemetry"):
         raise
@@ -729,7 +729,7 @@ class OtelObserver:
         content_filter: ContentFilter | None = None,
         attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
+        tracer_provider: TracerProvider | None = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -738,7 +738,7 @@ class OtelObserver:
         capture_message_content: bool,
         attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
+        tracer_provider: TracerProvider | None = None,
     ) -> None: ...
     def __init__(
         self,
@@ -747,7 +747,7 @@ class OtelObserver:
         content_filter: ContentFilter | None = None,
         attribute_mapper: AttributeMapper = gen_ai_attributes,
         extra_attributes: SpanAttributes | None = None,
-        tracer: Tracer | None = None,
+        tracer_provider: TracerProvider | None = None,
     ) -> None:
         """Resolve the tracer once, at construction.
 
@@ -768,13 +768,13 @@ class OtelObserver:
         `extra_attributes=None` supplies no extra attributes.
         Request and dispatch identity attributes replace matching `extra_attributes` keys at span start.
         A key the mapper also emits resolves to the mapper's value, set at completion.
-        `tracer=None` resolves `trace.get_tracer("langchaint.tracing", <package version>)` during construction.
+        `tracer_provider` decides where spans go, and `tracer_provider=None` uses the global tracer provider.
+        Either way, the tracer is named `langchaint.tracing` with the package version.
+        That name is every span's instrumentation scope, which identifies langchaint as the span's source.
         """
         self._span_config = _SpanConfig(
-            tracer=(
-                tracer
-                if tracer is not None
-                else trace.get_tracer("langchaint.tracing", _PACKAGE_VERSION)
+            tracer=trace.get_tracer(
+                "langchaint.tracing", _PACKAGE_VERSION, tracer_provider=tracer_provider
             ),
             attribute_mapper=attribute_mapper,
             extra_attributes=extra_attributes if extra_attributes is not None else {},

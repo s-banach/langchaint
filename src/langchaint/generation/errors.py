@@ -138,7 +138,7 @@ class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
 
 
 class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
-    """A structured response ended in a refusal.
+    """A refusal ended a response that produced no output.
 
     Validation rejects unknown fields.
     """

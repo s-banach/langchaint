@@ -119,11 +119,15 @@ def _attempt_row(
     }
 
 
-def to_tables[OutputT](
-    results: CallResult[OutputT]
-    | CallResultRecord[OutputT]
+def to_tables[OutputT, TurnOutputT](
+    results: CallResult[OutputT, TurnOutputT]
+    | CallResultRecord[OutputT, TurnOutputT]
     | AbandonedCallRecord
-    | Iterable[CallResult[OutputT] | CallResultRecord[OutputT] | AbandonedCallRecord],
+    | Iterable[
+        CallResult[OutputT, TurnOutputT]
+        | CallResultRecord[OutputT, TurnOutputT]
+        | AbandonedCallRecord
+    ],
 ) -> Tables:
     """Flatten live or normalized results into calls and attempts tables.
 

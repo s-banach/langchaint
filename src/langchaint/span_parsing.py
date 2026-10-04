@@ -38,7 +38,11 @@ from langchaint.common.messages import (
 )
 from langchaint.generation.call import CallRecord, SettledAttemptRecord
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
-from langchaint.generation.response import ResponseRecord
+from langchaint.generation.response import (
+    GenerationRecord,
+    ResponseRecord,
+    ToolCallTurnRecord,
+)
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
 OPERATION_NAME = "gen_ai.operation.name"
@@ -570,10 +574,12 @@ def generation_input_from_otel(
 
 
 def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessage:
+    """Convert one output message, dropping empty text parts as an adapter drops empty provider text."""
     _require_message_metadata(message)
     if message.role != "assistant":
         raise _unsupported(message, "output message role")
-    return _assistant_message_from_parts(message.parts)
+    turn = _assistant_message_from_parts(message.parts).turn
+    return AssistantMessage(turn=tuple(part for part in turn if part.kind != "text" or part.text))
 
 
 def output_messages_from_otel(
@@ -599,9 +605,13 @@ def output_messages_from_otel(
     return tuple(_assistant_message_from_output(message) for message in output_messages)
 
 
-def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[JsonValue]:
-    """Convert one successful parsed OTel chat span into a normalized response record.
+def generation_record_from_otel(
+    otel_chat_span: OtelChatSpan,
+) -> GenerationRecord[JsonValue, JsonValue]:
+    """Convert one successful parsed OTel chat span into the record a live call returns.
 
+    An output message with a tool call returns `ToolCallTurnRecord`.
+    Any other output message returns `ResponseRecord`.
     The record contains one synthetic attempt.
     `started_after_seconds`, attempt `elapsed_seconds`, and call `elapsed_seconds` are `0.0`.
     `seconds_to_first_item`, `error`, and `request_id` are `None`.
@@ -618,7 +628,7 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
 
     Raises:
         OtelToLangchaintConversionError: The span reports failure.
-        OtelToLangchaintConversionError: A selected value cannot construct a successful `ResponseRecord` unchanged.
+        OtelToLangchaintConversionError: A selected value cannot construct a successful record unchanged.
     """
     if otel_chat_span.error_type is not None:
         raise _attribute_conversion_error("error.type", "reports a failed span")
@@ -661,6 +671,8 @@ def response_record_from_otel(otel_chat_span: OtelChatSpan) -> ResponseRecord[Js
         attempt_records=(attempt,),
         elapsed_seconds=0.0,
     )
+    if assistant_message.tool_calls:
+        return ToolCallTurnRecord[JsonValue](call=call, output=output, stop_reason=stop_reason)
     return ResponseRecord[JsonValue](call=call, output=output, stop_reason=stop_reason)
 
 
@@ -826,21 +838,32 @@ def _selected_output_type(output_type: str | None) -> str:
 
 
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
+    """Return the output a live call returns for `assistant_message`.
+
+    Under `"text"`, the output is `assistant_message.text`.
+    Under `"json"`, a turn with a tool call has output `None` when its text is not valid JSON.
+
+    Raises:
+        OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
+        OtelToLangchaintConversionError: The text of a turn without a tool call is not valid JSON under `"json"`.
+    """
     selected_output_type = _selected_output_type(output_type)
     if selected_output_type == "text":
         return assistant_message.text
-    if selected_output_type == "json":
-        try:
-            return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
-        except ValidationError as error:
-            raise _attribute_conversion_error(
-                "gen_ai.output.type",
-                "declares output that is not valid JSON",
-            ) from error
-    raise _attribute_conversion_error(
-        "gen_ai.output.type",
-        "has no ResponseRecord[JsonValue] representation",
-    )
+    if selected_output_type != "json":
+        raise _attribute_conversion_error(
+            "gen_ai.output.type",
+            "has no GenerationRecord[JsonValue, JsonValue] representation",
+        )
+    try:
+        return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
+    except ValidationError as error:
+        if assistant_message.tool_calls:
+            return None
+        raise _attribute_conversion_error(
+            "gen_ai.output.type",
+            "declares output that is not valid JSON",
+        ) from error
 
 
 def _require_matching_response_format(
@@ -985,10 +1008,10 @@ __all__ = [
     "OtelToolDefinition",
     "OtelUriPart",
     "generation_input_from_otel",
+    "generation_record_from_otel",
     "output_messages_from_otel",
     "parse_otel",
     "reconstruct_bound_llm",
-    "response_record_from_otel",
     "system_prompt_from_otel",
     "tool_schemas_from_otel",
 ]

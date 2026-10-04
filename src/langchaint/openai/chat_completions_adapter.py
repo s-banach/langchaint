@@ -365,8 +365,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
             case "reasoning_part":
                 param.update(part.raw)
             case "text":
-                if part.text:
-                    texts.append(part.text)
+                texts.append(part.text)
             case "tool_call":
                 tool_calls.append({
                     "id": part.id,

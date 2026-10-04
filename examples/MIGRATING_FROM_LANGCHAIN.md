@@ -130,13 +130,13 @@ See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `
 | Binding | `generate_one` success type |
 | --- | --- |
 | text, without tools | `Response[str]` |
-| text, with `ToolManager` | `Response[str]` |
+| text, with `ToolManager` | `Response[str] \| ToolCallTurn[str]` |
 | structured, without tools | `Response[Model]` |
-| structured, with `ToolManager` | `Response[Model] \| ToolCallTurn[Model]` |
+| structured, with `ToolManager` | `Response[Model] \| ToolCallTurn[Model \| None]` |
 
-`GenerateResult[Model]` names the success union.
-`CallResult[Model]` adds `GenerationError` for batch results.
-Text bindings expose tool calls through `Response.tool_calls`.
+`GenerateResult[str]` and `GenerateResult[Model, Model | None]` name the success unions.
+`CallResult` adds `GenerationError` for batch results.
+A binding with `ToolManager` returns `ToolCallTurn` for every turn that calls tools.
 
 ```python
 from pydantic import BaseModel
@@ -158,9 +158,9 @@ match result.kind:
         print(result.output.text)
 ```
 
-`Response.output` is never `None`.
-`ToolCallTurn.output` may be `None`.
-Append `assistant_message` when continuing a conversation.
+A text binding's `output` is the turn's text, which is `""` for a turn without text.
+A structured `ToolCallTurn.output` is `None` when the turn has no valid `Model`.
+Append `assistant_message`, never `output`, when continuing a conversation.
 
 See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.
 See [`10_tool_forms_and_approval.py`](10_tool_forms_and_approval.py) for advanced tool forms.

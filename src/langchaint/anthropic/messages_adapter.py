@@ -696,7 +696,6 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
 
     `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
     The API rejects modified thinking blocks and unknown `type` values.
-    Empty `TextPart` values are omitted because the API rejects them.
 
     Raises:
         json.JSONDecodeError: `ToolCall.args_json` is invalid JSON.
@@ -705,8 +704,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
     blocks: list[_ContentBlockParam] = []
     for part in assistant_message.turn:
         if part.kind == "text":
-            if part.text:
-                blocks.append(TextBlockParam(type="text", text=part.text))
+            blocks.append(TextBlockParam(type="text", text=part.text))
         elif part.kind == "tool_call":
             blocks.append(
                 ToolUseBlockParam(
@@ -936,6 +934,7 @@ def _first_text_block_text(message: anthropic.types.Message) -> str | None:
 def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessage:
     """Build `AssistantMessage` from SDK blocks in order.
 
+    Empty text blocks are dropped because the API rejects them on replay.
     Thinking blocks become replayable `ReasoningPart` values.
     Redacted thinking has `text=None`.
     Unmodeled blocks become replayable `RawPart` values.
@@ -943,7 +942,8 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     turn: list[TurnPart] = []
     for block in message.content:
         if block.type == "text":
-            turn.append(TextPart(text=block.text))
+            if block.text:
+                turn.append(TextPart(text=block.text))
         elif block.type == "tool_use":
             turn.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
         elif block.type == "thinking":

@@ -435,7 +435,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     """A frozen prompt prefix with generation and streaming methods.
 
     `OutputT` is `str` or the validated `response_format` type.
-    A structured binding with `ToolManager` returns `ToolCallTurn` for tool-call turns.
+    A binding with `ToolManager` returns `ToolCallTurn` for tool-call turns.
+    A text `ToolCallTurn` has `str` output, and a structured one has `OutputT | None` output.
     `tool_manager` preserves the bound `ToolManager` for application dispatch.
     """
 
@@ -517,7 +518,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     @property
     def _splits_tool_call_turns(self) -> bool:
-        return self.response_format is not None and self._tool_manager is not None
+        return self._tool_manager is not None
 
     @overload
     def bind[NewModelT: BaseModel](
@@ -956,25 +957,32 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     @overload
     async def generate_one(
-        self: "BoundLLM[str, ToolManagerT]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> Response[str]: ...
-    @overload
-    async def generate_one(
-        self: "BoundLLM[OutputT, ToolManager]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> GenerateResult[OutputT]: ...
-    @overload
-    async def generate_one(
         self: "BoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> Response[OutputT]: ...
+    @overload
+    async def generate_one(
+        self: "BoundLLM[str, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> GenerateResult[str]: ...
+    @overload
+    async def generate_one[ModelT: BaseModel](
+        self: "BoundLLM[ModelT, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> GenerateResult[ModelT, ModelT | None]: ...
+    @overload
+    async def generate_one(
+        self: "BoundLLM[OutputT, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> GenerateResult[OutputT, OutputT | None]: ...
     async def generate_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> GenerateResult[Any]:
@@ -1068,22 +1076,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     @overload
     async def generate_many(
-        self: "BoundLLM[str, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[Response[str] | GenerationError]: ...
-    @overload
-    async def generate_many(
-        self: "BoundLLM[OutputT, ToolManager]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[CallResult[OutputT]]: ...
-    @overload
-    async def generate_many(
         self: "BoundLLM[OutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1092,12 +1084,28 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[Response[OutputT] | GenerationError]: ...
     @overload
     async def generate_many(
+        self: "BoundLLM[str, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResult[str]]: ...
+    @overload
+    async def generate_many[ModelT: BaseModel](
+        self: "BoundLLM[ModelT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResult[ModelT, ModelT | None]]: ...
+    @overload
+    async def generate_many(
         self: "BoundLLM[OutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
         warm_cache: bool = ...,
         max_working_seconds_per_item: float | None = ...,
-    ) -> list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]]: ...
+    ) -> list[Response[OutputT] | GenerationError] | list[CallResult[OutputT, OutputT | None]]: ...
     async def generate_many(
         self,
         generation_inputs: SequenceNotStr[GenerationInput],
@@ -1145,26 +1153,6 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     @overload
     async def generate_many_records(
-        self: "BoundLLM[str, ToolManagerT]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[ResponseRecord[str] | GenerationErrorRecord]: ...
-    @overload
-    async def generate_many_records(
-        self: "BoundLLM[OutputT, ToolManager]",
-        generation_inputs: SequenceNotStr[GenerationInput],
-        *,
-        resume_path: Path,
-        sample_ids: SequenceNotStr[str] | None = ...,
-        warm_cache: bool = ...,
-        max_working_seconds_per_item: float | None = ...,
-    ) -> list[CallResultRecord[OutputT]]: ...
-    @overload
-    async def generate_many_records(
         self: "BoundLLM[OutputT, None]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1175,6 +1163,26 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
     ) -> list[ResponseRecord[OutputT] | GenerationErrorRecord]: ...
     @overload
     async def generate_many_records(
+        self: "BoundLLM[str, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResultRecord[str, str]]: ...
+    @overload
+    async def generate_many_records[ModelT: BaseModel](
+        self: "BoundLLM[ModelT, ToolManagerT]",
+        generation_inputs: SequenceNotStr[GenerationInput],
+        *,
+        resume_path: Path,
+        sample_ids: SequenceNotStr[str] | None = ...,
+        warm_cache: bool = ...,
+        max_working_seconds_per_item: float | None = ...,
+    ) -> list[CallResultRecord[ModelT, ModelT | None]]: ...
+    @overload
+    async def generate_many_records(
         self: "BoundLLM[OutputT, ToolManagerT]",
         generation_inputs: SequenceNotStr[GenerationInput],
         *,
@@ -1183,7 +1191,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_item: float | None = ...,
     ) -> (
-        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]]
+        list[ResponseRecord[OutputT] | GenerationErrorRecord]
+        | list[CallResultRecord[OutputT, OutputT | None]]
     ): ...
     async def generate_many_records(
         self,
@@ -1214,6 +1223,10 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         The file's `binding_fingerprint` is the value from `config_fingerprint()`.
         Changes excluded by `config_fingerprint()` do not replace the file.
         A malformed file or unsupported format raises before any provider request and remains unchanged.
+        A file in the supported format holds the records this langchaint version would write.
+        Those are the records for the binding and inputs that produced the file.
+        That equality assumes the provider answers the same way both times.
+        A langchaint version that writes different records for the same binding and inputs uses a new format.
         Missing records generate again.
         `RetriesExhaustedErrorRecord`, `TimedOutErrorRecord`, and `AuthErrorRecord` values generate again.
         The fingerprints exclude the causes of those errors, so the same input can succeed later.
@@ -1286,25 +1299,32 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
 
     @overload
     def stream_one(
-        self: "BoundLLM[str, ToolManagerT]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> StreamHandle[str]: ...
-    @overload
-    def stream_one(
-        self: "BoundLLM[OutputT, ToolManager]",
-        generation_input: GenerationInput,
-        *,
-        timeout_seconds: float | None = ...,
-    ) -> StreamHandle[OutputT, ToolCallTurn[OutputT]]: ...
-    @overload
-    def stream_one(
         self: "BoundLLM[OutputT, None]",
         generation_input: GenerationInput,
         *,
         timeout_seconds: float | None = ...,
     ) -> StreamHandle[OutputT]: ...
+    @overload
+    def stream_one(
+        self: "BoundLLM[str, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> StreamHandle[str, ToolCallTurn[str]]: ...
+    @overload
+    def stream_one[ModelT: BaseModel](
+        self: "BoundLLM[ModelT, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> StreamHandle[ModelT, ToolCallTurn[ModelT | None]]: ...
+    @overload
+    def stream_one(
+        self: "BoundLLM[OutputT, ToolManagerT]",
+        generation_input: GenerationInput,
+        *,
+        timeout_seconds: float | None = ...,
+    ) -> StreamHandle[OutputT, ToolCallTurn[OutputT | None]]: ...
     def stream_one(
         self, generation_input: GenerationInput, *, timeout_seconds: float | None = None
     ) -> StreamHandle[Any, Any]:

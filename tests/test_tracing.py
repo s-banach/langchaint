@@ -32,6 +32,7 @@ from langchaint import (
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
+    GenerateResult,
     GenerationError,
     ImagePart,
     ImageUrlPart,
@@ -142,7 +143,7 @@ type _CallPath = Literal["generate", "stream"]
 
 async def _generate_through[ToolManagerT: ToolManager | None](
     path: _CallPath, bound_llm: BoundLLM[str, ToolManagerT]
-) -> Response[str]:
+) -> GenerateResult[str]:
     """Run one call through `generate_one`, or through `stream_one` drained before its `final()`.
 
     Raises:

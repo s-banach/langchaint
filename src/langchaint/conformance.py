@@ -28,6 +28,7 @@ from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import (
     AssistantMessage,
     Message,
+    TextPart,
     UserMessage,
     messages_from_json,
     messages_to_json,
@@ -326,6 +327,24 @@ class AdapterConformance(ABC):
         assert self._assistant_wire_parts_of(
             bound_adapter, restored
         ) == self._assistant_wire_parts_of(bound_adapter, original)
+
+    def test_empty_provider_text_becomes_no_text_part(self) -> None:
+        """Empty provider text leaves nothing in the turn, and the text output is then `""`.
+
+        Anthropic rejects an empty text block, so a replayed tool-call turn must not carry one.
+        """
+        outcome = self._bound_adapter().interpret(self.response_with_text(""))
+        assert outcome.kind == "adapter_result"
+        assert outcome.output == ""
+        assert outcome.assistant_message.turn == ()
+
+    def test_an_empty_text_part_is_sent_as_given(self) -> None:
+        """Replay sends every assistant `TextPart`, including one with empty text."""
+        parts = self._assistant_wire_parts_of(
+            self._bound_adapter(),
+            [UserMessage(content="hi"), AssistantMessage(turn=(TextPart(text=""),))],
+        )
+        assert len(parts) == 1
 
     def test_structured_output_may_inherit_no_output(self) -> None:
         """A validated instance is output in an AdapterResult even when its class inherits NoOutput.

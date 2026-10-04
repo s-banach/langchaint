@@ -430,7 +430,7 @@ class NoOutput:
 
 @dataclass(frozen=True, kw_only=True)
 class Refusal(NoOutput):
-    """A completed response whose structured parse found a refusal."""
+    """A completed response that a refusal ended before it produced output."""
 
     kind: Literal["refusal"] = "refusal"
 

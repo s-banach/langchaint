@@ -9,7 +9,7 @@ Alpha: the API may change without notice.
 ## Why langchaint
 
 - **Consistent API.** Bind request fields once with `LLM.bind()`, then call `generate_one()`, `generate_many()`, or `stream_one()` on the resulting `BoundLLM`.
-- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `Response[Answer]`. Binding `tools` as well adds `ToolCallTurn[Answer]` to that return type.
+- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `Response[Answer]`. Binding `tools` adds `ToolCallTurn` to the return type of any binding.
 - **Result variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
 - **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
 - **Complete billing.** Successful results and `GenerationError` values retain provider-reported usage from every recorded attempt, including billed retries.

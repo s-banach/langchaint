@@ -18,7 +18,13 @@ from langchaint.common.messages import JsonValue
 from langchaint.concurrency.cancellation import await_task_cancellation_safe
 from langchaint.generation.response import CallResultRecord
 
-_RESUME_FORMAT_VERSION = 1
+_RESUME_FORMAT_VERSION = 2
+"""The resume file version that this code reads and writes.
+
+Restoring a file of this version gives the records that rerunning its binding and inputs would give.
+That equality assumes the provider answers the same way both times.
+Any change to the records written for the same binding and inputs requires a new version.
+"""
 _RESUME_IO_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _RESUME_MODEL_CONFIG = ConfigDict(
     frozen=True,
@@ -35,69 +41,69 @@ async def _run_resume_io[ResultT](function: Callable[[], ResultT]) -> ResultT:
     return await await_task_cancellation_safe(task)
 
 
-class _PositionItem[OutputT](CheckedCopyModel):
+class _PositionItem[OutputT, TurnOutputT](CheckedCopyModel):
     """Validation reconstructs one result record and rejects unknown fields."""
 
     model_config = _RESUME_MODEL_CONFIG
 
     input_fingerprint: str
-    result_record: CallResultRecord[OutputT] | None
+    result_record: CallResultRecord[OutputT, TurnOutputT] | None
 
 
-class _SampleIdItem[OutputT](CheckedCopyModel):
+class _SampleIdItem[OutputT, TurnOutputT](CheckedCopyModel):
     """Validation reconstructs one identified result record and rejects unknown fields."""
 
     model_config = _RESUME_MODEL_CONFIG
 
     sample_id: str
     input_fingerprint: str
-    result_record: CallResultRecord[OutputT] | None
+    result_record: CallResultRecord[OutputT, TurnOutputT] | None
 
 
-class _PositionDocument[OutputT](CheckedCopyModel):
+class _PositionDocument[OutputT, TurnOutputT](CheckedCopyModel):
     """Validation fixes the position resume document shape."""
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[1] = 1
+    format_version: Literal[2] = 2
     binding_fingerprint: str
     identity_mode: Literal["position"] = "position"
-    items: tuple[_PositionItem[OutputT], ...]
+    items: tuple[_PositionItem[OutputT, TurnOutputT], ...]
 
 
-class _SampleIdDocument[OutputT](CheckedCopyModel):
+class _SampleIdDocument[OutputT, TurnOutputT](CheckedCopyModel):
     """Validation fixes the `sample_id` resume document shape and rejects duplicates."""
 
     model_config = _RESUME_MODEL_CONFIG
 
-    format_version: Literal[1] = 1
+    format_version: Literal[2] = 2
     binding_fingerprint: str
     identity_mode: Literal["sample_id"] = "sample_id"
-    items: tuple[_SampleIdItem[OutputT], ...]
+    items: tuple[_SampleIdItem[OutputT, TurnOutputT], ...]
 
     @model_validator(mode="after")
-    def _require_unique_sample_ids(self) -> "_SampleIdDocument[OutputT]":
+    def _require_unique_sample_ids(self) -> "_SampleIdDocument[OutputT, TurnOutputT]":
         sample_ids = tuple(item.sample_id for item in self.items)
         if len(set(sample_ids)) != len(sample_ids):
             raise ValueError("resume file sample_id values must be unique")
         return self
 
 
-type _ResumeDocument[OutputT] = Annotated[
-    _PositionDocument[OutputT] | _SampleIdDocument[OutputT],
+type _ResumeDocument[OutputT, TurnOutputT] = Annotated[
+    _PositionDocument[OutputT, TurnOutputT] | _SampleIdDocument[OutputT, TurnOutputT],
     Field(discriminator="identity_mode"),
 ]
 
 _JSON_OBJECT_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
-_BROAD_DOCUMENT_ADAPTER: TypeAdapter[_ResumeDocument[JsonValue]] = TypeAdapter(
-    _ResumeDocument[JsonValue]
+_BROAD_DOCUMENT_ADAPTER: TypeAdapter[_ResumeDocument[JsonValue, JsonValue]] = TypeAdapter(
+    _ResumeDocument[JsonValue, JsonValue]
 )
 
 
 @dataclass(frozen=True)
 class _LoadedDocument:
     document_json: bytes
-    document: _PositionDocument[JsonValue] | _SampleIdDocument[JsonValue]
+    document: _PositionDocument[JsonValue, JsonValue] | _SampleIdDocument[JsonValue, JsonValue]
 
 
 _CLAIMED_RESUME_PATHS: set[Path] = set()
@@ -124,7 +130,9 @@ def claim_resume_path(resolved_resume_path: Path) -> Generator[None]:
             _CLAIMED_RESUME_PATHS.remove(resolved_resume_path)
 
 
-def _regenerates[OutputT](result_record: CallResultRecord[OutputT] | None) -> bool:
+def _regenerates[OutputT, TurnOutputT](
+    result_record: CallResultRecord[OutputT, TurnOutputT] | None,
+) -> bool:
     """Report whether a resumed call generates this entry again.
 
     An entry without a record was never generated.
@@ -139,15 +147,16 @@ def _regenerates[OutputT](result_record: CallResultRecord[OutputT] | None) -> bo
             return False
 
 
-class ResumeState[OutputT]:
+class ResumeState[OutputT, TurnOutputT]:
     """Hold one validated document while generated records replace pending entries."""
 
     def __init__(
         self,
         *,
         resume_path: Path,
-        document: _PositionDocument[OutputT] | _SampleIdDocument[OutputT],
-        document_adapter: TypeAdapter[_ResumeDocument[OutputT]],
+        document: _PositionDocument[OutputT, TurnOutputT]
+        | _SampleIdDocument[OutputT, TurnOutputT],
+        document_adapter: TypeAdapter[_ResumeDocument[OutputT, TurnOutputT]],
     ) -> None:
         self._resume_path = resume_path
         self._document = document
@@ -163,7 +172,7 @@ class ResumeState[OutputT]:
     def store_result_record(
         self,
         index: int,
-        result_record: CallResultRecord[OutputT],
+        result_record: CallResultRecord[OutputT, TurnOutputT],
     ) -> None:
         """Atomically replace one entry and mark its generation attempt complete."""
         if index < 0 or index >= len(self._document.items):
@@ -177,7 +186,7 @@ class ResumeState[OutputT]:
         self._document = validated_document
         self._pending_index_set.discard(index)
 
-    def result_records(self) -> list[CallResultRecord[OutputT]]:
+    def result_records(self) -> list[CallResultRecord[OutputT, TurnOutputT]]:
         """Return records in current input order after each pending item settles.
 
         Raises:
@@ -185,7 +194,7 @@ class ResumeState[OutputT]:
         """
         if self._pending_index_set:
             raise RuntimeError("resume state still has pending generation inputs")
-        result_records: list[CallResultRecord[OutputT]] = []
+        result_records: list[CallResultRecord[OutputT, TurnOutputT]] = []
         for item in self._document.items:
             if item.result_record is None:
                 raise RuntimeError("resume state has a missing result record")
@@ -195,8 +204,8 @@ class ResumeState[OutputT]:
     def _document_with_result(
         self,
         index: int,
-        result_record: CallResultRecord[OutputT],
-    ) -> _PositionDocument[OutputT] | _SampleIdDocument[OutputT]:
+        result_record: CallResultRecord[OutputT, TurnOutputT],
+    ) -> _PositionDocument[OutputT, TurnOutputT] | _SampleIdDocument[OutputT, TurnOutputT]:
         items = list(self._document.items)
         items[index] = items[index].model_copy(update={"result_record": result_record})
         return self._document.model_copy(update={"items": tuple(items)})
@@ -210,7 +219,7 @@ def prepare_resume_state(
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...] | None,
-) -> ResumeState[str]: ...
+) -> ResumeState[str, str]: ...
 
 
 @overload
@@ -221,7 +230,7 @@ def prepare_resume_state[OutputT](
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT]: ...
+) -> ResumeState[OutputT, OutputT | None]: ...
 
 
 def prepare_resume_state[OutputT](
@@ -231,7 +240,7 @@ def prepare_resume_state[OutputT](
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT] | ResumeState[str]:
+) -> ResumeState[OutputT, OutputT | None] | ResumeState[str, str]:
     """Validate or replace one resume document before generation starts.
 
     Raises:
@@ -245,29 +254,28 @@ def prepare_resume_state[OutputT](
     if response_format is None:
         return _prepare_resume_state(
             resume_path=resume_path,
-            output_type=str,
+            document_adapter=TypeAdapter(_ResumeDocument[str, str]),
             binding_fingerprint=binding_fingerprint,
             input_fingerprints=input_fingerprints,
             sample_ids=sample_ids,
         )
     return _prepare_resume_state(
         resume_path=resume_path,
-        output_type=response_format,
+        document_adapter=TypeAdapter(_ResumeDocument[response_format, response_format | None]),
         binding_fingerprint=binding_fingerprint,
         input_fingerprints=input_fingerprints,
         sample_ids=sample_ids,
     )
 
 
-def _prepare_resume_state[OutputT](
+def _prepare_resume_state[OutputT, TurnOutputT](
     *,
     resume_path: Path,
-    output_type: type[OutputT],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, TurnOutputT]],
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...] | None,
-) -> ResumeState[OutputT]:
-    document_adapter = _document_adapter(output_type)
+) -> ResumeState[OutputT, TurnOutputT]:
     loaded_document = _load_document(resume_path)
     if sample_ids is None:
         document = _prepare_position_document(
@@ -296,12 +304,6 @@ def _prepare_resume_state[OutputT](
     )
 
 
-def _document_adapter[OutputT](
-    output_type: type[OutputT],
-) -> TypeAdapter[_ResumeDocument[OutputT]]:
-    return TypeAdapter(_ResumeDocument[output_type])
-
-
 def _load_document(resume_path: Path) -> _LoadedDocument | None:
     try:
         document_json = resume_path.read_bytes()
@@ -317,17 +319,19 @@ def _load_document(resume_path: Path) -> _LoadedDocument | None:
     try:
         document = _BROAD_DOCUMENT_ADAPTER.validate_python(document_object)
     except ValidationError as error:
-        raise ValueError(f"{resume_path} is not a valid version 1 resume document") from error
+        raise ValueError(
+            f"{resume_path} is not a valid version {_RESUME_FORMAT_VERSION} resume document"
+        ) from error
     return _LoadedDocument(document_json=document_json, document=document)
 
 
-def _prepare_position_document[OutputT](
+def _prepare_position_document[OutputT, TurnOutputT](
     *,
     loaded_document: _LoadedDocument | None,
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT]],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, TurnOutputT]],
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
-) -> _PositionDocument[OutputT]:
+) -> _PositionDocument[OutputT, TurnOutputT]:
     if (
         loaded_document is not None
         and isinstance(loaded_document.document, _PositionDocument)
@@ -348,15 +352,15 @@ def _prepare_position_document[OutputT](
     )
 
 
-def _prepare_sample_id_document[OutputT](
+def _prepare_sample_id_document[OutputT, TurnOutputT](
     *,
     loaded_document: _LoadedDocument | None,
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT]],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, TurnOutputT]],
     binding_fingerprint: str,
     input_fingerprints: tuple[str, ...],
     sample_ids: tuple[str, ...],
-) -> _SampleIdDocument[OutputT]:
-    stored_items: dict[str, _SampleIdItem[OutputT]] = {}
+) -> _SampleIdDocument[OutputT, TurnOutputT]:
+    stored_items: dict[str, _SampleIdItem[OutputT, TurnOutputT]] = {}
     if (
         loaded_document is not None
         and isinstance(loaded_document.document, _SampleIdDocument)
@@ -366,7 +370,7 @@ def _prepare_sample_id_document[OutputT](
         if not isinstance(restored, _SampleIdDocument):
             raise TypeError("the sample_id discriminator changed during validation")
         stored_items = {item.sample_id: item for item in restored.items}
-    reconciled_items: list[_SampleIdItem[OutputT]] = []
+    reconciled_items: list[_SampleIdItem[OutputT, TurnOutputT]] = []
     for sample_id, input_fingerprint in zip(sample_ids, input_fingerprints, strict=True):
         stored_item = stored_items.get(sample_id)
         result_record = (
@@ -387,12 +391,12 @@ def _prepare_sample_id_document[OutputT](
     )
 
 
-def _write_document[OutputT](
+def _write_document[OutputT, TurnOutputT](
     *,
     resume_path: Path,
-    document: _PositionDocument[OutputT] | _SampleIdDocument[OutputT],
-    document_adapter: TypeAdapter[_ResumeDocument[OutputT]],
-) -> _PositionDocument[OutputT] | _SampleIdDocument[OutputT]:
+    document: _PositionDocument[OutputT, TurnOutputT] | _SampleIdDocument[OutputT, TurnOutputT],
+    document_adapter: TypeAdapter[_ResumeDocument[OutputT, TurnOutputT]],
+) -> _PositionDocument[OutputT, TurnOutputT] | _SampleIdDocument[OutputT, TurnOutputT]:
     validated_document = document_adapter.validate_python(document)
     document_json = document_adapter.dump_json(validated_document, indent=2) + b"\n"
     validated_document = document_adapter.validate_json(document_json)

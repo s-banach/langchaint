@@ -912,12 +912,6 @@ def test_unsendable_messages_build_an_invalid_request(case: _InvalidMessages) ->
         assert fragment in invalid.reason
 
 
-def test_empty_assistant_text_is_skipped_on_replay() -> None:
-    """An empty TextPart puts nothing on the wire."""
-    request = _built_request([AssistantMessage(turn=(TextPart(text=""), TextPart(text="kept")))])
-    assert request.contents[0].parts == [types.Part(text="kept")]
-
-
 # --- the thought-signature pairing ---
 
 
@@ -938,6 +932,7 @@ _SIGNED_CALL = types.Part(
 )
 # The signature is not valid UTF-8, so only a byte-preserving encoding in ReasoningPart.raw replays it.
 _SIGNED_ANSWER = types.Part(text="final answer", thought_signature=b"\x00\xffsig")
+_SIGNED_EMPTY_ANSWER = types.Part(text="", thought_signature=b"\x00\xffsig")
 _THOUGHT = types.Part(thought=True, text="thinking...")
 _EMPTY_TEXT_BESIDE_CODE = types.Part(
     text="",
@@ -963,6 +958,12 @@ _READ_TURNS = [
         "signed_answer_text",
         (_SIGNED_ANSWER,),
         (ReasoningPart(raw=_dump(_SIGNED_ANSWER)), TextPart(text="final answer")),
+    ),
+    # Empty answer text becomes no TextPart, and the signed part alone replays it.
+    _ReadTurn(
+        "signed_empty_answer_text",
+        (_SIGNED_EMPTY_ANSWER,),
+        (ReasoningPart(raw=_dump(_SIGNED_EMPTY_ANSWER)),),
     ),
     # Thought text reaches ReasoningPart.text and stays outside the answer text.
     _ReadTurn(

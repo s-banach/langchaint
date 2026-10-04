@@ -36,7 +36,7 @@ def _render_body(event: Event) -> str:
         case TurnStarted(turn_number=turn, usage_so_far=usage):
             return f"  turn {turn} begins ({usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f})"
         case LlmResponse(turn_number=turn, text=text, usage_so_far=usage):
-            shown = text or "(tool calls only)"
+            shown = text or "(no text)"
             return f"  llm t{turn}: {shown[:40]!r} -> {usage.input_tokens_total}in/{usage.output_tokens}out ${usage.cost_in_usd:.4f}"
         case LlmCallAbandoned(turn_number=turn, usage_so_far=usage):
             return (

@@ -91,12 +91,14 @@ class ResponseRecord[OutputT](_SuccessRecordBase):
 
 
 class ToolCallTurnRecord[OutputT](_SuccessRecordBase):
-    """One normalized structured result whose turn called tools.
+    """One normalized result whose turn called tools.
+
+    `output` is `None` when a structured binding's turn has no validated caller model.
 
     Validation rejects unknown fields.
     """
 
-    output: OutputT | None
+    output: OutputT
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     @model_validator(mode="after")
@@ -188,7 +190,11 @@ class Response(_LiveSuccess[ResponseRecord[_OutputT_co]], Generic[_OutputT_co]):
 
     @property
     def output(self) -> _OutputT_co:
-        """Return the assistant text or validated caller model."""
+        """Return the assistant text or validated caller model.
+
+        A text binding returns the joined `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
+        To continue the conversation, replay `assistant_message`.
+        """
         return self.record.output
 
 
@@ -199,8 +205,13 @@ class ToolCallTurn(_LiveSuccess[ToolCallTurnRecord[_OutputT_co]], Generic[_Outpu
     kind: Literal["tool_call_turn"] = "tool_call_turn"
 
     @property
-    def output(self) -> _OutputT_co | None:
-        """Return the validated caller model or `None` for a tool-only turn."""
+    def output(self) -> _OutputT_co:
+        """Return the turn's text or validated caller model.
+
+        A text binding returns the joined `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
+        A structured binding returns `None` when the turn has no validated caller model.
+        To continue the conversation, replay `assistant_message`.
+        """
         return self.record.output
 
 
@@ -219,20 +230,36 @@ def _final_raw(provider_attempts: tuple[AttemptProviderData, ...]) -> BaseModel:
     return final_raw
 
 
-type GenerateResult[OutputT] = Response[OutputT] | ToolCallTurn[OutputT]
-type CallResult[OutputT] = GenerateResult[OutputT] | GenerationError
+type GenerateResult[OutputT, TurnOutputT = OutputT] = Response[OutputT] | ToolCallTurn[TurnOutputT]
+"""One success, where `TurnOutputT` is `OutputT | None` for a structured binding."""
+type GenerationRecord[OutputT, TurnOutputT] = (
+    ResponseRecord[OutputT] | ToolCallTurnRecord[TurnOutputT]
+)
+"""The normalized record of one `Response` or `ToolCallTurn`.
 
-type CallResultRecord[OutputT] = Annotated[
+`TurnOutputT` has no default because pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
+pydantic then validates that argument as `Any`.
+"""
+type CallResult[OutputT, TurnOutputT = OutputT] = (
+    GenerateResult[OutputT, TurnOutputT] | GenerationError
+)
+
+type CallResultRecord[OutputT, TurnOutputT] = Annotated[
     SerializeAsAny[ResponseRecord[OutputT]]
-    | SerializeAsAny[ToolCallTurnRecord[OutputT]]
+    | SerializeAsAny[ToolCallTurnRecord[TurnOutputT]]
     | GenerationErrorRecord,
     Field(discriminator="kind"),
 ]
+"""The normalized record of one call result.
+
+`TurnOutputT` has no default because pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
+pydantic then validates that argument as `Any`.
+"""
 
 
-def _result_record[OutputT](
-    result: CallResult[OutputT] | CallResultRecord[OutputT],
-) -> CallResultRecord[OutputT]:
+def _result_record[OutputT, TurnOutputT](
+    result: CallResult[OutputT, TurnOutputT] | CallResultRecord[OutputT, TurnOutputT],
+) -> CallResultRecord[OutputT, TurnOutputT]:
     if isinstance(result, (Response, ToolCallTurn, GenerationError)):
         if type(result) not in (Response, ToolCallTurn, GenerationError):
             raise TypeError(f"unsupported call result: {type(result).__name__}")

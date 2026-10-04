@@ -392,8 +392,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
 
     for part in assistant_message.turn:
         if part.kind == "text":
-            if part.text:
-                pending_texts.append(part.text)
+            pending_texts.append(part.text)
         elif part.kind == "tool_call":
             flush_text_run()
             function_call_item: ResponseFunctionToolCallParam = {
@@ -582,7 +581,7 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
     """Build the langchaint assistant turn from the output items, item order preserved.
 
     Reasoning items become replayable `ReasoningPart` values with readable text.
-    Message content becomes ordered `TextPart` values, including refusals.
+    Non-empty message content becomes ordered `TextPart` values, including refusals.
     Other items become replayable `RawPart` values.
     """
     turn: list[TurnPart] = []
@@ -597,11 +596,10 @@ def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
         elif item.type == "function_call":
             turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
         elif item.type == "message":
-            for content_part in item.content:
-                if content_part.type == "output_text":
-                    turn.append(TextPart(text=content_part.text))
-                elif content_part.type == "refusal":
-                    turn.append(TextPart(text=content_part.refusal))
+            texts = (
+                part.text if part.type == "output_text" else part.refusal for part in item.content
+            )
+            turn.extend(TextPart(text=text) for text in texts if text)
         else:
             turn.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))

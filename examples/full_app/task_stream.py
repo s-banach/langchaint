@@ -41,10 +41,10 @@ from langchaint import (
     BoundLLM,
     DispatchExceptionGroup,
     DispatchManyOutcome,
+    GenerateResult,
     GenerationError,
     Message,
     PydanticTool,
-    Response,
     ToolCall,
     ToolManager,
     ToolMessage,
@@ -61,7 +61,7 @@ class LlmTurn:
     """Record one successful generate call."""
 
     turn_number: int
-    response: Response[str]
+    response: GenerateResult[str]
 
 
 @dataclass(frozen=True)
@@ -288,17 +288,18 @@ class ReActAgent(AgentRun):
                 )
             )
             self.messages.append(response.assistant_message)
-            tool_calls = response.tool_calls
-            if not tool_calls:
-                if self.config.self_correction_enabled and not self.critique_approved:
-                    self.messages.append(
-                        UserMessage(
-                            content="Call critique on that draft and revise it before answering."
+            match response.kind:
+                case "tool_call_turn":
+                    await self._dispatch_all(response.tool_calls)
+                case "response":
+                    if self.config.self_correction_enabled and not self.critique_approved:
+                        self.messages.append(
+                            UserMessage(
+                                content="Call critique on that draft and revise it before answering."
+                            )
                         )
-                    )
-                    continue
-                return response.output
-            await self._dispatch_all(tool_calls)
+                        continue
+                    return response.output
         raise RuntimeError(
             f"{self.agent_path} did not finish within {self.config.max_turns} turns"
         )

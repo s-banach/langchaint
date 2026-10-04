@@ -631,7 +631,7 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
     Thought or signed parts become replayable `ReasoningPart` values.
     Signed answer text and function calls also produce `TextPart` or `ToolCall`.
     Unmodeled parts become replayable `RawPart` values.
-    Empty text becomes `RawPart` only when the part has no other modeled value.
+    A part holding only empty text produces nothing, as every adapter drops empty provider text.
     Missing content or parts produces an empty turn.
     """
     parts = content.parts if content is not None and content.parts is not None else []
@@ -650,7 +650,7 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
         elif part.text:
             if not part.thought:
                 turn.append(TextPart(text=part.text))
-        elif not carries_reasoning:
+        elif not carries_reasoning and part.model_dump(exclude_none=True) != {"text": ""}:
             turn.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
     return AssistantMessage(turn=tuple(turn))
 
@@ -725,7 +725,6 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
 
     A ReasoningPart restores its source Part.
     A following TurnPart with the same payload is skipped.
-    An empty TextPart yields nothing.
     A RawPart restores the same way and carries no such pair.
 
     Raises:
@@ -742,8 +741,7 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
                 continue
         match part.kind:
             case "text":
-                if part.text:
-                    parts.append(types.Part(text=part.text))
+                parts.append(types.Part(text=part.text))
             case "tool_call":
                 parts.append(types.Part(function_call=_function_call_from(part)))
             case "reasoning_part":

@@ -3,7 +3,7 @@
 from pydantic import BaseModel
 
 from langchaint import (
-    Response,
+    GenerateResult,
     SpecificToolChoice,
     StreamItem,
     tool,
@@ -37,8 +37,8 @@ def print_stream_item(item: StreamItem) -> None:
             print(f"completed call: {item.name}({item.args_json})")
 
 
-async def stream_tool_call() -> Response[str]:
-    """Print stream items and return the assembled Response.
+async def stream_tool_call() -> GenerateResult[str]:
+    """Print stream items and return the assembled result.
 
     Raises:
         openai.OpenAIError: OpenAI credentials are unavailable.

@@ -30,10 +30,10 @@ from langchaint.span_parsing import (
     OtelTextPart,
     OtelToLangchaintConversionError,
     generation_input_from_otel,
+    generation_record_from_otel,
     output_messages_from_otel,
     parse_otel,
     reconstruct_bound_llm,
-    response_record_from_otel,
     system_prompt_from_otel,
     tool_schemas_from_otel,
 )
@@ -742,8 +742,8 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
-def test_reconstructs_text_response_record_and_synthetic_fields() -> None:
-    """response_record_from_otel preserves supported output and identity values."""
+def test_reconstructs_text_tool_call_turn_record_and_synthetic_fields() -> None:
+    """generation_record_from_otel preserves supported output and identity values."""
     span = _successful_chat_span({
         "gen_ai.output.messages": [
             {
@@ -765,7 +765,8 @@ def test_reconstructs_text_response_record_and_synthetic_fields() -> None:
         "gen_ai.usage.input_tokens": 100,
         "openai.response.service_tier": "priority",
     })
-    record = response_record_from_otel(span)
+    record = generation_record_from_otel(span)
+    assert record.kind == "tool_call_turn"
     assert record.output == "beforeafter"
     assert record.stop_reason == "end_turn"
     assert record.call.model == "fake-model"
@@ -807,7 +808,7 @@ def test_reconstructs_each_json_value_shape(output: JsonValue) -> None:
             }
         ],
     })
-    assert response_record_from_otel(span).output == output
+    assert generation_record_from_otel(span).output == output
 
 
 def test_rejects_invalid_declared_json_output() -> None:
@@ -819,14 +820,63 @@ def test_rejects_invalid_declared_json_output() -> None:
         ],
     })
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
+
+
+_TOOL_CALL_OUTPUT_PART: JsonValue = {
+    "type": "tool_call",
+    "id": "call-1",
+    "name": "lookup",
+    "arguments": {},
+}
+
+
+@pytest.mark.parametrize(
+    ("output_type", "parts", "expected"),
+    [
+        ("text", [], ("response", "")),
+        ("text", [_TOOL_CALL_OUTPUT_PART], ("tool_call_turn", "")),
+        (
+            "text",
+            [{"type": "text", "content": ""}, _TOOL_CALL_OUTPUT_PART],
+            ("tool_call_turn", ""),
+        ),
+        ("json", [_TOOL_CALL_OUTPUT_PART], ("tool_call_turn", None)),
+        (
+            "json",
+            [{"type": "text", "content": "not json"}, _TOOL_CALL_OUTPUT_PART],
+            ("tool_call_turn", None),
+        ),
+    ],
+    ids=[
+        "text_without_parts",
+        "text_tool_call_without_text",
+        "text_tool_call_with_empty_text",
+        "json_tool_call_without_text",
+        "json_tool_call_with_invalid_json",
+    ],
+)
+def test_output_without_text_matches_a_live_call(
+    output_type: str, parts: list[JsonValue], expected: tuple[str, JsonValue]
+) -> None:
+    """A turn without text has the variant and output a live call returns.
+
+    An empty text part becomes no `TextPart`, as an adapter drops empty provider text.
+    """
+    span = _successful_chat_span({
+        "gen_ai.output.type": output_type,
+        "gen_ai.output.messages": [{"role": "assistant", "parts": parts}],
+    })
+    record = generation_record_from_otel(span)
+    assert (record.kind, record.output) == expected
+    assert all(part.text for part in record.assistant_message.turn if part.kind == "text")
 
 
 @pytest.mark.parametrize("output_type", ["image", "speech", "provider_defined"])
-def test_response_record_rejects_unsupported_output_type(output_type: str) -> None:
-    """ResponseRecord[JsonValue] rejects each unsupported output type."""
+def test_generation_record_rejects_unsupported_output_type(output_type: str) -> None:
+    """generation_record_from_otel rejects each unsupported output type."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
-        _ = response_record_from_otel(_successful_chat_span({"gen_ai.output.type": output_type}))
+        _ = generation_record_from_otel(_successful_chat_span({"gen_ai.output.type": output_type}))
 
 
 @pytest.mark.parametrize(
@@ -837,13 +887,13 @@ def test_response_record_rejects_unsupported_output_type(output_type: str) -> No
         [{"type": "provider_part", "value": 1}],
     ],
 )
-def test_response_record_rejects_unsupported_assistant_parts(parts: list[JsonValue]) -> None:
+def test_generation_record_rejects_unsupported_assistant_parts(parts: list[JsonValue]) -> None:
     """Output conversion rejects assistant parts without a lossless representation."""
     span = _successful_chat_span({
         "gen_ai.output.messages": [{"role": "assistant", "parts": parts}]
     })
     with pytest.raises(OtelToLangchaintConversionError):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize(
@@ -862,16 +912,16 @@ def test_response_record_rejects_unsupported_assistant_parts(parts: list[JsonVal
         },
     ],
 )
-def test_response_record_rejects_unsupported_output_message_metadata(
+def test_generation_record_rejects_unsupported_output_message_metadata(
     message: dict[str, JsonValue],
 ) -> None:
     """Output conversion rejects unsupported role, name, and additional properties."""
     span = _successful_chat_span({"gen_ai.output.messages": [message]})
     with pytest.raises(OtelToLangchaintConversionError):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
-def test_response_record_rejects_output_part_additional_properties() -> None:
+def test_generation_record_rejects_output_part_additional_properties() -> None:
     """Output conversion rejects additional properties on a supported part."""
     span = _successful_chat_span({
         "gen_ai.output.messages": [
@@ -882,14 +932,14 @@ def test_response_record_rejects_output_part_additional_properties() -> None:
         ]
     })
     with pytest.raises(OtelToLangchaintConversionError, match="additional properties"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
-def test_response_record_requires_output_messages() -> None:
+def test_generation_record_requires_output_messages() -> None:
     """Output conversion rejects an absent output_messages attribute."""
     span = _successful_chat_span().model_copy(update={"output_messages": None})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.messages"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize(
@@ -902,26 +952,26 @@ def test_response_record_requires_output_messages() -> None:
         ],
     ],
 )
-def test_response_record_requires_exactly_one_output_message(
+def test_generation_record_requires_exactly_one_output_message(
     output_messages: list[JsonValue],
 ) -> None:
     """Output conversion rejects empty and multiple output message sequences."""
     span = _successful_chat_span({"gen_ai.output.messages": output_messages})
     with pytest.raises(OtelToLangchaintConversionError, match="exactly one"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
-def test_response_record_rejects_error_type() -> None:
+def test_generation_record_rejects_error_type() -> None:
     """error.type marks a span as failed before output conversion."""
     with pytest.raises(OtelToLangchaintConversionError, match=r"error\.type"):
-        _ = response_record_from_otel(_successful_chat_span({"error.type": "ProviderError"}))
+        _ = generation_record_from_otel(_successful_chat_span({"error.type": "ProviderError"}))
 
 
-def test_response_record_rejects_error_finish_reason() -> None:
+def test_generation_record_rejects_error_finish_reason() -> None:
     """The selected error finish reason marks a span as failed."""
     span = _successful_chat_span({"gen_ai.response.finish_reasons": ["error"]})
     with pytest.raises(OtelToLangchaintConversionError, match="finish_reason"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize(
@@ -935,13 +985,15 @@ def test_response_record_rejects_error_finish_reason() -> None:
         ("provider_defined", "other"),
     ],
 )
-def test_response_record_maps_selected_finish_reason(finish_reason: str, stop_reason: str) -> None:
+def test_generation_record_maps_selected_finish_reason(
+    finish_reason: str, stop_reason: str
+) -> None:
     """Finish-reason conversion maps known values and uses other for unknown values."""
     span = _successful_chat_span({"gen_ai.response.finish_reasons": [finish_reason]})
-    assert response_record_from_otel(span).stop_reason == stop_reason
+    assert generation_record_from_otel(span).stop_reason == stop_reason
 
 
-def test_response_record_falls_back_to_message_finish_reason() -> None:
+def test_generation_record_falls_back_to_message_finish_reason() -> None:
     """The deprecated message finish_reason supplies the value when the span attribute is absent."""
     span = _successful_chat_span({
         "gen_ai.output.messages": [
@@ -952,10 +1004,10 @@ def test_response_record_falls_back_to_message_finish_reason() -> None:
             }
         ]
     }).model_copy(update={"response_finish_reasons": None})
-    assert response_record_from_otel(span).stop_reason == "max_tokens"
+    assert generation_record_from_otel(span).stop_reason == "max_tokens"
 
 
-def test_response_record_requires_matching_finish_reason_locations() -> None:
+def test_generation_record_requires_matching_finish_reason_locations() -> None:
     """Span-level and message-level finish reasons must agree when both are present."""
     span = _successful_chat_span({
         "gen_ai.output.messages": [
@@ -967,11 +1019,11 @@ def test_response_record_requires_matching_finish_reason_locations() -> None:
         ]
     })
     with pytest.raises(OtelToLangchaintConversionError, match="differs"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize("finish_reasons", [[], ["stop", "length"]])
-def test_response_record_requires_one_span_finish_reason(
+def test_generation_record_requires_one_span_finish_reason(
     finish_reasons: list[str],
 ) -> None:
     """A present span finish-reason sequence must contain one value."""
@@ -979,27 +1031,29 @@ def test_response_record_requires_one_span_finish_reason(
         update={"response_finish_reasons": tuple(finish_reasons)}
     )
     with pytest.raises(OtelToLangchaintConversionError, match="exactly one"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
-def test_response_record_requires_a_finish_reason() -> None:
+def test_generation_record_requires_a_finish_reason() -> None:
     """Output conversion rejects spans with neither finish-reason location."""
     span = _successful_chat_span().model_copy(update={"response_finish_reasons": None})
     with pytest.raises(OtelToLangchaintConversionError, match="contain no value"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize("field_name", ["provider_name", "request_model"])
 @pytest.mark.parametrize("field_value", [None, ""])
-def test_response_record_requires_call_identity(field_name: str, field_value: str | None) -> None:
+def test_generation_record_requires_call_identity(
+    field_name: str, field_value: str | None
+) -> None:
     """CallRecord identity requires a provider name and requested model."""
     span = _successful_chat_span().model_copy(update={field_name: field_value})
     with pytest.raises(OtelToLangchaintConversionError, match="is required"):
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
 
 
 @pytest.mark.parametrize("conversion_case", ["reasoning", "cardinality", "invalid_json"])
-def test_response_record_errors_exclude_generated_content(conversion_case: str) -> None:
+def test_generation_record_errors_exclude_generated_content(conversion_case: str) -> None:
     """Conversion error text excludes generated content for each content-bearing failure."""
     secret = "generated-secret-value"
     if conversion_case == "reasoning":
@@ -1026,7 +1080,7 @@ def test_response_record_errors_exclude_generated_content(conversion_case: str) 
             ],
         })
     with pytest.raises(OtelToLangchaintConversionError) as rejected:
-        _ = response_record_from_otel(span)
+        _ = generation_record_from_otel(span)
     assert secret not in str(rejected.value)
 
 

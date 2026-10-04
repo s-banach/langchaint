@@ -499,13 +499,13 @@ def test_generation_error_requires_provider_attempt_alignment() -> None:
 
 def test_mixed_normalized_result_list_round_trips() -> None:
     """A mixed normalized result list reconstructs through its concrete output type."""
-    records: list[CallResultRecord[Report]] = [
+    records: list[CallResultRecord[Report, Report | None]] = [
         ResponseRecord(
             output=Report(value=9), call=_completed_turn_call(), stop_reason="end_turn"
         ),
         RefusalErrorRecord(call=_completed_turn_call()),
     ]
-    adapter = TypeAdapter(list[CallResultRecord[Report]])
+    adapter = TypeAdapter(list[CallResultRecord[Report, Report | None]])
     records_json = adapter.dump_json(records)
     restored = adapter.validate_json(records_json)
     assert adapter.dump_json(restored) == records_json

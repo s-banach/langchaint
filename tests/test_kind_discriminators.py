@@ -6,6 +6,8 @@ Each partial match requires a non-exhaustive-match suppression.
 
 from typing import assert_type
 
+from pydantic import BaseModel
+
 from langchaint import (
     AuthErrorRecord,
     ContentPart,
@@ -152,18 +154,22 @@ def _by_response_outcome_kind_missing_a_variant(outcome: ResponseOutcome[str]) -
             return outcome.output
 
 
-def _by_generate_result_kind(result: GenerateResult[int]) -> object:
-    """Verify that kind narrows GenerateResult.output."""
+class _Answer(BaseModel):
+    text: str
+
+
+def _by_generate_result_kind(result: GenerateResult[_Answer, _Answer | None]) -> object:
+    """Verify that kind narrows a structured GenerateResult.output, the one whose variants differ."""
     match result.kind:
         case "response":
-            assert_type(result.output, int)
+            assert_type(result.output, _Answer)
             return result.output
         case "tool_call_turn":
-            assert_type(result.output, int | None)
+            assert_type(result.output, _Answer | None)
             return result.tool_calls
 
 
-def _by_generate_result_kind_missing_a_variant(result: GenerateResult[int]) -> object:
+def _by_generate_result_kind_missing_a_variant(result: GenerateResult[str]) -> object:
     match result.kind:  # pyrefly: ignore[non-exhaustive-match]
         case "response":
             return result.output

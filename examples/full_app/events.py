@@ -46,7 +46,7 @@ class TurnStarted:
 class LlmResponse:
     """Report one generate response and updated usage.
 
-    text is empty for a response containing only tool calls.
+    text is empty for a turn without text.
     usage covers this call, and usage_so_far covers the run.
     """
 

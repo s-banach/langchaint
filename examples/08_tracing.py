@@ -47,10 +47,12 @@ async def print_tool_loop_spans(prompt: str, max_turns: int = 10) -> str:
 
     messages: list[Message] = [UserMessage(content=prompt)]
     for _ in range(max_turns):
-        response = await bound.generate_one(messages)
-        messages.append(response.assistant_message)
-        if not response.tool_calls:
-            return response.output
-        outcomes = await bound.tool_manager.dispatch_many(response.tool_calls)
-        messages.extend(outcome.tool_message for outcome in outcomes)
+        result = await bound.generate_one(messages)
+        match result.kind:
+            case "tool_call_turn":
+                messages.append(result.assistant_message)
+                outcomes = await bound.tool_manager.dispatch_many(result.tool_calls)
+                messages.extend(outcome.tool_message for outcome in outcomes)
+            case "response":
+                return result.output
     raise RuntimeError(f"model did not finish within {max_turns} turns")

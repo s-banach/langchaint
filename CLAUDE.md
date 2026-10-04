@@ -38,6 +38,7 @@ Document every public parameter and cross-provider difference.
 - Never write bare `input_tokens` because providers count it differently.
 - Use `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and the derived `input_tokens_total`.
 - Keep `content`, `output`, and `raw` distinct: model-facing message body, generation result payload, and unchanged provider data.
+- Replay `assistant_message`, never `output`.
 - Use `reasoning` only for reasoning the model produced.
 
 ## Application API
@@ -57,6 +58,11 @@ Document every public parameter and cross-provider difference.
 - Let the SDK assemble streams.
 - Do not define wire `TypedDict` types.
 - Send user inputs and model ids verbatim.
+- Send every message exactly as given, including a replayed provider turn.
+- When a provider rejects a message the user wrote, return the provider's error.
+- Never build a `TextPart` from empty provider text, because Anthropic rejects an empty text block on replay.
+- Applications replay a provider turn to continue after its tool calls, so dropping empty text leaves no turn empty.
+- A turn without tool calls ends a tool loop, and an application that continues after one chooses what to send.
 - Do not predict provider responses, probe endpoints, or add guards based on guessed provider rules.
 - Raise client-side only for documented provider facts and detectable defects that would otherwise produce a silently wrong result.
 - Keep SDKs as optional dependencies.

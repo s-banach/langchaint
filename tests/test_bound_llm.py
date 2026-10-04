@@ -113,7 +113,7 @@ def _settled_attempt_records(
 
 
 def _outputs(
-    results: Sequence[Response[str] | GenerationError | CallResultRecord[str]],
+    results: Sequence[Response[str] | GenerationError | CallResultRecord[str, str]],
 ) -> list[str]:
     """Assert every result is a response and return each output in order."""
     outputs: list[str] = []
@@ -1139,20 +1139,21 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     structured_with_tools = llm.bind(response_format=_Answer, tools=tool_manager)
     assert_type(
         await structured_with_tools.generate_one("hi"),
-        Response[_Answer] | ToolCallTurn[_Answer],
+        Response[_Answer] | ToolCallTurn[_Answer | None],
     )
     assert_type(
-        structured_with_tools.stream_one("hi"), StreamHandle[_Answer, ToolCallTurn[_Answer]]
+        structured_with_tools.stream_one("hi"),
+        StreamHandle[_Answer, ToolCallTurn[_Answer | None]],
     )
     assert_type(
         await structured_with_tools.generate_many(["hi"]),
-        list[CallResult[_Answer]],
+        list[CallResult[_Answer, _Answer | None]],
     )
     assert_type(
         await structured_with_tools.generate_many_records(
             ["hi"], resume_path=Path("records.json")
         ),
-        list[CallResultRecord[_Answer]],
+        list[CallResultRecord[_Answer, _Answer | None]],
     )
     structured = llm.bind(response_format=_Answer)
     assert_type(await structured.generate_one("hi"), Response[_Answer])
@@ -1161,12 +1162,13 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
         list[ResponseRecord[_Answer] | GenerationErrorRecord],
     )
     text_with_tools = llm.bind(tools=tool_manager)
-    assert_type(await text_with_tools.generate_one("hi"), Response[str])
+    assert_type(await text_with_tools.generate_one("hi"), Response[str] | ToolCallTurn[str])
+    assert_type(await text_with_tools.generate_many(["hi"]), list[CallResult[str]])
     assert_type(
         await text_with_tools.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[ResponseRecord[str] | GenerationErrorRecord],
+        list[CallResultRecord[str, str]],
     )
-    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str])
+    assert_type(text_with_tools.stream_one("hi"), StreamHandle[str, ToolCallTurn[str]])
 
 
 async def _pin_generic_request_method_return_types[
@@ -1175,19 +1177,17 @@ async def _pin_generic_request_method_return_types[
 ](bound_llm: BoundLLM[OutputT, ToolManagerT]) -> None:
     assert_type(
         await bound_llm.generate_many(["hi"]),
-        list[Response[OutputT] | GenerationError] | list[CallResult[OutputT]],
+        list[Response[OutputT] | GenerationError] | list[CallResult[OutputT, OutputT | None]],
     )
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[ResponseRecord[OutputT] | GenerationErrorRecord] | list[CallResultRecord[OutputT]],
+        list[ResponseRecord[OutputT] | GenerationErrorRecord]
+        | list[CallResultRecord[OutputT, OutputT | None]],
     )
 
 
-class _ScriptedStructuredBoundAdapter[OutputT](BoundAdapter[OutputT]):
-    """A structured bound adapter handing every request one scripted outcome.
-
-    Structured generation tests use this adapter.
-    """
+class _ScriptedBoundAdapter[OutputT](BoundAdapter[OutputT]):
+    """A bound adapter handing every request one scripted outcome."""
 
     def __init__(self, outcome: ResponseOutcome[OutputT]) -> None:
         """Store the outcome and start `open_count` at zero."""
@@ -1233,6 +1233,13 @@ _STRUCTURED_TOOL_CALL_TURN: AdapterResult[_Answer | None] = AdapterResult(
 )
 """A structured turn of tool calls alone: nothing parsed, one call to dispatch."""
 
+_STRUCTURED_TOOL_CALL_TURN_WITH_INSTANCE: AdapterResult[_Answer | None] = AdapterResult(
+    output=_Answer(value=7),
+    assistant_message=AssistantMessage(turn=(TextPart(text='{"value":7}'), FAKE_TOOL_CALL)),
+    stop_reason="tool_use",
+)
+"""A structured turn whose text validates beside a tool call."""
+
 _STRUCTURED_FINAL_TURN: AdapterResult[_Answer | None] = AdapterResult(
     output=_Answer(value=7),
     assistant_message=AssistantMessage(turn=(TextPart(text='{"value":7}'),)),
@@ -1251,7 +1258,7 @@ def _structured_tool_bound_llm(
     bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
         response_format=_Answer, tools=ToolManager([])
     )
-    bound_llm._bound_adapter = _ScriptedStructuredBoundAdapter(outcome)
+    bound_llm._bound_adapter = _ScriptedBoundAdapter(outcome)
     return bound_llm
 
 
@@ -1275,19 +1282,23 @@ def test_structured_tool_bound_generate_one_splits_on_tool_calls(
 
 @pytest.mark.parametrize(
     ("outcome", "kind"),
-    [(_STRUCTURED_FINAL_TURN, "response"), (_STRUCTURED_TOOL_CALL_TURN, "tool_call_turn")],
-    ids=["response", "tool_call_turn"],
+    [
+        (_STRUCTURED_FINAL_TURN, "response"),
+        (_STRUCTURED_TOOL_CALL_TURN, "tool_call_turn"),
+        (_STRUCTURED_TOOL_CALL_TURN_WITH_INSTANCE, "tool_call_turn"),
+    ],
+    ids=["response", "tool_call_turn", "tool_call_turn_with_instance"],
 )
 def test_generate_many_records_restores_a_structured_record(
     tmp_path: Path, outcome: AdapterResult[_Answer | None], kind: str
 ) -> None:
-    """A resumed record keeps its variant, and a response's output is the bound `_Answer` again."""
+    """A resumed record keeps its variant, and its output is the bound `_Answer` or `None` again."""
 
     async def scenario() -> None:
         """Generate one structured record, then restore it without another request."""
         bound_llm = _structured_tool_bound_llm(outcome)
         structured_adapter = bound_llm._bound_adapter
-        assert isinstance(structured_adapter, _ScriptedStructuredBoundAdapter)
+        assert isinstance(structured_adapter, _ScriptedBoundAdapter)
         resume_path = tmp_path / "records.json"
         generated = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         restored = await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
@@ -1328,11 +1339,31 @@ def test_generate_many_records_validates_serialized_bytes_before_replacing_the_f
             stop_reason="end_turn",
         )
         bound_llm = LLM(FakeAdapter()).bind(response_format=_NonRoundTrippableAnswer)
-        bound_llm._bound_adapter = _ScriptedStructuredBoundAdapter(outcome)
+        bound_llm._bound_adapter = _ScriptedBoundAdapter(outcome)
         with pytest.raises(ValueError, match="Input should be a valid number"):
             await bound_llm.generate_many_records(["hi"], resume_path=resume_path)
         assert len(replaced_document_json) == 1
         assert resume_path.read_bytes() == replaced_document_json[0]
+
+    run_with_timeout(scenario())
+
+
+def test_text_tool_bound_generate_one_returns_the_tool_call_turn_variant() -> None:
+    """A text binding with tools returns ToolCallTurn for a turn that called tools."""
+
+    async def scenario() -> None:
+        bound_llm = LLM(FakeAdapter(), shared_backoff=fast_shared_backoff()).bind(
+            tools=ToolManager([])
+        )
+        tool_call_turn: AdapterResult[str] = AdapterResult(
+            output="",
+            assistant_message=AssistantMessage(turn=(FAKE_TOOL_CALL,)),
+            stop_reason="tool_use",
+        )
+        bound_llm._bound_adapter = _ScriptedBoundAdapter(tool_call_turn)
+        result = await bound_llm.generate_one("hi")
+        assert result.kind == "tool_call_turn"
+        assert result.output == ""
 
     run_with_timeout(scenario())
 

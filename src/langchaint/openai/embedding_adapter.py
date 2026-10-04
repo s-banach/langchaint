@@ -16,6 +16,7 @@ from langchaint.adapter import ErrorClassification, _require_provider_name
 from langchaint.common.exceptions import EmbeddingOutputError
 from langchaint.common.sequence_not_str import SequenceNotStr
 from langchaint.concurrency.cancellation import to_thread_cancellation_safe
+from langchaint.concurrency.shared_backoff import Verdict
 from langchaint.embedding import (
     EmbeddingTask,
     Float2D,
@@ -26,6 +27,7 @@ from langchaint.openai.shared import (
     OPENAI_FAILURE_TYPES,
     PROVIDER_NAME_BY_OPENAI_CLIENT_CLASS,
     classify_openai,
+    parse_openai,
 )
 
 if TYPE_CHECKING:
@@ -145,6 +147,11 @@ class _OpenAIEmbeddingAdapter(_EmbeddingAdapter):
             expected_rows=len(inputs),
             dimension=self.dimension,
         )
+
+    @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Delegate failure parsing to `parse_openai`."""
+        return parse_openai(failure)
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:

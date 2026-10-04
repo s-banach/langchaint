@@ -40,14 +40,23 @@ class _StubEmbeddingAdapter:
     dimension = 2
     failure_types: ClassVar[tuple[type[Exception], ...]] = (_ProviderError,)
 
-    def __init__(self, requests: Sequence[Float2D | Exception]) -> None:
+    def __init__(
+        self,
+        requests: Sequence[Float2D | Exception],
+        *,
+        parse: Callable[[Exception], Verdict] = _retry_provider_failure,
+    ) -> None:
         self._requests = list(requests)
+        self._parse = parse
         self.prepare_calls = 0
         self.partition_calls = 0
         self.embed_calls = 0
         self.partition_tasks: list[EmbeddingTask] = []
         self.embed_inputs: list[tuple[str, ...]] = []
         self.embed_tasks: list[EmbeddingTask] = []
+
+    def parse(self, failure: Exception) -> Verdict:
+        return self._parse(failure)
 
     async def prepare(self) -> None:
         self.prepare_calls += 1
@@ -96,6 +105,10 @@ class _PartitioningEmbeddingAdapter:
         self.fail_once = set(fail_once or ())
         self.requests: Counter[str] = Counter()
 
+    def parse(self, failure: Exception) -> Verdict:
+        """Retry every `_ProviderError`."""
+        return _retry_provider_failure(failure)
+
     async def prepare(self) -> None:
         """Complete preparation without work."""
 
@@ -132,15 +145,8 @@ class _PartitioningEmbeddingAdapter:
         return "unknown_exception"
 
 
-def _shared_backoff(
-    *,
-    parse: Callable[[Exception], Verdict] = _retry_provider_failure,
-    failure_types: tuple[type[Exception], ...] = (_ProviderError,),
-    longest_wait_seconds: float = 0.001,
-) -> SharedBackoff:
+def _shared_backoff(*, longest_wait_seconds: float = 0.001) -> SharedBackoff:
     return SharedBackoff(
-        parse=parse,
-        failure_types=failure_types,
         max_concurrent_requests=2,
         max_request_starts_per_second=100_000.0,
         minimum_wait_ceiling_seconds=0.001,
@@ -152,15 +158,11 @@ def _model(
     adapter: _StubEmbeddingAdapter,
     *,
     max_requests: int = 3,
-    parse: Callable[[Exception], Verdict] = _retry_provider_failure,
-    failure_types: tuple[type[Exception], ...] = (_ProviderError,),
     longest_wait_seconds: float = 0.001,
 ) -> EmbeddingModel:
     return EmbeddingModel(
         adapter=adapter,
-        shared_backoff=_shared_backoff(
-            parse=parse, failure_types=failure_types, longest_wait_seconds=longest_wait_seconds
-        ),
+        shared_backoff=_shared_backoff(longest_wait_seconds=longest_wait_seconds),
         max_requests=max_requests,
     )
 
@@ -249,25 +251,26 @@ def test_a_retry_this_one_retry_after_sets_the_minimum_private_wait() -> None:
     The private ceiling starts at 0.001 seconds, and request starts are 0.00001 seconds apart.
     So only retry_after can make the retry wait 0.02 seconds.
     """
-    adapter = _StubEmbeddingAdapter([_ProviderError("slow"), np.array([[1.0, 0.0]], np.float32)])
-    model = _model(
-        adapter, parse=lambda _failure: RetryThisOne(retry_after=0.02), longest_wait_seconds=1.0
+    adapter = _StubEmbeddingAdapter(
+        [_ProviderError("slow"), np.array([[1.0, 0.0]], np.float32)],
+        parse=lambda _failure: RetryThisOne(retry_after=0.02),
     )
+    model = _model(adapter, longest_wait_seconds=1.0)
     started_at = time.monotonic()
     _ = run_with_timeout(model.embed(["one"], task="classification"))
     assert time.monotonic() - started_at >= 0.02
     assert adapter.embed_calls == 2
 
 
-def test_a_failure_the_shared_backoff_does_not_parse_is_decided_by_classify() -> None:
-    """An adapter failure type outside the `SharedBackoff.failure_types` reaches no verdict.
+def test_a_failure_outside_failure_types_is_decided_by_classify() -> None:
+    """A failure outside the adapter's `failure_types` reaches no verdict.
 
     `classify` calls it unknown_exception, so the batch fails without a retry.
     """
-    failure = _ProviderError("unparsed")
+    failure = KeyError("unparsed")
     adapter = _StubEmbeddingAdapter([failure, np.array([[1.0, 0.0]], dtype=np.float32)])
-    model = _model(adapter, failure_types=(KeyError,))
-    with pytest.raises(_ProviderError) as caught:
+    model = _model(adapter)
+    with pytest.raises(KeyError) as caught:
         _ = run_with_timeout(model.embed(["one"], task="classification"))
     assert caught.value is failure
     assert adapter.embed_calls == 1
@@ -276,11 +279,11 @@ def test_a_failure_the_shared_backoff_does_not_parse_is_decided_by_classify() ->
 def test_terminal_provider_failure_propagates_unchanged() -> None:
     """A terminal provider failure receives no replacement exception."""
     failure = _ProviderError("provider text")
-    adapter = _StubEmbeddingAdapter([failure])
+    adapter = _StubEmbeddingAdapter([failure], parse=_reject_provider_failure)
 
     async def scenario() -> None:
         with pytest.raises(_ProviderError, match="provider text") as caught:
-            _ = await _model(adapter, parse=_reject_provider_failure).embed(
+            _ = await _model(adapter).embed(
                 ["one"],
                 task="classification",
             )

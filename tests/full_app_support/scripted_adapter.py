@@ -297,8 +297,6 @@ def build_llm(scripts: dict[str, list[Turn]], *, observer: Observer | None = Non
     return LLM(
         adapter,
         shared_backoff=SharedBackoff(
-            parse=adapter.parse,
-            failure_types=adapter.failure_types,
             max_concurrent_requests=16,
             max_request_starts_per_second=10_000.0,
             minimum_wait_ceiling_seconds=0.001,

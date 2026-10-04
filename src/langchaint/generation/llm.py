@@ -266,7 +266,7 @@ class LLM:
     ) -> None:
         """Store the shared pieces.
 
-        `shared_backoff=None` uses `max_concurrent_requests=8` and other `SharedBackoff` defaults.
+        `shared_backoff=None` creates a `SharedBackoff` with its defaults.
         Pass one instance to every `LLM` sharing a rate-limit quota.
         Every binding and stream of this `LLM` reports to `observer`.
 
@@ -277,11 +277,7 @@ class LLM:
         """
         self.adapter: Adapter = adapter
         self.shared_backoff: SharedBackoff = (
-            shared_backoff
-            if shared_backoff is not None
-            else SharedBackoff(
-                parse=adapter.parse, failure_types=adapter.failure_types, max_concurrent_requests=8
-            )
+            shared_backoff if shared_backoff is not None else SharedBackoff()
         )
         self.observer: Observer | None = observer
 
@@ -873,45 +869,49 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             observations = _StreamObservations(billing=None, request_id=None, opened=False)
             try:
                 async with admission:
-                    deadline.resume_on_admission()
-                    ledger.start_request()
-                    adapter_stream = await self._bound_adapter.open_stream(request_params)
-                    observations = observations._replace(opened=True)
                     try:
-                        async for _ in adapter_stream.items():
-                            pass
-                        raw = await adapter_stream.final()
-                        observations = observations._replace(
-                            request_id=adapter_stream.request_id()
+                        deadline.resume_on_admission()
+                        ledger.start_request()
+                        adapter_stream = await self._bound_adapter.open_stream(request_params)
+                        observations = observations._replace(opened=True)
+                        try:
+                            async for _ in adapter_stream.items():
+                                pass
+                            raw = await adapter_stream.final()
+                            observations = observations._replace(
+                                request_id=adapter_stream.request_id()
+                            )
+                        except BaseException:
+                            observations = observations._replace(
+                                billing=adapter_stream.billing_reported(),
+                                request_id=adapter_stream.request_id(),
+                            )
+                            ledger.note_billing_in_flight(observations.billing)
+                            raise
+                        finally:
+                            await _close_stream_quietly(
+                                adapter_stream,
+                                failure_log_message=(
+                                    "closing the provider stream raised; the request's outcome stands"
+                                ),
+                            )
+                        outcome = self._staged_interpretation(
+                            raw, request_id=observations.request_id, ledger=ledger
                         )
-                    except BaseException:
-                        observations = observations._replace(
-                            billing=adapter_stream.billing_reported(),
-                            request_id=adapter_stream.request_id(),
-                        )
-                        ledger.note_billing_in_flight(observations.billing)
+                        if outcome.kind == "provider_failed_transiently":
+                            # Raise inside the try so the failure_types handler records its verdict.
+                            # A billable 200 body can report a transient provider failure.
+                            # A rate-limit body pauses the rate-limit quota like a 429 status.
+                            assistant_message = outcome.assistant_message
+                            raise TransientError(
+                                outcome.reason, is_rate_limit=outcome.is_rate_limit
+                            )
+                    except self.adapter.failure_types as error:
+                        admission.record(self.adapter.parse(error))
                         raise
-                    finally:
-                        await _close_stream_quietly(
-                            adapter_stream,
-                            failure_log_message=(
-                                "closing the provider stream raised; the request's outcome stands"
-                            ),
-                        )
-                    outcome = self._staged_interpretation(
-                        raw, request_id=observations.request_id, ledger=ledger
-                    )
-                    if outcome.kind == "provider_failed_transiently":
-                        # Raise inside the block so its exit parses the failure.
-                        # A billable 200 body can report a transient provider failure.
-                        # A rate-limit body pauses the rate-limit quota like a 429 status.
-                        assistant_message = outcome.assistant_message
-                        raise TransientError(  # noqa: TRY301 (the admitted() block's exit is the parser, so the raise must sit inside it)
-                            outcome.reason, is_rate_limit=outcome.is_rate_limit
-                        )
             except Exception as exc:  # noqa: BLE001 (_settle_failed_request raises every terminal failure)
                 last_failure = exc
-                # The block's exit set a verdict only when `exc` is one of `failure_types`.
+                # The admission holds a verdict only when `exc` is one of `failure_types`.
                 await self._settle_failed_request(
                     exc,
                     verdict=admission.verdict,

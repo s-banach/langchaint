@@ -43,7 +43,6 @@ from langchaint.gemini.generate_content_adapter import (
     GeminiRates,
     GeminiServiceTier,
     assembled_response,
-    parse_gemini,
 )
 from langchaint.generation.llm import LLM
 from langchaint.generation.observer import Observer
@@ -124,42 +123,23 @@ class Gemini:
         self,
         *,
         client: genai.Client | None = None,
-        max_concurrent_requests: int | None = 8,
-        max_request_starts_per_second: float = 50.0,
-        minimum_wait_ceiling_seconds: float = 1.0,
-        longest_wait_seconds: float = 60.0,
-        wait_multiplier: float = 2.0,
-        quiet_seconds_per_decay_step: float = 60.0,
+        shared_backoff: SharedBackoff | None = None,
         observer: Observer | None = None,
     ) -> None:
         """Build `Gemini` without sending a request.
 
         `client=None` constructs `genai.Client(vertexai=False)`.
         A passed `client` must reach the Gemini Developer API.
-        `max_concurrent_requests` limits concurrent admitted requests.
-        `max_request_starts_per_second` limits starts during queued demand.
-        `minimum_wait_ceiling_seconds` sets the initial and minimum wait ceiling.
-        `longest_wait_seconds` caps adaptive and provider-stated waits.
-        `wait_multiplier` scales wait-ceiling changes.
-        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `shared_backoff` admits every request of the created `LLM` values.
+        `shared_backoff=None` creates a `SharedBackoff` with its defaults.
         `observer` follows every input and every tool dispatch of the created `LLM` values.
         `observer=None` follows none.
 
         Raises:
             ValueError: `client` is absent and no API key is available.
-                Also raised when a `SharedBackoff` setting is invalid.
         """
         self._observer = observer
-        self._shared_backoff = SharedBackoff(
-            parse=parse_gemini,
-            failure_types=GeminiGenerateContentAdapter.failure_types,
-            max_concurrent_requests=max_concurrent_requests,
-            max_request_starts_per_second=max_request_starts_per_second,
-            minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
-            longest_wait_seconds=longest_wait_seconds,
-            wait_multiplier=wait_multiplier,
-            quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
-        )
+        self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.client: genai.Client = client if client is not None else genai.Client(vertexai=False)
 
     @overload
@@ -228,5 +208,4 @@ __all__ = [
     "GeminiRates",
     "GeminiServiceTier",
     "assembled_response",
-    "parse_gemini",
 ]

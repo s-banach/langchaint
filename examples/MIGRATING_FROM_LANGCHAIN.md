@@ -34,7 +34,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
 | `RunnableRetry` | `max_requests` on `bind` |
-| `InMemoryRateLimiter` | `max_concurrent_requests` and `max_request_starts_per_second` |
+| `InMemoryRateLimiter` | `SharedBackoff(max_concurrent_requests=..., max_request_starts_per_second=...)` |
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
 | callbacks and LangSmith | `OpenAI(observer=OtelObserver(...))` |
@@ -265,9 +265,10 @@ An adapter rejects `extra_body` keys that it already populates.
 Set `max_requests=1` to disable retries.
 
 ```python
+from langchaint import SharedBackoff
+
 openai = OpenAI(
-    max_concurrent_requests=16,
-    max_request_starts_per_second=5,
+    shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
 )
 bound = openai.model("gpt-5.6-terra").bind(
     max_requests=5,

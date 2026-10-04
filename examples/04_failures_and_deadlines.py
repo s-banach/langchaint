@@ -6,6 +6,7 @@ from langchaint import (
     GenerationWithoutToolCalls,
     ImagePart,
     Message,
+    SharedBackoff,
     TextPart,
     UserMessage,
 )
@@ -23,8 +24,7 @@ async def run_batch_and_handle_what_failed() -> list[
         GenerationError: Fallback generation fails.
     """
     anthropic = Anthropic(
-        max_concurrent_requests=16,
-        max_request_starts_per_second=5,
+        shared_backoff=SharedBackoff(max_concurrent_requests=16, max_request_starts_per_second=5),
     )
     openai = OpenAI()
     summarizer = anthropic.model("claude-sonnet-5").bind(

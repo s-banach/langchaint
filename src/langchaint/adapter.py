@@ -847,7 +847,7 @@ class Adapter(ABC):
         ...
 
     failure_types: ClassVar[tuple[type[Exception], ...]]
-    """The exception types `parse` maps to a `Verdict` for `SharedBackoff.failure_types`.
+    """The exception types `parse` maps to a `Verdict` for `Admission.record`.
 
     `parse` handles SDK status errors and `TransientError`.
     `classify` handles other transport failures.
@@ -856,7 +856,7 @@ class Adapter(ABC):
 
     @abstractmethod
     def parse(self, failure: Exception) -> Verdict:
-        """Map one `failure_types` exception to its `Verdict` for `SharedBackoff.parse`.
+        """Map one `failure_types` exception to its `Verdict` for `Admission.record`.
 
         A retry-after header sets only `retry_after`.
         Return a verdict for every input without raising.

@@ -92,7 +92,6 @@ from tests.fake_adapter import (
     assert_the_first_open_runs_alone,
     billed,
     fast_shared_backoff,
-    parse_fake,
     usable_text_response,
 )
 from tests.helpers import (
@@ -680,7 +679,7 @@ def test_a_terminal_outcome_raises_without_retry(
 
 
 def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
-    """The outcome is retried, that 200's billing lands on its record, and the reason on its error."""
+    """The outcome is retried, and that 200's billing, assistant message, and reason land on its record."""
 
     async def scenario() -> None:
         """Drive one generate_one whose first request reports the failure and whose second is usable."""
@@ -693,6 +692,7 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
         assert isinstance(rejected.error, TransientErrorRecord)
         assert str(rejected.error) == _PROVIDER_FAILURE_REASON
         assert rejected.usage.cost_in_usd == 0.25
+        assert rejected.assistant_message == REJECTED_ASSISTANT_MESSAGE
         assert succeeded.error is None
 
     run_with_timeout(scenario())
@@ -702,7 +702,7 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
     """A failure the provider named a rate limit pauses every request sharing the rate-limit quota.
 
     `is_rate_limit` is the only distinction from another failed response.
-    The exception must leave `admitted()` to pause the rate-limit quota.
+    The exception must reach the `failure_types` handler inside the `admitted()` block to pause the rate-limit quota.
     """
 
     async def scenario() -> None:
@@ -729,48 +729,6 @@ def test_provider_failed_transiently_carrying_the_rate_limit_flag_pauses_admissi
         assert record.error.is_rate_limit
         # Only a PauseAll record moves _pause_until off the sentinel, so this is the flag arriving.
         assert shared_backoff._pause_until != _NEVER
-
-    run_with_timeout(scenario())
-
-
-def test_a_transient_200_retries_under_a_shared_backoff_whose_failure_types_omit_transient_error() -> (
-    None
-):
-    """A TransientError that reaches no verdict retries without classify and keeps what it carried.
-
-    The failure raised for ProviderFailedTransiently is a TransientError.
-    This SharedBackoff does not parse it, so no verdict decides it.
-    """
-
-    async def scenario() -> None:
-        """Retry past one rate-limited 200 and read the failed request's record."""
-        shared_backoff = SharedBackoff(
-            parse=parse_fake,
-            failure_types=(KeyError,),
-            max_concurrent_requests=8,
-            minimum_wait_ceiling_seconds=0.001,
-            longest_wait_seconds=0.002,
-            max_request_starts_per_second=10_000.0,
-        )
-        adapter = FakeAdapter(
-            scripted_requests=[
-                billed(
-                    ProviderFailedTransiently(
-                        reason="Rate limit reached for gpt-5.6",
-                        is_rate_limit=True,
-                        assistant_message=REJECTED_ASSISTANT_MESSAGE,
-                    )
-                )
-            ]
-        )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(max_requests=2)
-        generation = await bound_llm.generate_one([UserMessage(content="hi")])
-        assert generation.output == "ok"
-        failed, _succeeded = _settled_request_records(generation.request_records)
-        assert isinstance(failed.error, TransientErrorRecord)
-        assert failed.error.message == "Rate limit reached for gpt-5.6"
-        assert failed.error.is_rate_limit
-        assert failed.assistant_message == REJECTED_ASSISTANT_MESSAGE
 
     run_with_timeout(scenario())
 
@@ -2317,7 +2275,10 @@ def test_a_close_that_raises_still_returns_the_in_flight_permit() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             async for _item in handle:
                 break
-        async with shared_backoff.admitted(budget=1.0), shared_backoff.admitted(budget=1.0):
+        async with (
+            shared_backoff.admitted(budget=1.0),
+            shared_backoff.admitted(budget=1.0),
+        ):
             pass
 
     run_with_timeout(scenario())
@@ -2434,9 +2395,7 @@ def test_a_mid_stream_rate_limit_pauses_the_rate_limit_quota() -> None:
 
     async def scenario() -> None:
         """Read the pause after one stream item fails."""
-        shared_backoff = SharedBackoff(
-            parse=parse_fake, failure_types=(TransientError,), max_concurrent_requests=8
-        )
+        shared_backoff = SharedBackoff()
         stream = _RaisesItsOwnTransientErrorStream()
         bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=shared_backoff).bind()
         before_monotonic_seconds = time.monotonic()
@@ -3000,11 +2959,11 @@ def test_a_pause_all_do_not_retry_verdict_stops_a_failure_that_would_otherwise_r
 
     async def scenario() -> None:
         """Fail one request with a TransientError that parses to PauseAllDoNotRetry."""
-        adapter = FakeAdapter(scripted_requests=[TransientError("throttled")])
-        shared_backoff = fast_shared_backoff(
-            parse=lambda _failure: PauseAllDoNotRetry(retry_after=None)
+        adapter = FakeAdapter(
+            scripted_requests=[TransientError("throttled")],
+            parse=lambda _failure: PauseAllDoNotRetry(retry_after=None),
         )
-        bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind()
+        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as raised:
             await _generate_through(path, bound_llm)
         assert adapter.bound_adapters[0].open_count == 1
@@ -3021,12 +2980,11 @@ def test_a_pause_all_do_not_retry_verdict_names_a_mid_stream_failure_declared_fi
 
     async def scenario() -> None:
         """Fail the open stream with a TransientError that parses to PauseAllDoNotRetry."""
-        shared_backoff = fast_shared_backoff(
-            parse=lambda _failure: PauseAllDoNotRetry(retry_after=None)
+        adapter = FakeAdapter(
+            stream=_RaisesItsOwnTransientErrorStream(),
+            parse=lambda _failure: PauseAllDoNotRetry(retry_after=None),
         )
-        bound_llm = LLM(
-            FakeAdapter(stream=_RaisesItsOwnTransientErrorStream()), shared_backoff=shared_backoff
-        ).bind()
+        bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
@@ -3046,11 +3004,11 @@ def test_a_retry_this_one_retry_after_sets_the_minimum_private_wait(path: _Gener
     async def scenario() -> None:
         """Recover from one failure whose verdict asks for a wait above the private ceiling."""
         retry_after_seconds = 0.02
-        adapter = FakeAdapter(scripted_requests=[TransientError("slow down")])
-        shared_backoff = fast_shared_backoff(
+        adapter = FakeAdapter(
+            scripted_requests=[TransientError("slow down")],
             parse=lambda _failure: RetryThisOne(retry_after=retry_after_seconds),
-            longest_wait_seconds=1.0,
         )
+        shared_backoff = fast_shared_backoff(longest_wait_seconds=1.0)
         bound_llm = LLM(adapter, shared_backoff=shared_backoff).bind(max_requests=2)
         started_at = time.monotonic()
         _ = await _generate_through(path, bound_llm)

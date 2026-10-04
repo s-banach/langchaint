@@ -13,7 +13,7 @@ from google import genai
 from openai import AsyncAzureOpenAI, AsyncBedrockOpenAI, AsyncOpenAI
 from pydantic import TypeAdapter
 
-from langchaint import LLM, JsonValue
+from langchaint import LLM, JsonValue, SharedBackoff
 from langchaint.adapter import Adapter
 from langchaint.anthropic import (
     ANTHROPIC_BEDROCK,
@@ -270,11 +270,10 @@ def test_the_gemini_adapter_accepts_a_vertex_client_under_its_own_name() -> None
 
 
 def test_gemini_shares_backoff() -> None:
-    """Models from one Gemini share SharedBackoff."""
+    """Models from one Gemini share its SharedBackoff."""
+    shared_backoff = SharedBackoff()
     gemini = Gemini(
-        client=genai.Client(api_key="offline", vertexai=False),
-        max_concurrent_requests=16,
-        max_request_starts_per_second=25.0,
+        client=genai.Client(api_key="offline", vertexai=False), shared_backoff=shared_backoff
     )
     llm = gemini.model(
         "gemini-3.5-flash",
@@ -283,9 +282,8 @@ def test_gemini_shares_backoff() -> None:
     adapter = llm.adapter
     assert isinstance(adapter, GeminiGenerateContentAdapter)
     assert adapter.service_tier == "flex"
-    assert llm.shared_backoff.max_concurrent_requests == 16
-    assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert gemini.model("gemini-3.1-pro-preview").shared_backoff is llm.shared_backoff
+    assert llm.shared_backoff is shared_backoff
+    assert gemini.model("gemini-3.1-pro-preview").shared_backoff is shared_backoff
     defaulted = gemini.model("gemini-3.5-flash")
     defaulted_adapter = defaulted.adapter
     assert isinstance(defaulted_adapter, GeminiGenerateContentAdapter)
@@ -339,16 +337,11 @@ def test_deepseek_without_a_client_requires_the_deepseek_key(
 
 
 def test_deepseek_shares_backoff() -> None:
-    """Models from one DeepSeek share SharedBackoff."""
-    deepseek = DeepSeek(
-        client=_deepseek_client(),
-        max_concurrent_requests=16,
-        max_request_starts_per_second=25.0,
-    )
-    llm = deepseek.model("deepseek-v4-flash")
-    assert llm.shared_backoff.max_concurrent_requests == 16
-    assert llm.shared_backoff.max_request_starts_per_second == 25.0
-    assert deepseek.model("deepseek-v4-pro").shared_backoff is llm.shared_backoff
+    """Models from one DeepSeek share its SharedBackoff."""
+    shared_backoff = SharedBackoff()
+    deepseek = DeepSeek(client=_deepseek_client(), shared_backoff=shared_backoff)
+    assert deepseek.model("deepseek-v4-flash").shared_backoff is shared_backoff
+    assert deepseek.model("deepseek-v4-pro").shared_backoff is shared_backoff
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -536,15 +529,8 @@ def test_service_tier_reaches_each_first_party_adapter() -> None:
 def test_openai_shares_client_and_shared_backoff() -> None:
     """Models from one `OpenAI` share its client and `SharedBackoff`."""
     client = AsyncOpenAI(api_key="offline")
-    openai = OpenAI(
-        client=client,
-        max_concurrent_requests=16,
-        max_request_starts_per_second=25.0,
-        minimum_wait_ceiling_seconds=0.25,
-        longest_wait_seconds=12.0,
-        wait_multiplier=3.0,
-        quiet_seconds_per_decay_step=9.0,
-    )
+    shared_backoff = SharedBackoff()
+    openai = OpenAI(client=client, shared_backoff=shared_backoff)
     terra = openai.model("gpt-5.6-terra", regional_processing=False)
     sol = openai.model("gpt-5.6-sol", regional_processing=False)
     embedding_model = openai.embedding_model("text-embedding-3-small")
@@ -555,14 +541,9 @@ def test_openai_shares_client_and_shared_backoff() -> None:
     assert terra.adapter.client is openai.client
     assert sol.adapter.client is openai.client
     assert embedding_model._adapter.client is openai.client
-    assert terra.shared_backoff is sol.shared_backoff
-    assert terra.shared_backoff is embedding_model._shared_backoff
-    assert terra.shared_backoff.max_concurrent_requests == 16
-    assert terra.shared_backoff.max_request_starts_per_second == 25.0
-    assert terra.shared_backoff.minimum_wait_ceiling_seconds == 0.25
-    assert terra.shared_backoff.longest_wait_seconds == 12.0
-    assert terra.shared_backoff.wait_multiplier == 3.0
-    assert terra.shared_backoff.quiet_seconds_per_decay_step == 9.0
+    assert terra.shared_backoff is shared_backoff
+    assert sol.shared_backoff is shared_backoff
+    assert embedding_model._shared_backoff is shared_backoff
 
 
 def test_separate_openai_values_create_separate_shared_backoffs() -> None:

@@ -79,12 +79,13 @@ A terminal failure becomes that input's `GenerationError`, so sibling outcomes r
 
 ## Coordinate retries across a rate-limit quota
 
-Create one `OpenAI` for each rate-limit quota:
+Create one `SharedBackoff` for each rate-limit quota, and pass it to every backend that sends requests against that quota. Models from one `OpenAI` share its `SharedBackoff`:
 
 ```python
+from langchaint import SharedBackoff
+
 openai = OpenAI(
-    max_concurrent_requests=8,
-    max_request_starts_per_second=50.0,
+    shared_backoff=SharedBackoff(max_concurrent_requests=8, max_request_starts_per_second=50.0),
 )
 
 fast_model = openai.model("gpt-5.6-luna")

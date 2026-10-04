@@ -73,7 +73,6 @@ def parse_fake(failure: Exception) -> Verdict:
 def fast_shared_backoff(
     *,
     max_concurrent_requests: int | None = 8,
-    parse: Callable[[Exception], Verdict] = parse_fake,
     longest_wait_seconds: float = 0.002,
     max_request_starts_per_second: float = 10_000.0,
 ) -> SharedBackoff:
@@ -82,8 +81,6 @@ def fast_shared_backoff(
     One instance serves one event loop.
     """
     return SharedBackoff(
-        parse=parse,
-        failure_types=(TransientError,),
         max_concurrent_requests=max_concurrent_requests,
         minimum_wait_ceiling_seconds=0.001,
         longest_wait_seconds=longest_wait_seconds,
@@ -417,13 +414,14 @@ class FakeAdapter(Adapter):
         echo: bool = False,
         stream: FakeStream | None = None,
         classify_result: ErrorClassification = "unknown_exception",
+        parse: Callable[[Exception], Verdict] = parse_fake,
         open_seconds: float = 0.0,
         hang_from_open: int | None = None,
         open_barrier: asyncio.Barrier | None = None,
         open_barrier_from_call: int = 1,
         automatic_cache_breakpoints_default: bool = False,
     ) -> None:
-        """Store the behavior every bound adapter reads, and the classify verdict.
+        """Store the behavior every bound adapter reads, the classify verdict, and the failure parser.
 
         From call number open_barrier_from_call on, open_stream first waits at open_barrier.
         From call number hang_from_open on, it then suspends until cancelled.
@@ -450,6 +448,7 @@ class FakeAdapter(Adapter):
         self.open_barrier: asyncio.Barrier | None = open_barrier
         self.open_barrier_from_call: int = open_barrier_from_call
         self._classify_result = classify_result
+        self._parse = parse
         self.bound_adapters: list[FakeBoundAdapter] = []
         self.structured_bind_count: int = 0
 
@@ -477,8 +476,8 @@ class FakeAdapter(Adapter):
 
     @override
     def parse(self, failure: Exception) -> Verdict:
-        """Delegate to the module-level rule fast_shared_backoff also parses with."""
-        return parse_fake(failure)
+        """Delegate to the failure parser passed to the constructor."""
+        return self._parse(failure)
 
     @override
     def classify(self, error: Exception) -> ErrorClassification:

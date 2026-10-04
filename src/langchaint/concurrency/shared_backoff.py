@@ -1,6 +1,7 @@
 """Paced request admission for one rate-limit quota.
 
 `SharedBackoff.admitted` applies concurrency, request-rate, queue-order, and shared-pause constraints.
+The caller parses each provider failure into a `Verdict` and passes it to `Admission.record`.
 `PauseAll` and `PauseAllDoNotRetry` pause the quota.
 `RetryThisOne` and `DoNotRetry` leave shared state unchanged.
 """
@@ -11,12 +12,14 @@ import math
 import random
 import time
 from collections import Counter, deque
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from types import TracebackType
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from langchaint.common.exceptions import GaveUpWaitingError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _logger = logging.getLogger("langchaint.shared_backoff")
 
@@ -110,10 +113,9 @@ def _validated_positive_float(name: str, value: float) -> float:
 
 
 class Admission:
-    """Represent one `admitted()` block. Entry waits until the request may start. Exit reports how the request ended.
+    """Represent one `admitted()` block. Entry waits until the request may start. Exit returns the permit.
 
-    `verdict` is `None` until a `failure_types` exception exits the block.
-    `verdict` then holds the normalized `parse` result.
+    `verdict` is `None` until `record` stores the normalized verdict of the request's failure.
     Build `Admission` only through `SharedBackoff.admitted`, which validates `budget` first.
     """
 
@@ -146,50 +148,50 @@ class Admission:
             ) from None
         return self
 
+    def record(self, verdict: Verdict) -> None:
+        """Store the normalized verdict of the request's failure in `verdict` and apply it to shared state.
+
+        Call it inside the block, so a `PauseAll` starts its pause before the permit passes to a waiter.
+        """
+        normalized = self._shared_backoff._normalized(verdict)
+        self.verdict = normalized
+        self._shared_backoff._record(normalized)
+
+    def _release(self) -> None:
+        """Return the permit.
+
+        `StreamHandle` calls this directly because its admission spans several of its methods.
+        """
+        self._shared_backoff._release_permit()
+
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> Literal[False]:
-        """Parse and record a provider failure before releasing the permit.
+        """Return the permit.
 
         Raises:
             BaseException: The admitted block raises it.
         """
-        _ = _exit_admission(self, exc_value)
+        self._release()
         return False
-
-
-def _exit_admission(admission: Admission, failure: BaseException | None) -> Verdict | None:
-    """Parse and record `failure` before returning the admission's permit, and return `admission.verdict`.
-
-    `Admission.__aexit__` passes the block's exception.
-    `StreamHandle` calls this directly because its admission spans several of its methods.
-    """
-    shared_backoff = admission._shared_backoff
-    if isinstance(failure, shared_backoff.failure_types):
-        verdict = shared_backoff._normalized(shared_backoff.parse(failure))
-        admission.verdict = verdict
-        shared_backoff._record(verdict)
-    shared_backoff._release_permit()
-    return admission.verdict
 
 
 class SharedBackoff:
     """Coordinate request starts for one rate-limit quota.
 
     Run each complete provider request inside `admitted`.
-    Raise `failure_types` inside that block so provider pushback updates shared state.
+    Pass each failure's verdict to `Admission.record` inside that block so provider pushback updates shared state.
     Use `PrivateBackoff` between `RetryThisOne` requests.
+    Share one instance among every `LLM` and `EmbeddingModel` that draws on the same rate-limit quota.
     """
 
     def __init__(
         self,
         *,
-        parse: Callable[[Exception], Verdict],
-        failure_types: tuple[type[Exception], ...],
-        max_concurrent_requests: int | None,
+        max_concurrent_requests: int | None = 8,
         minimum_wait_ceiling_seconds: float = 1.0,
         longest_wait_seconds: float = 60.0,
         wait_multiplier: float = 2.0,
@@ -198,13 +200,10 @@ class SharedBackoff:
     ) -> None:
         """Validate configuration. Initialize an unpaused `SharedBackoff`.
 
-        `parse` maps each `failure_types` exception to `Verdict`.
         `max_concurrent_requests=None` applies no concurrency limit.
         `longest_wait_seconds` caps generated waits and `retry_after`.
 
         Args:
-            parse: The provider failure parser, which returns a verdict for every input without raising.
-            failure_types: The exception types that `parse` accepts.
             max_concurrent_requests: The request concurrency limit, or `None`.
             minimum_wait_ceiling_seconds: The minimum private wait ceiling in seconds.
             longest_wait_seconds: The maximum generated or provider-specified wait in seconds.
@@ -219,7 +218,6 @@ class SharedBackoff:
             ValueError: `wait_multiplier` is at most one.
             ValueError: `longest_wait_seconds` is below `minimum_wait_ceiling_seconds`.
             ValueError: `max_concurrent_requests` is boolean or below one.
-            ValueError: `failure_types` is empty or contains `Exception`.
         """
         self.minimum_wait_ceiling_seconds: float = _validated_positive_float(
             "minimum_wait_ceiling_seconds", minimum_wait_ceiling_seconds
@@ -262,14 +260,6 @@ class SharedBackoff:
                 f"max_concurrent_requests must be None or a positive int, "
                 f"got {max_concurrent_requests!r}"
             )
-        if not failure_types:
-            raise ValueError(
-                "failure_types must not be empty: the exit would parse nothing and record nothing"
-            )
-        if Exception in failure_types:
-            raise ValueError("failure_types must not contain Exception")
-        self.parse: Callable[[Exception], Verdict] = parse
-        self.failure_types: tuple[type[Exception], ...] = failure_types
         self._max_concurrent_requests = max_concurrent_requests
         self._steps_to_floor = math.ceil(math.log(ceiling_ratio) / math.log(self.wait_multiplier))
         """Quiet steps after which the ceiling has reached the floor, whatever it started at.

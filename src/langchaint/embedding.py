@@ -30,6 +30,7 @@ from langchaint.concurrency.run_many import max_pending_for_requests, run_many
 from langchaint.concurrency.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
+    Verdict,
 )
 from langchaint.failure_step import _failure_step
 
@@ -53,6 +54,10 @@ class _EmbeddingAdapter(Protocol):
     model: str
     dimension: int
     failure_types: ClassVar[tuple[type[Exception], ...]]
+
+    def parse(self, failure: Exception) -> Verdict:
+        """Map one `failure_types` exception to its `Verdict` without raising."""
+        ...
 
     async def prepare(self) -> None:
         """Complete preparation without work."""
@@ -166,7 +171,7 @@ class EmbeddingModel:
         """Run one request batch through its retry budget.
 
         `_failure_step` decides whether a failed request is retried.
-        A failure outside the `SharedBackoff.failure_types` reaches no verdict, so `classify` decides it.
+        A failure outside the adapter's `failure_types` reaches no verdict, so `classify` decides it.
 
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
@@ -179,9 +184,13 @@ class EmbeddingModel:
             admission = self._shared_backoff.admitted()
             try:
                 async with admission:
-                    return await self._adapter.embed_batch(inputs, task=task)
+                    try:
+                        return await self._adapter.embed_batch(inputs, task=task)
+                    except self._adapter.failure_types as error:
+                        admission.record(self._adapter.parse(error))
+                        raise
             except Exception as error:
-                # The block's exit set a verdict only when `error` is one of `failure_types`.
+                # The admission holds a verdict only when `error` is one of `failure_types`.
                 step = _failure_step(
                     error,
                     verdict=admission.verdict,

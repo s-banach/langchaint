@@ -17,6 +17,7 @@ from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
 import langchaint.cohere as cohere_backend
+from langchaint import SharedBackoff
 from langchaint.cohere import COHERE_BEDROCK_EMBEDDING_MODELS, CohereBedrock
 from langchaint.common.exceptions import EmbeddingOutputError
 from tests.helpers import run_with_timeout
@@ -340,7 +341,9 @@ async def test_batching_uses_ninety_six_inputs() -> None:
     )
     stubber.activate()
     try:
-        cohere_bedrock = CohereBedrock(client=client, max_concurrent_requests=1)
+        cohere_bedrock = CohereBedrock(
+            client=client, shared_backoff=SharedBackoff(max_concurrent_requests=1)
+        )
         model = cohere_bedrock.embedding_model("cohere.embed-v4:0", dimension=256)
         embeddings = await model.embed(inputs, task="clustering")
         assert embeddings.shape == (97, 256)
@@ -611,9 +614,11 @@ async def test_transient_client_error_retries_only_failed_request(
     _ = _install_fake_client(monkeypatch, fake_client)
     cohere_bedrock = CohereBedrock(
         aws_region="us-east-1",
-        minimum_wait_ceiling_seconds=0.000_001,
-        longest_wait_seconds=0.000_002,
-        quiet_seconds_per_decay_step=0.000_001,
+        shared_backoff=SharedBackoff(
+            minimum_wait_ceiling_seconds=0.000_001,
+            longest_wait_seconds=0.000_002,
+            quiet_seconds_per_decay_step=0.000_001,
+        ),
     )
     model = cohere_bedrock.embedding_model(
         "cohere.embed-v4:0",

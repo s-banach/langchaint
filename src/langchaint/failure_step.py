@@ -53,7 +53,7 @@ def _failure_step(
     """Decide what follows after one request fails with `failure`.
 
     `verdict` is the verdict the `admitted()` block recorded for `failure`.
-    `verdict` is `None` when `failure` is not one of the `SharedBackoff.failure_types`.
+    `verdict` is `None` when `failure` is not one of the adapter's `failure_types`.
     A `TransientError` or `StreamProtocolError` without a verdict retries without `classify`.
     `classify` runs only for another failure without a verdict and for `DoNotRetry`.
     Only a failure without a verdict retries on the classification `"transient"`.

@@ -31,7 +31,6 @@ from langchaint.concurrency.shared_backoff import (
     PrivateBackoff,
     SharedBackoff,
     Verdict,
-    _exit_admission,
 )
 from langchaint.failure_step import (
     _failure_step,
@@ -292,12 +291,16 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
     def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
         """Exit the held admission and return its `Verdict`.
 
+        When `exc` is one of the adapter's `failure_types`, its parsed verdict is recorded before the permit returns.
         Repeated calls return `None`.
         """
         if self._admission is None:
             return None
         admission, self._admission = self._admission, None
-        return _exit_admission(admission, exc)
+        if isinstance(exc, self._adapter.failure_types):
+            admission.record(self._adapter.parse(exc))
+        admission._release()
+        return admission.verdict
 
     async def _close_adapter_stream(self) -> None:
         """Close the provider connection and release admission.

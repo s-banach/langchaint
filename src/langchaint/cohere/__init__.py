@@ -376,6 +376,11 @@ class _CohereBedrockEmbeddingAdapter(_EmbeddingAdapter):
         return await to_thread_cancellation_safe(lambda: self._invoke(client, inputs, task))
 
     @override
+    def parse(self, failure: Exception) -> Verdict:
+        """Delegate failure parsing to `_parse_cohere_bedrock`."""
+        return _parse_cohere_bedrock(failure)
+
+    @override
     def classify(self, error: Exception) -> ErrorClassification:
         """Classify a failure that reached no verdict or a `DoNotRetry` verdict."""
         return _classify_cohere_bedrock(error)
@@ -389,43 +394,24 @@ class CohereBedrock:
         *,
         aws_region: str | None = None,
         client: BedrockRuntimeClient | None = None,
-        max_concurrent_requests: int | None = 8,
-        max_request_starts_per_second: float = 50.0,
-        minimum_wait_ceiling_seconds: float = 1.0,
-        longest_wait_seconds: float = 60.0,
-        wait_multiplier: float = 2.0,
-        quiet_seconds_per_decay_step: float = 60.0,
+        shared_backoff: SharedBackoff | None = None,
     ) -> None:
         """Build `CohereBedrock` without creating a client.
 
         `aws_region` selects the region for a client created by `CohereBedrock`.
         A passed `client` must disable SDK retries.
-        `max_concurrent_requests` limits concurrent admitted requests.
-        `max_request_starts_per_second` limits starts during queued demand.
-        `minimum_wait_ceiling_seconds` sets the minimum adaptive wait ceiling.
-        `longest_wait_seconds` caps adaptive and provider-stated waits.
-        `wait_multiplier` scales wait-ceiling changes.
-        `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
+        `shared_backoff` admits every request of the created `EmbeddingModel` values.
+        `shared_backoff=None` creates a `SharedBackoff` with its defaults.
 
         Raises:
             ValueError: `client` accompanies `aws_region`.
                 Also raised when client retries remain enabled.
-                Also raised when a `SharedBackoff` setting is invalid.
         """
         if client is not None and aws_region is not None:
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None:
             _require_one_sdk_request(client)
-        self._shared_backoff = SharedBackoff(
-            parse=_parse_cohere_bedrock,
-            failure_types=_CohereBedrockEmbeddingAdapter.failure_types,
-            max_concurrent_requests=max_concurrent_requests,
-            max_request_starts_per_second=max_request_starts_per_second,
-            minimum_wait_ceiling_seconds=minimum_wait_ceiling_seconds,
-            longest_wait_seconds=longest_wait_seconds,
-            wait_multiplier=wait_multiplier,
-            quiet_seconds_per_decay_step=quiet_seconds_per_decay_step,
-        )
+        self._shared_backoff = shared_backoff if shared_backoff is not None else SharedBackoff()
         self.aws_region: str | None = aws_region
         self._client_cache = _CohereBedrockClientCache(
             aws_region=aws_region,

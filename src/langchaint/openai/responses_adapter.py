@@ -960,7 +960,7 @@ class _OpenAIStream(AdapterStream):
             if error_event is not None:
                 raise openai.APIStatusError(
                     error_event.message,
-                    response=self._sdk_stream._response,  # noqa: SLF001
+                    response=self._sdk_stream._response,
                     body={
                         "code": error_event.code,
                         "message": error_event.message,
@@ -1021,7 +1021,7 @@ class _OpenAIStream(AdapterStream):
         openai 3.0.0 exposes `AsyncResponseStream._response` as `httpx2.Response`.
         No public attribute exposes the same headers.
         """
-        http_response = self._sdk_stream._response  # noqa: SLF001
+        http_response = self._sdk_stream._response
         request_id: str | None = http_response.headers.get("x-request-id")
         return request_id
 

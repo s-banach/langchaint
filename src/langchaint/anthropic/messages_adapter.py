@@ -230,7 +230,7 @@ def client_without_retries[ClientT: AnthropicClient](client: ClientT) -> ClientT
     if client.max_retries == 0:
         return client
     # Bedrock copy() drops custom transports unless http_client is passed again.
-    return client.with_options(max_retries=0, http_client=client._client)  # noqa: SLF001
+    return client.with_options(max_retries=0, http_client=client._client)
 
 
 @dataclass(frozen=True, kw_only=True)

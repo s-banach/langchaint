@@ -135,7 +135,7 @@ class Admission:
         """
         try:
             async with asyncio.timeout(self._budget_seconds):
-                await self._shared_backoff._wait_turn()  # noqa: SLF001 (same-module machinery)
+                await self._shared_backoff._wait_turn()
         except TimeoutError:
             self._shared_backoff.event_counts["gave_up_waiting"] += 1
             _logger.info(
@@ -167,12 +167,12 @@ def _exit_admission(admission: Admission, failure: BaseException | None) -> Verd
     `Admission.__aexit__` passes the block's exception.
     `StreamHandle` calls this directly because its admission spans several of its methods.
     """
-    shared_backoff = admission._shared_backoff  # noqa: SLF001 (same-module machinery)
+    shared_backoff = admission._shared_backoff
     if isinstance(failure, shared_backoff.failure_types):
-        verdict = shared_backoff._normalized(shared_backoff.parse(failure))  # noqa: SLF001 (same-module machinery)
+        verdict = shared_backoff._normalized(shared_backoff.parse(failure))
         admission.verdict = verdict
-        shared_backoff._record(verdict)  # noqa: SLF001 (same-module machinery)
-    shared_backoff._release_permit()  # noqa: SLF001 (same-module machinery)
+        shared_backoff._record(verdict)
+    shared_backoff._release_permit()
     return admission.verdict
 
 

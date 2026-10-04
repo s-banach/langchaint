@@ -121,7 +121,6 @@ lint.select = [
     "PT",
     "RET",
     "RSE",
-    "SLF",
     "SIM",
     "SLOT",
     "TID",
@@ -219,7 +218,6 @@ lint.pylint.max-returns = 10
 lint.pylint.max-branches = 18
 lint.pylint.max-statements = 60
 
-lint.per-file-ignores."tests/*" = ["private-member-access"]
 lint.per-file-ignores."examples/*" = ["implicit-namespace-package"]
 lint.per-file-ignores."examples/full_app/*" = ["implicit-namespace-package", "blind-except", "too-many-return-statements"]
 

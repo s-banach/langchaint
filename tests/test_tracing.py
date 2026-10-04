@@ -46,12 +46,18 @@ from langchaint import (
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
-    TransientError,
     TurnPart,
     UserMessage,
     to_tables,
 )
-from langchaint.adapter import AdapterResult, AdapterStream, InvalidRequest, Refusal, RequestParams
+from langchaint.adapter import (
+    AdapterResult,
+    AdapterStream,
+    InvalidRequest,
+    Refusal,
+    RequestParams,
+    TransientError,
+)
 from langchaint.common.messages import StopReason
 from langchaint.span_parsing import generation_input_from_otel, parse_otel
 from langchaint.tracing import (

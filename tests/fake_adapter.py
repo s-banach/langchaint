@@ -13,15 +13,12 @@ from pydantic import BaseModel
 
 from langchaint import (
     AssistantMessage,
-    DoNotRetry,
     Message,
     SharedBackoff,
     StreamItem,
     TextPart,
     ToolCall,
-    TransientError,
     Usage,
-    Verdict,
 )
 from langchaint.adapter import (
     Adapter,
@@ -29,6 +26,7 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     BoundAdapter,
+    DoNotRetry,
     ErrorClassification,
     InvalidRequest,
     MaxCompletionTokensExceeded,
@@ -37,6 +35,8 @@ from langchaint.adapter import (
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
+    TransientError,
+    Verdict,
     verdict_from_transient_error,
 )
 from tests.helpers import stated_provider_billing, yield_until

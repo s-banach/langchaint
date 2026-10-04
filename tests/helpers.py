@@ -29,16 +29,17 @@ from langchaint import (
     Billing,
     CallRecord,
     SettledAttemptRecord,
-    TransientError,
     TransientErrorRecord,
     Usage,
 )
-from langchaint.adapter import ErrorClassification, ProviderBilling
-from langchaint.concurrency.shared_backoff import (
+from langchaint.adapter import (
     DoNotRetry,
+    ErrorClassification,
     PauseAll,
     PauseAllDoNotRetry,
+    ProviderBilling,
     RetryThisOne,
+    TransientError,
     Verdict,
 )
 from scripts import refresh_semconv_genai

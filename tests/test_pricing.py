@@ -4,8 +4,8 @@ import math
 
 import pytest
 
-from langchaint import ZERO_USAGE, Usage, category_cost
-from langchaint.billing.pricing import invocation_cost_in_usd
+from langchaint import ZERO_USAGE, Usage
+from langchaint.billing.pricing import category_cost, invocation_cost_in_usd
 from tests.helpers import stated_billing
 
 

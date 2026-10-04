@@ -30,10 +30,10 @@ from langchaint import (
     TurnPart,
     UnfinishedTurnErrorRecord,
     UnknownExceptionErrorRecord,
-    Verdict,
 )
 from langchaint.adapter import (
     ResponseOutcome,
+    Verdict,
 )
 
 

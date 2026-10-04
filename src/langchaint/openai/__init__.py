@@ -119,7 +119,7 @@ class OpenAI:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
-        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer` follows every input and every tool dispatch of the created `LLM` values.
         `observer=None` follows none.
 
         Raises:
@@ -230,7 +230,7 @@ class OpenAI:
         model: Literal["text-embedding-3-small"],
         *,
         dimension: int = 1536,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     @overload
@@ -239,7 +239,7 @@ class OpenAI:
         model: Literal["text-embedding-3-large"],
         *,
         dimension: int = 3072,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     @overload
@@ -247,7 +247,7 @@ class OpenAI:
         self,
         model: Literal["text-embedding-ada-002"],
         *,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     def embedding_model(
@@ -255,7 +255,7 @@ class OpenAI:
         model: OpenAIEmbeddingModelName,
         *,
         dimension: int | None = None,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged OpenAI model.
 
@@ -264,7 +264,7 @@ class OpenAI:
         Every model counts batching tokens with tiktoken's `cl100k_base` encoding.
 
         Raises:
-            ValueError: `model`, `dimension`, or `max_attempts` is invalid.
+            ValueError: `model`, `dimension`, or `max_requests` is invalid.
             ModuleNotFoundError: Either `numpy` or `tiktoken` is unavailable.
         """
         if model not in OPENAI_EMBEDDING_MODELS:
@@ -306,7 +306,7 @@ class OpenAI:
         return EmbeddingModel(
             adapter=adapter,
             shared_backoff=self._shared_backoff,
-            max_attempts=max_attempts,
+            max_requests=max_requests,
         )
 
 
@@ -335,7 +335,7 @@ class OpenAIBedrock:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
-        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer` follows every input and every tool dispatch of the created `LLM` values.
         `observer=None` follows none.
 
         Raises:

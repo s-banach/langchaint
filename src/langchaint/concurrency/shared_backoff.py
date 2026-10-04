@@ -41,7 +41,7 @@ class PauseAll:
 class RetryThisOne:
     """Worth retrying, with no sign the provider wants less traffic overall.
 
-    `retry_after` is a wait floor for this request's next attempt.
+    `retry_after` is a wait floor before the next request of the same retry loop.
     `retry_after` is `None` when the provider specified no wait.
     Recording this verdict changes no shared state.
     """
@@ -181,7 +181,7 @@ class SharedBackoff:
 
     Run each complete provider request inside `admitted`.
     Raise `failure_types` inside that block so provider pushback updates shared state.
-    Use `PrivateBackoff` between `RetryThisOne` attempts.
+    Use `PrivateBackoff` between `RetryThisOne` requests.
     """
 
     def __init__(
@@ -316,7 +316,7 @@ class SharedBackoff:
         return self._max_concurrent_requests
 
     def admitted(self, *, budget: float | None = None) -> Admission:
-        """Return an `Admission` block for one attempt.
+        """Return an `Admission` block for one request.
 
         `budget` limits the admission wait.
         `budget=None` permits an indefinite wait.
@@ -543,9 +543,9 @@ class SharedBackoff:
 
 
 class PrivateBackoff:
-    """Generate private waits between one request's `RetryThisOne` attempts.
+    """Generate private waits between the `RetryThisOne` retries of one retry loop.
 
-    Keep one instance for the request's complete retry loop.
+    Keep one instance for a complete retry loop.
     Sleep returned waits outside `admitted` blocks.
     """
 

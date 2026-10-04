@@ -25,12 +25,12 @@ from langchaint import (
 _MESSAGES_TYPE_ADAPTER: TypeAdapter[tuple[Message, ...]] = TypeAdapter(tuple[Message, ...])
 
 
-def test_string_turn_coercion() -> None:
-    """A bare string turn coerces to one TextPart on every construction path."""
-    assistant = AssistantMessage(turn="hey")
-    assert assistant.turn == (TextPart(text="hey"),)
-    assert assistant == AssistantMessage(turn=(TextPart(text="hey"),))
-    assert AssistantMessage.model_validate({"kind": "assistant", "turn": "hey"}) == assistant
+def test_string_parts_coercion() -> None:
+    """A bare string `parts` value coerces to one TextPart on every construction path."""
+    assistant = AssistantMessage(parts="hey")
+    assert assistant.parts == (TextPart(text="hey"),)
+    assert assistant == AssistantMessage(parts=(TextPart(text="hey"),))
+    assert AssistantMessage.model_validate({"kind": "assistant", "parts": "hey"}) == assistant
 
 
 def test_tool_message_error_binds_the_call_id_and_sets_is_error() -> None:
@@ -72,22 +72,22 @@ def test_cache_breakpoint_round_trips() -> None:
     assert restored == messages
 
 
-def test_assistant_turn_rejects_a_marked_text_part() -> None:
-    """A TextPart with cache_breakpoint in an assistant turn fails validation on every construction path."""
+def test_assistant_message_rejects_a_marked_text_part() -> None:
+    """A TextPart with cache_breakpoint in an assistant message fails validation on every construction path."""
     marked = TextPart(text="hey", cache_breakpoint=True)
     with pytest.raises(ValidationError, match="cache_breakpoint"):
-        _ = AssistantMessage(turn=(marked,))
+        _ = AssistantMessage(parts=(marked,))
     with pytest.raises(ValidationError, match="cache_breakpoint"):
         _ = AssistantMessage.model_validate({
             "kind": "assistant",
-            "turn": [{"kind": "text", "text": "hey", "cache_breakpoint": True}],
+            "parts": [{"kind": "text", "text": "hey", "cache_breakpoint": True}],
         })
 
 
 _PINNED_MESSAGES: tuple[Message, ...] = (
     UserMessage(content=(TextPart(text="context", cache_breakpoint=True), TextPart(text="q"))),
     AssistantMessage(
-        turn=(
+        parts=(
             ReasoningPart(raw={"type": "thinking", "thinking": "hm", "signature": "s"}, text="hm"),
             TextPart(text="checking"),
             ToolCall(id="c1", name="probe", args_json='{"depth": 2}'),
@@ -108,14 +108,14 @@ _PINNED_MESSAGES: tuple[Message, ...] = (
 
 
 def _one_of_each_message() -> list[Message]:
-    """One conversation holding every Message, ContentPart, and TurnPart variant.
+    """One conversation holding every Message, ContentPart, and AssistantPart variant.
 
     Append a part here, so _PINNED_MESSAGES stays pinned.
     """
     return [
         *_PINNED_MESSAGES,
         AssistantMessage(
-            turn=(
+            parts=(
                 RawPart(raw={"type": "web_search_call", "id": "ws_1"}),
                 TextPart(text="ok"),
             )
@@ -142,7 +142,7 @@ def test_messages_json_round_trip_restores_the_list() -> None:
     assert messages_from_json(messages_to_json(messages)) == messages
 
 
-_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"turn":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_part"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
+_PINNED_MESSAGES_JSON = r'[{"content":[{"text":"context","cache_breakpoint":true,"kind":"text"},{"text":"q","cache_breakpoint":false,"kind":"text"}],"kind":"user"},{"parts":[{"raw":{"type":"thinking","thinking":"hm","signature":"s"},"text":"hm","kind":"reasoning_part"},{"text":"checking","cache_breakpoint":false,"kind":"text"},{"id":"c1","name":"probe","args_json":"{\"depth\": 2}","kind":"tool_call"},{"id":"c2","name":"fetch","args_json":"{}","kind":"tool_call"}],"kind":"assistant"},{"tool_call_id":"c1","content":[{"text":"saw","cache_breakpoint":false,"kind":"text"},{"data":"iVBORwD_","media_type":"image/png","cache_breakpoint":false,"kind":"image"}],"is_error":false,"kind":"tool"},{"tool_call_id":"c2","content":"fetch failed","is_error":true,"kind":"tool"},{"content":"and then?","kind":"user"}]'
 """One messages_to_json output, pasted rather than computed.
 
 This is the persisted-text format applications hold on disk.
@@ -224,11 +224,11 @@ def test_raw_parts_reject_nonfinite_recursive_json(
 def test_model_copy_rejects_a_derived_property_key() -> None:
     """model_copy(update={"tool_calls": ...}) raises instead of silently dropping the key.
 
-    pydantic's unvalidated copy would leave turn unchanged.
+    pydantic's unvalidated copy would leave `parts` unchanged.
     The property would shadow the unused key.
-    An app could then resend the unfiltered assistant turn.
+    An app could then resend the unfiltered assistant message.
     """
-    message = AssistantMessage(turn=(ToolCall(id="c1", name="probe", args_json="{}"),))
+    message = AssistantMessage(parts=(ToolCall(id="c1", name="probe", args_json="{}"),))
     with pytest.raises(TypeError, match="derived property of AssistantMessage"):
         _ = message.model_copy(update={"tool_calls": ()})
 

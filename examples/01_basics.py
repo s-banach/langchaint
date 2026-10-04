@@ -1,4 +1,4 @@
-"""Demonstrate OpenAI generation results."""
+"""Demonstrate OpenAI generations and their records."""
 
 from pathlib import Path
 from typing import Literal
@@ -29,9 +29,9 @@ async def basics() -> None:
     assistant = llm.bind(system_prompt="Be terse.")
     colors = await assistant.generate_one("Name three primary colors.")
     print(f"answer: {colors.output}")
-    print(f"model: {colors.call.model}")
-    print(f"provider: {colors.call.provider_name}")
-    print(f"attempts: {len(colors.call.attempt_records)}")
+    print(f"model: {colors.request_history.model}")
+    print(f"provider: {colors.request_history.provider_name}")
+    print(f"requests: {colors.request_count}")
 
     classifier = llm.bind(response_format=Sentiment)
     classification = await classifier.generate_one("Best day I have had in months.")
@@ -44,9 +44,9 @@ async def basics() -> None:
     bridge = await detailed.generate_one("How does a suspension bridge carry load?")
     print(bridge.output)
 
-    result_records = await assistant.generate_many_records(
+    outcome_records = await assistant.generate_many_records(
         ["Define entropy.", "Define enthalpy."],
         resume_path=Path("definition-records.json"),
     )
-    calls, attempts = to_tables(result_records)
-    print(f"{len(calls)} calls over {len(attempts)} attempts")
+    outcome_rows, request_rows = to_tables(outcome_records)
+    print(f"{len(outcome_rows)} outcomes over {len(request_rows)} requests")

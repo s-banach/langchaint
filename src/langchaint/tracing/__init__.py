@@ -1,4 +1,4 @@
-"""Trace langchaint calls with OTel spans.
+"""Trace langchaint generations and tool dispatches with OTel spans.
 
 Importing this subpackage requires `opentelemetry-api`.
 Applications configure the OTel SDK.
@@ -8,7 +8,7 @@ Every `LLM`, binding, and stream that backend creates is then traced, and the ap
 A `ToolManager` that `bind` builds from a tool sequence traces its dispatches.
 A `ToolManager` the application builds traces its dispatches when built with `observer=`.
 
-Each generation call opens one CLIENT span.
+Each input opens one CLIENT span.
 `generate_many` opens one span per started input.
 `generate_many_records` opens one span per input that requires generation.
 Restored records open no span.
@@ -31,19 +31,19 @@ Request and completion attributes replace matching `extra_attributes` keys.
 Required `gen_ai.operation.name` values also replace matching `extra_attributes` keys.
 
 Chat and stream spans use `gen_ai.operation.name="chat"`.
-They report provider, request model, response model, finish reasons, token usage, attempts, and cost.
+They report provider, request model, response model, finish reasons, token usage, request count, and cost.
 They report the standard attributes for each set request field.
-They report `gen_ai.output.type` for every call.
+They report `gen_ai.output.type` for every input.
 With capture enabled, they report system instructions, tool definitions, input messages, and output messages.
 Stream spans also report `gen_ai.request.stream=True`.
 A stream span reports `gen_ai.response.time_to_first_chunk` once an item arrives, including for a stream left early.
 A stream span whose block exits before the conclusion reports its usage and cost.
-Its status stays unset, because the call did not fail.
+Its status stays unset, because handling the input did not fail.
 Tool spans use `gen_ai.operation.name="execute_tool"` and report tool name and tool call id.
 With capture enabled, tool spans report arguments and results.
 
-`langchaint.*` names attempts and cost because the convention has no matching keys.
-Each failed attempt adds `langchaint.attempt_failed` with `error_text` and `elapsed_seconds`.
+`langchaint.*` names the request count and cost because the convention has no matching keys.
+Each failed request adds `langchaint.request_failed` with `error_text` and `elapsed_seconds`.
 
 Each span starts and ends exactly once, including for failed, cancelled, and abandoned streams.
 A mapper may set only attribute names and values.
@@ -79,6 +79,7 @@ except ModuleNotFoundError as exc:
 
 from langchaint.adapter import Binding
 from langchaint.common.messages import (
+    AssistantPart,
     ContentPart,
     JsonValue,
     Message,
@@ -86,13 +87,12 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnPart,
 )
 from langchaint.common.observed_operation import ObservedOperation
-from langchaint.generation.call import AbandonedCallRecord
 from langchaint.generation.errors import GenerationError
 from langchaint.generation.observer import GenerationStart
-from langchaint.generation.response import CallResult
+from langchaint.generation.request_history import AbandonedStreamRecord
+from langchaint.generation.response import GenerationOutcome
 from langchaint.tools import DispatchOutcome, ToolSchema
 
 type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
@@ -101,17 +101,22 @@ type SpanAttributeValue = str | bool | int | float | list[str] | tuple[str, ...]
 type SpanAttributes = Mapping[str, SpanAttributeValue]
 """A span's attributes, keyed by name."""
 
-type AttributeMapper = Callable[[CallResult[object] | AbandonedCallRecord], SpanAttributes]
-"""Maps one generate result, or a stream's `abandoned` record, to its span attributes.
+type AttributeMapper = Callable[
+    [GenerationOutcome[object] | AbandonedStreamRecord], SpanAttributes
+]
+"""Maps one `GenerationOutcome`, or a stream's `abandoned` record, to its span attributes.
 
-The mapper reads the fields shared by each `CallResult` variant and `AbandonedCallRecord`.
-No mapper receives the call's input messages, so `gen_ai_attributes` cannot put a prompt on a span.
-A custom mapper can reach `CallResult.raw`, which holds the SDK response by reference.
-`AbandonedCallRecord` has no `raw`, because no response completed.
-`capture_message_content` controls prompt capture because `OtelObserver` receives the input messages at call start.
+The mapper reads the fields shared by each `GenerationOutcome` variant and `AbandonedStreamRecord`.
+No mapper receives the input messages, so `gen_ai_attributes` cannot put a prompt on a span.
+A custom mapper can reach `raw` on a `Generation`, which holds the final SDK response by reference.
+It can reach `request_provider_data` on a `Generation` or `GenerationError`.
+`AbandonedStreamRecord` has no `raw`, because no response completed.
+`capture_message_content` controls prompt capture because `OtelObserver` receives the messages when an input starts.
 """
 
-type ContentFilter = Callable[[str, ContentPart | TurnPart], ContentPart | TurnPart | None]
+type ContentFilter = Callable[
+    [str, ContentPart | AssistantPart], ContentPart | AssistantPart | None
+]
 """Decides what one content attribute records for one part.
 
 The first argument is the content attribute name, such as `"gen_ai.input.messages"`.
@@ -127,8 +132,8 @@ Message-level fields such as `role`, `tool_call_id`, `is_error`, and `finish_rea
 
 
 def _record_every_part(
-    _attribute_name: str, part: ContentPart | TurnPart
-) -> ContentPart | TurnPart:
+    _attribute_name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart:
     """Return `part` unchanged, as the filter that `content_filter=None` selects."""
     return part
 
@@ -143,11 +148,11 @@ def _filtered_part(
 ) -> ContentPart | None: ...
 @overload
 def _filtered_part(
-    content_filter: ContentFilter, attribute_name: str, part: TurnPart
-) -> TurnPart | None: ...
+    content_filter: ContentFilter, attribute_name: str, part: AssistantPart
+) -> AssistantPart | None: ...
 def _filtered_part(
-    content_filter: ContentFilter, attribute_name: str, part: ContentPart | TurnPart
-) -> ContentPart | TurnPart | None:
+    content_filter: ContentFilter, attribute_name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart | None:
     """Run the filter on one part.
 
     The overloads state what the `isinstance` check guarantees: a kept part has the class of `part`.
@@ -179,7 +184,7 @@ _logger = logging.getLogger("langchaint.tracing")
 def _guarding_telemetry_failures(what: str) -> Generator[None]:
     """Log whatever the block raises instead of letting it out.
 
-    OTel Exception values are logged because they must not replace a result or active exception.
+    OTel Exception values are logged because they must not replace a return value or active exception.
     Application callables use guards that name the callable.
     Only Exception is caught, so a cancellation still reaches the caller.
     """
@@ -190,13 +195,13 @@ def _guarding_telemetry_failures(what: str) -> Generator[None]:
 
 
 def _set_ok_status(span: Span) -> None:
-    """Mark one span successful, without letting the call reach the caller."""
+    """Mark one span OK, without letting an OTel exception reach the caller."""
     with _guarding_telemetry_failures("setting the span status"):
         span.set_status(Status(StatusCode.OK))
 
 
 def _set_span_attributes(span: Span, attributes: SpanAttributes) -> None:
-    """Set a mapping of attributes, without letting the call reach the caller.
+    """Set a mapping of attributes, without letting an OTel exception reach the caller.
 
     A non-recording span ignores them, as the OTel API specifies.
     """
@@ -240,12 +245,12 @@ Unmapped values pass through unchanged.
 """
 
 
-_NO_COMPLETED_TURN_FINISH_REASON = "error"
-"""What gen_ai.output.messages reports for a turn whose result states no stop reason.
+_NO_STOP_REASON_FINISH_REASON = "error"
+"""What gen_ai.output.messages reports for an assistant message whose outcome states no stop reason.
 
-The convention's `error` enum member identifies a failed generation.
+The convention uses `error` when handling an input fails.
 `gen_ai.response.finish_reasons` is optional and is omitted.
-The per-message field is required, so a turn recorded from a failure needs a value.
+The per-message field is required, so an assistant message recorded from a failure needs a value.
 """
 
 
@@ -258,53 +263,53 @@ def _finish_reason(stop_reason: StopReason) -> str:
 
 
 def gen_ai_attributes[OutputT](
-    result: CallResult[OutputT] | AbandonedCallRecord,
+    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
 ) -> SpanAttributes:
-    """Map a generate result to GenAI-convention span attributes plus langchaint scalars.
+    """Map a `GenerationOutcome` to GenAI-convention span attributes plus langchaint scalars.
 
-    `result` supplies the response identity, usage, stop reason, and attempt records.
+    `outcome` supplies the response identity, usage, stop reason, and request records.
     This is the default attribute_mapper.
-    A custom AttributeMapper can extend its result.
+    A custom AttributeMapper can extend the returned dict.
     Extension keys must use the application's namespace because langchaint.* is reserved.
     `extra_attributes` sets a constant on every span.
-    Each call builds and returns a fresh dict, so extending the result mutates nothing shared.
-    This function reads only the fields shared by every `CallResult` variant and `AbandonedCallRecord`.
+    Each call builds and returns a fresh dict, so extending it mutates nothing shared.
+    This function reads only the fields shared by every `GenerationOutcome` variant and `AbandonedStreamRecord`.
     The langchaint.* prefix is used only when the GenAI convention has no corresponding key.
-    This applies to langchaint.attempts and langchaint.cost_in_usd.
+    This applies to langchaint.request_count and langchaint.cost_in_usd.
     gen_ai.usage.input_tokens is Usage.input_tokens_total.
     The cache-read and cache-write attributes are parts of that total.
     No cache_none counter is emitted because it is derived.
     gen_ai.response.finish_reasons contains the mapped stop_reason and is omitted when stop_reason is None.
-    gen_ai.response.model is the last attempt's model_served and is omitted when unavailable.
-    gen_ai.response.time_to_first_chunk is the last attempt's seconds_to_first_item, settled or cut off.
+    gen_ai.response.model is the last request's model_served and is omitted when unavailable.
+    gen_ai.response.time_to_first_chunk is the last request's seconds_to_first_item, settled or cut off.
     That value runs from sending the request to the first stream item, so only a stream has it.
-    The usage and cost attributes are the call's paid totals across every attempt.
-    `result.usage` has that scope.
-    `langchaint.attempt_failed` span events retain per-attempt detail.
+    The usage and cost attributes are the input's paid totals across every request.
+    `outcome.usage` has that scope.
+    `langchaint.request_failed` span events retain per-request detail.
     """
-    usage = result.usage
-    records = result.attempt_records
+    usage = outcome.usage
+    records = outcome.request_records
     final_record = records[-1] if records else None
     final_settled_record = (
         final_record if final_record is not None and final_record.kind == "settled" else None
     )
     attributes: dict[str, SpanAttributeValue] = {
-        "gen_ai.provider.name": result.provider_name,
-        "gen_ai.request.model": result.model,
+        "gen_ai.provider.name": outcome.provider_name,
+        "gen_ai.request.model": outcome.model,
         "gen_ai.usage.input_tokens": usage.input_tokens_total,
         "gen_ai.usage.output_tokens": usage.output_tokens,
         "gen_ai.usage.reasoning.output_tokens": usage.output_tokens_reasoning,
         "gen_ai.usage.cache_read.input_tokens": usage.input_tokens_cache_read,
         "gen_ai.usage.cache_write.input_tokens": usage.input_tokens_cache_write,
-        "langchaint.attempts": result.attempts,
+        "langchaint.request_count": outcome.request_count,
         "langchaint.cost_in_usd": usage.cost_in_usd,
     }
     if final_settled_record is not None and final_settled_record.model_served is not None:
         attributes["gen_ai.response.model"] = final_settled_record.model_served
     if final_record is not None and final_record.seconds_to_first_item is not None:
         attributes["gen_ai.response.time_to_first_chunk"] = final_record.seconds_to_first_item
-    if result.stop_reason is not None:
-        attributes["gen_ai.response.finish_reasons"] = [_finish_reason(result.stop_reason)]
+    if outcome.stop_reason is not None:
+        attributes["gen_ai.response.finish_reasons"] = [_finish_reason(outcome.stop_reason)]
     return attributes
 
 
@@ -368,8 +373,8 @@ def _tool_call_arguments(args_json: str) -> JsonValue:
         return args_json
 
 
-def _turn_part(part: TurnPart) -> dict[str, object] | None:
-    """Render one TurnPart as the convention's part object, or None when it records nothing.
+def _assistant_part(part: AssistantPart) -> dict[str, object] | None:
+    """Render one AssistantPart as the convention's part object, or None when it records nothing.
 
     ReasoningPart and TextPart emit their text, and render as None when it is empty.
     ReasoningPart.raw is opaque and is never emitted.
@@ -391,15 +396,15 @@ def _turn_part(part: TurnPart) -> dict[str, object] | None:
             return None
 
 
-def _recorded_turn(
-    turn: tuple[TurnPart, ...], content_filter: ContentFilter, attribute_name: str
+def _recorded_assistant_parts(
+    parts: tuple[AssistantPart, ...], content_filter: ContentFilter, attribute_name: str
 ) -> list[dict[str, object]]:
-    """Filter an assistant turn and render the kept parts as the convention's parts array, in emission order.
+    """Filter an assistant message's parts and render the kept ones as the convention's parts array, in order.
 
-    A turn whose every part is omitted or renders as None renders as an empty parts array, not as a missing message.
+    If every part is omitted or renders as None, the message renders as an empty parts array, not as a missing message.
     """
-    kept = (_filtered_part(content_filter, attribute_name, part) for part in turn)
-    rendered = (_turn_part(part) for part in kept if part is not None)
+    kept = (_filtered_part(content_filter, attribute_name, part) for part in parts)
+    rendered = (_assistant_part(part) for part in kept if part is not None)
     return [part for part in rendered if part is not None]
 
 
@@ -411,14 +416,14 @@ def _input_message(message: Message, content_filter: ContentFilter) -> dict[str,
     attribute_name = "gen_ai.input.messages"
     match message.kind:
         case "user":
-            parts = _recorded_content(message.content, content_filter, attribute_name)
-            return {"role": "user", "parts": parts}
+            otel_parts = _recorded_content(message.content, content_filter, attribute_name)
+            return {"role": "user", "parts": otel_parts}
         case "tool":
-            parts = [_tool_call_response_part(message, content_filter, attribute_name)]
-            return {"role": "tool", "parts": parts}
+            otel_parts = [_tool_call_response_part(message, content_filter, attribute_name)]
+            return {"role": "tool", "parts": otel_parts}
         case "assistant":
-            parts = _recorded_turn(message.turn, content_filter, attribute_name)
-            return {"role": "assistant", "parts": parts}
+            otel_parts = _recorded_assistant_parts(message.parts, content_filter, attribute_name)
+            return {"role": "assistant", "parts": otel_parts}
 
 
 def _tool_call_response_part(
@@ -458,7 +463,7 @@ def _tool_definitions(tool_schemas: tuple[ToolSchema, ...]) -> list[dict[str, ob
 def _input_content_attributes(
     binding: Binding, messages: Sequence[Message], *, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
-    """Build the input-side content attributes for one call, each a JSON string.
+    """Build the input-side content attributes for one input, each a JSON string.
 
     OTel attribute values cannot nest, so structured values use the permitted JSON string form.
     A key whose source is empty or absent is omitted.
@@ -503,20 +508,22 @@ def _request_attributes(start: GenerationStart) -> dict[str, SpanAttributeValue]
 
 
 def _output_content_attributes(
-    turn: tuple[TurnPart, ...], stop_reason: StopReason | None, content_filter: ContentFilter
+    parts: tuple[AssistantPart, ...], stop_reason: StopReason | None, content_filter: ContentFilter
 ) -> dict[str, SpanAttributeValue]:
-    """Build gen_ai.output.messages from one assistant turn.
+    """Build gen_ai.output.messages from one assistant message's parts.
 
-    One function for the success and the failure paths, so one turn renders the same whichever reported it.
-    One key contains one message for one turn.
+    One function for the generation and the failure paths, so an assistant message renders the same from either.
+    One key contains one message.
     """
     return {
         "gen_ai.output.messages": json.dumps([
             {
                 "role": "assistant",
-                "parts": _recorded_turn(turn, content_filter, "gen_ai.output.messages"),
+                "parts": _recorded_assistant_parts(
+                    parts, content_filter, "gen_ai.output.messages"
+                ),
                 "finish_reason": (
-                    _NO_COMPLETED_TURN_FINISH_REASON
+                    _NO_STOP_REASON_FINISH_REASON
                     if stop_reason is None
                     else _finish_reason(stop_reason)
                 ),
@@ -526,59 +533,61 @@ def _output_content_attributes(
 
 
 def _apply_output_content[OutputT](
-    span: Span, result: CallResult[OutputT] | AbandonedCallRecord, span_config: _SpanConfig
+    span: Span,
+    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
+    span_config: _SpanConfig,
 ) -> None:
-    """Set gen_ai.output.messages from the result's turn, when capture is on and the span is recording.
+    """Set gen_ai.output.messages from the outcome's assistant message, when capture is on and the span is recording.
 
-    GenerationError carries the last produced turn. The key is omitted when no attempt produced a turn.
-    Per-attempt detail stays on the langchaint.attempt_failed events, which carry no content.
+    GenerationError carries the last assistant message. The key is omitted when no request produced one.
+    Per-request detail stays on the langchaint.request_failed events, which carry no content.
     """
-    assistant_message = result.assistant_message
+    assistant_message = outcome.assistant_message
     if assistant_message is None:
         return
-    stop_reason = result.stop_reason
+    stop_reason = outcome.stop_reason
     _apply_content_attributes(
         span,
         span_config,
         lambda content_filter: _output_content_attributes(
-            assistant_message.turn, stop_reason, content_filter
+            assistant_message.parts, stop_reason, content_filter
         ),
     )
 
 
-def _record_attempt_failed_events[OutputT](
-    span: Span, result: CallResult[OutputT] | AbandonedCallRecord
+def _record_request_failed_events[OutputT](
+    span: Span, outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord
 ) -> None:
-    """Add one langchaint.attempt_failed event per failed attempt in the result's records.
+    """Add one langchaint.request_failed event per failed request in the outcome's request records.
 
-    Each event carries the attempt's error text and its own `elapsed_seconds`.
+    Each event carries the request's error text and its own `elapsed_seconds`.
     Events are stamped at recording time because the records carry only monotonic brackets.
-    They answer the first question a slow traced call raises: was it the request or the retries.
+    They answer the first question a slow traced input raises: was it one request or the retries.
     """
-    for record in result.attempt_records:
+    for record in outcome.request_records:
         if record.kind == "settled" and record.error is not None:
             span.add_event(
-                "langchaint.attempt_failed",
+                "langchaint.request_failed",
                 {"error_text": str(record.error), "elapsed_seconds": record.elapsed_seconds},
             )
 
 
-def _apply_result_attributes[OutputT](
+def _apply_outcome_attributes[OutputT](
     span: Span,
-    result: CallResult[OutputT] | AbandonedCallRecord,
+    outcome: GenerationOutcome[OutputT] | AbandonedStreamRecord,
     attribute_mapper: AttributeMapper,
 ) -> None:
-    """Set the langchaint.attempt_failed events and the mapper's attributes on a recording span.
+    """Set the langchaint.request_failed events and the mapper's attributes on a recording span.
 
     A non-recording span skips both, because an `AttributeMapper` may be expensive.
     The events are added before the mapper runs.
     Events and mapper attributes use separate guards, so a mapper that raises keeps the events.
     An error whose str() raises can leave the events partial.
     """
-    with _guarding_telemetry_failures("adding the langchaint.attempt_failed events"):
+    with _guarding_telemetry_failures("adding the langchaint.request_failed events"):
         if span.is_recording():
-            _record_attempt_failed_events(span, result)
-    _set_built_attributes(span, "attribute_mapper", lambda: attribute_mapper(result))
+            _record_request_failed_events(span, outcome)
+    _set_built_attributes(span, "attribute_mapper", lambda: attribute_mapper(outcome))
 
 
 def _apply_content_attributes(
@@ -598,7 +607,7 @@ def _apply_content_attributes(
 
 
 def _set_error_status(span: Span, error_type: str, description: str) -> None:
-    """Set error.type and error status, without letting the calls reach the caller.
+    """Set error.type and error status, without letting an OTel exception reach the caller.
 
     An empty description sets a status without a description.
     """
@@ -663,19 +672,19 @@ class _SpanOperation:
 
 
 class _GenerationSpan(_SpanOperation):
-    """The CLIENT chat span of one generation call."""
+    """The CLIENT chat span of one input."""
 
-    def conclude(self, outcome: CallResult[object] | AbandonedCallRecord) -> None:
-        """Set the span's result attributes, output content, and status from the call's outcome.
+    def conclude(self, outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> None:
+        """Set the span's outcome attributes, output content, and status from the input's outcome.
 
-        A success sets OK status, and a `GenerationError` sets error status and error.type.
-        An `AbandonedCallRecord` leaves the status unset, because the application's code ended the stream.
+        A `Generation` sets OK status, and a `GenerationError` sets error status and error.type.
+        An `AbandonedStreamRecord` leaves the status unset, because the application's code ended the stream.
         """
-        _apply_result_attributes(self._span, outcome, self._span_config.attribute_mapper)
+        _apply_outcome_attributes(self._span, outcome, self._span_config.attribute_mapper)
         _apply_output_content(self._span, outcome, self._span_config)
         if isinstance(outcome, GenerationError):
             _set_error_status(self._span, outcome.kind, outcome.error_text)
-        elif outcome.kind != "abandoned_call":
+        elif outcome.kind != "abandoned_stream":
             _set_ok_status(self._span)
 
 
@@ -710,7 +719,7 @@ class _DispatchSpan(_SpanOperation):
 
 
 class OtelObserver:
-    """Trace generation calls and tool dispatches with OTel spans.
+    """Trace generations and tool dispatches with OTel spans.
 
     Pass one instance to a backend constructor, `LLM(observer=...)`, or `ToolManager(observer=...)`.
     The OTel SDK configures whether tracing records and where it sends spans.
@@ -752,14 +761,14 @@ class OtelObserver:
         """Resolve the tracer once, at construction.
 
         `capture_message_content` has no default because content capture affects privacy.
-        `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant turns.
+        `capture_message_content=True` records bound prompts, tool definitions, inputs, and assistant messages.
         It also records tool arguments and tool results.
         `content_filter` decides per part what those attributes record.
         The overloads accept `content_filter` only with `capture_message_content=True`.
         `content_filter=None` records every part unchanged, including image and audio bytes.
         A filter that keeps everything except inline bytes:
 
-            def drop_binary(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+            def drop_binary(name: str, part: ContentPart | AssistantPart) -> ContentPart | AssistantPart | None:
                 return None if part.kind in ("image", "audio") else part
 
         `attribute_mapper` sets the completion attributes of each chat span.
@@ -784,7 +793,7 @@ class OtelObserver:
 
     def generation_started(
         self, start: GenerationStart
-    ) -> ObservedOperation[CallResult[object] | AbandonedCallRecord]:
+    ) -> ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]:
         """Open the CLIENT chat span and set its start attributes.
 
         The span is named "chat {start.model}".

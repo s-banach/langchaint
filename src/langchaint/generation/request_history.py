@@ -1,4 +1,4 @@
-"""Provider-neutral per-attempt and per-call generation records."""
+"""Provider-neutral request records and the request history of one input."""
 
 import math
 import time
@@ -32,7 +32,7 @@ def _less_than_or_ulp_close(left: float, right: float) -> bool:
 
 
 class TransientErrorRecord(CheckedCopyModel):
-    """The normalized retry information from one failed attempt."""
+    """The normalized retry information from one failed request."""
 
     model_config = _RECORD_CONFIG
 
@@ -46,13 +46,13 @@ class TransientErrorRecord(CheckedCopyModel):
         return self.message
 
 
-class AttemptRecord(CheckedCopyModel):
+class RequestRecord(CheckedCopyModel):
     """The normalized base for settled and cut-off request records."""
 
     model_config = _RECORD_CONFIG
 
 
-class SettledAttemptRecord(AttemptRecord):
+class SettledRequestRecord(RequestRecord):
     """One request whose ending langchaint observed."""
 
     started_after_seconds: _NonnegativeFiniteFloat
@@ -72,7 +72,7 @@ class SettledAttemptRecord(AttemptRecord):
         return ZERO_USAGE if self.billing is None else self.billing.usage
 
     @model_validator(mode="after")
-    def _validate_first_item_timing(self) -> "SettledAttemptRecord":
+    def _validate_first_item_timing(self) -> "SettledRequestRecord":
         if self.seconds_to_first_item is not None and not _less_than_or_ulp_close(
             self.seconds_to_first_item, self.elapsed_seconds
         ):
@@ -80,7 +80,7 @@ class SettledAttemptRecord(AttemptRecord):
         return self
 
 
-class CutOffAttemptRecord(AttemptRecord):
+class CutOffRequestRecord(RequestRecord):
     """One request whose ending langchaint did not observe.
 
     `seconds_to_first_item` is `None` when no streamed item arrived before the cut-off.
@@ -98,156 +98,174 @@ class CutOffAttemptRecord(AttemptRecord):
         return ZERO_USAGE if self.billing is None else self.billing.usage
 
 
-type _AttemptRecordVariant = Annotated[
-    SettledAttemptRecord | CutOffAttemptRecord, Field(discriminator="kind")
+type _RequestRecordVariant = Annotated[
+    SettledRequestRecord | CutOffRequestRecord, Field(discriminator="kind")
 ]
 
 
-class CallRecord(CheckedCopyModel):
-    """The normalized ordered request records and elapsed time of one call."""
+class RequestHistory(CheckedCopyModel):
+    """The normalized ordered request records and elapsed time of one input."""
 
     model_config = _RECORD_CONFIG
 
     model: str
     provider_name: str
-    attempt_records: tuple[_AttemptRecordVariant, ...]
+    request_records: tuple[_RequestRecordVariant, ...]
     elapsed_seconds: _NonnegativeFiniteFloat
 
     @model_validator(mode="after")
-    def _validate_attempt_timing(self) -> "CallRecord":
+    def _validate_request_timing(self) -> "RequestHistory":
         cut_off_indexes = [
             index
-            for index, attempt in enumerate(self.attempt_records)
-            if attempt.kind == "cut_off"
+            for index, request_record in enumerate(self.request_records)
+            if request_record.kind == "cut_off"
         ]
         if len(cut_off_indexes) > 1:
-            raise ValueError("attempt_records may contain at most one cut-off record")
-        if cut_off_indexes and cut_off_indexes[0] != len(self.attempt_records) - 1:
-            raise ValueError("a cut-off attempt record must be final")
+            raise ValueError("request_records may contain at most one cut-off record")
+        if cut_off_indexes and cut_off_indexes[0] != len(self.request_records) - 1:
+            raise ValueError("a cut-off request record must be final")
 
         previous_end = 0.0
-        for attempt in self.attempt_records:
-            if not _less_than_or_ulp_close(previous_end, attempt.started_after_seconds):
-                raise ValueError("attempt records must not overlap")
-            if not _less_than_or_ulp_close(attempt.started_after_seconds, self.elapsed_seconds):
-                raise ValueError("an attempt start must fall within the call")
-            if attempt.kind == "settled":
-                attempt_end = attempt.started_after_seconds + attempt.elapsed_seconds
-                if not _less_than_or_ulp_close(attempt_end, self.elapsed_seconds):
-                    raise ValueError("a settled attempt end must fall within the call")
-                previous_end = attempt_end
+        for request_record in self.request_records:
+            if not _less_than_or_ulp_close(previous_end, request_record.started_after_seconds):
+                raise ValueError("request records must not overlap")
+            if not _less_than_or_ulp_close(
+                request_record.started_after_seconds, self.elapsed_seconds
+            ):
+                raise ValueError("a request start must fall within the request history")
+            if request_record.kind == "settled":
+                request_end = request_record.started_after_seconds + request_record.elapsed_seconds
+                if not _less_than_or_ulp_close(request_end, self.elapsed_seconds):
+                    raise ValueError("a settled request end must fall within the request history")
+                previous_end = request_end
         return self
 
 
-class _CallResultRecordBase(CheckedCopyModel):
-    """Share call-derived properties across normalized result records.
+class _InputOutcomeRecordBase(CheckedCopyModel):
+    """Share properties derived from `request_history` across every `InputOutcomeRecord` variant.
 
     Validation rejects unknown fields.
     """
 
     model_config = _RECORD_CONFIG
 
-    call: CallRecord
+    request_history: RequestHistory
 
     @property
-    def attempts(self) -> int:
+    def request_count(self) -> int:
         """Return the observed request count."""
-        return len(self.call.attempt_records)
+        return len(self.request_history.request_records)
 
     @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
-        return Usage.sum_of(attempt.usage for attempt in self.call.attempt_records)
+        return Usage.sum_of(
+            request_record.usage for request_record in self.request_history.request_records
+        )
 
     @property
     def model(self) -> str:
         """Return the requested model id."""
-        return self.call.model
+        return self.request_history.model
 
     @property
     def provider_name(self) -> str:
         """Return the provider name."""
-        return self.call.provider_name
+        return self.request_history.provider_name
 
     @property
     def elapsed_seconds(self) -> float:
-        """Return the complete call duration."""
-        return self.call.elapsed_seconds
+        """Return the seconds from the start of handling the input until its request history was frozen.
+
+        It includes admission and backoff waits.
+        """
+        return self.request_history.elapsed_seconds
 
     @property
-    def attempt_records(
+    def request_records(
         self,
-    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
-        """Return the call's normalized attempt records."""
-        return self.call.attempt_records
+    ) -> tuple[SettledRequestRecord | CutOffRequestRecord, ...]:
+        """Return the input's normalized request records."""
+        return self.request_history.request_records
 
     @property
     def assistant_message(self) -> AssistantMessage | None:
         """Return the last recorded assistant message."""
-        for attempt in reversed(self.call.attempt_records):
-            if attempt.kind == "settled" and attempt.assistant_message is not None:
-                return attempt.assistant_message
+        for request_record in reversed(self.request_history.request_records):
+            if request_record.kind == "settled" and request_record.assistant_message is not None:
+                return request_record.assistant_message
         return None
 
 
-def _require_abandoned_shape(call: CallRecord) -> None:
-    settled = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
-    final_is_cut_off = bool(call.attempt_records) and call.attempt_records[-1].kind == "cut_off"
+def _require_abandoned_shape(request_history: RequestHistory) -> None:
+    settled = tuple(
+        request_record
+        for request_record in request_history.request_records
+        if request_record.kind == "settled"
+    )
+    final_is_cut_off = (
+        bool(request_history.request_records)
+        and request_history.request_records[-1].kind == "cut_off"
+    )
     if final_is_cut_off:
         settled_prefix = settled
     elif settled and settled[-1].error is None:
         final = settled[-1]
         if final.assistant_message is not None:
-            raise ValueError("the final settled request must be a terminal provider result")
+            raise ValueError("the final settled request must not contain an assistant message")
         settled_prefix = settled[:-1]
     else:
         settled_prefix = settled
-    if any(attempt.error is None for attempt in settled_prefix):
-        raise ValueError("settled attempts before the terminal request must contain errors")
+    if any(request_record.error is None for request_record in settled_prefix):
+        raise ValueError("settled requests before the final request must contain errors")
 
 
-class AbandonedCallRecord(_CallResultRecordBase):
-    """A stream call whose block exited before a result or `GenerationError` recorded it.
+class AbandonedStreamRecord(_InputOutcomeRecordBase):
+    """A `stream_one` input whose `async with` block exited before a `Generation` or `GenerationError` recorded it.
 
-    The application ended the stream, so the call did not fail.
+    The application ended the stream, so handling the input did not fail.
     The record keeps the billing and first-item time of the request the exit cut off.
     Validation rejects unknown fields.
     """
 
     stop_reason: ClassVar[StopReason | None] = None
-    kind: Literal["abandoned_call"] = "abandoned_call"
+    kind: Literal["abandoned_stream"] = "abandoned_stream"
 
     @model_validator(mode="after")
-    def _validate_abandoned_shape(self) -> "AbandonedCallRecord":
-        _require_abandoned_shape(self.call)
+    def _validate_abandoned_shape(self) -> "AbandonedStreamRecord":
+        _require_abandoned_shape(self.request_history)
         return self
 
 
-def _settled_attempts(call: CallRecord) -> tuple[SettledAttemptRecord, ...]:
-    attempts = tuple(attempt for attempt in call.attempt_records if attempt.kind == "settled")
-    if len(attempts) != len(call.attempt_records):
-        raise ValueError("this record does not permit a cut-off attempt")
-    return attempts
+def _settled_request_records(request_history: RequestHistory) -> tuple[SettledRequestRecord, ...]:
+    settled_request_records = tuple(
+        request_record
+        for request_record in request_history.request_records
+        if request_record.kind == "settled"
+    )
+    if len(settled_request_records) != len(request_history.request_records):
+        raise ValueError("this record does not permit a cut-off request")
+    return settled_request_records
 
 
-def _require_completed_model_turn(call: CallRecord) -> None:
-    attempts = _settled_attempts(call)
-    if not attempts:
-        raise ValueError("call must contain at least one settled attempt")
-    if any(attempt.error is None for attempt in attempts[:-1]):
-        raise ValueError("every attempt before the final attempt must contain an error")
-    final = attempts[-1]
+def _require_completed_assistant_message(request_history: RequestHistory) -> None:
+    settled_request_records = _settled_request_records(request_history)
+    if not settled_request_records:
+        raise ValueError("request history must contain at least one settled request")
+    if any(request_record.error is None for request_record in settled_request_records[:-1]):
+        raise ValueError("every request before the final request must contain an error")
+    final = settled_request_records[-1]
     if final.error is not None:
-        raise ValueError("the final attempt must be error-free")
+        raise ValueError("the final request must be error-free")
     if final.billing is None:
-        raise ValueError("the final attempt must contain billing")
+        raise ValueError("the final request must contain billing")
     if final.assistant_message is None:
-        raise ValueError("the final attempt must contain an assistant message")
+        raise ValueError("the final request must contain an assistant message")
 
 
 @dataclass(frozen=True, kw_only=True)
-class AttemptProviderData:
-    """Live provider values aligned with one normalized attempt record."""
+class RequestProviderData:
+    """Live provider values aligned with one normalized request record."""
 
     raw: BaseModel | None
     usage_raw: BaseModel | None
@@ -259,21 +277,21 @@ class _StagedResponse(NamedTuple):
     identity: ResponseIdentity
 
 
-class _CallLedger:
-    """Accumulate live attempt state and freeze provider-neutral records.
+class _RequestLedger:
+    """Accumulate live request state and freeze provider-neutral records.
 
-    Building a ledger starts the call.
+    Building a ledger starts the input's request history.
     """
 
     def __init__(self, *, model: str, provider_name: str) -> None:
         self._model = model
         self._provider_name = provider_name
-        self._attempt_records: list[SettledAttemptRecord] = []
-        self._provider_attempts: list[AttemptProviderData] = []
+        self._request_records: list[SettledRequestRecord] = []
+        self._request_provider_data: list[RequestProviderData] = []
         self._staged_response: _StagedResponse | None = None
         self._started_at_monotonic_seconds = time.monotonic()
-        self._attempt_started_at_monotonic_seconds = self._started_at_monotonic_seconds
-        self._attempt_in_flight = False
+        self._request_started_at_monotonic_seconds = self._started_at_monotonic_seconds
+        self._request_in_flight = False
         self._first_item_at_monotonic_seconds: float | None = None
         self._noted_request_id: str | None = None
         self._billing_in_flight: ProviderBilling | None = None
@@ -290,10 +308,10 @@ class _CallLedger:
             raw=raw, provider_billing=billing, identity=identity
         )
 
-    def start_attempt(self) -> None:
-        """Start one request attempt."""
-        self._attempt_started_at_monotonic_seconds = time.monotonic()
-        self._attempt_in_flight = True
+    def start_request(self) -> None:
+        """Start one request."""
+        self._request_started_at_monotonic_seconds = time.monotonic()
+        self._request_in_flight = True
         self._first_item_at_monotonic_seconds = None
         self._noted_request_id = None
         self._billing_in_flight = None
@@ -304,7 +322,7 @@ class _CallLedger:
             self._first_item_at_monotonic_seconds = time.monotonic()
 
     def note_request_id(self, request_id: str | None) -> None:
-        """Store the current attempt's request id."""
+        """Store the current request's request id."""
         self._noted_request_id = request_id
 
     def note_billing_in_flight(self, billing: ProviderBilling | None) -> None:
@@ -317,19 +335,19 @@ class _CallLedger:
         return self._billing_in_flight
 
     @property
-    def attempts(self) -> int:
+    def request_count(self) -> int:
         """Return the settled request count."""
-        return len(self._attempt_records)
+        return len(self._request_records)
 
     @property
-    def attempt_records(self) -> tuple[SettledAttemptRecord, ...]:
-        """Return the settled normalized attempt records."""
-        return tuple(self._attempt_records)
+    def request_records(self) -> tuple[SettledRequestRecord, ...]:
+        """Return the settled normalized request records."""
+        return tuple(self._request_records)
 
     @property
-    def provider_attempts(self) -> tuple[AttemptProviderData, ...]:
-        """Return live provider data aligned with settled attempts."""
-        return tuple(self._provider_attempts)
+    def request_provider_data(self) -> tuple[RequestProviderData, ...]:
+        """Return live provider data aligned with settled request records."""
+        return tuple(self._request_provider_data)
 
     def record(
         self,
@@ -338,7 +356,7 @@ class _CallLedger:
         assistant_message: AssistantMessage | None,
         billing: ProviderBilling | None = None,
     ) -> None:
-        """Close the current attempt at the current monotonic time."""
+        """Close the current request at the current monotonic time."""
         self.record_ending_at(
             time.monotonic(), error=error, assistant_message=assistant_message, billing=billing
         )
@@ -351,25 +369,25 @@ class _CallLedger:
         assistant_message: AssistantMessage | None,
         billing: ProviderBilling | None = None,
     ) -> None:
-        """Close the current attempt at an existing monotonic timestamp."""
+        """Close the current request at an existing monotonic timestamp."""
         staged = self._staged_response
         self._staged_response = None
-        self._attempt_in_flight = False
+        self._request_in_flight = False
         self._billing_in_flight = None
         provider_billing = staged.provider_billing if staged is not None else billing
         started_after_seconds = (
-            self._attempt_started_at_monotonic_seconds - self._started_at_monotonic_seconds
+            self._request_started_at_monotonic_seconds - self._started_at_monotonic_seconds
         )
-        elapsed_seconds = ended_at_monotonic_seconds - self._attempt_started_at_monotonic_seconds
-        self._attempt_records.append(
-            SettledAttemptRecord(
+        elapsed_seconds = ended_at_monotonic_seconds - self._request_started_at_monotonic_seconds
+        self._request_records.append(
+            SettledRequestRecord(
                 started_after_seconds=started_after_seconds,
                 elapsed_seconds=elapsed_seconds,
                 seconds_to_first_item=(
                     None
                     if self._first_item_at_monotonic_seconds is None
                     else self._first_item_at_monotonic_seconds
-                    - self._attempt_started_at_monotonic_seconds
+                    - self._request_started_at_monotonic_seconds
                 ),
                 error=(
                     None
@@ -389,61 +407,61 @@ class _CallLedger:
                 ),
             )
         )
-        self._provider_attempts.append(
-            AttemptProviderData(
+        self._request_provider_data.append(
+            RequestProviderData(
                 raw=staged.raw if staged is not None else None,
                 usage_raw=None if provider_billing is None else provider_billing.usage_raw,
             )
         )
 
-    def freeze(self) -> CallRecord:
-        """Freeze settled call state at the current monotonic time."""
+    def freeze(self) -> RequestHistory:
+        """Freeze the settled request history at the current monotonic time."""
         return self.freeze_ending_at(time.monotonic())
 
-    def freeze_ending_at(self, ended_at_monotonic_seconds: float) -> CallRecord:
-        """Freeze settled call state at an existing monotonic timestamp."""
+    def freeze_ending_at(self, ended_at_monotonic_seconds: float) -> RequestHistory:
+        """Freeze the settled request history at an existing monotonic timestamp."""
         if self._staged_response is not None:
             self.record_ending_at(ended_at_monotonic_seconds, error=None, assistant_message=None)
-        return CallRecord(
+        return RequestHistory(
             model=self._model,
             provider_name=self._provider_name,
-            attempt_records=tuple(self._attempt_records),
+            request_records=tuple(self._request_records),
             elapsed_seconds=ended_at_monotonic_seconds - self._started_at_monotonic_seconds,
         )
 
     def freeze_with_cut_off(
         self, billing: ProviderBilling | None = None
-    ) -> tuple[CallRecord, tuple[AttemptProviderData, ...]]:
-        """Freeze the call and append one cut-off record for an open request."""
+    ) -> tuple[RequestHistory, tuple[RequestProviderData, ...]]:
+        """Freeze the request history and append one cut-off record for an open request."""
         ended_at_monotonic_seconds = time.monotonic()
-        cut_off_in_flight = self._attempt_in_flight and self._staged_response is None
-        attempt_started_at_monotonic_seconds = self._attempt_started_at_monotonic_seconds
+        cut_off_in_flight = self._request_in_flight and self._staged_response is None
+        request_started_at_monotonic_seconds = self._request_started_at_monotonic_seconds
         first_item_at_monotonic_seconds = self._first_item_at_monotonic_seconds
-        call = self.freeze_ending_at(ended_at_monotonic_seconds)
-        provider_attempts = self.provider_attempts
+        request_history = self.freeze_ending_at(ended_at_monotonic_seconds)
+        request_provider_data = self.request_provider_data
         if not cut_off_in_flight:
-            return call, provider_attempts
+            return request_history, request_provider_data
         provider_billing = billing if billing is not None else self._billing_in_flight
-        cut_off = CutOffAttemptRecord(
-            started_after_seconds=attempt_started_at_monotonic_seconds
+        cut_off = CutOffRequestRecord(
+            started_after_seconds=request_started_at_monotonic_seconds
             - self._started_at_monotonic_seconds,
             seconds_to_first_item=(
                 None
                 if first_item_at_monotonic_seconds is None
-                else first_item_at_monotonic_seconds - attempt_started_at_monotonic_seconds
+                else first_item_at_monotonic_seconds - request_started_at_monotonic_seconds
             ),
             billing=None if provider_billing is None else provider_billing.billing,
         )
         return (
-            CallRecord(
-                model=call.model,
-                provider_name=call.provider_name,
-                attempt_records=(*call.attempt_records, cut_off),
-                elapsed_seconds=call.elapsed_seconds,
+            RequestHistory(
+                model=request_history.model,
+                provider_name=request_history.provider_name,
+                request_records=(*request_history.request_records, cut_off),
+                elapsed_seconds=request_history.elapsed_seconds,
             ),
             (
-                *provider_attempts,
-                AttemptProviderData(
+                *request_provider_data,
+                RequestProviderData(
                     raw=None,
                     usage_raw=None if provider_billing is None else provider_billing.usage_raw,
                 ),

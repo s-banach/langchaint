@@ -1,9 +1,9 @@
 """Implement Gemini `generateContent` through the google-genai SDK.
 
 The following SDK facts were verified against google-genai 2.16.0.
-`retry_args(None)` permits one attempt.
+`retry_args(None)` permits one request.
 Every request sets `HttpRetryOptions(attempts=1)` through per-request `http_options`.
-The per-request value replaces the client value and preserves `max_attempts` for passed clients.
+The per-request value replaces the client value and preserves `max_requests` for passed clients.
 `generate_content_stream` yields `GenerateContentResponse` chunks without assembling them.
 `assembled_response` assembles the chunks.
 A mid-stream error raises `errors.APIError` with the response body code.
@@ -19,7 +19,7 @@ Source: https://ai.google.dev/gemini-api/docs/caching, read 2026-08-03.
 `Part.thought` marks reasoning, and `Part.thought_signature` contains bytes.
 JSON-mode SDK dumps encode bytes as base64 and validate them back.
 `ReasoningPart.raw` stores that JSON-mode dump.
-SDK models reject unknown keys, so another provider's dump returns `InvalidRequest`.
+SDK models reject unknown keys, so another provider's dump returns `RefusedMessages`.
 SDK enums preserve unknown effort and tier values as synthetic enum values with `UserWarning`.
 `FunctionResponse.response` uses `"output"` and `"error"` for `ToolMessage.content` and `ToolMessage.is_error`.
 
@@ -28,12 +28,12 @@ Source: https://ai.google.dev/gemini-api/docs/thinking, read 2026-08-03.
 The adapter emits `ReasoningPart` for each part with `thought` or `thought_signature`.
 `Part.model_validate_json` restores each part unchanged.
 A signed part may also emit `TextPart` or `ToolCall` for its answer text or function call.
-Replay skips a matching following `TurnPart` because `ReasoningPart.raw` already contains its data.
+Replay skips a matching following `AssistantPart` because `ReasoningPart.raw` already contains its data.
 
 `generateContent` has no request field for implicit caching.
 Both `automatic_cache_breakpoints` values produce the same request and cache-read billing.
 Gemini never bills a cache write.
-A marked system part raises `ValueError`, and a marked message part returns `InvalidRequest`.
+A marked system part raises `ValueError`, and a marked message part returns `RefusedMessages`.
 `extra_body={"cachedContent": ...}` selects an explicit cache resource.
 
 Content mappings were verified against google-genai 2.17.0.
@@ -47,7 +47,7 @@ Request and response mappings:
 - `ToolMessage` becomes `function_response` inside user-role `Content`.
 - Consecutive `ToolMessage` values share one `Content`.
 - `FunctionResponse.name` comes from the earlier `ToolCall` matching `tool_call_id`.
-- A missing match returns `InvalidRequest`.
+- A missing match returns `RefusedMessages`.
 - `FunctionCall.id` is optional, while `ToolCall.id` is required.
 - The adapter uses the function name when the provider omits the id.
 - Replay sends the id only when it differs from the function name.
@@ -78,18 +78,16 @@ from langchaint.adapter import (
     AUTH_STATUSES,
     REASONING_PART_SEPARATOR,
     Adapter,
-    AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyTurn,
+    EmptyAssistantMessage,
     ErrorClassification,
-    InvalidRequest,
     MaxCompletionTokensExceeded,
-    NoOutput,
     ReasoningDelta,
     Refusal,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -97,9 +95,11 @@ from langchaint.adapter import (
     SpecificToolChoice,
     StreamItem,
     ToolChoice,
-    UnfinishedTurn,
+    UnfinishedAssistantMessage,
+    UsableResponse,
     _NotSendableError,
-    narrowed_request,
+    _UnusableResponseBase,
+    narrowed_request_params,
     record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
     retry_after_seconds_from_headers,
@@ -117,6 +117,7 @@ from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import (
     AssistantMessage,
+    AssistantPart,
     ContentPart,
     Message,
     RawPart,
@@ -125,7 +126,6 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnPart,
     UserMessage,
 )
 from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
@@ -174,14 +174,14 @@ _REFUSAL_FINISH_REASONS = frozenset({
     types.FinishReason.IMAGE_PROHIBITED_CONTENT,
     types.FinishReason.IMAGE_RECITATION,
 })
-"""The finish reasons where the model or a filter declined to answer: the turn is a refusal."""
+"""The finish reasons where the model or a filter declined to answer: the assistant message is a refusal."""
 
 _FINISHED_FINISH_REASONS = (
     frozenset({types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}) | _REFUSAL_FINISH_REASONS
 )
-"""The finish reasons langchaint can read a completed turn from.
+"""The finish reasons langchaint can read a finished assistant message from.
 
-All other values produce `UnfinishedTurn` for a structured binding.
+All other values produce `UnfinishedAssistantMessage` for a structured binding.
 """
 
 _NO_CACHE_BREAKPOINT_WIRE_FORM = (
@@ -632,27 +632,27 @@ def _assistant_message_from(content: types.Content | None) -> AssistantMessage:
     Signed answer text and function calls also produce `TextPart` or `ToolCall`.
     Unmodeled parts become replayable `RawPart` values.
     A part holding only empty text produces nothing, as every adapter drops empty provider text.
-    Missing content or parts produces an empty turn.
+    Missing content or parts produces an `AssistantMessage` without parts.
     """
-    parts = content.parts if content is not None and content.parts is not None else []
-    turn: list[TurnPart] = []
-    for part in parts:
+    wire_parts = content.parts if content is not None and content.parts is not None else []
+    parts: list[AssistantPart] = []
+    for part in wire_parts:
         carries_reasoning = part.thought or part.thought_signature is not None
         if carries_reasoning:
-            turn.append(
+            parts.append(
                 ReasoningPart(
                     raw=part.model_dump(mode="json", exclude_none=True),
                     text=(part.text or None) if part.thought else None,
                 )
             )
         if part.function_call is not None:
-            turn.append(_tool_call_from(part.function_call))
+            parts.append(_tool_call_from(part.function_call))
         elif part.text:
             if not part.thought:
-                turn.append(TextPart(text=part.text))
+                parts.append(TextPart(text=part.text))
         elif not carries_reasoning and part.model_dump(exclude_none=True) != {"text": ""}:
-            turn.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(turn=tuple(turn))
+            parts.append(RawPart(raw=part.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(parts=tuple(parts))
 
 
 def _function_call_from(tool_call: ToolCall) -> types.FunctionCall:
@@ -693,8 +693,8 @@ def _part_from_dump(raw: Mapping[str, object], *, part_description: str) -> type
         ) from not_a_part
 
 
-def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) -> bool:
-    """Whether TurnPart repeats payload already carried by replayed_part.
+def _matches_replayed_part_payload(part: AssistantPart, replayed_part: types.Part) -> bool:
+    """Whether AssistantPart repeats payload already carried by replayed_part.
 
     _assistant_message_from pairs a signature-carrying part with the ToolCall or TextPart that holds its payload.
     A part without a match goes on the wire itself.
@@ -721,19 +721,19 @@ def _matches_replayed_part_payload(part: TurnPart, replayed_part: types.Part) ->
 
 
 def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Part]:
-    """Convert one AssistantMessage to wire parts in turn order.
+    """Convert one AssistantMessage to wire parts in `parts` order.
 
     A ReasoningPart restores its source Part.
-    A following TurnPart with the same payload is skipped.
+    A following AssistantPart with the same payload is skipped.
     A RawPart restores the same way and carries no such pair.
 
     Raises:
         _NotSendableError: Stored raw data does not restore to a Gemini Part, or args_json is not an object.
         json.JSONDecodeError: a tool call's args_json is not valid JSON.
     """
-    parts: list[types.Part] = []
+    wire_parts: list[types.Part] = []
     replayed_part_with_paired_payload: types.Part | None = None
-    for part in assistant_message.turn:
+    for part in assistant_message.parts:
         if replayed_part_with_paired_payload is not None:
             replayed_part = replayed_part_with_paired_payload
             replayed_part_with_paired_payload = None
@@ -741,19 +741,19 @@ def _assistant_wire_parts(assistant_message: AssistantMessage) -> list[types.Par
                 continue
         match part.kind:
             case "text":
-                parts.append(types.Part(text=part.text))
+                wire_parts.append(types.Part(text=part.text))
             case "tool_call":
-                parts.append(types.Part(function_call=_function_call_from(part)))
+                wire_parts.append(types.Part(function_call=_function_call_from(part)))
             case "reasoning_part":
                 replayed_part = _part_from_dump(part.raw, part_description="a ReasoningPart")
-                parts.append(replayed_part)
+                wire_parts.append(replayed_part)
                 if replayed_part.function_call is not None or (
                     replayed_part.text and not replayed_part.thought
                 ):
                     replayed_part_with_paired_payload = replayed_part
             case "raw_part":
-                parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
-    return parts
+                wire_parts.append(_part_from_dump(part.raw, part_description="a RawPart"))
+    return wire_parts
 
 
 def _cache_breakpoint_reason(
@@ -787,17 +787,17 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
     """
     if isinstance(content, str):
         return [types.Part(text=content)]
-    parts: list[types.Part] = []
+    wire_parts: list[types.Part] = []
     for part in content:
         if part.cache_breakpoint:
             raise _NotSendableError(_cache_breakpoint_reason(part, message_class=UserMessage))
         match part.kind:
             case "text":
-                parts.append(types.Part(text=part.text))
+                wire_parts.append(types.Part(text=part.text))
             case "image":
-                parts.append(_inline_part(part.data, part.media_type))
+                wire_parts.append(_inline_part(part.data, part.media_type))
             case "image_url":
-                parts.append(
+                wire_parts.append(
                     types.Part(
                         file_data=types.FileData(
                             file_uri=part.url,
@@ -806,8 +806,8 @@ def _user_parts(content: str | tuple[ContentPart, ...]) -> list[types.Part]:
                     )
                 )
             case "audio":
-                parts.append(_inline_part(part.data, part.media_type))
-    return parts
+                wire_parts.append(_inline_part(part.data, part.media_type))
+    return wire_parts
 
 
 def _function_response_part(
@@ -829,7 +829,7 @@ def _function_response_part(
     if name is None:
         raise _NotSendableError(
             f"tool_call_id {tool_message.tool_call_id!r} matches no ToolCall in an earlier "
-            f"assistant turn, so the FunctionResponse name the wire requires cannot be recovered"
+            f"assistant message, so the FunctionResponse name the wire requires cannot be recovered"
         )
     function_response_parts: list[types.FunctionResponsePart] = []
     if isinstance(tool_message.content, str):
@@ -874,7 +874,7 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     """Convert messages to wire contents.
 
     Consecutive ToolMessage values form one user-role Content.
-    Assistant turns supply ToolCall names for later FunctionResponse values.
+    Assistant messages supply ToolCall names for later FunctionResponse values.
 
     Raises:
         _NotSendableError: A message is unsendable.
@@ -907,22 +907,22 @@ def _wire_contents(messages: Sequence[Message]) -> list[types.Content]:
     return contents
 
 
-def _request_contents(messages: Sequence[Message]) -> list[types.Content] | InvalidRequest:
+def _request_contents(messages: Sequence[Message]) -> list[types.Content] | RefusedMessages:
     """Convert messages, or report them unsendable.
 
-    An unsendable Sequence[Message] becomes InvalidRequest. This includes unparseable tool_call.args_json.
+    An unsendable Sequence[Message] becomes RefusedMessages. This includes unparseable tool_call.args_json.
     """
     try:
         return _wire_contents(messages)
     except _NotSendableError as not_sendable:
-        return InvalidRequest(reason=str(not_sendable))
+        return RefusedMessages(reason=str(not_sendable))
     except json.JSONDecodeError as not_json:
-        return InvalidRequest(reason=f"a tool call's args_json is not valid JSON: {not_json}")
+        return RefusedMessages(reason=f"a tool call's args_json is not valid JSON: {not_json}")
 
 
 @dataclass(frozen=True, kw_only=True)
 class _GeminiRequestParams(RequestParams):
-    """One generateContent request: the binding's config and this call's converted contents."""
+    """One generateContent request: the binding's config and one input's converted contents."""
 
     model: str
     config: types.GenerateContentConfig
@@ -1494,10 +1494,10 @@ def _candidate_parts(chunk: types.GenerateContentResponse) -> list[types.Part]:
 def assembled_response(
     chunks: Iterable[types.GenerateContentResponse],
 ) -> types.GenerateContentResponse:
-    """Assemble streamed chunks into the one response a whole call would have returned.
+    """Assemble streamed chunks into the one response a non-streaming request would have returned.
 
     _ResponseAccumulator.add defines the merge rule.
-    Adapter conformance tests compare this result with a whole response.
+    Adapter conformance tests compare the assembled response with a non-streamed one.
     """
     accumulator = _ResponseAccumulator()
     for chunk in chunks:
@@ -1557,8 +1557,8 @@ class _GeminiStream(AdapterStream):
         separator_pending = False
         async for chunk in self._first_then_rest():
             self._accumulator.add(chunk)
-            parts = _candidate_parts(chunk)
-            for index, part in enumerate(parts):
+            wire_parts = _candidate_parts(chunk)
+            for index, part in enumerate(wire_parts):
                 if part.function_call is not None:
                     yield _tool_call_from(part.function_call)
                 if part.text:
@@ -1570,7 +1570,7 @@ class _GeminiStream(AdapterStream):
                         yield ReasoningDelta(text=part.text)
                     else:
                         yield part.text
-                part_ended = part.thought_signature is not None or index < len(parts) - 1
+                part_ended = part.thought_signature is not None or index < len(wire_parts) - 1
                 if part.thought and part_ended:
                     separator_pending = reasoning_delta_yielded
         if self._accumulator.finish_reason is None and not self._accumulator.blocked():
@@ -1632,21 +1632,22 @@ def _as_response(raw: BaseModel) -> types.GenerateContentResponse:
 
 
 @dataclass(frozen=True, kw_only=True)
-class _FinishedTurn:
-    """A candidate langchaint can read a turn from: its finish reason and its converted turn."""
+class _FinishedMessage:
+    """A candidate with an assistant message: its finish reason and its converted assistant message."""
 
     finish_reason: types.FinishReason
     assistant_message: AssistantMessage
 
 
-def _finished_turn_or_no_output(
+def _finished_message_or_unusable_response(
     response: types.GenerateContentResponse,
-) -> _FinishedTurn | Refusal | UnfinishedTurn:
-    """Read the first candidate as a finished turn, or report why no turn can be read.
+) -> _FinishedMessage | Refusal | UnfinishedAssistantMessage:
+    """Read the first candidate as a finished assistant message, or report why none can be read.
 
-    No candidates with block_reason becomes Refusal with an empty turn.
-    No candidates without block_reason becomes UnfinishedTurn.
-    A candidate without finish_reason also becomes UnfinishedTurn and preserves its partial turn.
+    No candidates with block_reason becomes Refusal with an assistant message without parts.
+    No candidates without block_reason becomes UnfinishedAssistantMessage.
+    A candidate without finish_reason also becomes UnfinishedAssistantMessage.
+    That UnfinishedAssistantMessage preserves the candidate's partial assistant message.
     """
     candidates = response.candidates
     if not candidates:
@@ -1654,46 +1655,46 @@ def _finished_turn_or_no_output(
             response.prompt_feedback is not None
             and response.prompt_feedback.block_reason is not None
         ):
-            return Refusal(assistant_message=AssistantMessage(turn=()))
-        return UnfinishedTurn(
-            reason="gemini returned no candidates and no block reason, so there is no turn to read",
-            assistant_message=AssistantMessage(turn=()),
+            return Refusal(assistant_message=AssistantMessage(parts=()))
+        return UnfinishedAssistantMessage(
+            reason="gemini returned no candidates and no block reason, so there is no assistant message to read",
+            assistant_message=AssistantMessage(parts=()),
         )
     candidate = candidates[0]
     assistant_message = _assistant_message_from(candidate.content)
     if candidate.finish_reason is None:
-        return UnfinishedTurn(
+        return UnfinishedAssistantMessage(
             reason="gemini returned a candidate with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
         )
-    return _FinishedTurn(
+    return _FinishedMessage(
         finish_reason=candidate.finish_reason, assistant_message=assistant_message
     )
 
 
-def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
+def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
     """Map the finish reason to the neutral vocabulary.
 
     The module docstring states each mapping.
     """
-    finish_reason = finished_turn.finish_reason
+    finish_reason = finished_message.finish_reason
     if finish_reason == types.FinishReason.MAX_TOKENS:
         return "max_tokens"
     if finish_reason in _REFUSAL_FINISH_REASONS:
         return "refusal"
     if finish_reason == types.FinishReason.STOP:
-        return "tool_use" if finished_turn.assistant_message.tool_calls else "end_turn"
+        return "tool_use" if finished_message.assistant_message.tool_calls else "end_turn"
     return "other"
 
 
-def _adapter_result[OutputT](
-    finished_turn: _FinishedTurn, output: OutputT
-) -> AdapterResult[OutputT]:
-    return AdapterResult(
+def _usable_response[OutputT](
+    finished_message: _FinishedMessage, output: OutputT
+) -> UsableResponse[OutputT]:
+    return UsableResponse(
         output=output,
-        assistant_message=finished_turn.assistant_message,
-        stop_reason=_normalized_stop_reason(finished_turn),
+        assistant_message=finished_message.assistant_message,
+        stop_reason=_normalized_stop_reason(finished_message),
     )
 
 
@@ -1743,17 +1744,17 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
         """Convert messages under the binding's config."""
         contents = _request_contents(messages)
-        if isinstance(contents, InvalidRequest):
+        if isinstance(contents, RefusedMessages):
             return contents
         return _GeminiRequestParams(
             model=self._adapter.model, config=self._config, contents=contents
         )
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open one generate_content_stream and return the live stream.
 
         In google-genai 2.16.0, awaiting generate_content_stream returns an unstarted async generator.
@@ -1764,7 +1765,7 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request(request, _GeminiRequestParams)
+        params = narrowed_request_params(request_params, _GeminiRequestParams)
         chunks = await self._adapter.client.aio.models.generate_content_stream(
             model=params.model, contents=params.contents, config=params.config
         )
@@ -1781,25 +1782,25 @@ class _BoundGemini[OutputT](BoundAdapter[OutputT], ABC):
 
 
 class _BoundGeminiText(_BoundGemini[str]):
-    """Text-bound adapter: output is the concatenated text of the turn."""
+    """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the turn, whose concatenated text is this binding's output.
+        """Read the assistant message, whose concatenated text is this binding's output.
 
-        Every finished turn returns its text. stop_reason reports refusal or truncation.
+        Every finished assistant message returns its text. stop_reason reports refusal or truncation.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
-        finished_turn = _finished_turn_or_no_output(_as_response(raw))
-        if isinstance(finished_turn, NoOutput):
-            return finished_turn
-        return _adapter_result(finished_turn, finished_turn.assistant_message.text)
+        finished_message = _finished_message_or_unusable_response(_as_response(raw))
+        if isinstance(finished_message, _UnusableResponseBase):
+            return finished_message
+        return _usable_response(finished_message, finished_message.assistant_message.text)
 
 
 class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
-    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
+    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
@@ -1812,31 +1813,33 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
         super().__init__(adapter=adapter, config=config, provider_tool_fields=provider_tool_fields)
         self._output_type_adapter = output_type_adapter
 
-    def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
+    def _parsed_outcome(
+        self, finished_message: _FinishedMessage
+    ) -> ResponseOutcome[ModelT | None]:
+        """Validate the text into the instance, report tool calls as None, or report why neither exists.
 
         Local validation preserves the response and rejected text.
         A non-finished reason takes precedence over schema validation.
         MAX_TOKENS takes precedence over SchemaViolation.
         """
         validation_error: ValidationError | None = None
-        text = finished_turn.assistant_message.text
+        text = finished_message.assistant_message.text
         if text:
             try:
                 output = self._output_type_adapter.validate_json(text)
-                return _adapter_result(finished_turn, output)
+                return _usable_response(finished_message, output)
             except ValidationError as rejection:
                 validation_error = rejection
-        finish_reason = finished_turn.finish_reason
-        assistant_message = finished_turn.assistant_message
+        finish_reason = finished_message.finish_reason
+        assistant_message = finished_message.assistant_message
         if finish_reason not in _FINISHED_FINISH_REASONS:
-            return UnfinishedTurn(
+            return UnfinishedAssistantMessage(
                 reason=f"gemini returned finish_reason {finish_reason.value!r}, "
                 f"which langchaint cannot continue",
                 assistant_message=assistant_message,
             )
         if assistant_message.tool_calls:
-            return _adapter_result(finished_turn, None)
+            return _usable_response(finished_message, None)
         if finish_reason in _REFUSAL_FINISH_REASONS:
             return Refusal(assistant_message=assistant_message)
         if finish_reason == types.FinishReason.MAX_TOKENS:
@@ -1846,16 +1849,16 @@ class _BoundGeminiStructured[ModelT: BaseModel](_BoundGemini[ModelT | None]):
                 validation_error_json=validation_error.json(include_url=False),
                 assistant_message=assistant_message,
             )
-        return EmptyTurn(assistant_message=assistant_message)
+        return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, or report why the response produced none.
+        """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:
             TypeError: raw is not a genai GenerateContentResponse.
         """
-        finished_turn = _finished_turn_or_no_output(_as_response(raw))
-        if isinstance(finished_turn, NoOutput):
-            return finished_turn
-        return self._parsed_outcome(finished_turn)
+        finished_message = _finished_message_or_unusable_response(_as_response(raw))
+        if isinstance(finished_message, _UnusableResponseBase):
+            return finished_message
+        return self._parsed_outcome(finished_message)

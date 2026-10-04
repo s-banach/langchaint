@@ -17,6 +17,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 from langchaint import (
     AllowedToolsChoice,
     AssistantMessage,
+    AssistantPart,
     AudioPart,
     Billing,
     ContentPart,
@@ -31,7 +32,6 @@ from langchaint import (
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnPart,
     UserMessage,
 )
 from langchaint.adapter import (
@@ -41,8 +41,8 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    InvalidRequest,
     ProviderBilling,
+    RefusedMessages,
     RequestParams,
     ToolChoice,
 )
@@ -181,7 +181,7 @@ def _bound_config(
 ) -> types.GenerateContentConfig:
     """Bind for text and read the config the binding produced."""
     bound = (adapter or _adapter()).bind_text(binding)
-    request = bound.build_request([UserMessage(content="hi")])
+    request = bound.build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _GeminiRequestParams)
     return request.config
 
@@ -190,7 +190,7 @@ def _built_request(
     messages: Sequence[Message], binding: Binding | None = None
 ) -> _GeminiRequestParams:
     """Build a request that must be valid."""
-    request = _adapter().bind_text(binding or _binding()).build_request(messages)
+    request = _adapter().bind_text(binding or _binding()).build_request_params(messages)
     assert isinstance(request, _GeminiRequestParams)
     return request
 
@@ -349,7 +349,7 @@ class _Answer(BaseModel):
 
 
 _NO_SDK_RETRIES = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-"""The http_options every binding sends, so max_attempts counts every request."""
+"""The http_options every binding sends, so max_requests counts every request."""
 
 
 def _echo_schema() -> ToolSchema:
@@ -708,7 +708,9 @@ def test_reasoning_level_outside_the_sdk_enum_passes_through() -> None:
 def test_structured_bind_sends_the_response_schema() -> None:
     """The structured binding sends response_json_schema with the JSON mime type."""
     request = (
-        _adapter().bind_structured(_binding(), _Answer).build_request([UserMessage(content="hi")])
+        _adapter()
+        .bind_structured(_binding(), _Answer)
+        .build_request_params([UserMessage(content="hi")])
     )
     assert isinstance(request, _GeminiRequestParams)
     assert request.config == types.GenerateContentConfig(
@@ -730,7 +732,7 @@ def test_service_tier_is_sent_and_fingerprinted() -> None:
     )
 
 
-# --- build_request ---
+# --- build_request_params ---
 
 
 def test_user_message_forms() -> None:
@@ -770,15 +772,15 @@ def test_user_message_forms() -> None:
 
 def test_tool_results_group_and_recover_names() -> None:
     """Consecutive tool results share one user Content, each naming the call it answers."""
-    turn = AssistantMessage(
-        turn=(
+    assistant_message = AssistantMessage(
+        parts=(
             ToolCall(id="call-a", name="f", args_json='{"x": 1}'),
             ToolCall(id="g", name="g", args_json="{}"),
         )
     )
     request = _built_request([
         UserMessage(content="go"),
-        turn,
+        assistant_message,
         ToolMessage(tool_call_id="call-a", content="ra"),
         ToolMessage(tool_call_id="g", content="rb", is_error=True),
         UserMessage(content="next"),
@@ -801,7 +803,7 @@ def test_tool_results_group_and_recover_names() -> None:
 def test_tool_message_maps_image_part_image_url_part_and_audio_part() -> None:
     """ToolMessage maps ContentPart values to FunctionResponsePart fields."""
     request = _built_request([
-        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
+        AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(
             tool_call_id="c",
             content=(
@@ -841,7 +843,7 @@ def _marked_part_messages(
     if message_class is UserMessage:
         return (UserMessage(content=(part,)),)
     return (
-        AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{}"),)),
+        AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{}"),)),
         ToolMessage(tool_call_id="c", content=(part,)),
     )
 
@@ -862,12 +864,12 @@ _INVALID_MESSAGES = [
     # The wire field holds the parsed arguments object, so text that is not JSON has nowhere to go.
     _InvalidMessages(
         "tool_call_args_not_json",
-        (AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="{not json"),)),),
+        (AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="{not json"),)),),
         ("args_json",),
     ),
     _InvalidMessages(
         "tool_call_args_not_an_object",
-        (AssistantMessage(turn=(ToolCall(id="c", name="f", args_json="[1]"),)),),
+        (AssistantMessage(parts=(ToolCall(id="c", name="f", args_json="[1]"),)),),
         ("JSON object",),
     ),
     # A foreign ReasoningPart.raw cannot restore a Gemini Part.
@@ -875,7 +877,7 @@ _INVALID_MESSAGES = [
         "foreign_reasoning_part",
         (
             AssistantMessage(
-                turn=(
+                parts=(
                     ReasoningPart(
                         raw={"type": "thinking", "thinking": "x", "signature": "s"}, text="x"
                     ),
@@ -905,9 +907,9 @@ _INVALID_MESSAGES = [
     "case", _INVALID_MESSAGES, ids=[case.case_id for case in _INVALID_MESSAGES]
 )
 def test_unsendable_messages_build_an_invalid_request(case: _InvalidMessages) -> None:
-    """Messages without a Gemini wire form become InvalidRequest naming what cannot be sent."""
-    invalid = _adapter().bind_text(_binding()).build_request(case.messages)
-    assert isinstance(invalid, InvalidRequest)
+    """Messages without a Gemini wire form become RefusedMessages naming what cannot be sent."""
+    invalid = _adapter().bind_text(_binding()).build_request_params(case.messages)
+    assert isinstance(invalid, RefusedMessages)
     for fragment in case.reason_fragments:
         assert fragment in invalid.reason
 
@@ -915,10 +917,10 @@ def test_unsendable_messages_build_an_invalid_request(case: _InvalidMessages) ->
 # --- the thought-signature pairing ---
 
 
-def _interpreted_turn(response: types.GenerateContentResponse) -> AssistantMessage:
-    """Interpret under the text binding and return the turn."""
+def _interpreted_assistant_message(response: types.GenerateContentResponse) -> AssistantMessage:
+    """Interpret under the text binding and return the assistant message."""
     outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert outcome.kind == "adapter_result"
+    assert outcome.kind == "usable_response"
     return outcome.assistant_message
 
 
@@ -940,39 +942,39 @@ _EMPTY_TEXT_BESIDE_CODE = types.Part(
 )
 
 
-class _ReadTurn(NamedTuple):
+class _ReadPartsCase(NamedTuple):
     case_id: str
     wire_parts: tuple[types.Part, ...]
-    turn: tuple[TurnPart, ...]
+    parts: tuple[AssistantPart, ...]
 
 
-_READ_TURNS = [
+_READ_PARTS_CASES = [
     # ReasoningPart.raw preserves the signature bytes. ToolCall remains dispatchable.
-    _ReadTurn(
+    _ReadPartsCase(
         "signed_function_call",
         (_SIGNED_CALL,),
         (ReasoningPart(raw=_dump(_SIGNED_CALL)), ToolCall(id="f", name="f", args_json='{"x": 1}')),
     ),
     # Non-thought text carrying a signature stays readable as answer text.
-    _ReadTurn(
+    _ReadPartsCase(
         "signed_answer_text",
         (_SIGNED_ANSWER,),
         (ReasoningPart(raw=_dump(_SIGNED_ANSWER)), TextPart(text="final answer")),
     ),
     # Empty answer text becomes no TextPart, and the signed part alone replays it.
-    _ReadTurn(
+    _ReadPartsCase(
         "signed_empty_answer_text",
         (_SIGNED_EMPTY_ANSWER,),
         (ReasoningPart(raw=_dump(_SIGNED_EMPTY_ANSWER)),),
     ),
     # Thought text reaches ReasoningPart.text and stays outside the answer text.
-    _ReadTurn(
+    _ReadPartsCase(
         "thought_text",
         (_THOUGHT, types.Part(text="answer")),
         (ReasoningPart(raw=_dump(_THOUGHT), text="thinking..."), TextPart(text="answer")),
     ),
     # Reading empty text as present rather than as non-empty would drop the whole part.
-    _ReadTurn(
+    _ReadPartsCase(
         "empty_text_beside_code",
         (_EMPTY_TEXT_BESIDE_CODE,),
         (RawPart(raw=_dump(_EMPTY_TEXT_BESIDE_CODE)),),
@@ -980,12 +982,16 @@ _READ_TURNS = [
 ]
 
 
-@pytest.mark.parametrize("case", _READ_TURNS, ids=[case.case_id for case in _READ_TURNS])
-def test_candidate_parts_read_into_the_turn_and_replay_as_themselves(case: _ReadTurn) -> None:
-    """Each wire part becomes its turn parts, and the turn replays the original wire parts."""
-    turn = _interpreted_turn(_response(case.wire_parts))
-    assert turn.turn == case.turn
-    request = _built_request([UserMessage(content="go"), turn])
+@pytest.mark.parametrize(
+    "case", _READ_PARTS_CASES, ids=[case.case_id for case in _READ_PARTS_CASES]
+)
+def test_candidate_parts_read_into_the_assistant_message_and_replay_as_themselves(
+    case: _ReadPartsCase,
+) -> None:
+    """Each wire part becomes its assistant message parts, and the assistant message replays the original wire parts."""
+    assistant_message = _interpreted_assistant_message(_response(case.wire_parts))
+    assert assistant_message.parts == case.parts
+    request = _built_request([UserMessage(content="go"), assistant_message])
     assert request.contents[1].parts == list(case.wire_parts)
 
 
@@ -1013,65 +1019,65 @@ def test_as_json_holds_the_request_without_transport_config() -> None:
 
 
 def test_text_binding_reads_stop_reasons() -> None:
-    """STOP is end_turn or tool_use by the turn's calls. MAX_TOKENS and SAFETY name themselves."""
+    """STOP is end_turn or tool_use by the assistant message's tool calls. MAX_TOKENS and SAFETY name themselves."""
     bound = _adapter().bind_text(_binding())
     ended = bound.interpret(_response([types.Part(text="hi")]))
-    assert ended.kind == "adapter_result"
+    assert ended.kind == "usable_response"
     assert (ended.output, ended.stop_reason) == ("hi", "end_turn")
     called = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert called.kind == "adapter_result"
+    assert called.kind == "usable_response"
     assert called.stop_reason == "tool_use"
     truncated = bound.interpret(
         _response([types.Part(text="par")], finish_reason=types.FinishReason.MAX_TOKENS)
     )
-    assert truncated.kind == "adapter_result"
+    assert truncated.kind == "usable_response"
     assert (truncated.output, truncated.stop_reason) == ("par", "max_tokens")
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
-    assert refused.kind == "adapter_result"
+    assert refused.kind == "usable_response"
     assert (refused.output, refused.stop_reason) == ("", "refusal")
     other = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert other.kind == "adapter_result"
+    assert other.kind == "usable_response"
     assert other.stop_reason == "other"
 
 
 def test_both_bindings_report_a_missing_finish_reason_as_unfinished() -> None:
-    """A candidate without a finish_reason is a turn that never closed, its partial turn carried."""
+    """A candidate without a finish_reason is an unfinished assistant message that carries its partial parts."""
     response = _response([types.Part(text="par")], finish_reason=None)
     text_outcome = _adapter().bind_text(_binding()).interpret(response)
-    assert text_outcome.kind == "unfinished_turn"
+    assert text_outcome.kind == "unfinished_assistant_message"
     assert text_outcome.assistant_message.text == "par"
     structured_outcome = _adapter().bind_structured(_binding(), _Answer).interpret(response)
-    assert structured_outcome.kind == "unfinished_turn"
+    assert structured_outcome.kind == "unfinished_assistant_message"
 
 
 def test_no_candidates_reads_the_block_reason() -> None:
-    """A blocked prompt is a Refusal with an empty turn. No candidates and no block is unfinished."""
+    """A blocked prompt is a Refusal with an empty assistant message. No candidates and no block is unfinished."""
     bound = _adapter().bind_text(_binding())
     blocked = bound.interpret(
         _response(None, finish_reason=None, block_reason=types.BlockedReason.SAFETY)
     )
     assert blocked.kind == "refusal"
-    assert blocked.assistant_message.turn == ()
+    assert blocked.assistant_message.parts == ()
     silent = bound.interpret(_response(None, finish_reason=None))
-    assert silent.kind == "unfinished_turn"
+    assert silent.kind == "unfinished_assistant_message"
 
 
 def test_structured_binding_outcomes() -> None:
     """The structured matrix: instance, tool-call None, refusal, truncation, violation, empty, unfinished."""
     bound = _adapter().bind_structured(_binding(), _Answer)
     parsed = bound.interpret(_response([types.Part(text='{"value": 3}')]))
-    assert parsed.kind == "adapter_result"
+    assert parsed.kind == "usable_response"
     assert parsed.output == _Answer(value=3)
-    tool_turn = bound.interpret(
+    tool_call_outcome = bound.interpret(
         _response([types.Part(function_call=types.FunctionCall(name="f", args={}))])
     )
-    assert tool_turn.kind == "adapter_result"
-    assert tool_turn.output is None
-    assert tool_turn.stop_reason == "tool_use"
+    assert tool_call_outcome.kind == "usable_response"
+    assert tool_call_outcome.output is None
+    assert tool_call_outcome.stop_reason == "tool_use"
     refused = bound.interpret(_response(None, finish_reason=types.FinishReason.SAFETY))
     assert refused.kind == "refusal"
     truncated = bound.interpret(
@@ -1082,15 +1088,15 @@ def test_structured_binding_outcomes() -> None:
     assert violated.kind == "schema_violation"
     assert "value" in violated.validation_error_json
     empty = bound.interpret(_response([]))
-    assert empty.kind == "empty_turn"
+    assert empty.kind == "empty_assistant_message"
     unfinished = bound.interpret(
         _response([types.Part(text="?")], finish_reason=types.FinishReason.LANGUAGE)
     )
-    assert unfinished.kind == "unfinished_turn"
+    assert unfinished.kind == "unfinished_assistant_message"
     assert "LANGUAGE" in unfinished.reason
 
 
-def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
+def test_a_structured_binding_ignores_thought_text_when_validating() -> None:
     """Only non-thought text is the candidate instance."""
     bound = _adapter().bind_structured(_binding(), _Answer)
     outcome = bound.interpret(
@@ -1099,7 +1105,7 @@ def test_a_structured_turn_ignores_thought_text_when_validating() -> None:
             types.Part(text='{"value": 7}'),
         ])
     )
-    assert outcome.kind == "adapter_result"
+    assert outcome.kind == "usable_response"
     assert outcome.output == _Answer(value=7)
 
 
@@ -1437,7 +1443,7 @@ def test_items_translate_parts_with_reasoning_separators() -> None:
 
 
 def test_assembly_merges_text_slices_and_signatures_end_parts() -> None:
-    """final() reads the same turn a whole response would carry."""
+    """final() reads the same assistant message a whole response would carry."""
     chunks = [
         _response([types.Part(thought=True, text="think a")], finish_reason=None),
         _response(
@@ -1597,7 +1603,7 @@ _TWO_CHUNK_SSE_BODY = (
     b'data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "y"}]},'
     b' "finishReason": "STOP"}]}\r\n\r\n'
 )
-"""A streamGenerateContent server-sent-event body of two chunks, the second finishing the turn."""
+"""A streamGenerateContent server-sent-event body of two chunks, the second carrying finishReason STOP."""
 
 
 def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
@@ -1644,13 +1650,13 @@ def test_open_stream_sends_the_request_and_pulls_the_first_chunk() -> None:
 
 
 def _executable_code_part() -> types.Part:
-    """One code-execution part without another TurnPart variant."""
+    """One code-execution part without another AssistantPart variant."""
     return types.Part(
         executable_code=types.ExecutableCode(code="print(1)", language=types.Language.PYTHON)
     )
 
 
-def _reasoning_turn_response(
+def _reasoning_response(
     usage_metadata: types.GenerateContentResponseUsageMetadata | None,
 ) -> types.GenerateContentResponse:
     """Build reasoning, executable-code, and text parts."""
@@ -1674,25 +1680,25 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a turn whose usage fills every counter Gemini bills. Writes are always zero."""
-        return _reasoning_turn_response(_usage_metadata())
+        """Return a response whose usage fills every counter Gemini bills. Writes are always zero."""
+        return _reasoning_response(_usage_metadata())
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a turn carrying no usage_metadata at all."""
-        return _reasoning_turn_response(None)
+        """Return a response carrying no usage_metadata at all."""
+        return _reasoning_response(None)
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a turn served at PROVISIONED_THROUGHPUT, which _PRICING holds no table for."""
-        return _reasoning_turn_response(
+        """Return a response served at PROVISIONED_THROUGHPUT, which _PRICING holds no table for."""
+        return _reasoning_response(
             _usage_metadata(traffic_type=types.TrafficType.PROVISIONED_THROUGHPUT)
         )
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a turn whose cached counter exceeds the prompt total it is a share of."""
-        return _reasoning_turn_response(
+        """Return a response whose cached counter exceeds the prompt total it is a share of."""
+        return _reasoning_response(
             _usage_metadata(prompt_token_count=100, cached_content_token_count=200)
         )
 
@@ -1702,25 +1708,25 @@ class TestGeminiGenerateContentConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return the reasoning turn with signature bytes as the payload."""
-        return _reasoning_turn_response(_usage_metadata())
+        """Return the reasoning response with signature bytes as the payload."""
+        return _reasoning_response(_usage_metadata())
 
     @override
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return the turn whose middle part carries executable_code."""
-        return _reasoning_turn_response(_usage_metadata())
+        """Return the response whose middle part carries executable_code."""
+        return _reasoning_response(_usage_metadata())
 
     @override
-    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
         """Read the parts of the model Content this request ends with, as their JSON dumps."""
-        assert isinstance(request, _GeminiRequestParams)
-        parts = request.contents[-1].parts
+        assert isinstance(request_params, _GeminiRequestParams)
+        parts = request_params.contents[-1].parts
         assert parts is not None
         return [part.model_dump(mode="json", exclude_none=True) for part in parts]
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return one turn as assembled_response builds it and as a whole response.
+        """Return one response as assembled_response builds it and as a whole response.
 
         Assembly preserves terminal executable_code and merged text.
         """

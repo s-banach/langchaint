@@ -1,4 +1,9 @@
-"""Provider-neutral messages and content parts.
+"""Provider-neutral messages and their parts.
+
+A part is one ordered value in a message.
+`UserMessage.content` and `ToolMessage.content` hold `ContentPart` values.
+`AssistantMessage.parts` holds `AssistantPart` values.
+`TextPart` is the only part of both kinds.
 
 Adapters convert each complete `Sequence[Message]` to provider values.
 The system prompt remains a binding parameter because providers place it outside messages.
@@ -159,7 +164,7 @@ class ToolCall(CheckedCopyModel):
 
 
 class UserMessage(CheckedCopyModel):
-    """Pydantic selects each `ContentPart` variant by `kind` in one user turn.
+    """Pydantic selects each `ContentPart` variant by `kind` in one user message.
 
     Raises:
         pydantic.ValidationError: `content` is invalid or an unknown key is passed.
@@ -176,7 +181,7 @@ class ReasoningPart(CheckedCopyModel):
 
     The producing adapter stores an SDK dump in `raw`.
     The same adapter replays `raw` unchanged.
-    Rebuild turns before switching providers.
+    Rebuild assistant messages before switching providers.
     `text` contains readable reasoning for display and does not affect replay.
     `text=None` means the provider returned no readable reasoning.
     """
@@ -191,11 +196,11 @@ class ReasoningPart(CheckedCopyModel):
 class RawPart(CheckedCopyModel):
     """Pydantic rejects unknown keys in one replayable provider fragment.
 
-    `AssistantMessage.turn` preserves `RawPart` response order.
+    `AssistantMessage.parts` preserves `RawPart` response order.
     `raw` is the producing SDK `model_dump` fragment required for replay.
     The consuming adapter sends `raw` unchanged in its original wire position.
-    Another adapter returns `InvalidRequest` or leaves validation to its provider.
-    Applications inspect `Response.raw` for the complete SDK response.
+    Another adapter returns `RefusedMessages` or leaves validation to its provider.
+    Applications inspect `Generation.raw` for the complete SDK response.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -204,45 +209,45 @@ class RawPart(CheckedCopyModel):
     kind: Literal["raw_part"] = "raw_part"
 
 
-type TurnPart = Annotated[
+type AssistantPart = Annotated[
     ReasoningPart | TextPart | ToolCall | RawPart, Field(discriminator="kind")
 ]
-"""One ordered value inside `AssistantMessage.turn`.
+"""One ordered value inside `AssistantMessage.parts`.
 
 An image a provider returns arrives as `RawPart`.
 """
 
 
-def _text_only_turn(turn: object) -> object:
-    if isinstance(turn, str):
-        return (TextPart(text=turn),)
-    return turn
+def _text_only_parts(parts: object) -> object:
+    if isinstance(parts, str):
+        return (TextPart(text=parts),)
+    return parts
 
 
 class AssistantMessage(CheckedCopyModel):
-    """Pydantic selects each `TurnPart` variant by `kind` in one assistant turn.
+    """Pydantic selects each `AssistantPart` variant by `kind` in one assistant message.
 
     A bare string becomes one `TextPart`.
 
     Raises:
-        pydantic.ValidationError: `turn` has an invalid value or a `TextPart` sets `cache_breakpoint`.
+        pydantic.ValidationError: `parts` has an invalid value or a `TextPart` sets `cache_breakpoint`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    turn: Annotated[tuple[TurnPart, ...], BeforeValidator(_text_only_turn)]
+    parts: Annotated[tuple[AssistantPart, ...], BeforeValidator(_text_only_parts)]
     kind: Literal["assistant"] = "assistant"
 
     @model_validator(mode="after")
     def _reject_cache_breakpoint(self) -> "AssistantMessage":
-        """Reject a turn whose `TextPart` sets `cache_breakpoint`.
+        """Reject an assistant message whose `TextPart` sets `cache_breakpoint`.
 
         Raises:
-            ValueError: A `TextPart` in `turn` sets `cache_breakpoint`.
+            ValueError: A `TextPart` in `parts` sets `cache_breakpoint`.
         """
-        if any(part.kind == "text" and part.cache_breakpoint for part in self.turn):
+        if any(part.kind == "text" and part.cache_breakpoint for part in self.parts):
             raise ValueError(
-                "cache_breakpoint is not supported on assistant turn text. "
+                "cache_breakpoint is not supported on assistant message text. "
                 "openai has no breakpoint on assistant replay text. "
                 "Mark the following user or tool message instead"
             )
@@ -250,16 +255,16 @@ class AssistantMessage(CheckedCopyModel):
 
     @property
     def text(self) -> str:
-        """Return the concatenated `TextPart.text` values from `turn`.
+        """Return the concatenated `TextPart.text` values from `parts`.
 
-        Return an empty string when `turn` contains no `TextPart`.
+        Return an empty string when `parts` contains no `TextPart`.
         """
-        return "".join(part.text for part in self.turn if part.kind == "text")
+        return "".join(part.text for part in self.parts if part.kind == "text")
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """Return the `ToolCall` values from `turn` in emission order."""
-        return tuple(part for part in self.turn if part.kind == "tool_call")
+        """Return the `ToolCall` values from `parts` in emission order."""
+        return tuple(part for part in self.parts if part.kind == "tool_call")
 
 
 class ToolMessage(CheckedCopyModel):

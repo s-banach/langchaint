@@ -1,4 +1,4 @@
-"""Pricing arithmetic and per-attempt `Billing`.
+"""Pricing arithmetic and per-request `Billing`.
 
 Provider subpackages define rate tables.
 A nonzero category with no configured rate costs NaN.
@@ -81,7 +81,7 @@ def require_finite_nonnegative_rate(*, rate_name: str, rate: float | None) -> No
 
 
 class Billing(CheckedCopyModel):
-    """One attempt's normalized priced usage, service tier, and applied rates.
+    """One request's normalized priced usage, service tier, and applied rates.
 
     Stored rates reproduce token costs without the original rate table.
     A missing category rate is NaN.
@@ -108,11 +108,11 @@ class Billing(CheckedCopyModel):
 
     @property
     def cache_savings_in_usd(self) -> float:
-        """What prompt caching saved this attempt against billing every input token uncached.
+        """What prompt caching saved this request against billing every input token uncached.
 
         The counterfactual prices every input token at the uncached rate.
         Output cost cancels because it is identical in both totals.
-        The result is negative when write premiums exceed read discounts.
+        The value is negative when write premiums exceed read discounts.
         It is NaN when a nonzero input counter lacks a rate, and `0.0` when no input was billed.
         """
         uncached = category_cost(
@@ -129,7 +129,7 @@ class Billing(CheckedCopyModel):
 
 @dataclass(frozen=True, kw_only=True)
 class ProviderBilling:
-    """One attempt's normalized billing and live provider usage."""
+    """One request's normalized billing and live provider usage."""
 
     billing: Billing
     usage_raw: BaseModel | None

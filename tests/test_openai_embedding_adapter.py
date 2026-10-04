@@ -408,7 +408,7 @@ def test_transport_failure_retries_the_failed_batch(
         model = OpenAI(client=client).embedding_model(
             "text-embedding-3-small",
             dimension=1,
-            max_attempts=2,
+            max_requests=2,
         )
         vectors = await model.embed(["text"], task="retrieval_query")
         assert vectors.tolist() == [[1.0]]

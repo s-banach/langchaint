@@ -14,7 +14,7 @@ from langchaint import (
     DispatchExceptionGroup,
     DispatchHandled,
     DispatchInvalidToolArgs,
-    DispatchManyOutcome,
+    DispatchManyItemOutcome,
     DispatchPrecomputed,
     DispatchUnknownTool,
     ImagePart,
@@ -635,7 +635,7 @@ def _raiser_tool() -> PydanticTool[_EchoArgs]:
 def test_dispatch_many_runs_concurrently_and_keeps_call_order() -> None:
     """dispatch_many runs calls concurrently and preserves call order."""
 
-    async def _run() -> tuple[DispatchManyOutcome, ...]:
+    async def _run() -> tuple[DispatchManyItemOutcome, ...]:
         gate = asyncio.Event()
 
         async def _waiter_function(args: _EchoArgs) -> str:

@@ -116,7 +116,7 @@ async def test_v4_routes_model_and_dimension_verbatim(
         embeddings = await cohere_bedrock.embedding_model(
             model,
             dimension=dimension,
-            max_attempts=1,
+            max_requests=1,
         ).embed(["document"], task="retrieval_document")
         assert embeddings.shape == (1, dimension)
         stubber.assert_no_pending_responses()
@@ -575,10 +575,10 @@ async def test_concurrent_preparation_creates_one_client(
 
 
 @_run_async_test
-async def test_synchronous_attempt_runs_outside_event_loop(
+async def test_synchronous_request_runs_outside_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The complete SDK attempt runs outside the event-loop thread."""
+    """The complete SDK request runs outside the event-loop thread."""
     fake_client = _FakeClient()
     _ = _install_fake_client(monkeypatch, fake_client)
     cohere_bedrock = CohereBedrock(aws_region="us-east-1")
@@ -618,7 +618,7 @@ async def test_transient_client_error_retries_only_failed_request(
     model = cohere_bedrock.embedding_model(
         "cohere.embed-v4:0",
         dimension=256,
-        max_attempts=2,
+        max_requests=2,
     )
     embeddings = await model.embed(["text"], task="classification")
     assert embeddings.shape == (1, 256)
@@ -626,7 +626,7 @@ async def test_transient_client_error_retries_only_failed_request(
 
 
 @_run_async_test
-async def test_cancellation_waits_for_synchronous_attempt(
+async def test_cancellation_waits_for_synchronous_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancellation waits for invocation and response closure."""
@@ -717,15 +717,15 @@ async def test_cancelled_failed_creation_retries_client_creation(
 
 
 def test_passed_client_retry_configuration() -> None:
-    """Passed clients must configure one total SDK attempt."""
+    """Passed clients must configure one request per SDK call."""
     retrying_client = _bedrock_client(total_max_attempts=2)
-    one_attempt_client = _bedrock_client()
+    one_request_client = _bedrock_client()
     try:
         with pytest.raises(ValueError, match="total_max_attempts"):
             _ = CohereBedrock(client=retrying_client)
-        _ = CohereBedrock(client=one_attempt_client)
+        _ = CohereBedrock(client=one_request_client)
         with pytest.raises(ValueError, match="at most one"):
-            _ = CohereBedrock(client=one_attempt_client, aws_region="us-east-1")
+            _ = CohereBedrock(client=one_request_client, aws_region="us-east-1")
     finally:
         retrying_client.close()
-        one_attempt_client.close()
+        one_request_client.close()

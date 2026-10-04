@@ -2,7 +2,7 @@
 
 `EmbeddingModel` copies inputs before partitioning them into provider requests.
 `EmbeddingModel` retries each embedding batch independently.
-All attempts use its `SharedBackoff`.
+All requests use its `SharedBackoff`.
 The adapter owns provider batching and response decoding.
 The returned matrix preserves input order.
 The returned matrix owns writable `float32` storage.
@@ -136,23 +136,24 @@ class EmbeddingModel:
         *,
         adapter: _EmbeddingAdapter,
         shared_backoff: SharedBackoff,
-        max_attempts: int,
+        max_requests: int,
     ) -> None:
-        """Store one adapter, `SharedBackoff`, and `max_attempts`.
+        """Store one adapter, `SharedBackoff`, and `max_requests`.
 
         Args:
             adapter: The provider-specific embedding operations.
             shared_backoff: The request admission state.
-            max_attempts: The maximum provider requests for one batch.
+            max_requests: The maximum number of requests sent for one batch; i.e., max_requests = max_retries + 1.
+                `embed` splits its inputs into batches.
 
         Raises:
-            ValueError: `max_attempts` is boolean or below one.
+            ValueError: `max_requests` is boolean or below one.
         """
-        if isinstance(max_attempts, bool) or max_attempts < 1:
-            raise ValueError(f"max_attempts must be a positive int, got {max_attempts!r}")
+        if isinstance(max_requests, bool) or max_requests < 1:
+            raise ValueError(f"max_requests must be a positive int, got {max_requests!r}")
         self.model: str = adapter.model
         self.dimension: int = adapter.dimension
-        self.max_attempts: int = max_attempts
+        self.max_requests: int = max_requests
         self._adapter = adapter
         self._shared_backoff = shared_backoff
 
@@ -164,17 +165,17 @@ class EmbeddingModel:
     ) -> Float2D:
         """Run one request batch through its retry budget.
 
-        `_failure_step` decides whether a failed attempt retries.
+        `_failure_step` decides whether a failed request is retried.
         A failure outside the `SharedBackoff.failure_types` reaches no verdict, so `classify` decides it.
 
         Raises:
             asyncio.CancelledError: The caller cancelled this operation.
-            Exception: A provider request failed terminally or spent the last attempt.
+            Exception: A provider request failed terminally or used the last of `max_requests`.
         """
         private_backoff = PrivateBackoff(self._shared_backoff)
-        attempt_index = 0
+        request_index = 0
         while True:
-            attempt_index += 1
+            request_index += 1
             admission = self._shared_backoff.admitted()
             try:
                 async with admission:
@@ -186,7 +187,7 @@ class EmbeddingModel:
                     verdict=admission.verdict,
                     classify=self._adapter.classify,
                 )
-                if step.kind == "terminal" or attempt_index == self.max_attempts:
+                if step.kind == "terminal" or request_index == self.max_requests:
                     raise
                 if step.kind == "retry_after_private_wait":
                     await asyncio.sleep(private_backoff.next_wait(step.retry_after))
@@ -208,9 +209,9 @@ class EmbeddingModel:
         Raises:
             TypeError: `inputs` is a bare `str`.
             ValueError: An input cannot form a provider request.
-            EmbeddingOutputError: A successful response contains invalid vectors.
+            EmbeddingOutputError: A response contains invalid vectors.
             asyncio.CancelledError: The caller cancelled this operation.
-            Exception: A provider request failed terminally or spent the last attempt.
+            Exception: A provider request failed terminally or used the last of `max_requests`.
         """
         if isinstance(inputs, str):
             raise TypeError("inputs is a bare str; wrap one input in a list")

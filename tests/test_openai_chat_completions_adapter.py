@@ -41,14 +41,14 @@ from langchaint import (
 )
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     BoundAdapter,
     ErrorClassification,
-    InvalidRequest,
+    RefusedMessages,
     RequestParams,
     ResponseOutcome,
+    UsableResponse,
 )
 from langchaint.billing.pricing import Billing, ProviderBilling
 from langchaint.common.exceptions import StreamProtocolError
@@ -121,9 +121,9 @@ _FUNCTION_CALL_WIRE: dict[str, object] = {
 """One deprecated function_call as the API returns it."""
 
 
-def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
-    """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
-    assert outcome.kind == "adapter_result"
+def _assert_usable[OutputT](outcome: ResponseOutcome[OutputT]) -> UsableResponse[OutputT]:
+    """Narrow a ResponseOutcome to its UsableResponse variant, failing the test on any other variant."""
+    assert outcome.kind == "usable_response"
     return outcome
 
 
@@ -378,13 +378,13 @@ def test_stop_reason_mapping(
 
     Under the text binding, a refusal's sentences are the output and the stop reason names the refusal.
     """
-    result = _assert_result(_text_bound().interpret(build_completion()))
-    assert result.stop_reason == expected
-    assert result.output == expected_output
+    usable = _assert_usable(_text_bound().interpret(build_completion()))
+    assert usable.stop_reason == expected
+    assert usable.output == expected_output
 
 
-def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
-    """One message decomposes into the turn, reasoning_content read off the extra fields."""
+def test_the_assistant_message_orders_reasoning_then_text_then_refusal_then_tool_calls() -> None:
+    """One message decomposes into the assistant message, reasoning_content read off the extra fields."""
     message = ChatCompletionMessage.model_validate({
         "role": "assistant",
         "content": "hey",
@@ -392,7 +392,7 @@ def test_the_turn_orders_reasoning_then_text_then_refusal_then_tool_calls() -> N
         "tool_calls": [_TOOL_CALL_WIRE],
         "reasoning_content": "thought it over",
     })
-    assert _assistant_message_from(message).turn == (
+    assert _assistant_message_from(message).parts == (
         ReasoningPart(raw={"reasoning_content": "thought it over"}, text="thought it over"),
         TextPart(text="hey"),
         TextPart(text="but no more"),
@@ -408,7 +408,7 @@ def test_a_custom_tool_call_becomes_a_raw_part_and_replays_in_order() -> None:
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
+    assert assistant_message.parts == (RawPart(raw=_CUSTOM_TOOL_CALL_WIRE), _TOOL_CALL)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "tool_calls": [_CUSTOM_TOOL_CALL_WIRE, _TOOL_CALL_WIRE],
@@ -436,7 +436,7 @@ def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
         "function_call": function_call,
     })
     assistant_message = _assistant_message_from(message)
-    assert assistant_message.turn == (RawPart(raw={"function_call": function_call}),)
+    assert assistant_message.parts == (RawPart(raw={"function_call": function_call}),)
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "function_call": function_call,
@@ -446,7 +446,7 @@ def test_a_function_call_becomes_a_raw_part_and_replays_unchanged(
 def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_message_param(assistant_message) == {
         "role": "assistant",
         "content": "hi",
@@ -457,13 +457,13 @@ def test_foreign_reasoning_merges_its_keys_into_the_param_unchanged() -> None:
 def test_wire_messages_converts_each_message_kind() -> None:
     """User, assistant, and tool messages each map to their message param.
 
-    The assistant turn becomes one param whose texts join into content.
+    The assistant message becomes one param whose texts join into content.
     ToolCall values and ReasoningPart.raw keep their fields.
     """
     wire = _wire_messages([
         UserMessage(content="q"),
         AssistantMessage(
-            turn=(
+            parts=(
                 ReasoningPart(
                     raw={"reasoning_content": "thought it over"}, text="thought it over"
                 ),
@@ -549,7 +549,7 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
         (
             [
                 AssistantMessage(
-                    turn=(
+                    parts=(
                         RawPart(raw={"function_call": _FUNCTION_CALL_WIRE}),
                         RawPart(raw={"function_call": {"name": "second", "arguments": "{}"}}),
                     )
@@ -560,7 +560,7 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
         (
             [
                 AssistantMessage(
-                    turn=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
+                    parts=(RawPart(raw={"type": "server_tool_use"}), TextPart(text="searching"))
                 )
             ],
             ("no Chat Completions wire form",),
@@ -593,12 +593,12 @@ def test_wire_messages_maps_user_and_tool_parts_and_marks_marked_ones() -> None:
 def test_build_request_reports_unsendable_messages_as_invalid_request(
     messages: list[Message], reason_fragments: tuple[str, ...]
 ) -> None:
-    """A message with no Chat Completions wire form returns InvalidRequest before sending.
+    """A message with no Chat Completions wire form returns RefusedMessages before sending.
 
     One assistant message has one function_call field, and the tool message param's content is text-only.
     """
-    request = _adapter().bind_text(_binding()).build_request(messages)
-    assert isinstance(request, InvalidRequest)
+    request = _adapter().bind_text(_binding()).build_request_params(messages)
+    assert isinstance(request, RefusedMessages)
     for reason_fragment in reason_fragments:
         assert reason_fragment in request.reason
 
@@ -889,9 +889,9 @@ def _structured_completion(
     return _completion(usage=None, message=message, finish_reason=finish_reason)
 
 
-def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
+def test_structured_bind_sets_output_on_an_assistant_message_that_also_called_a_tool() -> None:
     """The message's content validates into the response_format beside the extracted tool call."""
-    outcome = _assert_result(
+    outcome = _assert_usable(
         _structured_bound().interpret(_structured_completion(_REPORT_JSON, tool_call=True))
     )
     assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
@@ -901,14 +901,14 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
 @pytest.mark.parametrize(
     ("completion", "expected_kind"),
     [
-        (_structured_completion(None), "empty_turn"),
+        (_structured_completion(None), "empty_assistant_message"),
         (
             _completion(
                 usage=None,
                 message={"tool_calls": [_CUSTOM_TOOL_CALL_WIRE]},
                 finish_reason="tool_calls",
             ),
-            "empty_turn",
+            "empty_assistant_message",
         ),
         (
             _structured_completion('{"city": "Nair', finish_reason="length"),
@@ -921,8 +921,8 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
         (_structured_completion(None, refusal="I can't help", tool_call=True), "refusal"),
         (_structured_completion(None, refusal=_REPORT_JSON), "refusal"),
         (_structured_completion(None, finish_reason="content_filter"), "refusal"),
-        (_structured_completion(None, tool_call=True), "adapter_result"),
-        (_structured_completion("let me look that up", tool_call=True), "adapter_result"),
+        (_structured_completion(None, tool_call=True), "usable_response"),
+        (_structured_completion("let me look that up", tool_call=True), "usable_response"),
     ],
     ids=[
         "no_text",
@@ -936,31 +936,31 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
         "tool_call_beside_prose",
     ],
 )
-def test_structured_bind_reports_why_a_turn_produced_no_instance(
+def test_structured_bind_reports_why_an_assistant_message_produced_no_instance(
     completion: ChatCompletion, expected_kind: str
 ) -> None:
-    """Every outcome carries the converted turn, including tool calls langchaint cannot dispatch.
+    """Every outcome carries the converted assistant message, including tool calls langchaint cannot dispatch.
 
     A refusal is the model declining, so its sentences never enter validation.
-    A length finish is the truncation, never a dispatchable turn, even with tool calls.
-    A tool-call turn parses no instance and returns an AdapterResult whose output is None.
+    A length finish is the truncation, never a dispatchable assistant message, even with tool calls.
+    An assistant message with tool calls parses no instance and returns a UsableResponse whose output is None.
     """
     outcome = _structured_bound().interpret(completion)
     assert outcome.kind == expected_kind
     assert outcome.assistant_message == _assistant_message_from(completion.choices[0].message)
 
 
-def test_a_completion_with_no_choices_is_unfinished_turn() -> None:
-    """No choices is a response langchaint cannot read a turn from, with an empty partial turn."""
+def test_a_completion_with_no_choices_is_an_unfinished_assistant_message() -> None:
+    """No choices is a response langchaint cannot read an assistant message from, so the message has no parts."""
     outcome = _text_bound().interpret(_completion(usage=None, choices=[]))
-    assert outcome.kind == "unfinished_turn"
-    assert outcome.assistant_message.turn == ()
+    assert outcome.kind == "unfinished_assistant_message"
+    assert outcome.assistant_message.parts == ()
 
 
-def test_a_choice_with_no_finish_reason_is_unfinished_turn_carrying_the_partial_turn() -> None:
-    """finish_reason reads None at runtime on a lenient snapshot, which is not a finished turn."""
+def test_a_choice_with_no_finish_reason_is_unfinished_and_keeps_the_partial_text() -> None:
+    """finish_reason reads None at runtime on a lenient snapshot, which leaves the assistant message unfinished."""
     outcome = _text_bound().interpret(_lenient_completion(None))
-    assert outcome.kind == "unfinished_turn"
+    assert outcome.kind == "unfinished_assistant_message"
     assert outcome.assistant_message.text == "hey"
 
 
@@ -1056,7 +1056,7 @@ def test_stream_passes_text_deltas_through_as_bare_strings() -> None:
     assert _collected_items(_text_stream_chunks()) == ["he", "y"]
 
 
-def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concatenation() -> None:
+def test_stream_yields_reasoning_deltas_and_the_assistant_message_joins_them() -> None:
     """Each reasoning_content delta streams as one ReasoningDelta and the snapshot joins them."""
     stream = _stream([
         _chunk(delta={"role": "assistant", "reasoning_content": "part a"}),
@@ -1074,8 +1074,8 @@ def test_stream_yields_reasoning_deltas_and_the_final_turn_carries_their_concate
         ReasoningDelta(text=" part b"),
         "hey",
     ]
-    result = _assert_result(_text_bound().interpret(final))
-    assert result.assistant_message.turn[0] == ReasoningPart(
+    usable = _assert_usable(_text_bound().interpret(final))
+    assert usable.assistant_message.parts[0] == ReasoningPart(
         raw={"reasoning_content": "part a part b"}, text="part a part b"
     )
 
@@ -1241,8 +1241,8 @@ def _request_body_sent[OutputT](
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
     )
     bound = bind(_adapter(client=client))
-    request = bound.build_request([UserMessage(content="q")])
-    assert not isinstance(request, InvalidRequest)
+    request = bound.build_request_params([UserMessage(content="q")])
+    assert not isinstance(request, RefusedMessages)
     _ = run_with_timeout(bound.open_stream(request))
     (body,) = bodies
     decoded_body: object = json.loads(body)
@@ -1291,14 +1291,14 @@ def test_structured_request_sends_the_non_strict_json_schema_response_format() -
 
 
 def test_a_built_request_renders_as_json_carrying_the_messages_and_no_omitted_field() -> None:
-    """as_json holds the binding's precomputed fields and this call's messages after the prefix.
+    """as_json holds the binding's precomputed fields and this input's messages after the prefix.
 
     An unstated temperature is absent from the request.
     """
     request = (
         _adapter()
         .bind_text(_binding(system_prompt="sys"))
-        .build_request([UserMessage(content="hi")])
+        .build_request_params([UserMessage(content="hi")])
     )
     assert isinstance(request, _ChatCompletionsRequestParams)
     rendered = json.loads(request.as_json())
@@ -1327,22 +1327,22 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a turn whose prompt_tokens carries both a cache read and a cache write."""
+        """Return a response whose prompt_tokens carries both a cache read and a cache write."""
         return _completion(usage=_usage_with_cache())
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a turn whose usage field is absent, the runtime state a cut-off stream leaves."""
+        """Return a response whose usage field is absent, the runtime state a cut-off stream leaves."""
         return _completion(usage=None)
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a turn served at flex, which _PRICING holds no table for."""
+        """Return a response served at flex, which _PRICING holds no table for."""
         return _completion(usage=_usage_with_cache(), service_tier="flex")
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a turn whose cache counters sum past prompt_tokens.
+        """Return a response whose cache counters sum past prompt_tokens.
 
         Excess cache counters make the derived uncached counter negative.
         """
@@ -1356,7 +1356,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return a turn carrying reasoning_content beside its one text part."""
+        """Return a response carrying reasoning_content beside its one text part."""
         return _completion(usage=_usage_with_cache(), message=_conformance_message())
 
     @override
@@ -1371,14 +1371,14 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
         )
 
     @override
-    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
         """Decompose one assistant param into wire-order parts.
 
-        This wire stores the turn in one message param.
-        Split ReasoningPart.raw, content, and ToolCall values in TurnPart order.
+        This wire stores the assistant message in one message param.
+        Split ReasoningPart.raw, content, and ToolCall values in AssistantPart order.
         """
-        assert isinstance(request, _ChatCompletionsRequestParams)
-        (assistant_param,) = request.messages[1:]
+        assert isinstance(request_params, _ChatCompletionsRequestParams)
+        (assistant_param,) = request_params.messages[1:]
         payload = dict(assistant_param)
         parts: list[object] = []
         if "reasoning_content" in payload:
@@ -1392,7 +1392,7 @@ class TestOpenAIChatCompletionsConformance(AdapterConformance):
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return the same turn as the snapshot ChatCompletionStreamState assembles and whole."""
+        """Return the same response as the snapshot ChatCompletionStreamState assembles and whole."""
         whole = _completion(usage=_usage_with_cache(), message=_conformance_message())
         state = ChatCompletionStreamState()
         for chunk in (

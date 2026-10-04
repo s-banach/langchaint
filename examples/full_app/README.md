@@ -68,7 +68,7 @@ The remaining accounting fields are exact:
 ## Deadlines and cancellation
 
 `generate_one_timeout_seconds` belongs to one `generate_one` call.
-A `TimedOutErrorRecord` carries settled attempt accounting.
+A `TimedOutErrorRecord` carries settled request accounting.
 The loop appends `LlmFailure` before continuing.
 `LlmCallAbandoned` reports that continuation.
 

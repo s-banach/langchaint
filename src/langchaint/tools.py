@@ -114,7 +114,7 @@ Call a concrete tool's `dispatch` to preserve its `app_data` type.
 """
 
 
-type DispatchManyOutcome = DispatchOutcome | DispatchPrecomputed
+type DispatchManyItemOutcome = DispatchOutcome | DispatchPrecomputed
 """One ordered outcome from `ToolManager.dispatch_many`."""
 
 
@@ -147,14 +147,14 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
     Cancellation propagates separately with this group as its cause when both occur.
     """
 
-    completed_outcomes: "tuple[DispatchManyOutcome, ...]"
+    completed_outcomes: "tuple[DispatchManyItemOutcome, ...]"
 
     def __new__(
         cls,
         message: str,
         exceptions: Sequence[Exception],
         *,
-        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
+        completed_outcomes: "tuple[DispatchManyItemOutcome, ...]",
     ) -> Self:
         """Build a group carrying the completed dispatch outcomes."""
         group = super().__new__(cls, message, exceptions)
@@ -166,7 +166,7 @@ class DispatchExceptionGroup(ExceptionGroup[Exception]):
         message: str,
         exceptions: Sequence[Exception],
         *,
-        completed_outcomes: "tuple[DispatchManyOutcome, ...]",
+        completed_outcomes: "tuple[DispatchManyItemOutcome, ...]",
     ) -> None:
         """Store grouped exceptions and completed dispatch outcomes."""
         super().__init__(message, exceptions)
@@ -645,7 +645,7 @@ class ToolManager:
         tool_calls: Sequence[ToolCall],
         *,
         precomputed: Callable[[ToolCall], ToolMessage | None] | None = None,
-    ) -> tuple[DispatchManyOutcome, ...]:
+    ) -> tuple[DispatchManyItemOutcome, ...]:
         """Dispatch calls concurrently. Preserve `tool_calls` order.
 
         `precomputed` runs for every call before any tool function starts.
@@ -663,7 +663,7 @@ class ToolManager:
             BaseException: A tool function raises a non-`Exception` value after every call settles.
         """
         answered, to_dispatch = _split_precomputed(tool_calls, precomputed)
-        settled: dict[int, DispatchManyOutcome | BaseException] = dict(answered)
+        settled: dict[int, DispatchManyItemOutcome | BaseException] = dict(answered)
         tasks = [asyncio.ensure_future(self.dispatch(tool_call)) for _, tool_call in to_dispatch]
         try:
             results: list[DispatchOutcome | BaseException] = await asyncio.gather(
@@ -677,7 +677,7 @@ class ToolManager:
             raise
         for (index, _), result in zip(to_dispatch, results, strict=True):
             settled[index] = result
-        completed_outcomes: list[DispatchManyOutcome] = []
+        completed_outcomes: list[DispatchManyItemOutcome] = []
         raised_exceptions: list[Exception] = []
         base_exceptions: list[BaseException] = []
         for index in range(len(tool_calls)):

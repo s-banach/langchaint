@@ -2,12 +2,12 @@
 
 
 class TransientError(Exception):
-    """One failed attempt that a retry may fix.
+    """One failed request that a retry may fix.
 
     `__cause__` holds the original provider exception when one exists.
     Retry loops raise `TransientError` inside `SharedBackoff.admitted()`.
-    `SettledAttemptRecord.error` preserves normalized failure data.
-    `SettledAttemptRecord.billing` preserves billing from the same request.
+    `SettledRequestRecord.error` preserves normalized failure data.
+    `SettledRequestRecord.billing` preserves billing from the same request.
     """
 
     retry_after_seconds: float | None
@@ -33,7 +33,7 @@ class EmbeddingOutputError(RuntimeError):
 class StreamProtocolError(Exception):
     """A stream did not follow the event contract.
 
-    A stream that ends without a terminal result raises this error.
+    A stream that ends without a terminal event raises this error.
     A missing Messages API stop reason or Responses API terminal response raises this error.
     `StreamHandle` reports this error from `AdapterStream.items()` as a `retry_unavailable_error` `GenerationError`.
     `generate_one` retries this error as a transient failure.
@@ -45,5 +45,5 @@ class GaveUpWaitingError(Exception):
     """A budget expired before `SharedBackoff.admitted()` admitted the request.
 
     The admission holds no permit or queue position and records no request.
-    A new attempt joins the same queue behind the same pause.
+    A new request joins the same queue behind the same pause.
     """

@@ -1,7 +1,7 @@
 """Define each agent's identity and limits.
 
 generate_one_timeout_seconds bounds one generate_one call.
-A timed-out call appends no messages, and the next turn uses the same messages.
+A timed-out `generate_one` appends no messages, and the next turn uses the same messages.
 max_turns bounds repeated timeouts.
 """
 
@@ -15,7 +15,7 @@ class AgentConfig:
 
     name matches the last segment of agent_path before any spawn index.
     max_tool_calls bounds the whole run and declines excess calls with an error ToolMessage.
-    max_attempts includes the first request of each generate_one call.
+    max_requests counts every request for one generate_one input, including the first.
     max_cost_in_usd stops new turns after settled spend reaches the limit.
     self_correction_enabled requires critique approval before a final answer.
     """
@@ -25,7 +25,7 @@ class AgentConfig:
     automatic_cache_breakpoints: bool
     max_turns: int = 8
     max_tool_calls: int = 12
-    max_attempts: int = 2
+    max_requests: int = 2
     generate_one_timeout_seconds: float = 10.0
     max_cost_in_usd: float | None = None
     self_correction_enabled: bool = False

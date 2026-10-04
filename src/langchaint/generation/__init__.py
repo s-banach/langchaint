@@ -1,1 +1,1 @@
-"""Generation execution, call records, results, and table conversion."""
+"""Generation execution, request histories, outcomes, and table conversion."""

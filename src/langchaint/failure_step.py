@@ -1,4 +1,4 @@
-"""The retry decision after one failed provider attempt, shared by generation and embedding."""
+"""The retry decision after one failed provider request, shared by generation and embedding."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,14 +50,14 @@ def _failure_step(
     verdict: Verdict | None,
     classify: Callable[[Exception], ErrorClassification],
 ) -> _FailureStep:
-    """Decide how a request continues after one attempt fails with `failure`.
+    """Decide what follows after one request fails with `failure`.
 
     `verdict` is the verdict the `admitted()` block recorded for `failure`.
     `verdict` is `None` when `failure` is not one of the `SharedBackoff.failure_types`.
     A `TransientError` or `StreamProtocolError` without a verdict retries without `classify`.
     `classify` runs only for another failure without a verdict and for `DoNotRetry`.
     Only a failure without a verdict retries on the classification `"transient"`.
-    The caller counts attempts, so a retry step does not promise that an attempt remains.
+    The caller counts requests, so a retry step does not promise that `max_requests` permits another.
     """
     if verdict is None:
         if isinstance(failure, (TransientError, StreamProtocolError)):
@@ -81,7 +81,7 @@ def _failure_step(
 def _transient_error_for_step(
     failure: Exception, message: str, step: _RetryStep
 ) -> TransientError:
-    """Wrap one retried attempt failure as the `TransientError` its attempt record carries.
+    """Wrap one retried request failure as the `TransientError` its request record carries.
 
     Return an existing `TransientError` unchanged.
     This preserves its `retry_after_seconds`, `is_rate_limit`, and message.

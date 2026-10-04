@@ -34,14 +34,14 @@ def _reject_provider_failure(_failure: Exception) -> Verdict:
 
 
 class _StubEmbeddingAdapter:
-    """Script partitioning and provider attempts for neutral tests."""
+    """Script partitioning and provider requests for neutral tests."""
 
     model = "stub-embedding"
     dimension = 2
     failure_types: ClassVar[tuple[type[Exception], ...]] = (_ProviderError,)
 
-    def __init__(self, attempts: Sequence[Float2D | Exception]) -> None:
-        self._attempts = list(attempts)
+    def __init__(self, requests: Sequence[Float2D | Exception]) -> None:
+        self._requests = list(requests)
         self.prepare_calls = 0
         self.partition_calls = 0
         self.embed_calls = 0
@@ -71,7 +71,7 @@ class _StubEmbeddingAdapter:
         self.embed_calls += 1
         self.embed_inputs.append(tuple(inputs))
         self.embed_tasks.append(task)
-        outcome = self._attempts.pop(0)
+        outcome = self._requests.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -94,7 +94,7 @@ class _PartitioningEmbeddingAdapter:
         self.started = {input_text: asyncio.Event() for input_text in inputs}
         self.release = {input_text: asyncio.Event() for input_text in inputs}
         self.fail_once = set(fail_once or ())
-        self.attempts: Counter[str] = Counter()
+        self.requests: Counter[str] = Counter()
 
     async def prepare(self) -> None:
         """Complete preparation without work."""
@@ -118,10 +118,10 @@ class _PartitioningEmbeddingAdapter:
         """Wait for release, then fail once or return the input's row."""
         del task
         input_text = inputs[0]
-        self.attempts[input_text] += 1
+        self.requests[input_text] += 1
         self.started[input_text].set()
         await self.release[input_text].wait()
-        if input_text in self.fail_once and self.attempts[input_text] == 1:
+        if input_text in self.fail_once and self.requests[input_text] == 1:
             raise _ProviderError(input_text)
         row = [1.0, 0.0] if input_text == "first" else [0.0, 1.0]
         return np.array([row], dtype=np.float32)
@@ -151,7 +151,7 @@ def _shared_backoff(
 def _model(
     adapter: _StubEmbeddingAdapter,
     *,
-    max_attempts: int = 3,
+    max_requests: int = 3,
     parse: Callable[[Exception], Verdict] = _retry_provider_failure,
     failure_types: tuple[type[Exception], ...] = (_ProviderError,),
     longest_wait_seconds: float = 0.001,
@@ -161,7 +161,7 @@ def _model(
         shared_backoff=_shared_backoff(
             parse=parse, failure_types=failure_types, longest_wait_seconds=longest_wait_seconds
         ),
-        max_attempts=max_attempts,
+        max_requests=max_requests,
     )
 
 
@@ -197,11 +197,11 @@ def test_empty_input_returns_without_adapter_work() -> None:
     assert adapter.embed_calls == 0
 
 
-@pytest.mark.parametrize("max_attempts", [True, False, 0, -1])
-def test_embedding_model_rejects_invalid_max_attempts(max_attempts: int) -> None:
+@pytest.mark.parametrize("max_requests", [True, False, 0, -1])
+def test_embedding_model_rejects_invalid_max_requests(max_requests: int) -> None:
     """Invalid retry budgets fail during model construction."""
-    with pytest.raises(ValueError, match="max_attempts"):
-        _ = _model(_StubEmbeddingAdapter([]), max_attempts=max_attempts)
+    with pytest.raises(ValueError, match="max_requests"):
+        _ = _model(_StubEmbeddingAdapter([]), max_requests=max_requests)
 
 
 @pytest.mark.parametrize(
@@ -297,7 +297,7 @@ def test_exhausted_transport_failure_propagates_unchanged() -> None:
 
     async def scenario() -> None:
         with pytest.raises(_TransportError, match="final") as caught:
-            _ = await _model(adapter, max_attempts=2).embed(
+            _ = await _model(adapter, max_requests=2).embed(
                 ["one"],
                 task="classification",
             )
@@ -314,7 +314,7 @@ def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
         model = EmbeddingModel(
             adapter=adapter,
             shared_backoff=_shared_backoff(),
-            max_attempts=1,
+            max_requests=1,
         )
         embed_task = asyncio.create_task(
             model.embed(["first", "second"], task="retrieval_document")
@@ -331,7 +331,7 @@ def test_request_batches_run_concurrently_and_preserve_input_order() -> None:
 
 
 def test_retrying_one_request_batch_does_not_repeat_its_sibling() -> None:
-    """Only the failed request batch consumes another attempt."""
+    """Only the failed request batch sends another request."""
 
     async def scenario() -> None:
         adapter = _PartitioningEmbeddingAdapter(
@@ -343,10 +343,10 @@ def test_retrying_one_request_batch_does_not_repeat_its_sibling() -> None:
         model = EmbeddingModel(
             adapter=adapter,
             shared_backoff=_shared_backoff(),
-            max_attempts=2,
+            max_requests=2,
         )
         vectors = await model.embed(["first", "second"], task="retrieval_document")
         np.testing.assert_array_equal(vectors, [[1.0, 0.0], [0.0, 1.0]])
-        assert adapter.attempts == {"first": 2, "second": 1}
+        assert adapter.requests == {"first": 2, "second": 1}
 
     run_with_timeout(scenario())

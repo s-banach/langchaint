@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from langchaint import (
     DispatchExceptionGroup,
-    DispatchManyOutcome,
+    DispatchManyItemOutcome,
     JSONSchemaTool,
     ToolCall,
     ToolManager,
@@ -114,7 +114,7 @@ async def dispatch_with_approval(
     return tuple(outcome.tool_message for outcome in outcomes)
 
 
-def _record_app_data(outcomes: Sequence[DispatchManyOutcome]) -> None:
+def _record_app_data(outcomes: Sequence[DispatchManyItemOutcome]) -> None:
     """Record application data from settled dispatch outcomes."""
     for outcome in outcomes:
         if outcome.kind != "handled":

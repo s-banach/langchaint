@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 
-async def await_task_cancellation_safe[ResultT](task: asyncio.Task[ResultT]) -> ResultT:
+async def await_task_cancellation_safe[ReturnT](task: asyncio.Task[ReturnT]) -> ReturnT:
     """Settle `task` before propagating caller cancellation.
 
     Args:
@@ -26,7 +26,7 @@ async def await_task_cancellation_safe[ResultT](task: asyncio.Task[ResultT]) -> 
         raise
 
 
-async def to_thread_cancellation_safe[ResultT](function: Callable[[], ResultT]) -> ResultT:
+async def to_thread_cancellation_safe[ReturnT](function: Callable[[], ReturnT]) -> ReturnT:
     """Run `function` in a thread and settle it before propagating cancellation.
 
     The function receives no cancellation signal from `asyncio`.

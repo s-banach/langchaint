@@ -1,4 +1,4 @@
-"""Live generation results and normalized result records."""
+"""Live generations, their records, and the outcome unions."""
 
 from dataclasses import dataclass
 from typing import Annotated, Generic, Literal, Self, TypeVar, override
@@ -9,19 +9,10 @@ from langchaint.adapter import RequestParams, ResponseOutcome
 from langchaint.billing.pricing import ProviderBilling
 from langchaint.billing.usage import Usage
 from langchaint.common.messages import AssistantMessage, StopReason, ToolCall
-from langchaint.generation.call import (
-    AttemptProviderData,
-    CallRecord,
-    SettledAttemptRecord,
-    _CallLedger,
-    _CallResultRecordBase,
-    _require_completed_model_turn,
-    _settled_attempts,
-)
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
     ContextWindowExceededErrorRecord,
-    EmptyTurnErrorRecord,
+    EmptyAssistantMessageErrorRecord,
     EscapedExceptionErrorRecord,
     GenerationError,
     GenerationErrorRecord,
@@ -30,17 +21,27 @@ from langchaint.generation.errors import (
     RefusalErrorRecord,
     SchemaViolationErrorRecord,
     TimedOutErrorRecord,
-    UnfinishedTurnErrorRecord,
+    UnfinishedAssistantMessageErrorRecord,
     _GenerationErrorRecordBase,
+)
+from langchaint.generation.request_history import (
+    AbandonedStreamRecord,
+    RequestHistory,
+    RequestProviderData,
+    SettledRequestRecord,
+    _InputOutcomeRecordBase,
+    _RequestLedger,
+    _require_completed_assistant_message,
+    _settled_request_records,
 )
 
 # Declared covariant because pyrefly infers a PEP 695 parameter invariant through the record's
-# `output` field, and `AttributeMapper` takes `CallResult[object]`.
+# `output` field, and `AttributeMapper` takes `GenerationOutcome[object]`.
 _OutputT_co = TypeVar("_OutputT_co", covariant=True)
 
 
-class _SuccessRecordBase(_CallResultRecordBase):
-    """Properties and invariants shared by normalized success records.
+class _GenerationRecordBase(_InputOutcomeRecordBase):
+    """Properties and invariants shared by the two generation records.
 
     Validation rejects unknown fields.
     """
@@ -48,86 +49,81 @@ class _SuccessRecordBase(_CallResultRecordBase):
     stop_reason: StopReason
 
     @model_validator(mode="after")
-    def _validate_success(self) -> Self:
-        _require_completed_model_turn(self.call)
+    def _validate_generation(self) -> Self:
+        _require_completed_assistant_message(self.request_history)
         return self
 
     @property
     @override
-    def attempt_records(
+    def request_records(
         self,
-    ) -> tuple[SettledAttemptRecord, ...]:
-        """Return the call's normalized request records."""
-        return _settled_attempts(self.call)
+    ) -> tuple[SettledRequestRecord, ...]:
+        """Return the input's normalized request records."""
+        return _settled_request_records(self.request_history)
 
     @property
     @override
     def assistant_message(self) -> AssistantMessage:
-        """Return the successful attempt's assistant message."""
-        final = self.call.attempt_records[-1]
+        """Return the kept assistant message, from the final request."""
+        final = self.request_history.request_records[-1]
         assert final.kind == "settled"
         assert final.assistant_message is not None
         return final.assistant_message
 
     @property
-    def usage_successful_attempt(self) -> Usage:
-        """Return normalized usage for the successful request."""
-        return self.call.attempt_records[-1].usage
-
-    @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
-        """Return the final turn's tool calls."""
+        """Return the kept assistant message's tool calls."""
         return self.assistant_message.tool_calls
 
 
-class ResponseRecord[OutputT](_SuccessRecordBase):
-    """One normalized successful generation result.
+class GenerationWithoutToolCallsRecord[OutputT](_GenerationRecordBase):
+    """The normalized record of one `GenerationWithoutToolCalls`.
 
     Validation rejects unknown fields.
     """
 
     output: OutputT
-    kind: Literal["response"] = "response"
+    kind: Literal["without_tool_calls"] = "without_tool_calls"
 
 
-class ToolCallTurnRecord[OutputT](_SuccessRecordBase):
-    """One normalized result whose turn called tools.
+class GenerationWithToolCallsRecord[OutputT](_GenerationRecordBase):
+    """The normalized record of one `GenerationWithToolCalls`.
 
-    `output` is `None` when a structured binding's turn has no validated caller model.
+    `output` is `None` when a structured binding's kept assistant message has no validated caller model.
 
     Validation rejects unknown fields.
     """
 
     output: OutputT
-    kind: Literal["tool_call_turn"] = "tool_call_turn"
+    kind: Literal["with_tool_calls"] = "with_tool_calls"
 
     @model_validator(mode="after")
     def _validate_tool_call(self) -> Self:
         if not self.assistant_message.tool_calls:
-            raise ValueError("a ToolCallTurnRecord must contain at least one tool call")
+            raise ValueError("a GenerationWithToolCallsRecord must contain at least one tool call")
         return self
 
 
 @dataclass(frozen=True, kw_only=True)
-class _LiveSuccess[RecordT: _SuccessRecordBase]:
-    """Delegate live success properties to one normalized record."""
+class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
+    """Delegate live generation properties to one normalized record."""
 
     record: RecordT
-    provider_attempts: tuple[AttemptProviderData, ...]
+    request_provider_data: tuple[RequestProviderData, ...]
 
     def __post_init__(self) -> None:
         """Require aligned provider data with a final provider response."""
-        _validate_live_success(self.record, self.provider_attempts)
+        _validate_live_generation(self.record, self.request_provider_data)
 
     @property
     def raw(self) -> BaseModel:
         """Return the final provider SDK response."""
-        return _final_raw(self.provider_attempts)
+        return _final_raw(self.request_provider_data)
 
     @property
-    def call(self) -> CallRecord:
-        """Return the normalized call record."""
-        return self.record.call
+    def request_history(self) -> RequestHistory:
+        """Return the normalized request history."""
+        return self.record.request_history
 
     @property
     def stop_reason(self) -> StopReason:
@@ -140,26 +136,21 @@ class _LiveSuccess[RecordT: _SuccessRecordBase]:
         return self.record.assistant_message
 
     @property
-    def attempt_records(
+    def request_records(
         self,
-    ) -> tuple[SettledAttemptRecord, ...]:
-        """Return normalized attempt records in request order."""
-        return self.record.attempt_records
+    ) -> tuple[SettledRequestRecord, ...]:
+        """Return normalized request records in request order."""
+        return self.record.request_records
 
     @property
-    def attempts(self) -> int:
+    def request_count(self) -> int:
         """Return the observed request count."""
-        return self.record.attempts
+        return self.record.request_count
 
     @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
         return self.record.usage
-
-    @property
-    def usage_successful_attempt(self) -> Usage:
-        """Return normalized usage for the successful request."""
-        return self.record.usage_successful_attempt
 
     @property
     def model(self) -> str:
@@ -173,7 +164,10 @@ class _LiveSuccess[RecordT: _SuccessRecordBase]:
 
     @property
     def elapsed_seconds(self) -> float:
-        """Return the complete call duration."""
+        """Return the seconds from the start of handling the input until its request history was frozen.
+
+        It includes admission and backoff waits.
+        """
         return self.record.elapsed_seconds
 
     @property
@@ -183,10 +177,13 @@ class _LiveSuccess[RecordT: _SuccessRecordBase]:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Response(_LiveSuccess[ResponseRecord[_OutputT_co]], Generic[_OutputT_co]):  # noqa: UP046
-    """A live success with a normalized record and provider SDK values."""
+class GenerationWithoutToolCalls(
+    _LiveGenerationBase[GenerationWithoutToolCallsRecord[_OutputT_co]],
+    Generic[_OutputT_co],  # noqa: UP046
+):
+    """A generation whose kept assistant message has no tool calls, with provider SDK values."""
 
-    kind: Literal["response"] = "response"
+    kind: Literal["without_tool_calls"] = "without_tool_calls"
 
     @property
     def output(self) -> _OutputT_co:
@@ -199,171 +196,208 @@ class Response(_LiveSuccess[ResponseRecord[_OutputT_co]], Generic[_OutputT_co]):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ToolCallTurn(_LiveSuccess[ToolCallTurnRecord[_OutputT_co]], Generic[_OutputT_co]):  # noqa: UP046
-    """A live tool-call turn with normalized and provider SDK values."""
+class GenerationWithToolCalls(
+    _LiveGenerationBase[GenerationWithToolCallsRecord[_OutputT_co]],
+    Generic[_OutputT_co],  # noqa: UP046
+):
+    """A generation whose kept assistant message has tool calls, with provider SDK values.
 
-    kind: Literal["tool_call_turn"] = "tool_call_turn"
+    Only a binding with tools produces one.
+    """
+
+    kind: Literal["with_tool_calls"] = "with_tool_calls"
 
     @property
     def output(self) -> _OutputT_co:
-        """Return the turn's text or validated caller model.
+        """Return the kept assistant message's text or validated caller model.
 
         A text binding returns the joined `TextPart` text of `assistant_message`, which is `""` without a `TextPart`.
-        A structured binding returns `None` when the turn has no validated caller model.
+        A structured binding returns `None` when the kept assistant message has no validated caller model.
         To continue the conversation, replay `assistant_message`.
         """
         return self.record.output
 
 
-def _validate_live_success(
-    record: _SuccessRecordBase, provider_attempts: tuple[AttemptProviderData, ...]
+def _validate_live_generation(
+    record: _GenerationRecordBase, request_provider_data: tuple[RequestProviderData, ...]
 ) -> None:
-    if len(provider_attempts) != len(record.call.attempt_records):
-        raise ValueError("provider_attempts must align with call.attempt_records")
-    _ = _final_raw(provider_attempts)
+    if len(request_provider_data) != len(record.request_history.request_records):
+        raise ValueError("request_provider_data must align with request_history.request_records")
+    _ = _final_raw(request_provider_data)
 
 
-def _final_raw(provider_attempts: tuple[AttemptProviderData, ...]) -> BaseModel:
-    final_raw = provider_attempts[-1].raw
+def _final_raw(request_provider_data: tuple[RequestProviderData, ...]) -> BaseModel:
+    final_raw = request_provider_data[-1].raw
     if final_raw is None:
-        raise ValueError("a live success requires a final provider response")
+        raise ValueError("a live generation requires a final provider response")
     return final_raw
 
 
-type GenerateResult[OutputT, TurnOutputT = OutputT] = Response[OutputT] | ToolCallTurn[TurnOutputT]
-"""One success, where `TurnOutputT` is `OutputT | None` for a structured binding."""
-type GenerationRecord[OutputT, TurnOutputT] = (
-    ResponseRecord[OutputT] | ToolCallTurnRecord[TurnOutputT]
+type Generation[OutputT, WithToolCallsOutputT = OutputT] = (
+    GenerationWithoutToolCalls[OutputT] | GenerationWithToolCalls[WithToolCallsOutputT]
 )
-"""The normalized record of one `Response` or `ToolCallTurn`.
+"""What an input produces when it succeeds. `WithToolCallsOutputT` is `OutputT | None` for a structured binding."""
+type GenerationRecord[OutputT, WithToolCallsOutputT] = (
+    GenerationWithoutToolCallsRecord[OutputT] | GenerationWithToolCallsRecord[WithToolCallsOutputT]
+)
+"""The normalized record of one `GenerationWithoutToolCalls` or `GenerationWithToolCalls`.
 
-`TurnOutputT` has no default because pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
+`WithToolCallsOutputT` has no default: pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
 pydantic then validates that argument as `Any`.
 """
-type CallResult[OutputT, TurnOutputT = OutputT] = (
-    GenerateResult[OutputT, TurnOutputT] | GenerationError
+type GenerationOutcome[OutputT, WithToolCallsOutputT = OutputT] = (
+    Generation[OutputT, WithToolCallsOutputT] | GenerationError
 )
+"""Every live outcome of an input: a `Generation` or a `GenerationError`.
 
-type CallResultRecord[OutputT, TurnOutputT] = Annotated[
-    SerializeAsAny[ResponseRecord[OutputT]]
-    | SerializeAsAny[ToolCallTurnRecord[TurnOutputT]]
+`InputOutcomeRecord` also covers abandonment, which has no live form.
+"""
+
+type GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] = Annotated[
+    SerializeAsAny[GenerationWithoutToolCallsRecord[OutputT]]
+    | SerializeAsAny[GenerationWithToolCallsRecord[WithToolCallsOutputT]]
     | GenerationErrorRecord,
     Field(discriminator="kind"),
 ]
-"""The normalized record of one call result.
+"""The normalized record of one `GenerationOutcome`.
 
-`TurnOutputT` has no default because pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
+`WithToolCallsOutputT` has no default: pydantic 2.13.5 ignores a `type` alias default that names another type parameter.
 pydantic then validates that argument as `Any`.
 """
 
+type InputOutcomeRecord[OutputT, WithToolCallsOutputT] = (
+    GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] | AbandonedStreamRecord
+)
+"""Every record of an input's outcome, including a stream the application abandoned."""
 
-def _result_record[OutputT, TurnOutputT](
-    result: CallResult[OutputT, TurnOutputT] | CallResultRecord[OutputT, TurnOutputT],
-) -> CallResultRecord[OutputT, TurnOutputT]:
-    if isinstance(result, (Response, ToolCallTurn, GenerationError)):
-        if type(result) not in (Response, ToolCallTurn, GenerationError):
-            raise TypeError(f"unsupported call result: {type(result).__name__}")
-        record = result.record
+
+def _generation_outcome_record[OutputT, WithToolCallsOutputT](
+    generation_outcome: GenerationOutcome[OutputT, WithToolCallsOutputT]
+    | GenerationOutcomeRecord[OutputT, WithToolCallsOutputT],
+) -> GenerationOutcomeRecord[OutputT, WithToolCallsOutputT]:
+    if isinstance(
+        generation_outcome, (GenerationWithoutToolCalls, GenerationWithToolCalls, GenerationError)
+    ):
+        if type(generation_outcome) not in (
+            GenerationWithoutToolCalls,
+            GenerationWithToolCalls,
+            GenerationError,
+        ):
+            raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
+        record = generation_outcome.record
         if (
-            isinstance(record, _SuccessRecordBase)
+            isinstance(record, _GenerationRecordBase)
             or type(record) in _GENERATION_ERROR_RECORD_CLASSES
         ):
             return record
-        raise TypeError(f"unsupported call result record: {type(record).__name__}")
-    if isinstance(result, _SuccessRecordBase):
-        return result
+        raise TypeError(f"unsupported generation outcome record: {type(record).__name__}")
+    if isinstance(generation_outcome, _GenerationRecordBase):
+        return generation_outcome
     if (
-        isinstance(result, _GenerationErrorRecordBase)
-        and type(result) in _GENERATION_ERROR_RECORD_CLASSES
+        isinstance(generation_outcome, _GenerationErrorRecordBase)
+        and type(generation_outcome) in _GENERATION_ERROR_RECORD_CLASSES
     ):
-        return result
-    raise TypeError(f"unsupported call result: {type(result).__name__}")
+        return generation_outcome
+    raise TypeError(f"unsupported generation outcome: {type(generation_outcome).__name__}")
 
 
-def _success_variant[OutputT](
+def _generation_variant[OutputT](
     *,
-    splits_tool_call_turns: bool,
+    splits_on_tool_calls: bool,
     output: OutputT,
-    call: CallRecord,
-    provider_attempts: tuple[AttemptProviderData, ...],
+    request_history: RequestHistory,
+    request_provider_data: tuple[RequestProviderData, ...],
     stop_reason: StopReason,
-) -> GenerateResult[OutputT]:
-    """Build one live success and its single normalized record."""
-    final = call.attempt_records[-1]
+) -> Generation[OutputT]:
+    """Build one live generation and its normalized record."""
+    final = request_history.request_records[-1]
     assert final.kind == "settled"
     assert final.assistant_message is not None
-    if splits_tool_call_turns and final.assistant_message.tool_calls:
-        return ToolCallTurn(
-            record=ToolCallTurnRecord(output=output, call=call, stop_reason=stop_reason),
-            provider_attempts=provider_attempts,
+    if splits_on_tool_calls and final.assistant_message.tool_calls:
+        return GenerationWithToolCalls(
+            record=GenerationWithToolCallsRecord(
+                output=output, request_history=request_history, stop_reason=stop_reason
+            ),
+            request_provider_data=request_provider_data,
         )
-    return Response(
-        record=ResponseRecord(output=output, call=call, stop_reason=stop_reason),
-        provider_attempts=provider_attempts,
+    return GenerationWithoutToolCalls(
+        record=GenerationWithoutToolCallsRecord(
+            output=output, request_history=request_history, stop_reason=stop_reason
+        ),
+        request_provider_data=request_provider_data,
     )
 
 
-def _call_result_from_response_outcome[OutputT](
+def _generation_outcome_from_response_outcome[OutputT](
     outcome: ResponseOutcome[OutputT],
     *,
-    call: CallRecord,
-    provider_attempts: tuple[AttemptProviderData, ...],
-    request: RequestParams | None,
-    splits_tool_call_turns: bool,
-) -> CallResult[OutputT]:
+    request_history: RequestHistory,
+    request_provider_data: tuple[RequestProviderData, ...],
+    request_params: RequestParams | None,
+    splits_on_tool_calls: bool,
+) -> GenerationOutcome[OutputT]:
     match outcome.kind:
-        case "adapter_result":
-            return _success_variant(
-                splits_tool_call_turns=splits_tool_call_turns,
+        case "usable_response":
+            return _generation_variant(
+                splits_on_tool_calls=splits_on_tool_calls,
                 output=outcome.output,
-                call=call,
-                provider_attempts=provider_attempts,
+                request_history=request_history,
+                request_provider_data=request_provider_data,
                 stop_reason=outcome.stop_reason,
             )
         case "refusal":
-            record = RefusalErrorRecord(call=call)
+            record = RefusalErrorRecord(request_history=request_history)
         case "max_completion_tokens_exceeded":
-            record = MaxCompletionTokensExceededErrorRecord(call=call)
-        case "empty_turn":
-            record = EmptyTurnErrorRecord(call=call)
+            record = MaxCompletionTokensExceededErrorRecord(request_history=request_history)
+        case "empty_assistant_message":
+            record = EmptyAssistantMessageErrorRecord(request_history=request_history)
         case "schema_violation":
             record = SchemaViolationErrorRecord(
-                validation_error_json=outcome.validation_error_json, call=call
+                validation_error_json=outcome.validation_error_json,
+                request_history=request_history,
             )
         case "context_window_exceeded":
-            record = ContextWindowExceededErrorRecord(call=call)
-        case "unfinished_turn":
-            record = UnfinishedTurnErrorRecord(error_text=outcome.reason, call=call)
+            record = ContextWindowExceededErrorRecord(request_history=request_history)
+        case "unfinished_assistant_message":
+            record = UnfinishedAssistantMessageErrorRecord(
+                error_text=outcome.reason, request_history=request_history
+            )
         case "provider_failed_terminally":
-            record = ProviderFailedTerminallyErrorRecord(error_text=outcome.reason, call=call)
+            record = ProviderFailedTerminallyErrorRecord(
+                error_text=outcome.reason, request_history=request_history
+            )
         case "provider_failed_transiently":
             raise ValueError("ProviderFailedTransiently requires the caller's retry policy")
     return GenerationError(
         record=record,
-        request=request,
-        provider_attempts=provider_attempts,
+        request_params=request_params,
+        request_provider_data=request_provider_data,
     )
 
 
 def _timed_out_error(
-    ledger: _CallLedger, billing_in_flight: ProviderBilling | None = None
+    ledger: _RequestLedger, billing_in_flight: ProviderBilling | None = None
 ) -> GenerationError:
     """Build the expired deadline's failure with one normalized cut-off request."""
-    call, provider_attempts = ledger.freeze_with_cut_off(billing_in_flight)
+    request_history, request_provider_data = ledger.freeze_with_cut_off(billing_in_flight)
     return GenerationError(
-        record=TimedOutErrorRecord(call=call), request=None, provider_attempts=provider_attempts
+        record=TimedOutErrorRecord(request_history=request_history),
+        request_params=None,
+        request_provider_data=request_provider_data,
     )
 
 
-def _escaped_error(ledger: _CallLedger, escaped: Exception) -> GenerationError:
+def _escaped_error(ledger: _RequestLedger, escaped: Exception) -> GenerationError:
     """Build the failure for an `Exception` that escaped failure handling, with one normalized cut-off request.
 
     The cut-off request carries the billing noted on `ledger` for the request in flight.
     The caller sets `escaped` as the cause.
     """
-    call, provider_attempts = ledger.freeze_with_cut_off()
+    request_history, request_provider_data = ledger.freeze_with_cut_off()
     return GenerationError(
-        record=EscapedExceptionErrorRecord(error_text=str(escaped), call=call),
-        request=None,
-        provider_attempts=provider_attempts,
+        record=EscapedExceptionErrorRecord(
+            error_text=str(escaped), request_history=request_history
+        ),
+        request_params=None,
+        request_provider_data=request_provider_data,
     )

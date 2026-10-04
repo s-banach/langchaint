@@ -1,4 +1,4 @@
-"""The retry decision after one failed attempt, over constructed failures and verdicts."""
+"""The retry decision after one failed request, over constructed failures and verdicts."""
 
 from typing import NamedTuple
 

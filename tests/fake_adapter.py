@@ -22,20 +22,20 @@ from langchaint import (
 )
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     BoundAdapter,
     DoNotRetry,
     ErrorClassification,
-    InvalidRequest,
     MaxCompletionTokensExceeded,
     ProviderBilling,
     Refusal,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
     TransientError,
+    UsableResponse,
     Verdict,
     verdict_from_transient_error,
 )
@@ -122,23 +122,23 @@ def billed(outcome: ResponseOutcome[str]) -> ScriptedResponse:
     return ScriptedResponse(outcome=outcome, usage=USAGE_BILLED)
 
 
-REJECTED_TURN: AssistantMessage = AssistantMessage(
-    turn=(TextPart(text="what the rejected 200 carried"),)
+REJECTED_ASSISTANT_MESSAGE: AssistantMessage = AssistantMessage(
+    parts=(TextPart(text="what the rejected 200 carried"),)
 )
-"""The turn a 200 that produced no output still carried, which every such variant takes."""
+"""The assistant message a 200 that produced no output still carried, which every such variant takes."""
 
 
-REFUSAL: Refusal = Refusal(assistant_message=REJECTED_TURN)
+REFUSAL: Refusal = Refusal(assistant_message=REJECTED_ASSISTANT_MESSAGE)
 MAX_COMPLETION_TOKENS_EXCEEDED: MaxCompletionTokensExceeded = MaxCompletionTokensExceeded(
-    assistant_message=REJECTED_TURN
+    assistant_message=REJECTED_ASSISTANT_MESSAGE
 )
 
 
-def success_result(content: str) -> AdapterResult[str]:
-    """Build a successful text AdapterResult carrying the given content."""
-    return AdapterResult(
+def usable_text_response(content: str) -> UsableResponse[str]:
+    """Build a text UsableResponse carrying the given content."""
+    return UsableResponse(
         output=content,
-        assistant_message=AssistantMessage(turn=(TextPart(text=content),)),
+        assistant_message=AssistantMessage(parts=(TextPart(text=content),)),
         stop_reason="end_turn",
     )
 
@@ -150,7 +150,7 @@ class FakeStream(AdapterStream):
     """Provide fixed stream items and an assembled response."""
 
     def __init__(self, *, outcome: ResponseOutcome[str] | None = None) -> None:
-        """Script the assembled outcome, defaulting to a success whose output is "ab"."""
+        """Script the assembled outcome, defaulting to a usable response whose output is "ab"."""
         self.closed: bool = False
         self.raw: FakeRawResponse = FakeRawResponse(id="fake-final")
         self._usage_reported: Usage | None = None
@@ -170,10 +170,10 @@ class FakeStream(AdapterStream):
         return "req-fake-stream"
 
     def scripted_response(self) -> ScriptedResponse:
-        """Return the assembled result the SDK would produce, and what the stream billed."""
+        """Return the assembled response the SDK would produce, and what the stream billed."""
         if self._outcome is not None:
             return billed(self._outcome)
-        return ScriptedResponse(outcome=success_result("ab"), usage=USAGE_STREAM)
+        return ScriptedResponse(outcome=usable_text_response("ab"), usage=USAGE_STREAM)
 
     @override
     async def items(self) -> AsyncIterator[StreamItem]:
@@ -205,15 +205,15 @@ class HangsAfterFirstItemStream(FakeStream):
         await asyncio.Event().wait()
 
 
-type ScriptedAttempt = Exception | ScriptedResponse
+type ScriptedRequest = Exception | ScriptedResponse
 """One open_stream exception or assembled response."""
 
 
-class ScriptedAttemptStream(FakeStream):
+class ScriptedRequestStream(FakeStream):
     """Stream one scripted response.
 
-    Each attempt has a fresh raw response and request ID.
-    A success yields its content and FAKE_TOOL_CALL.
+    Each request has a fresh raw response and request ID.
+    A stream with content yields it and FAKE_TOOL_CALL.
     """
 
     def __init__(self, *, raw: FakeRawResponse, content: str | None) -> None:
@@ -235,8 +235,8 @@ class ScriptedAttemptStream(FakeStream):
 
 
 @dataclass(frozen=True, kw_only=True)
-class FakeRequest(RequestParams):
-    """Store messages for a fake request."""
+class FakeRequestParams(RequestParams):
+    """Store messages for fake request params."""
 
     messages: tuple[Message, ...]
 
@@ -246,15 +246,15 @@ class FakeRequest(RequestParams):
         return json.dumps([message.model_dump(mode="json") for message in self.messages])
 
 
-def as_fake_request(request: RequestParams) -> FakeRequest:
-    """Narrow a request to the fake one.
+def as_fake_request_params(request_params: RequestParams) -> FakeRequestParams:
+    """Narrow request params to the fake ones.
 
     Raises:
-        TypeError: request is not a FakeRequest, which the real adapters raise for the same reason.
+        TypeError: request_params is not a FakeRequestParams, which the real adapters raise for the same reason.
     """
-    if not isinstance(request, FakeRequest):
-        raise TypeError(f"expected a FakeRequest, got {type(request).__name__}")
-    return request
+    if not isinstance(request_params, FakeRequestParams):
+        raise TypeError(f"expected a FakeRequestParams, got {type(request_params).__name__}")
+    return request_params
 
 
 class FakeBoundAdapter(BoundAdapter[str]):
@@ -266,11 +266,11 @@ class FakeBoundAdapter(BoundAdapter[str]):
     def __init__(self, adapter: "FakeAdapter") -> None:
         """Copy the adapter's scripts so this binding consumes them independently."""
         self._adapter = adapter
-        self._scripted_attempts = list(adapter.scripted_attempts)
+        self._scripted_requests = list(adapter.scripted_requests)
         self._invalid_requests = list(adapter.invalid_requests)
         self._scripted_by_raw_id: dict[str, ScriptedResponse] = {}
         self.final_raws: list[FakeRawResponse] = []
-        """The raw response of every attempt stream this binding built, in order."""
+        """The raw response of every request stream this binding built, in order."""
         self.build_count: int = 0
         self.open_count: int = 0
         self.hang_reached: asyncio.Event = asyncio.Event()
@@ -297,31 +297,31 @@ class FakeBoundAdapter(BoundAdapter[str]):
         return self._scripted_by_raw_id[as_fake_raw(raw).id].outcome
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Report the scripted refusal, else carry messages into the request."""
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+        """Report the scripted refusal, else carry messages into the request params."""
         if self._invalid_requests:
             return self._invalid_requests.pop(0)
         self.build_count += 1
-        return FakeRequest(messages=tuple(messages))
+        return FakeRequestParams(messages=tuple(messages))
 
-    def _attempt_stream(
+    def _request_stream(
         self, scripted_response: ScriptedResponse, *, content: str | None
-    ) -> ScriptedAttemptStream:
-        """Register the scripted response under a fresh raw and wrap it in this attempt's stream."""
+    ) -> ScriptedRequestStream:
+        """Register the scripted response under a fresh raw and wrap it in this request's stream."""
         raw = FakeRawResponse(id=f"fake-response-{self.open_count}")
         self._scripted_by_raw_id[raw.id] = scripted_response
         self.final_raws.append(raw)
-        return ScriptedAttemptStream(raw=raw, content=content)
+        return ScriptedRequestStream(raw=raw, content=content)
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
-        """Count the attempt, suspend, then raise or return the next scripted attempt's stream.
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
+        """Count the request, suspend, then raise or return the next scripted request's stream.
 
         Raises:
-            TypeError: request is not a FakeRequest.
+            TypeError: request_params is not a FakeRequestParams.
             Exception: the next scripted failure.
         """
-        messages = as_fake_request(request).messages
+        messages = as_fake_request_params(request_params).messages
         self.open_count += 1
         open_call = self.open_count
         adapter = self._adapter
@@ -332,11 +332,11 @@ class FakeBoundAdapter(BoundAdapter[str]):
             await asyncio.Event().wait()
         if adapter.open_seconds:
             await asyncio.sleep(adapter.open_seconds)
-        if self._scripted_attempts:
-            scripted_attempt = self._scripted_attempts.pop(0)
-            if isinstance(scripted_attempt, Exception):
-                raise scripted_attempt
-            return self._attempt_stream(scripted_attempt, content=None)
+        if self._scripted_requests:
+            scripted_request = self._scripted_requests.pop(0)
+            if isinstance(scripted_request, Exception):
+                raise scripted_request
+            return self._request_stream(scripted_request, content=None)
         if adapter.stream is not None:
             stream = adapter.stream
             self._scripted_by_raw_id[stream.raw.id] = stream.scripted_response()
@@ -347,8 +347,8 @@ class FakeBoundAdapter(BoundAdapter[str]):
             if adapter.echo and first.kind == "user" and isinstance(first.content, str)
             else "ok"
         )
-        return self._attempt_stream(
-            ScriptedResponse(outcome=success_result(content), usage=USAGE), content=content
+        return self._request_stream(
+            ScriptedResponse(outcome=usable_text_response(content), usage=USAGE), content=content
         )
 
 
@@ -375,12 +375,12 @@ class FakeStructuredBoundAdapter[ModelT: BaseModel](BoundAdapter[ModelT]):
         raise NotImplementedError
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams:
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams:
         """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Unreachable: response_format replacement tests do not generate."""
         raise NotImplementedError
 
@@ -395,7 +395,7 @@ class RequestIdError(RuntimeError):
 
 
 class TransientRequestIdError(TransientError):
-    """The same id, on the class an adapter raises to retry an attempt without going through classify."""
+    """The same id, on the class an adapter raises to retry a request without going through classify."""
 
     def __init__(self, message: str, request_id: str) -> None:
         """Store the message and the request id."""
@@ -412,8 +412,8 @@ class FakeAdapter(Adapter):
     def __init__(
         self,
         *,
-        scripted_attempts: Sequence[ScriptedAttempt] = (),
-        invalid_requests: Sequence[InvalidRequest] = (),
+        scripted_requests: Sequence[ScriptedRequest] = (),
+        invalid_requests: Sequence[RefusedMessages] = (),
         echo: bool = False,
         stream: FakeStream | None = None,
         classify_result: ErrorClassification = "unknown_exception",
@@ -427,11 +427,11 @@ class FakeAdapter(Adapter):
 
         From call number open_barrier_from_call on, open_stream first waits at open_barrier.
         From call number hang_from_open on, it then suspends until cancelled.
-        It then sleeps open_seconds, and raises or streams the next of scripted_attempts.
+        It then sleeps open_seconds, and raises or streams the next of scripted_requests.
         With none left, it returns stream.
-        Without a stream, it streams a success whose output is "ok".
+        Without a stream, it streams a usable response whose output is "ok".
         With echo set and a first message that is a user message with str content, the output is that content.
-        build_request returns the next of invalid_requests while any remain.
+        build_request_params returns the next of invalid_requests while any remain.
         """
         # This adapter reaches no SDK, so it passes client=None.
         # The empty provider_name_by_client_class preserves the stated "fake" provider_name.
@@ -441,8 +441,8 @@ class FakeAdapter(Adapter):
             provider_name="fake",
             automatic_cache_breakpoints_default=automatic_cache_breakpoints_default,
         )
-        self.scripted_attempts: Sequence[ScriptedAttempt] = scripted_attempts
-        self.invalid_requests: Sequence[InvalidRequest] = invalid_requests
+        self.scripted_requests: Sequence[ScriptedRequest] = scripted_requests
+        self.invalid_requests: Sequence[RefusedMessages] = invalid_requests
         self.echo: bool = echo
         self.stream: FakeStream | None = stream
         self.open_seconds: float = open_seconds
@@ -494,7 +494,7 @@ class FakeAdapter(Adapter):
 
 
 SIBLING_OPEN_YIELDS = 100
-"""Event loop turns, far more than an unblocked sibling generation needs to reach open_stream."""
+"""Event loop iterations, far more than an unblocked sibling generation needs to reach open_stream."""
 
 
 async def assert_the_first_open_runs_alone(
@@ -503,7 +503,7 @@ async def assert_the_first_open_runs_alone(
     """Hold the first open at opens_pair_up, assert that no sibling opens meanwhile, then release it.
 
     adapter's open_barrier must be opens_pair_up with two parties, so later opens release each other.
-    A batch that starts its siblings with the first item opens a second request within SIBLING_OPEN_YIELDS turns.
+    A batch that starts its siblings with the first item opens a second request within SIBLING_OPEN_YIELDS iterations.
     """
     bound_adapter = adapter.bound_adapters[0]
     await yield_until(lambda: opens_pair_up.n_waiting == 1)

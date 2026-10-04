@@ -22,24 +22,25 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
     LLM,
-    AbandonedCallRecord,
+    AbandonedStreamRecord,
     AssistantMessage,
+    AssistantPart,
     AudioPart,
     BoundLLM,
-    CallResult,
     ContentPart,
     DispatchHandled,
     DispatchInvalidToolArgs,
     DispatchOutcome,
     DispatchUnknownTool,
-    GenerateResult,
+    Generation,
     GenerationError,
+    GenerationOutcome,
+    GenerationWithoutToolCalls,
     ImagePart,
     ImageUrlPart,
     JSONSchemaTool,
     PydanticTool,
     ReasoningPart,
-    Response,
     StreamHandle,
     StreamItem,
     TextPart,
@@ -47,17 +48,16 @@ from langchaint import (
     ToolManager,
     ToolMessage,
     ToolOutputExplicit,
-    TurnPart,
     UserMessage,
     to_tables,
 )
 from langchaint.adapter import (
-    AdapterResult,
     AdapterStream,
-    InvalidRequest,
     Refusal,
+    RefusedMessages,
     RequestParams,
     TransientError,
+    UsableResponse,
 )
 from langchaint.common.messages import StopReason
 from langchaint.span_parsing import generation_input_from_otel, parse_otel
@@ -76,7 +76,7 @@ from scripts import refresh_semconv_genai
 from tests.fake_adapter import (
     MAX_COMPLETION_TOKENS_EXCEEDED,
     REFUSAL,
-    REJECTED_TURN,
+    REJECTED_ASSISTANT_MESSAGE,
     USAGE,
     FakeAdapter,
     FakeBoundAdapter,
@@ -138,16 +138,16 @@ def _traced(
     return llm, exporter
 
 
-type _CallPath = Literal["generate", "stream"]
+type _GenerationPath = Literal["generate", "stream"]
 
 
 async def _generate_through[ToolManagerT: ToolManager | None](
-    path: _CallPath, bound_llm: BoundLLM[str, ToolManagerT]
-) -> GenerateResult[str]:
-    """Run one call through `generate_one`, or through `stream_one` drained before its `final()`.
+    path: _GenerationPath, bound_llm: BoundLLM[str, ToolManagerT]
+) -> Generation[str]:
+    """Run one input through `generate_one`, or through `stream_one` drained before its `final()`.
 
     Raises:
-        GenerationError: the call ends in a terminal failure.
+        GenerationError: the input ends in a terminal failure.
     """
     if path == "generate":
         return await bound_llm.generate_one("hi")
@@ -192,18 +192,18 @@ class _MidFailStream(FakeStream):
         raise ValueError("mid-stream boom")
 
 
-def test_generate_one_success_produces_one_fully_attributed_span() -> None:
-    """A success emits one CLIENT span named "chat {model}", OK status, and every gen_ai attribute.
+def test_generate_one_generation_produces_one_fully_attributed_span() -> None:
+    """A generation emits one CLIENT span named "chat {model}", OK status, and every gen_ai attribute.
 
     Capture is off, so the bound system prompt and tools leave no content attribute on the span.
     """
 
     async def scenario() -> None:
-        """Drive one generate_one to success and inspect the single finished span."""
+        """Drive one generate_one to a generation and inspect the single finished span."""
         llm, exporter = _traced(FakeAdapter(echo=True))
         bound = llm.bind(system_prompt="be brief", tools=ToolManager([_echo_tool()]))
         result = await bound.generate_one("hi")
-        assert result.kind == "response"
+        assert result.kind == "without_tool_calls"
         assert result.output == "hi"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
@@ -222,7 +222,7 @@ def test_generate_one_success_produces_one_fully_attributed_span() -> None:
             "gen_ai.usage.reasoning.output_tokens": USAGE.output_tokens_reasoning,
             "gen_ai.usage.cache_read.input_tokens": USAGE.input_tokens_cache_read,
             "gen_ai.usage.cache_write.input_tokens": USAGE.input_tokens_cache_write,
-            "langchaint.attempts": 1,
+            "langchaint.request_count": 1,
             "langchaint.cost_in_usd": 0.0,
         }
 
@@ -238,14 +238,14 @@ class _CurrentSpanRecordingBoundAdapter(FakeBoundAdapter):
         self.spans_current_at_open: list[trace.Span] = []
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Record the current span, then open as FakeBoundAdapter does.
 
         Raises:
             Exception: whatever FakeBoundAdapter.open_stream raises.
         """
         self.spans_current_at_open.append(trace.get_current_span())
-        return await super().open_stream(request)
+        return await super().open_stream(request_params)
 
 
 class _CurrentSpanRecordingAdapter(FakeAdapter):
@@ -256,7 +256,7 @@ class _CurrentSpanRecordingAdapter(FakeAdapter):
 
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
-    path: _CallPath,
+    path: _GenerationPath,
 ) -> None:
     """generate_one makes its chat span current, so spans that adapter and SDK code starts nest under it.
 
@@ -264,7 +264,7 @@ def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
     """
 
     async def scenario() -> None:
-        """Run the call and compare the span current at open with the finished chat span."""
+        """Run the input and compare the span current at open with the finished chat span."""
         adapter = _CurrentSpanRecordingAdapter()
         llm, exporter = _traced(adapter)
         await _generate_through(path, llm.bind())
@@ -282,15 +282,15 @@ def test_the_chat_span_is_current_during_generate_one_and_never_during_a_stream(
 
 
 class _TerminalCase(NamedTuple):
-    """One call that ends in GenerationError, and what its span must record."""
+    """One input that ends in GenerationError, and what its span must record."""
 
     adapter: Callable[[], FakeAdapter]
     error_type: str
     status_description: str | None
     finish_reasons: tuple[str, ...] | None
-    """The finish reasons of the 200 that ended the call, or None where no attempt reached a 200."""
-    attempts: int
-    attempt_failed_events: int
+    """The finish reasons of the 200 that ended the input, or None where no request reached a 200."""
+    request_count: int
+    request_failed_events: int
 
 
 @pytest.mark.parametrize(
@@ -301,63 +301,65 @@ class _TerminalCase(NamedTuple):
             error_type="refusal_error",
             status_description=None,
             finish_reasons=("refusal",),
-            attempts=1,
-            attempt_failed_events=0,
+            request_count=1,
+            request_failed_events=0,
         ),
         _TerminalCase(
             adapter=lambda: FakeAdapter(stream=FakeStream(outcome=MAX_COMPLETION_TOKENS_EXCEEDED)),
             error_type="max_completion_tokens_exceeded_error",
             status_description=None,
             finish_reasons=("length",),
-            attempts=1,
-            attempt_failed_events=0,
+            request_count=1,
+            request_failed_events=0,
         ),
         _TerminalCase(
             adapter=lambda: FakeAdapter(
-                scripted_attempts=[TransientError("connection reset")] * 2
+                scripted_requests=[TransientError("connection reset")] * 2
             ),
             error_type="retries_exhausted_error",
-            status_description="attempt 1: connection reset\nattempt 2: connection reset",
+            status_description="request 1: connection reset\nrequest 2: connection reset",
             finish_reasons=None,
-            attempts=2,
-            attempt_failed_events=2,
+            request_count=2,
+            request_failed_events=2,
         ),
         _TerminalCase(
-            adapter=lambda: FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")]),
-            error_type="invalid_request_error",
+            adapter=lambda: FakeAdapter(
+                invalid_requests=[RefusedMessages(reason="misconfigured")]
+            ),
+            error_type="rejected_error",
             status_description="misconfigured",
             finish_reasons=None,
-            attempts=0,
-            attempt_failed_events=0,
+            request_count=0,
+            request_failed_events=0,
         ),
     ],
     ids=["refusal", "max_completion_tokens_exceeded", "retries_exhausted", "invalid_request"],
 )
 @pytest.mark.parametrize("path", ["generate", "stream"])
-def test_a_generation_error_ends_the_span_with_error_status_and_the_calls_attributes(
-    path: _CallPath, case: _TerminalCase
+def test_a_generation_error_ends_the_span_with_error_status_and_the_inputs_attributes(
+    path: _GenerationPath, case: _TerminalCase
 ) -> None:
-    """A GenerationError ends the span with error status, error.type, and the call's billing.
+    """A GenerationError ends the span with error status, error.type, and the input's billing.
 
-    A 200 that ended the call contributes its real tokens, cost, finish reason, and turn.
-    A call that reached no 200 records zero usage and no finish reason, response model, or output.
+    A 200 that ended the input contributes its real tokens, cost, finish reason, and assistant message.
+    An input that reached no 200 records zero usage and no finish reason, response model, or output.
     The input attributes set at span start stay on the span.
     """
 
     async def scenario() -> None:
-        """Drive the call under capture and inspect the error span."""
+        """Drive the input under capture and inspect the error span."""
         llm, exporter = _traced(case.adapter(), capture_message_content=True)
         with pytest.raises(GenerationError):
-            await _generate_through(path, llm.bind(system_prompt="be brief", max_attempts=2))
+            await _generate_through(path, llm.bind(system_prompt="be brief", max_requests=2))
         (span,) = exporter.get_finished_spans()
         assert span.status.status_code == StatusCode.ERROR
         assert span.status.description == case.status_description
         assert span.attributes is not None
         assert span.attributes["error.type"] == case.error_type
-        assert span.attributes["langchaint.attempts"] == case.attempts
+        assert span.attributes["langchaint.request_count"] == case.request_count
         assert [event.name for event in span.events] == [
-            "langchaint.attempt_failed"
-        ] * case.attempt_failed_events
+            "langchaint.request_failed"
+        ] * case.request_failed_events
         assert _json_attribute(span, "gen_ai.input.messages") == [
             {"role": "user", "parts": [{"type": "text", "content": "hi"}]}
         ]
@@ -393,7 +395,7 @@ async def _drain_by_iterating(handle: StreamHandle[str]) -> None:
 
 
 async def _drain_by_final(handle: StreamHandle[str]) -> None:
-    """Ask final() for the Response, never iterating."""
+    """Ask final() for the Generation, never iterating."""
     await handle.final()
 
 
@@ -441,17 +443,17 @@ def test_a_cancelled_traced_batch_ends_every_started_items_span() -> None:
     run_with_timeout(scenario())
 
 
-def test_retry_surfaces_as_an_attempt_failed_span_event() -> None:
-    """A recovered transient failure becomes one langchaint.attempt_failed event on the success span."""
+def test_retry_surfaces_as_a_request_failed_span_event() -> None:
+    """A recovered transient failure becomes one langchaint.request_failed event on the generation's span."""
 
     async def scenario() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
-        llm, exporter = _traced(FakeAdapter(scripted_attempts=[TransientError("boom")]))
-        response = await llm.bind().generate_one("hi")
-        assert response.attempts == 2
+        llm, exporter = _traced(FakeAdapter(scripted_requests=[TransientError("boom")]))
+        generation = await llm.bind().generate_one("hi")
+        assert generation.request_count == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
-        assert event.name == "langchaint.attempt_failed"
+        assert event.name == "langchaint.request_failed"
         assert event.attributes is not None
         assert event.attributes["error_text"] == "boom"
 
@@ -463,7 +465,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
 
     async def scenario() -> None:
         """Serialize a three-item batch whose first item is Refusal, then inspect the spans."""
-        adapter = FakeAdapter(echo=True, scripted_attempts=[billed(REFUSAL)])
+        adapter = FakeAdapter(echo=True, scripted_requests=[billed(REFUSAL)])
         llm, exporter = _traced(adapter, max_concurrent_requests=1)
         results = await llm.bind().generate_many([
             [UserMessage(content="a")],
@@ -472,7 +474,7 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
         ])
         first, *rest = results
         assert isinstance(first, GenerationError)
-        assert all(result.kind == "response" for result in rest)
+        assert all(result.kind == "without_tool_calls" for result in rest)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -488,16 +490,16 @@ def test_generate_many_emits_one_chat_span_per_item_and_none_for_the_batch() -> 
     run_with_timeout(scenario())
 
 
-def test_generate_many_maps_and_captures_each_item_from_its_own_result() -> None:
-    """Each item's span carries that item's mapped result and generation_input, never the batch's."""
+def test_generate_many_maps_and_captures_each_item_from_its_own_outcome() -> None:
+    """Each item's span carries that item's mapped outcome and generation_input, never the batch's."""
 
     async def scenario() -> None:
         """Run a serialized two-item batch under a recording mapper and capture."""
         mapped_outputs: list[object] = []
 
-        def _mapper(result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
-            """Record the result mapped and emit it as an attribute."""
-            output = result.output if result.kind == "response" else None
+        def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
+            """Record the mapped outcome and emit it as an attribute."""
+            output = outcome.output if outcome.kind == "without_tool_calls" else None
             mapped_outputs.append(output)
             return {"custom.mapped_output": str(output)}
 
@@ -508,7 +510,10 @@ def test_generate_many_maps_and_captures_each_item_from_its_own_result() -> None
             max_concurrent_requests=1,
         )
         results = await llm.bind().generate_many(["a", "b"])
-        assert [result.output for result in results if result.kind == "response"] == ["a", "b"]
+        assert [result.output for result in results if result.kind == "without_tool_calls"] == [
+            "a",
+            "b",
+        ]
         assert mapped_outputs == ["a", "b"]
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
@@ -544,7 +549,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             sample_ids=["sample-a", "sample-b"],
         )
-        assert all(record.kind == "response" for record in first)
+        assert all(record.kind == "without_tool_calls" for record in first)
         assert len(exporter.get_finished_spans()) == 2
 
         resumed = await bound.generate_many_records(
@@ -552,7 +557,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
             resume_path=resume_path,
             sample_ids=["sample-b", "sample-c", "sample-a"],
         )
-        assert all(record.kind == "response" for record in resumed)
+        assert all(record.kind == "without_tool_calls" for record in resumed)
         spans = exporter.get_finished_spans()
         assert len(spans) == 3
         assert all(span.kind == SpanKind.CLIENT for span in spans)
@@ -564,7 +569,7 @@ def test_generate_many_records_traces_generated_items_and_skips_reused_items(
 def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -> None:
     """A drained stream ends exactly one span carrying time_to_first_chunk.
 
-    A second final() returns the same Response and ends no second span.
+    A second final() returns the same Generation and ends no second span.
     """
 
     async def scenario() -> None:
@@ -572,10 +577,10 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
         llm, exporter = _traced(FakeAdapter())
         async with llm.bind().stream_one("hi") as stream:
             texts = [item async for item in stream if isinstance(item, str)]
-            response = await stream.final()
-            assert await stream.final() is response
+            generation = await stream.final()
+            assert await stream.final() is generation
         assert "".join(texts) == "ok"
-        assert response.output == "ok"
+        assert generation.output == "ok"
         (span,) = exporter.get_finished_spans()
         assert span.name == "chat fake-model"
         assert span.kind == SpanKind.CLIENT
@@ -590,21 +595,21 @@ def test_stream_exhausted_then_final_emits_one_span_with_time_to_first_chunk() -
     run_with_timeout(scenario())
 
 
-@pytest.mark.parametrize("block_exit", ["break", "another_calls_generation_error"])
-def test_a_stream_block_left_after_its_first_item_reports_the_stream_call_with_status_unset(
-    block_exit: Literal["break", "another_calls_generation_error"],
+@pytest.mark.parametrize("block_exit", ["break", "another_inputs_generation_error"])
+def test_a_stream_block_left_after_its_first_item_reports_the_stream_input_with_status_unset(
+    block_exit: Literal["break", "another_inputs_generation_error"],
 ) -> None:
-    """Leaving the block early is no failure of the stream's call, which still reports its first chunk.
+    """Leaving the block early is no failure of the stream's input, which still reports its first chunk.
 
-    A GenerationError from another call that escapes the block belongs to the application.
-    The stream span reports its own call, never the other call's status or error.type.
+    A GenerationError from another input that escapes the block belongs to the application.
+    The stream span reports its own input, never the other input's status or error.type.
     """
 
     async def scenario() -> None:
         """Pull one item, leave the block as `block_exit` names, then read the stream span."""
         llm, exporter = _traced(FakeAdapter())
         other_llm = LLM(
-            FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")]),
+            FakeAdapter(invalid_requests=[RefusedMessages(reason="misconfigured")]),
             shared_backoff=fast_shared_backoff(),
         )
 
@@ -612,14 +617,14 @@ def test_a_stream_block_left_after_its_first_item_reports_the_stream_call_with_s
             """Pull one item, then leave the block.
 
             Raises:
-                GenerationError: `block_exit` runs the other call, whose request is invalid.
+                GenerationError: `block_exit` runs the other input, whose request params are invalid.
             """
             async with llm.bind().stream_one("hi") as stream:
                 _ = await anext(stream)
-                if block_exit == "another_calls_generation_error":
+                if block_exit == "another_inputs_generation_error":
                     await other_llm.bind().generate_one("hi")
 
-        if block_exit == "another_calls_generation_error":
+        if block_exit == "another_inputs_generation_error":
             with pytest.raises(GenerationError):
                 await leave_after_the_first_item()
         else:
@@ -628,7 +633,7 @@ def test_a_stream_block_left_after_its_first_item_reports_the_stream_call_with_s
         assert span.status.status_code == StatusCode.UNSET
         assert span.attributes is not None
         assert "error.type" not in span.attributes
-        assert span.attributes["langchaint.attempts"] == 1
+        assert span.attributes["langchaint.request_count"] == 1
         assert "gen_ai.response.time_to_first_chunk" in span.attributes
 
     run_with_timeout(scenario())
@@ -666,7 +671,7 @@ def test_stream_never_entered_emits_no_span() -> None:
 
 
 def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_error() -> None:
-    """A stream failure records GenerationError and attempt_failed."""
+    """A stream failure records GenerationError and langchaint.request_failed."""
 
     async def _drain(llm: LLM) -> None:
         """Iterate the mid-failing stream to its raise inside an async with block."""
@@ -683,7 +688,7 @@ def test_stream_failing_mid_iteration_ends_its_span_like_any_other_generation_er
         assert span.status.status_code == StatusCode.ERROR
         assert span.attributes is not None
         assert span.attributes["error.type"] == "retry_unavailable_error"
-        assert [event.name for event in span.events] == ["langchaint.attempt_failed"]
+        assert [event.name for event in span.events] == ["langchaint.request_failed"]
 
     run_with_timeout(scenario())
 
@@ -704,10 +709,10 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
     response_format: type[_Answer] | None,
     output_type: str,
 ) -> None:
-    """Request attributes describe text, structured, and streaming calls."""
+    """Request attributes describe text, structured, and streaming inputs."""
 
     async def scenario() -> None:
-        """Run the selected call and inspect its request attributes."""
+        """Run the selected input and inspect its request attributes."""
         llm, exporter = _traced(FakeAdapter(echo=True))
         bound = llm.bind(
             response_format=response_format,
@@ -743,14 +748,16 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
 
 
 @pytest.mark.parametrize("path", ["generate", "stream"])
-def test_span_parsing_reads_every_convention_attribute_a_chat_span_writes(path: _CallPath) -> None:
+def test_span_parsing_reads_every_convention_attribute_a_chat_span_writes(
+    path: _GenerationPath,
+) -> None:
     """`parse_otel` reads each key of a captured chat span into a field, except the langchaint keys.
 
     The usage counters read back unchanged.
     """
 
     async def scenario() -> None:
-        """Run one fully configured call and parse its span's exported attributes."""
+        """Run one fully configured input and parse its span's exported attributes."""
         llm, exporter = _traced(FakeAdapter(echo=True), capture_message_content=True)
         bound = llm.bind(
             system_prompt="be brief",
@@ -782,7 +789,7 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
         """Generate under a no-op tracer and assert the mapper never ran."""
         calls: list[int] = []
 
-        def _mapper(_result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
+        def _mapper(_outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
             """Count each invocation."""
             calls.append(1)
             return {}
@@ -796,14 +803,14 @@ def test_mapper_not_invoked_on_a_non_recording_span() -> None:
                 capture_message_content=False,
             ),
         )
-        response = await llm.bind().generate_one("hi")
-        assert response.output == "ok"
+        generation = await llm.bind().generate_one("hi")
+        assert generation.output == "ok"
         assert calls == []
 
     run_with_timeout(scenario())
 
 
-def _raising_mapper(_result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
+def _raising_mapper(_outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
     """Raise to simulate a buggy user mapper.
 
     Raises:
@@ -813,13 +820,13 @@ def _raising_mapper(_result: CallResult[object] | AbandonedCallRecord) -> SpanAt
 
 
 @pytest.mark.parametrize("path", ["generate", "stream"])
-def test_raising_mapper_is_caught_and_the_result_survives(
-    path: _CallPath, caplog: pytest.LogCaptureFixture
+def test_raising_mapper_is_caught_and_the_generation_survives(
+    path: _GenerationPath, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A raising mapper is logged, the call still returns its Response, and the span still ends."""
+    """A raising mapper is logged, the input still returns its Generation, and the span still ends."""
 
     async def scenario() -> None:
-        """Run the call under a mapper that raises and confirm the result and span survive."""
+        """Run the input under a mapper that raises and confirm the generation and span survive."""
         llm, exporter = _traced(FakeAdapter(), attribute_mapper=_raising_mapper)
         with caplog.at_level(logging.WARNING, logger="langchaint.tracing"):
             response = await _generate_through(path, llm.bind())
@@ -831,16 +838,18 @@ def test_raising_mapper_is_caught_and_the_result_survives(
     run_with_timeout(scenario())
 
 
-def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> SpanAttributes:
-    """Pin the mapper covariance: a Response[_Answer] must satisfy the Response[object] parameter.
+def _covariance_pin(
+    mapper: AttributeMapper, generation: GenerationWithoutToolCalls[_Answer]
+) -> SpanAttributes:
+    """Pin that a GenerationWithoutToolCalls[_Answer] satisfies the mapper's GenerationOutcome[object] parameter.
 
-    pyrefly checks Response OutputT covariance at the call below.
+    pyrefly checks the OutputT covariance at the call below.
     """
-    return mapper(response)
+    return mapper(generation)
 
 
 def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
-    """A custom mapper replaces the default result attributes on generate, stream, and batch item spans.
+    """A custom mapper replaces the default outcome attributes on generate, stream, and batch item spans.
 
     A replacement binding keeps the observer.
     A mapper key of the same name as an extra wins at completion.
@@ -851,10 +860,10 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
         """Generate, stream, and batch on a replacement binding, then read every span."""
         mapped_models: list[str] = []
 
-        def _mapper(result: CallResult[object] | AbandonedCallRecord) -> SpanAttributes:
-            """Record the call and emit one attribute from the result and one colliding with an extra."""
-            mapped_models.append(result.model)
-            return {"custom.model": result.model, "shared.key": "mapped"}
+        def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
+            """Record the outcome and emit one attribute from it and one colliding with an extra."""
+            mapped_models.append(outcome.model)
+            return {"custom.model": outcome.model, "shared.key": "mapped"}
 
         llm, exporter = _traced(
             FakeAdapter(echo=True),
@@ -1268,7 +1277,7 @@ def test_refresh_removes_an_obsolete_file_and_rewrites_source_doc(
 
 
 def test_capture_on_records_all_four_content_attributes_in_convention_shape() -> None:
-    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant turn.
+    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant message.
 
     Capture carries over to a replacement binding.
     """
@@ -1282,7 +1291,9 @@ def test_capture_on_records_all_four_content_attributes_in_convention_shape() ->
         )
         await bound.generate_one([
             UserMessage(content="look it up"),
-            AssistantMessage(turn=(ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),)),
+            AssistantMessage(
+                parts=(ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),)
+            ),
             ToolMessage(tool_call_id="call1", content="x"),
         ])
         assert _captured(exporter, "gen_ai.system_instructions") == [
@@ -1344,7 +1355,9 @@ _MULTIMODAL_USER_MESSAGE = UserMessage(
 """One user message holding every ContentPart variant."""
 
 
-def _drop_binary(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+def _drop_binary(
+    _name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart | None:
     """Keep every part except inline bytes, the filter the OtelObserver docstring shows."""
     return None if part.kind in ("image", "audio") else part
 
@@ -1439,7 +1452,9 @@ _MARKER = "SECRET-MARKER"
 """The text a scrubbing filter must remove from every content attribute."""
 
 
-def _scrub_marker(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart | None:
+def _scrub_marker(
+    _name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart | None:
     """Replace _MARKER in every text-carrying part and keep the rest unchanged."""
     match part.kind:
         case "text":
@@ -1464,8 +1479,8 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
     async def scenario() -> None:
         """Generate and dispatch under _scrub_marker, then scan every content attribute on both spans."""
         tracer_provider, exporter = _in_memory_tracer_provider()
-        scripted_turn = AssistantMessage(
-            turn=(
+        scripted_assistant_message = AssistantMessage(
+            parts=(
                 ReasoningPart(raw={"signature": "opaque"}, text=f"thinking {_MARKER}"),
                 TextPart(text=f"answer {_MARKER}"),
             )
@@ -1477,11 +1492,11 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         )
         llm = LLM(
             FakeAdapter(
-                scripted_attempts=[
+                scripted_requests=[
                     ScriptedResponse(
-                        outcome=AdapterResult(
+                        outcome=UsableResponse(
                             output="answer",
-                            assistant_message=scripted_turn,
+                            assistant_message=scripted_assistant_message,
                             stop_reason="end_turn",
                         ),
                         usage=USAGE,
@@ -1494,7 +1509,7 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
         tool_call = ToolCall(id="call1", name="echo", args_json=f'{{"text": "{_MARKER}"}}')
         await bound.generate_one([
             UserMessage(content=f"question {_MARKER}"),
-            AssistantMessage(turn=(tool_call,)),
+            AssistantMessage(parts=(tool_call,)),
             ToolMessage(tool_call_id="call1", content=f"echoed {_MARKER}"),
         ])
         tool_manager = ToolManager([_echo_tool()], observer=observer)
@@ -1514,8 +1529,8 @@ def test_a_scrubbing_filter_reaches_every_content_attribute(
 
 
 def _drop_system_instructions(
-    name: str, part: ContentPart | TurnPart
-) -> ContentPart | TurnPart | None:
+    name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart | None:
     """Omit every part of the system prompt and keep every other part."""
     return None if name == "gen_ai.system_instructions" else part
 
@@ -1551,7 +1566,9 @@ def test_system_instructions_render_one_element_per_part_and_omit_an_empty_array
     assert "gen_ai.input.messages" in attributes
 
 
-def _raise_on_input_messages(name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
+def _raise_on_input_messages(
+    name: str, part: ContentPart | AssistantPart
+) -> ContentPart | AssistantPart:
     """Raise on every input-message part and keep every other part.
 
     Raises:
@@ -1572,19 +1589,19 @@ def _raise_on_input_messages(name: str, part: ContentPart | TurnPart) -> Content
 )
 @pytest.mark.parametrize("path", ["generate", "stream"])
 def test_a_failure_building_input_content_omits_the_three_input_attributes(
-    path: _CallPath,
+    path: _GenerationPath,
     content_filter: ContentFilter,
     build_tool: Callable[[], PydanticTool[_EchoToolArgs] | JSONSchemaTool],
     logged_error_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The three input keys build as one dict, so one failure drops all three and the call proceeds.
+    """The three input keys build as one dict, so one failure drops all three and the input proceeds.
 
     The failure is logged with its exception, and the output content, usage, and stream timing still reach the span.
     """
 
     async def scenario() -> None:
-        """Run the call with input content that cannot be built, then read the span and the log."""
+        """Run an input whose content cannot be built, then read the span and the log."""
         tracer_provider, exporter = _in_memory_tracer_provider()
         llm = LLM(
             FakeAdapter(),
@@ -1625,7 +1642,9 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
 ) -> None:
     """A TextPart returned for the ToolCall cannot take its place, so the arguments key is omitted."""
 
-    def text_for_tool_call(_name: str, part: ContentPart | TurnPart) -> ContentPart | TurnPart:
+    def text_for_tool_call(
+        _name: str, part: ContentPart | AssistantPart
+    ) -> ContentPart | AssistantPart:
         return TextPart(text="not a tool call") if part.kind == "tool_call" else part
 
     async def scenario() -> None:
@@ -1655,7 +1674,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
 
 
 @pytest.mark.parametrize(
-    ("turn", "stop_reason", "expected_parts", "expected_finish_reason"),
+    ("parts", "stop_reason", "expected_parts", "expected_finish_reason"),
     [
         ((ReasoningPart(raw={"signature": "opaque"}),), "end_turn", [], "stop"),
         (
@@ -1677,7 +1696,7 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
             "stop",
         ),
         (
-            REJECTED_TURN.turn,
+            REJECTED_ASSISTANT_MESSAGE.parts,
             None,
             [{"type": "text", "content": "what the rejected 200 carried"}],
             "error",
@@ -1691,16 +1710,16 @@ def test_a_filter_returning_a_part_of_another_kind_omits_the_attribute(
     ],
 )
 def test_output_messages_render_readable_text_and_never_the_reasoning_payload(
-    turn: tuple[TurnPart, ...],
+    parts: tuple[AssistantPart, ...],
     stop_reason: StopReason | None,
     expected_parts: list[object],
     expected_finish_reason: str,
 ) -> None:
-    """A turn renders its readable text in order, ReasoningPart.raw never, and "error" for no stop reason.
+    """An assistant message renders its readable text in order, ReasoningPart.raw never, and "error" for no stop reason.
 
-    A turn without readable text still renders its message, with an empty parts array.
+    An assistant message without readable text still renders its message, with an empty parts array.
     """
-    attributes = _output_content_attributes(turn, stop_reason, _record_every_part)
+    attributes = _output_content_attributes(parts, stop_reason, _record_every_part)
     output_messages = str(attributes["gen_ai.output.messages"])
     assert json.loads(output_messages) == [
         {"role": "assistant", "parts": expected_parts, "finish_reason": expected_finish_reason}
@@ -1726,7 +1745,7 @@ def test_tool_span_captures_arguments_and_result_under_capture(
     """A dispatch span records the parsed arguments and the tool_message as a tool_call_response part.
 
     Argument text that does not parse is recorded unchanged as a JSON string.
-    The result is recorded on the variants where no tool ran, too.
+    The tool result is recorded on the variants where no tool ran, too.
     """
 
     async def scenario() -> None:
@@ -1780,11 +1799,11 @@ def test_input_tool_calls_nest_parsed_arguments_and_keep_unparseable_text() -> N
     """Input tool calls record parsed objects and malformed text in a payload the schema accepts."""
 
     async def scenario() -> None:
-        """Generate over a turn holding one parseable and one unparseable tool call."""
+        """Generate over an assistant message holding one parseable and one unparseable tool call."""
         llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
         await llm.bind().generate_one([
             AssistantMessage(
-                turn=(
+                parts=(
                     ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),
                     ToolCall(id="call2", name="echo", args_json="{oops"),
                 )
@@ -1813,30 +1832,30 @@ _CONTENT_SENTINEL = "sentinel-string-no-ungated-channel-may-carry"
 
 
 @pytest.mark.parametrize("capture_message_content", [False, True])
-def test_a_failures_turn_reaches_a_span_only_through_the_gated_output_key(
+def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_output_key(
     *, capture_message_content: bool
 ) -> None:
-    """A failed turn reaches spans only through gated gen_ai.output.messages."""
-    turn = AssistantMessage(turn=(TextPart(text=_CONTENT_SENTINEL),))
+    """A failed input's assistant message reaches spans only through gated gen_ai.output.messages."""
+    assistant_message = AssistantMessage(parts=(TextPart(text=_CONTENT_SENTINEL),))
 
     async def scenario() -> None:
-        """Fail two attempts and inspect content channels."""
+        """Fail two requests and inspect content channels."""
         adapter = FakeAdapter(
-            scripted_attempts=[
-                TransientError("the first attempt failed"),
-                billed(Refusal(assistant_message=turn)),
+            scripted_requests=[
+                TransientError("the first request failed"),
+                billed(Refusal(assistant_message=assistant_message)),
             ]
         )
         llm, exporter = _traced(adapter, capture_message_content=capture_message_content)
         with pytest.raises(GenerationError) as raised:
-            await llm.bind(max_attempts=3).generate_one("hi")
+            await llm.bind(max_requests=3).generate_one("hi")
 
         error = raised.value
-        assert error.attempts == 2
+        assert error.request_count == 2
         assert _CONTENT_SENTINEL not in error.error_text
         assert _CONTENT_SENTINEL not in str(error)
-        assert error.assistant_message == turn
-        assert _CONTENT_SENTINEL in str(to_tables(error).attempts[-1]["assistant_message_json"])
+        assert error.assistant_message == assistant_message
+        assert _CONTENT_SENTINEL in str(to_tables(error).requests[-1]["assistant_message_json"])
 
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None

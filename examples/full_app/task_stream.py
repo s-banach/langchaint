@@ -40,8 +40,8 @@ from langchaint import (
     ZERO_USAGE,
     BoundLLM,
     DispatchExceptionGroup,
-    DispatchManyOutcome,
-    GenerateResult,
+    DispatchManyItemOutcome,
+    Generation,
     GenerationError,
     Message,
     PydanticTool,
@@ -58,10 +58,10 @@ from langchaint import (
 
 @dataclass(frozen=True)
 class LlmTurn:
-    """Record one successful generate call."""
+    """Record one `Generation`."""
 
     turn_number: int
-    response: GenerateResult[str]
+    generation: Generation[str]
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ def _spend_of(record: TurnRecord) -> Usage:
     """Return one record's reported Usage."""
     match record:
         case LlmTurn():
-            return record.response.usage
+            return record.generation.usage
         case LlmFailure():
             return record.error.usage
         case ToolTurn():
@@ -260,7 +260,7 @@ class ReActAgent(AgentRun):
                 )
             )
             try:
-                response = await self.bound.generate_one(
+                generation = await self.bound.generate_one(
                     self.messages,
                     timeout_seconds=self.config.generate_one_timeout_seconds,
                 )
@@ -268,7 +268,7 @@ class ReActAgent(AgentRun):
                 self.turn_log.append(LlmFailure(turn_number=self.turn_number, error=error))
                 if error.record.kind != "timed_out_error":
                     raise
-                # The timed-out call leaves self.messages unchanged for the next turn.
+                # The timed-out `generate_one` leaves self.messages unchanged for the next turn.
                 self.on_event(
                     LlmCallAbandoned(
                         agent_path=self.agent_path,
@@ -277,21 +277,21 @@ class ReActAgent(AgentRun):
                     )
                 )
                 continue
-            self.turn_log.append(LlmTurn(turn_number=self.turn_number, response=response))
+            self.turn_log.append(LlmTurn(turn_number=self.turn_number, generation=generation))
             self.on_event(
                 LlmResponse(
                     agent_path=self.agent_path,
                     turn_number=self.turn_number,
-                    text=response.assistant_message.text,
-                    usage=response.usage,
+                    text=generation.assistant_message.text,
+                    usage=generation.usage,
                     usage_so_far=self.usage,
                 )
             )
-            self.messages.append(response.assistant_message)
-            match response.kind:
-                case "tool_call_turn":
-                    await self._dispatch_all(response.tool_calls)
-                case "response":
+            self.messages.append(generation.assistant_message)
+            match generation.kind:
+                case "with_tool_calls":
+                    await self._dispatch_all(generation.tool_calls)
+                case "without_tool_calls":
                     if self.config.self_correction_enabled and not self.critique_approved:
                         self.messages.append(
                             UserMessage(
@@ -299,7 +299,7 @@ class ReActAgent(AgentRun):
                             )
                         )
                         continue
-                    return response.output
+                    return generation.output
         raise RuntimeError(
             f"{self.agent_path} did not finish within {self.config.max_turns} turns"
         )
@@ -354,7 +354,7 @@ class ReActAgent(AgentRun):
             self.messages.append(outcome.tool_message)
 
     def _settle_outcomes(
-        self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyOutcome]
+        self, tool_calls: Sequence[ToolCall], outcomes: Sequence[DispatchManyItemOutcome]
     ) -> None:
         """Record each outcome and emit ToolResponse.
 
@@ -449,7 +449,7 @@ def build_delegate_tool(
             bound=llm.bind(
                 system_prompt=sub_config.system_prompt,
                 tools=_tools_for(sub_config, [search_tool]),
-                max_attempts=sub_config.max_attempts,
+                max_requests=sub_config.max_requests,
                 automatic_cache_breakpoints=sub_config.automatic_cache_breakpoints,
             ),
             prompt=args.question,
@@ -479,7 +479,9 @@ def _validate_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     seen_ids: set[str] = set()
     for tool_call in tool_calls:
         if tool_call.id in seen_ids:
-            raise RuntimeError(f"ToolCall.id {tool_call.id!r} appears twice in one turn")
+            raise RuntimeError(
+                f"ToolCall.id {tool_call.id!r} appears twice in one assistant message"
+            )
         seen_ids.add(tool_call.id)
 
 
@@ -524,7 +526,7 @@ class App:
             bound=self._llm.bind(
                 system_prompt=config.system_prompt,
                 tools=_tools_for(config, tools),
-                max_attempts=config.max_attempts,
+                max_requests=config.max_requests,
                 automatic_cache_breakpoints=config.automatic_cache_breakpoints,
             ),
             prompt=prompt,
@@ -550,7 +552,7 @@ class App:
         Raises:
             KeyError: A required configuration is missing.
             ValueError: An `agent_path` is already registered.
-            ValueError: `max_attempts` is boolean or below one.
+            ValueError: `max_requests` is boolean or below one.
             ValueError: `automatic_cache_breakpoints` is unsupported.
             asyncio.CancelledError: An outer deadline cancels the graph after researcher tasks settle.
             DispatchExceptionGroup: A synthesize tool function raises.

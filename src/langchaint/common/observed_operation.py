@@ -1,4 +1,4 @@
-"""Define the handle an observer returns for one generation call or tool dispatch."""
+"""Define the handle an observer returns for one input or one tool dispatch."""
 
 import logging
 from collections.abc import Callable, Generator
@@ -21,7 +21,7 @@ class ObservedOperation[OutcomeT](Protocol):
     def current(self) -> AbstractContextManager[None]:
         """Mark the operation as the active context while langchaint awaits it.
 
-        langchaint enters this around a generation call's retry loop and around a tool function.
+        langchaint enters this around an input's retry loop and around a tool function.
         A stream never enters it, because the application's code runs between stream items.
         langchaint exits it without the block's exception, so the context can neither see nor suppress it.
         """

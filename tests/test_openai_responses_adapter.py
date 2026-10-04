@@ -67,17 +67,17 @@ from langchaint import (
 )
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     BoundAdapter,
     ErrorClassification,
-    InvalidRequest,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
+    UsableResponse,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.common.exceptions import StreamProtocolError
@@ -175,7 +175,7 @@ _WEB_SEARCH_OUTPUT_ITEM: dict[str, object] = {
     "status": "completed",
     "action": {"type": "search", "query": "langchaint"},
 }
-"""One built-in tool call without another TurnPart variant."""
+"""One built-in tool call without another AssistantPart variant."""
 
 _FILE_SEARCH_OUTPUT_ITEM: dict[str, object] = {
     "type": "file_search_call",
@@ -185,9 +185,9 @@ _FILE_SEARCH_OUTPUT_ITEM: dict[str, object] = {
 }
 
 
-def _assert_result[OutputT](outcome: ResponseOutcome[OutputT]) -> AdapterResult[OutputT]:
-    """Narrow a ResponseOutcome to its success variant, failing the test on any other variant."""
-    assert outcome.kind == "adapter_result"
+def _assert_usable[OutputT](outcome: ResponseOutcome[OutputT]) -> UsableResponse[OutputT]:
+    """Narrow a ResponseOutcome to its UsableResponse variant, failing the test on any other variant."""
+    assert outcome.kind == "usable_response"
     return outcome
 
 
@@ -448,9 +448,9 @@ def test_stop_reason_mapping(
     response: OpenAIResponse, expected: StopReason, expected_output: str
 ) -> None:
     """Check translated stop reasons alongside the preserved output, which includes refusal text."""
-    result = _assert_result(_text_bound().interpret(response))
-    assert result.stop_reason == expected
-    assert result.output == expected_output
+    usable = _assert_usable(_text_bound().interpret(response))
+    assert usable.stop_reason == expected
+    assert usable.output == expected_output
 
 
 def test_every_output_item_replays_as_one_input_item_in_position() -> None:
@@ -525,7 +525,7 @@ def test_reasoning_part_text_takes_the_content_over_the_summary_and_is_none_with
 ) -> None:
     """Reasoning text prefers content, joins parts, and excludes empty text."""
     response = _response(usage=None, output=[_reasoning_item(summary=summary, content=content)])
-    reasoning_part = _assistant_message_from(response).turn[0]
+    reasoning_part = _assistant_message_from(response).parts[0]
     assert reasoning_part.kind == "reasoning_part"
     assert reasoning_part.text == expected_text
 
@@ -543,14 +543,14 @@ def test_two_text_parts_stay_split_on_produce_and_rejoin_into_one_message_item()
         ],
     }
     assistant_message = _assistant_message_from(_response(usage=None, output=[two_part_message]))
-    assert assistant_message.turn == (TextPart(text="he"), TextPart(text="y"))
+    assert assistant_message.parts == (TextPart(text="he"), TextPart(text="y"))
     assert _assistant_items(assistant_message) == [{"role": "assistant", "content": "hey"}]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw: dict[str, JsonValue] = {"type": "thinking", "thinking": "t", "signature": "s"}
-    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_items(assistant_message) == [
         raw,
         {"role": "assistant", "content": "hi"},
@@ -562,7 +562,7 @@ def test_wire_input_converts_each_message_kind() -> None:
     wire = _wire_input([
         UserMessage(content="q"),
         AssistantMessage(
-            turn=(
+            parts=(
                 TextPart(text="thinking"),
                 ToolCall(id="call1", name="lookup", args_json="{}"),
             ),
@@ -662,11 +662,13 @@ def test_wire_input_sends_every_mark_without_a_client_side_cap() -> None:
     ],
 )
 def test_build_request_reports_audio_as_invalid_request(message: Message) -> None:
-    """OpenAIResponsesAdapter returns InvalidRequest for AudioPart."""
+    """OpenAIResponsesAdapter returns RefusedMessages for AudioPart."""
     request = (
-        _adapter().bind_text(_binding(automatic_cache_breakpoints=True)).build_request([message])
+        _adapter()
+        .bind_text(_binding(automatic_cache_breakpoints=True))
+        .build_request_params([message])
     )
-    assert isinstance(request, InvalidRequest)
+    assert isinstance(request, RefusedMessages)
     assert "AudioPart" in request.reason
     assert type(message).__name__ in request.reason
 
@@ -817,7 +819,7 @@ def test_the_refusal_reaches_bind_before_any_request_is_built() -> None:
 
 
 def test_a_request_under_a_default_binding_omits_every_unstated_field() -> None:
-    """as_json holds the binding's precomputed fields and this call's converted input.
+    """as_json holds the binding's precomputed fields and this input's converted messages.
 
     A str system_prompt becomes instructions with an empty input prefix.
     No tools leaves tools, tool_choice, and parallel_tool_calls unsent.
@@ -825,7 +827,7 @@ def test_a_request_under_a_default_binding_omits_every_unstated_field() -> None:
     request = (
         _adapter()
         .bind_text(_binding(automatic_cache_breakpoints=True, system_prompt="sys"))
-        .build_request([UserMessage(content="hi")])
+        .build_request_params([UserMessage(content="hi")])
     )
     assert isinstance(request, _OpenAIRequestParams)
     assert json.loads(request.as_json()) == {
@@ -1003,7 +1005,7 @@ def _request_body_sent[OutputT](
             )
         )
     )
-    request = bound.build_request([UserMessage(content="q")])
+    request = bound.build_request_params([UserMessage(content="q")])
     assert isinstance(request, RequestParams)
     _ = run_with_timeout(bound.open_stream(request))
     (body,) = bodies
@@ -1138,7 +1140,7 @@ def test_cutoff_openai_provider_tool_billing_is_nan() -> None:
 
 
 def test_a_stream_reports_the_request_id_header_of_the_response_it_reads() -> None:
-    """The stream's own response is the only channel a streamed turn has for the header.
+    """The stream's own response is the only channel a streamed request has for the header.
 
     _response supplies the streamed request ID for provider support.
     """
@@ -1353,7 +1355,7 @@ def test_a_summary_part_boundary_streams_the_assembled_reasoning_part_separator(
         return streamed, _assistant_message_from(await adapter_stream.final())
 
     streamed, assistant_message = run_with_timeout(scenario())
-    reasoning_part = assistant_message.turn[0]
+    reasoning_part = assistant_message.parts[0]
     assert reasoning_part.kind == "reasoning_part"
     assert streamed == reasoning_part.text == "First, water evaporates.\n\nThen it condenses."
 
@@ -1462,9 +1464,9 @@ def test_stream_final_passes_a_leniently_built_terminal_through_unvalidated() ->
         async for _item in adapter_stream.items():
             pass
         assert await adapter_stream.final() is leniently_built
-        result = _assert_result(_text_bound().interpret(leniently_built))
-        assert result.output == "hey"
-        assert result.stop_reason == "max_tokens"
+        usable = _assert_usable(_text_bound().interpret(leniently_built))
+        assert usable.output == "hey"
+        assert usable.stop_reason == "max_tokens"
 
     run_with_timeout(scenario())
 
@@ -1516,7 +1518,7 @@ def _structured_bound() -> _BoundOpenAIStructured[_StructuredReport]:
 
 
 def _structured_parse(response: OpenAIResponse) -> ResponseOutcome[_StructuredReport | None]:
-    """Run the structured binding's parse over one response, with the turn that response carries."""
+    """Run the structured binding's parse over one response, with the assistant message read from it."""
     return _structured_bound()._parsed_outcome(response, _assistant_message_from(response))
 
 
@@ -1555,9 +1557,9 @@ def _structured_response(
     )
 
 
-def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None:
-    """A valid instance takes precedence over the tool call, which the turn still carries."""
-    outcome = _assert_result(
+def test_structured_bind_sets_output_on_an_assistant_message_that_also_called_a_tool() -> None:
+    """A valid instance takes precedence over the tool call, which the assistant message still carries."""
+    outcome = _assert_usable(
         _structured_bound().interpret(_structured_response(_REPORT_JSON, tool_call=True))
     )
     assert outcome.output == _StructuredReport(city="Nairobi", celsius=25)
@@ -1567,16 +1569,18 @@ def test_structured_bind_sets_output_on_a_turn_that_also_called_a_tool() -> None
 
 
 @pytest.mark.parametrize("text", [None, "let me look that up"])
-def test_structured_bind_reports_a_tool_call_turn_as_none(text: str | None) -> None:
-    """A completed tool-call turn without an instance parses None, not a schema violation."""
+def test_structured_bind_reports_an_assistant_message_with_tool_calls_as_none(
+    text: str | None,
+) -> None:
+    """A completed assistant message with tool calls and no instance parses None, not a schema violation."""
     outcome = _structured_parse(_structured_response(text, tool_call=True))
-    assert _assert_result(outcome).output is None
+    assert _assert_usable(outcome).output is None
 
 
 @pytest.mark.parametrize(
     ("response", "expected_kind"),
     [
-        (_structured_response(None), "empty_turn"),
+        (_structured_response(None), "empty_assistant_message"),
         (
             _structured_response(
                 '{"city": "Nair',
@@ -1604,7 +1608,7 @@ def test_structured_bind_reports_a_tool_call_turn_as_none(text: str | None) -> N
         ),
     ],
     ids=[
-        "completed_without_text_is_an_empty_turn",
+        "completed_without_text_is_an_empty_assistant_message",
         "json_cut_at_max_output_tokens_is_truncation",
         "refusal_block",
         "content_filter_blocks_without_retry",
@@ -1612,17 +1616,17 @@ def test_structured_bind_reports_a_tool_call_turn_as_none(text: str | None) -> N
         "failed_status_wins_over_a_refusal",
     ],
 )
-def test_structured_bind_reports_why_a_turn_has_no_instance(
+def test_structured_bind_reports_why_an_assistant_message_has_no_instance(
     response: OpenAIResponse, expected_kind: str
 ) -> None:
     """A failed run's fragments are not the answer, and refusal and truncation win over validation."""
     assert _structured_parse(response).kind == expected_kind
 
 
-def test_a_run_that_stopped_short_of_a_turn_is_unfinished_turn_naming_the_status() -> None:
-    """A cancelled run is neither a failure openai described nor a turn, so it names its status."""
+def test_a_cancelled_run_is_an_unfinished_assistant_message_naming_the_status() -> None:
+    """A cancelled run is neither a described failure nor a finished assistant message, so it names its status."""
     outcome = _structured_parse(_structured_response(None, status="cancelled"))
-    assert outcome.kind == "unfinished_turn"
+    assert outcome.kind == "unfinished_assistant_message"
     assert outcome.reason == "openai returned status 'cancelled'"
 
 
@@ -1875,24 +1879,24 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        """Return a turn whose input_tokens carries both a cache read and a cache write."""
+        """Return a response whose input_tokens carries both a cache read and a cache write."""
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a turn whose usage field is absent, which openai answers a run with."""
+        """Return a response whose usage field is absent, which openai answers a run with."""
         return _response(usage=None, output=[dict(_TEXT_OUTPUT_ITEM)])
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a turn served at flex, which _PRICING holds no table for."""
+        """Return a response served at flex, which _PRICING holds no table for."""
         return _response(
             usage=_usage_with_cache(), output=_conformance_output(), service_tier="flex"
         )
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a turn whose cache counts sum past input_tokens.
+        """Return a response whose cache counts sum past input_tokens.
 
         Excess cache counts make the derived uncached counter negative.
         """
@@ -1913,23 +1917,23 @@ class TestOpenAIResponsesConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return a turn whose reasoning item carries the unnamed key."""
+        """Return a response whose reasoning item carries the unnamed key."""
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return the turn whose middle item is the built-in web search call."""
+        """Return the response whose middle item is the built-in web search call."""
         return _response(usage=_usage_with_cache(), output=_conformance_output())
 
     @override
-    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
         """Read the input items past the one the user message became."""
-        assert isinstance(request, _OpenAIRequestParams)
-        return request.input[1:]
+        assert isinstance(request_params, _OpenAIRequestParams)
+        return request_params.input[1:]
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return the same turn as the ParsedResponse a stream assembles into and as a Response."""
+        """Return the same response as the ParsedResponse a stream assembles into and as a Response."""
         whole = _response(usage=_usage_with_cache(), output=_conformance_output())
         return ParsedResponse[None].model_validate(whole.model_dump()), whole
 

@@ -52,8 +52,8 @@ from langchaint.adapter import (
     AdapterStream,
     Binding,
     ErrorClassification,
-    InvalidRequest,
     ProviderBilling,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -461,7 +461,7 @@ def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
         bound = llm.adapter.bind_text(
             _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
         )
-        request = bound.build_request([UserMessage(content="q")])
+        request = bound.build_request_params([UserMessage(content="q")])
         assert isinstance(request, _AnthropicRequestParams)
         assert json.loads(request.as_json())["precomputed"]["system"][0]["cache_control"] == (
             _MARK_1H
@@ -479,14 +479,14 @@ def test_model_cache_ttl_reaches_the_system_cache_marker() -> None:
 def test_stop_reason_mapping(raw: at.StopReason | None, expected: str) -> None:
     """Check translated stop reasons alongside the preserved partial text."""
     message = _message_snapshot(raw, [at.TextBlock(type="text", text="partial text")])
-    result = (
+    outcome = (
         _adapter()
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert result.kind == "adapter_result"
-    assert result.stop_reason == expected
-    assert result.output == "partial text"
+    assert outcome.kind == "usable_response"
+    assert outcome.stop_reason == expected
+    assert outcome.output == "partial text"
 
 
 def test_text_output_concatenates_the_text_blocks() -> None:
@@ -495,14 +495,14 @@ def test_text_output_concatenates_the_text_blocks() -> None:
         at.TextBlock(type="text", text="hello "),
         at.TextBlock(type="text", text="world"),
     ])
-    result = (
+    outcome = (
         _adapter()
         .bind_text(_binding(system_prompt=None, tool_schemas=(), automatic_cache_breakpoints=True))
         .interpret(message)
     )
-    assert result.kind == "adapter_result"
-    assert result.output == "hello world"
-    assert result.stop_reason == "tool_use"
+    assert outcome.kind == "usable_response"
+    assert outcome.output == "hello world"
+    assert outcome.stop_reason == "tool_use"
 
 
 def _message_with_content(
@@ -523,7 +523,7 @@ def _message_with_content(
 
 
 def test_assistant_blocks_convert_to_parts_and_back() -> None:
-    """Each SDK block becomes one TurnPart in order, and each TurnPart converts back to its wire block.
+    """Each SDK block becomes one AssistantPart in order, and each AssistantPart converts back to its wire block.
 
     A server tool block becomes RawPart and replays without the SDK model's unset fields.
     """
@@ -549,7 +549,7 @@ def test_assistant_blocks_convert_to_parts_and_back() -> None:
             ),
         ])
     )
-    assert assistant_message.turn == (
+    assert assistant_message.parts == (
         ReasoningPart(raw=thinking_raw, text="check first"),
         TextPart(text="hello"),
         ToolCall(id="tu_1", name="get_weather", args_json='{"city": "Nairobi"}'),
@@ -586,14 +586,14 @@ def test_text_free_reasoning_reads_as_none_and_replays_by_its_type_key(
     The dump replays unchanged, and its type key routes it on the wire.
     """
     assistant_message = _assistant_message_from(_message_with_content([block]))
-    assert assistant_message.turn == (ReasoningPart(raw=expected_raw, text=None),)
+    assert assistant_message.parts == (ReasoningPart(raw=expected_raw, text=None),)
     assert _assistant_content_blocks(assistant_message) == [expected_raw]
 
 
 def test_foreign_reasoning_goes_to_the_wire_unchanged() -> None:
     """A foreign ReasoningPart sends ReasoningPart.raw unchanged for provider validation."""
     raw = {"type": "reasoning", "id": "rs_1"}
-    assistant_message = AssistantMessage(turn=(ReasoningPart(raw=raw), TextPart(text="hi")))
+    assistant_message = AssistantMessage(parts=(ReasoningPart(raw=raw), TextPart(text="hi")))
     assert _assistant_content_blocks(assistant_message) == [
         raw,
         {"type": "text", "text": "hi"},
@@ -608,7 +608,7 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
     messages = [
         UserMessage(content="hi"),
         AssistantMessage(
-            turn=(
+            parts=(
                 TextPart(text="checking"),
                 ToolCall(id="tu_1", name="t", args_json='{"a": 1}'),
                 ToolCall(id="tu_2", name="t", args_json='{"a": 2}'),
@@ -617,9 +617,9 @@ def test_wire_messages_groups_consecutive_tool_results() -> None:
         ToolMessage(tool_call_id="tu_1", content="r1", is_error=False),
         ToolMessage(tool_call_id="tu_2", content="r2", is_error=True),
         UserMessage(content="and then?"),
-        AssistantMessage(turn=(ToolCall(id="tu_3", name="t", args_json='{"a": 3}'),)),
+        AssistantMessage(parts=(ToolCall(id="tu_3", name="t", args_json='{"a": 3}'),)),
         ToolMessage(tool_call_id="tu_3", content="r3"),
-        AssistantMessage(turn=(TextPart(text="done"),)),
+        AssistantMessage(parts=(TextPart(text="done"),)),
     ]
     wire = _wire_messages(
         messages, automatic_cache_breakpoints=False, cache_ttl="5m", message_mark_budget=4
@@ -675,7 +675,7 @@ def _marked_texts(count: int) -> tuple[TextPart, ...]:
             _MarkCase(
                 (
                     AssistantMessage(
-                        turn=(
+                        parts=(
                             TextPart(text="t"),
                             ReasoningPart(
                                 raw={"type": "thinking", "thinking": "x", "signature": "s"}
@@ -910,7 +910,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         ),
         pytest.param(
             (
-                AssistantMessage(turn=(ToolCall(id="c1", name="f", args_json="not json"),)),
+                AssistantMessage(parts=(ToolCall(id="c1", name="f", args_json="not json"),)),
                 ToolMessage(tool_call_id="c1", content="ok"),
             ),
             "args_json",
@@ -919,7 +919,7 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
         pytest.param(
             (
                 UserMessage(content="q"),
-                AssistantMessage(turn=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
+                AssistantMessage(parts=(RawPart(raw={"parts": [{"text": "from elsewhere"}]}),)),
             ),
             "type key",
             id="stored_payload_naming_no_type",
@@ -929,13 +929,13 @@ def test_wire_messages_sends_image_url_part_unchanged() -> None:
 def test_build_request_reports_an_unsendable_sequence_as_invalid_request(
     messages: tuple[Message, ...], reason_fragment: str
 ) -> None:
-    """An unsendable Sequence[Message] reaches build_request's caller as the InvalidRequest variant.
+    """An unsendable Sequence[Message] reaches build_request_params's caller as the RefusedMessages variant.
 
-    Nothing is sent: the retry loop takes this answer before its first attempt.
+    Nothing is sent: the retry loop takes this answer before its first request.
     A marked non-last ToolMessage part is rejected instead of silently moving the cache boundary.
     """
-    request = _structured_bound().build_request(messages)
-    assert isinstance(request, InvalidRequest)
+    request = _structured_bound().build_request_params(messages)
+    assert isinstance(request, RefusedMessages)
     assert reason_fragment in request.reason
 
 
@@ -1028,7 +1028,7 @@ def test_open_stream_sends_the_built_request() -> None:
     sent_bodies: list[object] = []
 
     def reject_after_recording(request: httpx2.Request) -> httpx2.Response:
-        """Record the request body, then end the call with a 400 so no stream is read."""
+        """Record the request body, then end the request with a 400 so no stream is read."""
         sent_bodies.append(json.loads(request.content))
         return httpx2.Response(
             400, json={"type": "error", "error": {"type": "invalid_request_error"}}
@@ -1054,8 +1054,8 @@ def test_open_stream_sends_the_built_request() -> None:
             temperature=0.2,
         )
     )
-    request = bound.build_request([UserMessage(content="q")])
-    assert not isinstance(request, InvalidRequest)
+    request = bound.build_request_params([UserMessage(content="q")])
+    assert not isinstance(request, RefusedMessages)
     with pytest.raises(anthropic.BadRequestError):
         _ = run_with_timeout(bound.open_stream(request))
     assert sent_bodies == [
@@ -1605,7 +1605,7 @@ def _structured_bound() -> _BoundAnthropicStructured[_StructuredReport]:
 
 
 def _structured_parse(message: at.Message) -> ResponseOutcome[_StructuredReport | None]:
-    """Run the structured binding's parse over one message, with the turn that message carries."""
+    """Run the structured binding's parse over one message, with the assistant message read from it."""
     return _structured_bound()._parsed_outcome(message, _assistant_message_from(message))
 
 
@@ -1636,7 +1636,7 @@ def test_automatic_cache_breakpoints_select_final_caching_by_client(
     bound = adapter.bind_text(
         _binding(system_prompt="sys", tool_schemas=(), automatic_cache_breakpoints=True)
     )
-    request = bound.build_request([
+    request = bound.build_request_params([
         UserMessage(
             content=tuple(
                 TextPart(text=str(index), cache_breakpoint=index < 4) for index in range(5)
@@ -1680,7 +1680,7 @@ def _structured_message(
 
 def test_the_structured_request_merges_the_schema_into_the_output_config() -> None:
     """The response_format's JSON schema, as anthropic's SDK transforms it, joins the binding's effort."""
-    request = _structured_bound().build_request([UserMessage(content="q")])
+    request = _structured_bound().build_request_params([UserMessage(content="q")])
     assert isinstance(request, _AnthropicRequestParams)
     assert request.precomputed.output_config == {
         "effort": "high",
@@ -1723,11 +1723,13 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
         pytest.param(
             _REPORT_JSON,
             "end_turn",
-            "adapter_result",
+            "usable_response",
             _StructuredReport(city="Nairobi", celsius=25),
             id="valid_text",
         ),
-        pytest.param(None, "end_turn", "empty_turn", None, id="end_turn_without_text"),
+        pytest.param(
+            None, "end_turn", "empty_assistant_message", None, id="end_turn_without_text"
+        ),
         pytest.param(None, "refusal", "refusal", None, id="refusal"),
         pytest.param(None, "max_tokens", "max_completion_tokens_exceeded", None, id="max_tokens"),
         pytest.param(
@@ -1744,18 +1746,18 @@ def test_request_rejects_an_extra_body_key_the_adapter_populates() -> None:
             None,
             id="context_window_exceeded",
         ),
-        pytest.param(None, None, "unfinished_turn", None, id="no_stop_reason"),
-        pytest.param(None, "pause_turn", "unfinished_turn", None, id="pause_turn"),
+        pytest.param(None, None, "unfinished_assistant_message", None, id="no_stop_reason"),
+        pytest.param(None, "pause_turn", "unfinished_assistant_message", None, id="pause_turn"),
         pytest.param(
             "partial thought",
             "pause_turn",
-            "unfinished_turn",
+            "unfinished_assistant_message",
             None,
             id="pause_turn_ahead_of_schema_violation",
         ),
-        pytest.param(None, "tool_use", "adapter_result", None, id="tool_use"),
+        pytest.param(None, "tool_use", "usable_response", None, id="tool_use"),
         pytest.param(
-            "let me look that up", "tool_use", "adapter_result", None, id="tool_use_with_prose"
+            "let me look that up", "tool_use", "usable_response", None, id="tool_use_with_prose"
         ),
     ],
 )
@@ -1767,19 +1769,19 @@ def test_structured_outcome_by_text_and_stop_reason(
 ) -> None:
     """Valid text validates into the instance, and otherwise the stop reason names the outcome.
 
-    A null stop reason or pause_turn is not a finished turn, so it is unfinished even when text failed validation.
-    A tool_use turn parses no instance and nothing went wrong, so its output is None even beside prose.
+    A null stop reason or pause_turn leaves the assistant message unfinished, even when text failed validation.
+    A tool_use stop parses no instance and nothing went wrong, so its output is None even beside prose.
     """
     outcome = _structured_parse(_structured_message(text, stop_reason=stop_reason))
     assert outcome.kind == expected_kind
-    if outcome.kind == "adapter_result":
+    if outcome.kind == "usable_response":
         assert outcome.output == expected_output
 
 
-def test_an_unfinished_structured_turn_names_the_stop_reason() -> None:
+def test_an_unfinished_structured_assistant_message_names_the_stop_reason() -> None:
     """The reason quotes anthropic's own stop reason."""
     outcome = _structured_parse(_structured_message(None, stop_reason="pause_turn"))
-    assert outcome.kind == "unfinished_turn"
+    assert outcome.kind == "unfinished_assistant_message"
     assert "pause_turn" in outcome.reason
 
 
@@ -1976,11 +1978,11 @@ def test_uncataloged_bedrock_model_requires_pricing() -> None:
 
 
 def test_a_built_request_renders_as_json_carrying_the_prompt_and_no_omitted_field() -> None:
-    """as_json holds the binding's precomputed fields and this call's converted messages.
+    """as_json holds the binding's precomputed fields and this input's converted messages.
 
     An unstated temperature is absent from the request.
     """
-    request = _structured_bound().build_request([UserMessage(content="hi")])
+    request = _structured_bound().build_request_params([UserMessage(content="hi")])
     assert isinstance(request, _AnthropicRequestParams)
     rendered = json.loads(request.as_json())
     assert rendered["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
@@ -2068,7 +2070,7 @@ def test_billing_reported_reports_nothing_until_the_first_event_and_the_snapshot
     )
 
 
-def _turn_content() -> list[at.ContentBlock]:
+def _assistant_message_content() -> list[at.ContentBlock]:
     """Build reasoning, server-tool-call, and text blocks.
 
     The reasoning block carries an extra raw field.
@@ -2088,9 +2090,9 @@ def _turn_content() -> list[at.ContentBlock]:
     ]
 
 
-def _turn_message(usage: at.Usage) -> at.Message:
-    """Build a finished turn of _turn_content's blocks, billing the given usage."""
-    return _message_with_content(_turn_content(), stop_reason="end_turn", usage=usage)
+def _finished_message(usage: at.Usage) -> at.Message:
+    """Build a finished message of _assistant_message_content's blocks, billing the given usage."""
+    return _message_with_content(_assistant_message_content(), stop_reason="end_turn", usage=usage)
 
 
 class TestAnthropicMessagesConformance(AdapterConformance):
@@ -2103,17 +2105,17 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_cache_writes(self) -> BaseModel:
-        return _turn_message(_usage_with_cache_split())
+        return _finished_message(_usage_with_cache_split())
 
     @override
     def response_without_usage(self) -> BaseModel:
-        """Return a turn reporting zero everywhere, anthropic's Message requiring a usage object."""
-        return _turn_message(at.Usage(input_tokens=0, output_tokens=0))
+        """Return a response reporting zero everywhere, anthropic's Message requiring a usage object."""
+        return _finished_message(at.Usage(input_tokens=0, output_tokens=0))
 
     @override
     def response_at_an_unpriced_tier(self) -> BaseModel:
-        """Return a turn served at priority, which _PRICING holds no table for."""
-        return _turn_message(
+        """Return a response served at priority, which _PRICING holds no table for."""
+        return _finished_message(
             at.Usage(
                 input_tokens=100,
                 output_tokens=50,
@@ -2125,8 +2127,8 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_impossible_counters(self) -> BaseModel:
-        """Return a turn reporting a negative output counter."""
-        return _turn_message(at.Usage(input_tokens=1, output_tokens=-1))
+        """Return a response reporting a negative output counter."""
+        return _finished_message(at.Usage(input_tokens=1, output_tokens=-1))
 
     @override
     def response_with_text(self, text: str) -> BaseModel:
@@ -2134,24 +2136,24 @@ class TestAnthropicMessagesConformance(AdapterConformance):
 
     @override
     def response_with_reasoning(self) -> BaseModel:
-        """Return a turn whose thinking block carries the unnamed key."""
-        return _turn_message(_usage_with_cache_split())
+        """Return a response whose thinking block carries the unnamed key."""
+        return _finished_message(_usage_with_cache_split())
 
     @override
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return the turn whose middle block is a server tool call."""
-        return _turn_message(_usage_with_cache_split())
+        """Return the response whose middle block is a server tool call."""
+        return _finished_message(_usage_with_cache_split())
 
     @override
-    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
+    def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
         """Read the content blocks of the assistant message this request ends with."""
-        assert isinstance(request, _AnthropicRequestParams)
-        return _content_blocks(request.messages[-1])
+        assert isinstance(request_params, _AnthropicRequestParams)
+        return _content_blocks(request_params.messages[-1])
 
     @override
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return the same turn as the ParsedMessage a stream assembles into and as a Message."""
-        whole = _turn_message(_usage_with_cache_split())
+        """Return the same response as the ParsedMessage a stream assembles into and as a Message."""
+        whole = _finished_message(_usage_with_cache_split())
         return ParsedMessage[None].model_validate(whole.model_dump()), whole
 
     @override

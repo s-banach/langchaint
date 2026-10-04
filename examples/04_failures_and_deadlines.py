@@ -3,9 +3,9 @@
 from langchaint import (
     GenerationError,
     GenerationInput,
+    GenerationWithoutToolCalls,
     ImagePart,
     Message,
-    Response,
     TextPart,
     UserMessage,
 )
@@ -13,7 +13,9 @@ from langchaint.anthropic import Anthropic
 from langchaint.openai import OpenAI
 
 
-async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationError]:
+async def run_batch_and_handle_what_failed() -> list[
+    GenerationWithoutToolCalls[str] | GenerationError
+]:
     """Run a batch and send failed items to a second provider.
 
     Raises:
@@ -27,7 +29,7 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     openai = OpenAI()
     summarizer = anthropic.model("claude-sonnet-5").bind(
         system_prompt="Summarize in one sentence.",
-        max_attempts=5,
+        max_requests=5,
     )
     fallback = openai.model("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")
 
@@ -46,15 +48,15 @@ async def run_batch_and_handle_what_failed() -> list[Response[str] | GenerationE
     ]
 
     # Admission waits pause each item's clock.
-    results = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
+    outcomes = await summarizer.generate_many(documents, max_working_seconds_per_item=30)
 
-    for index, result in enumerate(results):
-        if not isinstance(result, GenerationError):
+    for index, outcome in enumerate(outcomes):
+        if not isinstance(outcome, GenerationError):
             continue
 
-        print(f"item {index} failed with {type(result).__name__}: {result.error_text}")
-        print(f"item {index} billed {result.usage.cost_in_usd} USD before failing")
+        print(f"item {index} failed with {type(outcome).__name__}: {outcome.error_text}")
+        print(f"item {index} billed {outcome.usage.cost_in_usd} USD before failing")
 
         # generate_one raises when fallback fails.
-        results[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
-    return results
+        outcomes[index] = await fallback.generate_one(documents[index], timeout_seconds=30)
+    return outcomes

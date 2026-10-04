@@ -1,7 +1,7 @@
 """Test provider-neutral adapter helpers.
 
 retry_after_seconds_from_headers tests header precedence, units, and HTTP dates that email.utils cannot convert.
-request_json and narrowed_request tests use local request values.
+request_params_json and narrowed_request_params tests use local request params values.
 """
 
 import json
@@ -13,8 +13,8 @@ from pydantic import BaseModel
 
 from langchaint.adapter import (
     RequestParams,
-    narrowed_request,
-    request_json,
+    narrowed_request_params,
+    request_params_json,
     retry_after_seconds_from_headers,
 )
 
@@ -75,14 +75,14 @@ class _Omit:
 
 
 class _Nested(BaseModel):
-    """Provide a nested pydantic request value."""
+    """Provide a nested pydantic request params value."""
 
     depth: int
 
 
 @dataclass(frozen=True, kw_only=True)
-class _Request(RequestParams):
-    """Provide each request value shape under test."""
+class _SampleRequestParams(RequestParams):
+    """Provide each request params value shape under test."""
 
     model: str
     temperature: float | _Omit
@@ -92,29 +92,29 @@ class _Request(RequestParams):
 
     @override
     def as_json(self) -> str:
-        """Serialize through request_json."""
-        return request_json(self, omitted_class=_Omit)
+        """Serialize through request_params_json."""
+        return request_params_json(self, omitted_class=_Omit)
 
 
-def test_request_json_drops_omitted_fields_and_keeps_every_sent_one() -> None:
-    """request_json recursively removes omitted fields."""
-    request = _Request(
+def test_request_params_json_drops_omitted_fields_and_keeps_every_sent_one() -> None:
+    """request_params_json recursively removes omitted fields."""
+    request_params = _SampleRequestParams(
         model="m",
         temperature=_Omit(),
         tools=[{"name": "t", "cache_control": _Omit()}],
         messages=[{"role": "user", "content": "hi"}],
     )
-    assert json.loads(request.as_json()) == {
+    assert json.loads(request_params.as_json()) == {
         "model": "m",
         "tools": [{"name": "t"}],
         "messages": [{"role": "user", "content": "hi"}],
     }
 
 
-def test_request_json_renders_a_model_an_adapter_passes_by_instance() -> None:
-    """request_json serializes nested pydantic values by field."""
-    request = _Request(model="m", temperature=0.5, reasoning=_Nested(depth=2))
-    assert json.loads(request.as_json()) == {
+def test_request_params_json_renders_a_model_an_adapter_passes_by_instance() -> None:
+    """request_params_json serializes nested pydantic values by field."""
+    request_params = _SampleRequestParams(model="m", temperature=0.5, reasoning=_Nested(depth=2))
+    assert json.loads(request_params.as_json()) == {
         "model": "m",
         "temperature": 0.5,
         "tools": [],
@@ -124,8 +124,8 @@ def test_request_json_renders_a_model_an_adapter_passes_by_instance() -> None:
 
 
 @dataclass(frozen=True, kw_only=True)
-class _OtherRequest(RequestParams):
-    """A request some other adapter built, which narrowing to _Request must refuse."""
+class _OtherAdapterRequestParams(RequestParams):
+    """Request params some other adapter built, which narrowing to _SampleRequestParams must refuse."""
 
     @override
     def as_json(self) -> str:
@@ -133,12 +133,12 @@ class _OtherRequest(RequestParams):
         raise NotImplementedError
 
 
-def test_narrowed_request_hands_back_the_adapters_own_and_refuses_every_other() -> None:
-    """A request another adapter built raises rather than reaching that adapter's own open_stream.
+def test_narrowed_request_params_hands_back_the_adapters_own_and_refuses_every_other() -> None:
+    """Request params another adapter built raise rather than reaching that adapter's own open_stream.
 
     Mixing them raises before I/O and names the unexpected class.
     """
-    own = _Request(model="m", temperature=0.5)
-    assert narrowed_request(own, _Request) is own
-    with pytest.raises(TypeError, match="_OtherRequest"):
-        _ = narrowed_request(_OtherRequest(), _Request)
+    own = _SampleRequestParams(model="m", temperature=0.5)
+    assert narrowed_request_params(own, _SampleRequestParams) is own
+    with pytest.raises(TypeError, match="_OtherAdapterRequestParams"):
+        _ = narrowed_request_params(_OtherAdapterRequestParams(), _SampleRequestParams)

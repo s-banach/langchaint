@@ -14,8 +14,8 @@ from langchaint.openai import OpenAI
 openai = OpenAI()
 llm = openai.model("gpt-5.6-terra")
 bound = llm.bind()
-response = await bound.generate_one([UserMessage(content="Hello")])
-print(response.output)
+generation = await bound.generate_one([UserMessage(content="Hello")])
+print(generation.output)
 ```
 
 Every model from `openai` uses `openai.client` and one `SharedBackoff`.
@@ -33,7 +33,7 @@ Every model from `openai` uses `openai.client` and one `SharedBackoff`.
 | `model.bind_tools(tools)` | `llm.bind(tools=tools)` |
 | `model.with_structured_output(Model)` | `llm.bind(response_format=Model)` |
 | `create_react_agent(...)` | application tool loop |
-| `RunnableRetry` | `max_attempts` on `bind` |
+| `RunnableRetry` | `max_requests` on `bind` |
 | `InMemoryRateLimiter` | `max_concurrent_requests` and `max_request_starts_per_second` |
 | `.with_fallbacks(...)` | application `try` and `except` |
 | `set_llm_cache(...)` | provider prompt caching |
@@ -97,7 +97,7 @@ Uncataloged models require explicit pricing.
 concise = llm.bind(
     system_prompt="Answer in one sentence.",
     temperature=0.2,
-    max_attempts=3,
+    max_requests=3,
 )
 creative = concise.bind(
     system_prompt="Write a vivid paragraph.",
@@ -125,18 +125,18 @@ search_only = bound.bind(
 
 See [`06_required_choice.py`](06_required_choice.py) for `AllowedToolsChoice`, `tool_choice="required"`, and `SpecificToolChoice` with unchanged `tools`.
 
-## Result types
+## Generation types
 
-| Binding | `generate_one` success type |
+| Binding | `generate_one` return type |
 | --- | --- |
-| text, without tools | `Response[str]` |
-| text, with `ToolManager` | `Response[str] \| ToolCallTurn[str]` |
-| structured, without tools | `Response[Model]` |
-| structured, with `ToolManager` | `Response[Model] \| ToolCallTurn[Model \| None]` |
+| text, without tools | `GenerationWithoutToolCalls[str]` |
+| text, with `ToolManager` | `GenerationWithoutToolCalls[str] \| GenerationWithToolCalls[str]` |
+| structured, without tools | `GenerationWithoutToolCalls[Model]` |
+| structured, with `ToolManager` | `GenerationWithoutToolCalls[Model] \| GenerationWithToolCalls[Model \| None]` |
 
-`GenerateResult[str]` and `GenerateResult[Model, Model | None]` name the success unions.
-`CallResult` adds `GenerationError` for batch results.
-A binding with `ToolManager` returns `ToolCallTurn` for every turn that calls tools.
+`Generation[str]` and `Generation[Model, Model | None]` name the unions `generate_one` returns.
+`GenerationOutcome` adds `GenerationError` for batch outcomes.
+A binding with `ToolManager` returns `GenerationWithToolCalls` whenever the kept assistant message has tool calls.
 
 ```python
 from pydantic import BaseModel
@@ -146,20 +146,20 @@ class Answer(BaseModel):
     text: str
 
 
-result = await llm.bind(
+generation = await llm.bind(
     response_format=Answer,
     tools=tools,
 ).generate_one("Answer the question")
 
-match result.kind:
-    case "tool_call_turn":
-        print(result.tool_calls)
-    case "response":
-        print(result.output.text)
+match generation.kind:
+    case "with_tool_calls":
+        print(generation.tool_calls)
+    case "without_tool_calls":
+        print(generation.output.text)
 ```
 
-A text binding's `output` is the turn's text, which is `""` for a turn without text.
-A structured `ToolCallTurn.output` is `None` when the turn has no valid `Model`.
+A text binding's `output` is the assistant message's text, which is `""` for an assistant message without text.
+A structured `GenerationWithToolCalls.output` is `None` when the assistant message has no valid `Model`.
 Append `assistant_message`, never `output`, when continuing a conversation.
 
 See [`02_tool_loop.py`](02_tool_loop.py) for the basic tool loop.
@@ -235,13 +235,13 @@ Use `warm_cache=True` for batches sharing a reusable prefix.
 The first item completes before remaining items start.
 
 ```python
-results = await bound.generate_many(
+outcomes = await bound.generate_many(
     ["First question", "Second question", "Third question"],
     warm_cache=True,
 )
 ```
 
-The first result may be a `GenerationError`.
+The first outcome may be a `GenerationError`.
 Remaining items still start afterward.
 See [`05_prompt_caching.py`](05_prompt_caching.py) for measured cache counters.
 
@@ -261,8 +261,8 @@ An adapter rejects `extra_body` keys that it already populates.
 
 ## Retries, batches, and errors
 
-`max_attempts` counts requests, including the first request.
-Set `max_attempts=1` to disable retries.
+`max_requests` counts requests, including the first request.
+Set `max_requests=1` to disable retries.
 
 ```python
 openai = OpenAI(
@@ -270,7 +270,7 @@ openai = OpenAI(
     max_request_starts_per_second=5,
 )
 bound = openai.model("gpt-5.6-terra").bind(
-    max_attempts=5,
+    max_requests=5,
 )
 ```
 
@@ -281,17 +281,17 @@ bound = openai.model("gpt-5.6-terra").bind(
 from langchaint import GenerationError
 
 try:
-    response = await primary.generate_one(messages, timeout_seconds=30)
+    generation = await primary.generate_one(messages, timeout_seconds=30)
 except GenerationError:
-    response = await fallback.generate_one(messages, timeout_seconds=30)
+    generation = await fallback.generate_one(messages, timeout_seconds=30)
 
-results = await primary.generate_many(inputs)
-for index, result in enumerate(results):
-    if isinstance(result, GenerationError):
-        results[index] = await fallback.generate_one(inputs[index])
+outcomes = await primary.generate_many(inputs)
+for index, outcome in enumerate(outcomes):
+    if isinstance(outcome, GenerationError):
+        outcomes[index] = await fallback.generate_one(inputs[index])
 ```
 
-`GenerationError.usage` includes paid usage across settled attempts.
+`GenerationError.usage` includes paid usage across settled requests.
 `max_working_seconds_per_item` excludes admission waits.
 Use `timeout_seconds` for a `generate_one` wall-clock deadline.
 
@@ -302,7 +302,7 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | LangChain hook | Application location |
 | --- | --- |
 | `before_model` | before `await bound.generate_one(messages)` |
-| `after_model` | after receiving `Response` or `ToolCallTurn` |
+| `after_model` | after receiving `GenerationWithoutToolCalls` or `GenerationWithToolCalls` |
 | `modify_model_request` | `bound = bound.bind(...)` |
 | `wrap_tool_call` | around `dispatch` or `dispatch_many` |
 | tool error handling | inspect `DispatchOutcome`, or catch `DispatchExceptionGroup` |
@@ -310,9 +310,9 @@ See [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) for failure h
 | human approval | `dispatch_many(..., precomputed=...)` |
 | message trimming | edit `messages` before the next call |
 | structured output | `bind(response_format=Model, ...)` |
-| usage tracking | read `result.usage` |
+| usage tracking | read `generation.usage` |
 
-The application owns routing between turns.
+The application owns routing between `generate_one` calls.
 A tool returns data instead of a control-flow instruction.
 
 See [`03_streaming.py`](03_streaming.py) for provider response streaming.

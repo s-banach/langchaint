@@ -167,7 +167,7 @@ class Anthropic:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
-        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer` follows every input and every tool dispatch of the created `LLM` values.
         `observer=None` follows none.
 
         Raises:
@@ -285,7 +285,7 @@ class AnthropicBedrock:
         `longest_wait_seconds` caps adaptive and provider-stated waits.
         `wait_multiplier` scales wait-ceiling changes.
         `quiet_seconds_per_decay_step` earns one wait-ceiling reduction.
-        `observer` follows every generation call and tool dispatch of the created `LLM` values.
+        `observer` follows every input and every tool dispatch of the created `LLM` values.
         `observer=None` follows none.
 
         Raises:

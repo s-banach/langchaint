@@ -9,12 +9,12 @@ Alpha: the API may change without notice.
 ## Why langchaint
 
 - **Consistent API.** Bind request fields once with `LLM.bind()`, then call `generate_one()`, `generate_many()`, or `stream_one()` on the resulting `BoundLLM`.
-- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `Response[Answer]`. Binding `tools` adds `ToolCallTurn` to the return type of any binding.
-- **Result variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
+- **Output types determined by binding.** Binding `response_format=Answer` gives `generate_one()` the return type `GenerationWithoutToolCalls[Answer]`. Binding `tools` adds `GenerationWithToolCalls` to the return type of any binding.
+- **Outcome variants with autocomplete.** Match on `.kind` with editor autocomplete and no class imports.
 - **Coordinated retries.** Share concurrency limits, request-start pacing, and provider-directed pauses across models using one rate-limit quota.
-- **Complete billing.** Successful results and `GenerationError` values retain provider-reported usage from every recorded attempt, including billed retries.
-- **Streaming.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed result with its usage.
-- **Agent loops in Python.** Provider-neutral messages, typed tools with argument validation, concurrent dispatch, and explicit result variants support async control flow.
+- **Complete billing.** `Generation` and `GenerationError` values retain provider-reported usage from every recorded request, including billed retries.
+- **Streaming.** `stream_one()` returns an async context manager and async iterator. `final()` returns the typed generation with its usage.
+- **Agent loops in Python.** Provider-neutral messages, typed tools with argument validation, concurrent dispatch, and explicit outcome variants support async control flow.
 
 ## Install
 
@@ -39,7 +39,7 @@ pip install "langchaint[openai]"
 
 Install `langchaint[tracing]` for OpenTelemetry tracing.
 
-## Generate a typed response
+## Generate a typed output
 
 ```python
 import asyncio
@@ -63,10 +63,10 @@ async def main() -> None:
             response_format=Answer,
         )
     )
-    response = await assistant.generate_one("Why is the sky blue?")
+    generation = await assistant.generate_one("Why is the sky blue?")
 
-    print(response.output.answer)
-    print(response.usage.cost_in_usd)
+    print(generation.output.answer)
+    print(generation.usage.cost_in_usd)
 
 
 asyncio.run(main())
@@ -74,8 +74,8 @@ asyncio.run(main())
 
 The Pydantic model validates the provider response.
 
-`generate_many()` returns one result per input in input order.
-A terminal failure becomes that input's `GenerationError`, so sibling results remain available.
+`generate_many()` returns one outcome per input in input order.
+A terminal failure becomes that input's `GenerationError`, so sibling outcomes remain available.
 
 ## Coordinate retries across a rate-limit quota
 
@@ -104,10 +104,10 @@ async with text_assistant.stream_one("Explain photosynthesis.") as stream:
         if isinstance(item, str):
             print(item, end="", flush=True)
 
-    response = await stream.final()
+    generation = await stream.final()
 ```
 
-`final()` consumes the remaining stream and returns the assembled result.
+`final()` consumes the remaining stream and returns the assembled generation.
 
 ## Build agent loops
 
@@ -117,15 +117,15 @@ The application controls turn limits, state, approvals, model changes, and persi
 messages: list[Message] = [UserMessage(content=prompt)]
 
 for _ in range(max_turns):
-    result = await bound.generate_one(messages)
+    generation = await bound.generate_one(messages)
 
-    match result.kind:
-        case "tool_call_turn":
-            messages.append(result.assistant_message)
-            outcomes = await bound.tool_manager.dispatch_many(result.tool_calls)
+    match generation.kind:
+        case "with_tool_calls":
+            messages.append(generation.assistant_message)
+            outcomes = await bound.tool_manager.dispatch_many(generation.tool_calls)
             messages.extend(outcome.tool_message for outcome in outcomes)
-        case "response":
-            return result.output
+        case "without_tool_calls":
+            return generation.output
 
 raise RuntimeError("model did not finish within max_turns")
 ```
@@ -134,10 +134,10 @@ raise RuntimeError("model did not finish within max_turns")
 
 See [`examples/02_tool_loop.py`](examples/02_tool_loop.py) for a complete typed tool loop.
 
-## Account for the complete call
+## Account for every request
 
-`response.usage.cost_in_usd` includes every billed retry recorded for the call.
-`GenerationError.usage` preserves the recorded cost of failed calls.
+`generation.usage.cost_in_usd` includes every billed retry recorded for the input.
+`GenerationError.usage` preserves the recorded cost of a failed input.
 
 ## More examples
 

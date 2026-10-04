@@ -18,9 +18,9 @@ from langchaint.adapter import (
     Binding,
     BoundAdapter,
     ErrorClassification,
-    InvalidRequest,
-    NoOutput,
+    RefusedMessages,
     RequestParams,
+    _UnusableResponseBase,
 )
 from langchaint.billing.pricing import Billing
 from langchaint.billing.usage import ZERO_USAGE
@@ -34,7 +34,11 @@ from langchaint.common.messages import (
     messages_to_json,
 )
 from langchaint.concurrency.shared_backoff import Verdict
-from langchaint.generation.call import AbandonedCallRecord, CallRecord, SettledAttemptRecord
+from langchaint.generation.request_history import (
+    AbandonedStreamRecord,
+    RequestHistory,
+    SettledRequestRecord,
+)
 from langchaint.generation.tables import RowValue, to_tables
 
 _PLAIN_TEXT_BINDING = Binding(
@@ -58,10 +62,13 @@ class _WeatherReport(BaseModel):
     celsius: int
 
 
-class _WeatherReportAlsoNoOutput(_WeatherReport, NoOutput):
-    """A caller's response_format that also inherits NoOutput, the base of every no-output outcome."""
+class _WeatherReportAlsoUnusableResponseBase(_WeatherReport, _UnusableResponseBase):
+    """A caller's response_format that also inherits `_UnusableResponseBase`.
 
-    assistant_message: AssistantMessage = AssistantMessage(turn=())
+    `_UnusableResponseBase` is the base of every `UnusableResponse` variant.
+    """
+
+    assistant_message: AssistantMessage = AssistantMessage(parts=())
 
 
 def _validation_error_json(response_format: type[BaseModel], text: str) -> str:
@@ -81,7 +88,7 @@ def _costs_agree(actual: float, expected: float) -> bool:
 
 
 def _row_number(row: Mapping[str, RowValue], column: str) -> float:
-    """Read one numeric cell of an attempts row.
+    """Read one numeric cell of a `Tables.requests` row.
 
     This suite reads only rows backed by `Billing`, so each selected column is filled.
     """
@@ -138,7 +145,7 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_with_text(self, text: str) -> BaseModel:
-        """Return an SDK response for a finished turn whose only answer text is text.
+        """Return an SDK response for a finished assistant message whose only answer text is text.
 
         Args:
             text: The answer text, which the structured-output invariants validate.
@@ -147,50 +154,50 @@ class AdapterConformance(ABC):
 
     @abstractmethod
     def response_with_reasoning(self) -> BaseModel:
-        """Return an SDK response whose turn holds one ReasoningPart and one TextPart.
+        """Return an SDK response whose assistant message holds one ReasoningPart and one TextPart.
 
         The reasoning must carry a key absent from the installed SDK.
         Rebuilding the payload would drop that key.
-        Each TurnPart must map to one wire part.
+        Each AssistantPart must map to one wire part.
         Avoid adjacent parts the adapter joins.
         """
         ...
 
     @abstractmethod
     def response_with_raw_part(self) -> BaseModel | None:
-        """Return an SDK response whose turn holds one RawPart.
+        """Return an SDK response whose assistant message holds one RawPart.
 
-        Beside it, include at least one other TurnPart.
-        Each TurnPart must map to one wire part.
-        Return None when one message holds the whole turn.
+        Beside it, include at least one other AssistantPart.
+        Each AssistantPart must map to one wire part.
+        Return None when one wire message holds the whole assistant message.
         Such a wire has no RawPart position.
         Returning None on a part-based wire hides a dropped RawPart.
         """
         ...
 
     @abstractmethod
-    def assistant_wire_parts(self, request: RequestParams) -> Sequence[object]:
-        """Read the assistant turn's parts from a request, in wire order.
+    def assistant_wire_parts(self, request_params: RequestParams) -> Sequence[object]:
+        """Read the assistant message's wire parts from request params, in wire order.
 
-        The request contains one `UserMessage` before the tested assistant turn.
+        The request params contain one `UserMessage` before the tested assistant message.
         Skip the wire content produced by that `UserMessage`.
 
         Args:
-            request: The adapter-specific request to inspect.
+            request_params: The adapter-specific request params to inspect.
         """
         ...
 
     @abstractmethod
     def streamed_and_whole(self) -> tuple[BaseModel, BaseModel]:
-        """Return one turn twice: as the type the SDK's stream assembles into, and whole.
+        """Return one assistant message twice: as the type the SDK's stream assembles into, and whole.
 
-        Both responses must represent the same turn.
+        Both responses must represent the same assistant message.
         """
         ...
 
     @abstractmethod
     def stream_without_its_terminal_event(self) -> AdapterStream:
-        """Return a stream whose events end before the one that closes the turn."""
+        """Return a stream whose events end before the one that closes the assistant message."""
         ...
 
     @abstractmethod
@@ -214,13 +221,13 @@ class AdapterConformance(ABC):
     def _assistant_wire_parts_of(
         self, bound_adapter: BoundAdapter[str], messages: Sequence[Message]
     ) -> Sequence[object]:
-        """Build a request and read its assistant turn's wire parts.
+        """Build request params and read the assistant message's wire parts.
 
         The assertion lets callers compare parts without repeating the guard.
         """
-        request = bound_adapter.build_request(messages)
-        assert not isinstance(request, InvalidRequest)
-        return self.assistant_wire_parts(request)
+        request_params = bound_adapter.build_request_params(messages)
+        assert not isinstance(request_params, RefusedMessages)
+        return self.assistant_wire_parts(request_params)
 
     def _billings(self) -> list[Billing]:
         """Return the billing of each fixture response the cost invariants price."""
@@ -271,30 +278,30 @@ class AdapterConformance(ABC):
         assert math.isnan(billing.usage.cost_in_usd)
 
     def test_reasoning_round_trips_verbatim_in_position(self) -> None:
-        """The reasoning an adapter read off a turn goes back on the wire unchanged, where it sat.
+        """The reasoning an adapter read off an assistant message goes back on the wire unchanged, where it sat.
 
         Providers can verify reasoning payloads.
         langchaint therefore sends the received payload unchanged.
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert outcome.kind == "adapter_result"
-        turn = outcome.assistant_message.turn
+        assert outcome.kind == "usable_response"
+        parts = outcome.assistant_message.parts
         ((index, reasoning_part),) = [
-            (index, part) for index, part in enumerate(turn) if part.kind == "reasoning_part"
+            (index, part) for index, part in enumerate(parts) if part.kind == "reasoning_part"
         ]
-        parts = self._assistant_wire_parts_of(
+        wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(parts) == len(turn)
-        assert parts[index] == reasoning_part.raw
+        assert len(wire_parts) == len(parts)
+        assert wire_parts[index] == reasoning_part.raw
 
     def test_raw_part_round_trips_verbatim_in_position(self) -> None:
         """RawPart.raw returns unchanged in its original position.
 
         Dropping the part loses paid output.
-        A continued tool loop would replay a different turn.
-        The turn must hold a RawPart.
+        A continued tool loop would replay a different assistant message.
+        The assistant message must hold a RawPart.
         Dropping a RawPart value shortens both compared sequences.
         """
         response = self.response_with_raw_part()
@@ -302,26 +309,26 @@ class AdapterConformance(ABC):
             return
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(response)
-        assert outcome.kind == "adapter_result"
-        turn = outcome.assistant_message.turn
-        assert any(part.kind == "raw_part" for part in turn)
-        parts = self._assistant_wire_parts_of(
+        assert outcome.kind == "usable_response"
+        parts = outcome.assistant_message.parts
+        assert any(part.kind == "raw_part" for part in parts)
+        wire_parts = self._assistant_wire_parts_of(
             bound_adapter, [UserMessage(content="hi"), outcome.assistant_message]
         )
-        assert len(parts) == len(turn)
-        for index, part in enumerate(turn):
+        assert len(wire_parts) == len(parts)
+        for index, part in enumerate(parts):
             if part.kind == "raw_part":
-                assert parts[index] == part.raw
+                assert wire_parts[index] == part.raw
 
-    def test_a_json_round_tripped_turn_builds_the_same_wire_request(self) -> None:
-        """A restored turn puts the original parts on the wire.
+    def test_a_json_round_tripped_assistant_message_builds_the_same_wire_request(self) -> None:
+        """A restored assistant message puts the original parts on the wire.
 
         Serialization must preserve provider-verified raw payloads.
         Every `ReasoningPart.raw` value must be JSON-representable.
         """
         bound_adapter = self._bound_adapter()
         outcome = bound_adapter.interpret(self.response_with_reasoning())
-        assert outcome.kind == "adapter_result"
+        assert outcome.kind == "usable_response"
         original: list[Message] = [UserMessage(content="hi"), outcome.assistant_message]
         restored = messages_from_json(messages_to_json(original))
         assert self._assistant_wire_parts_of(
@@ -329,39 +336,39 @@ class AdapterConformance(ABC):
         ) == self._assistant_wire_parts_of(bound_adapter, original)
 
     def test_empty_provider_text_becomes_no_text_part(self) -> None:
-        """Empty provider text leaves nothing in the turn, and the text output is then `""`.
+        """Empty provider text leaves no part in the assistant message, and the text output is then `""`.
 
-        Anthropic rejects an empty text block, so a replayed tool-call turn must not carry one.
+        Anthropic rejects an empty text block, so a replayed assistant message with tool calls must not carry one.
         """
         outcome = self._bound_adapter().interpret(self.response_with_text(""))
-        assert outcome.kind == "adapter_result"
+        assert outcome.kind == "usable_response"
         assert outcome.output == ""
-        assert outcome.assistant_message.turn == ()
+        assert outcome.assistant_message.parts == ()
 
     def test_an_empty_text_part_is_sent_as_given(self) -> None:
         """Replay sends every assistant `TextPart`, including one with empty text."""
-        parts = self._assistant_wire_parts_of(
+        wire_parts = self._assistant_wire_parts_of(
             self._bound_adapter(),
-            [UserMessage(content="hi"), AssistantMessage(turn=(TextPart(text=""),))],
+            [UserMessage(content="hi"), AssistantMessage(parts=(TextPart(text=""),))],
         )
-        assert len(parts) == 1
+        assert len(wire_parts) == 1
 
-    def test_structured_output_may_inherit_no_output(self) -> None:
-        """A validated instance is output in an AdapterResult even when its class inherits NoOutput.
+    def test_structured_output_may_inherit_the_unusable_response_base(self) -> None:
+        """A validated instance is output in a `UsableResponse` even when its class inherits `_UnusableResponseBase`.
 
-        The outcome kind, not the output's class, separates output from a no-output outcome.
+        The outcome kind, not the output's class, separates a usable response from an unusable one.
         """
         bound_adapter = self.make_adapter().bind_structured(
-            _PLAIN_TEXT_BINDING, _WeatherReportAlsoNoOutput
+            _PLAIN_TEXT_BINDING, _WeatherReportAlsoUnusableResponseBase
         )
         outcome = bound_adapter.interpret(
             self.response_with_text('{"city": "Nairobi", "celsius": 25}')
         )
-        assert outcome.kind == "adapter_result"
-        assert outcome.output == _WeatherReportAlsoNoOutput(city="Nairobi", celsius=25)
+        assert outcome.kind == "usable_response"
+        assert outcome.output == _WeatherReportAlsoUnusableResponseBase(city="Nairobi", celsius=25)
 
     def test_text_the_response_format_rejects_is_a_schema_violation(self) -> None:
-        """A finished turn whose text fails response_format validation is SchemaViolation.
+        """A finished assistant message whose text fails response_format validation is SchemaViolation.
 
         validation_error_json is pydantic's error JSON without documentation URLs.
         It keeps each rejected field and value for the caller.
@@ -408,7 +415,7 @@ class AdapterConformance(ABC):
         assert TransientError in adapter.failure_types
 
     def test_the_stream_assembled_type_reads_the_same_as_the_whole_response(self) -> None:
-        """One turn read off the type a stream assembles into and off a whole response agree.
+        """One assistant message read off the type a stream assembles into and off a whole response agree.
 
         Both request paths use `interpret`, which must read both response shapes identically.
         """
@@ -420,9 +427,9 @@ class AdapterConformance(ABC):
         )
 
     def test_a_stream_missing_its_terminal_event_raises(self) -> None:
-        """Draining a stream whose turn never closed is a protocol violation, not an empty answer.
+        """Draining a stream whose assistant message never closed is a protocol violation, not an empty answer.
 
-        Received events do not form a completed turn.
+        Received events do not form a finished assistant message.
         Returning them would present truncated output as complete.
         """
         stream = self.stream_without_its_terminal_event()
@@ -438,11 +445,11 @@ class AdapterConformance(ABC):
             return
         raise AssertionError("a stream missing its terminal event drained without raising")
 
-    def test_to_tables_preserves_billing_fields_in_each_attempt_row(self) -> None:
+    def test_to_tables_preserves_billing_fields_in_each_request_row(self) -> None:
         """Compare exported counters, costs, and rates with the source Billing."""
         adapter = self.make_adapter()
         for billing in self._billings():
-            (row,) = to_tables(_carrier_of(billing, adapter)).attempts
+            (row,) = to_tables(_carrier_of(billing, adapter)).requests
             usage = billing.usage
             for column, expected in (
                 ("input_tokens_cache_read", usage.input_tokens_cache_read),
@@ -467,14 +474,14 @@ class AdapterConformance(ABC):
                 assert _costs_agree(_row_number(row, column), expected)
 
 
-def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedCallRecord:
-    """Wrap one Billing in a result carrier, to reach to_tables with a single attempts row."""
-    return AbandonedCallRecord(
-        call=CallRecord(
+def _carrier_of(billing: Billing, adapter: Adapter) -> AbandonedStreamRecord:
+    """Wrap one Billing in an `AbandonedStreamRecord`, to reach to_tables with a single request row."""
+    return AbandonedStreamRecord(
+        request_history=RequestHistory(
             model=adapter.model,
             provider_name=adapter.provider_name,
-            attempt_records=(
-                SettledAttemptRecord(
+            request_records=(
+                SettledRequestRecord(
                     started_after_seconds=0.0,
                     elapsed_seconds=1.0,
                     seconds_to_first_item=None,

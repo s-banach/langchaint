@@ -1,7 +1,7 @@
 """The stream handle.
 
 `StreamHandle` opens inside `async with` and yields `StreamItem` values.
-`final` drains remaining items and returns the assembled result.
+`final` drains remaining items and returns the generation.
 Open failures can retry; failures after opening cannot retry.
 One `SharedBackoff.admitted` block spans the open stream's lifetime.
 """
@@ -17,7 +17,7 @@ from langchaint.adapter import (
     Adapter,
     AdapterStream,
     BoundAdapter,
-    InvalidRequest,
+    RefusedMessages,
     RequestParams,
     ResponseOutcome,
     StreamItem,
@@ -39,20 +39,20 @@ from langchaint.failure_step import (
     _RetryStep,
     _transient_error_for_step,
 )
-from langchaint.generation.call import AbandonedCallRecord, _CallLedger
 from langchaint.generation.errors import (
     GenerationError,
-    InvalidRequestErrorRecord,
+    RejectedErrorRecord,
     RetriesExhaustedErrorRecord,
     RetryUnavailableErrorRecord,
     _terminal_generation_error,
 )
+from langchaint.generation.request_history import AbandonedStreamRecord, _RequestLedger
 from langchaint.generation.response import (
-    CallResult,
-    Response,
-    ToolCallTurn,
-    _call_result_from_response_outcome,
+    GenerationOutcome,
+    GenerationWithoutToolCalls,
+    GenerationWithToolCalls,
     _escaped_error,
+    _generation_outcome_from_response_outcome,
     _timed_out_error,
 )
 
@@ -68,11 +68,11 @@ _ALREADY_ENTERED_MESSAGE = "stream already entered: call stream_one again for a 
 async def _close_stream_quietly(
     adapter_stream: AdapterStream, *, failure_log_message: str
 ) -> None:
-    """Close one attempt's stream, logging a close failure rather than raising it.
+    """Close one request's stream, logging a close failure rather than raising it.
 
     The request has already ended.
-    A close exception would displace its result or error, so this function logs the exception.
-    `failure_log_message` names the preserved result.
+    A close exception would displace its generation or error, so this function logs the exception.
+    `failure_log_message` names the preserved outcome.
 
     Raises:
         BaseException: `adapter_stream.close()` raises a value outside `Exception`.
@@ -83,11 +83,12 @@ async def _close_stream_quietly(
         _logger.warning(failure_log_message, exc_info=True)
 
 
-class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
-    """An async context manager and iterator for one streamed call.
+class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[object] = Never]:
+    """An async context manager and iterator for one streamed input.
 
-    Entry opens the request. `final` drains items. `final` returns `Response` or `ToolTurnT`.
-    `max_attempts` applies only before the stream opens.
+    Entry opens the request. `final` drains items.
+    `final` returns `GenerationWithoutToolCalls` or `GenerationWithToolCallsT`.
+    `max_requests` applies only before the stream opens.
     An open-stream transient failure raises `GenerationError`.
     """
 
@@ -98,56 +99,58 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         bound_adapter: BoundAdapter[OutputT],
         messages: Sequence[Message],
         shared_backoff: SharedBackoff,
-        max_attempts: int,
+        max_requests: int,
         timeout_seconds: float | None,
-        splits_tool_call_turns: bool,
+        splits_on_tool_calls: bool,
         generation_started: Callable[
-            [], ObservedOperation[CallResult[object] | AbandonedCallRecord]
+            [], ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord]
         ],
     ) -> None:
         """Store the request.
 
-        `generation_started` starts following the call when the handle is entered.
+        `generation_started` starts following the input when the handle is entered.
         """
         self._generation_started = generation_started
-        self._operation: ObservedOperation[CallResult[object] | AbandonedCallRecord] | None = None
+        self._operation: (
+            ObservedOperation[GenerationOutcome[object] | AbandonedStreamRecord] | None
+        ) = None
         self._adapter = adapter
         self._bound_adapter = bound_adapter
         self._messages = messages
         self._shared_backoff = shared_backoff
-        self._max_attempts = max_attempts
+        self._max_requests = max_requests
         self._private_backoff = PrivateBackoff(shared_backoff)
         self._timeout_seconds = timeout_seconds
-        self._splits_tool_call_turns = splits_tool_call_turns
+        self._splits_on_tool_calls = splits_on_tool_calls
         self._deadline: asyncio.Timeout | None = None
-        self.abandoned: AbandonedCallRecord | None = None
-        """The account of a call that no result or `GenerationError` records, or `None`.
+        self.abandoned: AbandonedStreamRecord | None = None
+        """The record of an input that no `Generation` or `GenerationError` records, or `None`.
 
         Leaving the block before the conclusion, an exception raised inside it, and cancellation each set this value.
         It holds the billing and first-item time of the request the exit cut off.
         Cancellation sets it before the caller receives `asyncio.CancelledError`.
-        A success or `GenerationError` leaves this value as `None`.
+        A `Generation` or `GenerationError` leaves this value as `None`.
         An expired `timeout_seconds` raises `GenerationError` and leaves this value as `None`.
         """
         self._adapter_stream: AdapterStream | None = None
         self._items: AsyncIterator[StreamItem] | None = None
-        self._ledger: _CallLedger
-        """Built by `__aenter__`, which starts the call."""
+        self._ledger: _RequestLedger
+        """Built by `__aenter__`, which starts handling the input."""
         self._admission: Admission | None = None
         self._ended_at_monotonic_seconds: float | None = None
-        self._conclusion: CallResult[OutputT] | None = None
+        self._conclusion: GenerationOutcome[OutputT] | None = None
         self._state: _State = "unopened"
-        self._request: RequestParams | None = None
+        self._request_params: RequestParams | None = None
 
-    async def __aenter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
+    async def __aenter__(self) -> "StreamHandle[OutputT, GenerationWithToolCallsT]":
         """Open the request and return self.
 
         Raises:
-            GenerationError: `build_request` returns `InvalidRequest`.
+            GenerationError: `build_request_params` returns `RefusedMessages`.
                 The provider rejects the request.
                 The provider declares the open failure final.
                 The adapter cannot classify the open failure.
-                The open attempts consume `max_attempts`.
+                The requests that open the stream consume `max_requests`.
                 `timeout_seconds` expires before the request opens.
                 An `Exception` escapes failure handling.
             RuntimeError: This handle was already entered.
@@ -175,7 +178,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         Raises what `__aenter__` documents.
         """
         self._state = "open"
-        self._ledger = _CallLedger(
+        self._ledger = _RequestLedger(
             model=self._adapter.model, provider_name=self._adapter.provider_name
         )
         self._deadline = asyncio.timeout(self._timeout_seconds)
@@ -184,7 +187,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             await self._open_stream_with_retries()
         except BaseException as exc:
             # `__aexit__` does not run when `__aenter__` raises.
-            # Finish the call, exit admission, and close the deadline here.
+            # Finish the input, exit admission, and close the deadline here.
             # An open deadline would retain a timer that could cancel this task after this operation.
             # Record abandonment here because no other frame sees cancellation during the open.
             self._state = "finished"
@@ -204,9 +207,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     ) -> None:
         """Close the deadline, connection, and admission.
 
-        Leaving the block sets `abandoned` unless a conclusion already records the call.
+        Leaving the block sets `abandoned` unless a conclusion already records the input.
         An expired `timeout_seconds` raises `GenerationError` instead.
-        A call without a conclusion concludes with the expiry's `GenerationError` or with `abandoned`.
+        An input without a conclusion concludes with the expiry's `GenerationError` or with `abandoned`.
 
         Raises:
             GenerationError: `timeout_seconds` expires before the block finishes.
@@ -220,8 +223,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         finally:
             self._end_operation(None)
 
-    def _end_operation(self, conclusion: CallResult[OutputT] | AbandonedCallRecord | None) -> None:
-        """Give the observer the call's conclusion, when there is one, and end the operation once."""
+    def _end_operation(
+        self, conclusion: GenerationOutcome[OutputT] | AbandonedStreamRecord | None
+    ) -> None:
+        """Give the observer the input's conclusion, when there is one, and end the operation once."""
         operation, self._operation = self._operation, None
         if operation is None:
             return
@@ -274,14 +279,14 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return self._adapter_stream.billing_reported()
 
     def _abandon(self, billing_in_flight: ProviderBilling | None) -> None:
-        """Set `abandoned` and conclude the operation with it, when the call has no conclusion.
+        """Set `abandoned` and conclude the operation with it, when the input has no conclusion.
 
-        Include billing reported by the interrupted attempt.
+        Include billing reported by the interrupted request.
         """
         if self._conclusion is not None:
             return
-        call, _ = self._ledger.freeze_with_cut_off(billing_in_flight)
-        self.abandoned = AbandonedCallRecord(call=call)
+        request_history, _ = self._ledger.freeze_with_cut_off(billing_in_flight)
+        self.abandoned = AbandonedStreamRecord(request_history=request_history)
         self._end_operation(self.abandoned)
 
     def _exit_admission(self, exc: BaseException | None) -> Verdict | None:
@@ -314,7 +319,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             _ = self._exit_admission(None)
 
     def _step_after_failure(self, exc: Exception, verdict: Verdict | None) -> _FailureStep:
-        """Note the failed attempt's request id and decide how the call continues."""
+        """Note the failed request's request id and decide how handling the input continues."""
         request_id = self._adapter.request_id_from_error(exc)
         if request_id is None and self._adapter_stream is not None:
             request_id = self._adapter_stream.request_id()
@@ -322,54 +327,54 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         return _failure_step(exc, verdict=verdict, classify=self._adapter.classify)
 
     async def _backoff_or_exhaust(self, exc: Exception, step: _RetryStep) -> None:
-        """Wait before the next open attempt, as `step` asks.
+        """Wait before the next request that opens the stream, as `step` asks.
 
         `_RetryAfterSharedPause` relies on the next `admitted()` wait.
 
         Raises:
-            GenerationError: the recorded failure spent the last attempt.
+            GenerationError: the recorded failure used the last of `max_requests`.
         """
-        if self._ledger.attempts >= self._max_attempts:
+        if self._ledger.request_count >= self._max_requests:
             raise GenerationError(
-                record=RetriesExhaustedErrorRecord(call=self._ledger.freeze()),
-                request=self._request,
-                provider_attempts=self._ledger.provider_attempts,
+                record=RetriesExhaustedErrorRecord(request_history=self._ledger.freeze()),
+                request_params=self._request_params,
+                request_provider_data=self._ledger.request_provider_data,
             ) from exc
         if step.kind == "retry_after_private_wait":
             await asyncio.sleep(self._private_backoff.next_wait(step.retry_after))
 
-    def __aiter__(self) -> "StreamHandle[OutputT, ToolTurnT]":
+    def __aiter__(self) -> "StreamHandle[OutputT, GenerationWithToolCallsT]":
         """Return `self` because the handle is its own iterator."""
         return self
 
     async def _open_stream_with_retries(self) -> None:
         """Open an adapter stream and retry transient open failures.
 
-        Each attempt uses one `admitted` block and releases it before backoff.
-        A successful stream holds admission until completion.
+        Each request uses one `admitted` block and releases it before backoff.
+        An opened stream holds admission until completion.
 
         Raises:
-            GenerationError: The adapter or provider rejects the request.
+            GenerationError: The adapter returns `RefusedMessages`, or the provider rejects a request.
                 The provider declares the open failure terminal.
                 The adapter cannot classify the open failure.
-                Open failures consume `max_attempts`.
+                Open failures consume `max_requests`.
         """
-        built = self._bound_adapter.build_request(self._messages)
-        if isinstance(built, InvalidRequest):
+        built = self._bound_adapter.build_request_params(self._messages)
+        if isinstance(built, RefusedMessages):
             raise GenerationError(
-                record=InvalidRequestErrorRecord(
-                    error_text=built.reason, call=self._ledger.freeze()
+                record=RejectedErrorRecord(
+                    error_text=built.reason, request_history=self._ledger.freeze()
                 ),
-                request=None,
-                provider_attempts=self._ledger.provider_attempts,
+                request_params=None,
+                request_provider_data=self._ledger.request_provider_data,
             ) from None
-        request = built
-        self._request = request
+        request_params = built
+        self._request_params = request_params
         while self._adapter_stream is None:
             self._admission = await self._shared_backoff.admitted().__aenter__()
-            self._ledger.start_attempt()
+            self._ledger.start_request()
             try:
-                opened = await self._bound_adapter.open_stream(request)
+                opened = await self._bound_adapter.open_stream(request_params)
             except Exception as exc:
                 step = self._step_after_failure(exc, self._exit_admission(exc))
                 if step.kind == "terminal":
@@ -378,7 +383,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                         reason=str(exc),
                         ledger=self._ledger,
                         billing=None,
-                        request=request,
+                        request_params=request_params,
                         stream_opened=self._adapter_stream is not None,
                     ) from exc
                 self._ledger.record(
@@ -418,8 +423,8 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         except BaseException as exc:
             self._state = "finished"
             if self._conclusion is not None or not isinstance(exc, Exception):
-                # A stored conclusion already records the call.
-                # Cancellation destroys the frames that could observe the call, so `abandoned` records it.
+                # A stored conclusion already records the input.
+                # Cancellation destroys the frames that could observe the input, so `abandoned` records it.
                 raise
             failure = (
                 exc if isinstance(exc, GenerationError) else _escaped_error(self._ledger, exc)
@@ -444,7 +449,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 self._ended_at_monotonic_seconds = time.monotonic()
             _ = self._exit_admission(None)
             raise
-        except Exception as exc:  # noqa: BLE001 (every failure of an open stream settles its attempt)
+        except Exception as exc:  # noqa: BLE001 (every failure of an open stream settles its request)
             raise await self._error_after_stream_failure(exc, stage="iteration")  # noqa: B904 (the returned error already holds its cause)
         except BaseException:
             _ = self._exit_admission(None)
@@ -455,9 +460,9 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
     async def _error_after_stream_failure(
         self, exc: Exception, *, stage: Literal["iteration", "assembly"]
     ) -> GenerationError:
-        """Settle the open stream's failed attempt and build the call's error with its cause set.
+        """Settle the open stream's failed request and build the input's error with its cause set.
 
-        An open stream cannot retry, so a transient failure ends the call as `retry_unavailable_error`.
+        An open stream cannot retry, so a transient failure ends the input as `retry_unavailable_error`.
         `stage` names the stream step that failed in the transient error text.
         """
         self._state = "finished"
@@ -470,7 +475,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 reason=str(exc),
                 ledger=self._ledger,
                 billing=stream_billing,
-                request=self._request,
+                request_params=self._request_params,
                 stream_opened=self._adapter_stream is not None,
             )
             error.__cause__ = exc
@@ -480,27 +485,29 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             self._ledger.record(error=wrapped, assistant_message=None, billing=stream_billing)
             error = GenerationError(
-                record=RetryUnavailableErrorRecord(call=self._ledger.freeze()),
-                request=self._request,
-                provider_attempts=self._ledger.provider_attempts,
+                record=RetryUnavailableErrorRecord(request_history=self._ledger.freeze()),
+                request_params=self._request_params,
+                request_provider_data=self._ledger.request_provider_data,
             )
             error.__cause__ = wrapped
         await self._close_adapter_stream()
         return error
 
     @overload
-    async def final(self: "StreamHandle[OutputT, Never]") -> Response[OutputT]: ...
+    async def final(
+        self: "StreamHandle[OutputT, Never]",
+    ) -> GenerationWithoutToolCalls[OutputT]: ...
     @overload
-    async def final(self) -> "Response[OutputT] | ToolTurnT": ...
-    async def final(self) -> Response[OutputT] | ToolCallTurn[object]:
-        """Drain remaining items and return the stored result.
+    async def final(self) -> "GenerationWithoutToolCalls[OutputT] | GenerationWithToolCallsT": ...
+    async def final(self) -> GenerationWithoutToolCalls[OutputT] | GenerationWithToolCalls[object]:
+        """Drain remaining items and return the stored generation.
 
         Repeated calls return or raise the same conclusion without reading the stream again.
-        A response with no output becomes a terminal `GenerationError`.
+        A response that is not usable becomes a terminal `GenerationError`.
 
         Raises:
             GenerationError: The adapter or provider reports a terminal failure.
-                The assembled response reports a terminal result.
+                The assembled response is not usable.
                 The open stream fails transiently.
                 The event stream violates its event contract, such as ending without a terminal event.
                 The adapter cannot classify an item exception.
@@ -527,23 +534,23 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                     adapter_stream, ended_at_monotonic_seconds=ended_at_monotonic_seconds
                 )
             except Exception as escaped:  # noqa: BLE001 (an escaped Exception becomes the stored escaped_exception_error)
-                # Store every conclusion, because `_conclude` records the attempt before it can raise.
-                # A second `final()` call would otherwise record the attempt again.
+                # Store every conclusion, because `_conclude` records the request before it can raise.
+                # A second `final()` call would otherwise record the request again.
                 escaped_error = _escaped_error(self._ledger, escaped)
                 escaped_error.__cause__ = escaped
                 self._conclusion = escaped_error
             self._end_operation(self._conclusion)
             await self._close_deadline(None)
-        if isinstance(self._conclusion, (Response, ToolCallTurn)):
+        if isinstance(self._conclusion, (GenerationWithoutToolCalls, GenerationWithToolCalls)):
             return self._conclusion
         raise self._conclusion
 
     async def _assembled_conclusion(
         self, adapter_stream: AdapterStream, *, ended_at_monotonic_seconds: float
-    ) -> CallResult[OutputT]:
-        """Assemble and interpret the drained stream's response, and build the call's conclusion.
+    ) -> GenerationOutcome[OutputT]:
+        """Assemble and interpret the drained stream's response, and build the input's conclusion.
 
-        A failure to assemble or interpret settles the attempt like a failure during iteration.
+        A failure to assemble or interpret settles the request like a failure during iteration.
         """
         try:
             raw = await adapter_stream.final()
@@ -555,7 +562,7 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
                 ),
             )
             outcome = self._bound_adapter.interpret(raw)
-        except Exception as exc:  # noqa: BLE001 (an assembly failure settles the attempt like an iteration failure)
+        except Exception as exc:  # noqa: BLE001 (an assembly failure settles the request like an iteration failure)
             return await self._error_after_stream_failure(exc, stage="assembly")
         return self._conclude(outcome, ended_at_monotonic_seconds=ended_at_monotonic_seconds)
 
@@ -564,12 +571,12 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
         outcome: ResponseOutcome[OutputT],
         *,
         ended_at_monotonic_seconds: float,
-    ) -> CallResult[OutputT]:
-        """Build the call result for this outcome.
+    ) -> GenerationOutcome[OutputT]:
+        """Build the `GenerationOutcome` for this response outcome.
 
-        Returns the error rather than raising it, so no case can conclude the call without being stored.
-        Every outcome records the staged response before building the result.
-        The frozen call therefore includes the terminal response and billing.
+        Returns the error rather than raising it, so no case can conclude the input without being stored.
+        Every outcome records the staged response before building the `GenerationOutcome`.
+        The frozen `RequestHistory` therefore includes the last response and billing.
         """
         if outcome.kind == "provider_failed_transiently":
             failure = TransientError(outcome.reason, is_rate_limit=outcome.is_rate_limit)
@@ -580,10 +587,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             )
             retry_unavailable = GenerationError(
                 record=RetryUnavailableErrorRecord(
-                    call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
+                    request_history=self._ledger.freeze_ending_at(ended_at_monotonic_seconds)
                 ),
-                request=self._request,
-                provider_attempts=self._ledger.provider_attempts,
+                request_params=self._request_params,
+                request_provider_data=self._ledger.request_provider_data,
             )
             retry_unavailable.__cause__ = failure
             return retry_unavailable
@@ -592,10 +599,10 @@ class StreamHandle[OutputT, ToolTurnT: ToolCallTurn[object] = Never]:
             error=None,
             assistant_message=outcome.assistant_message,
         )
-        return _call_result_from_response_outcome(
+        return _generation_outcome_from_response_outcome(
             outcome,
-            call=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
-            provider_attempts=self._ledger.provider_attempts,
-            request=self._request,
-            splits_tool_call_turns=self._splits_tool_call_turns,
+            request_history=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
+            request_provider_data=self._ledger.request_provider_data,
+            request_params=self._request_params,
+            splits_on_tool_calls=self._splits_on_tool_calls,
         )

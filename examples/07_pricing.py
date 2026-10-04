@@ -1,10 +1,10 @@
-"""Price an uncataloged model and read its response cost."""
+"""Price an uncataloged model and read the cost of a generation."""
 
-from langchaint import Response
+from langchaint import GenerationWithoutToolCalls
 from langchaint.openai import OpenAI, OpenAIPricingTable, OpenAIRates
 
 
-async def price_at_negotiated_rates() -> Response[str]:
+async def price_at_negotiated_rates() -> GenerationWithoutToolCalls[str]:
     """Price an uncataloged model at contract rates.
 
     Raises:
@@ -24,7 +24,6 @@ async def price_at_negotiated_rates() -> Response[str]:
         pricing=pricing,
         supports_prompt_cache_options=True,
     ).bind(system_prompt="Be terse.")
-    response = await bound.generate_one("Name three primary colors.")
-    print(f"bill this call at {response.usage.cost_in_usd} USD")
-    print(f"kept answer cost: {response.usage_successful_attempt.cost_in_usd} USD")
-    return response
+    generation = await bound.generate_one("Name three primary colors.")
+    print(f"billed {generation.usage.cost_in_usd} USD across every request")
+    return generation

@@ -27,7 +27,6 @@ from langchaint import (
 )
 from langchaint.adapter import (
     Adapter,
-    AdapterResult,
     AdapterStream,
     Binding,
     BoundAdapter,
@@ -37,6 +36,7 @@ from langchaint.adapter import (
     RequestParams,
     ResponseIdentity,
     TransientError,
+    UsableResponse,
     Verdict,
     verdict_from_transient_error,
 )
@@ -88,7 +88,7 @@ _TURN_BILLING = Billing(
 
 @dataclass
 class Turn:
-    """Configure one scripted assistant turn.
+    """Configure one scripted turn.
 
     text ends the loop, and tool_calls continue it.
     delay_seconds suspends open_stream before error is raised or output is returned.
@@ -165,8 +165,8 @@ class ScriptedAdapter(Adapter):
 
 
 @dataclass(frozen=True, kw_only=True)
-class _ScriptedRequest(RequestParams):
-    """Store the messages for one scripted attempt."""
+class _ScriptedRequestParams(RequestParams):
+    """Store the messages for one scripted request."""
 
     messages: tuple[Message, ...]
 
@@ -202,33 +202,33 @@ class _ScriptedBoundAdapter(BoundAdapter[str]):
         )
 
     @override
-    def interpret(self, raw: BaseModel) -> AdapterResult[str]:
-        """Build the result for the scripted turn.
+    def interpret(self, raw: BaseModel) -> UsableResponse[str]:
+        """Build the usable response for the scripted turn.
 
         Raises:
             TypeError: `raw` is not a `FakeRaw`.
         """
         turn = self._adapter.scripts[self._system_prompt].turns[_turn_index(raw)]
         if turn.tool_calls:
-            return AdapterResult(
+            return UsableResponse(
                 output="",
-                assistant_message=AssistantMessage(turn=turn.tool_calls),
+                assistant_message=AssistantMessage(parts=turn.tool_calls),
                 stop_reason="tool_use",
             )
         assert turn.text is not None
-        return AdapterResult(
+        return UsableResponse(
             output=turn.text,
-            assistant_message=AssistantMessage(turn=(TextPart(text=turn.text),)),
+            assistant_message=AssistantMessage(parts=(TextPart(text=turn.text),)),
             stop_reason="end_turn",
         )
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams:
-        """Build a request containing the messages."""
-        return _ScriptedRequest(messages=tuple(messages))
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams:
+        """Build request params containing the messages."""
+        return _ScriptedRequestParams(messages=tuple(messages))
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open the next scripted turn after its delay.
 
         Raises:

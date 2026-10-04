@@ -110,7 +110,7 @@ ZERO_USAGE: Usage = Usage(
     output_tokens_cost_in_usd=0.0,
     provider_executed_tool_cost_in_usd=0.0,
 )
-"""Usage for an empty sum or an attempt with no reported billing."""
+"""Usage for an empty sum or a request with no reported billing."""
 
 
 def _serialize_nonfinite_float(value: float) -> float | str:

@@ -36,12 +36,12 @@ from langchaint.common.messages import (
     UserMessage,
     _is_object_dict,
 )
-from langchaint.generation.call import CallRecord, SettledAttemptRecord
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
+from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
 from langchaint.generation.response import (
     GenerationRecord,
-    ResponseRecord,
-    ToolCallTurnRecord,
+    GenerationWithoutToolCallsRecord,
+    GenerationWithToolCallsRecord,
 )
 from langchaint.tools import ToolManager, ToolSchema, ToolSequence
 
@@ -578,8 +578,10 @@ def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessa
     _require_message_metadata(message)
     if message.role != "assistant":
         raise _unsupported(message, "output message role")
-    turn = _assistant_message_from_parts(message.parts).turn
-    return AssistantMessage(turn=tuple(part for part in turn if part.kind != "text" or part.text))
+    parts = _assistant_message_from_parts(message.parts).parts
+    return AssistantMessage(
+        parts=tuple(part for part in parts if part.kind != "text" or part.text)
+    )
 
 
 def output_messages_from_otel(
@@ -608,17 +610,17 @@ def output_messages_from_otel(
 def generation_record_from_otel(
     otel_chat_span: OtelChatSpan,
 ) -> GenerationRecord[JsonValue, JsonValue]:
-    """Convert one successful parsed OTel chat span into the record a live call returns.
+    """Convert one parsed OTel chat span of a generation into the record a live `generate_one` returns.
 
-    An output message with a tool call returns `ToolCallTurnRecord`.
-    Any other output message returns `ResponseRecord`.
-    The record contains one synthetic attempt.
-    `started_after_seconds`, attempt `elapsed_seconds`, and call `elapsed_seconds` are `0.0`.
+    An output message with a tool call returns `GenerationWithToolCallsRecord`.
+    Any other output message returns `GenerationWithoutToolCallsRecord`.
+    The record contains one synthetic request record.
+    `started_after_seconds` and both `elapsed_seconds` values, on the request record and the request history, are `0.0`.
     `seconds_to_first_item`, `error`, and `request_id` are `None`.
     `Billing.usage` is `ZERO_USAGE`.
     `Billing.service_tier` is `"unknown"`.
     Every `Billing` rate is NaN.
-    Trace usage, cost, retry, attempt, timing, and provider service-tier attributes are ignored.
+    Trace usage, cost, retry, request count, timing, and provider service-tier attributes are ignored.
     Failure detection uses `error.type` and the selected finish reason.
     `OtelChatSpan` does not contain OTel span status.
     A failed span without either failure signal cannot be detected.
@@ -628,7 +630,7 @@ def generation_record_from_otel(
 
     Raises:
         OtelToLangchaintConversionError: The span reports failure.
-        OtelToLangchaintConversionError: A selected value cannot construct a successful record unchanged.
+        OtelToLangchaintConversionError: A selected value cannot construct a generation record unchanged.
     """
     if otel_chat_span.error_type is not None:
         raise _attribute_conversion_error("error.type", "reports a failed span")
@@ -654,7 +656,7 @@ def generation_record_from_otel(
         cache_write_usd_per_million_tokens=float("nan"),
         output_usd_per_million_tokens=float("nan"),
     )
-    attempt = SettledAttemptRecord(
+    request_record = SettledRequestRecord(
         started_after_seconds=0.0,
         elapsed_seconds=0.0,
         seconds_to_first_item=None,
@@ -665,15 +667,19 @@ def generation_record_from_otel(
         response_id=otel_chat_span.response_id,
         request_id=None,
     )
-    call = CallRecord(
+    request_history = RequestHistory(
         model=otel_chat_span.request_model,
         provider_name=otel_chat_span.provider_name,
-        attempt_records=(attempt,),
+        request_records=(request_record,),
         elapsed_seconds=0.0,
     )
     if assistant_message.tool_calls:
-        return ToolCallTurnRecord[JsonValue](call=call, output=output, stop_reason=stop_reason)
-    return ResponseRecord[JsonValue](call=call, output=output, stop_reason=stop_reason)
+        return GenerationWithToolCallsRecord[JsonValue](
+            request_history=request_history, output=output, stop_reason=stop_reason
+        )
+    return GenerationWithoutToolCallsRecord[JsonValue](
+        request_history=request_history, output=output, stop_reason=stop_reason
+    )
 
 
 @overload
@@ -838,14 +844,14 @@ def _selected_output_type(output_type: str | None) -> str:
 
 
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
-    """Return the output a live call returns for `assistant_message`.
+    """Return the output a live `generate_one` returns for `assistant_message`.
 
     Under `"text"`, the output is `assistant_message.text`.
-    Under `"json"`, a turn with a tool call has output `None` when its text is not valid JSON.
+    Under `"json"`, an assistant message with a tool call has output `None` when its text is not valid JSON.
 
     Raises:
         OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
-        OtelToLangchaintConversionError: The text of a turn without a tool call is not valid JSON under `"json"`.
+        OtelToLangchaintConversionError: Under `"json"`, an assistant message without a tool call has invalid JSON text.
     """
     selected_output_type = _selected_output_type(output_type)
     if selected_output_type == "text":
@@ -935,7 +941,7 @@ def _assistant_message_from_parts(parts: tuple[OtelMessagePart, ...]) -> Assista
             )
         else:
             raise _unsupported(part, "assistant part type")
-    return AssistantMessage(turn=tuple(converted))
+    return AssistantMessage(parts=tuple(converted))
 
 
 def _content_parts_from_otel(parts: tuple[OtelMessagePart, ...]) -> tuple[ContentPart, ...]:

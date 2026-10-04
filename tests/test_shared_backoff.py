@@ -61,19 +61,19 @@ def _all_permits_free(shared_backoff: SharedBackoff) -> bool:
 
 
 async def _raise_in_block(admission: Admission, failure: Exception) -> None:
-    """Enter the block and raise failure as the attempt's ending."""
+    """Enter the block and raise failure as the request's ending."""
     async with admission:
         raise failure
 
 
 async def _enter_empty_block(admission: Admission) -> None:
-    """Enter the block and end the attempt at once, successfully."""
+    """Enter the block and end the request at once without a failure."""
     async with admission:
         pass
 
 
-async def _fail_one_attempt(shared_backoff: SharedBackoff) -> Admission:
-    """Run one attempt that raises ProviderError, and return its Admission.
+async def _fail_one_request(shared_backoff: SharedBackoff) -> Admission:
+    """Run one request that raises ProviderError, and return its Admission.
 
     Asserts the exit re-raised the provider failure to the caller.
     """
@@ -199,7 +199,7 @@ def test_success_returns_the_permit_and_records_nothing() -> None:
 
 
 def test_an_exception_outside_failure_types_propagates_unparsed() -> None:
-    """A fault in the attempt returns the permit and is neither parsed nor recorded."""
+    """A fault in the request returns the permit and is neither parsed nor recorded."""
 
     async def scenario() -> None:
         parsed: list[Exception] = []
@@ -210,8 +210,8 @@ def test_an_exception_outside_failure_types_propagates_unparsed() -> None:
 
         shared_backoff = _shared_backoff(parse=parse)
         admission = shared_backoff.admitted()
-        with pytest.raises(ValueError, match="attempt fault"):
-            await _raise_in_block(admission, ValueError("attempt fault"))
+        with pytest.raises(ValueError, match="request fault"):
+            await _raise_in_block(admission, ValueError("request fault"))
         assert admission.verdict is None
         assert parsed == []
         assert _all_permits_free(shared_backoff)
@@ -225,7 +225,7 @@ def test_a_failure_is_parsed_recorded_and_propagated() -> None:
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=0.25))
-        admission = await _fail_one_attempt(shared_backoff)
+        admission = await _fail_one_request(shared_backoff)
         assert admission.verdict == PauseAll(retry_after=0.25)
         assert _all_permits_free(shared_backoff)
         assert shared_backoff._pause_until > shared_backoff._clock()
@@ -244,7 +244,7 @@ def test_a_pause_all_do_not_retry_verdict_starts_the_shared_pause() -> None:
         shared_backoff = _shared_backoff(
             parse=lambda _failure: PauseAllDoNotRetry(retry_after=0.25)
         )
-        admission = await _fail_one_attempt(shared_backoff)
+        admission = await _fail_one_request(shared_backoff)
         assert admission.verdict == PauseAllDoNotRetry(retry_after=0.25)
         assert shared_backoff._pause_until > shared_backoff._clock()
 
@@ -258,7 +258,7 @@ def test_a_pause_all_do_not_retry_retry_after_is_capped_like_any_other() -> None
         shared_backoff = _shared_backoff(
             parse=lambda _failure: PauseAllDoNotRetry(retry_after=10_000.0)
         )
-        admission = await _fail_one_attempt(shared_backoff)
+        admission = await _fail_one_request(shared_backoff)
         assert admission.verdict == PauseAllDoNotRetry(
             retry_after=shared_backoff.longest_wait_seconds
         )
@@ -276,7 +276,7 @@ def test_a_non_pausing_verdict_changes_no_shared_state(verdict: Verdict) -> None
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff(parse=lambda _failure: verdict)
-        admission = await _fail_one_attempt(shared_backoff)
+        admission = await _fail_one_request(shared_backoff)
         assert admission.verdict == verdict
         assert shared_backoff._pause_until == _NEVER
 
@@ -310,7 +310,7 @@ def test_retry_after_normalization() -> None:
             shared_backoff = _shared_backoff(
                 parse=lambda _failure, stated=stated: PauseAll(retry_after=stated)
             )
-            admission = await _fail_one_attempt(shared_backoff)
+            admission = await _fail_one_request(shared_backoff)
             assert isinstance(admission.verdict, PauseAll), f"stated={stated!r}"
             assert admission.verdict.retry_after == expected, f"stated={stated!r}"
 
@@ -325,7 +325,7 @@ def test_retry_after_corrections_are_counted() -> None:
             shared_backoff = _shared_backoff(
                 parse=lambda _failure, stated=stated: PauseAll(retry_after=stated)
             )
-            _ = await _fail_one_attempt(shared_backoff)
+            _ = await _fail_one_request(shared_backoff)
             assert shared_backoff.event_counts[tag] == 1
 
     run_with_timeout(scenario())
@@ -339,7 +339,7 @@ def test_a_pause_holds_the_next_admission_until_it_ends() -> None:
 
     async def scenario() -> None:
         shared_backoff = _shared_backoff(parse=lambda _failure: PauseAll(retry_after=10.0))
-        _ = await _fail_one_attempt(shared_backoff)
+        _ = await _fail_one_request(shared_backoff)
         entering = asyncio.create_task(_enter_empty_block(shared_backoff.admitted()))
         await yield_until(lambda: len(shared_backoff._queue) == 1)
         admit_timer = shared_backoff._admit_timer

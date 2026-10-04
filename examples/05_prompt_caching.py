@@ -1,11 +1,11 @@
 """Warm a reusable prompt prefix before running its batch siblings."""
 
-from langchaint import GenerationError, Response, TextPart
+from langchaint import GenerationError, GenerationWithoutToolCalls, TextPart
 from langchaint.anthropic import Anthropic
 
 
-async def generate_with_a_warm_cache() -> list[Response[str] | GenerationError]:
-    """Warm one prefix and print each result's cache usage."""
+async def generate_with_a_warm_cache() -> list[GenerationWithoutToolCalls[str] | GenerationError]:
+    """Warm one prefix and print each outcome's cache usage."""
     anthropic = Anthropic()
     stable_policy = (
         "Support policy: route refunds to a human. "
@@ -21,9 +21,9 @@ async def generate_with_a_warm_cache() -> list[Response[str] | GenerationError]:
         "How do I request a refund?",
         "Which details may a support request include?",
     ]
-    results = await bound.generate_many(prompts, warm_cache=True)
-    for index, result in enumerate(results):
-        usage = result.usage
+    outcomes = await bound.generate_many(prompts, warm_cache=True)
+    for index, outcome in enumerate(outcomes):
+        usage = outcome.usage
         print(f"item {index} wrote {usage.input_tokens_cache_write} cache tokens")
         print(f"item {index} read {usage.input_tokens_cache_read} cache tokens")
-    return results
+    return outcomes

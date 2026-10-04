@@ -41,8 +41,8 @@ Content mappings were verified against openai 2.53.0.
 - `ImagePart` becomes a data URL in `image_url.url`.
 - `ImageUrlPart.url` becomes `image_url.url` unchanged.
 - `AudioPart` accepts `audio/wav` and `audio/mpeg` inside `UserMessage`.
-- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `InvalidRequest`.
-- `ChatCompletionMessage.audio` remains available through `Response.raw`.
+- `ImagePart`, `ImageUrlPart`, and `AudioPart` inside `ToolMessage` return `RefusedMessages`.
+- `ChatCompletionMessage.audio` remains available through `Generation.raw`.
 
 Request and response mappings:
 - A string `system_prompt` becomes the first system-role message.
@@ -96,17 +96,15 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
-    AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyTurn,
-    InvalidRequest,
+    EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
-    NoOutput,
     ReasoningDelta,
     Refusal,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -115,16 +113,19 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedTurn,
+    UnfinishedAssistantMessage,
+    UsableResponse,
     _NotSendableError,
-    narrowed_request,
+    _UnusableResponseBase,
+    narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
-    request_json,
+    request_params_json,
 )
 from langchaint.billing.pricing import ProviderBilling
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
+    AssistantPart,
     ContentPart,
     Message,
     RawPart,
@@ -133,7 +134,6 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnPart,
     UserMessage,
 )
 from langchaint.openai.shared import (
@@ -211,7 +211,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
 
 @dataclass(frozen=True, kw_only=True)
 class _ChatCompletionsRequestParams(RequestParams):
-    """One Chat Completions request: the binding's precomputed fields and this call's messages."""
+    """One Chat Completions request: the binding's precomputed fields and one input's messages."""
 
     precomputed: _ChatCompletionsPrecomputedFields
     messages: list[ChatCompletionMessageParam]
@@ -220,7 +220,7 @@ class _ChatCompletionsRequestParams(RequestParams):
     @override
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
-        return request_json(self, omitted_class=Omit)
+        return request_params_json(self, omitted_class=Omit)
 
 
 def _reasoning_content_extra(model: BaseModel) -> str | None:
@@ -278,19 +278,21 @@ def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
-    parts: list[ChatCompletionContentPartParam] = []
+    wire_parts: list[ChatCompletionContentPartParam] = []
     for part in user_message.content:
         match part.kind:
             case "text":
-                parts.append(_text_part_param(part))
+                wire_parts.append(_text_part_param(part))
             case "image":
-                parts.append(
+                wire_parts.append(
                     _image_part_param(
                         _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
                     )
                 )
             case "image_url":
-                parts.append(_image_part_param(part.url, cache_breakpoint=part.cache_breakpoint))
+                wire_parts.append(
+                    _image_part_param(part.url, cache_breakpoint=part.cache_breakpoint)
+                )
             case "audio":
                 audio_format = _AUDIO_FORMAT_BY_MEDIA_TYPE.get(part.media_type)
                 if audio_format is None:
@@ -308,8 +310,8 @@ def _user_message(user_message: UserMessage) -> ChatCompletionUserMessageParam:
                 }
                 if part.cache_breakpoint:
                     wire_audio["prompt_cache_breakpoint"] = {"mode": "explicit"}
-                parts.append(wire_audio)
-    return {"role": "user", "content": parts}
+                wire_parts.append(wire_audio)
+    return {"role": "user", "content": wire_parts}
 
 
 def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
@@ -326,11 +328,11 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
             "tool_call_id": tool_message.tool_call_id,
             "content": tool_message.content,
         }
-    parts: list[ChatCompletionContentPartTextParam] = []
+    wire_parts: list[ChatCompletionContentPartTextParam] = []
     for part in tool_message.content:
         match part.kind:
             case "text":
-                parts.append(_text_part_param(part))
+                wire_parts.append(_text_part_param(part))
             case "image":
                 raise _text_only_tool_message_error(part)
             case "image_url":
@@ -340,7 +342,7 @@ def _tool_message(tool_message: ToolMessage) -> ChatCompletionToolMessageParam:
     return {
         "role": "tool",
         "tool_call_id": tool_message.tool_call_id,
-        "content": parts,
+        "content": wire_parts,
     }
 
 
@@ -360,7 +362,7 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
     param: dict[str, object] = {"role": "assistant"}
     texts: list[str] = []
     tool_calls: list[ChatCompletionMessageToolCallUnionParam] = []
-    for part in assistant_message.turn:
+    for part in assistant_message.parts:
         match part.kind:
             case "reasoning_part":
                 param.update(part.raw)
@@ -379,14 +381,14 @@ def _assistant_message_param(assistant_message: AssistantMessage) -> ChatComplet
                 elif len(part.raw) == 1 and "function_call" in part.raw:
                     if "function_call" in param:
                         raise _NotSendableError(
-                            "an assistant turn contains more than one function_call, but Chat "
+                            "an assistant message contains more than one function_call, but Chat "
                             "Completions has one function_call field"
                         )
                     param.update(part.raw)
                 else:
                     raise _NotSendableError(
                         "RawPart.raw has no Chat Completions wire form: only custom tool_calls and "
-                        "function_call can hold it; rebuild the turn without it"
+                        "function_call can hold it; rebuild the assistant message without it"
                     )
     if texts:
         param["content"] = "".join(texts)
@@ -467,7 +469,7 @@ def _as_chat_completion(raw: BaseModel) -> ChatCompletion:
 
 
 def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
-    """Preserve replayable provider values inside AssistantMessage.turn.
+    """Preserve replayable provider values inside AssistantMessage.parts.
 
     A non-empty reasoning_content becomes ReasoningPart first.
     message.content then becomes TextPart when non-empty.
@@ -477,28 +479,28 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
     Each custom message.tool_calls entry becomes RawPart.
     The message.tool_calls entry order is preserved.
     openai 2.51.0 defines both variants.
-    message.annotations and message.audio reach no TurnPart.
-    Read those fields from Response.raw.
+    message.annotations and message.audio reach no AssistantPart.
+    Read those fields from `Generation.raw`.
     """
-    turn: list[TurnPart] = []
+    parts: list[AssistantPart] = []
     reasoning_content = _reasoning_content_extra(message)
     if reasoning_content is not None:
-        turn.append(
+        parts.append(
             ReasoningPart(raw={"reasoning_content": reasoning_content}, text=reasoning_content)
         )
     if message.content:
-        turn.append(TextPart(text=message.content))
+        parts.append(TextPart(text=message.content))
     if message.refusal:
-        turn.append(TextPart(text=message.refusal))
+        parts.append(TextPart(text=message.refusal))
     if message.function_call is not None:
-        turn.append(
+        parts.append(
             RawPart(
                 raw=message.model_dump(mode="json", include={"function_call"}, exclude_none=True)
             )
         )
     for tool_call in message.tool_calls or ():
         if tool_call.type == "function":
-            turn.append(
+            parts.append(
                 ToolCall(
                     id=tool_call.id,
                     name=tool_call.function.name,
@@ -506,56 +508,58 @@ def _assistant_message_from(message: ChatCompletionMessage) -> AssistantMessage:
                 )
             )
         else:
-            turn.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(turn=tuple(turn))
+            parts.append(RawPart(raw=tool_call.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(parts=tuple(parts))
 
 
 @dataclass(frozen=True, kw_only=True)
-class _FinishedTurn:
-    """A choice langchaint can read a turn from: its finish reason, its message, and its converted turn."""
+class _FinishedMessage:
+    """A choice with an assistant message: its finish reason, its message, and its converted assistant message."""
 
     finish_reason: str
     message: ChatCompletionMessage
     assistant_message: AssistantMessage
 
 
-def _finished_turn_or_unfinished(completion: ChatCompletion) -> _FinishedTurn | UnfinishedTurn:
-    """Read the first choice as a finished turn, or report why no turn can be read.
+def _finished_message_or_unfinished(
+    completion: ChatCompletion,
+) -> _FinishedMessage | UnfinishedAssistantMessage:
+    """Read the first choice as a finished assistant message, or report why none can be read.
 
-    Missing choices and `finish_reason=None` return `UnfinishedTurn`.
-    The result carries any partial turn.
+    Missing choices and `finish_reason=None` return `UnfinishedAssistantMessage`.
+    An `UnusableResponse` carries any partial assistant message.
     """
     if not completion.choices:
-        return UnfinishedTurn(
-            reason="openai returned no choices, so there is no turn to read",
-            assistant_message=AssistantMessage(turn=()),
+        return UnfinishedAssistantMessage(
+            reason="openai returned no choices, so there is no assistant message to read",
+            assistant_message=AssistantMessage(parts=()),
         )
     choice = completion.choices[0]
     assistant_message = _assistant_message_from(choice.message)
     finish_reason: str | None = choice.finish_reason
     if finish_reason is None:
-        return UnfinishedTurn(
+        return UnfinishedAssistantMessage(
             reason="openai returned a choice with no finish_reason, "
             "which langchaint cannot call finished",
             assistant_message=assistant_message,
         )
-    return _FinishedTurn(
+    return _FinishedMessage(
         finish_reason=finish_reason, message=choice.message, assistant_message=assistant_message
     )
 
 
-def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
+def _normalized_stop_reason(finished_message: _FinishedMessage) -> StopReason:
     """Map the finish reason to the neutral vocabulary.
 
     The module docstring states each mapping.
 
     The refusal field is tested ahead of the rows, as the module docstring states.
     """
-    if finished_turn.message.refusal:
+    if finished_message.message.refusal:
         return "refusal"
-    match finished_turn.finish_reason:
+    match finished_message.finish_reason:
         case "stop":
-            return "tool_use" if finished_turn.assistant_message.tool_calls else "end_turn"
+            return "tool_use" if finished_message.assistant_message.tool_calls else "end_turn"
         case "tool_calls":
             return "tool_use"
         case "length":
@@ -566,13 +570,13 @@ def _normalized_stop_reason(finished_turn: _FinishedTurn) -> StopReason:
             return "other"
 
 
-def _adapter_result[OutputT](
-    finished_turn: _FinishedTurn, output: OutputT
-) -> AdapterResult[OutputT]:
-    return AdapterResult(
+def _usable_response[OutputT](
+    finished_message: _FinishedMessage, output: OutputT
+) -> UsableResponse[OutputT]:
+    return UsableResponse(
         output=output,
-        assistant_message=finished_turn.assistant_message,
-        stop_reason=_normalized_stop_reason(finished_turn),
+        assistant_message=finished_message.assistant_message,
+        stop_reason=_normalized_stop_reason(finished_message),
     )
 
 
@@ -1024,26 +1028,26 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Convert messages into the wire messages every attempt of this call sends."""
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+        """Convert messages into the wire messages every request for one input sends."""
         try:
             wire_messages = _wire_messages(messages)
         except _NotSendableError as not_sendable:
-            return InvalidRequest(reason=str(not_sendable))
+            return RefusedMessages(reason=str(not_sendable))
         return _ChatCompletionsRequestParams(
             precomputed=self._precomputed_fields,
             messages=[*self._precomputed_fields.messages_prefix, *wire_messages],
         )
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open one streaming create call and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request(request, _ChatCompletionsRequestParams)
+        params = narrowed_request_params(request_params, _ChatCompletionsRequestParams)
         precomputed = params.precomputed
         sdk_stream = await self._adapter.client.chat.completions.create(
             model=precomputed.model,
@@ -1073,25 +1077,25 @@ class _BoundChatCompletions[OutputT](BoundAdapter[OutputT], ABC):
 
 
 class _BoundChatCompletionsText(_BoundChatCompletions[str]):
-    """Text-bound adapter: output is the concatenated text of the turn."""
+    """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the turn, whose concatenated text is this binding's output.
+        """Read the assistant message, whose concatenated text is this binding's output.
 
         Refusals and truncations still return their text with a matching stop reason.
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_turn = _finished_turn_or_unfinished(_as_chat_completion(raw))
-        if isinstance(finished_turn, NoOutput):
-            return finished_turn
-        return _adapter_result(finished_turn, finished_turn.assistant_message.text)
+        finished_message = _finished_message_or_unfinished(_as_chat_completion(raw))
+        if isinstance(finished_message, _UnusableResponseBase):
+            return finished_message
+        return _usable_response(finished_message, finished_message.assistant_message.text)
 
 
 class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[ModelT | None]):
-    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
+    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
@@ -1112,7 +1116,9 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
             ),
         )
 
-    def _parsed_outcome(self, finished_turn: _FinishedTurn) -> ResponseOutcome[ModelT | None]:
+    def _parsed_outcome(
+        self, finished_message: _FinishedMessage
+    ) -> ResponseOutcome[ModelT | None]:
         """Validate message.content after the response enters langchaint.
 
         Therefore, rejected content and billing remain available.
@@ -1122,38 +1128,41 @@ class _BoundChatCompletionsStructured[ModelT: BaseModel](_BoundChatCompletions[M
         finish_reason "length" returns MaxCompletionTokensExceeded.
         A tool_use stop with non-empty AssistantMessage.tool_calls returns None.
         Remaining invalid content returns SchemaViolation.
-        Every remaining response returns EmptyTurn.
+        Every remaining response returns EmptyAssistantMessage.
         """
         validation_error: ValidationError | None = None
-        text = finished_turn.message.content
+        text = finished_message.message.content
         if text:
             try:
                 output = self._response_format.model_validate_json(text)
-                return _adapter_result(finished_turn, output)
+                return _usable_response(finished_message, output)
             except ValidationError as rejection:
                 validation_error = rejection
-        assistant_message = finished_turn.assistant_message
-        if _normalized_stop_reason(finished_turn) == "tool_use" and assistant_message.tool_calls:
-            return _adapter_result(finished_turn, None)
-        if finished_turn.message.refusal or finished_turn.finish_reason == "content_filter":
+        assistant_message = finished_message.assistant_message
+        if (
+            _normalized_stop_reason(finished_message) == "tool_use"
+            and assistant_message.tool_calls
+        ):
+            return _usable_response(finished_message, None)
+        if finished_message.message.refusal or finished_message.finish_reason == "content_filter":
             return Refusal(assistant_message=assistant_message)
-        if finished_turn.finish_reason == "length":
+        if finished_message.finish_reason == "length":
             return MaxCompletionTokensExceeded(assistant_message=assistant_message)
         if validation_error is not None:
             return SchemaViolation(
                 validation_error_json=validation_error.json(include_url=False),
                 assistant_message=assistant_message,
             )
-        return EmptyTurn(assistant_message=assistant_message)
+        return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, or report why the response produced none.
+        """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:
             TypeError: raw is not an openai ChatCompletion.
         """
-        finished_turn = _finished_turn_or_unfinished(_as_chat_completion(raw))
-        if isinstance(finished_turn, NoOutput):
-            return finished_turn
-        return self._parsed_outcome(finished_turn)
+        finished_message = _finished_message_or_unfinished(_as_chat_completion(raw))
+        if isinstance(finished_message, _UnusableResponseBase):
+            return finished_message
+        return self._parsed_outcome(finished_message)

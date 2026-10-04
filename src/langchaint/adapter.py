@@ -33,7 +33,7 @@ _logger = logging.getLogger(__name__)
 
 
 class ResponseIdentity(NamedTuple):
-    """Provider response identifiers recorded on one settled attempt."""
+    """Provider response identifiers recorded on one settled request."""
 
     model_served: str
     response_id: str
@@ -240,7 +240,7 @@ Two forming calls' deltas may interleave, so a consumer accumulates per id.
 When the completed call's `args_json` is valid JSON, its concatenated deltas parse to the same JSON value.
 An adapter may re-serialize the arguments it accumulated, so text equality is not promised.
 Providers that deliver complete calls or empty arguments can produce no deltas.
-Usage, cost, and stop reason are available on the `Response` from `final()` instead of the stream.
+Usage, cost, and stop reason are available on the `Generation` from `final()` instead of the stream.
 """
 
 
@@ -408,43 +408,43 @@ def reject_extra_body_keys_the_adapter_populates(
 
 
 @dataclass(frozen=True, kw_only=True)
-class AdapterResult[OutputT]:
-    """A successful provider turn normalized to langchaint values.
+class UsableResponse[OutputT]:
+    """A response whose assistant message is usable: it gives output or has tool calls.
 
     `output` contains text or a validated `response_format` instance.
-    A structured tool-call turn has `output=None` and carries its calls on `assistant_message`.
+    A structured binding's assistant message with tool calls and no instance has `output=None`.
     """
 
     output: OutputT
     assistant_message: AssistantMessage
     stop_reason: StopReason
-    kind: Literal["adapter_result"] = "adapter_result"
+    kind: Literal["usable_response"] = "usable_response"
 
 
 @dataclass(frozen=True, kw_only=True)
-class NoOutput:
-    """The `assistant_message` from a response that produced no output."""
+class _UnusableResponseBase:
+    """The base of every `UnusableResponse` variant: a response whose `assistant_message` is not usable."""
 
     assistant_message: AssistantMessage
 
 
 @dataclass(frozen=True, kw_only=True)
-class Refusal(NoOutput):
+class Refusal(_UnusableResponseBase):
     """A completed response that a refusal ended before it produced output."""
 
     kind: Literal["refusal"] = "refusal"
 
 
 @dataclass(frozen=True, kw_only=True)
-class MaxCompletionTokensExceeded(NoOutput):
+class MaxCompletionTokensExceeded(_UnusableResponseBase):
     """A completed 200 that reached the token cap before its JSON closed."""
 
     kind: Literal["max_completion_tokens_exceeded"] = "max_completion_tokens_exceeded"
 
 
 @dataclass(frozen=True, kw_only=True)
-class SchemaViolation(NoOutput):
-    """A completed turn whose text fails `response_format` validation.
+class SchemaViolation(_UnusableResponseBase):
+    """A finished assistant message whose text fails `response_format` validation.
 
     `validation_error_json` preserves pydantic's error details and rejected values without documentation URLs.
     """
@@ -454,14 +454,14 @@ class SchemaViolation(NoOutput):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ProviderFailedTransiently(NoOutput):
+class ProviderFailedTransiently(_UnusableResponseBase):
     """A billable response reporting a transient provider failure.
 
-    Generation records the attempt and retries.
-    `reason` becomes the attempt's `TransientError` text.
+    Generation records the request and retries.
+    `reason` becomes the request's `TransientError` text.
     `is_rate_limit=True` produces `PauseAll` during generation.
     `PauseAll` pauses the rate-limit quota.
-    Streaming records the attempt and raises `GenerationError`.
+    Streaming records the request and raises `GenerationError`.
     Streaming cannot retry because the response stream already ended.
     """
 
@@ -471,7 +471,7 @@ class ProviderFailedTransiently(NoOutput):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ProviderFailedTerminally(NoOutput):
+class ProviderFailedTerminally(_UnusableResponseBase):
     """A billable response containing a terminal provider failure.
 
     `reason` preserves the provider's description.
@@ -482,21 +482,21 @@ class ProviderFailedTerminally(NoOutput):
 
 
 @dataclass(frozen=True, kw_only=True)
-class EmptyTurn(NoOutput):
-    """A completed turn that produced no instance and no ToolCall.
+class EmptyAssistantMessage(_UnusableResponseBase):
+    """A finished assistant message with neither a `response_format` instance nor a ToolCall.
 
-    The retry loop records the attempt and raises `GenerationError` without retrying.
+    The retry loop records the request and raises `GenerationError` without retrying.
     A retry would request a new sample.
     """
 
-    kind: Literal["empty_turn"] = "empty_turn"
+    kind: Literal["empty_assistant_message"] = "empty_assistant_message"
 
 
 @dataclass(frozen=True, kw_only=True)
-class ContextWindowExceeded(NoOutput):
+class ContextWindowExceeded(_UnusableResponseBase):
     """A 200 reporting that the request overflowed the model's context window.
 
-    The retry loop records the attempt and raises `GenerationError` without retrying.
+    The retry loop records the request and raises `GenerationError` without retrying.
     The same request always overflows.
     """
 
@@ -504,21 +504,21 @@ class ContextWindowExceeded(NoOutput):
 
 
 @dataclass(frozen=True, kw_only=True)
-class UnfinishedTurn(NoOutput):
+class UnfinishedAssistantMessage(_UnusableResponseBase):
     """A response whose partial content is not a finished answer.
 
     `reason` preserves the provider's description.
     """
 
     reason: str
-    kind: Literal["unfinished_turn"] = "unfinished_turn"
+    kind: Literal["unfinished_assistant_message"] = "unfinished_assistant_message"
 
 
 @dataclass(frozen=True, kw_only=True)
-class InvalidRequest:
+class RefusedMessages:
     """A `Sequence[Message]` the adapter will not put on the wire.
 
-    The retry loop records no attempt and raises `GenerationError` whose `error_text` is `reason`.
+    The retry loop sends no request and raises `GenerationError` whose `error_text` is `reason`.
     Nothing was sent or billed.
     """
 
@@ -527,16 +527,16 @@ class InvalidRequest:
 
 
 class _NotSendableError(Exception):
-    """Carry `InvalidRequest.reason` through nested request conversion functions."""
+    """Carry `RefusedMessages.reason` through nested request conversion functions."""
 
 
 @dataclass(frozen=True, kw_only=True)
 class RequestParams(ABC):
-    """One request, built once per call and sent once per attempt.
+    """Request params, built once per input and sent with every request for that input.
 
-    Each adapter defines a subclass that `narrowed_request` validates.
+    Each adapter defines a subclass that `narrowed_request_params` validates.
     The SDK client holds credentials.
-    Failures carry the request for application storage.
+    `GenerationError.request_params` carries them for application storage.
     """
 
     @abstractmethod
@@ -545,33 +545,37 @@ class RequestParams(ABC):
         ...
 
 
-def narrowed_request[RequestT: RequestParams](
-    request: RequestParams, request_class: type[RequestT]
-) -> RequestT:
-    """Narrow the neutral request to the subclass one adapter builds for `open_stream`.
+def narrowed_request_params[RequestParamsT: RequestParams](
+    request_params: RequestParams, request_params_class: type[RequestParamsT]
+) -> RequestParamsT:
+    """Narrow neutral request params to the subclass one adapter builds for `open_stream`.
 
     Args:
-        request: The neutral request to narrow.
-        request_class: The required adapter-specific request class.
+        request_params: The neutral request params to narrow.
+        request_params_class: The required adapter-specific `RequestParams` subclass.
 
     Raises:
-        TypeError: `request` is not an instance of `request_class`.
+        TypeError: `request_params` is not an instance of `request_params_class`.
     """
-    if not isinstance(request, request_class):
-        raise TypeError(f"expected a request this adapter built, got {type(request).__name__}")
-    return request
+    if not isinstance(request_params, request_params_class):
+        raise TypeError(
+            f"expected request params this adapter built, got {type(request_params).__name__}"
+        )
+    return request_params
 
 
-def request_json(request: RequestParams, *, omitted_class: type) -> str:
-    """Render a request as JSON after removing `omitted_class` values.
+def request_params_json(request_params: RequestParams, *, omitted_class: type) -> str:
+    """Render request params as JSON after removing `omitted_class` values.
 
     Convert unsupported JSON values to text.
 
     Args:
-        request: The request to render.
+        request_params: The request params to render.
         omitted_class: The omit sentinel class whose values to remove.
     """
-    return json.dumps(_without_omitted(asdict(request), omitted_class), default=_json_default)
+    return json.dumps(
+        _without_omitted(asdict(request_params), omitted_class), default=_json_default
+    )
 
 
 def _without_omitted(value: object, omitted_class: type) -> object:
@@ -594,24 +598,26 @@ def _json_default(value: object) -> object:
     return str(value)
 
 
-type NoOutputOutcome = (
+type UnusableResponse = (
     Refusal
     | MaxCompletionTokensExceeded
     | ContextWindowExceeded
-    | EmptyTurn
+    | EmptyAssistantMessage
     | ProviderFailedTerminally
     | ProviderFailedTransiently
     | SchemaViolation
-    | UnfinishedTurn
+    | UnfinishedAssistantMessage
 )
-"""Every outcome of a billable 200 that produced no output.
+"""Every way reading a billable 200 can end when its assistant message is not usable.
 
-The concrete variants make a `kind` match over `NoOutputOutcome` or `ResponseOutcome` exhaustive.
+Such an assistant message gives no output and has no tool calls.
+
+The concrete variants make a `kind` match over `UnusableResponse` or `ResponseOutcome` exhaustive.
 Each variant has distinct retry-loop behavior.
 """
 
-type ResponseOutcome[OutputT] = AdapterResult[OutputT] | NoOutputOutcome
-"""What one completed 200 produced: the turn or the reason it yielded no output."""
+type ResponseOutcome[OutputT] = UsableResponse[OutputT] | UnusableResponse
+"""Every way reading one response can end: a usable response, or the reason it is not usable."""
 
 
 class AdapterStream(ABC):
@@ -663,11 +669,11 @@ class BoundAdapter[OutputT](ABC):
     """One adapter bound to a frozen prefix."""
 
     @abstractmethod
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Convert messages and the binding into the request every attempt of this call sends.
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+        """Convert messages and the binding into the request params every request for this input sends.
 
-        Called once before the first attempt.
-        Returns `InvalidRequest` before any request or retry budget use.
+        Called once before the first request.
+        Returns `RefusedMessages` before any request or retry budget use.
         Performs no I/O.
 
         Args:
@@ -703,7 +709,7 @@ class BoundAdapter[OutputT](ABC):
 
     @abstractmethod
     def interpret(self, raw: BaseModel) -> ResponseOutcome[OutputT]:
-        """Return a normalized turn or a `NoOutputOutcome`.
+        """Return a `UsableResponse` or an `UnusableResponse`.
 
         Args:
             raw: The provider SDK response.
@@ -714,14 +720,14 @@ class BoundAdapter[OutputT](ABC):
         ...
 
     @abstractmethod
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open a streaming request.
 
         Args:
-            request: The adapter-specific request.
+            request_params: The adapter-specific request params.
 
         Raises:
-            TypeError: `request` has the wrong `RequestParams` subclass.
+            TypeError: `request_params` has the wrong `RequestParams` subclass.
             Exception: The SDK fails before returning the stream.
         """
         ...
@@ -760,7 +766,7 @@ class Adapter(ABC):
     """
 
     provider_name: str
-    """The serving provider recorded on each result and error."""
+    """The serving provider recorded on each generation and error."""
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = {}
     """SDK client classes that fix the serving provider.
@@ -781,7 +787,7 @@ class Adapter(ABC):
         Args:
             client: The provider SDK client.
             model: The model id to send verbatim.
-            provider_name: The serving provider recorded on results and errors.
+            provider_name: The serving provider recorded on generations and errors.
             automatic_cache_breakpoints_default: The default for automatic prompt-cache boundaries.
 
         Raises:
@@ -827,7 +833,7 @@ class Adapter(ABC):
     ) -> BoundAdapter[ModelT | None]:
         """Bind structured output parsed into `response_format`.
 
-        A successful tool-call turn returns `None` because it contains no structured instance.
+        An assistant message with tool calls and no structured instance gives `output=None`.
 
         Args:
             binding: The provider-neutral binding.
@@ -888,19 +894,15 @@ __all__ = [
     "AUTH_STATUSES",
     "REASONING_PART_SEPARATOR",
     "Adapter",
-    "AdapterResult",
     "AdapterStream",
     "AllowedToolsChoice",
     "Binding",
     "BoundAdapter",
     "ContextWindowExceeded",
     "DoNotRetry",
-    "EmptyTurn",
+    "EmptyAssistantMessage",
     "ErrorClassification",
-    "InvalidRequest",
     "MaxCompletionTokensExceeded",
-    "NoOutput",
-    "NoOutputOutcome",
     "PauseAll",
     "PauseAllDoNotRetry",
     "ProviderBilling",
@@ -908,6 +910,7 @@ __all__ = [
     "ProviderFailedTransiently",
     "ReasoningDelta",
     "Refusal",
+    "RefusedMessages",
     "RequestParams",
     "ResponseIdentity",
     "ResponseOutcome",
@@ -919,14 +922,16 @@ __all__ = [
     "ToolCallDelta",
     "ToolChoice",
     "TransientError",
-    "UnfinishedTurn",
+    "UnfinishedAssistantMessage",
+    "UnusableResponse",
+    "UsableResponse",
     "Verdict",
     "category_cost",
     "invocation_cost_in_usd",
-    "narrowed_request",
+    "narrowed_request_params",
     "record_parse_fallthrough",
     "reject_extra_body_keys_the_adapter_populates",
-    "request_json",
+    "request_params_json",
     "require_finite_nonnegative_rate",
     "retry_after_seconds_from_headers",
     "should_retry_from_headers",

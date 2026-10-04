@@ -30,13 +30,13 @@ The adapter omits unset `reasoning.effort` and `reasoning.summary` keys.
 Content mappings were verified against openai 2.53.0.
 - `ImagePart` becomes a data URL in `image_url`.
 - `ImageUrlPart.url` becomes `image_url` unchanged.
-- `AudioPart` returns `InvalidRequest` inside `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `RefusedMessages` inside `UserMessage` and `ToolMessage`.
 - Web search and file search produce distinct output item types.
 
 Request and response mappings:
 - A string `system_prompt` becomes `instructions`.
 - A parts `system_prompt` becomes the first developer-role input message because only parts support breakpoints.
-- `AssistantMessage` replays `TurnPart` values in emission order under `store=False`.
+- `AssistantMessage` replays `AssistantPart` values in emission order under `store=False`.
 - `ReasoningPart` and `RawPart` replay their stored items unchanged.
 - `ToolCall` becomes `function_call`, and adjacent `TextPart` values become one assistant message.
 - `ToolMessage` becomes `function_call_output` keyed by `tool_call_id`.
@@ -93,19 +93,17 @@ from pydantic import BaseModel, ValidationError
 
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
-    AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
-    EmptyTurn,
-    InvalidRequest,
+    EmptyAssistantMessage,
     MaxCompletionTokensExceeded,
-    NoOutputOutcome,
     ProviderFailedTerminally,
     ProviderFailedTransiently,
     ReasoningDelta,
     Refusal,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -114,11 +112,13 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedTurn,
+    UnfinishedAssistantMessage,
+    UnusableResponse,
+    UsableResponse,
     _NotSendableError,
-    narrowed_request,
+    narrowed_request_params,
     reject_extra_body_keys_the_adapter_populates,
-    request_json,
+    request_params_json,
     validated_provider_executed_tool_types,
 )
 from langchaint.billing.pricing import (
@@ -129,6 +129,7 @@ from langchaint.billing.pricing import (
 from langchaint.common.exceptions import StreamProtocolError
 from langchaint.common.messages import (
     AssistantMessage,
+    AssistantPart,
     ContentPart,
     Message,
     RawPart,
@@ -136,7 +137,6 @@ from langchaint.common.messages import (
     StopReason,
     TextPart,
     ToolCall,
-    TurnPart,
     UserMessage,
 )
 from langchaint.openai.shared import (
@@ -246,7 +246,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
 
 @dataclass(frozen=True, kw_only=True)
 class _OpenAIRequestParams(RequestParams):
-    """One responses request: the binding's precomputed fields and this call's converted input."""
+    """One responses request: the binding's precomputed fields and one input's converted input."""
 
     precomputed: _OpenAIPrecomputedFields
     input: list[ResponseInputItemParam]
@@ -255,7 +255,7 @@ class _OpenAIRequestParams(RequestParams):
     @override
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
-        return request_json(self, omitted_class=Omit)
+        return request_params_json(self, omitted_class=Omit)
 
 
 def _user_image_param(image_url: str, *, cache_breakpoint: bool) -> ResponseInputImageParam:
@@ -290,28 +290,30 @@ def _user_item(user_message: UserMessage) -> EasyInputMessageParam:
     """
     if isinstance(user_message.content, str):
         return {"role": "user", "content": user_message.content}
-    parts: ResponseInputMessageContentListParam = []
+    wire_parts: ResponseInputMessageContentListParam = []
     for part in user_message.content:
         match part.kind:
             case "text":
                 wire_text: ResponseInputTextParam = {"type": "input_text", "text": part.text}
                 if part.cache_breakpoint:
                     wire_text["prompt_cache_breakpoint"] = {"mode": "explicit"}
-                parts.append(wire_text)
+                wire_parts.append(wire_text)
             case "image":
-                parts.append(
+                wire_parts.append(
                     _user_image_param(
                         _image_data_uri(part), cache_breakpoint=part.cache_breakpoint
                     )
                 )
             case "image_url":
-                parts.append(_user_image_param(part.url, cache_breakpoint=part.cache_breakpoint))
+                wire_parts.append(
+                    _user_image_param(part.url, cache_breakpoint=part.cache_breakpoint)
+                )
             case "audio":
                 raise _NotSendableError(
                     "OpenAIResponsesAdapter cannot send AudioPart inside UserMessage.content: "
                     "ResponseInputContentParam has no audio variant"
                 )
-    return {"role": "user", "content": parts}
+    return {"role": "user", "content": wire_parts}
 
 
 def _function_call_output(
@@ -374,7 +376,7 @@ def _replayed_item(raw: Mapping[str, object]) -> ResponseInputItemParam:
 
 
 def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputItemParam]:
-    """Convert one AssistantMessage to its input items in turn order.
+    """Convert one AssistantMessage to its input items in `parts` order.
 
     The API requires the original item order for replay under store=False.
     Adjacent `TextPart` values become one assistant message item.
@@ -390,7 +392,7 @@ def _assistant_items(assistant_message: AssistantMessage) -> list[ResponseInputI
             items.append({"role": "assistant", "content": "".join(pending_texts)})
             pending_texts.clear()
 
-    for part in assistant_message.turn:
+    for part in assistant_message.parts:
         if part.kind == "text":
             pending_texts.append(part.text)
         elif part.kind == "tool_call":
@@ -524,7 +526,7 @@ def _as_response(raw: BaseModel) -> OpenAIResponse:
 
 
 def _first_output_text(response: OpenAIResponse) -> str | None:
-    """Return the text of the turn's first output_text content part, None when it holds none.
+    """Return the text of the assistant message's first output_text content part, None when it holds none.
 
     Structured output validation uses this part.
     SDK parsing validates every `output_text` part and returns the first instance.
@@ -550,7 +552,7 @@ def _normalized_stop_reason(response: OpenAIResponse) -> StopReason:
 
     The API reports no finish reason field.
 
-    An incomplete `content_filter` result maps to `refusal` without retry.
+    An incomplete `content_filter` response maps to `refusal` without retry.
     """
     if _has_refusal(response):
         return "refusal"
@@ -578,31 +580,31 @@ def _reasoning_text(item: ResponseReasoningItem) -> str | None:
 
 
 def _assistant_message_from(response: OpenAIResponse) -> AssistantMessage:
-    """Build the langchaint assistant turn from the output items, item order preserved.
+    """Build the langchaint assistant message from the output items, item order preserved.
 
     Reasoning items become replayable `ReasoningPart` values with readable text.
     Non-empty message content becomes ordered `TextPart` values, including refusals.
     Other items become replayable `RawPart` values.
     """
-    turn: list[TurnPart] = []
+    parts: list[AssistantPart] = []
     for item in response.output:
         if item.type == "reasoning":
-            turn.append(
+            parts.append(
                 ReasoningPart(
                     raw=item.model_dump(mode="json", exclude_none=True),
                     text=_reasoning_text(item),
                 )
             )
         elif item.type == "function_call":
-            turn.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
+            parts.append(ToolCall(id=item.call_id, name=item.name, args_json=item.arguments))
         elif item.type == "message":
             texts = (
                 part.text if part.type == "output_text" else part.refusal for part in item.content
             )
-            turn.extend(TextPart(text=text) for text in texts if text)
+            parts.extend(TextPart(text=text) for text in texts if text)
         else:
-            turn.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(turn=tuple(turn))
+            parts.append(RawPart(raw=item.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(parts=tuple(parts))
 
 
 def _billing_from_response(
@@ -675,11 +677,11 @@ def _billing_from_response(
     )
 
 
-def _adapter_result[OutputT](
+def _usable_response[OutputT](
     response: OpenAIResponse, output: OutputT, assistant_message: AssistantMessage
-) -> AdapterResult[OutputT]:
-    """Normalize one completed request around already-extracted output and its turn."""
-    return AdapterResult(
+) -> UsableResponse[OutputT]:
+    """Normalize one completed request around already-extracted output and its assistant message."""
+    return UsableResponse(
         output=output,
         assistant_message=assistant_message,
         stop_reason=_normalized_stop_reason(response),
@@ -1066,26 +1068,26 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
-        """Convert messages into each attempt's input."""
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
+        """Convert messages into the input items every request for one input sends."""
         try:
             wire_input = _wire_input(messages)
         except _NotSendableError as not_sendable:
-            return InvalidRequest(reason=str(not_sendable))
+            return RefusedMessages(reason=str(not_sendable))
         return _OpenAIRequestParams(
             precomputed=self._precomputed_fields,
             input=[*self._precomputed_fields.input_prefix, *wire_input],
         )
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open one responses.stream and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request(request, _OpenAIRequestParams)
+        params = narrowed_request_params(request_params, _OpenAIRequestParams)
         precomputed = params.precomputed
         manager = self._adapter.client.responses.stream(
             model=precomputed.model,
@@ -1114,11 +1116,11 @@ class _BoundOpenAI[OutputT](BoundAdapter[OutputT], ABC):
 
 
 class _BoundOpenAIText(_BoundOpenAI[str]):
-    """Text-bound adapter: output is the concatenated text of the turn."""
+    """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[str]:
-        """Read the turn's text as this binding's output, or report the run openai says failed.
+        """Read the assistant message's text as this binding's output, or report the run openai says failed.
 
         A failed status returns `_provider_failure` because emitted items are fragments.
         An incomplete status returns partial text with the stop reason from `_normalized_stop_reason`.
@@ -1131,11 +1133,11 @@ class _BoundOpenAIText(_BoundOpenAI[str]):
         assistant_message = _assistant_message_from(response)
         if response.status == "failed":
             return _provider_failure(response, assistant_message=assistant_message)
-        return _adapter_result(response, assistant_message.text, assistant_message)
+        return _usable_response(response, assistant_message.text, assistant_message)
 
 
 class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
-    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
+    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
@@ -1162,14 +1164,14 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
         response: OpenAIResponse,
         validation_error: ValidationError | None,
         assistant_message: AssistantMessage,
-    ) -> NoOutputOutcome:
-        """Report why the turn produced no instance and no tool call.
+    ) -> UnusableResponse:
+        """Report why the assistant message has no instance and no tool call.
 
         Failed status takes precedence because emitted items are fragments.
         Refusal and truncation take precedence over validation.
         Completed text with `validation_error` returns `SchemaViolation`.
-        Completed output without text returns `EmptyTurn`.
-        Other statuses return `UnfinishedTurn`.
+        Completed output without text returns `EmptyAssistantMessage`.
+        Other statuses return `UnfinishedAssistantMessage`.
         Every variant carries `assistant_message`.
         """
         if response.status == "failed":
@@ -1188,8 +1190,8 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
                     validation_error_json=validation_error.json(include_url=False),
                     assistant_message=assistant_message,
                 )
-            return EmptyTurn(assistant_message=assistant_message)
-        return UnfinishedTurn(
+            return EmptyAssistantMessage(assistant_message=assistant_message)
+        return UnfinishedAssistantMessage(
             reason=f"openai returned status {response.status!r}",
             assistant_message=assistant_message,
         )
@@ -1197,28 +1199,28 @@ class _BoundOpenAIStructured[ModelT: BaseModel](_BoundOpenAI[ModelT | None]):
     def _parsed_outcome(
         self, response: OpenAIResponse, assistant_message: AssistantMessage
     ) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, report a tool-call turn as None, or report why neither exists.
+        """Validate the text into the instance, report tool calls as None, or report why neither exists.
 
-        Validation occurs after the attempt records its response and billing.
+        Validation occurs after the request records its response and billing.
         Failed status returns `_provider_failure` even when fragment text validates.
         A valid instance takes precedence over tool calls.
-        A tool-call turn without an instance returns `None`.
+        An assistant message with tool calls and no instance returns `None`.
         """
         validation_error: ValidationError | None = None
         text = _first_output_text(response)
         if response.status != "failed" and text is not None:
             try:
                 output = self._response_format.model_validate_json(text)
-                return _adapter_result(response, output, assistant_message)
+                return _usable_response(response, output, assistant_message)
             except ValidationError as rejection:
                 validation_error = rejection
         if response.status == "completed" and _normalized_stop_reason(response) == "tool_use":
-            return _adapter_result(response, None, assistant_message)
+            return _usable_response(response, None, assistant_message)
         return self._no_instance(response, validation_error, assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, or report why the response produced none.
+        """Validate the assistant message's text into the instance, or report why the response produced none.
 
         Raises:
             TypeError: raw is not an openai Response.

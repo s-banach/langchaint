@@ -152,8 +152,8 @@ def _classify_cohere_bedrock(error: Exception) -> ErrorClassification:
     return "unknown_exception"
 
 
-def _require_one_sdk_attempt(client: BedrockRuntimeClient) -> None:
-    """Require one request attempt from a passed Bedrock client.
+def _require_one_sdk_request(client: BedrockRuntimeClient) -> None:
+    """Require that a passed Bedrock client sends one request per SDK call.
 
     Raises:
         ValueError: The client retry configuration is missing or differs.
@@ -415,7 +415,7 @@ class CohereBedrock:
         if client is not None and aws_region is not None:
             raise ValueError("Pass at most one of client= or aws_region=")
         if client is not None:
-            _require_one_sdk_attempt(client)
+            _require_one_sdk_request(client)
         self._shared_backoff = SharedBackoff(
             parse=_parse_cohere_bedrock,
             failure_types=_CohereBedrockEmbeddingAdapter.failure_types,
@@ -438,7 +438,7 @@ class CohereBedrock:
         model: CohereEmbedV4ModelName,
         *,
         dimension: CohereEmbedV4Dimension = 1536,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     @overload
@@ -446,7 +446,7 @@ class CohereBedrock:
         self,
         model: CohereEmbedV3ModelName,
         *,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel: ...
 
     def embedding_model(
@@ -454,7 +454,7 @@ class CohereBedrock:
         model: _CohereBedrockEmbeddingModelName,
         *,
         dimension: CohereEmbedV4Dimension | object = _DIMENSION_UNSET,
-        max_attempts: int = 3,
+        max_requests: int = 3,
     ) -> EmbeddingModel:
         """Build an `EmbeddingModel` for one cataloged Bedrock model.
 
@@ -462,7 +462,7 @@ class CohereBedrock:
         V3 models always return 1024 dimensions.
 
         Raises:
-            ValueError: `model`, `dimension`, or `max_attempts` is invalid.
+            ValueError: `model`, `dimension`, or `max_requests` is invalid.
         """
         if model in _COHERE_EMBED_V4_MODELS:
             selected_dimension = 1536 if dimension is _DIMENSION_UNSET else dimension
@@ -487,7 +487,7 @@ class CohereBedrock:
         return EmbeddingModel(
             adapter=adapter,
             shared_backoff=self._shared_backoff,
-            max_attempts=max_attempts,
+            max_requests=max_requests,
         )
 
 

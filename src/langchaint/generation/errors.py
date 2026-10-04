@@ -6,17 +6,17 @@ from pydantic import Field, model_validator
 
 from langchaint.billing.usage import Usage
 from langchaint.common.messages import AssistantMessage, StopReason
-from langchaint.generation.call import (
-    AttemptProviderData,
-    CallRecord,
-    CutOffAttemptRecord,
-    SettledAttemptRecord,
+from langchaint.generation.request_history import (
+    CutOffRequestRecord,
+    RequestHistory,
+    RequestProviderData,
+    SettledRequestRecord,
     TransientErrorRecord,
-    _CallLedger,
-    _CallResultRecordBase,
+    _InputOutcomeRecordBase,
+    _RequestLedger,
     _require_abandoned_shape,
-    _require_completed_model_turn,
-    _settled_attempts,
+    _require_completed_assistant_message,
+    _settled_request_records,
 )
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from langchaint.failure_step import _Terminal
 
 
-class _GenerationErrorRecordBase(_CallResultRecordBase):
+class _GenerationErrorRecordBase(_InputOutcomeRecordBase):
     """Shared normalized data and properties for terminal generation errors.
 
     Validation rejects unknown fields.
@@ -41,39 +41,39 @@ class _GenerationErrorRecordBase(_CallResultRecordBase):
         return self.error_text
 
 
-class _CompletedModelTurnErrorRecordBase(_GenerationErrorRecordBase):
-    """Shared validation for errors that require a completed model turn.
+class _CompletedAssistantMessageErrorRecordBase(_GenerationErrorRecordBase):
+    """Shared validation for errors whose final request is error-free, billed, and holds an assistant message.
 
     Validation rejects unknown fields.
     """
 
     @model_validator(mode="after")
-    def _validate_completed_model_turn(self) -> Self:
-        _require_completed_model_turn(self.call)
+    def _validate_completed_assistant_message(self) -> Self:
+        _require_completed_assistant_message(self.request_history)
         return self
 
 
-def _require_retry_failures(call: CallRecord) -> tuple[TransientErrorRecord, ...]:
-    attempts = _settled_attempts(call)
-    if not attempts:
-        raise ValueError("call must contain at least one settled attempt")
+def _require_retry_failures(request_history: RequestHistory) -> tuple[TransientErrorRecord, ...]:
+    settled_request_records = _settled_request_records(request_history)
+    if not settled_request_records:
+        raise ValueError("request history must contain at least one settled request")
     errors: list[TransientErrorRecord] = []
-    for attempt in attempts:
-        if attempt.error is None:
-            raise ValueError("every attempt must contain a transient error")
-        errors.append(attempt.error)
+    for request_record in settled_request_records:
+        if request_record.error is None:
+            raise ValueError("every request must contain a transient error")
+        errors.append(request_record.error)
     return tuple(errors)
 
 
-def _retries_exhausted_error_text(call: CallRecord) -> str:
+def _retries_exhausted_error_text(request_history: RequestHistory) -> str:
     return "\n".join(
-        f"attempt {attempt_number}: {error.message.replace('\n', '\n  ')}"
-        for attempt_number, error in enumerate(_require_retry_failures(call), start=1)
+        f"request {request_number}: {error.message.replace('\n', '\n  ')}"
+        for request_number, error in enumerate(_require_retry_failures(request_history), start=1)
     )
 
 
-def _retry_unavailable_error_text(call: CallRecord) -> str:
-    return _require_retry_failures(call)[-1].message
+def _retry_unavailable_error_text(request_history: RequestHistory) -> str:
+    return _require_retry_failures(request_history)[-1].message
 
 
 def _set_or_validate_retry_error_text(
@@ -82,22 +82,24 @@ def _set_or_validate_retry_error_text(
     if "error_text" not in record.model_fields_set:
         object.__setattr__(record, "error_text", expected_error_text)
     elif record.error_text != expected_error_text:
-        raise ValueError("error_text must match the call's transient errors")
+        raise ValueError("error_text must match the request history's transient errors")
 
 
-def _require_terminal_provider_result(call: CallRecord, *, permit_empty: bool) -> None:
-    attempts = _settled_attempts(call)
-    if not attempts:
+def _require_final_terminal_response(
+    request_history: RequestHistory, *, permit_empty: bool
+) -> None:
+    settled_request_records = _settled_request_records(request_history)
+    if not settled_request_records:
         if permit_empty:
             return
-        raise ValueError("call must contain a final provider result")
-    if any(attempt.error is None for attempt in attempts[:-1]):
-        raise ValueError("every attempt before the final attempt must contain an error")
-    final = attempts[-1]
+        raise ValueError("request history must contain a final response")
+    if any(request_record.error is None for request_record in settled_request_records[:-1]):
+        raise ValueError("every request before the final request must contain an error")
+    final = settled_request_records[-1]
     if final.error is not None:
-        raise ValueError("the final attempt must be error-free")
+        raise ValueError("the final request must be error-free")
     if final.assistant_message is not None:
-        raise ValueError("the final provider result must not contain an assistant message")
+        raise ValueError("the final response must not contain an assistant message")
 
 
 class RetriesExhaustedErrorRecord(_GenerationErrorRecordBase):
@@ -111,14 +113,14 @@ class RetriesExhaustedErrorRecord(_GenerationErrorRecordBase):
 
     @model_validator(mode="after")
     def _validate_retry_failures(self) -> Self:
-        expected_error_text = _retries_exhausted_error_text(self.call)
+        expected_error_text = _retries_exhausted_error_text(self.request_history)
         _set_or_validate_retry_error_text(self, expected_error_text)
         return self
 
     @property
-    def errors_from_attempts(self) -> tuple[TransientErrorRecord, ...]:
-        """Return each attempt's normalized transient error."""
-        return _require_retry_failures(self.call)
+    def errors_from_requests(self) -> tuple[TransientErrorRecord, ...]:
+        """Return each request's normalized transient error."""
+        return _require_retry_failures(self.request_history)
 
 
 class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
@@ -132,12 +134,12 @@ class RetryUnavailableErrorRecord(_GenerationErrorRecordBase):
 
     @model_validator(mode="after")
     def _validate_retry_failures(self) -> Self:
-        expected_error_text = _retry_unavailable_error_text(self.call)
+        expected_error_text = _retry_unavailable_error_text(self.request_history)
         _set_or_validate_retry_error_text(self, expected_error_text)
         return self
 
 
-class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
+class RefusalErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A refusal ended a response that produced no output.
 
     Validation rejects unknown fields.
@@ -149,7 +151,7 @@ class RefusalErrorRecord(_CompletedModelTurnErrorRecordBase):
     stop_reason: ClassVar[Literal["refusal"]] = "refusal"
 
 
-class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
+class MaxCompletionTokensExceededErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A structured response reached its token limit before parsing.
 
     Validation rejects unknown fields.
@@ -161,19 +163,19 @@ class MaxCompletionTokensExceededErrorRecord(_CompletedModelTurnErrorRecordBase)
     stop_reason: ClassVar[Literal["max_tokens"]] = "max_tokens"
 
 
-class EmptyTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
+class EmptyAssistantMessageErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A structured response produced no output or tool call.
 
     Validation rejects unknown fields.
     """
 
     error_text: str = ""
-    kind: Literal["empty_turn_error"] = "empty_turn_error"
+    kind: Literal["empty_assistant_message_error"] = "empty_assistant_message_error"
 
     stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
 
 
-class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
+class SchemaViolationErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A structured response failed the caller's model validation.
 
     Validation rejects unknown fields.
@@ -186,7 +188,7 @@ class SchemaViolationErrorRecord(_CompletedModelTurnErrorRecordBase):
     stop_reason: ClassVar[Literal["end_turn"]] = "end_turn"
 
 
-class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
+class ContextWindowExceededErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A response reported that the request exceeded the context window.
 
     Validation rejects unknown fields.
@@ -198,16 +200,16 @@ class ContextWindowExceededErrorRecord(_CompletedModelTurnErrorRecordBase):
     stop_reason: ClassVar[Literal["context_window_exceeded"]] = "context_window_exceeded"
 
 
-class UnfinishedTurnErrorRecord(_CompletedModelTurnErrorRecordBase):
-    """A provider returned a partial turn that langchaint cannot continue.
+class UnfinishedAssistantMessageErrorRecord(_CompletedAssistantMessageErrorRecordBase):
+    """A provider returned an unfinished assistant message.
 
     Validation rejects unknown fields.
     """
 
-    kind: Literal["unfinished_turn_error"] = "unfinished_turn_error"
+    kind: Literal["unfinished_assistant_message_error"] = "unfinished_assistant_message_error"
 
 
-class ProviderFailedTerminallyErrorRecord(_CompletedModelTurnErrorRecordBase):
+class ProviderFailedTerminallyErrorRecord(_CompletedAssistantMessageErrorRecordBase):
     """A billable response reported a terminal generation failure.
 
     Validation rejects unknown fields.
@@ -226,22 +228,22 @@ class AuthErrorRecord(_GenerationErrorRecordBase):
     kind: Literal["auth_error"] = "auth_error"
 
     @model_validator(mode="after")
-    def _validate_terminal_provider_result(self) -> Self:
-        _require_terminal_provider_result(self.call, permit_empty=False)
+    def _validate_final_terminal_response(self) -> Self:
+        _require_final_terminal_response(self.request_history, permit_empty=False)
         return self
 
 
-class InvalidRequestErrorRecord(_GenerationErrorRecordBase):
-    """An adapter or provider rejected one request.
+class RejectedErrorRecord(_GenerationErrorRecordBase):
+    """The adapter returned `RefusedMessages`, so `request_count == 0`, or the provider rejected a request.
 
     Validation rejects unknown fields.
     """
 
-    kind: Literal["invalid_request_error"] = "invalid_request_error"
+    kind: Literal["rejected_error"] = "rejected_error"
 
     @model_validator(mode="after")
-    def _validate_terminal_provider_result(self) -> Self:
-        _require_terminal_provider_result(self.call, permit_empty=True)
+    def _validate_final_terminal_response(self) -> Self:
+        _require_final_terminal_response(self.request_history, permit_empty=True)
         return self
 
 
@@ -254,8 +256,8 @@ class ProviderDeclaredFinalErrorRecord(_GenerationErrorRecordBase):
     kind: Literal["provider_declared_final_error"] = "provider_declared_final_error"
 
     @model_validator(mode="after")
-    def _validate_terminal_provider_result(self) -> Self:
-        _require_terminal_provider_result(self.call, permit_empty=False)
+    def _validate_final_terminal_response(self) -> Self:
+        _require_final_terminal_response(self.request_history, permit_empty=False)
         return self
 
 
@@ -278,7 +280,7 @@ class EscapedExceptionErrorRecord(_GenerationErrorRecordBase):
 
 
 class TimedOutErrorRecord(_GenerationErrorRecordBase):
-    """A langchaint deadline expired before the call returned.
+    """A langchaint deadline expired before handling the input ended.
 
     Validation rejects unknown fields.
     """
@@ -288,7 +290,7 @@ class TimedOutErrorRecord(_GenerationErrorRecordBase):
 
     @model_validator(mode="after")
     def _validate_abandoned_shape(self) -> Self:
-        _require_abandoned_shape(self.call)
+        _require_abandoned_shape(self.request_history)
         return self
 
 
@@ -297,13 +299,13 @@ type GenerationErrorKind = Literal[
     "retry_unavailable_error",
     "refusal_error",
     "max_completion_tokens_exceeded_error",
-    "empty_turn_error",
+    "empty_assistant_message_error",
     "schema_violation_error",
     "context_window_exceeded_error",
-    "unfinished_turn_error",
+    "unfinished_assistant_message_error",
     "provider_failed_terminally_error",
     "auth_error",
-    "invalid_request_error",
+    "rejected_error",
     "provider_declared_final_error",
     "unknown_exception_error",
     "escaped_exception_error",
@@ -316,13 +318,13 @@ type GenerationErrorRecord = Annotated[
     | RetryUnavailableErrorRecord
     | RefusalErrorRecord
     | MaxCompletionTokensExceededErrorRecord
-    | EmptyTurnErrorRecord
+    | EmptyAssistantMessageErrorRecord
     | SchemaViolationErrorRecord
     | ContextWindowExceededErrorRecord
-    | UnfinishedTurnErrorRecord
+    | UnfinishedAssistantMessageErrorRecord
     | ProviderFailedTerminallyErrorRecord
     | AuthErrorRecord
-    | InvalidRequestErrorRecord
+    | RejectedErrorRecord
     | ProviderDeclaredFinalErrorRecord
     | UnknownExceptionErrorRecord
     | EscapedExceptionErrorRecord
@@ -335,13 +337,13 @@ _GENERATION_ERROR_RECORD_CLASSES = (
     RetryUnavailableErrorRecord,
     RefusalErrorRecord,
     MaxCompletionTokensExceededErrorRecord,
-    EmptyTurnErrorRecord,
+    EmptyAssistantMessageErrorRecord,
     SchemaViolationErrorRecord,
     ContextWindowExceededErrorRecord,
-    UnfinishedTurnErrorRecord,
+    UnfinishedAssistantMessageErrorRecord,
     ProviderFailedTerminallyErrorRecord,
     AuthErrorRecord,
-    InvalidRequestErrorRecord,
+    RejectedErrorRecord,
     ProviderDeclaredFinalErrorRecord,
     UnknownExceptionErrorRecord,
     EscapedExceptionErrorRecord,
@@ -352,63 +354,65 @@ _GENERATION_ERROR_RECORD_CLASSES = (
 _PROVIDER_ANSWERED_CLASSIFICATIONS = ("auth", "invalid_request", "declared_final")
 """The classifications that show the provider answered the terminal request.
 
-`_terminal_generation_error` records a settled attempt for that answer.
-`_require_terminal_provider_result` validates that attempt on the records for these classifications.
+`_terminal_generation_error` records a settled request for that answer.
+`_require_final_terminal_response` validates that request on the records for these classifications.
 """
 
 
 def _terminal_error_record(
-    classification: "ErrorClassification", *, reason: str, call: CallRecord
+    classification: "ErrorClassification", *, reason: str, request_history: RequestHistory
 ) -> GenerationErrorRecord:
     if classification == "auth":
-        return AuthErrorRecord(error_text=reason, call=call)
+        return AuthErrorRecord(error_text=reason, request_history=request_history)
     if classification == "invalid_request":
-        return InvalidRequestErrorRecord(error_text=reason, call=call)
+        return RejectedErrorRecord(error_text=reason, request_history=request_history)
     if classification == "declared_final":
-        return ProviderDeclaredFinalErrorRecord(error_text=reason, call=call)
-    return UnknownExceptionErrorRecord(error_text=reason, call=call)
+        return ProviderDeclaredFinalErrorRecord(error_text=reason, request_history=request_history)
+    return UnknownExceptionErrorRecord(error_text=reason, request_history=request_history)
 
 
 class GenerationError(Exception):
     """A live terminal generation failure with one normalized record."""
 
     record: GenerationErrorRecord
-    request: "RequestParams | None"
-    provider_attempts: tuple[AttemptProviderData, ...]
+    request_params: "RequestParams | None"
+    request_provider_data: tuple[RequestProviderData, ...]
 
     def __init__(
         self,
         *,
         record: GenerationErrorRecord,
-        request: "RequestParams | None",
-        provider_attempts: tuple[AttemptProviderData, ...],
+        request_params: "RequestParams | None",
+        request_provider_data: tuple[RequestProviderData, ...],
     ) -> None:
         """Store normalized and live-only failure data."""
         if type(record) not in _GENERATION_ERROR_RECORD_CLASSES:
             raise TypeError(f"unsupported generation error record: {type(record).__name__}")
-        if len(provider_attempts) != len(record.call.attempt_records):
-            raise ValueError("provider_attempts must align with call.attempt_records")
+        if len(request_provider_data) != len(record.request_history.request_records):
+            raise ValueError(
+                "request_provider_data must align with request_history.request_records"
+            )
         super().__init__()
         self.record = record
-        self.request = request
-        self.provider_attempts = provider_attempts
+        self.request_params = request_params
+        self.request_provider_data = request_provider_data
 
     @property
-    def call(self) -> CallRecord:
-        """Return the normalized call record."""
-        return self.record.call
+    def request_history(self) -> RequestHistory:
+        """Return the normalized request history."""
+        return self.record.request_history
 
     @property
-    def attempt_records(
+    def request_records(
         self,
-    ) -> tuple[SettledAttemptRecord | CutOffAttemptRecord, ...]:
+    ) -> tuple[SettledRequestRecord | CutOffRequestRecord, ...]:
         """Return normalized request records in order."""
-        return self.record.attempt_records
+        return self.record.request_records
 
     @property
-    def attempts(self) -> int:
+    def request_count(self) -> int:
         """Return requests that langchaint observed going out."""
-        return self.record.attempts
+        return self.record.request_count
 
     @property
     def usage(self) -> Usage:
@@ -427,7 +431,10 @@ class GenerationError(Exception):
 
     @property
     def elapsed_seconds(self) -> float:
-        """Return the complete call duration."""
+        """Return the seconds from the start of handling the input until its request history was frozen.
+
+        It includes admission and backoff waits.
+        """
         return self.record.elapsed_seconds
 
     @property
@@ -460,20 +467,22 @@ def _terminal_generation_error(
     step: "_Terminal",
     *,
     reason: str,
-    ledger: _CallLedger,
+    ledger: _RequestLedger,
     billing: "ProviderBilling | None",
-    request: "RequestParams | None",
+    request_params: "RequestParams | None",
     stream_opened: bool,
 ) -> GenerationError:
-    """Settle the failed attempt when the provider answered or the stream opened, then build the call's error.
+    """Settle the failed request when the provider answered or the stream opened, then build the input's error.
 
-    `billing` is the provider-reported billing of the failed attempt.
+    `billing` is the provider-reported billing of the failed request.
     `stream_opened` is true when the provider stream opened before the failure.
     """
     if step.classification in _PROVIDER_ANSWERED_CLASSIFICATIONS or stream_opened:
         ledger.record(error=None, assistant_message=None, billing=billing)
     return GenerationError(
-        record=_terminal_error_record(step.classification, reason=reason, call=ledger.freeze()),
-        request=request,
-        provider_attempts=ledger.provider_attempts,
+        record=_terminal_error_record(
+            step.classification, reason=reason, request_history=ledger.freeze()
+        ),
+        request_params=request_params,
+        request_provider_data=ledger.request_provider_data,
     )

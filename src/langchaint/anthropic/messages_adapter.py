@@ -8,10 +8,10 @@ SDK parsing may reject text before final output and cache counters arrive.
 `messages.stream` assembles deltas, and `get_final_message()` returns the message.
 The SDK reports no all-inclusive input total.
 
-The API requires an unchanged replay of the latest assistant turn's thinking during tool use.
+The API requires an unchanged replay of the latest assistant message's thinking during tool use.
 The API filters earlier thinking blocks.
 The API rejects consecutive thinking blocks outside their original order.
-The adapter replays every `ReasoningPart` in turn order.
+The adapter replays every `ReasoningPart` in `parts` order.
 
 `automatic_cache_breakpoints=True` marks the frozen prefix.
 For `AsyncAnthropic` and `AsyncAnthropicBedrockMantle`, it also sends top-level `cache_control`.
@@ -21,7 +21,7 @@ The frozen prefix ends at the system prompt or at the last tool when no system p
 `automatic_cache_breakpoints=False` adds no automatic marker.
 A marked user part adds `cache_control` to its text or image block.
 A marked final `ToolMessage` part adds `cache_control` to its enclosing `tool_result` block.
-A marked non-final `ToolMessage` part returns `InvalidRequest` because the boundary would move.
+A marked non-final `ToolMessage` part returns `RefusedMessages` because the boundary would move.
 A parts `system_prompt` produces one system block per part and preserves marked boundaries.
 
 The API accepts at most four cache breakpoints per request.
@@ -45,7 +45,7 @@ The default `"5m"` omits the API-default `ttl` key.
 Content mappings were verified against anthropic 0.121.0.
 - `ImagePart` becomes `Base64ImageSourceParam`.
 - `ImageUrlPart` becomes `URLImageSourceParam`.
-- `AudioPart` returns `InvalidRequest` inside `UserMessage` and `ToolMessage`.
+- `AudioPart` returns `RefusedMessages` inside `UserMessage` and `ToolMessage`.
 - `Usage.server_tool_use` reports web-search invocation counts.
 
 Request and response mappings:
@@ -102,18 +102,17 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from langchaint.adapter import (
     REASONING_PART_SEPARATOR,
     Adapter,
-    AdapterResult,
     AdapterStream,
     AllowedToolsChoice,
     Binding,
     BoundAdapter,
     ContextWindowExceeded,
-    EmptyTurn,
+    EmptyAssistantMessage,
     ErrorClassification,
-    InvalidRequest,
     MaxCompletionTokensExceeded,
     ReasoningDelta,
     Refusal,
+    RefusedMessages,
     RequestParams,
     ResponseIdentity,
     ResponseOutcome,
@@ -122,12 +121,13 @@ from langchaint.adapter import (
     StreamItem,
     ToolCallDelta,
     ToolChoice,
-    UnfinishedTurn,
+    UnfinishedAssistantMessage,
+    UsableResponse,
     _NotSendableError,
-    narrowed_request,
+    narrowed_request_params,
     record_parse_fallthrough,
     reject_extra_body_keys_the_adapter_populates,
-    request_json,
+    request_params_json,
     retry_after_seconds_from_headers,
     terminal_classification_from_response,
     validated_provider_executed_tool_types,
@@ -145,6 +145,7 @@ from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import StreamProtocolError, TransientError
 from langchaint.common.messages import (
     AssistantMessage,
+    AssistantPart,
     ContentPart,
     Message,
     RawPart,
@@ -153,7 +154,6 @@ from langchaint.common.messages import (
     TextPart,
     ToolCall,
     ToolMessage,
-    TurnPart,
     UserMessage,
 )
 from langchaint.concurrency.shared_backoff import DoNotRetry, PauseAll, RetryThisOne, Verdict
@@ -583,7 +583,7 @@ _ADAPTER_POPULATED_WIRE_KEYS = frozenset({
 
 @dataclass(frozen=True, kw_only=True)
 class _AnthropicRequestParams(RequestParams):
-    """One messages request: the binding's precomputed fields and this call's converted messages."""
+    """One messages request: the binding's precomputed fields and one input's converted messages."""
 
     precomputed: _AnthropicPrecomputedFields
     messages: list[MessageParam]
@@ -591,7 +591,7 @@ class _AnthropicRequestParams(RequestParams):
     @override
     def as_json(self) -> str:
         """Render the request as a JSON object, dropping every field left to the provider's default."""
-        return request_json(self, omitted_class=Omit)
+        return request_params_json(self, omitted_class=Omit)
 
 
 def _part_block(
@@ -692,7 +692,7 @@ def _replayed_block(raw: Mapping[str, object]) -> _ContentBlockParam:
 
 
 def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_ContentBlockParam]:
-    """Convert one AssistantMessage to wire blocks in turn order.
+    """Convert one AssistantMessage to wire blocks in `parts` order.
 
     `ReasoningPart.raw` and `RawPart.raw` pass through unchanged by their `type` keys.
     The API rejects modified thinking blocks and unknown `type` values.
@@ -702,7 +702,7 @@ def _assistant_content_blocks(assistant_message: AssistantMessage) -> list[_Cont
         _NotSendableError: A stored block lacks a `type` key.
     """
     blocks: list[_ContentBlockParam] = []
-    for part in assistant_message.turn:
+    for part in assistant_message.parts:
         if part.kind == "text":
             blocks.append(TextBlockParam(type="text", text=part.text))
         elif part.kind == "tool_call":
@@ -801,10 +801,10 @@ def _wire_messages(
 
 def _request_messages(
     messages: Sequence[Message], precomputed_fields: _AnthropicPrecomputedFields
-) -> list[MessageParam] | InvalidRequest:
+) -> list[MessageParam] | RefusedMessages:
     """Convert messages under the binding's caching parameters, or report them unsendable.
 
-    The one place a Sequence[Message] this adapter will not put on the wire becomes an InvalidRequest.
+    The one place a Sequence[Message] this adapter will not put on the wire becomes RefusedMessages.
     The wire block holds parsed `tool_call.args_json`.
     Text that is not JSON has no wire block.
     """
@@ -816,9 +816,9 @@ def _request_messages(
             message_mark_budget=precomputed_fields.message_mark_budget,
         )
     except _NotSendableError as not_sendable:
-        return InvalidRequest(reason=str(not_sendable))
+        return RefusedMessages(reason=str(not_sendable))
     except json.JSONDecodeError as not_json:
-        return InvalidRequest(reason=f"a tool call's args_json is not valid JSON: {not_json}")
+        return RefusedMessages(reason=f"a tool call's args_json is not valid JSON: {not_json}")
 
 
 def _wire_tool_choice(tool_choice: ToolChoice, *, parallel_tool_calls: bool) -> ToolChoiceParam:
@@ -885,10 +885,10 @@ def _normalized_stop_reason(stop_reason: str | None) -> StopReason:
     return "other"
 
 
-def _unfinished_turn_or_none(
+def _unfinished_message_or_none(
     message: anthropic.types.Message, *, assistant_message: AssistantMessage
-) -> UnfinishedTurn | None:
-    """Return `UnfinishedTurn` for `pause_turn`, a null stop reason, or an unknown stop reason."""
+) -> UnfinishedAssistantMessage | None:
+    """Return `UnfinishedAssistantMessage` for `pause_turn`, a null stop reason, or an unknown stop reason."""
     stop_reason = message.stop_reason
     if stop_reason in (
         "end_turn",
@@ -899,7 +899,7 @@ def _unfinished_turn_or_none(
         "model_context_window_exceeded",
     ):
         return None
-    return UnfinishedTurn(
+    return UnfinishedAssistantMessage(
         reason=f"anthropic returned stop_reason {stop_reason!r}, which langchaint cannot continue",
         assistant_message=assistant_message,
     )
@@ -920,7 +920,7 @@ def _as_message(raw: BaseModel) -> anthropic.types.Message:
 
 
 def _first_text_block_text(message: anthropic.types.Message) -> str | None:
-    """Return the text of the turn's first text block, None when the turn holds none.
+    """Return the text of the assistant message's first text block, None when it holds none.
 
     Structured output validation uses this block.
     SDK parsing validates every text block and returns the first instance.
@@ -939,25 +939,25 @@ def _assistant_message_from(message: anthropic.types.Message) -> AssistantMessag
     Redacted thinking has `text=None`.
     Unmodeled blocks become replayable `RawPart` values.
     """
-    turn: list[TurnPart] = []
+    parts: list[AssistantPart] = []
     for block in message.content:
         if block.type == "text":
             if block.text:
-                turn.append(TextPart(text=block.text))
+                parts.append(TextPart(text=block.text))
         elif block.type == "tool_use":
-            turn.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
+            parts.append(ToolCall(id=block.id, name=block.name, args_json=json.dumps(block.input)))
         elif block.type == "thinking":
-            turn.append(
+            parts.append(
                 ReasoningPart(
                     raw=block.model_dump(mode="json", exclude_none=True),
                     text=block.thinking or None,
                 )
             )
         elif block.type == "redacted_thinking":
-            turn.append(ReasoningPart(raw=block.model_dump(mode="json", exclude_none=True)))
+            parts.append(ReasoningPart(raw=block.model_dump(mode="json", exclude_none=True)))
         else:
-            turn.append(RawPart(raw=block.model_dump(mode="json", exclude_none=True)))
-    return AssistantMessage(turn=tuple(turn))
+            parts.append(RawPart(raw=block.model_dump(mode="json", exclude_none=True)))
+    return AssistantMessage(parts=tuple(parts))
 
 
 def _priced_tier(
@@ -1038,11 +1038,11 @@ def _billing_from_sdk_usage(
     )
 
 
-def _adapter_result[OutputT](
+def _usable_response[OutputT](
     message: anthropic.types.Message, output: OutputT, assistant_message: AssistantMessage
-) -> AdapterResult[OutputT]:
-    """Normalize one completed message around already-extracted output and its turn."""
-    return AdapterResult(
+) -> UsableResponse[OutputT]:
+    """Normalize one completed message around already-extracted output and its assistant message."""
+    return UsableResponse(
         output=output,
         assistant_message=assistant_message,
         stop_reason=_normalized_stop_reason(message.stop_reason),
@@ -1504,24 +1504,24 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
         )
 
     @override
-    def build_request(self, messages: Sequence[Message]) -> RequestParams | InvalidRequest:
+    def build_request_params(self, messages: Sequence[Message]) -> RequestParams | RefusedMessages:
         """Convert messages under the binding's precomputed fields."""
         wire_messages = _request_messages(messages, self._precomputed_fields)
-        if isinstance(wire_messages, InvalidRequest):
+        if isinstance(wire_messages, RefusedMessages):
             return wire_messages
         return _AnthropicRequestParams(
             precomputed=self._precomputed_fields, messages=wire_messages
         )
 
     @override
-    async def open_stream(self, request: RequestParams) -> AdapterStream:
+    async def open_stream(self, request_params: RequestParams) -> AdapterStream:
         """Open one messages.stream and return the live stream.
 
         Raises:
             TypeError: request was built by another adapter.
             Exception: The SDK fails to open the stream.
         """
-        params = narrowed_request(request, _AnthropicRequestParams)
+        params = narrowed_request_params(request_params, _AnthropicRequestParams)
         precomputed = params.precomputed
         manager = self._adapter.client.messages.stream(
             model=precomputed.model,
@@ -1545,11 +1545,11 @@ class _BoundAnthropic[OutputT](BoundAdapter[OutputT], ABC):
 
 
 class _BoundAnthropicText(_BoundAnthropic[str]):
-    """Text-bound adapter: output is the concatenated text of the turn."""
+    """Text-bound adapter: output is the concatenated text of the assistant message."""
 
     @override
-    def interpret(self, raw: BaseModel) -> AdapterResult[str]:
-        """Read the turn, whose concatenated text is this binding's output.
+    def interpret(self, raw: BaseModel) -> UsableResponse[str]:
+        """Read the assistant message, whose concatenated text is this binding's output.
 
         Every message supplies its text despite an unhandled stop reason.
 
@@ -1558,11 +1558,11 @@ class _BoundAnthropicText(_BoundAnthropic[str]):
         """
         message = _as_message(raw)
         assistant_message = _assistant_message_from(message)
-        return _adapter_result(message, assistant_message.text, assistant_message)
+        return _usable_response(message, assistant_message.text, assistant_message)
 
 
 class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None]):
-    """Structured-bound adapter: output is the response_format instance validated from the turn's text."""
+    """Structured-bound adapter: output is the response_format instance validated from the assistant message's text."""
 
     def __init__(
         self,
@@ -1595,9 +1595,9 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
     def _parsed_outcome(
         self, message: anthropic.types.Message, assistant_message: AssistantMessage
     ) -> ResponseOutcome[ModelT | None]:
-        """Validate text, return `None` for a tool-call turn, or return a failure variant.
+        """Validate text, return `None` for an assistant message with tool calls, or return a failure variant.
 
-        Validation occurs after the attempt records its message and billing.
+        Validation occurs after the request records its message and billing.
         Stop reasons take precedence over schema validation.
         Every failure variant carries `assistant_message`.
         """
@@ -1606,14 +1606,16 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
         if text is not None:
             try:
                 output = self._output_type_adapter.validate_json(text)
-                return _adapter_result(message, output, assistant_message)
+                return _usable_response(message, output, assistant_message)
             except ValidationError as rejection:
                 validation_error = rejection
-        unfinished_turn = _unfinished_turn_or_none(message, assistant_message=assistant_message)
-        if unfinished_turn is not None:
-            return unfinished_turn
+        unfinished_message = _unfinished_message_or_none(
+            message, assistant_message=assistant_message
+        )
+        if unfinished_message is not None:
+            return unfinished_message
         if message.stop_reason == "tool_use":
-            return _adapter_result(message, None, assistant_message)
+            return _usable_response(message, None, assistant_message)
         if message.stop_reason == "refusal":
             return Refusal(assistant_message=assistant_message)
         if message.stop_reason == "max_tokens":
@@ -1625,11 +1627,11 @@ class _BoundAnthropicStructured[ModelT: BaseModel](_BoundAnthropic[ModelT | None
                 validation_error_json=validation_error.json(include_url=False),
                 assistant_message=assistant_message,
             )
-        return EmptyTurn(assistant_message=assistant_message)
+        return EmptyAssistantMessage(assistant_message=assistant_message)
 
     @override
     def interpret(self, raw: BaseModel) -> ResponseOutcome[ModelT | None]:
-        """Validate the turn's text into the instance, or report why the message produced none.
+        """Validate the assistant message's text into the instance, or report why the message produced none.
 
         Raises:
             TypeError: raw is not an anthropic Message.

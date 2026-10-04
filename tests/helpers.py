@@ -25,10 +25,10 @@ import langchaint
 from langchaint import (
     ZERO_USAGE,
     AssistantMessage,
-    AttemptRecord,
     Billing,
-    CallRecord,
-    SettledAttemptRecord,
+    RequestHistory,
+    RequestRecord,
+    SettledRequestRecord,
     TransientErrorRecord,
     Usage,
 )
@@ -46,7 +46,7 @@ from scripts import refresh_semconv_genai
 
 
 class StubRaw(BaseModel):
-    """Stand-in for the SDK's own response model a result carries on raw."""
+    """Stand-in for the SDK's own response model a generation carries on raw."""
 
 
 def stated_billing(
@@ -81,7 +81,7 @@ def stated_provider_billing(
     )
 
 
-def attempt_record(
+def request_record(
     *,
     error: TransientError | TransientErrorRecord | None,
     usage: Usage = ZERO_USAGE,
@@ -90,12 +90,12 @@ def attempt_record(
     started_after_seconds: float = 0.0,
     elapsed_seconds: float = 0.0,
     seconds_to_first_item: float | None = None,
-    turn: AssistantMessage | None = None,
+    assistant_message: AssistantMessage | None = None,
     model_served: str | None = None,
     response_id: str | None = None,
     request_id: str | None = None,
-) -> SettledAttemptRecord:
-    """Build one normalized settled attempt record."""
+) -> SettledRequestRecord:
+    """Build one normalized settled request record."""
     normalized_error = (
         TransientErrorRecord(
             message=str(error),
@@ -105,7 +105,7 @@ def attempt_record(
         if isinstance(error, TransientError)
         else error
     )
-    return SettledAttemptRecord(
+    return SettledRequestRecord(
         started_after_seconds=started_after_seconds,
         elapsed_seconds=elapsed_seconds,
         seconds_to_first_item=seconds_to_first_item,
@@ -118,7 +118,7 @@ def attempt_record(
             if reported_billing
             else None
         ),
-        assistant_message=turn,
+        assistant_message=assistant_message,
         model_served=model_served,
         response_id=response_id,
         request_id=request_id,
@@ -126,13 +126,13 @@ def attempt_record(
 
 
 def call_record(
-    attempt_records: tuple[AttemptRecord, ...], *, elapsed_seconds: float
-) -> CallRecord:
-    """Build a CallRecord over the records under test. The identity fields are fixed filler."""
-    return CallRecord(
+    request_records: tuple[RequestRecord, ...], *, elapsed_seconds: float
+) -> RequestHistory:
+    """Build a RequestHistory over the records under test. The identity fields are fixed filler."""
+    return RequestHistory(
         model="fake-model",
         provider_name="fake",
-        attempt_records=attempt_records,
+        request_records=request_records,
         elapsed_seconds=elapsed_seconds,
     )
 
@@ -156,7 +156,7 @@ TEST_TIMEOUT_SECONDS = 5.0
 """How long `run_with_timeout` lets one awaitable run. The slowest test takes under half a second."""
 
 
-def run_with_timeout[ResultT](awaitable: Awaitable[ResultT]) -> ResultT:
+def run_with_timeout[ReturnT](awaitable: Awaitable[ReturnT]) -> ReturnT:
     """Run `awaitable` in a new event loop and return its result.
 
     The timeout makes a deadlocked test fail instead of hanging the suite.
@@ -165,7 +165,7 @@ def run_with_timeout[ResultT](awaitable: Awaitable[ResultT]) -> ResultT:
         TimeoutError: `awaitable` ran longer than `TEST_TIMEOUT_SECONDS`.
     """
 
-    async def guarded() -> ResultT:
+    async def guarded() -> ReturnT:
         return await asyncio.wait_for(awaitable, timeout=TEST_TIMEOUT_SECONDS)
 
     return asyncio.run(guarded())
@@ -182,9 +182,9 @@ async def yield_until(condition: Callable[[], bool]) -> None:
         await asyncio.sleep(0)
 
 
-async def time_out_when[ResultT](
-    awaitable: Awaitable[ResultT], condition: Callable[[], bool]
-) -> ResultT:
+async def time_out_when[ReturnT](
+    awaitable: Awaitable[ReturnT], condition: Callable[[], bool]
+) -> ReturnT:
     """Await `awaitable` in the current task under a timeout that expires once `condition` holds.
 
     The expiry cancels `awaitable` at the point it has reached, as a caller's own `asyncio.timeout` would.
@@ -363,7 +363,7 @@ class _ChatSpanDeclaration(BaseModel):
     attributes: tuple[_DeclaredAttribute, ...]
 
 
-LANGCHAINT_KEYS = frozenset({"langchaint.attempts", "langchaint.cost_in_usd"})
+LANGCHAINT_KEYS = frozenset({"langchaint.request_count", "langchaint.cost_in_usd"})
 """The keys langchaint writes on a chat span for values the convention has no attribute for."""
 
 

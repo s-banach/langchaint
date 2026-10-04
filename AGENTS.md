@@ -5,7 +5,7 @@ The API is alpha and may change without notice.
 
 ## Documentation
 
-Keep CLAUDE.md to cross-module principles and architecture required to edit langchaint safely.
+Keep AGENTS.md to cross-module principles and architecture required to edit langchaint safely.
 Put symbol behavior in the implementing code's docstring.
 Never cite internal documents, design deliberation, dead alternatives, or prior code.
 State current behavior and its reason without requiring historical context.
@@ -16,12 +16,26 @@ Put a verified SDK fact only in a docstring where the caller acts on the outcome
 Include the SDK version when an SDK fact can drift.
 Document every public parameter and cross-provider difference.
 
+## Terms
+
+- langchaint: this project.
+- provider: anthropic, openai, or a model-serving platform.
+- adapter: an `Adapter` implementation.
+- request: one send to the provider. Each retry is another request.
+- response: the provider's reply to one request.
+- input: one `GenerationInput`.
+- request params: what every request for one input sends.
+- assistant message: the `AssistantMessage` in one response.
+- output: what application code reads from a finished assistant message, either its joined text or that text validated into `response_format`. An assistant message gives output when that value exists.
+- usable: an assistant message that gives output or has tool calls.
+- kept assistant message: the usable assistant message that ends handling an input.
+- generation: what handling an input produces when it succeeds. `GenerationError` is its failure.
+- outcome: one way that handling an input, reading one response, or dispatching a tool call ends. An `*Outcome` type is the union of them.
+- Use these terms, and never give one of these concepts a second name.
+
 ## Vocabulary
 
-- Call the project "langchaint".
 - Use "package" only for its Python meanings.
-- Call an `Adapter` implementation an "adapter".
-- Call anthropic, openai, and model-serving platforms "providers".
 - Compose a concrete adapter name from its provider and `Adapter`, as in `AnthropicMessagesAdapter`.
 - Name each backend class for its provider.
 - Compose a Bedrock class name with the model provider.
@@ -37,7 +51,7 @@ Document every public parameter and cross-provider difference.
 - `cache_breakpoint=True` means the reusable prompt prefix ends at that part.
 - Never write bare `input_tokens` because providers count it differently.
 - Use `input_tokens_cache_read`, `input_tokens_cache_write`, `input_tokens_cache_none`, and the derived `input_tokens_total`.
-- Keep `content`, `output`, and `raw` distinct: model-facing message body, generation result payload, and unchanged provider data.
+- Keep `content`, `output`, and `raw` distinct: model-facing message body, `Generation` payload, and unchanged provider data.
 - Replay `assistant_message`, never `output`.
 - Use `reasoning` only for reasoning the model produced.
 
@@ -52,17 +66,15 @@ Document every public parameter and cross-provider difference.
 
 - Create one `SharedBackoff` per rate-limit quota.
 - Gate every request start through its `admitted()` block.
-- Count `max_attempts` as requests sent, including the first.
-- Disable SDK retries so langchaint accounts for every attempt.
+- Disable SDK retries so langchaint accounts for every request.
 - Wrap official SDK clients.
 - Let the SDK assemble streams.
 - Do not define wire `TypedDict` types.
-- Send user inputs and model ids verbatim.
-- Send every message exactly as given, including a replayed provider turn.
+- Send model ids, `system_prompt`, and every message exactly as given, including a replayed assistant message.
 - When a provider rejects a message the user wrote, return the provider's error.
 - Never build a `TextPart` from empty provider text, because Anthropic rejects an empty text block on replay.
-- Applications replay a provider turn to continue after its tool calls, so dropping empty text leaves no turn empty.
-- A turn without tool calls ends a tool loop, and an application that continues after one chooses what to send.
+- Applications replay an assistant message to continue after its tool calls, so dropping empty text leaves no replayed assistant message without parts.
+- An assistant message without tool calls ends a tool loop, and an application that continues after one chooses what to send.
 - Do not predict provider responses, probe endpoints, or add guards based on guessed provider rules.
 - Raise client-side only for documented provider facts and detectable defects that would otherwise produce a silently wrong result.
 - Keep SDKs as optional dependencies.
@@ -71,12 +83,12 @@ Document every public parameter and cross-provider difference.
 - Import each SDK at the backend subpackage module top under a guard that raises `ModuleNotFoundError` with installation instructions.
 - Put the pricing source URL in each backend subpackage docstring.
 
-## Results and errors
+## Outcomes and errors
 
 - Validate a structured response against the caller's model while preserving the response and billing.
 - Classify provider failures into the retry loop's neutral actions.
-- Retry transient failures during non-streaming generation and while opening a stream.
-- Terminate the call on other provider failures.
+- Retry transient failures in `generate_one`, `generate_many`, and `generate_many_records`, and while `stream_one` opens a stream.
+- Stop handling the input on other provider failures.
 - Return one outcome per `GenerationInput` without letting one non-transient failure cancel a sibling.
 - Raise detectable binding defects before sending a request.
 - Never return a parse without output as data.
@@ -89,17 +101,17 @@ Document every public parameter and cross-provider difference.
 - Match non-exception class variants on the string `.kind` attribute.
 - The `.kind` attribute lets autocomplete provide the discriminator without imports of variant classes.
 - Use `isinstance` for exceptions and builtin types.
-- Re-emit every reasoning trace verbatim and in place across turns.
+- Re-emit every reasoning trace verbatim and in place when replaying assistant messages.
 - Let applications trim reasoning.
 
 ## Usage and pricing
 
 - Add a field to `Usage` only for a provider-invariant counter or a priced category that partitions request cost.
 - Keep provider-specific details on the raw SDK usage.
-- Require `usage` on every generation result and `GenerationError`.
+- Require `usage` on every `Generation` and `GenerationError`.
 - Derive totals from categories.
 - Let applications carry their own fees.
-- Make `usage` aggregate every available `Billing` across the call.
+- Make `usage` aggregate every available `Billing` across the input's requests.
 - Represent a nonzero category with no configured rate as NaN.
 - Never fabricate prices or model catalogs.
 - Use a provider subpackage's default rate table only when it maps the model id.
@@ -143,9 +155,9 @@ Document every public parameter and cross-provider difference.
 
 ## Module map
 
-- `generation/llm.py`: client binding, generation, and shared batch coordination.
+- `generation/llm.py`: client binding, the generate methods, and shared batch coordination.
 - `generation/_config_fingerprint.py`: deterministic binding and generation-input fingerprints.
-- `generation/_generate_many_records.py`: validated JSON resume state and atomic result-record persistence.
+- `generation/_generate_many_records.py`: validated JSON resume state and atomic outcome-record persistence.
 - `adapter.py`: the SDK-free neutral adapter contract and `ResponseIdentity`.
 - `concurrency/cancellation.py`: cancellation-safe synchronous provider work.
 - `conformance.py`: SDK-free adapter invariants that adapter tests inherit.
@@ -153,18 +165,18 @@ Document every public parameter and cross-provider difference.
 - `concurrency/shared_backoff.py`: request admission for one rate-limit quota.
 - `common/exceptions.py`: basic shared exceptions without langchaint imports.
 - `generation/errors.py`: normalized generation error records and live generation failures.
-- `failure_step.py`: the retry decision after a failed attempt, shared by generation and embedding.
-- `generation/response.py`: generation results and normalized result records.
-- `generation/tables.py`: tabular call and attempt views.
-- `generation/call.py`: attempt records, immutable call history, and retry accounting.
+- `failure_step.py`: the retry decision after a failed request, shared by generation and embedding.
+- `generation/response.py`: live generations, their records, and the outcome unions.
+- `generation/tables.py`: tabular outcome and request views.
+- `generation/request_history.py`: request records, immutable request history, and retry accounting.
 - `generation/streaming.py`: the stream handle.
-- `generation/observer.py`: the protocol that follows every generation call and tool dispatch.
-- `common/observed_operation.py`: the handle an observer returns for one operation and the guard that logs observer failures, without langchaint imports.
+- `generation/observer.py`: the protocol that follows every input and every tool dispatch.
+- `common/observed_operation.py`: the handle an observer returns for one input or one tool dispatch, and the guard that logs observer failures, without langchaint imports.
 - `tools.py`: tool forms, dispatch, dispatch outcomes, and tool exceptions.
 - `common/messages.py`: provider-neutral messages, content parts, and JSON round trips.
 - `billing/usage.py`: token accounting and per-category costs.
 - `common/checked_copy.py`: the base for langchaint pydantic models.
-- `billing/pricing.py`: SDK-free rate arithmetic and per-attempt `Billing`.
+- `billing/pricing.py`: SDK-free rate arithmetic and per-request `Billing`.
 - `anthropic/`, `cohere/`, `deepseek/`, `gemini/`, `openai/`: backend subpackages that require their SDKs.
 - `concurrency/run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
 - `common/sequence_not_str.py`: the sequence protocol that excludes bare `str` values.

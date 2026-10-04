@@ -1,4 +1,4 @@
-"""Convert generation results into calls and attempts tables."""
+"""Convert outcomes into outcome and request tables."""
 
 from collections.abc import Iterable
 from typing import NamedTuple
@@ -6,29 +6,28 @@ from typing import NamedTuple
 from pydantic import BaseModel
 
 from langchaint.billing.pricing import Billing
-from langchaint.generation.call import (
-    AbandonedCallRecord,
-    AttemptProviderData,
-    CutOffAttemptRecord,
-    SettledAttemptRecord,
-)
 from langchaint.generation.errors import GenerationError, _GenerationErrorRecordBase
+from langchaint.generation.request_history import (
+    CutOffRequestRecord,
+    RequestProviderData,
+    SettledRequestRecord,
+)
 from langchaint.generation.response import (
-    CallResult,
-    CallResultRecord,
-    Response,
-    ToolCallTurn,
-    _SuccessRecordBase,
+    GenerationOutcome,
+    GenerationWithoutToolCalls,
+    GenerationWithToolCalls,
+    InputOutcomeRecord,
+    _GenerationRecordBase,
 )
 
 type RowValue = str | int | float | bool | None
 
 
 class Tables(NamedTuple):
-    """The calls and attempts tables joined on `call_id`."""
+    """The outcome and request tables joined on `outcome_index`."""
 
-    calls: list[dict[str, RowValue]]
-    attempts: list[dict[str, RowValue]]
+    outcomes: list[dict[str, RowValue]]
+    requests: list[dict[str, RowValue]]
 
 
 def _output_cell(output: object) -> str | None:
@@ -40,7 +39,7 @@ def _output_cell(output: object) -> str | None:
 
 
 def _billing_cells(
-    billing: Billing | None, provider_data: AttemptProviderData | None
+    billing: Billing | None, provider_data: RequestProviderData | None
 ) -> dict[str, RowValue]:
     usage = None if billing is None else billing.usage
     usage_raw = None if provider_data is None else provider_data.usage_raw
@@ -82,24 +81,24 @@ def _billing_cells(
     }
 
 
-def _attempt_row(
+def _request_row(
     *,
-    call_id: int,
-    attempt_index: int,
+    outcome_index: int,
+    request_index: int,
     kept: bool,
-    attempt: SettledAttemptRecord | CutOffAttemptRecord,
-    provider_data: AttemptProviderData | None,
+    request_record: SettledRequestRecord | CutOffRequestRecord,
+    provider_data: RequestProviderData | None,
 ) -> dict[str, RowValue]:
-    common = _billing_cells(attempt.billing, provider_data) | {
-        "call_id": call_id,
-        "attempt_index": attempt_index,
+    common = _billing_cells(request_record.billing, provider_data) | {
+        "outcome_index": outcome_index,
+        "request_index": request_index,
         "kept": kept,
-        "started_after_seconds": attempt.started_after_seconds,
+        "started_after_seconds": request_record.started_after_seconds,
     }
-    if attempt.kind == "cut_off":
+    if request_record.kind == "cut_off":
         return common | {
             "elapsed_seconds": None,
-            "seconds_to_first_item": attempt.seconds_to_first_item,
+            "seconds_to_first_item": request_record.seconds_to_first_item,
             "model_served": None,
             "response_id": None,
             "request_id": None,
@@ -107,73 +106,74 @@ def _attempt_row(
             "assistant_message_json": None,
         }
     return common | {
-        "elapsed_seconds": attempt.elapsed_seconds,
-        "seconds_to_first_item": attempt.seconds_to_first_item,
-        "model_served": attempt.model_served,
-        "response_id": attempt.response_id,
-        "request_id": attempt.request_id,
-        "error_text": None if attempt.error is None else str(attempt.error),
+        "elapsed_seconds": request_record.elapsed_seconds,
+        "seconds_to_first_item": request_record.seconds_to_first_item,
+        "model_served": request_record.model_served,
+        "response_id": request_record.response_id,
+        "request_id": request_record.request_id,
+        "error_text": None if request_record.error is None else str(request_record.error),
         "assistant_message_json": None
-        if attempt.assistant_message is None
-        else attempt.assistant_message.model_dump_json(),
+        if request_record.assistant_message is None
+        else request_record.assistant_message.model_dump_json(),
     }
 
 
-def to_tables[OutputT, TurnOutputT](
-    results: CallResult[OutputT, TurnOutputT]
-    | CallResultRecord[OutputT, TurnOutputT]
-    | AbandonedCallRecord
+def to_tables[OutputT, WithToolCallsOutputT](
+    outcomes: GenerationOutcome[OutputT, WithToolCallsOutputT]
+    | InputOutcomeRecord[OutputT, WithToolCallsOutputT]
     | Iterable[
-        CallResult[OutputT, TurnOutputT]
-        | CallResultRecord[OutputT, TurnOutputT]
-        | AbandonedCallRecord
+        GenerationOutcome[OutputT, WithToolCallsOutputT]
+        | InputOutcomeRecord[OutputT, WithToolCallsOutputT]
     ],
 ) -> Tables:
-    """Flatten live or normalized results into calls and attempts tables.
+    """Flatten live outcomes or outcome records into outcome and request tables.
 
-    An `AbandonedCallRecord` row has neither `output` nor `error_text`, and no kept attempt.
+    `outcome_index` is a value's position in `outcomes`.
+    An `AbandonedStreamRecord` row has neither `output` nor `error_text`, and no kept request.
     """
     values = (
-        list(results)
-        if isinstance(results, Iterable) and not isinstance(results, BaseModel)
-        else [results]
+        list(outcomes)
+        if isinstance(outcomes, Iterable) and not isinstance(outcomes, BaseModel)
+        else [outcomes]
     )
-    calls: list[dict[str, RowValue]] = []
-    attempts: list[dict[str, RowValue]] = []
-    for call_id, value in enumerate(values):
-        if isinstance(value, (Response, ToolCallTurn, GenerationError)):
+    outcome_rows: list[dict[str, RowValue]] = []
+    request_rows: list[dict[str, RowValue]] = []
+    for outcome_index, value in enumerate(values):
+        if isinstance(
+            value, (GenerationWithoutToolCalls, GenerationWithToolCalls, GenerationError)
+        ):
             record = value.record
-            provider_attempts = value.provider_attempts
+            request_provider_data = value.request_provider_data
         else:
             record = value
-            provider_attempts = ()
+            request_provider_data = ()
         live_error = value if isinstance(value, GenerationError) else None
         is_error = isinstance(record, _GenerationErrorRecordBase)
-        is_success = isinstance(record, _SuccessRecordBase)
-        calls.append({
-            "call_id": call_id,
+        is_generation = isinstance(record, _GenerationRecordBase)
+        outcome_rows.append({
+            "outcome_index": outcome_index,
             "model": record.model,
             "provider_name": record.provider_name,
             "elapsed_seconds": record.elapsed_seconds,
-            "attempts": record.attempts,
+            "request_count": record.request_count,
             "stop_reason": record.stop_reason,
             "error_text": record.error_text if is_error else None,
-            "request_json": None
-            if live_error is None or live_error.request is None
-            else live_error.request.as_json(),
-            "output": _output_cell(record.output) if is_success else None,
+            "request_params_json": None
+            if live_error is None or live_error.request_params is None
+            else live_error.request_params.as_json(),
+            "output": _output_cell(record.output) if is_generation else None,
         })
-        kept_index = len(record.attempt_records) - 1 if is_success else None
-        for attempt_index, attempt in enumerate(record.attempt_records):
-            attempts.append(
-                _attempt_row(
-                    call_id=call_id,
-                    attempt_index=attempt_index,
-                    kept=attempt_index == kept_index,
-                    attempt=attempt,
+        kept_index = len(record.request_records) - 1 if is_generation else None
+        for request_index, request_record in enumerate(record.request_records):
+            request_rows.append(
+                _request_row(
+                    outcome_index=outcome_index,
+                    request_index=request_index,
+                    kept=request_index == kept_index,
+                    request_record=request_record,
                     provider_data=(
-                        provider_attempts[attempt_index] if provider_attempts else None
+                        request_provider_data[request_index] if request_provider_data else None
                     ),
                 )
             )
-    return Tables(calls=calls, attempts=attempts)
+    return Tables(outcomes=outcome_rows, requests=request_rows)

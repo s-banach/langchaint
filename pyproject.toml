@@ -193,8 +193,8 @@ lint.select = [
     # `raise Class.factory(...)` (they read the last attribute, `factory`, as the
     # exception name), which langchaint uses. Under them a correctly documented
     # raise reports as extraneous and a real raise reports as missing, so
-    # documenting raises is a CLAUDE.md convention (see "Document what a function
-    # raises") checked in review instead.
+    # documenting raises is an AGENTS.md convention (see "Document each exception
+    # relevant to the public interface") checked in review instead.
 ]
 lint.ignore = [
     "any-type",

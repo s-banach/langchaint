@@ -17,7 +17,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import NonRecordingSpan, SpanKind, StatusCode
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from langchaint import (
@@ -166,87 +166,6 @@ def _captured(exporter: InMemorySpanExporter, key: str) -> object:
     """Read one JSON content attribute off the only finished span as Python data."""
     (span,) = exporter.get_finished_spans()
     return _json_attribute(span, key)
-
-
-class _RaisingSpan(NonRecordingSpan):
-    """A span whose is_recording and end raise, standing in for a broken Span implementation."""
-
-    def __init__(self) -> None:
-        super().__init__(trace.INVALID_SPAN_CONTEXT)
-
-    @override
-    def is_recording(self) -> bool:
-        """Raise instead of answering.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError("is_recording boom")
-
-    @override
-    def end(self, end_time: int | None = None) -> None:
-        """Raise instead of ending.
-
-        Raises:
-            RuntimeError: always.
-        """
-        raise RuntimeError("end boom")
-
-
-class _RaisingSpanTracer(trace.NoOpTracer):
-    """A tracer handing out spans whose is_recording and end raise."""
-
-    @override
-    def start_span(self, name: str, *_args: object, **_kwargs: object) -> trace.Span:
-        """Return the raising span, ignoring every span argument."""
-        return _RaisingSpan()
-
-
-def test_a_span_that_raises_does_not_destroy_a_result() -> None:
-    """A broken span costs the telemetry, never the result the call returned.
-
-    Each span-owning entry point suppresses span failures.
-    """
-
-    async def scenario() -> None:
-        """Drive each span-owning entry point under a tracer whose spans raise."""
-        observer = OtelObserver(tracer=_RaisingSpanTracer(), capture_message_content=False)
-        llm = LLM(FakeAdapter(echo=True), shared_backoff=fast_shared_backoff(), observer=observer)
-        bound = llm.bind()
-
-        assert (await bound.generate_one("hi")).output == "hi"
-        (row,) = await bound.generate_many(["hi"])
-        assert row.kind == "response"
-        assert row.output == "hi"
-
-        async with bound.stream_one("hi") as stream:
-            items = [item async for item in stream if isinstance(item, str)]
-            assert (await stream.final()).output == "".join(items)
-
-        tool_manager = ToolManager([_echo_tool()], observer=observer)
-        outcome = await tool_manager.dispatch(
-            ToolCall(id="call1", name="echo", args_json='{"text": "hi"}')
-        )
-        assert outcome.kind == "handled"
-
-    run_with_timeout(scenario())
-
-
-def test_a_span_that_raises_does_not_displace_the_call_s_error() -> None:
-    """A broken span cannot replace GenerationError."""
-
-    async def scenario() -> None:
-        """Drive one failing generate_one under a tracer whose spans raise."""
-        adapter = FakeAdapter(invalid_requests=[InvalidRequest(reason="misconfigured")])
-        llm = LLM(
-            adapter,
-            shared_backoff=fast_shared_backoff(),
-            observer=OtelObserver(tracer=_RaisingSpanTracer(), capture_message_content=True),
-        )
-        with pytest.raises(GenerationError):
-            await llm.bind().generate_one("hi")
-
-    run_with_timeout(scenario())
 
 
 class _MidFailStream(FakeStream):
@@ -456,45 +375,6 @@ def test_a_generation_error_ends_the_span_with_error_status_and_the_calls_attrib
             assert [message["finish_reason"] for message in output_messages] == list(
                 case.finish_reasons
             )
-
-    run_with_timeout(scenario())
-
-
-def test_generate_one_cancellation_ends_the_span_with_its_status_unset() -> None:
-    """A cancelled traced generate_one ends its span and sets no status: nothing decided the call."""
-
-    async def scenario() -> None:
-        """Time out a traced call whose open hangs, then read the span."""
-        adapter = FakeAdapter(hang_from_open=1)
-        llm, exporter = _traced(adapter)
-        with pytest.raises(TimeoutError):
-            await time_out_when(
-                llm.bind().generate_one("hi"), adapter.bound_adapters[0].hang_reached.is_set
-            )
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.UNSET
-
-    run_with_timeout(scenario())
-
-
-def test_a_cancelled_stream_entry_ends_the_span_with_its_status_unset() -> None:
-    """A cancellation during __aenter__ ends the span and sets no status: nothing decided the call."""
-
-    async def scenario() -> None:
-        """Time out an entry whose open never returns, then read the span."""
-        adapter = FakeAdapter(hang_from_open=1)
-        llm, exporter = _traced(adapter)
-        handle = llm.bind().stream_one("hi")
-
-        async def enter_and_leave() -> None:
-            """Enter the handle whose open never returns. time_out_when below cancels this."""
-            async with handle:
-                pass
-
-        with pytest.raises(TimeoutError):
-            await time_out_when(enter_and_leave(), adapter.bound_adapters[0].hang_reached.is_set)
-        (span,) = exporter.get_finished_spans()
-        assert span.status.status_code == StatusCode.UNSET
 
     run_with_timeout(scenario())
 
@@ -953,7 +833,7 @@ def _covariance_pin(mapper: AttributeMapper, response: Response[_Answer]) -> Spa
 def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind() -> None:
     """A custom mapper replaces the default result attributes on generate, stream, and batch item spans.
 
-    A replacement binding keeps the mapper and extra_attributes.
+    A replacement binding keeps the observer.
     A mapper key of the same name as an extra wins at completion.
     The observer-owned gen_ai.operation.name wins at span start.
     """
@@ -1169,7 +1049,7 @@ def test_tool_manager_function_exception_marks_the_span_error_and_propagates() -
 
 
 def test_tool_manager_dispatch_many_spans_every_call() -> None:
-    """dispatch_many inherits per-call spans: two calls yield two execute_tool spans, outcomes ordered."""
+    """dispatch_many observes each call through dispatch: two calls yield two execute_tool spans, outcomes ordered."""
 
     async def scenario() -> None:
         """Dispatch two calls concurrently and read both spans."""

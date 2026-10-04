@@ -2627,6 +2627,38 @@ def test_a_stream_reports_one_conclusion_and_one_end_despite_later_misuse() -> N
     run_with_timeout(scenario())
 
 
+@pytest.mark.parametrize(
+    ("path", "expected_calls"),
+    [
+        ("generate", ["generation_started fake-model", "end"]),
+        (
+            "stream",
+            ["generation_started fake-model", "conclude AbandonedCallRecord", "end"],
+        ),
+    ],
+)
+def test_a_call_cancelled_during_its_open_ends_its_operation(
+    path: _CallPath, expected_calls: list[str]
+) -> None:
+    """A cancelled generate_one ends its operation without a conclusion.
+
+    A stream entry concludes with its `abandoned` record before the end.
+    """
+
+    async def scenario() -> None:
+        """Time out a call whose open never returns, then read the observer's record."""
+        observer = _RecordingObserver()
+        adapter = FakeAdapter(hang_from_open=1)
+        llm = LLM(adapter, shared_backoff=fast_shared_backoff(), observer=observer)
+        with pytest.raises(TimeoutError):
+            await time_out_when(
+                _generate_through(path, llm.bind()), adapter.bound_adapters[0].hang_reached.is_set
+            )
+        assert observer.calls == expected_calls
+
+    run_with_timeout(scenario())
+
+
 class _RaisingOperation:
     """An `ObservedOperation` whose every method raises."""
 

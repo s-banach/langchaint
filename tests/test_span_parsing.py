@@ -664,13 +664,12 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
-def test_generation_record_fills_the_request_fields_a_span_does_not_record() -> None:
-    """generation_record_from_otel reads the response model and id and fills timing, billing, and request id.
+def test_generation_record_fills_its_synthetic_request_record() -> None:
+    """generation_record_from_otel reads gen_ai.response.id and fills timing, billing, and request id.
 
     Trace usage and service-tier attributes are ignored.
     """
     span = _generation_chat_span({
-        "gen_ai.response.model": "served-model",
         "gen_ai.response.id": "response-1",
         "gen_ai.usage.input_tokens": 100,
         "openai.response.service_tier": "priority",
@@ -682,7 +681,6 @@ def test_generation_record_fills_the_request_fields_a_span_does_not_record() -> 
     assert request_record.elapsed_seconds == 0.0
     assert request_record.first_item_after_seconds is None
     assert request_record.error is None
-    assert request_record.model_served == "served-model"
     assert request_record.response_id == "response-1"
     assert request_record.request_id is None
     assert request_record.billing is not None

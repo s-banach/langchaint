@@ -14,7 +14,6 @@ from langchaint import (
     AssistantMessage,
     BoundLLM,
     DispatchHandled,
-    ImagePart,
     JsonValue,
     TextPart,
     ToolCall,
@@ -461,64 +460,22 @@ def test_tool_response_conversion_wraps_malformed_nested_parts() -> None:
         _ = generation_input_from_otel(parsed)
 
 
-def test_converts_representable_input_messages() -> None:
-    """Representable user, assistant, and tool messages retain prior reconstruction behavior."""
+def test_converts_a_string_tool_response_to_string_content() -> None:
+    """A tool_call_response whose response is a string converts to str `ToolMessage` content."""
     parsed = parse_otel(
         _chat_span({
             "gen_ai.input.messages": [
                 {
-                    "role": "user",
-                    "parts": [
-                        {"type": "text", "content": "question"},
-                        {
-                            "type": "blob",
-                            "modality": "image",
-                            "mime_type": "image/png",
-                            "content": "aW1hZ2U=",
-                        },
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "parts": [
-                        {"type": "text", "content": "checking"},
-                        {
-                            "type": "tool_call",
-                            "id": "call-1",
-                            "name": "lookup",
-                            "arguments": {"key": "value"},
-                        },
-                    ],
-                },
-                {
                     "role": "tool",
                     "parts": [
-                        {
-                            "type": "tool_call_response",
-                            "id": "call-1",
-                            "is_error": True,
-                            "response": "failed",
-                        }
+                        {"type": "tool_call_response", "id": "call-1", "response": "failed"}
                     ],
-                },
+                }
             ]
         })
     )
-    assert parsed.input_messages is not None
     assert generation_input_from_otel(parsed) == (
-        UserMessage(
-            content=(
-                TextPart(text="question"),
-                ImagePart(data=b"image", media_type="image/png"),
-            )
-        ),
-        AssistantMessage(
-            parts=(
-                TextPart(text="checking"),
-                ToolCall(id="call-1", name="lookup", args_json='{"key":"value"}'),
-            )
-        ),
-        ToolMessage(tool_call_id="call-1", content="failed", is_error=True),
+        ToolMessage(tool_call_id="call-1", content="failed"),
     )
 
 
@@ -672,24 +629,6 @@ def test_rejects_unrepresentable_leading_system_message(
         _ = generation_input_from_otel(parsed)
 
 
-def test_converts_system_instructions_and_tools() -> None:
-    """Explicit conversion functions produce the prior langchaint values."""
-    parsed = parse_otel(
-        _chat_span({
-            "gen_ai.system_instructions": [{"type": "text", "content": "Be brief."}],
-            "gen_ai.tool.definitions": [_captured_tool_definition()],
-        })
-    )
-    assert system_prompt_from_otel(parsed) == (TextPart(text="Be brief."),)
-    assert tool_schemas_from_otel(parsed) == (
-        ToolSchema(
-            name="lookup",
-            description="Look up one value.",
-            args_schema={"type": "object"},
-        ),
-    )
-
-
 def test_converts_every_output_message_without_span_identity_or_finish_reason() -> None:
     """Output message conversion requires no provider name, model, or finish reason."""
     parsed = parse_otel(
@@ -714,25 +653,6 @@ def test_absent_optional_values_return_none() -> None:
     assert tool_schemas_from_otel(parsed) is None
 
 
-def test_reconstructs_provider_neutral_binding_fields() -> None:
-    """reconstruct_bound_llm binds the representable request fields from OtelChatSpan."""
-    parsed = parse_otel(
-        _chat_span({
-            "gen_ai.provider.name": "fake",
-            "gen_ai.request.model": "fake-model",
-            "gen_ai.system_instructions": [{"type": "text", "content": "Be brief."}],
-            "gen_ai.request.max_tokens": 200,
-            "gen_ai.request.reasoning.level": "high",
-            "gen_ai.request.temperature": 0.25,
-        })
-    )
-    bound_llm = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
-    assert bound_llm.binding.system_prompt == (TextPart(text="Be brief."),)
-    assert bound_llm.binding.max_completion_tokens == 200
-    assert bound_llm.binding.reasoning_level == "high"
-    assert bound_llm.binding.temperature == 0.25
-
-
 def test_reconstruction_rejects_a_different_llm_identity() -> None:
     """reconstruct_bound_llm rejects a provider or model mismatch."""
     parsed = parse_otel(
@@ -742,43 +662,19 @@ def test_reconstruction_rejects_a_different_llm_identity() -> None:
         _ = reconstruct_bound_llm(parsed, llm=LLM(FakeAdapter()))
 
 
-def test_reconstructs_text_generation_with_tool_calls_record_and_synthetic_fields() -> None:
-    """generation_record_from_otel preserves supported output and identity values."""
+def test_generation_record_fills_the_request_fields_a_span_does_not_record() -> None:
+    """generation_record_from_otel reads the response model and id and fills timing, billing, and request id.
+
+    Trace usage and service-tier attributes are ignored.
+    """
     span = _generation_chat_span({
-        "gen_ai.output.messages": [
-            {
-                "role": "assistant",
-                "parts": [
-                    {"type": "text", "content": "before"},
-                    {
-                        "type": "tool_call",
-                        "id": "call-1",
-                        "name": "lookup",
-                        "arguments": {"key": "value"},
-                    },
-                    {"type": "text", "content": "after"},
-                ],
-            }
-        ],
         "gen_ai.response.model": "served-model",
         "gen_ai.response.id": "response-1",
         "gen_ai.usage.input_tokens": 100,
         "openai.response.service_tier": "priority",
     })
     record = generation_record_from_otel(span)
-    assert record.kind == "with_tool_calls"
-    assert record.output == "beforeafter"
-    assert record.stop_reason == "stop"
-    assert record.request_history.model == "fake-model"
-    assert record.request_history.provider_name == "fake"
     assert record.request_history.elapsed_seconds == 0.0
-    assert record.assistant_message == AssistantMessage(
-        parts=(
-            TextPart(text="before"),
-            ToolCall(id="call-1", name="lookup", args_json='{"key":"value"}'),
-            TextPart(text="after"),
-        )
-    )
     request_record = record.request_records[0]
     assert request_record.started_after_seconds == 0.0
     assert request_record.elapsed_seconds == 0.0
@@ -977,18 +873,14 @@ def test_generation_record_rejects_error_finish_reason() -> None:
 @pytest.mark.parametrize(
     ("finish_reason", "stop_reason"),
     [
-        ("stop", "stop"),
-        ("tool_call", "tool_call"),
-        ("length", "max_completion_tokens"),
         ("content_filter", "refusal"),
-        ("context_window_exceeded", "context_window_exceeded"),
         ("provider_defined", "other"),
     ],
 )
 def test_generation_record_maps_selected_finish_reason(
     finish_reason: str, stop_reason: str
 ) -> None:
-    """Finish-reason conversion maps known values and uses other for unknown values."""
+    """Finish-reason conversion maps content_filter to refusal and an unknown value to other."""
     span = _generation_chat_span({"gen_ai.response.finish_reasons": [finish_reason]})
     assert generation_record_from_otel(span).stop_reason == stop_reason
 

@@ -9,9 +9,8 @@ import json
 import logging
 import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import ClassVar, Literal, NamedTuple, override
+from typing import ClassVar, Literal, NamedTuple, get_args, override
 
-import jsonschema
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -34,6 +33,7 @@ from langchaint import (
     DispatchUnknownTool,
     Generation,
     GenerationError,
+    GenerationInput,
     GenerationOutcome,
     GenerationWithoutToolCalls,
     ImagePart,
@@ -60,7 +60,13 @@ from langchaint.adapter import (
     UsableResponse,
 )
 from langchaint.common.messages import StopReason
-from langchaint.span_parsing import generation_input_from_otel, parse_otel
+from langchaint.span_parsing import (
+    generation_input_from_otel,
+    generation_record_from_otel,
+    output_messages_from_otel,
+    parse_otel,
+    reconstruct_bound_llm,
+)
 from langchaint.tracing import (
     AttributeMapper,
     ContentFilter,
@@ -90,7 +96,6 @@ from tests.helpers import (
     LANGCHAINT_KEYS,
     SEMCONV_GENAI_DIR,
     ValidatingSpanExporter,
-    payload_schema,
     run_with_timeout,
     time_out_when,
     transient,
@@ -143,7 +148,9 @@ type _GenerationPath = Literal["generate", "stream"]
 
 
 async def _generate_through[ToolManagerT: ToolManager | None](
-    path: _GenerationPath, bound_llm: BoundLLM[str, ToolManagerT]
+    path: _GenerationPath,
+    bound_llm: BoundLLM[str, ToolManagerT],
+    generation_input: GenerationInput = "hi",
 ) -> Generation[str]:
     """Run one input through `generate_one`, or through `stream_one` drained before its `final()`.
 
@@ -151,8 +158,8 @@ async def _generate_through[ToolManagerT: ToolManager | None](
         GenerationError: the input ends in a terminal failure.
     """
     if path == "generate":
-        return await bound_llm.generate_one("hi")
-    async with bound_llm.stream_one("hi") as handle:
+        return await bound_llm.generate_one(generation_input)
+    async with bound_llm.stream_one(generation_input) as handle:
         _ = [item async for item in handle]
         return await handle.final()
 
@@ -706,23 +713,18 @@ class _Answer(BaseModel):
     ("stream", "response_format", "output_type"),
     [(False, None, "text"), (True, None, "text"), (False, _Answer, "json")],
 )
-def test_request_attributes_cover_generate_stream_and_structured_output(
+def test_request_attributes_record_the_output_type_and_a_stream(
     *,
     stream: bool,
     response_format: type[_Answer] | None,
     output_type: str,
 ) -> None:
-    """Request attributes describe text, structured, and streaming inputs."""
+    """gen_ai.output.type names the output form, and gen_ai.request.stream is present only on a stream."""
 
     async def scenario() -> None:
         """Run the selected input and inspect its request attributes."""
         llm, exporter = _traced(FakeAdapter(echo=True))
-        bound = llm.bind(
-            response_format=response_format,
-            max_completion_tokens=123,
-            reasoning_level="high",
-            temperature=0.25,
-        )
+        bound = llm.bind(response_format=response_format)
         if response_format is not None:
             with pytest.raises(GenerationError):
                 await bound.generate_one("hi")
@@ -734,53 +736,89 @@ def test_request_attributes_cover_generate_stream_and_structured_output(
 
         (span,) = exporter.get_finished_spans()
         assert span.attributes is not None
-        expected: dict[str, object] = {
-            "gen_ai.provider.name": "fake",
-            "gen_ai.request.model": "fake-model",
-            "gen_ai.request.max_tokens": 123,
-            "gen_ai.request.reasoning.level": "high",
-            "gen_ai.request.temperature": 0.25,
-            "gen_ai.output.type": output_type,
-        }
-        if stream:
-            expected["gen_ai.request.stream"] = True
-        assert {key: span.attributes[key] for key in expected} == expected
-        assert ("gen_ai.request.stream" in span.attributes) is stream
+        assert span.attributes["gen_ai.output.type"] == output_type
+        assert span.attributes.get("gen_ai.request.stream") == (True if stream else None)
 
     run_with_timeout(scenario())
 
 
+@pytest.mark.parametrize("stop_reason", get_args(StopReason.__value__))
 @pytest.mark.parametrize("path", ["generate", "stream"])
-def test_span_parsing_reads_every_convention_attribute_a_chat_span_writes(
-    path: _GenerationPath,
+def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_records(
+    path: _GenerationPath, stop_reason: StopReason
 ) -> None:
-    """`parse_otel` reads each key of a captured chat span into a field, except the langchaint keys.
+    """The span_parsing converters rebuild the binding, input, and generation of a captured chat span.
 
+    The input and system prompt use the forms span parsing returns: tuple content and compact `args_json`.
+    `parse_otel` reads each key of the span into a field, except the langchaint keys.
     The usage counters read back unchanged.
     """
+    tool_calls = (
+        (ToolCall(id="call2", name="echo", args_json='{"text":"y"}'),)
+        if stop_reason == "tool_call"
+        else ()
+    )
+    assistant_message = AssistantMessage(
+        parts=(TextPart(text="before"), *tool_calls, TextPart(text="after"))
+    )
+    generation_input = (
+        _MULTIMODAL_USER_MESSAGE,
+        AssistantMessage(
+            parts=(
+                TextPart(text="checking"),
+                ToolCall(id="call1", name="echo", args_json='{"text":"x"}'),
+            )
+        ),
+        ToolMessage(tool_call_id="call1", content=(TextPart(text="x"),), is_error=True),
+    )
 
     async def scenario() -> None:
-        """Run one fully configured input and parse its span's exported attributes."""
-        llm, exporter = _traced(FakeAdapter(echo=True), capture_message_content=True)
+        """Generate under capture, then convert the span's exported attributes back."""
+        adapter = FakeAdapter(
+            scripted_requests=[
+                ScriptedResponse(
+                    outcome=UsableResponse(
+                        output="beforeafter",
+                        assistant_message=assistant_message,
+                        stop_reason=stop_reason,
+                    ),
+                    usage=USAGE,
+                )
+            ]
+        )
+        llm, exporter = _traced(adapter, capture_message_content=True)
         bound = llm.bind(
-            system_prompt="be brief",
+            system_prompt=(TextPart(text="be brief"),),
             tools=[_echo_tool()],
             max_completion_tokens=123,
             reasoning_level="high",
             temperature=0.25,
         )
-        _ = await _generate_through(path, bound)
+        generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
-        exported = TypeAdapter(dict[str, JsonValue]).validate_json(
-            json.dumps(dict(span.attributes or {}))
+        parsed = parse_otel(
+            TypeAdapter(dict[str, JsonValue]).validate_json(
+                json.dumps(dict(span.attributes or {}))
+            )
         )
-        parsed = parse_otel(exported)
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
         assert parsed.usage_input_tokens == USAGE.input_tokens_total
         assert parsed.usage_output_tokens == USAGE.output_tokens
         assert parsed.usage_reasoning_output_tokens == USAGE.output_tokens_reasoning
         assert parsed.usage_cache_read_input_tokens == USAGE.input_tokens_cache_read
         assert parsed.usage_cache_write_input_tokens == USAGE.input_tokens_cache_write
+        reconstructed = reconstruct_bound_llm(parsed, llm=llm, tools=[_echo_tool()])
+        assert reconstructed.binding == bound.binding
+        assert generation_input_from_otel(parsed) == generation_input
+        assert output_messages_from_otel(parsed) == (generation.assistant_message,)
+        record = generation_record_from_otel(parsed)
+        assert record.kind == generation.kind
+        assert record.output == generation.output
+        assert record.stop_reason == generation.stop_reason
+        assert record.assistant_message == generation.assistant_message
+        assert record.request_history.provider_name == generation.request_history.provider_name
+        assert record.request_history.model == generation.request_history.model
+        assert record.kept_request.model_served == generation.kept_request.model_served
 
     run_with_timeout(scenario())
 
@@ -1279,73 +1317,6 @@ def test_refresh_removes_an_obsolete_file_and_rewrites_source_doc(
     assert (destination / "SOURCE.md").read_text() == "Resolved commit SHA: `new`.\n"
 
 
-def test_capture_on_records_all_four_content_attributes_in_convention_shape() -> None:
-    """capture_message_content True records the system prompt, tools, GenerationInput, and assistant message.
-
-    Capture carries over to a replacement binding.
-    """
-
-    async def scenario() -> None:
-        """Generate over a Sequence[Message] carrying every message role and inspect the shapes."""
-        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        bound = llm.bind(system_prompt="replaced").bind(
-            system_prompt="be brief",
-            tools=ToolManager([_echo_tool()]),
-        )
-        await bound.generate_one([
-            UserMessage(content="look it up"),
-            AssistantMessage(
-                parts=(ToolCall(id="call1", name="echo", args_json='{"text": "x"}'),)
-            ),
-            ToolMessage(tool_call_id="call1", content="x"),
-        ])
-        assert _captured(exporter, "gen_ai.system_instructions") == [
-            {"type": "text", "content": "be brief"}
-        ]
-        assert _captured(exporter, "gen_ai.tool.definitions") == [
-            {
-                "type": "function",
-                "name": "echo",
-                "description": "Echo the text back",
-                "parameters": _EchoToolArgs.model_json_schema(),
-            }
-        ]
-        assert _captured(exporter, "gen_ai.input.messages") == [
-            {"role": "user", "parts": [{"type": "text", "content": "look it up"}]},
-            {
-                "role": "assistant",
-                "parts": [
-                    {
-                        "type": "tool_call",
-                        "id": "call1",
-                        "name": "echo",
-                        "arguments": {"text": "x"},
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "parts": [
-                    {
-                        "type": "tool_call_response",
-                        "id": "call1",
-                        "is_error": False,
-                        "response": [{"type": "text", "content": "x"}],
-                    }
-                ],
-            },
-        ]
-        assert _captured(exporter, "gen_ai.output.messages") == [
-            {
-                "role": "assistant",
-                "parts": [{"type": "text", "content": "ok"}],
-                "finish_reason": "stop",
-            }
-        ]
-
-    run_with_timeout(scenario())
-
-
 _MULTIMODAL_USER_MESSAGE = UserMessage(
     content=(
         TextPart(text="what is this"),
@@ -1374,55 +1345,6 @@ def _captured_user_parts(exporter: InMemorySpanExporter) -> list[object]:
     captured_parts: object = captured_message["parts"]
     assert isinstance(captured_parts, list)
     return captured_parts
-
-
-def _parts_of_type(parts: list[object], part_type: str) -> list[object]:
-    """Select the recorded parts whose type field is part_type."""
-    return [part for part in parts if isinstance(part, dict) and part.get("type") == part_type]
-
-
-def test_true_records_image_and_audio_bytes_as_blob_parts_that_round_trip() -> None:
-    """capture_message_content=True records ImagePart and AudioPart as convention BlobPart objects.
-
-    ImageUrlPart is a convention UriPart.
-    span_parsing converts the recorded message back to the original message.
-    """
-
-    async def scenario() -> None:
-        """Generate over the multimodal message and read the recorded parts back."""
-        llm, exporter = _traced(FakeAdapter(), capture_message_content=True)
-        await llm.bind().generate_one([_MULTIMODAL_USER_MESSAGE])
-        captured_parts = _captured_user_parts(exporter)
-        schema_definitions = payload_schema("gen-ai-input-messages.json")["$defs"]
-        blob_parts = _parts_of_type(captured_parts, "blob")
-        assert len(blob_parts) == 2
-        blob_part_validator = jsonschema.Draft202012Validator({
-            "$defs": schema_definitions,
-            "$ref": "#/$defs/BlobPart",
-        })
-        for blob_part in blob_parts:
-            blob_part_validator.validate(blob_part)
-        uri_parts = _parts_of_type(captured_parts, "uri")
-        assert len(uri_parts) == 2
-        image_uri_part_validator = jsonschema.Draft202012Validator({
-            "$defs": schema_definitions,
-            "allOf": [
-                {"$ref": "#/$defs/UriPart"},
-                {"properties": {"modality": {"const": "image"}}},
-            ],
-        })
-        for uri_part in uri_parts:
-            image_uri_part_validator.validate(uri_part)
-        (span,) = exporter.get_finished_spans()
-        input_messages_json = _attribute(span, "gen_ai.input.messages")
-        assert isinstance(input_messages_json, str)
-        parsed = parse_otel({
-            "gen_ai.operation.name": "chat",
-            "gen_ai.input.messages": input_messages_json,
-        })
-        assert generation_input_from_otel(parsed) == (_MULTIMODAL_USER_MESSAGE,)
-
-    run_with_timeout(scenario())
 
 
 def test_a_filter_returning_none_drops_image_and_audio_parts() -> None:

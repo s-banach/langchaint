@@ -464,6 +464,7 @@ class OtelExecuteToolSpan(OtelModel):
     operation_name: Literal["execute_tool"] = Field(alias=OPERATION_NAME)
     error_type: str | None = Field(default=None, alias="error.type")
     agent_name: str | None = Field(default=None, alias="gen_ai.agent.name")
+    conversation_id: str | None = Field(default=None, alias="gen_ai.conversation.id")
     tool_call_arguments: JsonValue = Field(default=None, alias="gen_ai.tool.call.arguments")
     tool_call_id: str | None = Field(default=None, alias="gen_ai.tool.call.id")
     tool_call_result: OtelToolCallResult = Field(default=None, alias="gen_ai.tool.call.result")

@@ -35,6 +35,7 @@ from langchaint.common.messages import (
     ToolMessage,
     UserMessage,
     _is_object_dict,
+    _require_json_runtime_shape,
 )
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
 from langchaint.generation.request_history import RequestHistory, SettledRequestRecord
@@ -52,35 +53,38 @@ TOOL_DEFINITIONS = "gen_ai.tool.definitions"
 INPUT_MESSAGES = "gen_ai.input.messages"
 OUTPUT_MESSAGES = "gen_ai.output.messages"
 
-type StrictFiniteFloat = Annotated[FiniteFloat, Field(strict=True)]
 type StringTuple = Annotated[tuple[str, ...], Field(strict=False)]
 
 _SPAN_ATTRIBUTES_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 _BASE64_BYTES_ADAPTER: TypeAdapter[Base64UrlBytes] = TypeAdapter(Base64UrlBytes)
 _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
-_STRUCTURED_ATTRIBUTE_NAMES_ADAPTER: TypeAdapter[frozenset[str]] = TypeAdapter(frozenset[str])
-_STRUCTURED_ATTRIBUTE_NAMES = _STRUCTURED_ATTRIBUTE_NAMES_ADAPTER.validate_json(
+_FINITE_JSON_ADAPTER: TypeAdapter[object] = TypeAdapter(
+    Annotated[object, AfterValidator(_require_json_runtime_shape)]
+)
+_STRUCTURED_ATTRIBUTE_NAMES = TypeAdapter(frozenset[str]).validate_json(
     files("langchaint").joinpath("_semconv_genai_structured_attributes.json").read_text()
+)
+_DRAFT_07_METASCHEMA_VALIDATOR = jsonschema.Draft7Validator(
+    jsonschema.Draft7Validator.META_SCHEMA,
+    format_checker=jsonschema.Draft7Validator.FORMAT_CHECKER,
 )
 
 
-def _decode_semconv_attribute(name: str, value: JsonValue) -> JsonValue:
+def _decode_semconv_attribute(name: str, value: JsonValue) -> object:
+    """Parse a structured attribute's JSON text and reject non-finite numbers.
+
+    The destination field validates the rest of the parsed value.
+    """
     if name not in _STRUCTURED_ATTRIBUTE_NAMES or not isinstance(value, str):
         return value
-    return _JSON_VALUE_ADAPTER.validate_json(value)
+    return _FINITE_JSON_ADAPTER.validate_json(value)
 
 
 def _validate_draft_07_schema(value: JsonValue) -> JsonValue:
-    if not isinstance(value, (dict, bool)):
+    if not _DRAFT_07_METASCHEMA_VALIDATOR.is_valid(value):
         raise PydanticCustomError(
             "json_schema", "parameters must be a JSON Schema draft-07 document"
         )
-    try:
-        jsonschema.Draft7Validator.check_schema(value)
-    except jsonschema.SchemaError as error:
-        raise PydanticCustomError(
-            "json_schema", "parameters must be a JSON Schema draft-07 document"
-        ) from error
     return value
 
 
@@ -307,12 +311,12 @@ class OtelChatSpan(OtelModel):
     prompt_version: str | None = Field(default=None, alias="gen_ai.prompt.version")
     provider_name: str | None = Field(default=None, alias="gen_ai.provider.name")
     request_choice_count: int | None = Field(default=None, alias="gen_ai.request.choice.count")
-    request_frequency_penalty: StrictFiniteFloat | None = Field(
+    request_frequency_penalty: FiniteFloat | None = Field(
         default=None, alias="gen_ai.request.frequency_penalty"
     )
     request_max_tokens: int | None = Field(default=None, alias="gen_ai.request.max_tokens")
     request_model: str | None = Field(default=None, alias="gen_ai.request.model")
-    request_presence_penalty: StrictFiniteFloat | None = Field(
+    request_presence_penalty: FiniteFloat | None = Field(
         default=None, alias="gen_ai.request.presence_penalty"
     )
     request_previous_response_id: str | None = Field(
@@ -326,17 +330,17 @@ class OtelChatSpan(OtelModel):
         default=None, alias="gen_ai.request.stop_sequences"
     )
     request_stream: bool | None = Field(default=None, alias="gen_ai.request.stream")
-    request_temperature: StrictFiniteFloat | None = Field(
+    request_temperature: FiniteFloat | None = Field(
         default=None, alias="gen_ai.request.temperature"
     )
     request_top_k: int | None = Field(default=None, alias="gen_ai.request.top_k")
-    request_top_p: StrictFiniteFloat | None = Field(default=None, alias="gen_ai.request.top_p")
+    request_top_p: FiniteFloat | None = Field(default=None, alias="gen_ai.request.top_p")
     response_finish_reasons: StringTuple | None = Field(
         default=None, alias="gen_ai.response.finish_reasons"
     )
     response_id: str | None = Field(default=None, alias="gen_ai.response.id")
     response_model: str | None = Field(default=None, alias="gen_ai.response.model")
-    response_time_to_first_chunk: StrictFiniteFloat | None = Field(
+    response_time_to_first_chunk: FiniteFloat | None = Field(
         default=None, alias="gen_ai.response.time_to_first_chunk"
     )
     system_instructions: tuple[OtelSystemInstructionPart, ...] | None = Field(
@@ -408,9 +412,9 @@ class OtelChatSpan(OtelModel):
     @classmethod
     def _partition_span_attributes(cls, input_value: object) -> object:
         span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
-        parsed_attributes: dict[str, JsonValue] = {}
+        parsed_attributes: dict[str, object] = {}
         prompt_variables: dict[str, JsonValue] = {}
-        unused_attributes: dict[str, JsonValue] = {}
+        unused_attributes: dict[str, object] = {}
         for name, value in span_attributes.items():
             if name in _OTEL_CHAT_SPAN_FIXED_ALIASES:
                 if value is None:
@@ -450,7 +454,7 @@ def parse_otel(span_attributes: dict[str, JsonValue]) -> OtelChatSpan:
 
 
 def _system_prompt_from_parts(
-    system_prompt_parts: tuple[OtelSystemInstructionPart, ...] | tuple[OtelMessagePart, ...],
+    system_prompt_parts: tuple[OtelMessagePart, ...],
 ) -> tuple[TextPart, ...]:
     """Convert supported OTel system instructions into langchaint text parts."""
     converted: list[TextPart] = []
@@ -488,7 +492,11 @@ def _split_system_prompt(
     system_message_indexes = [
         index for index, message in enumerate(input_messages) if message.role == "system"
     ]
-    if system_message_indexes and otel_chat_span.system_instructions:
+    if not system_message_indexes:
+        if otel_chat_span.system_instructions:
+            return _system_prompt_from_parts(otel_chat_span.system_instructions), input_messages
+        return None, input_messages
+    if otel_chat_span.system_instructions:
         raise OtelToLangchaintConversionError(
             f"{SYSTEM_INSTRUCTIONS} and an {INPUT_MESSAGES} role='system' message both provide "
             "the system prompt"
@@ -497,21 +505,17 @@ def _split_system_prompt(
         raise _attribute_conversion_error(
             INPUT_MESSAGES, "contains multiple role='system' messages"
         )
-    if system_message_indexes and system_message_indexes[0] != 0:
+    if system_message_indexes[0] != 0:
         raise _attribute_conversion_error(
             INPUT_MESSAGES, "contains a role='system' message after the first message"
         )
-    if system_message_indexes:
-        system_message = input_messages[0]
-        _require_message_metadata(system_message)
-        if not system_message.parts:
-            raise _attribute_conversion_error(
-                INPUT_MESSAGES, "contains a role='system' message without parts"
-            )
-        return _system_prompt_from_parts(system_message.parts), input_messages[1:]
-    if otel_chat_span.system_instructions:
-        return _system_prompt_from_parts(otel_chat_span.system_instructions), input_messages
-    return None, input_messages
+    system_message = input_messages[0]
+    _require_message_metadata(system_message)
+    if not system_message.parts:
+        raise _attribute_conversion_error(
+            INPUT_MESSAGES, "contains a role='system' message without parts"
+        )
+    return _system_prompt_from_parts(system_message.parts), input_messages[1:]
 
 
 def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ...] | None:
@@ -535,11 +539,7 @@ def tool_schemas_from_otel(otel_chat_span: OtelChatSpan) -> tuple[ToolSchema, ..
         if not isinstance(definition, OtelFunctionTool):
             raise _unsupported(definition, "tool definition type")
         _require_no_additional_properties(definition)
-        if (
-            definition.description is None
-            or definition.parameters is None
-            or not isinstance(definition.parameters, dict)
-        ):
+        if definition.description is None or not isinstance(definition.parameters, dict):
             raise _unsupported(
                 definition, "function definition without description and parameters"
             )
@@ -578,7 +578,7 @@ def _assistant_message_from_output(message: OtelOutputMessage) -> AssistantMessa
     _require_message_metadata(message)
     if message.role != "assistant":
         raise _unsupported(message, "output message role")
-    parts = _assistant_message_from_parts(message.parts).parts
+    parts = map(_assistant_part_from_otel, message.parts)
     return AssistantMessage(
         parts=tuple(part for part in parts if part.kind != "text" or part.text)
     )
@@ -838,8 +838,21 @@ def _stop_reason_from_otel(
             return "other"
 
 
-def _selected_output_type(output_type: str | None) -> str:
-    return "text" if output_type is None else output_type
+def _supported_output_type(output_type: str | None) -> Literal["text", "json"]:
+    """Return `output_type`, reading an absent value as `"text"`.
+
+    Raises:
+        OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
+    """
+    match output_type:
+        case None | "text":
+            return "text"
+        case "json":
+            return "json"
+        case _:
+            raise OtelToLangchaintConversionError(
+                f"gen_ai.output.type {output_type!r} is neither 'text' nor 'json'"
+            )
 
 
 def _output_from_otel(output_type: str | None, assistant_message: AssistantMessage) -> JsonValue:
@@ -852,14 +865,8 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
         OtelToLangchaintConversionError: `output_type` is neither `"text"` nor `"json"`.
         OtelToLangchaintConversionError: Under `"json"`, an assistant message without a tool call has invalid JSON text.
     """
-    selected_output_type = _selected_output_type(output_type)
-    if selected_output_type == "text":
+    if _supported_output_type(output_type) == "text":
         return assistant_message.text
-    if selected_output_type != "json":
-        raise _attribute_conversion_error(
-            "gen_ai.output.type",
-            "has no GenerationRecord[JsonValue, JsonValue] representation",
-        )
     try:
         return _JSON_VALUE_ADAPTER.validate_json(assistant_message.text)
     except ValidationError as error:
@@ -874,7 +881,7 @@ def _output_from_otel(output_type: str | None, assistant_message: AssistantMessa
 def _require_matching_response_format(
     output_type: str | None, response_format: type[BaseModel] | None
 ) -> None:
-    selected_output_type = _selected_output_type(output_type)
+    selected_output_type = _supported_output_type(output_type)
     if selected_output_type == "json" and response_format is None:
         raise OtelToLangchaintConversionError(
             f"gen_ai.output.type {output_type!r} requires response_format, got {response_format!r}"
@@ -884,8 +891,6 @@ def _require_matching_response_format(
             f"gen_ai.output.type {output_type!r} requires response_format=None, got "
             f"{response_format!r}"
         )
-    if selected_output_type not in {"json", "text"}:
-        raise _attribute_conversion_error("gen_ai.output.type", "has no supported response_format")
 
 
 def _message_from_otel(message: OtelInputMessage) -> Message:
@@ -894,7 +899,7 @@ def _message_from_otel(message: OtelInputMessage) -> Message:
         case "user":
             return UserMessage(content=_content_parts_from_otel(message.parts))
         case "assistant":
-            return _assistant_message_from_parts(message.parts)
+            return AssistantMessage(parts=tuple(map(_assistant_part_from_otel, message.parts)))
         case "tool":
             return _tool_message_from_otel(message)
         case _:
@@ -910,37 +915,29 @@ def _tool_message_from_otel(message: OtelInputMessage) -> ToolMessage:
     _require_no_additional_properties(part)
     if isinstance(part.response, str):
         content: str | tuple[ContentPart, ...] = part.response
-    elif isinstance(part.response, list):
+    else:
         try:
             response_parts = _MESSAGE_PARTS_ADAPTER.validate_python(part.response)
         except ValidationError as error:
             raise _unsupported(part, "tool response value") from error
         content = _content_parts_from_otel(response_parts)
-    else:
-        raise _unsupported(part, "tool response value")
     return ToolMessage(tool_call_id=part.id, content=content, is_error=part.is_error)
 
 
-def _assistant_message_from_parts(parts: tuple[OtelMessagePart, ...]) -> AssistantMessage:
-    converted: list[TextPart | ToolCall] = []
-    for part in parts:
-        if isinstance(part, OtelTextPart):
-            _require_no_additional_properties(part)
-            converted.append(TextPart(text=part.content))
-        elif isinstance(part, OtelToolCallPart):
-            _require_no_additional_properties(part)
-            if part.id is None:
-                raise _unsupported(part, "tool call without id")
-            converted.append(
-                ToolCall(
-                    id=part.id,
-                    name=part.name,
-                    args_json=json.dumps(part.arguments, allow_nan=False, separators=(",", ":")),
-                )
-            )
-        else:
-            raise _unsupported(part, "assistant part type")
-    return AssistantMessage(parts=tuple(converted))
+def _assistant_part_from_otel(part: OtelMessagePart) -> TextPart | ToolCall:
+    if isinstance(part, OtelTextPart):
+        _require_no_additional_properties(part)
+        return TextPart(text=part.content)
+    if isinstance(part, OtelToolCallPart):
+        _require_no_additional_properties(part)
+        if part.id is None:
+            raise _unsupported(part, "tool call without id")
+        return ToolCall(
+            id=part.id,
+            name=part.name,
+            args_json=json.dumps(part.arguments, allow_nan=False, separators=(",", ":")),
+        )
+    raise _unsupported(part, "assistant part type")
 
 
 def _content_parts_from_otel(parts: tuple[OtelMessagePart, ...]) -> tuple[ContentPart, ...]:

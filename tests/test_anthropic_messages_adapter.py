@@ -238,7 +238,7 @@ def _binding(
         provider_executed_tools=provider_executed_tools,
         tool_choice=tool_choice,
         parallel_tool_calls=False,
-        max_completion_tokens=None,
+        max_completion_tokens=4096,
         reasoning_level="high",
         temperature=temperature,
         automatic_cache_breakpoints=automatic_cache_breakpoints,
@@ -252,12 +252,12 @@ _UNSET_BINDING = Binding(
     provider_executed_tools=(),
     tool_choice="auto",
     parallel_tool_calls=True,
-    max_completion_tokens=None,
+    max_completion_tokens=4096,
     reasoning_level=None,
     temperature=None,
     automatic_cache_breakpoints=False,
 )
-"""A binding that states no optional request field."""
+"""A binding that states only `max_completion_tokens`, which Anthropic requires."""
 
 
 def _precomputed_with_provider_tools(*tool_types: str) -> _AnthropicProviderTools:
@@ -980,7 +980,6 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
         model="m",
         pricing=_PRICING,
         provider_name="anthropic",
-        default_max_completion_tokens=8192,
         cache_ttl="1h",
         service_tier="standard_only",
         inference_geo="us",
@@ -988,7 +987,6 @@ def test_config_fingerprint_data_contains_only_stored_request_configuration() ->
     assert adapter.config_fingerprint_data() == {
         "uses_top_level_cache_control": True,
         "cache_ttl": "1h",
-        "default_max_completion_tokens": 8192,
         "inference_geo": "us",
         "service_tier": "standard_only",
     }
@@ -1009,6 +1007,12 @@ def test_unset_binding_fields_stay_at_the_omit_sentinel() -> None:
         precomputed_fields.cache_control,
     ):
         assert isinstance(field_value, anthropic.Omit)
+
+
+def test_binding_without_max_completion_tokens_is_rejected() -> None:
+    """The Messages API requires `max_tokens`, so binding without a limit raises before any request."""
+    with pytest.raises(ValueError, match="max_completion_tokens"):
+        _ = _adapter().bind_text(replace(_UNSET_BINDING, max_completion_tokens=None))
 
 
 def test_request_passes_reasoning_level_through() -> None:

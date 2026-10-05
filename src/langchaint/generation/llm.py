@@ -377,8 +377,8 @@ class LLM:
             response_format: The pydantic model for structured output, or `None` for text.
                 With `None`, `output` is the kept assistant message's joined text, possibly `""`, for any stop reason.
                 To treat an empty reply as a failure, bind a `response_format` that rejects empty text.
-            max_completion_tokens: The maximum generated tokens, or `None` to let the adapter select the value.
-                `AnthropicMessagesAdapter` uses `default_max_completion_tokens` when this value is `None`.
+            max_completion_tokens: The maximum generated tokens, or `None` to omit the limit.
+                `AnthropicMessagesAdapter` requires a value because the Messages API requires `max_tokens`.
             reasoning_level: The exact reasoning-level string sent to the provider, or `None`.
             temperature: The sampling temperature, or `None` for the provider default.
             tool_choice: The provider-neutral tool choice.
@@ -394,6 +394,7 @@ class LLM:
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one.
+            ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.
@@ -700,7 +701,8 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             provider_executed_tools: The replacement provider-shaped tools or `UNCHANGED`.
             tool_choice: The replacement tool choice or `UNCHANGED`.
             parallel_tool_calls: The replacement parallel-tool setting or `UNCHANGED`.
-            max_completion_tokens: The replacement token limit, `None`, or `UNCHANGED`.
+            max_completion_tokens: The replacement token limit, `None` to omit the limit, or `UNCHANGED`.
+                `AnthropicMessagesAdapter` requires a value because the Messages API requires `max_tokens`.
             reasoning_level: The replacement exact provider string, `None`, or `UNCHANGED`.
             temperature: The replacement sampling temperature, `None`, or `UNCHANGED`.
             extra_body: The replacement provider wire-body fields, `None`, or `UNCHANGED`.
@@ -714,6 +716,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
             ValueError: `automatic_cache_breakpoints` is unsupported.
             ValueError: `extra_body` contains an adapter-populated key.
             ValueError: `max_requests` is boolean or below one.
+            ValueError: `max_completion_tokens` is `None` on an `AnthropicMessagesAdapter`.
             ValueError: The Gemini SDK normalizes `reasoning_level` instead of accepting it unchanged.
             TypeError: The adapter does not support `tool_choice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` or a tool's `args_model` has no JSON schema.

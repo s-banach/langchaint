@@ -29,6 +29,7 @@ async def run_batch_and_handle_what_failed() -> list[
     openai = OpenAI()
     summarizer = anthropic.model("claude-sonnet-5").bind(
         system_prompt="Summarize in one sentence.",
+        max_completion_tokens=256,
         max_requests=5,
     )
     fallback = openai.model("gpt-5.6-terra").bind(system_prompt="Summarize in one sentence.")

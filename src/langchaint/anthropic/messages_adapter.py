@@ -1119,7 +1119,6 @@ class AnthropicMessagesAdapter(Adapter):
     """Adapter over an AsyncAnthropic, AsyncAnthropicBedrock, or AsyncAnthropicBedrockMantle client.
 
     All three clients expose `messages.stream` and `with_options`.
-    `default_max_completion_tokens` supplies required `max_tokens` when the binding omits it.
     """
 
     provider_name_by_client_class: ClassVar[Mapping[type, str]] = {
@@ -1139,7 +1138,6 @@ class AnthropicMessagesAdapter(Adapter):
         model: str,
         pricing: AnthropicPricingTable,
         provider_name: str,
-        default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
         service_tier: AnthropicServiceTier | None = None,
         inference_geo: str | None = None,
@@ -1167,7 +1165,6 @@ class AnthropicMessagesAdapter(Adapter):
         )
         self.client: AnthropicClient = client_without_retries(client)
         self.pricing: AnthropicPricingTable = pricing
-        self.default_max_completion_tokens: int = default_max_completion_tokens
         self.cache_ttl: CacheTTL = cache_ttl
         self._uses_top_level_cache_control: bool = not isinstance(
             self.client, AsyncAnthropicBedrock
@@ -1181,7 +1178,6 @@ class AnthropicMessagesAdapter(Adapter):
         return {
             "uses_top_level_cache_control": self._uses_top_level_cache_control,
             "cache_ttl": self.cache_ttl,
-            "default_max_completion_tokens": self.default_max_completion_tokens,
             "inference_geo": self.inference_geo,
             "service_tier": self.service_tier,
         }
@@ -1195,11 +1191,16 @@ class AnthropicMessagesAdapter(Adapter):
         Binding marks use the four-marker limit before message marks.
 
         Raises:
+            ValueError: `max_completion_tokens` is `None`, because the Messages API requires `max_tokens`.
             ValueError: Binding marks exceed four, `extra_body` conflicts, or `system_prompt` is empty.
             ValueError: A provider-executed tool type is unsupported or code execution lacks a qualifying web tool.
             ValueError: Provider-executed tools use another provider or web-search rates are invalid.
             TypeError: `tool_choice` is `AllowedToolsChoice`, which Anthropic does not support.
         """
+        if binding.max_completion_tokens is None:
+            raise ValueError(
+                "Anthropic requires max_completion_tokens; pass max_completion_tokens= to bind"
+            )
         reject_extra_body_keys_the_adapter_populates(
             binding.extra_body, populated_keys=_ADAPTER_POPULATED_WIRE_KEYS
         )
@@ -1211,7 +1212,6 @@ class AnthropicMessagesAdapter(Adapter):
                 rate_name="web_search_usd_per_invocation",
                 rate=self.pricing.web_search_usd_per_invocation,
             )
-        max_tokens = binding.max_completion_tokens
         system: list[TextBlockParam] | Omit = omit
         bind_marker_count = 0
         if binding.system_prompt is not None:
@@ -1267,9 +1267,7 @@ class AnthropicMessagesAdapter(Adapter):
             thinking = {"type": "adaptive"}
         return _AnthropicPrecomputedFields(
             model=self.model,
-            max_tokens=(
-                max_tokens if max_tokens is not None else self.default_max_completion_tokens
-            ),
+            max_tokens=binding.max_completion_tokens,
             temperature=(binding.temperature if binding.temperature is not None else omit),
             system=system,
             tools=tools,
@@ -1297,7 +1295,7 @@ class AnthropicMessagesAdapter(Adapter):
         """Bind for plain-text output without I/O.
 
         Raises:
-            ValueError: `binding` contains unsupported values.
+            ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
             TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
         """
         return _BoundAnthropicText(
@@ -1311,7 +1309,7 @@ class AnthropicMessagesAdapter(Adapter):
         """Bind for structured output validated into response_format without I/O.
 
         Raises:
-            ValueError: `binding` contains unsupported values.
+            ValueError: `binding.max_completion_tokens` is `None`, or `binding` contains other unsupported values.
             TypeError: `binding.tool_choice` is `AllowedToolsChoice`.
             pydantic.PydanticInvalidForJsonSchema: `response_format` cannot produce a JSON schema.
             pydantic.PydanticUserError: `response_format` is not fully defined.

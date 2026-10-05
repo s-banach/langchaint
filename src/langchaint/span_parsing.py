@@ -750,6 +750,7 @@ def reconstruct_bound_llm[ModelT: BaseModel](
     Raises:
         ValueError: The provider name or model on `llm` differs from `otel_chat_span`.
         ValueError: A parsed binding field is invalid for the adapter.
+        ValueError: The span lacks `gen_ai.request.max_tokens` and `llm` uses `AnthropicMessagesAdapter`.
         ValueError: `tools` contains duplicate names.
         OtelToLangchaintConversionError: Captured configuration differs from caller-supplied objects.
         OtelToLangchaintConversionError: A captured value has no lossless langchaint representation.

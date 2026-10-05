@@ -13,6 +13,7 @@ async def generate_with_a_warm_cache() -> list[GenerationWithoutToolCalls[str] |
     ) * 300
     bound = anthropic.model("claude-sonnet-5", cache_ttl="1h").bind(
         system_prompt=[TextPart(text=stable_policy, cache_breakpoint=True)],
+        max_completion_tokens=1024,
         automatic_cache_breakpoints=False,
     )
 

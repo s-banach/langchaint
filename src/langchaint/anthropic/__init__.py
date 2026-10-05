@@ -172,7 +172,6 @@ class Anthropic:
         model: AnthropicModelName,
         *,
         pricing: AnthropicPricingTable | None = ...,
-        default_max_completion_tokens: int = ...,
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
         inference_geo: str | None = ...,
@@ -184,7 +183,6 @@ class Anthropic:
         model: str,
         *,
         pricing: AnthropicPricingTable,
-        default_max_completion_tokens: int = ...,
         cache_ttl: CacheTTL = ...,
         service_tier: AnthropicServiceTier | None = ...,
         inference_geo: str | None = ...,
@@ -195,7 +193,6 @@ class Anthropic:
         model: str,
         *,
         pricing: AnthropicPricingTable | None = None,
-        default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
         service_tier: AnthropicServiceTier | None = None,
         inference_geo: str | None = None,
@@ -206,7 +203,6 @@ class Anthropic:
         Cataloged models receive `ANTHROPIC_PRICING`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing`.
-        `default_max_completion_tokens` fills an unstated bound completion limit.
         `cache_ttl` applies to automatic `cache_control` and every cache marker.
         `service_tier` sets the requested Anthropic service tier.
         `inference_geo` requests the inference geography.
@@ -226,7 +222,6 @@ class Anthropic:
             model=model,
             pricing=pricing,
             provider_name="anthropic",
-            default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
             service_tier=service_tier,
             inference_geo=inference_geo,
@@ -279,7 +274,6 @@ class AnthropicBedrock:
         model: AnthropicBedrockModelName,
         *,
         pricing: AnthropicPricingTable | None = None,
-        default_max_completion_tokens: int = 4096,
         cache_ttl: CacheTTL = "5m",
     ) -> LLM:
         """Build an `LLM` for one Bedrock model.
@@ -291,7 +285,6 @@ class AnthropicBedrock:
         Other known identifiers select `AsyncAnthropicBedrock`.
         Stated `pricing` replaces catalog pricing.
         Uncataloged models require `pricing` and a passed `client`.
-        `default_max_completion_tokens` fills an unstated bound completion limit.
         `cache_ttl` applies to automatic `cache_control` and every cache marker.
         Bedrock models accept no Anthropic `service_tier` parameter here.
 
@@ -308,7 +301,6 @@ class AnthropicBedrock:
             model=model,
             pricing=pricing if pricing is not None else self._catalog_pricing(model, resolution),
             provider_name="aws.bedrock",
-            default_max_completion_tokens=default_max_completion_tokens,
             cache_ttl=cache_ttl,
         )
         return LLM(adapter, shared_backoff=self._shared_backoff, observer=self._observer)

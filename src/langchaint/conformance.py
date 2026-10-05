@@ -47,12 +47,15 @@ _PLAIN_TEXT_BINDING = Binding(
     provider_executed_tools=(),
     tool_choice="auto",
     parallel_tool_calls=True,
-    max_completion_tokens=None,
+    max_completion_tokens=1024,
     reasoning_level=None,
     temperature=None,
     automatic_cache_breakpoints=True,
 )
-"""The binding every invariant here binds under: text output and nothing else stated."""
+"""The binding every invariant here binds under: text output and a completion limit.
+
+The limit is stated because `AnthropicMessagesAdapter` rejects a binding without one.
+"""
 
 
 class _WeatherReport(BaseModel):

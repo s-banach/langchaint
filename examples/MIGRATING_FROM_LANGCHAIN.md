@@ -87,6 +87,7 @@ cohere_embeddings = cohere_bedrock.embedding_model(
 Uncataloged models require explicit pricing.
 `OpenAI.model` also requires `supports_prompt_cache_options` for uncataloged models.
 `OpenAIBedrock.model` always requires both values.
+`Anthropic` and `AnthropicBedrock` models require `max_completion_tokens` in `bind`, because the Messages API requires `max_tokens`.
 
 ## Bind again
 

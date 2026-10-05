@@ -28,10 +28,7 @@ async def basics() -> None:
 
     assistant = llm.bind(system_prompt="Be terse.")
     colors = await assistant.generate_one("Name three primary colors.")
-    print(f"answer: {colors.output}")
-    print(f"model: {colors.request_history.model}")
-    print(f"provider: {colors.request_history.provider_name}")
-    print(f"requests: {colors.request_count}")
+    print(colors.output)
 
     classifier = llm.bind(response_format=Sentiment)
     classification = await classifier.generate_one("Best day I have had in months.")

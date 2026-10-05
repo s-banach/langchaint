@@ -9,10 +9,8 @@ from langchaint.common.exceptions import TransientError
 from langchaint.common.messages import AssistantMessage, StopReason
 from langchaint.common.request_failure import RequestFailure, _TerminalRequestFailureKind
 from langchaint.generation.request_history import (
-    CutOffRequestRecord,
     RequestHistory,
     RequestProviderData,
-    SettledRequestRecord,
     TransientErrorRecord,
     _InputOutcomeRecordBase,
     _RequestLedger,
@@ -133,7 +131,7 @@ type GenerationErrorKind = _GenerationErrorRecordKind | Literal["schema_violatio
 - `auth_error`: a provider rejected the client's credentials or permissions for one request.
   The same request can succeed after the caller repairs the credentials or permissions.
 - `rejected_error`: the adapter returned `RejectedMessages`, or the provider rejected a request.
-  After `RejectedMessages`, `request_count == 0`.
+  After `RejectedMessages`, `request_history.records` is empty.
 - `unknown_exception_error`: an exception escaped generation handling, or `Adapter.request_failure` could not place it.
 - `timed_out_error`: a langchaint deadline expired before handling the input ended.
 """
@@ -297,39 +295,9 @@ class GenerationError(Exception):
         return self.record.request_history
 
     @property
-    def request_records(
-        self,
-    ) -> tuple[SettledRequestRecord | CutOffRequestRecord, ...]:
-        """Return normalized request records in order."""
-        return self.record.request_records
-
-    @property
-    def request_count(self) -> int:
-        """Return requests that langchaint observed going out."""
-        return self.record.request_count
-
-    @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
         return self.record.usage
-
-    @property
-    def model(self) -> str:
-        """Return the requested model id."""
-        return self.record.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the provider name."""
-        return self.record.provider_name
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """Return the seconds from the start of handling the input until its request history was frozen.
-
-        It includes admission and backoff waits.
-        """
-        return self.record.elapsed_seconds
 
     @property
     def assistant_message(self) -> AssistantMessage | None:

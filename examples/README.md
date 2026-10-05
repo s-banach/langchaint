@@ -6,7 +6,7 @@ Most examples construct backend classes directly to show request code.
 
 | File | Shows |
 | --- | --- |
-| [`01_basics.py`](01_basics.py) | `OpenAI` construction, bindings, `request_history`, structured output, replacement bindings, batches, and outcome-record tables |
+| [`01_basics.py`](01_basics.py) | `OpenAI` construction, bindings, structured output, replacement bindings, batches, and outcome-record tables |
 | [`02_tool_loop.py`](02_tool_loop.py) | `GenerationWithoutToolCalls \| GenerationWithToolCalls` and a complete structured tool loop |
 | [`03_streaming.py`](03_streaming.py) | Every `StreamItem` variant and `StreamHandle.final()` |
 | [`04_failures_and_deadlines.py`](04_failures_and_deadlines.py) | Request pacing, deadlines, batch failures, and provider fallback |

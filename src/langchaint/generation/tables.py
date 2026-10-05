@@ -150,12 +150,13 @@ def to_tables[OutputT, WithToolCallsOutputT](
         live_error = value if isinstance(value, GenerationError) else None
         is_error = isinstance(record, _GenerationErrorRecordBase)
         is_generation = isinstance(record, _GenerationRecordBase)
+        request_history = record.request_history
         outcome_rows.append({
             "outcome_index": outcome_index,
-            "model": record.model,
-            "provider_name": record.provider_name,
-            "elapsed_seconds": record.elapsed_seconds,
-            "request_count": record.request_count,
+            "model": request_history.model,
+            "provider_name": request_history.provider_name,
+            "elapsed_seconds": request_history.elapsed_seconds,
+            "request_count": len(request_history.records),
             "stop_reason": record.stop_reason,
             "error_text": record.error_text if is_error else None,
             "request_params_json": None
@@ -163,8 +164,8 @@ def to_tables[OutputT, WithToolCallsOutputT](
             else live_error.request_params.as_json(),
             "output": _output_cell(record.output) if is_generation else None,
         })
-        kept_index = len(record.request_records) - 1 if is_generation else None
-        for request_index, request_record in enumerate(record.request_records):
+        kept_index = len(request_history.records) - 1 if is_generation else None
+        for request_index, request_record in enumerate(request_history.records):
             request_rows.append(
                 _request_row(
                     outcome_index=outcome_index,

@@ -107,7 +107,12 @@ type _RequestRecordVariant = Annotated[
 
 
 class RequestHistory(CheckedCopyModel):
-    """The normalized ordered request records and elapsed time of one input."""
+    """The normalized ordered request records and elapsed time of one input.
+
+    `model` is the requested model id.
+    `elapsed_seconds` runs from the start of handling the input until the history was frozen.
+    It includes admission and backoff waits.
+    """
 
     model_config = _RECORD_CONFIG
 
@@ -164,41 +169,11 @@ class _InputOutcomeRecordBase(CheckedCopyModel):
     request_history: RequestHistory
 
     @property
-    def request_count(self) -> int:
-        """Return the observed request count."""
-        return len(self.request_history.records)
-
-    @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
         return Usage.sum_of(
             request_record.usage for request_record in self.request_history.records
         )
-
-    @property
-    def model(self) -> str:
-        """Return the requested model id."""
-        return self.request_history.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the provider name."""
-        return self.request_history.provider_name
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """Return the seconds from the start of handling the input until its request history was frozen.
-
-        It includes admission and backoff waits.
-        """
-        return self.request_history.elapsed_seconds
-
-    @property
-    def request_records(
-        self,
-    ) -> tuple[SettledRequestRecord | CutOffRequestRecord, ...]:
-        """Return the input's normalized request records."""
-        return self.request_history.records
 
     @property
     def assistant_message(self) -> AssistantMessage | None:

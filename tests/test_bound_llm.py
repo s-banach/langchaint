@@ -344,7 +344,7 @@ def test_a_raise_from_interpret_leaves_the_response_and_its_billing_on_the_recor
         bound_llm = LLM(_InterpretRaisesAdapter(), shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = _settled_request_records(unplaceable.value.request_records)
+        (record,) = _settled_request_records(unplaceable.value.request_history.records)
         (request_provider_data,) = unplaceable.value.request_provider_data
         assert isinstance(request_provider_data.raw, FakeRawResponse)
         assert record.usage == USAGE
@@ -371,7 +371,7 @@ def test_a_stream_interpret_failure_raises_a_generation_error_with_the_response(
             with pytest.raises(GenerationError, match="interpretation failed") as raised:
                 await handle.final()
         assert raised.value.record.kind == "unknown_exception_error"
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         (request_provider_data,) = raised.value.request_provider_data
         assert request_provider_data.raw is stream.raw
         assert record.usage == USAGE_STREAM
@@ -391,11 +391,11 @@ def test_retry_recovers_after_a_transient_failure() -> None:
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind(system_prompt="s")
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         assert generation.output == "ok"
-        assert generation.request_count == 2
-        assert generation.model == "fake-model"
-        assert generation.provider_name == "fake"
+        assert generation.request_history.model == "fake-model"
+        assert generation.request_history.provider_name == "fake"
         assert adapter.bound_adapters[0].open_count == 2
         failed, succeeded = generation.request_records
+        assert generation.kept_request is succeeded
         assert str(failed.error) == "boom"
         assert failed.assistant_message is None
         assert (failed.model_served, failed.response_id, failed.request_id) == (None, None, None)
@@ -414,7 +414,7 @@ def test_retry_recovers_after_a_transient_failure() -> None:
             + succeeded.elapsed_seconds
             - failed.started_after_seconds
         )
-        assert generation.elapsed_seconds >= records_span
+        assert generation.request_history.elapsed_seconds >= records_span
 
     run_with_timeout(scenario())
 
@@ -519,9 +519,9 @@ def test_retry_exhaustion_raises_ordered_failure(path: _GenerationPath) -> None:
             "e2",
         ]
         assert failure.error_text == "request 1: e1\nrequest 2: e2"
-        assert failure.request_count == 2
-        assert failure.model == adapter.model
-        assert failure.provider_name == adapter.provider_name
+        assert len(failure.request_history.records) == 2
+        assert failure.request_history.model == adapter.model
+        assert failure.request_history.provider_name == adapter.provider_name
 
     run_with_timeout(scenario())
 
@@ -545,7 +545,7 @@ def test_request_record_bracket_excludes_the_backoff_sleep() -> None:
             failed.started_after_seconds + failed.elapsed_seconds
         )
         assert backoff_gap >= 0.02
-        assert generation.elapsed_seconds >= 0.02
+        assert generation.request_history.elapsed_seconds >= 0.02
 
     run_with_timeout(scenario())
 
@@ -570,9 +570,9 @@ def test_build_request_rejecting_messages_fails_the_input_with_nothing_sent(
         assert rejected.value.record.kind == "rejected_error"
         assert rejected.value.record.error_text == "nope"
         assert rejected.value.error_text == "nope"
-        assert rejected.value.model == adapter.model
-        assert rejected.value.provider_name == adapter.provider_name
-        assert rejected.value.request_records == ()
+        assert rejected.value.request_history.model == adapter.model
+        assert rejected.value.request_history.provider_name == adapter.provider_name
+        assert rejected.value.request_history.records == ()
         assert rejected.value.usage == ZERO_USAGE
 
     run_with_timeout(scenario())
@@ -593,7 +593,9 @@ def test_rejection_after_transient_requests_carries_their_records() -> None:
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as rejected:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        billed_record, rejected_record = _settled_request_records(rejected.value.request_records)
+        billed_record, rejected_record = _settled_request_records(
+            rejected.value.request_history.records
+        )
         assert billed_record.usage.cost_in_usd == 0.25
         assert rejected_record.error is None
         assert rejected_record.usage == ZERO_USAGE
@@ -666,9 +668,8 @@ def test_a_terminal_outcome_raises_without_retry(
         assert failure.record.kind == kind
         assert failure.stop_reason == stop_reason
         assert failure.error_text == error_text
-        assert failure.request_count == 1
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = _settled_request_records(failure.request_records)
+        (record,) = _settled_request_records(failure.request_history.records)
         assert record.error is None
         assert record.assistant_message == REJECTED_ASSISTANT_MESSAGE
         assert failure.request_provider_data[0].raw is not None
@@ -687,7 +688,6 @@ def test_provider_failed_transiently_is_retried_and_keeps_its_billing() -> None:
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         generation = await bound_llm.generate_one([UserMessage(content="hi")])
         assert adapter.bound_adapters[0].open_count == 2
-        assert generation.request_count == 2
         rejected, succeeded = generation.request_records
         assert isinstance(rejected.error, TransientErrorRecord)
         assert str(rejected.error) == _PROVIDER_FAILURE_REASON
@@ -724,7 +724,7 @@ def test_provider_failed_transiently_with_pauses_quota_pauses_admission() -> Non
         )
         with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = _settled_request_records(exhausted.value.request_records)
+        (record,) = _settled_request_records(exhausted.value.request_history.records)
         assert isinstance(record.error, TransientErrorRecord)
         assert record.error.pauses_quota
         # Only a pausing RequestFailure moves _pause_until off the sentinel, so this is the flag arriving.
@@ -771,10 +771,10 @@ def test_an_exception_placed_terminal_fails_the_item_without_retry(
         assert failure.record.kind == kind
         assert isinstance(failure.__cause__, ValueError)
         assert failure.error_text == "boom"
-        assert failure.model == adapter.model
-        assert failure.provider_name == adapter.provider_name
+        assert failure.request_history.model == adapter.model
+        assert failure.request_history.provider_name == adapter.provider_name
         assert failure.usage == ZERO_USAGE
-        records = _settled_request_records(failure.request_records)
+        records = _settled_request_records(failure.request_history.records)
         assert [record.error for record in records] == ([None] if records_request else [])
         assert [request_record.raw for request_record in failure.request_provider_data] == (
             [None] if records_request else []
@@ -796,7 +796,7 @@ def test_a_mid_drain_failure_records_reported_billing_and_request_id() -> None:
         )
         with pytest.raises(GenerationError) as exhausted:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = _settled_request_records(exhausted.value.request_records)
+        (record,) = _settled_request_records(exhausted.value.request_history.records)
         assert record.usage == USAGE_STREAM
         assert record.request_id == "req-fake-stream"
         assert stream.closed
@@ -815,7 +815,7 @@ def test_a_deadline_expiring_mid_drain_reports_the_streams_in_flight_billing() -
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
-        (cut_off,) = timed_out.request_records
+        (cut_off,) = timed_out.request_history.records
         assert cut_off.kind == "cut_off"
         assert cut_off.billing is not None
         assert cut_off.billing.usage == USAGE_STREAM
@@ -839,7 +839,7 @@ def test_a_settled_requests_billing_is_counted_once_after_a_later_deadline_cut()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
-        record, cut_off = timed_out.request_records
+        record, cut_off = timed_out.request_history.records
         assert record.usage == USAGE_STREAM
         assert cut_off.kind == "cut_off"
         assert cut_off.billing is None
@@ -887,7 +887,7 @@ def test_a_mid_drain_exception_nobody_can_place_still_records_the_request() -> N
         bound_llm = LLM(FakeAdapter(stream=stream), shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as unplaceable:
             await bound_llm.generate_one([UserMessage(content="hi")])
-        (record,) = _settled_request_records(unplaceable.value.request_records)
+        (record,) = _settled_request_records(unplaceable.value.request_history.records)
         assert record.usage == ZERO_USAGE
         assert record.request_id == "req-fake-stream"
         assert stream.closed
@@ -2118,7 +2118,7 @@ def test_an_escaped_defect_keeps_the_billing_of_the_request_it_cut_off() -> None
             async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
                 await handle.final()
         assert raised.value.record.kind == "unknown_exception_error"
-        (cut_off,) = raised.value.request_records
+        (cut_off,) = raised.value.request_history.records
         assert cut_off.kind == "cut_off"
         assert raised.value.record.usage == USAGE
 
@@ -2175,10 +2175,9 @@ def test_a_defect_over_a_staged_response_keeps_the_request_and_its_billing() -> 
         bound_llm = LLM(adapter, shared_backoff=fast_shared_backoff()).bind()
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="a")])
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert record.usage == USAGE
         assert raised.value.usage == USAGE
-        assert raised.value.request_count == 1
 
     run_with_timeout(scenario())
 
@@ -2281,11 +2280,11 @@ def test_a_stream_cancelled_inside_the_block_sets_its_abandoned(
             await time_out_when(drain(), lambda: stream.suspended)
         abandoned = handle.abandoned
         assert abandoned is not None
-        (cut_off,) = abandoned.request_records
+        (cut_off,) = abandoned.request_history.records
         assert cut_off.kind == "cut_off"
         assert (cut_off.billing is None) == (usage_reported is None)
         assert abandoned.usage == expected_usage
-        assert abandoned.model == adapter.model
+        assert abandoned.request_history.model == adapter.model
 
     run_with_timeout(scenario())
 
@@ -2362,7 +2361,7 @@ def test_a_block_left_before_the_outcome_sets_abandoned_with_the_first_item_time
             await leave(handle)
         abandoned = handle.abandoned
         assert abandoned is not None
-        (cut_off,) = abandoned.request_records
+        (cut_off,) = abandoned.request_history.records
         assert cut_off.kind == "cut_off"
         assert (cut_off.first_item_after_seconds is not None) == (
             block_exit != "before_first_item"
@@ -2463,7 +2462,7 @@ def test_a_failure_after_the_drained_stream_returned_its_permit_still_pauses_the
             assert shared_backoff._permits_held == 0
             with pytest.raises(GenerationError) as raised:
                 await handle.final()
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert isinstance(record.error, TransientErrorRecord)
         assert record.error.pauses_quota
         assert shared_backoff._pause_until != _NEVER
@@ -2559,7 +2558,7 @@ def test_a_close_raising_a_base_exception_still_sets_the_abandoned() -> None:
             await time_out_when(consume(), hang_reached.is_set)
         abandoned = handle.abandoned
         assert abandoned is not None
-        assert abandoned.model == "fake-model"
+        assert abandoned.request_history.model == "fake-model"
 
     run_with_timeout(scenario())
 
@@ -2606,7 +2605,7 @@ def test_a_stream_that_broke_after_items_records_what_the_provider_reported(
             with pytest.raises(GenerationError) as raised:
                 async for _item in handle:
                     pass
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert (None if record.error is None else str(record.error)) == record_error_text
         assert (record.billing is None) == (usage_reported is None)
         expected_usage = ZERO_USAGE if usage_reported is None else usage_reported
@@ -2880,9 +2879,8 @@ def test_stream_passes_items_through_and_assembles_final() -> None:
         assert collected_items == ["ok", FAKE_TOOL_CALL]
         assert generation.output == "ok"
         assert generation.stop_reason == "stop"
-        assert generation.model == "fake-model"
-        assert generation.provider_name == "fake"
-        assert generation.request_count == 1
+        assert generation.request_history.model == "fake-model"
+        assert generation.request_history.provider_name == "fake"
         (record,) = generation.request_records
         assert record.error is None
         assert record.elapsed_seconds >= 0.0
@@ -2901,10 +2899,9 @@ def test_stream_final_provider_failed_transiently_fails_the_item_with_retry_unav
             with pytest.raises(GenerationError) as retry_unavailable:
                 await handle.final()
         failure = retry_unavailable.value
-        assert failure.request_count == 1
         assert failure.error_text == _PROVIDER_FAILURE_REASON
         assert failure.usage.cost_in_usd == 0.25
-        (record,) = _settled_request_records(failure.request_records)
+        (record,) = _settled_request_records(failure.request_history.records)
         assert str(record.error) == _PROVIDER_FAILURE_REASON
         assert record.assistant_message == REJECTED_ASSISTANT_MESSAGE
         assert failure.request_provider_data[0].raw is not None
@@ -2928,7 +2925,7 @@ def test_a_stream_that_drops_mid_stream_records_the_id_its_open_response_carried
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await handle.final()
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert record.response_id is None
         assert record.request_id == "req-fake-stream"
 
@@ -2948,7 +2945,7 @@ def test_the_request_id_an_error_names_outranks_the_streams_own() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             with pytest.raises(GenerationError) as raised:
                 await anext(handle)
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert record.request_id == "req-from-items-error"
 
     run_with_timeout(scenario())
@@ -2967,7 +2964,6 @@ def test_stream_retry_populates_request_records() -> None:
         async with bound_llm.stream_one([UserMessage(content="hi")]) as handle:
             generation = await handle.final()
         assert generation.output == "ok"
-        assert generation.request_count == 2
         failed, succeeded = generation.request_records
         assert str(failed.error) == "connection reset"
         assert (failed.model_served, failed.response_id) == (None, None)
@@ -3028,7 +3024,7 @@ def test_stream_open_rejected_carries_the_prior_requests_records() -> None:
         assert rejected.value.record.kind == "rejected_error"
         assert rejected.value.record.error_text == "boom"
         transient_record, rejected_record = _settled_request_records(
-            rejected.value.request_records
+            rejected.value.request_history.records
         )
         assert str(transient_record.error) == "connection reset"
         assert rejected_record.error is None
@@ -3100,8 +3096,7 @@ def test_stream_item_failure_after_open_is_not_retried() -> None:
             with pytest.raises(GenerationError) as raised:
                 await anext(handle)
         assert adapter.bound_adapters[0].open_count == 1
-        assert raised.value.request_count == 1
-        (record,) = _settled_request_records(raised.value.request_records)
+        (record,) = _settled_request_records(raised.value.request_history.records)
         assert str(record.error) == "dropped before the first item"
         assert record.first_item_after_seconds is None
 
@@ -3120,7 +3115,7 @@ def test_stream_record_and_elapsed_end_at_exhaustion_not_at_final() -> None:
                 pass
             await asyncio.sleep(idle_seconds)
             generation = await handle.final()
-        assert generation.elapsed_seconds < idle_seconds
+        assert generation.request_history.elapsed_seconds < idle_seconds
 
     run_with_timeout(scenario())
 
@@ -3270,7 +3265,7 @@ def test_a_rate_limited_stream_open_pauses_the_rate_limit_quota_and_the_retry_su
         # Only a pausing RequestFailure moves _pause_until off the sentinel, so this is the open's failure arriving.
         assert shared_backoff._pause_until != _NEVER
         assert generation.output == "ok"
-        assert generation.request_count == 2
+        assert len(generation.request_history.records) == 2
 
     run_with_timeout(scenario())
 
@@ -3309,10 +3304,9 @@ def test_a_deadline_expiring_mid_request_counts_the_request_it_cut_off(
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="hi")], timeout_seconds=0.02)
         timed_out = raised.value
-        assert timed_out.request_count == settled_requests + 1
-        assert len(timed_out.request_records) == settled_requests + 1
-        assert timed_out.request_records[-1].kind == "cut_off"
-        assert timed_out.request_records[-1].billing is None
+        assert len(timed_out.request_history.records) == settled_requests + 1
+        assert timed_out.request_history.records[-1].kind == "cut_off"
+        assert timed_out.request_history.records[-1].billing is None
         assert timed_out.usage == ZERO_USAGE
         assert str(timed_out) == ""
 
@@ -3333,8 +3327,7 @@ def test_a_deadline_expiring_before_admission_reports_no_requests() -> None:
         with pytest.raises(GenerationError) as raised:
             await bound_llm.generate_one([UserMessage(content="queued")], timeout_seconds=0.02)
         timed_out = raised.value
-        assert timed_out.request_count == 0
-        assert timed_out.request_records == ()
+        assert timed_out.request_history.records == ()
         assert timed_out.usage == ZERO_USAGE
         _ = holder.cancel()
         await asyncio.gather(holder, return_exceptions=True)
@@ -3443,7 +3436,7 @@ def test_a_batch_item_banks_what_is_left_of_its_budget_across_a_retry() -> None:
         )
         assert isinstance(results[0], GenerationError)
         assert results[0].record.kind == "timed_out_error"
-        assert results[0].request_count == 2
+        assert len(results[0].request_history.records) == 2
 
     run_with_timeout(scenario())
 

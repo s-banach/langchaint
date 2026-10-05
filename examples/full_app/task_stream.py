@@ -270,7 +270,7 @@ class ReActAgent(AgentRun):
                 self.turn_log.append(
                     GenerationErrorEntry(turn_number=self.turn_number, error=error)
                 )
-                if error.record.kind != "timed_out_error":
+                if error.kind != "timed_out_error":
                     raise
                 # The timed-out `generate_one` leaves self.messages unchanged for the next turn.
                 self.on_event(

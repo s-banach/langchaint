@@ -287,20 +287,21 @@ def gen_ai_attributes[OutputT](
     `langchaint.request_failed` span events retain per-request detail.
     """
     usage = outcome.usage
-    records = outcome.request_records
+    request_history = outcome.request_history
+    records = request_history.records
     final_record = records[-1] if records else None
     final_settled_record = (
         final_record if final_record is not None and final_record.kind == "settled" else None
     )
     attributes: dict[str, SpanAttributeValue] = {
-        "gen_ai.provider.name": outcome.provider_name,
-        "gen_ai.request.model": outcome.model,
+        "gen_ai.provider.name": request_history.provider_name,
+        "gen_ai.request.model": request_history.model,
         "gen_ai.usage.input_tokens": usage.input_tokens_total,
         "gen_ai.usage.output_tokens": usage.output_tokens,
         "gen_ai.usage.reasoning.output_tokens": usage.output_tokens_reasoning,
         "gen_ai.usage.cache_read.input_tokens": usage.input_tokens_cache_read,
         "gen_ai.usage.cache_write.input_tokens": usage.input_tokens_cache_write,
-        "langchaint.request_count": outcome.request_count,
+        "langchaint.request_count": len(records),
         "langchaint.cost_in_usd": usage.cost_in_usd,
     }
     if final_settled_record is not None and final_settled_record.model_served is not None:
@@ -563,7 +564,7 @@ def _record_request_failed_events[OutputT](
     Events are stamped at recording time because the records carry only monotonic brackets.
     They answer the first question a slow traced input raises: was it one request or the retries.
     """
-    for record in outcome.request_records:
+    for record in outcome.request_history.records:
         if record.kind == "settled" and record.error is not None:
             span.add_event(
                 "langchaint.request_failed",

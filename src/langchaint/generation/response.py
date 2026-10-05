@@ -45,21 +45,24 @@ class _GenerationRecordBase(_InputOutcomeRecordBase):
         return self
 
     @property
-    @override
-    def request_records(
-        self,
-    ) -> tuple[SettledRequestRecord, ...]:
-        """Return the input's normalized request records."""
+    def request_records(self) -> tuple[SettledRequestRecord, ...]:
+        """Return `request_history.records`, which validation guarantees are settled."""
         return _settled_request_records(self.request_history)
+
+    @property
+    def kept_request(self) -> SettledRequestRecord:
+        """Return the final request, whose response holds the kept assistant message."""
+        final = self.request_history.records[-1]
+        assert final.kind == "settled"
+        return final
 
     @property
     @override
     def assistant_message(self) -> AssistantMessage:
         """Return the kept assistant message, from the final request."""
-        final = self.request_history.records[-1]
-        assert final.kind == "settled"
-        assert final.assistant_message is not None
-        return final.assistant_message
+        assistant_message = self.kept_request.assistant_message
+        assert assistant_message is not None
+        return assistant_message
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
@@ -127,39 +130,19 @@ class _LiveGenerationBase[RecordT: _GenerationRecordBase]:
         return self.record.assistant_message
 
     @property
-    def request_records(
-        self,
-    ) -> tuple[SettledRequestRecord, ...]:
-        """Return normalized request records in request order."""
+    def request_records(self) -> tuple[SettledRequestRecord, ...]:
+        """Return `request_history.records`, which validation guarantees are settled."""
         return self.record.request_records
 
     @property
-    def request_count(self) -> int:
-        """Return the observed request count."""
-        return self.record.request_count
+    def kept_request(self) -> SettledRequestRecord:
+        """Return the final request, whose response holds the kept assistant message."""
+        return self.record.kept_request
 
     @property
     def usage(self) -> Usage:
         """Return normalized usage across every request."""
         return self.record.usage
-
-    @property
-    def model(self) -> str:
-        """Return the requested model id."""
-        return self.record.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the provider name."""
-        return self.record.provider_name
-
-    @property
-    def elapsed_seconds(self) -> float:
-        """Return the seconds from the start of handling the input until its request history was frozen.
-
-        It includes admission and backoff waits.
-        """
-        return self.record.elapsed_seconds
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:

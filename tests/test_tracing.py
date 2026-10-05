@@ -451,7 +451,7 @@ def test_retry_surfaces_as_a_request_failed_span_event() -> None:
         """Recover one generate_one from a transient failure, then read the span event."""
         llm, exporter = _traced(FakeAdapter(scripted_requests=[TransientError("boom")]))
         generation = await llm.bind().generate_one("hi")
-        assert generation.request_count == 2
+        assert len(generation.request_history.records) == 2
         (span,) = exporter.get_finished_spans()
         (event,) = span.events
         assert event.name == "langchaint.request_failed"
@@ -865,8 +865,8 @@ def test_a_custom_mapper_and_extra_attributes_reach_every_chat_span_across_bind(
 
         def _mapper(outcome: GenerationOutcome[object] | AbandonedStreamRecord) -> SpanAttributes:
             """Record the outcome and emit one attribute from it and one colliding with an extra."""
-            mapped_models.append(outcome.model)
-            return {"custom.model": outcome.model, "shared.key": "mapped"}
+            mapped_models.append(outcome.request_history.model)
+            return {"custom.model": outcome.request_history.model, "shared.key": "mapped"}
 
         llm, exporter = _traced(
             FakeAdapter(echo=True),
@@ -1854,7 +1854,7 @@ def test_a_failures_assistant_message_reaches_a_span_only_through_the_gated_outp
             await llm.bind(max_requests=3).generate_one("hi")
 
         error = raised.value
-        assert error.request_count == 2
+        assert len(error.request_history.records) == 2
         assert _CONTENT_SENTINEL not in error.error_text
         assert _CONTENT_SENTINEL not in str(error)
         assert error.assistant_message == assistant_message

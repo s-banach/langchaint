@@ -1,8 +1,8 @@
 """Normalized generation error records and live generation failures."""
 
-from typing import TYPE_CHECKING, Literal, Self, override
+from typing import TYPE_CHECKING, Annotated, Literal, Self, override
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from langchaint.billing.usage import Usage
 from langchaint.common.exceptions import TransientError
@@ -67,7 +67,7 @@ def _set_or_validate_retry_error_text(
         raise ValueError("error_text must match the request history's transient errors")
 
 
-def _require_error_text(record: "GenerationErrorRecord") -> None:
+def _require_error_text(record: "PlainErrorRecord") -> None:
     if "error_text" not in record.model_fields_set:
         raise ValueError(f"{record.kind} requires error_text")
 
@@ -97,7 +97,7 @@ def _require_provider_failed_terminally_shape(request_history: RequestHistory) -
         _require_final_terminal_response(request_history, permit_empty=False)
 
 
-type _GenerationErrorRecordKind = Literal[
+type _PlainErrorRecordKind = Literal[
     "retries_exhausted_error",
     "retry_unavailable_error",
     "refusal_error",
@@ -111,10 +111,10 @@ type _GenerationErrorRecordKind = Literal[
     "unknown_exception_error",
     "timed_out_error",
 ]
-"""The kinds a `GenerationErrorRecord` reports, which `GenerationErrorKind` documents."""
+"""The kinds a `PlainErrorRecord` reports, which `GenerationErrorKind` documents."""
 
 
-type GenerationErrorKind = _GenerationErrorRecordKind | Literal["schema_violation_error"]
+type GenerationErrorKind = _PlainErrorRecordKind | Literal["schema_violation_error"]
 """The outcome a `GenerationError` reports.
 
 - `retries_exhausted_error`: every request failed transiently and the retry budget ended.
@@ -123,7 +123,6 @@ type GenerationErrorKind = _GenerationErrorRecordKind | Literal["schema_violatio
 - `max_completion_tokens_exceeded_error`: a structured response reached its token limit before parsing.
 - `empty_assistant_message_error`: a structured response produced no output or tool call.
 - `schema_violation_error`: a structured response failed the caller's model validation.
-  `SchemaViolationErrorRecord` reports it, and every other kind is a `GenerationErrorRecord`.
 - `context_window_exceeded_error`: a response reported that the request exceeded the context window.
 - `unfinished_assistant_message_error`: a provider returned an unfinished assistant message.
 - `provider_failed_terminally_error`: a provider reported a failure that sending the request again would repeat.
@@ -137,8 +136,8 @@ type GenerationErrorKind = _GenerationErrorRecordKind | Literal["schema_violatio
 """
 
 
-class GenerationErrorRecord(_GenerationErrorRecordBase):
-    """One terminal generation failure other than a schema violation.
+class PlainErrorRecord(_GenerationErrorRecordBase):
+    """One terminal generation failure whose record holds only the fields every `GenerationErrorRecord` variant shares.
 
     Validation requires of `request_history`, by `kind`:
     - `retries_exhausted_error` and `retry_unavailable_error`: every request has a transient error.
@@ -159,7 +158,7 @@ class GenerationErrorRecord(_GenerationErrorRecordBase):
     Validation rejects unknown fields.
     """
 
-    kind: _GenerationErrorRecordKind
+    kind: _PlainErrorRecordKind
 
     @property
     def stop_reason(self) -> StopReason | None:
@@ -235,7 +234,17 @@ class SchemaViolationErrorRecord(_GenerationErrorRecordBase):
         return self
 
 
-_GENERATION_ERROR_RECORD_CLASSES = (GenerationErrorRecord, SchemaViolationErrorRecord)
+type GenerationErrorRecord = Annotated[
+    PlainErrorRecord | SchemaViolationErrorRecord, Field(discriminator="kind")
+]
+"""The normalized record of one `GenerationError`.
+
+`kind` separates the variants.
+`schema_violation_error` is a `SchemaViolationErrorRecord`, and every other kind is a `PlainErrorRecord`.
+"""
+
+
+_GENERATION_ERROR_RECORD_CLASSES = (PlainErrorRecord, SchemaViolationErrorRecord)
 """The record classes a `GenerationError` holds."""
 
 
@@ -252,7 +261,7 @@ def _terminal_error_record(
     *,
     error_text: str,
     request_history: RequestHistory,
-) -> GenerationErrorRecord:
+) -> PlainErrorRecord:
     match request_failure_kind:
         case "auth":
             kind = "auth_error"
@@ -262,20 +271,20 @@ def _terminal_error_record(
             kind = "provider_failed_terminally_error"
         case "unknown_exception":
             kind = "unknown_exception_error"
-    return GenerationErrorRecord(kind=kind, error_text=error_text, request_history=request_history)
+    return PlainErrorRecord(kind=kind, error_text=error_text, request_history=request_history)
 
 
 class GenerationError(Exception):
     """A live terminal generation failure with one normalized record."""
 
-    record: GenerationErrorRecord | SchemaViolationErrorRecord
+    record: GenerationErrorRecord
     request_params: "RequestParams | None"
     request_provider_data: tuple[RequestProviderData, ...]
 
     def __init__(
         self,
         *,
-        record: GenerationErrorRecord | SchemaViolationErrorRecord,
+        record: GenerationErrorRecord,
         request_params: "RequestParams | None",
         request_provider_data: tuple[RequestProviderData, ...],
     ) -> None:

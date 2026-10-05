@@ -34,7 +34,7 @@ from langchaint.concurrency.shared_backoff import (
 )
 from langchaint.generation.errors import (
     GenerationError,
-    GenerationErrorRecord,
+    PlainErrorRecord,
     _terminal_generation_error,
     _transient_error_for,
 )
@@ -340,7 +340,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
         """
         if self._ledger.request_count >= self._max_requests:
             raise GenerationError(
-                record=GenerationErrorRecord(
+                record=PlainErrorRecord(
                     kind="retries_exhausted_error", request_history=self._ledger.freeze()
                 ),
                 request_params=self._request_params,
@@ -370,7 +370,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
         built = self._bound_adapter.build_request_params(self._messages)
         if isinstance(built, RejectedMessages):
             raise GenerationError(
-                record=GenerationErrorRecord(
+                record=PlainErrorRecord(
                     kind="rejected_error",
                     error_text=built.error_text,
                     request_history=self._ledger.freeze(),
@@ -498,7 +498,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
                 error=wrapped, assistant_message=None, provider_billing=stream_provider_billing
             )
             error = GenerationError(
-                record=GenerationErrorRecord(
+                record=PlainErrorRecord(
                     kind="retry_unavailable_error", request_history=self._ledger.freeze()
                 ),
                 request_params=self._request_params,
@@ -613,7 +613,7 @@ class StreamHandle[OutputT, GenerationWithToolCallsT: GenerationWithToolCalls[ob
                 assistant_message=response_outcome.assistant_message,
             )
             retry_unavailable = GenerationError(
-                record=GenerationErrorRecord(
+                record=PlainErrorRecord(
                     kind="retry_unavailable_error",
                     request_history=self._ledger.freeze_ending_at(ended_at_monotonic_seconds),
                 ),

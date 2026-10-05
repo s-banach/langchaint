@@ -47,6 +47,7 @@ from langchaint.generation.errors import (
     GenerationError,
     GenerationErrorKind,
     GenerationErrorRecord,
+    PlainErrorRecord,
     SchemaViolationErrorRecord,
 )
 from langchaint.generation.llm import LLM, BoundLLM, GenerationInput
@@ -167,6 +168,7 @@ __all__ = [
     "JsonValue",
     "Message",
     "MessageContent",
+    "PlainErrorRecord",
     "PydanticTool",
     "RawPart",
     "ReasoningDelta",

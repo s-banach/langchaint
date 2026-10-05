@@ -16,6 +16,7 @@ from langchaint import (
     Generation,
     GenerationErrorRecord,
     Message,
+    PlainErrorRecord,
     SchemaViolationErrorRecord,
     StreamItem,
 )
@@ -159,15 +160,15 @@ def _by_generation_kind_missing_a_variant(generation: Generation[str]) -> object
 
 
 def _by_generation_error_record_kind(
-    record: GenerationErrorRecord | SchemaViolationErrorRecord,
+    record: GenerationErrorRecord,
 ) -> object:
-    """Verify that `kind` separates `SchemaViolationErrorRecord` from `GenerationErrorRecord`."""
+    """Verify that `kind` separates `SchemaViolationErrorRecord` from `PlainErrorRecord`."""
     match record.kind:
         case "schema_violation_error":
             assert_type(record, SchemaViolationErrorRecord)
             return record.validation_error_json
         case _:
-            assert_type(record, GenerationErrorRecord)
+            assert_type(record, PlainErrorRecord)
             return record.error_text
 
 

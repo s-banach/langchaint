@@ -3,10 +3,10 @@
 import json
 import math
 from collections.abc import Callable
-from typing import Annotated, override
+from typing import override
 
 import pytest
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint import (
     ZERO_USAGE,
@@ -21,6 +21,7 @@ from langchaint import (
     GenerationWithoutToolCalls,
     GenerationWithoutToolCallsRecord,
     GenerationWithToolCallsRecord,
+    PlainErrorRecord,
     RequestHistory,
     RequestProviderData,
     SchemaViolationErrorRecord,
@@ -329,9 +330,7 @@ def test_generation_variant_constructs_one_normalized_record() -> None:
     assert generation.record.request_history is request_history
 
 
-def _error_record_cases() -> list[
-    tuple[GenerationErrorRecord | SchemaViolationErrorRecord, GenerationErrorKind, str]
-]:
+def _error_record_cases() -> list[tuple[GenerationErrorRecord, GenerationErrorKind, str]]:
     completed = _completed_request_history()
     failed = _failed_request_history()
     multiline_failed = _request_history(
@@ -353,31 +352,29 @@ def _error_record_cases() -> list[
     cut_off = _request_history(CutOffRequestRecord(started_after_seconds=0.0, billing=_BILLING))
     return [
         (
-            GenerationErrorRecord(
-                kind="retries_exhausted_error", request_history=multiline_failed
-            ),
+            PlainErrorRecord(kind="retries_exhausted_error", request_history=multiline_failed),
             "retries_exhausted_error",
             "request 1: connection\n  reset\nrequest 2: ",
         ),
         (
-            GenerationErrorRecord(kind="retry_unavailable_error", request_history=failed),
+            PlainErrorRecord(kind="retry_unavailable_error", request_history=failed),
             "retry_unavailable_error",
             "retry",
         ),
         (
-            GenerationErrorRecord(kind="refusal_error", request_history=completed),
+            PlainErrorRecord(kind="refusal_error", request_history=completed),
             "refusal_error",
             "",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="max_completion_tokens_exceeded_error", request_history=completed
             ),
             "max_completion_tokens_exceeded_error",
             "",
         ),
         (
-            GenerationErrorRecord(kind="empty_assistant_message_error", request_history=completed),
+            PlainErrorRecord(kind="empty_assistant_message_error", request_history=completed),
             "empty_assistant_message_error",
             "",
         ),
@@ -387,12 +384,12 @@ def _error_record_cases() -> list[
             "",
         ),
         (
-            GenerationErrorRecord(kind="context_window_exceeded_error", request_history=completed),
+            PlainErrorRecord(kind="context_window_exceeded_error", request_history=completed),
             "context_window_exceeded_error",
             "",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="unfinished_assistant_message_error",
                 request_history=completed,
                 error_text="unfinished",
@@ -401,7 +398,7 @@ def _error_record_cases() -> list[
             "unfinished",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="provider_failed_terminally_error",
                 request_history=completed,
                 error_text="failed",
@@ -410,7 +407,7 @@ def _error_record_cases() -> list[
             "failed",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="provider_failed_terminally_error",
                 request_history=terminal,
                 error_text="terminal",
@@ -419,12 +416,12 @@ def _error_record_cases() -> list[
             "terminal",
         ),
         (
-            GenerationErrorRecord(kind="auth_error", request_history=terminal, error_text="auth"),
+            PlainErrorRecord(kind="auth_error", request_history=terminal, error_text="auth"),
             "auth_error",
             "auth",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="rejected_error",
                 request_history=RequestHistory(
                     model="model",
@@ -438,7 +435,7 @@ def _error_record_cases() -> list[
             "invalid",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="unknown_exception_error",
                 request_history=RequestHistory(
                     model="model",
@@ -452,14 +449,14 @@ def _error_record_cases() -> list[
             "unknown",
         ),
         (
-            GenerationErrorRecord(
+            PlainErrorRecord(
                 kind="unknown_exception_error", request_history=cut_off, error_text="escaped"
             ),
             "unknown_exception_error",
             "escaped",
         ),
         (
-            GenerationErrorRecord(kind="timed_out_error", request_history=cut_off),
+            PlainErrorRecord(kind="timed_out_error", request_history=cut_off),
             "timed_out_error",
             "",
         ),
@@ -468,9 +465,7 @@ def _error_record_cases() -> list[
 
 def test_every_error_record_round_trips_through_the_closed_union() -> None:
     """The closed error union reconstructs each built-in error record."""
-    adapter = TypeAdapter(
-        Annotated[GenerationErrorRecord | SchemaViolationErrorRecord, Field(discriminator="kind")]
-    )
+    adapter = TypeAdapter(GenerationErrorRecord)
     for record, expected_kind, expected_error_text in _error_record_cases():
         assert record.error_text == expected_error_text
         record_json_text = record.model_dump_json()
@@ -486,15 +481,13 @@ def test_every_error_record_round_trips_through_the_closed_union() -> None:
 
 def test_error_record_properties_and_error_text() -> None:
     """Error records retain normalized properties and error_text."""
-    exhausted = GenerationErrorRecord(
+    exhausted = PlainErrorRecord(
         kind="retries_exhausted_error", request_history=_failed_request_history()
     )
     assert [str(error) for error in exhausted.request_history.errors_from_requests] == ["retry"]
     assert exhausted.error_text == "request 1: retry"
     assert exhausted.assistant_message is None
-    refusal = GenerationErrorRecord(
-        kind="refusal_error", request_history=_completed_request_history()
-    )
+    refusal = PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history())
     assert refusal.stop_reason == "refusal"
     assert refusal.assistant_message == _TEXT_ASSISTANT_MESSAGE
     assert refusal.usage == _USAGE
@@ -503,12 +496,12 @@ def test_error_record_properties_and_error_text() -> None:
 @pytest.mark.parametrize(
     "factory",
     [
-        lambda: GenerationErrorRecord(
+        lambda: PlainErrorRecord(
             kind="retries_exhausted_error",
             request_history=_failed_request_history(),
             error_text="different text",
         ),
-        lambda: GenerationErrorRecord(
+        lambda: PlainErrorRecord(
             kind="retry_unavailable_error",
             request_history=_failed_request_history(),
             error_text="different text",
@@ -516,7 +509,7 @@ def test_error_record_properties_and_error_text() -> None:
     ],
 )
 def test_retry_error_records_reject_error_text_that_disagrees_with_request_history(
-    factory: Callable[[], GenerationErrorRecord],
+    factory: Callable[[], PlainErrorRecord],
 ) -> None:
     """Retry records derive error_text from the request history."""
     with pytest.raises(ValidationError, match="error_text must match"):
@@ -527,26 +520,26 @@ def test_retry_error_records_reject_error_text_that_disagrees_with_request_histo
     ("factory", "match"),
     [
         (
-            lambda: GenerationErrorRecord(
+            lambda: PlainErrorRecord(
                 kind="retries_exhausted_error", request_history=_completed_request_history()
             ),
             "transient error",
         ),
         (
-            lambda: GenerationErrorRecord(
+            lambda: PlainErrorRecord(
                 kind="refusal_error", request_history=_failed_request_history()
             ),
             "final request must be error-free",
         ),
         (
-            lambda: GenerationErrorRecord(
+            lambda: PlainErrorRecord(
                 kind="auth_error",
                 request_history=_request_history(_settled(billing=None, assistant_message=None)),
             ),
             "auth_error requires error_text",
         ),
         (
-            lambda: GenerationErrorRecord(
+            lambda: PlainErrorRecord(
                 kind="provider_failed_terminally_error",
                 request_history=RequestHistory(
                     model="m", provider_name="p", records=(), elapsed_seconds=0.0
@@ -558,7 +551,7 @@ def test_retry_error_records_reject_error_text_that_disagrees_with_request_histo
     ],
 )
 def test_error_records_reject_invalid_request_history_shapes(
-    factory: Callable[[], GenerationErrorRecord], match: str
+    factory: Callable[[], PlainErrorRecord], match: str
 ) -> None:
     """Each constrained error group rejects a request history shape outside its contract."""
     with pytest.raises(ValidationError, match=match):
@@ -567,9 +560,7 @@ def test_error_records_reject_invalid_request_history_shapes(
 
 def test_generation_error_requires_provider_request_alignment() -> None:
     """Reject request_provider_data that do not align with the record."""
-    record = GenerationErrorRecord(
-        kind="refusal_error", request_history=_completed_request_history()
-    )
+    record = PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history())
     with pytest.raises(ValueError, match="align"):
         _ = GenerationError(record=record, request_params=None, request_provider_data=())
 
@@ -582,7 +573,7 @@ def test_mixed_normalized_outcome_list_round_trips() -> None:
             request_history=_completed_request_history(),
             stop_reason="stop",
         ),
-        GenerationErrorRecord(kind="refusal_error", request_history=_completed_request_history()),
+        PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history()),
     ]
     adapter = TypeAdapter(list[GenerationOutcomeRecord[Report, Report | None]])
     records_json = adapter.dump_json(records)
@@ -593,9 +584,7 @@ def test_mixed_normalized_outcome_list_round_trips() -> None:
 
 def test_to_tables_reads_live_only_request_params_and_provider_usage() -> None:
     """Tables read request params and provider usage only from live outcomes."""
-    record = GenerationErrorRecord(
-        kind="refusal_error", request_history=_completed_request_history()
-    )
+    record = PlainErrorRecord(kind="refusal_error", request_history=_completed_request_history())
     live = GenerationError(
         record=record,
         request_params=StubRequestParams(),
@@ -622,7 +611,7 @@ def test_to_tables_reads_live_only_request_params_and_provider_usage() -> None:
 
 def test_to_tables_emits_one_row_for_a_cut_off_request() -> None:
     """A cut-off request produces one request row with no fabricated ending."""
-    record = GenerationErrorRecord(
+    record = PlainErrorRecord(
         kind="timed_out_error",
         request_history=_request_history(
             CutOffRequestRecord(started_after_seconds=0.25, billing=_BILLING)
@@ -694,13 +683,13 @@ def test_timed_out_error_appends_one_cut_off_request_with_live_usage() -> None:
     "factory",
     [
         lambda: AbandonedStreamRecord(request_history=_failed_request_history()),
-        lambda: GenerationErrorRecord(
+        lambda: PlainErrorRecord(
             kind="timed_out_error", request_history=_failed_request_history()
         ),
     ],
 )
 def test_an_interrupted_outcome_record_accepts_a_transient_prefix_without_a_cut_off(
-    factory: Callable[[], AbandonedStreamRecord | GenerationErrorRecord],
+    factory: Callable[[], AbandonedStreamRecord | PlainErrorRecord],
 ) -> None:
     """An interruption during retry backoff retains its transient settled request."""
     record = factory()

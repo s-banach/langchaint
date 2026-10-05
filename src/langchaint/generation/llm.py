@@ -47,7 +47,7 @@ from langchaint.generation._generate_many_records import (
 from langchaint.generation.errors import (
     GenerationError,
     GenerationErrorRecord,
-    SchemaViolationErrorRecord,
+    PlainErrorRecord,
     _terminal_generation_error,
     _transient_error_for,
 )
@@ -945,7 +945,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
                     raise generation_outcome
                 return generation_outcome
         raise GenerationError(
-            record=GenerationErrorRecord(
+            record=PlainErrorRecord(
                 kind="retries_exhausted_error", request_history=ledger.freeze()
             ),
             request_params=request_params,
@@ -963,7 +963,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         built = self._bound_adapter.build_request_params(messages)
         if isinstance(built, RejectedMessages):
             raise GenerationError(
-                record=GenerationErrorRecord(
+                record=PlainErrorRecord(
                     kind="rejected_error",
                     error_text=built.error_text,
                     request_history=ledger.freeze(),
@@ -1183,11 +1183,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         input_ids: SequenceNotStr[str] | None = ...,
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
-    ) -> list[
-        GenerationWithoutToolCallsRecord[OutputT]
-        | GenerationErrorRecord
-        | SchemaViolationErrorRecord
-    ]: ...
+    ) -> list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]: ...
     @overload
     async def generate_many_records(
         self: "BoundLLM[str, ToolManagerT]",
@@ -1218,11 +1214,7 @@ class BoundLLM[OutputT, ToolManagerT: ToolManager | None = None]:
         warm_cache: bool = ...,
         max_working_seconds_per_input: float | None = ...,
     ) -> (
-        list[
-            GenerationWithoutToolCallsRecord[OutputT]
-            | GenerationErrorRecord
-            | SchemaViolationErrorRecord
-        ]
+        list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[OutputT, OutputT | None]]
     ): ...
     async def generate_many_records(

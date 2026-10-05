@@ -12,7 +12,7 @@ from langchaint.common.messages import AssistantMessage, StopReason, ToolCall
 from langchaint.generation.errors import (
     _GENERATION_ERROR_RECORD_CLASSES,
     GenerationError,
-    GenerationErrorRecord,
+    PlainErrorRecord,
     SchemaViolationErrorRecord,
 )
 from langchaint.generation.request_history import (
@@ -230,7 +230,7 @@ type GenerationOutcome[OutputT, WithToolCallsOutputT = OutputT] = (
 type GenerationOutcomeRecord[OutputT, WithToolCallsOutputT] = Annotated[
     SerializeAsAny[GenerationWithoutToolCallsRecord[OutputT]]
     | SerializeAsAny[GenerationWithToolCallsRecord[WithToolCallsOutputT]]
-    | GenerationErrorRecord
+    | PlainErrorRecord
     | SchemaViolationErrorRecord,
     Field(discriminator="kind"),
 ]
@@ -318,13 +318,13 @@ def _generation_outcome_from_response_outcome[OutputT](
                 stop_reason=outcome.stop_reason,
             )
         case "refusal":
-            record = GenerationErrorRecord(kind="refusal_error", request_history=request_history)
+            record = PlainErrorRecord(kind="refusal_error", request_history=request_history)
         case "max_completion_tokens_exceeded":
-            record = GenerationErrorRecord(
+            record = PlainErrorRecord(
                 kind="max_completion_tokens_exceeded_error", request_history=request_history
             )
         case "empty_assistant_message":
-            record = GenerationErrorRecord(
+            record = PlainErrorRecord(
                 kind="empty_assistant_message_error", request_history=request_history
             )
         case "schema_violation":
@@ -333,17 +333,17 @@ def _generation_outcome_from_response_outcome[OutputT](
                 request_history=request_history,
             )
         case "context_window_exceeded":
-            record = GenerationErrorRecord(
+            record = PlainErrorRecord(
                 kind="context_window_exceeded_error", request_history=request_history
             )
         case "unfinished_assistant_message":
-            record = GenerationErrorRecord(
+            record = PlainErrorRecord(
                 kind="unfinished_assistant_message_error",
                 error_text=outcome.error_text,
                 request_history=request_history,
             )
         case "provider_failed_terminally":
-            record = GenerationErrorRecord(
+            record = PlainErrorRecord(
                 kind="provider_failed_terminally_error",
                 error_text=outcome.error_text,
                 request_history=request_history,
@@ -363,7 +363,7 @@ def _timed_out_error(
     """Build the expired deadline's failure with one normalized cut-off request."""
     request_history, request_provider_data = ledger.freeze_with_cut_off(provider_billing_in_flight)
     return GenerationError(
-        record=GenerationErrorRecord(kind="timed_out_error", request_history=request_history),
+        record=PlainErrorRecord(kind="timed_out_error", request_history=request_history),
         request_params=None,
         request_provider_data=request_provider_data,
     )
@@ -377,7 +377,7 @@ def _escaped_error(ledger: _RequestLedger, escaped: Exception) -> GenerationErro
     """
     request_history, request_provider_data = ledger.freeze_with_cut_off()
     return GenerationError(
-        record=GenerationErrorRecord(
+        record=PlainErrorRecord(
             kind="unknown_exception_error",
             error_text=str(escaped),
             request_history=request_history,

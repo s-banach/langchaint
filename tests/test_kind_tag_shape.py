@@ -6,7 +6,7 @@ Each tagged union has distinct kind values.
 
 import inspect
 from types import UnionType
-from typing import Union, get_args, get_origin
+from typing import TypeAliasType, Union, get_args, get_origin
 
 from tests.helpers import package_modules
 
@@ -44,14 +44,17 @@ def _tagged_unions() -> dict[str, tuple[type, ...]]:
     return found
 
 
-def _tag_of(variant: type) -> str:
-    """Return the string in a variant's kind Literal."""
-    annotations = inspect.get_annotations(variant)
-    literal_arguments = get_args(annotations["kind"])
-    assert len(literal_arguments) == 1, f"{variant.__name__}.kind holds no single Literal value"
-    tag = literal_arguments[0]
-    assert isinstance(tag, str), f"{variant.__name__}.kind is not a string Literal"
-    return tag
+def _tags_of(variant: type) -> tuple[str, ...]:
+    """Return the strings in a variant's kind Literal, which a type alias may name."""
+    annotation = inspect.get_annotations(variant)["kind"]
+    if isinstance(annotation, TypeAliasType):
+        annotation = annotation.__value__
+    tags = get_args(annotation)
+    assert tags, f"{variant.__name__}.kind holds no Literal value"
+    assert all(isinstance(tag, str) for tag in tags), (
+        f"{variant.__name__}.kind is not a string Literal"
+    )
+    return tags
 
 
 _TAGGED_UNIONS = _tagged_unions()
@@ -62,7 +65,7 @@ def test_no_union_gives_two_variants_the_same_tag() -> None:
     assert _TAGGED_UNIONS
     collisions = {}
     for union_name, variants in _TAGGED_UNIONS.items():
-        tags = [_tag_of(variant) for variant in variants]
+        tags = [tag for variant in variants for tag in _tags_of(variant)]
         duplicated = sorted({tag for tag in tags if tags.count(tag) > 1})
         if duplicated:
             collisions[union_name] = duplicated

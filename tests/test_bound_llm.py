@@ -35,7 +35,6 @@ from langchaint import (
     GenerationWithToolCalls,
     Message,
     PydanticTool,
-    SchemaViolationErrorRecord,
     SettledRequestRecord,
     SharedBackoff,
     StopReason,
@@ -1137,11 +1136,7 @@ async def _pin_request_method_return_types(llm: LLM, tool_manager: ToolManager) 
     assert_type(await structured.generate_one("hi"), GenerationWithoutToolCalls[_Answer])
     assert_type(
         await structured.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[
-            GenerationWithoutToolCallsRecord[_Answer]
-            | GenerationErrorRecord
-            | SchemaViolationErrorRecord
-        ],
+        list[GenerationWithoutToolCallsRecord[_Answer] | GenerationErrorRecord],
     )
     text_with_tools = llm.bind(tools=tool_manager)
     assert_type(
@@ -1167,11 +1162,7 @@ async def _pin_generic_request_method_return_types[
     )
     assert_type(
         await bound_llm.generate_many_records(["hi"], resume_path=Path("records.json")),
-        list[
-            GenerationWithoutToolCallsRecord[OutputT]
-            | GenerationErrorRecord
-            | SchemaViolationErrorRecord
-        ]
+        list[GenerationWithoutToolCallsRecord[OutputT] | GenerationErrorRecord]
         | list[GenerationOutcomeRecord[OutputT, OutputT | None]],
     )
 

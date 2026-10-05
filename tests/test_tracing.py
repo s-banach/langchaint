@@ -5,6 +5,7 @@ The tests inspect recorded span names, kinds, statuses, attributes, events, and 
 Tests of the pure content renderers call them directly.
 """
 
+import contextlib
 import json
 import logging
 import pathlib
@@ -61,10 +62,12 @@ from langchaint.adapter import (
 )
 from langchaint.common.messages import StopReason
 from langchaint.span_parsing import (
+    OtelToolCallResponsePart,
     generation_input_from_otel,
     generation_record_from_otel,
     output_messages_from_otel,
     parse_otel,
+    parse_otel_execute_tool,
     reconstruct_bound_llm,
 )
 from langchaint.tracing import (
@@ -175,6 +178,11 @@ def _json_attribute(span: ReadableSpan, key: str) -> object:
     assert isinstance(value, str)
     parsed: object = json.loads(value)
     return parsed
+
+
+def _exported_attributes(span: ReadableSpan) -> dict[str, JsonValue]:
+    """Return the span's attributes as an exporter's JSON round trip delivers them."""
+    return TypeAdapter(dict[str, JsonValue]).validate_json(json.dumps(dict(span.attributes or {})))
 
 
 def _captured(exporter: InMemorySpanExporter, key: str) -> object:
@@ -796,11 +804,7 @@ def test_span_parsing_rebuilds_the_binding_input_and_generation_a_chat_span_reco
         )
         generation = await _generate_through(path, bound, generation_input)
         (span,) = exporter.get_finished_spans()
-        parsed = parse_otel(
-            TypeAdapter(dict[str, JsonValue]).validate_json(
-                json.dumps(dict(span.attributes or {}))
-            )
-        )
+        parsed = parse_otel(_exported_attributes(span))
         assert parsed.unused_attributes.keys() == LANGCHAINT_KEYS
         assert parsed.usage_input_tokens == USAGE.input_tokens_total
         assert parsed.usage_output_tokens == USAGE.output_tokens
@@ -1079,6 +1083,51 @@ def test_tool_manager_dispatch_emits_one_span_classified_by_its_outcome(
         )
         assert span.attributes is not None
         assert dict(span.attributes) == expected_attributes
+
+    run_with_timeout(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "records_result"),
+    [
+        (ToolCall(id="call1", name="echo", args_json='{"text": "hi"}'), True),
+        (ToolCall(id="call1", name="erring", args_json='{"text": "x"}'), True),
+        (ToolCall(id="call1", name="echo", args_json='{"wrong": 1}'), True),
+        (ToolCall(id="call1", name="missing", args_json="{}"), True),
+        (ToolCall(id="call1", name="boom", args_json='{"text": "x"}'), False),
+    ],
+    ids=[
+        "handled",
+        "function_authored_failure",
+        "invalid_tool_args",
+        "unknown_tool",
+        "function_exception",
+    ],
+)
+def test_parse_otel_execute_tool_reads_each_key_a_dispatch_span_records(
+    tool_call: ToolCall, *, records_result: bool
+) -> None:
+    """`parse_otel_execute_tool` reads each key of a captured dispatch span into a field.
+
+    The result parses as the `tool_call_response` part `OtelObserver` records.
+    A raising tool function records no `gen_ai.tool.call.result`.
+    """
+
+    async def scenario() -> None:
+        """Dispatch under capture, then parse the span's exported attributes."""
+        tracer_provider, exporter = _in_memory_tracer_provider()
+        tool_manager = ToolManager(
+            [_echo_tool(), _erring_tool(), _raising_tool()],
+            observer=OtelObserver(tracer_provider=tracer_provider, capture_message_content=True),
+        )
+        with contextlib.suppress(RuntimeError):
+            await tool_manager.dispatch(tool_call)
+        (span,) = exporter.get_finished_spans()
+        parsed = parse_otel_execute_tool(_exported_attributes(span))
+        assert parsed.unused_attributes == {}
+        assert (parsed.tool_name, parsed.tool_call_id) == (tool_call.name, tool_call.id)
+        assert parsed.tool_call_arguments == json.loads(tool_call.args_json)
+        assert isinstance(parsed.tool_call_result, OtelToolCallResponsePart) == records_result
 
     run_with_timeout(scenario())
 

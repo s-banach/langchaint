@@ -185,7 +185,7 @@ Document every public parameter and cross-provider difference.
 - `concurrency/run_many.py`: bounded execution of zero-argument async callables without langchaint imports.
 - `common/sequence_not_str.py`: the sequence protocol that excludes bare `str` values.
 - `tracing/`: the optional OTel subpackage and its `OtelObserver`.
-- `span_parsing.py`: OTel chat span parsing and conversion without OpenTelemetry dependencies.
+- `span_parsing.py`: OTel chat and execute_tool span parsing, and chat span conversion, without OpenTelemetry dependencies.
 
 ## Checks
 

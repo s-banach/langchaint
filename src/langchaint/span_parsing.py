@@ -1,4 +1,4 @@
-"""Parse OTel chat span attributes and convert supported values into langchaint values."""
+"""Parse OTel chat and execute_tool span attributes, and convert supported chat values into langchaint values."""
 
 import json
 from importlib.resources import files
@@ -78,6 +78,21 @@ def _decode_semconv_attribute(name: str, value: JsonValue) -> object:
     if name not in _STRUCTURED_ATTRIBUTE_NAMES or not isinstance(value, str):
         return value
     return _FINITE_JSON_ADAPTER.validate_json(value)
+
+
+def _decode_span_attributes(
+    input_value: object, fixed_aliases: frozenset[str]
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Decode every span attribute, and split the attributes named in `fixed_aliases` from the others."""
+    span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
+    parsed_attributes: dict[str, object] = {}
+    other_attributes: dict[str, object] = {}
+    for name, value in span_attributes.items():
+        if name in fixed_aliases and value is None:
+            raise ValueError(f"a present OTel attribute cannot be null: {name}")
+        target = parsed_attributes if name in fixed_aliases else other_attributes
+        target[name] = _decode_semconv_attribute(name, value)
+    return parsed_attributes, other_attributes
 
 
 def _validate_draft_07_schema(value: JsonValue) -> JsonValue:
@@ -411,26 +426,63 @@ class OtelChatSpan(OtelModel):
     @model_validator(mode="before")
     @classmethod
     def _partition_span_attributes(cls, input_value: object) -> object:
-        span_attributes = _SPAN_ATTRIBUTES_ADAPTER.validate_python(input_value)
-        parsed_attributes: dict[str, object] = {}
-        prompt_variables: dict[str, JsonValue] = {}
-        unused_attributes: dict[str, object] = {}
-        for name, value in span_attributes.items():
-            if name in _OTEL_CHAT_SPAN_FIXED_ALIASES:
-                if value is None:
-                    raise ValueError(f"a present OTel attribute cannot be null: {name}")
-                parsed_attributes[name] = _decode_semconv_attribute(name, value)
-            elif name.startswith(PROMPT_VARIABLE_PREFIX):
-                prompt_variables[name.removeprefix(PROMPT_VARIABLE_PREFIX)] = value
-            else:
-                unused_attributes[name] = _decode_semconv_attribute(name, value)
-        parsed_attributes["prompt_variables"] = prompt_variables
-        parsed_attributes["unused_attributes"] = unused_attributes
+        parsed_attributes, other_attributes = _decode_span_attributes(
+            input_value, _OTEL_CHAT_SPAN_FIXED_ALIASES
+        )
+        parsed_attributes["prompt_variables"] = {
+            name.removeprefix(PROMPT_VARIABLE_PREFIX): value
+            for name, value in other_attributes.items()
+            if name.startswith(PROMPT_VARIABLE_PREFIX)
+        }
+        parsed_attributes["unused_attributes"] = {
+            name: value
+            for name, value in other_attributes.items()
+            if not name.startswith(PROMPT_VARIABLE_PREFIX)
+        }
         return parsed_attributes
 
 
 _OTEL_CHAT_SPAN_FIXED_ALIASES: frozenset[str] = frozenset(
     field.alias for field in OtelChatSpan.model_fields.values() if field.alias is not None
+)
+
+type OtelToolCallResult = Annotated[
+    OtelToolCallResponsePart | JsonValue, Field(union_mode="left_to_right")
+]
+
+
+class OtelExecuteToolSpan(OtelModel):
+    """Pydantic validates the execute_tool attributes that the committed OTel convention snapshot names.
+
+    `tool_call_arguments` and `tool_call_result` accept any JSON value, not only the object the snapshot declares.
+    `OtelObserver` records arguments that are not an object, such as argument text that is not JSON.
+    `tool_call_arguments` and `tool_call_result` default to `None`.
+    `model_fields_set` distinguishes an absent attribute from a recorded JSON `null`.
+    """
+
+    operation_name: Literal["execute_tool"] = Field(alias=OPERATION_NAME)
+    error_type: str | None = Field(default=None, alias="error.type")
+    agent_name: str | None = Field(default=None, alias="gen_ai.agent.name")
+    tool_call_arguments: JsonValue = Field(default=None, alias="gen_ai.tool.call.arguments")
+    tool_call_id: str | None = Field(default=None, alias="gen_ai.tool.call.id")
+    tool_call_result: OtelToolCallResult = Field(default=None, alias="gen_ai.tool.call.result")
+    tool_description: str | None = Field(default=None, alias="gen_ai.tool.description")
+    tool_name: str | None = Field(default=None, alias="gen_ai.tool.name")
+    tool_type: str | None = Field(default=None, alias="gen_ai.tool.type")
+    unused_attributes: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _partition_span_attributes(cls, input_value: object) -> object:
+        parsed_attributes, other_attributes = _decode_span_attributes(
+            input_value, _OTEL_EXECUTE_TOOL_SPAN_FIXED_ALIASES
+        )
+        parsed_attributes["unused_attributes"] = other_attributes
+        return parsed_attributes
+
+
+_OTEL_EXECUTE_TOOL_SPAN_FIXED_ALIASES: frozenset[str] = frozenset(
+    field.alias for field in OtelExecuteToolSpan.model_fields.values() if field.alias is not None
 )
 
 
@@ -451,6 +503,21 @@ def parse_otel(span_attributes: dict[str, JsonValue]) -> OtelChatSpan:
         pydantic.ValidationError: A standard attribute is malformed or the operation is not `chat`.
     """
     return OtelChatSpan.model_validate(span_attributes)
+
+
+def parse_otel_execute_tool(span_attributes: dict[str, JsonValue]) -> OtelExecuteToolSpan:
+    """Parse one deserialized OTel execute_tool span attribute dictionary.
+
+    `parse_otel_execute_tool` does not parse span metadata.
+    Decoded JSON strings preserve values without preserving their original formatting.
+
+    Args:
+        span_attributes: The deserialized execute_tool span attributes.
+
+    Raises:
+        pydantic.ValidationError: A standard attribute is malformed or the operation is not `execute_tool`.
+    """
+    return OtelExecuteToolSpan.model_validate(span_attributes)
 
 
 def _system_prompt_from_parts(
@@ -996,6 +1063,7 @@ __all__ = [
     "OtelBlobPart",
     "OtelChatSpan",
     "OtelCompactionPart",
+    "OtelExecuteToolSpan",
     "OtelFilePart",
     "OtelFunctionTool",
     "OtelGenericObject",
@@ -1011,12 +1079,14 @@ __all__ = [
     "OtelToLangchaintConversionError",
     "OtelToolCallPart",
     "OtelToolCallResponsePart",
+    "OtelToolCallResult",
     "OtelToolDefinition",
     "OtelUriPart",
     "generation_input_from_otel",
     "generation_record_from_otel",
     "output_messages_from_otel",
     "parse_otel",
+    "parse_otel_execute_tool",
     "reconstruct_bound_llm",
     "system_prompt_from_otel",
     "tool_schemas_from_otel",

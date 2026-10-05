@@ -6,7 +6,7 @@ import pathlib
 from typing import assert_type
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from langchaint import (
     LLM,
@@ -22,6 +22,7 @@ from langchaint import (
 )
 from langchaint.span_parsing import (
     OtelChatSpan,
+    OtelExecuteToolSpan,
     OtelFunctionTool,
     OtelGenericObject,
     OtelGenericTool,
@@ -32,6 +33,7 @@ from langchaint.span_parsing import (
     generation_record_from_otel,
     output_messages_from_otel,
     parse_otel,
+    parse_otel_execute_tool,
     reconstruct_bound_llm,
     system_prompt_from_otel,
     tool_schemas_from_otel,
@@ -1101,3 +1103,25 @@ def test_reconstruction_rejects_unsupported_output_type(output_type: str) -> Non
     span = _generation_chat_span({"gen_ai.output.type": output_type})
     with pytest.raises(OtelToLangchaintConversionError, match=r"gen_ai\.output\.type"):
         _ = reconstruct_bound_llm(span, llm=LLM(FakeAdapter()))
+
+
+def test_manifest_attribute_names_match_otel_execute_tool_span_aliases() -> None:
+    """OtelExecuteToolSpan has one aliased field per attribute in the committed declaration."""
+    names = TypeAdapter(frozenset[str]).validate_json(
+        (SEMCONV_DIRECTORY / "execute-tool-span-attribute-names.json").read_text()
+    )
+    aliases = {
+        field.alias
+        for field_name, field in OtelExecuteToolSpan.model_fields.items()
+        if field_name != "unused_attributes"
+    }
+    assert aliases == names
+
+
+def test_execute_tool_result_of_another_shape_parses_as_a_json_value() -> None:
+    """A result that is not a tool_call_response part, as another emitter records, parses unchanged."""
+    parsed = parse_otel_execute_tool({
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.call.result": '{"temperature": 20}',
+    })
+    assert parsed.tool_call_result == {"temperature": 20}
